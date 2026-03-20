@@ -23,7 +23,7 @@ import torch
 from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -70,13 +70,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         optimizer_path: Optional[PathLike] = None,
         init_reference_model: bool = True,
         processor: Optional[AutoProcessor] = None,
+        worker_extension_cls_fqn: Optional[str] = None,
     ):
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:
             optimizer_path = os.path.abspath(optimizer_path)
 
-        worker_builder_cls: str
+        worker_builder_cls_fqn: str
         tp_size = 1
         pp_size = 1
         cp_size = 1
@@ -89,7 +90,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
         if megatron_enable:
-            worker_builder_cls = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
+            worker_builder_cls_fqn = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
@@ -112,7 +113,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
             use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
             if use_v2:
-                worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+                worker_builder_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
 
                 if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                     warnings.warn(
@@ -124,16 +125,42 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
                     is False
                 ), "LoRA is not supported for DTensorPolicyWorker V1"
-                worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+                worker_builder_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
 
+        # If a worker extension class is provided, use it instead of the default worker builder class
+        if worker_extension_cls_fqn is not None:
+            print(
+                f"Using worker extension class: {worker_extension_cls_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
+            )
+            worker_builder_cls_fqn = worker_extension_cls_fqn
+
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
         actual_world_size = cluster.world_size()
+
+        if (
+            not bool(os.environ.get("NRL_IGNORE_TP_ACCURACY_CHECK"))
+            and "logprob_batch_size" in config
+            and tp_size >= 4
+        ):
+            sep_line = "\n" + ("-" * 80)
+            assert config["train_micro_batch_size"] == config["logprob_batch_size"], (
+                f"{sep_line}\n"
+                "There is a known batch-variant accuracy issue with TP>=4 for both DTensor and Megatron backend.\n"
+                "See https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause for more details.\n"
+                "\n"
+                "Please choose either of the following solutions to avoid this issue:\n"
+                "1. Set tp_size to 1 or 2. (tensor_parallel_size for DTensor, or tensor_model_parallel_size for Megatron)\n"
+                "2. Set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value.\n"
+                "3. Set loss_fn.force_on_policy_ratio=true to force ratio=1.0, this requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt.\n"
+                "4. Set NRL_IGNORE_TP_ACCURACY_CHECK=1 to bypass this check. (not recommended)"
+                f"{sep_line}\n"
+            )
 
         if actual_world_size < model_parallel_size:
             raise ValueError(
@@ -169,7 +196,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         pre_init_queue = RayQueue()
         worker_builder = RayWorkerBuilder(
-            worker_builder_cls,
+            worker_builder_cls_fqn,
             config,
             tokenizer=tokenizer,
             processor=processor,
@@ -256,6 +283,44 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         self.cfg = config
 
+    def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:
+        """Run a method on all workers in parallel with the same data.
+
+        Mainly used for worker extension classes.
+
+        Args:
+            method_name: The name of the method to run.
+            *args: The positional arguments to pass to the method.
+            **kwargs: The keyword arguments to pass to the method.
+
+        Returns:
+            The results of the method run on all workers.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name, *args, **kwargs
+        )
+        results = ray.get(futures)
+        return results
+
+    def run_all_workers_multiple_data(self, method_name: str, *args, **kwargs) -> Any:
+        """Run a method on all workers in parallel with different data.
+
+        Mainly used for worker extension classes.
+
+        Args:
+            method_name: The name of the method to run.
+            *args: The positional arguments to pass to the method.
+            **kwargs: The keyword arguments to pass to the method.
+
+        Returns:
+            The results of the method run on all workers.
+        """
+        futures = self.worker_group.run_all_workers_multiple_data(
+            method_name, *args, **kwargs
+        )
+        results = ray.get(futures)
+        return results
+
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
@@ -286,13 +351,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
 
-        # DEBUG: Log input batch size
-        # input_batch_size = len(data.get("input_ids", []))
-        # if hasattr(data.get("input_ids"), "shape"):
-        #     input_batch_size = data["input_ids"].shape[0]
-
         with timer.time("get_logprobs/shard_data") if timer else nullcontext():
-            # Check if Hybrid Context Parallelism is enabled
             hcp_enabled = self.cfg.get("hybrid_cp", {}).get("enabled", False)
 
             if self.use_dynamic_batches:
@@ -310,34 +369,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 ]["logprob_mb_tokens"]
 
                 if hcp_enabled:
-                    # Use Hybrid Context Parallelism scheduler
                     from nemo_rl.models.policy.hybrid_cp_scheduler import HeadNodeHCPScheduler
                     from nemo_rl.models.policy.hybrid_cp_config import HybridCPConfig
 
-                    # print(f"[DEBUG get_logprobs] Using HCP scheduler for sharding")
-
-                    # Calculate max_seq_len from config or data
                     max_seq_len = self.cfg.get("max_seq_length", None)
                     if max_seq_len is None:
-                        # Fallback: use max length from current batch
                         max_seq_len = int(data["input_lengths"].max().item())
 
-                    # Get CP size
                     cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
 
-                    # Calculate max_seqlen_per_dp_cp_rank if not provided
                     max_seqlen_per_dp_cp_rank = self.cfg["hybrid_cp"].get(
                         "max_seqlen_per_dp_cp_rank", None
                     )
                     if max_seqlen_per_dp_cp_rank is None:
                         max_seqlen_per_dp_cp_rank = max_seq_len // cp_size
 
-                    # Scale by logprob_batch_size so the HCP scheduler packs more tokens
-                    # per group (matching what non-HCP sequence packing does with logprob_mb_tokens).
                     logprob_batch_size = self.cfg.get("logprob_batch_size", 1)
                     max_seqlen_per_dp_cp_rank = max_seqlen_per_dp_cp_rank * logprob_batch_size
 
-                    # Create HCP config
                     hcp_config = HybridCPConfig(
                         max_seqlen_per_dp_cp_rank=max_seqlen_per_dp_cp_rank,
                         scheduling_strategy=self.cfg["hybrid_cp"].get("scheduling_strategy", "dp"),
@@ -352,44 +401,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                         max_seq_len=max_seq_len,
                     )
 
-                    # Use HCP scheduler to shard data
-                    # Note: HCP scheduler returns DP×CP shards, not just DP shards
                     sharded_data_flat = hcp_scheduler.schedule_and_shard(
                         data=data,
                         seq_length_key="input_lengths",
                     )
-                    # HCP doesn't track unsorted indices the same way, so we don't need to reorder
                     unsorted_data_indices = None
 
-                    # Reshape flat list into 2D structure for worker group
-                    # HCP scheduler returns [hdp_size] shards where hdp_rank = dp_rank * cp_size + cp_rank
-                    # Worker group expects [dp_size][cp_size] structure
-                    # print(f"[HCP SHARDING] Reshaping flat shards into 2D structure: dp_size={dp_size}, cp_size={cp_size}")
                     sharded_data = []
                     for dp_idx in range(dp_size):
                         dp_shards = []
                         for cp_idx in range(cp_size):
                             hdp_idx = dp_idx * cp_size + cp_idx
-                            shard = sharded_data_flat[hdp_idx]
-                            dp_shards.append(shard)
-
-                            # Log shard info
-                            shard_size = shard.size if hasattr(shard, 'size') else len(shard.get("input_ids", []))
-                            shard_sample_ids = shard.get("shard_sample_ids", [])
-                            shard_input_lengths = shard.get("input_lengths", None)
-                            if shard_input_lengths is not None and hasattr(shard_input_lengths, 'tolist'):
-                                lengths_str = str(shard_input_lengths.tolist())
-                            else:
-                                lengths_str = str(shard_input_lengths)
-                            # print(
-                            #     f"[HCP SHARDING] Shard [dp={dp_idx}][cp={cp_idx}] (hdp={hdp_idx}): "
-                            #     f"size={shard_size}, sample_ids={shard_sample_ids}, seq_lengths={lengths_str}"
-                            # )
+                            dp_shards.append(sharded_data_flat[hdp_idx])
                         sharded_data.append(dp_shards)
-
-                    # print(f"[DEBUG get_logprobs] Reshaped HCP shards from flat [{len(sharded_data_flat)}] to 2D [{len(sharded_data)}][{len(sharded_data[0])}]")
                 else:
-                    # Use standard sequence packing without HCP
                     sharded_data, unsorted_data_indices = data.shard_by_batch_size(
                         dp_size,
                         batch_size=None,
@@ -401,53 +426,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     batch_size=None,
                 )
 
-        # DEBUG: Log sharding results
-        # # Handle both flat list (normal) and 2D list (HCP) structures
-        # if hcp_enabled and self.use_sequence_packing:
-        #     # 2D structure: [dp_size][cp_size]
-        #     total_samples_in_shards = sum(
-        #         shard["input_ids"].shape[0] if hasattr(shard.get("input_ids"), "shape") else len(shard.get("input_ids", []))
-        #         for dp_shards in sharded_data
-        #         for shard in dp_shards
-        #     )
-        #     print(f"[DEBUG get_logprobs] After HCP sharding: [{len(sharded_data)}][{len(sharded_data[0])}] shards, total samples: {total_samples_in_shards}")
-        #     for dp_idx, dp_shards in enumerate(sharded_data):
-        #         for cp_idx, shard in enumerate(dp_shards):
-        #             shard_size = shard["input_ids"].shape[0] if hasattr(shard.get("input_ids"), "shape") else len(shard.get("input_ids", []))
-        #             print(f"[DEBUG get_logprobs] Shard [{dp_idx}][{cp_idx}] size: {shard_size}")
-        # else:
-        #     # Flat list structure
-        #     total_samples_in_shards = sum(
-        #         shard["input_ids"].shape[0] if hasattr(shard.get("input_ids"), "shape") else len(shard.get("input_ids", []))
-        #         for shard in sharded_data
-        #     )
-        #     print(f"[DEBUG get_logprobs] After sharding: {len(sharded_data)} shards, total samples: {total_samples_in_shards}")
-        #     for i, shard in enumerate(sharded_data):
-        #         shard_size = shard["input_ids"].shape[0] if hasattr(shard.get("input_ids"), "shape") else len(shard.get("input_ids", []))
-        #         print(f"[DEBUG get_logprobs] Shard {i} size: {shard_size}")
-        # if (self.use_sequence_packing or self.use_dynamic_batches) and unsorted_data_indices is not None:
-        #     print(f"[DEBUG get_logprobs] unsorted_data_indices length: {len(unsorted_data_indices)}")
-        #     print(f"[DEBUG get_logprobs] unsorted_data_indices sample: {unsorted_data_indices[:10] if len(unsorted_data_indices) >= 10 else unsorted_data_indices}")
-
-        # Determine axes based on whether HCP is enabled
         if hcp_enabled and self.use_sequence_packing:
-            # When HCP is enabled, data is sharded across both DP and CP dimensions
-            # IMPORTANT: We do NOT mark CP as output_is_replicated here because in HCP,
-            # different samples have different local_cp_size values:
-            # - Some samples are on 1 rank (local_cp_size=1, no duplication)
-            # - Some samples are on 2 ranks (local_cp_size=2, duplicated)
-            # - Some samples are on 4 ranks (local_cp_size=4, duplicated)
-            # The worker group can't handle this dynamic per-sample replication pattern,
-            # so we collect from all workers and manually deduplicate later.
             in_sharded_axes = ["data_parallel", "context_parallel"]
             replicate_on_axes = ["tensor_parallel", "pipeline_parallel"]
-            output_is_replicated = ["tensor_parallel", "pipeline_parallel"]  # NO context_parallel
-            # print("[HCP] get_logprobs using HCP axes: input sharded on DP×CP, will deduplicate outputs manually")
+            output_is_replicated = ["tensor_parallel", "pipeline_parallel"]
         else:
-            # Normal case: shard on DP, replicate on CP/TP/PP
             in_sharded_axes = ["data_parallel"]
             replicate_on_axes = ["context_parallel", "tensor_parallel", "pipeline_parallel"]
             output_is_replicated = ["context_parallel", "tensor_parallel", "pipeline_parallel"]
+
 
         with (
             timer.time("get_logprobs/submit_logprob_futures")
@@ -461,24 +448,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 replicate_on_axes=replicate_on_axes,
                 output_is_replicated=output_is_replicated,
             )
-        # DEBUG: Log worker results before aggregation
         worker_results = self.worker_group.get_all_worker_results(futures)
-        # print(f"[DEBUG get_logprobs] Number of worker results: {len(worker_results)}")
-        # for i, result in enumerate(worker_results):
-        #     result_size = result["logprobs"].shape[0] if hasattr(result.get("logprobs"), "shape") else len(result.get("logprobs", []))
-        #     print(f"[DEBUG get_logprobs] Worker result {i} size: {result_size}")
 
-        # In HCP mode, deduplicate results based on sample IDs
-        # (different CP ranks process the same sample, so we get duplicates)
         if hcp_enabled and self.use_sequence_packing:
-            # print(f"[HCP] get_logprobs: Deduplicating {len(worker_results)} worker results")
             deduplicated_results = []
             seen_sample_ids = set()
 
             for result in worker_results:
                 if "_hcp_sample_ids" in result:
                     sample_ids = result["_hcp_sample_ids"]
-                    # Filter out samples we've already seen
                     unique_indices = []
                     for idx, sample_id in enumerate(sample_ids):
                         if sample_id not in seen_sample_ids:
@@ -486,31 +464,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                             unique_indices.append(idx)
 
                     if unique_indices:
-                        # Create new result with only unique samples
                         dedup_result = {}
                         for key, value in result.items():
                             if key == "_hcp_sample_ids":
-                                # Keep only unique sample IDs
                                 dedup_result[key] = [sample_ids[i] for i in unique_indices]
                             elif torch.is_tensor(value):
-                                # Index into tensor to keep only unique samples
                                 dedup_result[key] = value[unique_indices]
                             else:
-                                # Keep non-tensor values as-is
                                 dedup_result[key] = value
                         deduplicated_results.append(dedup_result)
                 else:
-                    # No sample IDs, keep as-is (shouldn't happen in HCP mode)
                     deduplicated_results.append(result)
 
-            # print(f"[HCP] get_logprobs: After deduplication: {len(deduplicated_results)} results, {len(seen_sample_ids)} unique samples")
             worker_results = deduplicated_results
 
         logprobs: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(worker_results)
-
-        # DEBUG: Log after aggregation
-        logprobs_batch_size = logprobs["logprobs"].shape[0] if hasattr(logprobs.get("logprobs"), "shape") else len(logprobs.get("logprobs", []))
-        # print(f"[DEBUG get_logprobs] After from_batches, logprobs batch size: {logprobs_batch_size}")
 
         # dynamic batching sorts the inputs by sequence length to improve load balancing,
         # so change it back here
@@ -546,7 +514,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             if timer
             else nullcontext()
         ):
-            # Check if Hybrid Context Parallelism is enabled
             hcp_enabled = self.cfg.get("hybrid_cp", {}).get("enabled", False)
 
             if self.use_dynamic_batches:
@@ -564,32 +531,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 ]["logprob_mb_tokens"]
 
                 if hcp_enabled:
-                    # Use Hybrid Context Parallelism scheduler
                     from nemo_rl.models.policy.hybrid_cp_scheduler import HeadNodeHCPScheduler
                     from nemo_rl.models.policy.hybrid_cp_config import HybridCPConfig
 
-                    # Calculate max_seq_len from config or data
                     max_seq_len = self.cfg.get("max_seq_length", None)
                     if max_seq_len is None:
-                        # Fallback: use max length from current batch
                         max_seq_len = int(data["input_lengths"].max().item())
 
-                    # Get CP size
                     cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
 
-                    # Calculate max_seqlen_per_dp_cp_rank if not provided
                     max_seqlen_per_dp_cp_rank = self.cfg["hybrid_cp"].get(
                         "max_seqlen_per_dp_cp_rank", None
                     )
                     if max_seqlen_per_dp_cp_rank is None:
                         max_seqlen_per_dp_cp_rank = max_seq_len // cp_size
 
-                    # Scale by logprob_batch_size so the HCP scheduler packs more tokens
-                    # per group (matching what non-HCP sequence packing does with logprob_mb_tokens).
                     logprob_batch_size = self.cfg.get("logprob_batch_size", 1)
                     max_seqlen_per_dp_cp_rank = max_seqlen_per_dp_cp_rank * logprob_batch_size
 
-                    # Create HCP config
                     hcp_config = HybridCPConfig(
                         max_seqlen_per_dp_cp_rank=max_seqlen_per_dp_cp_rank,
                         scheduling_strategy=self.cfg["hybrid_cp"].get("scheduling_strategy", "dp"),
@@ -604,15 +563,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                         max_seq_len=max_seq_len,
                     )
 
-                    # Use HCP scheduler to shard data
                     sharded_data_flat = hcp_scheduler.schedule_and_shard(
                         data=data,
                         seq_length_key="input_lengths",
                     )
                     unsorted_data_indices = None
 
-                    # Reshape flat list into 2D structure for worker group
-                    # print(f"[HCP SHARDING get_reference_policy_logprobs] Reshaping flat shards: dp_size={dp_size}, cp_size={cp_size}")
                     sharded_data = []
                     for dp_idx in range(dp_size):
                         dp_shards = []
@@ -621,7 +577,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                             dp_shards.append(sharded_data_flat[hdp_idx])
                         sharded_data.append(dp_shards)
                 else:
-                    # Use standard sequence packing without HCP
                     sharded_data, unsorted_data_indices = data.shard_by_batch_size(
                         dp_size,
                         batch_size=None,
@@ -633,19 +588,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     batch_size=None,
                 )
 
-        # Determine axes based on whether HCP is enabled
         if hcp_enabled and self.use_sequence_packing:
-            # When HCP is enabled, data is sharded across both DP and CP dimensions
-            # IMPORTANT: We do NOT mark CP as output_is_replicated here because in HCP,
-            # different samples have different local_cp_size values (dynamic per-sample replication).
-            # The worker group can't handle this dynamic pattern, so we collect from all workers
-            # and manually deduplicate later based on sample IDs.
             in_sharded_axes = ["data_parallel", "context_parallel"]
             replicate_on_axes = ["tensor_parallel", "pipeline_parallel"]
-            output_is_replicated = ["tensor_parallel", "pipeline_parallel"]  # NO context_parallel
-            # print("[HCP] get_reference_policy_logprobs using HCP axes: input sharded on DP×CP, will deduplicate outputs manually")
+            output_is_replicated = ["tensor_parallel", "pipeline_parallel"]
         else:
-            # Normal case: shard on DP, replicate on CP/TP/PP
             in_sharded_axes = ["data_parallel"]
             replicate_on_axes = ["context_parallel", "tensor_parallel", "pipeline_parallel"]
             output_is_replicated = ["context_parallel", "tensor_parallel", "pipeline_parallel"]
@@ -668,17 +615,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         worker_results = self.worker_group.get_all_worker_results(futures)
 
-        # In HCP mode, deduplicate results based on sample IDs
-        # (different CP ranks process the same sample, so we get duplicates)
         if hcp_enabled and self.use_sequence_packing:
-            # print(f"[HCP] get_reference_policy_logprobs: Deduplicating {len(worker_results)} worker results")
             deduplicated_results = []
             seen_sample_ids = set()
 
             for result in worker_results:
                 if "_hcp_sample_ids" in result:
                     sample_ids = result["_hcp_sample_ids"]
-                    # Filter out samples we've already seen
                     unique_indices = []
                     for idx, sample_id in enumerate(sample_ids):
                         if sample_id not in seen_sample_ids:
@@ -686,24 +629,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                             unique_indices.append(idx)
 
                     if unique_indices:
-                        # Create new result with only unique samples
                         dedup_result = {}
                         for key, value in result.items():
                             if key == "_hcp_sample_ids":
-                                # Keep only unique sample IDs
                                 dedup_result[key] = [sample_ids[i] for i in unique_indices]
                             elif torch.is_tensor(value):
-                                # Index into tensor to keep only unique samples
                                 dedup_result[key] = value[unique_indices]
                             else:
-                                # Keep non-tensor values as-is
                                 dedup_result[key] = value
                         deduplicated_results.append(dedup_result)
                 else:
-                    # No sample IDs, keep as-is (shouldn't happen in HCP mode)
                     deduplicated_results.append(result)
 
-            # print(f"[HCP] get_reference_policy_logprobs: After deduplication: {len(deduplicated_results)} results, {len(seen_sample_ids)} unique samples")
             worker_results = deduplicated_results
 
         logprobs: BatchedDataDict[ReferenceLogprobOutputSpec] = (
@@ -808,7 +745,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         cp_size = self.sharding_annotations.get_axis_size("context_parallel")
         hcp_enabled = self.cfg.get("hybrid_cp", {}).get("enabled", False)
 
-        # For HCP: we need to loop over global batches on head node
         if hcp_enabled and self.use_sequence_packing:
             # print(f"HCP: Training with dataset_size={data.size}, gbs={batch_size}")
 
@@ -952,10 +888,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     if "input_lengths" in shard:
                         self.flops_tracker.track_batch(shard["input_lengths"].tolist())
 
-            in_sharded_axes = ["data_parallel"]
-            replicate_on_axes = ["context_parallel", "tensor_parallel", "pipeline_parallel"]
-            output_is_replicated = ["context_parallel", "tensor_parallel", "pipeline_parallel"]
-
             with (
                 timer.time("policy_training/submit_training_futures")
                 if timer
@@ -964,9 +896,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 futures = self.worker_group.run_all_workers_sharded_data(
                     "train",
                     data=sharded_data,
-                    in_sharded_axes=in_sharded_axes,
-                    replicate_on_axes=replicate_on_axes,
-                    output_is_replicated=output_is_replicated,
+                    in_sharded_axes=["data_parallel"],
+                    replicate_on_axes=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    output_is_replicated=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
                     common_kwargs={
                         "loss_fn": loss_fn,
                         "eval_mode": eval_mode,

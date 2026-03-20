@@ -24,8 +24,14 @@ GIT_URL=${1:-https://github.com/vllm-project/vllm.git}
 GIT_REF=${2:-cc99baf14dacc2497d0c5ed84e076ef2c37f6a4d}
 # NOTE: VLLM_USE_PRECOMPILED=1 didn't always seem to work since the wheels were sometimes built against an incompatible torch/cuda combo.
 # This commit was chosen as one close to the v0.10 release: git merge-base --fork-point origin/main tags/v0.10.0
-VLLM_WHEEL_COMMIT=${3:-862f2ef893d9751db0a92bd2d4ae0e3d9677872f}  # use full commit hash from the main branch
-export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${VLLM_WHEEL_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+if [[ -n "${3:-}" ]]; then
+  VLLM_PRECOMPILED_WHEEL_LOCATION="$3"
+elif [[ "$(uname -m)" == "aarch64" ]]; then
+  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_aarch64.whl"
+else
+  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_x86_64.whl"
+fi
+export VLLM_PRECOMPILED_WHEEL_LOCATION
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty/vllm")
 if [[ -e "$BUILD_DIR" ]]; then
@@ -36,7 +42,6 @@ fi
 echo "Building vLLM from:"
 echo "  Vllm Git URL: $GIT_URL"
 echo "  Vllm Git ref: $GIT_REF"
-echo "  Vllm Wheel commit: $VLLM_WHEEL_COMMIT"
 echo "  Vllm Wheel location: $VLLM_PRECOMPILED_WHEEL_LOCATION"
 
 # Clone the repository

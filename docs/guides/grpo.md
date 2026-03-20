@@ -4,12 +4,12 @@ This guide details the Group Relative Policy Optimization (GRPO) implementation 
 
 ## Quickstart: Launch a GRPO Run
 
-To get started quickly, use the script [examples/run_grpo_math.py](../../examples/run_grpo_math.py), which demonstrates how to train a model on math problems using GRPO. You can launch this script locally or through Slurm. For detailed instructions on setting up Ray and launching a job with Slurm, refer to the [cluster documentation](../cluster.md).
+To get started quickly, use the script [examples/run_grpo.py](../../examples/run_grpo.py), which demonstrates how to train a model on math problems using GRPO. You can launch this script locally or through Slurm. For detailed instructions on setting up Ray and launching a job with Slurm, refer to the [cluster documentation](../cluster.md).
 
 We recommend launching the job using `uv`:
 
 ```bash
-uv run examples/run_grpo_math.py --config <PATH TO YAML CONFIG> {overrides}
+uv run examples/run_grpo.py --config <PATH TO YAML CONFIG> {overrides}
 ```
 
 If not specified, `config` will default to [examples/configs/grpo_math_1B.yaml](../../examples/configs/grpo_math_1B.yaml).
@@ -38,6 +38,25 @@ To support this, we need to know:
 
 #### Dataset
 
+GRPO datasets in NeMo RL are encapsulated using classes. Each GRPO data class is expected to have the following attributes:
+  1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
+  2. `task_name`: A string identifier that uniquely identifies the dataset.
+
+GRPO datasets are expected to follow the HuggingFace chat format. Refer to the [chat dataset document](../design-docs/chat-datasets.md) for details. If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. [response_datasets/deepscaler.py](../../nemo_rl/data/datasets/response_datasets/deepscaler.py) has an example:
+
+**Note:** The `task_name` field is required in each formatted example.
+
+```python
+def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "messages": [
+            {"role": "user", "content": data["problem"]},
+            {"role": "assistant", "content": data["answer"]},
+        ],
+        "task_name": self.task_name,
+    }
+```
+
 By default, NeMo RL has some built-in supported datasets (e.g., [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [Squad](../../nemo_rl/data/datasets/response_datasets/squad.py), etc.). You can see the full list [here](../../nemo_rl/data/datasets/response_datasets/__init__.py).
 All of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
@@ -51,6 +70,7 @@ data:
     # this dataset will override input_key and use the default values for other vars
     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
     input_key: question
+    subset: null  # used for HuggingFace datasets
     split: train  # used for HuggingFace datasets
     split_validation_size: 0.05  # use 5% of the training data as validation data
     seed: 42  # seed for train/validation split when split_validation_size > 0
@@ -66,6 +86,40 @@ data:
     system_prompt_file: null
     processor: "math_hf_data_processor"
     env_name: "math"
+```
+
+Your JSONL files should contain one JSON object per line with the following structure:
+
+```json
+{
+  "input": "Hello",     // <input_key>: <input_content>
+  "output": "Hi there!" // <output_key>: <output_content>
+}
+```
+
+We support using multiple datasets for train and validation. You can refer to `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example. Here's an example configuration:
+```yaml
+data:
+  _override_: true # override the data config instead of merging with it
+  # other data settings, see `examples/configs/grpo_math_1B.yaml` for more details
+  ...
+  # dataset settings
+  train:
+    # train dataset 1
+    - dataset_name: OpenMathInstruct-2
+      split_validation_size: 0.05 # use 5% of the training data as validation data
+      seed: 42  # seed for train/validation split when split_validation_size > 0
+    # train dataset 2
+    - dataset_name: DeepScaler
+  validation:
+    # validation dataset 1
+    - dataset_name: AIME2024
+      repeat: 16
+    # validation dataset 2
+    - dataset_name: DAPOMathAIME2024
+  # default settings for all datasets
+  default:
+    ...
 ```
 
 We support using a single dataset for both train and validation by using `split_validation_size` to set the validation ratio.
@@ -109,6 +163,69 @@ def my_data_processor(
 ```
 
 We have an example of this as `math_data_processor` in [processors.py](../../nemo_rl/data/processors.py).
+
+#### Multiple Dataloaders
+
+By default, NeMo RL uses a single dataloader that aggregates data from multiple datasets. For scenarios requiring fine-grained control over the number of prompts loaded from each dataset, NeMo RL provides support for multiple dataloaders.
+
+The following example demonstrates how to configure multiple dataloaders:
+
+```bash
+uv run examples/run_grpo.py \
+    --config examples/configs/grpo_multiple_datasets.yaml \
+    grpo.num_prompts_per_step=32 \
+    data.use_multiple_dataloader=true \
+    data.num_prompts_per_dataloader=16 \
+    data.custom_dataloader=examples.custom_dataloader.custom_dataloader.example_custom_dataloader
+```
+
+For example, consider using `example_custom_dataloader`, which samples data from each dataloader sequentially.
+
+Given two datasets:
+- Dataset 1: `[a, b, c, d]`
+- Dataset 2: `[1, 2, 3, 4, 5, 6, 7, 8]`
+
+With `data.use_multiple_dataloader=false` and `grpo.num_prompts_per_step=4`:
+```
+Batch 1: [a, b, c, d]
+Batch 2: [1, 2, 3, 4]
+Batch 3: [5, 6, 7, 8]
+```
+
+With `data.use_multiple_dataloader=true`, `grpo.num_prompts_per_step=4`, and `data.num_prompts_per_dataloader=2`:
+```
+Batch 1: [a, b, 1, 2]
+Batch 2: [c, d, 3, 4]
+Batch 3: [a, b, 5, 6]
+```
+
+**Custom Dataloader**
+
+The file `examples/custom_dataloader/custom_dataloader.py` provides a reference implementation that samples `data.num_prompts_per_dataloader` entries from each dataloader.
+
+When a single dataloader is exhausted, the data iterator must be reset in the custom dataloader function (as demonstrated in `examples/custom_dataloader/custom_dataloader.py`).
+This design ensures that the [MultipleDataloaderWrapper](../../nemo_rl/data/dataloader.py) operates as an infinite iterator, where `__next__()` will not raise StopIteration and `__len__()` is not supported.
+
+Additionally, custom dataloaders can access recorded metrics from the training loop. Use `wrapped_dataloader.set_records()` in `nemo_rl/algorithms/grpo.py` to store relevant information, which can then be retrieved in your custom dataloader implementation:
+
+```python
+# In nemo_rl/algorithms/grpo.py
+wrapped_dataloader.set_records({"reward": ...})
+
+# In custom_dataloader.py
+def example_custom_dataloader(
+    data_iterators: dict[str, Iterator],
+    dataloaders: dict[str, StatefulDataLoader],
+    **kwargs,
+) -> tuple[BatchedDataDict, dict[str, Iterator]]:
+    ...
+    reward = kwargs["reward"]
+    ...
+```
+
+**num_prompts_per_dataloader**
+
+This parameter specifies the number of prompts generated by each dataloader per iteration. Ensure that `grpo.num_prompts_per_step` is a multiple of `data.num_prompts_per_dataloader` to guarantee that exactly `grpo.num_prompts_per_step` prompts are available for each training step.
 
 ### Task–Dataset Mapping
 
@@ -221,12 +338,18 @@ We support vLLM through the [VllmGeneration](../../nemo_rl/models/generation/vll
 
 The function, [grpo_train](../../nemo_rl/algorithms/grpo.py), contains the core GRPO training loop.
 
+### Generation Sampling Parameters (temperature, top-p, top-k)
+
+GRPO uses temperature, top-p (nucleus sampling), and top-k sampling during rollout generation via vLLM; these settings are aligned with the training. For a detailed description of top-p and top-k filtering, see [Top-p and top-k filtering](#top-p-and-top-k-filtering) below.
+
+**Known issue (Qwen models):** For some Qwen-based models, a `ValueError: Token id 151708 is out of vocabulary` error may occur when the policy drifts from its initial distribution. Setting `top_p` to `0.9999` in the generation config is a recommended workaround. For details and discussion, see [#237](https://github.com/NVIDIA-NeMo/RL/issues/237).
+
 ## Performance Optimizations
 
 RL generations typically produce highly variable sequence lengths, which result in a significant amount of padding if approached naively. We address this with Sequence Packing and Dynamic Batching, which are techniques to reduce the amount of padding required. You can read more about these in the [design doc](../design-docs/sequence-packing-and-dynamic-batching.md).
 
 ## Loss
-We use the [ClippedPGLossFn](../../nemo_rl/algorithms/loss_functions.py) to calculate the loss for GRPO. Formally,
+We use the [ClippedPGLossFn](../../nemo_rl/algorithms/loss/loss_functions.py) to calculate the loss for GRPO. Formally,
 
 $$
 L(\theta) = E_{x \sim \pi_{\theta_{\text{old}}}} \Big[ \min \Big(\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}A_t, \text{clip} \big( \frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}, 1 - \varepsilon, 1 + \varepsilon \big) A_t \Big) \Big] - \beta D_{\text{KL}} (\pi_\theta \| \pi_\text{ref})
@@ -333,6 +456,18 @@ grpo:
 
 Set `overlong_filtering` to true when training on tasks where truncation at the maximum sequence length is expected, such as long-form reasoning or mathematical proofs.
 
+#### Top-p and top-k filtering
+
+The implementation aligns with vLLM’s top-p and top-k filtering by applying an equivalent process to the logits.
+
+When top-p or top-k filtering is enabled, the following conventions apply:
+
+- **`curr_logprobs` and `prev_logprobs`** are computed *with* filtering applied, for compatibility with the actor loss.
+- **`reference_policy_logprobs`** is computed *without* filtering (see the `use_reference_model` in the policy worker).
+- **KL divergence** uses `curr_logprobs_unfiltered`(`curr_logprobs` *without* filtering) so that it is consistent with the reference policy logprobs.
+
+Under tensor parallelism (TP), enabling top-p or top-k adds communication overhead. The vocabulary is sharded across GPUs (vocab-parallel), while top-p and top-k require full-vocabulary probabilities. A naive all-gather of logits would require large additional memory. The implementation therefore switches to a batch–sequence-parallel layout via all-to-all communication, applies filtering over the full vocabulary, then switches back, avoiding materialization of the full vocabulary on any single rank.
+
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
@@ -394,8 +529,48 @@ This expectation is estimated using the rollouts in each global training batch a
 
 We use this to track if our models are experiencing entropy collapse too quickly during training (as is quite common). This is a fairly rough Monte Carlo approximation, so we wouldn't recommend using this directly for an entropy bonus or otherwise backpropagating through this. You can take a look at NeMo Aligner's [implementation](https://github.com/NVIDIA/NeMo-Aligner/blob/main/nemo_aligner/utils/distributed.py#L351) of a full entropy calculation if you're interested (work-in-progress efficient calculation in NeMo RL).
 
+### GDPO: Group reward-Decoupled Normalization Policy Optimization for Multi-reward RL Optimization
+GDPO is a reinforcement learning optimization method designed for multi-reward training. While existing approaches commonly apply Group Relative Policy Optimization (GRPO) in multi-reward settings, the authors show that this leads to reward advantages collapse, reducing training signal resolution and causing unstable or failed convergence. GDPO resolves this issue by decoupling reward normalization across individual rewards, preserving their relative differences and enabling more faithful preference optimization. 
 
+For a group of  \\( N \\) rewards and  \\( G \\) samples per group, GDPO normalizes each reward independently:
 
+$$
+A_n^{(i,j)} = \frac{r_n^{(i,j)} - \text{mean}\{r_n^{(i,1)}, \ldots, r_n^{(i,G)}\}}{\text{std}\{r_n^{(i,1)}, \ldots, r_n^{(i,G)}\} + \epsilon}
+$$
+
+The normalized group advantage is then aggregated across rewards:
+
+$$
+A^{(i,j)} = \sum_{n=1}^{N} w_n A_n^{(i,j)}
+$$
+
+The final per-batch normalization produces:
+
+$$
+\hat{A}^{(i,j)} = \frac{A^{(i,j)} - \text{mean}_{i',j'}\{A^{(i',j')}\}}{\text{std}_{i',j'}\{A^{(i',j')}\} + \epsilon}
+$$
+
+Here,  \\( \text{mean}_{i',j'}\{A^{(i',j')}\} \\) and  \\( \text{std}_{i',j'}\{A^{(i',j')}\} \\) denote statistics over all groups in the batch.
+
+To enable GDPO for multi-reward RL training, simply set:
+```
+grpo:
+  adv_estimator:
+    name: "gdpo"
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+```
+Note that this method only has an effect when training involve more than one reward function.
+
+## LoRA Configuration
+
+### DTensor Backend
+
+GRPO supports LoRA on the NeMoRL DTensor backend. The LoRA settings live under `policy.dtensor_cfg.lora_cfg`, and the fields follow the SFT LoRA configuration. For DTensor parameter details, see [SFT LoRA: DTensor Configuration Parameters](./sft.md#dtensor-configuration-parameters). To enable LoRA, set `policy.dtensor_cfg.lora_cfg.enabled=true`, then configure target modules, rank, alpha, and dropout as needed.
+
+Our DTensor LoRA path uses a merge-weight approach: during generation, LoRA adapter weights are merged into the base linear weights. This improves performance, with a small training-inference mismatch that we consider acceptable. If you require strict training-inference parity, use the [split-weight variant branch](https://github.com/NVIDIA-NeMo/RL/tree/ruit/lora_grpo_async), which may trade off some performance. For a comparison between merge-weight and split-weight, see [PR 1797: Support lora in dtensor grpo workflow by merging weight](https://github.com/NVIDIA-NeMo/RL/pull/1797).
+
+We already provide a DTensor-based Nano v3 GRPO LoRA recipe. See [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](../../examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml) for an end-to-end example.
 
 ## Evaluate the Trained Model
 

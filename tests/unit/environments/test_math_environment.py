@@ -11,29 +11,34 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import time
 
 import pytest
 import ray
 
-from nemo_rl.distributed.ray_actor_environment_registry import (
-    get_actor_python_env,
-)
-from nemo_rl.environments.math_environment import MathEnvironment
+from nemo_rl.environments.utils import create_env
+
+# ============================================================================
+# Environment fixtures
+# ============================================================================
 
 
 @pytest.fixture(scope="module")
 def math_env():
     """Create a MathEnvironment actor for testing."""
-    env = MathEnvironment.options(
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.math_environment.MathEnvironment"
-            ),
-            "env_vars": dict(os.environ),
-        }
-    ).remote({"num_workers": 2})
+    env = create_env("math", {"num_workers": 2})
+    yield env
+    # Clean up the actor and wait for it to be killed
+    env.shutdown.remote()
+    ray.kill(env)
+    # Give some time for cleanup
+    time.sleep(0.1)
+
+
+@pytest.fixture(scope="module")
+def math_multi_reward_env():
+    """Create a MathMultiRewardEnvironment actor for testing."""
+    env = create_env("math_multi_reward", {"num_workers": 2})
     yield env
     # Clean up the actor and wait for it to be killed
     env.shutdown.remote()
@@ -45,21 +50,18 @@ def math_env():
 @pytest.fixture(scope="module")
 def multichoice_env(request):
     """Create a MathEnvironment actor for testing."""
-    verifier_type = request.param
-    env = MathEnvironment.options(
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.math_environment.MathEnvironment"
-            ),
-            "env_vars": dict(os.environ),
-        }
-    ).remote({"num_workers": 2, "verifier_type": verifier_type})
+    env = create_env("math", {"num_workers": 2, "verifier_type": request.param})
     yield env
     # Clean up the actor and wait for it to be killed
     env.shutdown.remote()
     ray.kill(env)
     # Give some time for cleanup
     time.sleep(0.1)
+
+
+# ============================================================================
+# Data fixtures
+# ============================================================================
 
 
 @pytest.fixture
@@ -84,6 +86,41 @@ def basic_test_data():
             {"ground_truth": "4"},
             {"ground_truth": "\\boxed{12}"},
             {"ground_truth": "\\boxed{5}"},
+        ],
+    }
+
+
+@pytest.fixture
+def multi_reward_test_data():
+    """Common test data for basic math problems with multiple rewards."""
+    return {
+        "message_log_batch": [
+            [
+                {"role": "user", "content": "What is 2 + 2?"},
+                {
+                    "role": "assistant",
+                    "content": "<think>2 + 2 = 4</think>\n<answer>4</answer>",
+                },
+            ],
+            [
+                {"role": "user", "content": "What is 3 * 4?"},
+                {
+                    "role": "assistant",
+                    "content": "<think>3 * 4 = 12</think>\n<answer>12.5</answer>",
+                },
+            ],
+            [
+                {"role": "user", "content": "What is 10 - 5?"},
+                {
+                    "role": "assistant",
+                    "content": "<think>10 - 5 = 5\n<answer>5</answer>",
+                },
+            ],
+        ],
+        "metadata": [
+            {"ground_truth": "4"},
+            {"ground_truth": "12"},
+            {"ground_truth": "5"},
         ],
     }
 
@@ -170,6 +207,11 @@ def multiple_assistant_test_data():
     }
 
 
+# ============================================================================
+# Environment tests
+# ============================================================================
+
+
 def test_math_env_step_basic(math_env, basic_test_data):
     """Test basic functionality of MathEnvironment step with simple messages."""
     result = ray.get(
@@ -198,6 +240,56 @@ def test_math_env_step_basic(math_env, basic_test_data):
     # Check rewards and done flags
     assert result.rewards.shape == (3,), "Rewards should be a tensor of shape (3,)"
     assert all(result.rewards == 1.0), "All rewards should be 1.0 for correct answers"
+    assert result.terminateds.shape == (3,), (
+        "Terminated flags should be a tensor of shape (3,)"
+    )
+    assert all(result.terminateds == 1.0), "All terminated flags should be 1.0"
+
+
+def test_multi_reward_env_step_basic(math_multi_reward_env, multi_reward_test_data):
+    """Test basic step: correct answer + valid format -> all 3 rewards 1.0."""
+    result = ray.get(
+        math_multi_reward_env.step.remote(
+            multi_reward_test_data["message_log_batch"],
+            multi_reward_test_data["metadata"],
+        )
+    )
+
+    # Check observations (based on correctness reward, index 0)
+    assert len(result.observations) == 3, (
+        "Should return observations for all 3 messages"
+    )
+    assert all(obs["role"] == "environment" for obs in result.observations), (
+        "All observations should be from environment"
+    )
+
+    # Check observations for each data point
+    assert result.observations[0]["content"] == "Environment: correct"
+    assert result.observations[1]["content"] == "Environment: incorrect"
+    assert result.observations[2]["content"] == "Environment: correct"
+
+    # Check metadata
+    assert len(result.metadata) == 3, "Should return metadata for all 3 messages"
+    assert result.metadata == multi_reward_test_data["metadata"], (
+        "Metadata should be unchanged"
+    )
+
+    # Check rewards: shape (batch_size=3, number_of_rewards=3)
+    assert result.rewards.shape == (3, 3), "Rewards should be a tensor of shape (3, 3)"
+
+    # Check rewards for each data point
+    # First reward: correctness reward 1.0, int reward 1.0, format reward 1.0
+    assert (result.rewards[0] == 1.0).all(), "First reward should be 1.0"
+    # Second reward: correctness reward 0.0, int reward 0.0, format reward 1.0
+    assert result.rewards[1][0] == 0.0
+    assert result.rewards[1][1] == 0.0
+    assert result.rewards[1][2] == 1.0
+    # Third reward: correctness reward 1.0, int reward 1.0, format reward 0.0
+    assert result.rewards[2][0] == 1.0
+    assert result.rewards[2][1] == 1.0
+    assert result.rewards[2][2] == 0.0
+
+    # Check terminated flags
     assert result.terminateds.shape == (3,), (
         "Terminated flags should be a tensor of shape (3,)"
     )

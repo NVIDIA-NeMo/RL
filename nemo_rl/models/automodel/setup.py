@@ -36,6 +36,7 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer, PreTrainedModel
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.models.automodel.config import ModelAndOptimizerState, RuntimeConfig
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
@@ -72,10 +73,20 @@ def validate_and_prepare_config(
     # Set basic configuration
     is_vlm = processor is not None
     is_generation_colocated = None
+    sampling_params = None
     if "generation" in config and config["generation"] is not None:
-        is_generation_colocated = config["generation"]["colocated"]["enabled"]
+        generation_cfg = config["generation"]
+        # set generation colocated
+        is_generation_colocated = generation_cfg["colocated"]["enabled"]
+        # set sampling params
+        sampling_params = TrainingSamplingParams(
+            top_k=generation_cfg["top_k"],
+            top_p=generation_cfg["top_p"],
+            temperature=generation_cfg["temperature"],
+        )
 
-    # Set NCCL environment variable
+    # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
+    # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
     if not is_generation_colocated:
         os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
@@ -192,6 +203,7 @@ def validate_and_prepare_config(
         cpu_offload=cpu_offload,
         offload_optimizer_for_logprob=offload_optimizer_for_logprob,
         is_generation_colocated=is_generation_colocated,
+        sampling_params=sampling_params,
         is_reward_model=is_reward_model,
     )
 
@@ -282,6 +294,11 @@ def setup_distributed(
 
     # Force setup distributed for world size 1 as FSDP2Manager skips it
     if world_size == 1:
+        if cpu_offload:
+            raise NotImplementedError(
+                "CPUOffload doesn't work on single GPU for AutoModel. "
+                "If you need this feature, please file an issue on https://github.com/NVIDIA-NeMo/Automodel."
+            )
         manager._setup_distributed()
 
     return manager

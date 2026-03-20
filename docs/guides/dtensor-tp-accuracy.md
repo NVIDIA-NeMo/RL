@@ -108,8 +108,6 @@ In batch-variant kernels, low-level implementation details—such as parallel re
 
 After aligning `train_micro_batch_size` and `logprob_batch_size` so that the same samples are processed with identical effective batch configurations, the importance-sampling ratio (`probs_ratio`) becomes 1 as expected, and the observed accuracy issues disappear. This confirms that the mismatch was caused by batch-dependent numerical variation rather than a conceptual error in the RL objective or data pipeline.
 
-Importantly, this problem is **model-specific** rather than universal. Models such as `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` and `Qwen/Qwen2.5-1.5B` exhibit clear batch-variant behavior under these settings, whereas `meta-llama/Llama-3.1-8B-Instruct` does not show the same sensitivity, likely due to differences in architecture, kernel implementations, or optimization choices in their respective stacks.
-
 ### Recommended Solutions
 
 When using DTensor with TP > 1, or when `probs_ratio != 1` is observed in an on-policy setting, the following mitigation strategies are recommended to restore numerical consistency and stabilize training:

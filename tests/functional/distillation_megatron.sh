@@ -22,7 +22,7 @@ mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
-    $PROJECT_ROOT/examples/run_distillation_math.py \
+    $PROJECT_ROOT/examples/run_distillation.py \
     --config $PROJECT_ROOT/examples/configs/distillation_math_megatron.yaml \
     policy.model_name=Qwen/Qwen3-0.6B-Base \
     teacher.model_name=Qwen/Qwen3-0.6B \

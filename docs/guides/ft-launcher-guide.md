@@ -6,7 +6,7 @@ The `ft_launcher` is provided by `nvidia-resiliency-ext` (included in NeMo RL de
 
 | Argument | Description | Example |
 |----------|-------------|---------|
-| `--ft-cfg-path` | Path to FT YAML config file | `examples/configs/ft_config.yaml` |
+| `--ft-cfg-path` | Path to FT YAML config file | `examples/ft_launcher/ft_config.yaml` |
 | `--ft-rank-heartbeat-timeout` | Heartbeat timeout in seconds | `450` |
 | `--ft-initial-rank-heartbeat-timeout` | Initial timeout (longer for setup) | `1200` |
 | `--max-restarts` | Maximum number of restart attempts | `5` |
@@ -15,15 +15,15 @@ The `ft_launcher` is provided by `nvidia-resiliency-ext` (included in NeMo RL de
 
 ```bash
 uv run ft_launcher \
-    --ft-cfg-path examples/configs/ft_config.yaml \
+    --ft-cfg-path examples/ft_launcher/ft_config.yaml \
     --ft-rank-heartbeat-timeout 450 \
     --ft-initial-rank-heartbeat-timeout 1200 \
     --max-restarts 5 \
-    examples/run_grpo_math.py \
+    examples/run_grpo.py \
     --config <your_config.yaml>
 ```
 
-## FT Config File (examples/configs/ft_config.yaml)
+## FT Config File (examples/ft_launcher/ft_config.yaml)
 
 ```yaml
 fault_tolerance:

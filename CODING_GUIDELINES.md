@@ -18,13 +18,13 @@ Don't:
 
 ```bash
 source .venv/bin/activate
-python examples/run_grpo_math.py
+python examples/run_grpo.py
 ```
 
 Do:
 
 ```bash
-uv run examples/run_grpo_math.py
+uv run examples/run_grpo.py
 ```
 
 Exception: `Dockerfile.ngc_pytorch` is exempt from this rule.
