@@ -438,14 +438,14 @@ name = "megatron-bridge"
 # Must stay in sync with 3rdparty/Megatron-Bridge-workspace/setup.py::CACHED_DEPENDENCIES.
 version = "0.0.0"
 requires-dist = [
-  "transformers>=5.0.0",
+  "transformers>=5.0.0,<=5.2.0",
   "datasets>=2.20.0",
   "accelerate",
   "omegaconf>=2.3.0",
   "tensorboard>=2.19.0",
   "typing-extensions",
   "rich",
-  "wandb>=0.19.10",
+  "wandb>=0.25.0",
   "six>=1.17.0",
   "regex>=2024.11.6",
   "pyyaml>=6.0.2",
@@ -457,7 +457,7 @@ requires-dist = [
   # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13
   "transformer-engine[pytorch,core_cu12]",
   "mamba-ssm",
-  "nvidia-resiliency-ext",
+  "nvidia-resiliency-ext~=0.4.1",
   "causal-conv1d",
   "flash-linear-attention",
   "timm",
