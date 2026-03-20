@@ -1,4 +1,8 @@
 defaults: ./grpo-gemma3-1b-it-1n8g-fsdp2tp1.yaml
+policy:
+  generation:
+    vllm_kwargs:
+      block_size: 32
 checkpointing:
   checkpoint_dir: results/grpo-gemma3-1b-it-1n4g-fsdp2tp1
 logger:
