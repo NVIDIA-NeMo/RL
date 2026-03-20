@@ -281,12 +281,12 @@ jobs:
   sphinx-build:
     needs: [pre-flight]
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.57.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.80.1
 
   build-container:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' && needs.pre-flight.outputs.image_tag == '' }}
     needs: [pre-flight, org-member-pre-flight]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.78.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.80.1
     with:
       build-ref: ${{ needs.pre-flight.outputs.test_sha }}
       image-name: ${{ vars.CI_CONTAINER_NAME }}
