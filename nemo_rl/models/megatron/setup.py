@@ -53,9 +53,12 @@ from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers import PreTrainedTokenizerBase
+
+from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
 
 try:
     from megatron.core.distributed import (
@@ -375,6 +378,9 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         assert config["sequence_packing"]["enabled"], (
             "Sequence Packing must be enabled to use Context Parallelism with MCore"
         )
+        assert not config["megatron_cfg"].get("use_linear_ce_fusion_loss", False), (
+            "Context Parallelism is not supported with linear CE fusion loss, please set use_linear_ce_fusion_loss to false"
+        )
 
 
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -462,6 +468,18 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # Fusion settings
     model_cfg.apply_rope_fusion = config["megatron_cfg"]["apply_rope_fusion"]
     model_cfg.bias_activation_fusion = config["megatron_cfg"]["bias_activation_fusion"]
+    # Optional explicit attention backend override for environments where
+    # TE auto backend probing is unstable.
+    attention_backend = config["megatron_cfg"].get("attention_backend")
+    if attention_backend is not None:
+        if isinstance(attention_backend, str):
+            model_cfg.attention_backend = AttnBackend[attention_backend]
+        elif isinstance(attention_backend, int):
+            model_cfg.attention_backend = AttnBackend(attention_backend)
+        else:
+            raise ValueError(
+                f"Unsupported {type(attention_backend)=}, expected str or int"
+            )
 
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -752,6 +770,10 @@ def setup_model_and_optimizer(
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     setattr(megatron_cfg.model, "_pg_collection", pg_collection)
+    if policy_cfg["megatron_cfg"].get("use_linear_ce_fusion_loss", False):
+        patch_gpt_model_forward_for_linear_ce_fusion(
+            chunk_size=policy_cfg["megatron_cfg"]["linear_ce_fusion_chunk_size"]
+        )
     model = get_model(
         megatron_cfg.model,
         megatron_cfg.ddp,

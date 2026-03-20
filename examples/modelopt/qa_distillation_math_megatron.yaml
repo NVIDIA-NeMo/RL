@@ -15,6 +15,10 @@ policy:
     quant_batch_size: 1
     quant_sequence_length: 2048
 
+    megatron_cfg:
+        # ModelOpt quantization is incompatible with gradient accumulation fusion.
+        gradient_accumulation_fusion: false
+
     generation:
         # Quantization config applied to the student's vLLM generation worker.
         quant_cfg: "NVFP4_DEFAULT_CFG"

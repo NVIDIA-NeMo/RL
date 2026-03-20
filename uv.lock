@@ -5220,6 +5220,7 @@ fsdp = [
     { name = "mamba-ssm" },
 ]
 mcore = [
+    { name = "emerging-optimizers" },
     { name = "deep-ep" },
     { name = "flash-attn", version = "2.8.1", source = { registry = "https://pypi.org/simple" } },
     { name = "megatron-bridge" },
@@ -5315,6 +5316,7 @@ requires-dist = [
     { name = "deep-ep", marker = "extra == 'mcore'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480" },
     { name = "deep-ep", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480" },
     { name = "deep-gemm", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" },
+    { name = "emerging-optimizers", marker = "extra == 'mcore'", specifier = "==0.1.0" },
     { name = "einops", marker = "extra == 'sglang'" },
     { name = "flash-attn", marker = "extra == 'automodel'", specifier = "==2.8.1" },
     { name = "flash-attn", marker = "extra == 'fsdp'", specifier = "==2.8.1" },

@@ -227,6 +227,7 @@ guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
 guides/quantization-aware-rl.md
+guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
 guides/ft-launcher-guide.md
 ```
