@@ -6,7 +6,7 @@ Quantization-Aware RL (QARL) integrates [NVIDIA Model Optimizer (ModelOpt)](http
 
 In a standard NeMo RL loop, model weights are trained in full precision and refitted into vLLM for generation. QARL applies fake quantization so that both the policy forward pass (training) and the rollout forward pass (vLLM generation) use quantized weights and activations. The policy backward pass remains in full precision, using the straight-through estimator to propagate gradients through the quantization nodes.
 
-QARL supports per-tensor quantization formats provided by ModelOpt. The examples below use NVFP4 (`NVFP4_DEFAULT_CFG`), which offers strong compression while maintaining accuracy through quantization-aware training.
+See [Supported Quantization Formats](#supported-quantization-formats) for details on which formats are available. The examples below use NVFP4 (`NVFP4_DEFAULT_CFG`), which offers strong compression while maintaining accuracy through quantization-aware training.
 
 ## Quantization-Aware GRPO (QA-GRPO)
 
@@ -110,9 +110,14 @@ QARL (via ModelOpt) and NeMo RL's built-in [FP8 training](../fp8.md) (via Transf
 
 - **ModelOpt QARL** focuses on **recovering accuracy under quantization** using fake quantization (quantization-aware training). The forward pass uses quantized weights and activations while the backward pass uses full-precision gradients, so the model learns to be robust to quantization error. Both training and vLLM generation use fake-quantized forward passes for consistency.
 
+## Supported Quantization Formats
+
+- **Weight quantization**: per-tensor, per-channel, and block-wise formats are all supported. Weights are pre-folded on the policy (Megatron) side before transfer to vLLM.
+- **Input (activation) quantization**: only per-tensor is supported. The input quantizer amax is synced to vLLM as a per-tensor scalar.
+
 ## Limitations
 
 - **Generation**: Currently only vLLM is supported for generation.
 - **DTensor backend**: Quantization support for the DTensor policy worker is not yet implemented.
-- **Quantization format**: Only per-tensor quantization formats are currently supported. Static block-wise quantization formats are not yet available.
+- **Input quantization**: Only per-tensor input (activation) quantization is supported.
 - **Model support**: MoE (Mixture of Experts) and Mamba models are currently not supported.
