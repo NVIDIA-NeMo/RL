@@ -1398,6 +1398,10 @@ def ppo_train(
                             greedy=False,
                         )
                     policy_generation.finish_generation()
+                    _free, _total = torch.cuda.mem_get_info()
+                    _used = (_total - _free) / (1024**3)
+                    _total_gb = _total / (1024**3)
+                    print(f"[GPU mem] after finish_generation (vLLM asleep): {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
                     if policy_generation is not None:
                         generation_logger_metrics = (
                             policy_generation.get_logger_metrics()
@@ -1478,8 +1482,16 @@ def ppo_train(
                 print("▶ Computing values...", flush=True)
                 with timer.time("value_inference"):
                     value_model.prepare_for_inference()
+                    _free, _total = torch.cuda.mem_get_info()
+                    _used = (_total - _free) / (1024**3)
+                    _total_gb = _total / (1024**3)
+                    print(f"[GPU mem] after value prepare_for_inference: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
                     values = value_model.get_values(train_data)
                     train_data["values"] = values["values"].squeeze(-1)
+                    value_model.finish_inference()
+                    _free, _total = torch.cuda.mem_get_info()
+                    _used = (_total - _free) / (1024**3)
+                    print(f"[GPU mem] after value finish_inference: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
 
                 print(
                     f"  • Average batch reward: {rewards.mean().numpy():.4f}\n"
@@ -1491,6 +1503,10 @@ def ppo_train(
                 print("▶ Preparing for logprob inference...", flush=True)
                 with timer.time("logprob_inference_prep"):
                     policy.prepare_for_lp_inference()
+                    _free, _total = torch.cuda.mem_get_info()
+                    _used = (_total - _free) / (1024**3)
+                    _total_gb = _total / (1024**3)
+                    print(f"[GPU mem] after policy prepare_for_lp_inference: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
@@ -1548,6 +1564,10 @@ def ppo_train(
 
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
+                _free, _total = torch.cuda.mem_get_info()
+                _used = (_total - _free) / (1024**3)
+                _total_gb = _total / (1024**3)
+                print(f"[GPU mem] baseline before training loop: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
                 for step in range(steps_per_epoch):
                     print(
                         f"▶ Step {step + 1}/{steps_per_epoch}...",
@@ -1746,8 +1766,6 @@ def ppo_train(
                 if master_config["checkpointing"]["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
-                    policy.prepare_for_training()
-
                     ppo_save_state["current_step"] = current_step + 1
                     ppo_save_state["total_steps"] = total_steps + 1
                     ppo_save_state["current_epoch"] = current_epoch
@@ -1793,6 +1811,10 @@ def ppo_train(
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             total_steps + 1, ppo_save_state, master_config
                         )
+
+                        # Save policy and value sequentially, reloading
+                        # each to GPU one at a time to avoid OOM.
+                        policy.prepare_for_training()
                         policy.save_checkpoint(
                             weights_path=os.path.join(
                                 checkpoint_path, "policy", "weights"
@@ -1805,6 +1827,9 @@ def ppo_train(
                             ),
                             checkpointing_cfg=master_config["checkpointing"],
                         )
+                        policy.finish_training()
+
+                        value_model.prepare_for_training()
                         value_model.save_checkpoint(
                             weights_path=os.path.join(
                                 checkpoint_path, "value", "weights"
@@ -1817,6 +1842,8 @@ def ppo_train(
                             ),
                             checkpointing_cfg=master_config["checkpointing"],
                         )
+                        value_model.finish_training()
+
                         torch.save(
                             dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
