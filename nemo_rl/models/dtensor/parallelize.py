@@ -194,7 +194,6 @@ def _parallelize_gemma3(
             input_layouts=Replicate(), output_layouts=Shard(1)
         ),
         f"{model_prefix}.rotary_emb": RotaryEmbedParallel(use_local_output=True),
-        f"{model_prefix}.rotary_emb_local": RotaryEmbedParallel(use_local_output=True),
         f"{model_prefix}.layers.*.input_layernorm": SequenceParallel(),
         f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(
             output_layouts=Shard(1)

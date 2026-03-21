@@ -737,6 +737,7 @@ class TestSetupDistributed:
             cpu_offload=True,
             offload_optimizer_for_logprob=False,
             is_generation_colocated=None,
+            sampling_params=None,
             is_reward_model=False,
         )
 
@@ -923,6 +924,7 @@ class TestSetupModelAndOptimizer:
             cpu_offload=False,
             offload_optimizer_for_logprob=False,
             is_generation_colocated=None,
+            sampling_params=None,
             is_reward_model=False,
         )
         runtime_config.model_class.from_pretrained.return_value = mock_model
@@ -984,6 +986,7 @@ class TestSetupModelAndOptimizer:
             cpu_offload=False,
             offload_optimizer_for_logprob=False,
             is_generation_colocated=None,
+            sampling_params=None,
             is_reward_model=True,
         )
         runtime_config.model_class.from_pretrained.return_value = mock_model
@@ -1079,6 +1082,7 @@ class TestSetupModelAndOptimizer:
             cpu_offload=False,
             offload_optimizer_for_logprob=False,
             is_generation_colocated=None,
+            sampling_params=None,
             is_reward_model=True,
         )
         runtime_config.model_class.from_pretrained.return_value = mock_model
