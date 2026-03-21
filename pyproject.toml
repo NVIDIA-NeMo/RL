@@ -54,6 +54,7 @@ dependencies = [
   "nccl4py",                                                                                                          # for non-colocated refit
   "cuda-bindings",                                                                                                    # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
+  "rwkv-fla>=0.7.202508221413",
 ]
 
 [project.optional-dependencies]
@@ -118,6 +119,7 @@ mcore = [
   "flash-attn==2.8.1",
   "emerging-optimizers==0.1.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  "rwkv-fla>=0.7.202508221413",
 ]
 nemo_gym = ["nemo_gym"]
 
