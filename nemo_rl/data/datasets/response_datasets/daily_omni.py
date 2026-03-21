@@ -29,9 +29,9 @@ class DailyOmniDataset(RawDataset):
 
     Args:
         split: Split name for the dataset, default is "train"
+        split_validation_size: Size of the validation data, default is 0
+        seed: Seed for train/validation split when split_validation_size > 0, default is 42
     """
-
-    task_name = "daily-omni"
 
     def __init__(
         self,
@@ -46,6 +46,9 @@ class DailyOmniDataset(RawDataset):
         }
         if split not in SPLIT_TO_HF_NAME:
             raise ValueError(f"Invalid split: {split}. Please use 'train'.")
+
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="daily-omni", **kwargs)
 
         self.hf_cache_dir = get_huggingface_cache_path(SPLIT_TO_HF_NAME[split])
         if not self.hf_cache_dir:

@@ -39,7 +39,8 @@ def load_preference_dataset(data_config: PreferenceDatasetConfig):
     if dataset_name in DATASET_REGISTRY:
         dataset_class = DATASET_REGISTRY[dataset_name]
         dataset = dataset_class(
-            **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
+            skip_set_processor=True,
+            **data_config,  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
         )
     else:
         raise ValueError(
@@ -47,9 +48,6 @@ def load_preference_dataset(data_config: PreferenceDatasetConfig):
             "Please either use a built-in dataset "
             "or set dataset_name in {'BinaryPreferenceDataset', 'PreferenceDataset'} to load from local JSONL file or HuggingFace."
         )
-
-    # bind prompt and system prompt
-    dataset.set_task_spec(data_config)
 
     return dataset
 

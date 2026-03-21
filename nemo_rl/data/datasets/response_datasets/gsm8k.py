@@ -37,11 +37,12 @@ class GSM8KDataset(RawDataset):
         self,
         split: str = "train",
         extract_answer: bool = True,
-        system_prompt_file: str | None = None,
         **kwargs,
     ) -> None:
-        self.task_name = "gsm8k"
         self.extract_answer = extract_answer
+
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="gsm8k", **kwargs)
 
         # load from huggingface
         self.dataset = load_dataset("openai/gsm8k", "main")[split]

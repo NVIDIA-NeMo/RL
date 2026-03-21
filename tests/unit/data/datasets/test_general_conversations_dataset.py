@@ -70,7 +70,6 @@ def test_general_conversation_jsonl_multimodal_interleaved_multiturn():
         # Expected OpenAI-compatible structure
         assert "messages" in formatted
         assert "task_name" in formatted
-        assert formatted["task_name"] == "general-conversation-jsonl"
 
         assert len(formatted["messages"]) == 4
 
@@ -221,7 +220,6 @@ def test_general_conversation_jsonl_multimodal_singleturn():
         # Expected OpenAI-compatible structure
         assert "messages" in formatted
         assert "task_name" in formatted
-        assert formatted["task_name"] == "general-conversation-jsonl"
 
         assert len(formatted["messages"]) == 2
 
@@ -261,7 +259,6 @@ def test_general_conversation_jsonl_multimodal_singleturn():
         # Expected OpenAI-compatible structure
         assert "messages" in formatted
         assert "task_name" in formatted
-        assert formatted["task_name"] == "general-conversation-jsonl"
 
         assert len(formatted["messages"]) == 2
 
@@ -297,7 +294,6 @@ def test_general_conversation_jsonl_multimodal_singleturn():
         # Expected OpenAI-compatible structure
         assert "messages" in formatted
         assert "task_name" in formatted
-        assert formatted["task_name"] == "general-conversation-jsonl"
 
         assert len(formatted["messages"]) == 2
 

@@ -78,7 +78,8 @@ class CLEVRCoGenTDataset(RawDataset):
                 f"Invalid split: {split}. Please use 'train', 'valA', or 'valB'."
             )
 
-        self.task_name = "clevr-cogent"
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="clevr-cogent", **kwargs)
 
         # this dataset will process the image during training using `format_clevr_cogent_dataset`
         self.dataset = load_dataset(SPLIT_TO_HF_NAME[split])["train"]

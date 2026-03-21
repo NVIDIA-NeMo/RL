@@ -90,4 +90,11 @@ assert_all_close(2, "train/mean_prompt_length", baseline=base, resume_2=resume_2
 assert max(base["train/token_mult_prob_error"].values()) < 1.05
 assert max(resume_1["train/token_mult_prob_error"].values()) < 1.05
 assert max(resume_2["train/token_mult_prob_error"].values()) < 1.05
+
+assert "validation/accuracy" in base
+assert "validation/accuracy" in resume_1
+assert "validation/accuracy" in resume_2
+assert "validation/accuracy_OpenMathInstruct-2" in base
+assert "validation/accuracy_OpenMathInstruct-2" in resume_1
+assert "validation/accuracy_OpenMathInstruct-2" in resume_2
 EOF

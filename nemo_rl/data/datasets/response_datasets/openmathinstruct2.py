@@ -45,7 +45,9 @@ class OpenMathInstruct2Dataset(RawDataset):
 
         self.input_key = "problem"
         self.output_key = output_key
-        self.task_name = "OpenMathInstruct-2"
+
+        # initialize common attributes (task name, prompt, system prompt, processor)
+        self.common_init(default_task_name="OpenMathInstruct-2", **kwargs)
 
         # load from huggingface
         self.dataset = load_dataset("nvidia/OpenMathInstruct-2", split=split)
