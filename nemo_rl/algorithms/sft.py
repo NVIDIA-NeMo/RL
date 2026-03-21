@@ -21,9 +21,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.loss_functions import (
-    NLLLoss,
-)
+from nemo_rl.algorithms.loss.loss_functions import NLLLossFn
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -70,6 +68,9 @@ class SFTConfig(TypedDict):
     val_global_batch_size: int
     val_micro_batch_size: int
     val_at_start: bool
+    # Whether to run validation on the last training step. Setting this to True ensures the
+    # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
+    val_at_end: bool
     seed: int
 
 
@@ -95,7 +96,7 @@ def setup(
     RayVirtualCluster,
     StatefulDataLoader,
     Optional[StatefulDataLoader],
-    NLLLoss,
+    NLLLossFn,
     Logger,
     CheckpointManager,
     SFTSaveState,
@@ -207,7 +208,10 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = NLLLoss()
+    loss_fn = NLLLossFn(
+        use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
+        and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"]
+    )
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
@@ -385,6 +389,7 @@ def sft_train(
     # Validation configuration
     val_period = sft_config["val_period"]
     val_at_start = sft_config["val_at_start"]
+    val_at_end = sft_config["val_at_end"]
     max_num_epochs = sft_config["max_num_epochs"]
 
     # Run validation at the start if configured
@@ -465,8 +470,10 @@ def sft_train(
                     and current_step + 1 == len(train_dataloader)
                 )
 
-                # Run validation if it's a validation step
-                if val_period > 0 and (total_steps + 1) % val_period == 0:
+                # Run validation if it's a validation step or last step with val_at_end
+                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
                     val_metrics, validation_timings = validate(
                         policy,
                         val_dataloader,

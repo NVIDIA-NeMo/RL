@@ -29,7 +29,7 @@ from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from tests.unit.test_utils import SimpleLoss
+from tests.unit.test_utils import SimpleLossFn
 
 # Define basic test config
 simple_policy_config = {
@@ -54,6 +54,7 @@ simple_policy_config = {
     },
     "dtensor_cfg": {
         "enabled": True,
+        "_v2": False,
         "cpu_offload": False,
         "sequence_parallel": False,
         "activation_checkpointing": False,
@@ -69,8 +70,10 @@ simple_policy_config = {
     },
     "max_grad_norm": 1.0,
     "generation": {
-        "backend": "vllm",
         "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": None,
+        "backend": "vllm",
         "colocated": {"enabled": True},
     },
 }
@@ -118,12 +121,20 @@ def tokenizer():
 
 
 @pytest.fixture(scope="function")
-def policy(cluster, tokenizer):
-    """Initialize the policy."""
+def policy(cluster, tokenizer, request):
+    """Initialize the policy with dtensor v1/v2."""
+    use_v2 = bool(getattr(request, "param", False))
+    config = {
+        **simple_policy_config,
+        "dtensor_cfg": {
+            **simple_policy_config["dtensor_cfg"],
+            "_v2": use_v2,
+        },
+    }
     policy = Policy(
         cluster=cluster,
         tokenizer=tokenizer,
-        config=simple_policy_config,
+        config=config,
         init_optimizer=True,
         init_reference_model=False,
     )
@@ -285,7 +296,8 @@ def test_save_and_load_model_and_optimizer(mock_experiment):
 
 
 @pytest.mark.parametrize("num_gpus", [1, 2], ids=["1gpu", "2gpu"])
-def test_convert_dcp_to_hf(policy, num_gpus):
+@pytest.mark.parametrize("policy", [False, True], ids=["v1", "v2"], indirect=True)
+def test_convert_dcp_to_hf(policy, num_gpus, request):
     ## warm up with a forward pass
     ## this is needed before saving a checkpoint because FSDP does some lazy initialization
     input_ids = torch.randint(0, 16000, (4, 128))  # 4 sequences, each of length 128
@@ -300,21 +312,30 @@ def test_convert_dcp_to_hf(policy, num_gpus):
             "sample_mask": torch.ones(input_ids.shape[0]),
         }
     )
-    policy.train(dummy_fwd_dict, SimpleLoss())
+    policy.train(dummy_fwd_dict, SimpleLossFn())
+    policy_version_is_v2 = request.node.callspec.params["policy"]
 
     with TemporaryDirectory() as tmp_dir:
         policy.save_checkpoint(
             os.path.join(tmp_dir, "test_hf_and_dcp"),
+            checkpointing_cfg={
+                "enabled": True,
+                "model_save_format": "torch_save" if policy_version_is_v2 else None,
+            },
         )
 
         # Dynamically create the expected set of distcp files based on num_gpus
         expected_distcp_files = {f"__{rank}_0.distcp" for rank in range(num_gpus)}
         expected_files = expected_distcp_files.union({".metadata"})
 
-        ## make sure we save both HF and DCP checkpoints
-        assert (
-            set(os.listdir(os.path.join(tmp_dir, "test_hf_and_dcp"))) == expected_files
+        ckpt_path = (
+            os.path.join(tmp_dir, "test_hf_and_dcp", "model")
+            if policy_version_is_v2
+            else os.path.join(tmp_dir, "test_hf_and_dcp")
         )
+
+        ## make sure we save both HF and DCP checkpoints
+        assert set(os.listdir(ckpt_path)) == expected_files
 
         offline_converted_model_path = convert_dcp_to_hf(
             os.path.join(tmp_dir, "test_hf_and_dcp"),

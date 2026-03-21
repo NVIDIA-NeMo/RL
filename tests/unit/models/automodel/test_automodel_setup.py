@@ -56,7 +56,12 @@ def mock_config():
             "use_hf_tp_plan": False,
             "activation_checkpointing": False,
         },
-        "generation": None,
+        "generation": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": None,
+            "colocated": {"enabled": True},
+        },
         "hf_config_overrides": {},
         "optimizer": {
             "name": "torch.optim.AdamW",
@@ -325,7 +330,7 @@ class TestValidateAndPrepareConfig:
         mock_resolve_class.return_value = Mock
 
         # Test with generation colocated enabled
-        mock_config["generation"] = {"colocated": {"enabled": True}}
+        mock_config["generation"]["colocated"]["enabled"] = True
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.is_generation_colocated is True
         # NCCL_CUMEM_ENABLE should not be set when colocated
@@ -348,7 +353,7 @@ class TestValidateAndPrepareConfig:
         mock_resolve_class.return_value = Mock
 
         # Test with generation colocated disabled
-        mock_config["generation"] = {"colocated": {"enabled": False}}
+        mock_config["generation"]["colocated"]["enabled"] = False
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.is_generation_colocated is False
         # NCCL_CUMEM_ENABLE should be set when not colocated
@@ -605,6 +610,7 @@ class TestSetupDistributed:
             cpu_offload=False,
             offload_optimizer_for_logprob=False,
             is_generation_colocated=None,
+            sampling_params=None,
             is_reward_model=False,
         )
 
@@ -645,6 +651,7 @@ class TestSetupDistributed:
             cpu_offload=True,  # CPU offload enabled
             offload_optimizer_for_logprob=False,
             is_generation_colocated=None,
+            sampling_params=None,
             is_reward_model=False,
         )
 
@@ -712,6 +719,7 @@ class TestSetupModelAndOptimizer:
             cpu_offload=False,
             offload_optimizer_for_logprob=False,
             is_generation_colocated=None,
+            sampling_params=None,
             is_reward_model=False,
         )
 
@@ -1469,6 +1477,7 @@ class TestSetupModelAndOptimizer:
             cpu_offload=True,  # CPU offload enabled
             offload_optimizer_for_logprob=False,
             is_generation_colocated=None,
+            sampling_params=None,
             is_reward_model=False,
         )
 

@@ -43,7 +43,7 @@ class DatumSpec(TypedDict):
     __extra__: NotRequired[Any]  # This allows additional fields of any type
 
 
-class DPODatumSpec(TypedDict):
+class PreferenceDatumSpec(TypedDict):
     message_log_chosen: LLMMessageLogType
     message_log_rejected: LLMMessageLogType
     length_chosen: int
@@ -101,3 +101,10 @@ class TaskDataProcessFnCallable(Protocol):
         idx: int,
     ) -> DatumSpec:
         raise NotImplementedError("Task data process not implemented")
+
+
+class TaskDataPreProcessFnCallable(Protocol):
+    """A callable that processes a loaded raw datum dictionary into a dictionary with required format for further processing."""
+
+    def __call__(self, datum_dict: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError("Task data preprocess not implemented")

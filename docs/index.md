@@ -209,6 +209,7 @@ adding-new-models.md
 guides/sft.md
 guides/dpo.md
 guides/dapo.md
+guides/prorlv2.md
 guides/grpo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
@@ -218,6 +219,7 @@ guides/eval.md
 guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
+guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
 guides/ft-launcher-guide.md
 ```
@@ -258,6 +260,7 @@ design-docs/fsdp2-parallel-plan.md
 design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
+design-docs/nemo-gym-integration.md
 ```
 
 ```{toctree}
