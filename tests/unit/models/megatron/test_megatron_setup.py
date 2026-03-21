@@ -187,7 +187,7 @@ class TestApplyMoeConfig:
                 "moe_router_bias_update_rate": 0.0,
                 "moe_permute_fusion": True,
                 "moe_enable_deepep": False,
-                "moe_token_dispatcher_type": "allgather",
+                "moe_token_dispatcher_type": "alltoall",
                 "moe_shared_expert_overlap": True,
             }
         }
@@ -201,7 +201,7 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_router_bias_update_rate == 0.0
         assert model_cfg.moe_permute_fusion is True
         assert model_cfg.moe_enable_deepep is False
-        assert model_cfg.moe_token_dispatcher_type == "allgather"
+        assert model_cfg.moe_token_dispatcher_type == "alltoall"
         assert model_cfg.moe_shared_expert_overlap is True
 
 
@@ -751,7 +751,6 @@ class TestValidateAndSetConfig:
                 hf_model_name="test-model",
                 pretrained_path="/path/to/model",
                 weights_path=None,
-                tokenizer=MagicMock(),
             )
 
         assert "Reward models are not yet supported" in str(exc_info.value)
@@ -764,6 +763,9 @@ class TestValidateAndSetConfig:
 
         config = {
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "colocated": {"enabled": True},
             },
             "precision": "bfloat16",
@@ -794,7 +796,6 @@ class TestValidateAndSetConfig:
                     hf_model_name="test-model",
                     pretrained_path="/path/to/model",
                     weights_path=None,
-                    tokenizer=MagicMock(),
                 )
 
                 assert runtime_config.is_generation_colocated is True
@@ -815,6 +816,7 @@ class TestRuntimeConfigNamedTuple:
             optimizer_cpu_offload=False,
             offload_optimizer_for_logprob=True,
             is_generation_colocated=True,
+            sampling_params=None,
             final_padded_vocab_size=32000,
         )
 
@@ -822,6 +824,7 @@ class TestRuntimeConfigNamedTuple:
         assert runtime_config.optimizer_cpu_offload is False
         assert runtime_config.offload_optimizer_for_logprob is True
         assert runtime_config.is_generation_colocated is True
+        assert runtime_config.sampling_params is None
         assert runtime_config.final_padded_vocab_size == 32000
 
 
@@ -920,6 +923,7 @@ class TestHandleModelImport:
 class TestSetupModelAndOptimizer:
     """Tests for setup_model_and_optimizer function."""
 
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
     @patch("nemo_rl.models.megatron.setup.GlobalState")
     @patch("nemo_rl.models.megatron.setup.initialize_megatron")
     @patch("nemo_rl.models.megatron.setup.set_jit_fusion_options")
@@ -946,6 +950,7 @@ class TestSetupModelAndOptimizer:
         mock_set_jit,
         mock_init_megatron,
         mock_global_state,
+        mock_pg_collection,
     ):
         """Test setup_model_and_optimizer with MoE router freezing."""
         from nemo_rl.models.megatron.setup import setup_model_and_optimizer
@@ -1006,6 +1011,7 @@ class TestSetupModelAndOptimizer:
 class TestSetupReferenceModelState:
     """Tests for setup_reference_model_state function."""
 
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
     @patch("nemo_rl.models.megatron.setup.init_checkpointing_context")
     @patch("nemo_rl.models.megatron.setup.GlobalState")
     @patch("nemo_rl.models.megatron.setup.get_model")
@@ -1019,6 +1025,7 @@ class TestSetupReferenceModelState:
         mock_get_model,
         mock_global_state,
         mock_init_ckpt_context,
+        mock_pg_collection,
         capsys,
     ):
         """Test setup_reference_model_state when checkpoint exists."""
@@ -1075,6 +1082,7 @@ class TestSetupReferenceModelState:
 class TestFinalizeMegatronSetup:
     """Tests for finalize_megatron_setup function."""
 
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
     @patch("nemo_rl.models.megatron.setup._update_model_config_funcs")
     @patch("nemo_rl.models.megatron.setup.build_tokenizer")
     @patch("nemo_rl.models.megatron.setup.AutoBridge")
@@ -1083,6 +1091,7 @@ class TestFinalizeMegatronSetup:
         mock_auto_bridge,
         mock_build_tokenizer,
         mock_update_model_config,
+        mock_pg_collection,
     ):
         """Test basic finalize_megatron_setup."""
         from nemo_rl.models.megatron.setup import finalize_megatron_setup

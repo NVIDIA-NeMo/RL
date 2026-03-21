@@ -16,7 +16,7 @@ from typing import Any, Union
 import torch
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
-from nemo_rl.data.interfaces import DatumSpec, DPODatumSpec
+from nemo_rl.data.interfaces import DatumSpec, PreferenceDatumSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
@@ -125,7 +125,7 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
 
 
 def preference_collate_fn(
-    data_batch: list[DPODatumSpec],
+    data_batch: list[PreferenceDatumSpec],
     tokenizer: TokenizerType,
     make_sequence_length_divisible_by: int,
     add_loss_mask: bool,

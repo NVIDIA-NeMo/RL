@@ -137,14 +137,14 @@ def test_minimize_in_place_and_check_with_explicit_base(
     )
 
     # Before minimizing with explicit base, check should fail
-    ns = type("NS", (), {"base": str(base), "config": str(child)})
+    ns = type("NS", (), {"base": str(base), "configs": [str(child)]})
     ret = cli.minimize_check(ns)
     assert ret == 1
     err = capsys.readouterr().err
     assert "Suggested fix" in err
 
     # Minimize in place with explicit base
-    ns2 = type("NS", (), {"base": str(base), "config": str(child), "in_place": True})
+    ns2 = type("NS", (), {"base": str(base), "configs": [str(child)], "in_place": True})
     ret2 = cli.minimize(ns2)
     assert ret2 == 0
     minimized = child.read_text().strip()
@@ -366,7 +366,7 @@ def test_minimize_inferred_base_preserves_chain_overrides(
     )
 
     # Minimize child with inferred base (should use parent.yaml)
-    ns = type("NS", (), {"config": str(child), "base": None, "in_place": False})
+    ns = type("NS", (), {"configs": [str(child)], "base": None, "in_place": False})
     ret = cli.minimize(ns)
     assert ret == 0
 
@@ -436,7 +436,7 @@ def test_minimize_inferred_base_removes_redundant_keys(
     import io
     import sys
 
-    ns = type("NS", (), {"config": str(child), "base": None, "in_place": False})
+    ns = type("NS", (), {"configs": [str(child)], "base": None, "in_place": False})
     old_stdout = sys.stdout
     sys.stdout = captured = io.StringIO()
     cli.minimize(ns)
@@ -478,7 +478,7 @@ def test_minimize_check_inferred_base(cli: Any, tmp_path: Path) -> None:
         ).strip()
     )
 
-    ns = type("NS", (), {"config": str(child), "base": None})
+    ns = type("NS", (), {"configs": [str(child)], "base": None})
     ret = cli.minimize_check(ns)
     assert ret == 0  # Already minimized
 
@@ -538,7 +538,7 @@ def test_minimize_with_explicit_base_rebases(cli: Any, tmp_path: Path) -> None:
 
     # Minimize with explicit base=grandparent (rebase mode)
     ns = type(
-        "NS", (), {"config": str(child), "base": str(grandparent), "in_place": False}
+        "NS", (), {"configs": [str(child)], "base": str(grandparent), "in_place": False}
     )
     old_stdout = sys.stdout
     sys.stdout = captured = io.StringIO()

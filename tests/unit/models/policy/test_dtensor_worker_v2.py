@@ -27,7 +27,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.policy import AutomodelKwargs, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from tests.unit.test_utils import SimpleLoss
+from tests.unit.test_utils import SimpleLossFn
 
 try:
     from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
@@ -70,9 +70,9 @@ def create_test_config(
         "generation": {
             "backend": "hf",
             "temperature": 1.0,
-            "max_new_tokens": 16,  # Small number of tokens for testing
             "top_p": 1.0,
             "top_k": None,
+            "max_new_tokens": 16,  # Small number of tokens for testing
             "stop_token_ids": None,
             "stop_strings": None,
             "colocated": {
@@ -423,7 +423,7 @@ def test_dtensor_v2_mixed_precision_training_and_logprobs(
     try:
         # --- Test Training ---
         train_data = create_test_batch(mode="train")
-        loss_fn = SimpleLoss()
+        loss_fn = SimpleLossFn()
 
         policy.prepare_for_training()
         results = policy.train(train_data, loss_fn)
