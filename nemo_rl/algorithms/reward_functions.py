@@ -44,6 +44,11 @@ class RewardShapingConfig(TypedDict):
     # The maximum response length threshold. Responses exceeding this length will be penalized.
     max_response_length: NotRequired[int]
 
+    # Stop properly penalty: scale factor for rewards of truncated responses (0-1).
+    # When set to 0, truncated responses get zero reward.
+    # When set to 1, no penalty is applied (default behavior).
+    stop_properly_penalty_coef: NotRequired[float | None]
+
 
 def apply_reward_shaping(
     batch: BatchedDataDict, cfg: RewardShapingConfig
@@ -56,11 +61,62 @@ def apply_reward_shaping(
     if not cfg["enabled"]:
         return batch
 
+    # Apply stop properly penalty if configured
+    stop_properly_penalty_coef = cfg.get("stop_properly_penalty_coef", None)
+    if stop_properly_penalty_coef is not None:
+        assert 0 <= stop_properly_penalty_coef <= 1, (
+            f"stop_properly_penalty_coef must be in [0, 1], got {stop_properly_penalty_coef}"
+        )
+        # Warn user that DAPO overlong parameters are ignored when stop_properly_penalty_coef is set
+        ignored_params = []
+        if cfg.get("overlong_buffer_length") is not None:
+            ignored_params.append("overlong_buffer_length")
+        if cfg.get("overlong_buffer_penalty") is not None:
+            ignored_params.append("overlong_buffer_penalty")
+        if cfg.get("max_response_length") is not None:
+            ignored_params.append("max_response_length")
+        if ignored_params:
+            print(
+                f"[WARN] stop_properly_penalty_coef is set, so the following DAPO overlong "
+                f"parameters are ignored: {', '.join(ignored_params)}. "
+                f"Set stop_properly_penalty_coef=null to use DAPO overlong reward shaping instead.",
+                flush=True,
+            )
+        truncated = batch.get("truncated")
+        assert truncated is not None, "truncated field not found in batch"
+        if isinstance(truncated, list):
+            truncated = torch.tensor(truncated, dtype=torch.bool, device=rewards.device)
+        else:
+            truncated = truncated.to(device=rewards.device)
+
+        num_truncated = truncated.sum().item()
+        if num_truncated > 0:
+            original_rewards = rewards.clone()
+            # For truncated samples, scale the reward by stop_properly_penalty_coef
+            rewards = torch.where(
+                truncated, rewards * stop_properly_penalty_coef, rewards
+            )
+            batch["total_reward"] = rewards
+            print(
+                f"[INFO] stop properly penalty applied: {num_truncated}/{len(truncated)} samples truncated, "
+                f"coef={stop_properly_penalty_coef}, "
+                f"original_reward_mean={original_rewards[truncated].mean().item():.4f}, "
+                f"shaped_reward_mean={rewards[truncated].mean().item():.4f}",
+                flush=True,
+            )
+        else:
+            print(
+                "[INFO] stop properly penalty: no truncated samples (truncation_rate=0)",
+                flush=True,
+            )
+
+        return batch
+
     # DAPO reward shaping requires overlong_buffer_length, overlong_buffer_penalty, and max_response_length to be set.
     if (
-        cfg["overlong_buffer_length"] is None
-        or cfg["overlong_buffer_penalty"] is None
-        or cfg["max_response_length"] is None
+        cfg.get("overlong_buffer_length") is None
+        or cfg.get("overlong_buffer_penalty") is None
+        or cfg.get("max_response_length") is None
     ):
         raise ValueError(
             "Reward function is enabled but only DAPO reward shaping is currently supported. Please ensure overlong_buffer_length, overlong_buffer_penalty, and max_response_length are properly configured."

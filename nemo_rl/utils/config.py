@@ -79,7 +79,10 @@ def load_config_with_inheritance(
         base_config = OmegaConf.create({})
         for default in defaults:
             parent_path = resolve_path(base_dir, str(default))
-            parent_config = load_config_with_inheritance(parent_path, base_dir)
+            # Use parent's directory as base_dir for resolving its own defaults
+            parent_config = load_config_with_inheritance(
+                parent_path, parent_path.parent
+            )
             base_config = cast(
                 DictConfig, merge_with_override(base_config, parent_config)
             )
@@ -183,3 +186,11 @@ def parse_hydra_overrides(cfg: DictConfig, overrides: list[str]) -> DictConfig:
         return cfg
     except Exception as e:
         raise OverridesError(f"Failed to parse Hydra overrides: {str(e)}") from e
+
+
+def register_omegaconf_resolvers() -> None:
+    """Register shared OmegaConf resolvers used in configs."""
+    if not OmegaConf.has_resolver("mul"):
+        OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+    if not OmegaConf.has_resolver("max"):
+        OmegaConf.register_new_resolver("max", lambda a, b: max(a, b))
