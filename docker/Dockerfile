@@ -198,7 +198,10 @@ else
     UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
 fi
 EOF
-RUN find /opt/ray_venvs /opt/nemo_rl_venv -name "ptxas-blackwell" -exec ln -sf /usr/local/cuda/bin/ptxas {} \;
+RUN for d in /opt/ray_venvs /opt/nemo_rl_venv; do \
+      [ -d "$d" ] || continue; \
+      find "$d" -name "ptxas-blackwell" -exec ln -sf /usr/local/cuda/bin/ptxas {} +; \
+    done
 
 # Generate container fingerprint for frozen environment support
 # Store outside /opt/nemo-rl to avoid being overwritten by user mounts
