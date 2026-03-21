@@ -131,6 +131,8 @@ class BaseVllmGenerationWorker:
                           Only needed for the first worker in each tied worker group.
             fraction_of_gpus: Fraction of GPUs to use for this worker
             seed: Random seed for initialization
+            extra_env_vars: Additional environment variable names to forward into
+                          the vLLM worker subprocess (e.g. for quantization configs).
         """
         self.cfg = config
         self.model_name = self.cfg["model_name"]
@@ -216,7 +218,6 @@ class BaseVllmGenerationWorker:
             extra_env_str = ", ".join(
                 [f'"{env_var}"' for env_var in (extra_env_vars or [])]
             )
-            print("extra_env_str: ", extra_env_str)
 
             new_lines = [
                 f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',

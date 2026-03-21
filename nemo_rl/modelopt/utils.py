@@ -31,8 +31,8 @@ def resolve_quant_cfg(quant_cfg):
     For custom configs, the target variable must be a dict with the ModelOpt
     quantization config format. See examples/modelopt/quant_configs/ for examples.
     """
-    if ":" in quant_cfg and quant_cfg.endswith(".py", 0, quant_cfg.index(":")):
-        file_path, _, attr_name = quant_cfg.rpartition(":")
+    file_path, sep, attr_name = quant_cfg.rpartition(":")
+    if sep and file_path.endswith(".py"):
         file_path = os.path.abspath(file_path)
         if not os.path.isfile(file_path):
             raise ValueError(f"quant_cfg file not found: '{file_path}'")

@@ -25,14 +25,20 @@ GENERATION_WORKER_OVERRIDES = {
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
-    """Return the quantized policy worker class if quant_cfg is set, otherwise the default."""
+    """Return the quantized policy worker class if quant_cfg is set, otherwise the default.
+
+    Safe to call even when ModelOpt is not installed — returns *default_cls* unchanged.
+    """
     if config.get("quant_cfg") is None:
         return default_cls
     return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
 
 
 def resolve_generation_worker_cls(default_cls: str, config: dict) -> str:
-    """Return the quantized generation worker class if quant_cfg is set, otherwise the default."""
+    """Return the quantized generation worker class if quant_cfg is set, otherwise the default.
+
+    Safe to call even when ModelOpt is not installed — returns *default_cls* unchanged.
+    """
     if config.get("quant_cfg") is None:
         return default_cls
     return GENERATION_WORKER_OVERRIDES.get(default_cls, default_cls)

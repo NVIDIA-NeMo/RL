@@ -68,7 +68,7 @@ def _fakequant_run_prolog_worker(self) -> None:
     for name, module in model.named_modules():
         if isinstance(module, TensorQuantizer) and module.is_enabled:
             module._is_active = True
-            # For easiser to merge amax of q,k,v, or experts
+            # For easier merging of amax across q,k,v or experts
             module.amax.fill_(-1.0)
             # we disable weight quantizers for CUDA graph capture.
             if name.endswith("weight_quantizer"):
