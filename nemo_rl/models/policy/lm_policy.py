@@ -401,19 +401,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                         max_seq_len=max_seq_len,
                     )
 
-                    sharded_data_flat = hcp_scheduler.schedule_and_shard(
+                    sharded_data = hcp_scheduler.schedule_and_shard(
                         data=data,
                         seq_length_key="input_lengths",
                     )
                     unsorted_data_indices = None
-
-                    sharded_data = []
-                    for dp_idx in range(dp_size):
-                        dp_shards = []
-                        for cp_idx in range(cp_size):
-                            hdp_idx = dp_idx * cp_size + cp_idx
-                            dp_shards.append(sharded_data_flat[hdp_idx])
-                        sharded_data.append(dp_shards)
                 else:
                     sharded_data, unsorted_data_indices = data.shard_by_batch_size(
                         dp_size,
@@ -563,19 +555,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                         max_seq_len=max_seq_len,
                     )
 
-                    sharded_data_flat = hcp_scheduler.schedule_and_shard(
+                    sharded_data = hcp_scheduler.schedule_and_shard(
                         data=data,
                         seq_length_key="input_lengths",
                     )
                     unsorted_data_indices = None
-
-                    sharded_data = []
-                    for dp_idx in range(dp_size):
-                        dp_shards = []
-                        for cp_idx in range(cp_size):
-                            hdp_idx = dp_idx * cp_size + cp_idx
-                            dp_shards.append(sharded_data_flat[hdp_idx])
-                        sharded_data.append(dp_shards)
                 else:
                     sharded_data, unsorted_data_indices = data.shard_by_batch_size(
                         dp_size,
@@ -746,8 +730,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         hcp_enabled = self.cfg.get("hybrid_cp", {}).get("enabled", False)
 
         if hcp_enabled and self.use_sequence_packing:
-            # print(f"HCP: Training with dataset_size={data.size}, gbs={batch_size}")
-
             # Calculate number of global batches
             num_global_batches = data.size // batch_size
             if num_global_batches == 0:
@@ -755,8 +737,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     f"HCP: Dataset size ({data.size}) < global batch size ({batch_size}). "
                     f"Reduce global_batch_size or increase dataset size."
                 )
-
-            # print(f"HCP: Processing {num_global_batches} global batches with per-batch scheduling")
 
             # Initialize HCP scheduler once
             from nemo_rl.models.policy.hybrid_cp_scheduler import HeadNodeHCPScheduler
@@ -805,19 +785,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
                 # HCP schedule THIS batch across DP×CP ranks
                 with timer.time("policy_training/hcp_scheduling") if timer else nullcontext():
-                    sharded_data_flat = hcp_scheduler.schedule_and_shard(
+                    sharded_data = hcp_scheduler.schedule_and_shard(
                         data=batch_data,
                         seq_length_key="input_lengths",
                     )
-
-                    # Reshape to 2D structure [DP][CP]
-                    sharded_data = []
-                    for dp_idx in range(dp_size):
-                        dp_shards = []
-                        for cp_idx in range(cp_size):
-                            hdp_idx = dp_idx * cp_size + cp_idx
-                            dp_shards.append(sharded_data_flat[hdp_idx])
-                        sharded_data.append(dp_shards)
 
                 # Track flops for this batch
                 if self.flops_tracker is not None:
@@ -849,14 +820,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 batch_results = self.worker_group.get_all_worker_results(futures)
                 all_batch_results.append(batch_results[0])
 
-                # print(f"HCP: Batch {batch_idx + 1} completed - loss={batch_results[0]['global_loss']:.4f}, grad_norm={batch_results[0]['grad_norm']:.4f}")
-
             # Use last batch results as final (could also average)
             results = [all_batch_results[-1]]
-            # print(f"HCP: All {num_global_batches} batches completed")
 
         else:
-            # Non-HCP path: shard once and let workers handle batching
             with timer.time("policy_training/sharding_data") if timer else nullcontext():
                 if self.use_dynamic_batches:
                     self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[

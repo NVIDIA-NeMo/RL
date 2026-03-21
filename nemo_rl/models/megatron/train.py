@@ -529,7 +529,7 @@ class TopkLogitsPostProcessor:
             packed_seq_params.cp_group
             if packed_seq_params is not None
             and getattr(packed_seq_params, "cp_group", None) is not None
-            else None
+            else get_context_parallel_group()
         )
         unpacked_seqlen = data_dict["input_ids"].shape[1]
         seq_lengths = data_dict["input_lengths"]
@@ -554,7 +554,6 @@ class TopkLogitsPostProcessor:
             )
 
             if cp_size > 1:
-                cp_grp = cp_group if cp_group is not None else get_context_parallel_group()
                 if pack:
                     # Per-sequence CP allgather following packed-sequence logic
                     batch_size = data_dict["input_ids"].shape[0]
@@ -582,10 +581,10 @@ class TopkLogitsPostProcessor:
                                 :, start_idx // cp_size : end_idx // cp_size, :
                             ]
                             gathered_vals = allgather_cp_sharded_tensor(
-                                local_vals_slice, cp_grp, seq_dim=1
+                                local_vals_slice, cp_group, seq_dim=1
                             )
                             gathered_idx = allgather_cp_sharded_tensor(
-                                local_idx_slice, cp_grp, seq_dim=1
+                                local_idx_slice, cp_group, seq_dim=1
                             )
                             # Some kernels may return [X, Y, k] where X*Y = (end_idx - start_idx).
                             # Flatten leading dims and reshape to [1, expected_len, k] to match target.

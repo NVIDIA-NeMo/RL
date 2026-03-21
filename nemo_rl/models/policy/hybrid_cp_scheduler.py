@@ -301,7 +301,7 @@ class HeadNodeHCPScheduler:
         self,
         data: BatchedDataDict,
         seq_length_key: str = "input_lengths",
-    ) -> List[SlicedDataDict]:
+    ) -> List[List[SlicedDataDict]]:
         """Complete HCP scheduling: extract lengths, schedule, and shard data.
 
         This is the main entry point that combines all steps.
@@ -311,7 +311,9 @@ class HeadNodeHCPScheduler:
             seq_length_key: Key containing sequence lengths
 
         Returns:
-            List of SlicedDataDict, one per DP×CP rank, with HCP metadata
+            2D list of SlicedDataDict indexed as [dp_idx][cp_idx], suitable
+            for passing to run_all_workers_sharded_data with
+            in_sharded_axes=["data_parallel", "context_parallel"].
         """
         # Step 0: Validate batch size consistency across all keys
         batch_sizes = set()
@@ -357,7 +359,11 @@ class HeadNodeHCPScheduler:
         # Note: sample_local_cp_size is calculated here for logging/validation,
         # but not passed to workers (Megatron calculates it from sample_id_groups)
 
-        # Step 4: Shard data with HCP metadata
-        sharded_data = self.shard_data_by_hdp_rank(data, sample_id_groups)
+        # Step 4: Shard data with HCP metadata (flat list, one per DP×CP rank)
+        flat_shards = self.shard_data_by_hdp_rank(data, sample_id_groups)
 
-        return sharded_data
+        # Step 5: Reshape to 2D [dp_idx][cp_idx] for run_all_workers_sharded_data
+        return [
+            [flat_shards[dp * self.cp_size + cp] for cp in range(self.cp_size)]
+            for dp in range(self.dp_size)
+        ]
