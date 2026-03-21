@@ -903,6 +903,9 @@ class TestTwoGPUCluster:
     def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(
         self, use_v2, two_gpu_cluster, tiny_llama_tied_model_path
     ):
+        pytest.skip(
+            reason="skipped until https://github.com/NVIDIA-NeMo/Automodel/pull/1489 is merged"
+        )
         """Test that DTensor with a tp > 1 and a tied model with a custom parallel plan works."""
         from torch.distributed.tensor.parallel import ColwiseParallel
         from torch.distributed.tensor.placement_types import Replicate

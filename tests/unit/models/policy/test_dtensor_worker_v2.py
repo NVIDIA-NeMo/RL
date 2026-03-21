@@ -239,6 +239,7 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
     cpu_offload,
     activation_checkpointing,
 ):
+    pytest.skip(reason="skipped until automodel doesn't update model config in-place")
     """Test that dtensor worker v1 and v2 produce equivalent model configurations.
 
     This test verifies that DTensorPolicyWorkerV2 produces the same model config
