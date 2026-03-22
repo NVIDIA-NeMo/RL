@@ -1742,8 +1742,8 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
     # Logit values already validated by assert_close above; index mismatches
     # occur when close-valued logits swap order due to numerical differences
     # in GB200 for torch 2.10 + TE 2.12 (H100 achieves exact match).
-    assert match_ratio >= 0.98, (
-        f"Top-k index match ratio too low: {match_ratio:.4f} (< 0.98)"
+    assert match_ratio >= 0.97, (
+        f"Top-k index match ratio too low: {match_ratio:.4f} (< 0.97)"
     )
 
     # Test 2: CP model (context_parallel_size=2) with sequence packing
