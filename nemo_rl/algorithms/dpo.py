@@ -252,7 +252,11 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = DPOLossFn(master_config["dpo"])
+    loss_fn = DPOLossFn(
+        master_config["dpo"],
+        use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
+        and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"],
+    )
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)

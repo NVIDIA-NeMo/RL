@@ -400,9 +400,11 @@ class LogprobsPostProcessor:
         self,
         cfg: PolicyConfig,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        use_linear_ce_fusion: bool = False,
     ):
         self.cfg = cfg
         self.sampling_params = sampling_params
+        self.use_linear_ce_fusion = use_linear_ce_fusion
 
     def __call__(
         self,
@@ -427,10 +429,13 @@ class LogprobsPostProcessor:
         original_seq_length = unpacked_input_ids.shape[1]
 
         def processor_fn_inner(output_tensor):
-            tp_grp = get_tensor_model_parallel_group()
-            tp_rank = get_tensor_model_parallel_rank()
-            logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
-            if self.cfg["sequence_packing"]["enabled"]:
+            if self.use_linear_ce_fusion:
+                token_logprobs = output_tensor.to(torch.float32)
+                token_logprobs = token_logprobs[:, : original_seq_length - 1]
+            elif self.cfg["sequence_packing"]["enabled"]:
+                tp_grp = get_tensor_model_parallel_group()
+                tp_rank = get_tensor_model_parallel_rank()
+                logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
                 token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
                     output_tensor,
                     target=input_ids,
@@ -445,6 +450,9 @@ class LogprobsPostProcessor:
                     sampling_params=self.sampling_params,
                 )
             else:
+                tp_grp = get_tensor_model_parallel_group()
+                tp_rank = get_tensor_model_parallel_rank()
+                logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
                 token_logprobs = from_parallel_logits_to_logprobs(
                     output_tensor,
                     target=unpacked_input_ids,

@@ -490,9 +490,13 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
+        use_linear_ce_fusion = self.cfg["megatron_cfg"].get(
+            "use_linear_ce_fusion_loss", False
+        )
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
             sampling_params=self.sampling_params,
+            use_linear_ce_fusion=use_linear_ce_fusion,
         )
 
         list_of_logprobs = megatron_forward_backward(
@@ -506,6 +510,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             defer_fp32_logits=self.defer_fp32_logits,
             sampling_params=self.sampling_params,
             straggler_timer=self.mcore_state.straggler_timer,
+            use_linear_ce_fusion_loss=use_linear_ce_fusion,
         )
 
         if is_pipeline_last_stage(ignore_virtual=True):
