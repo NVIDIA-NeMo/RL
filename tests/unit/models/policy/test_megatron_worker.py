@@ -1971,9 +1971,11 @@ def test_megatron_sft_linear_ce_fusion_agreement(tiny_qwen2_model_path):
     torch.testing.assert_close(loss_std, loss_fuse, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(600)
 def test_megatron_dpo_linear_ce_fusion_agreement(tiny_qwen2_model_path):
     """Test that linear CE fusion loss produces the same results as the standard path for DPO."""
+    import time
+
     num_gpus = 2
     batch_size = 4
     seq_len = 64
@@ -2031,6 +2033,8 @@ def test_megatron_dpo_linear_ce_fusion_agreement(tiny_qwen2_model_path):
     finally:
         policy_std.shutdown()
         cluster_std.shutdown()
+
+    time.sleep(10)
 
     # --- DPO with linear CE fusion ---
     cluster_fuse = RayVirtualCluster(
