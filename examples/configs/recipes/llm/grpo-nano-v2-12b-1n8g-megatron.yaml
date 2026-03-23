@@ -15,7 +15,7 @@ policy:
     tensor_model_parallel_size: 8
   dtensor_cfg:
     enabled: false
-  make_sequence_length_divisible_by: 1
+  make_sequence_length_divisible_by: 8
   generation:
     max_new_tokens: 512
     vllm_cfg:

@@ -576,6 +576,9 @@ class NLLLossFn(LossFunction):
     loss_type = LossType.TOKEN_LEVEL
     input_type = LossInputType.LOGPROB
 
+    def __init__(self, use_linear_ce_fusion: bool = False):
+        self.use_linear_ce_fusion = use_linear_ce_fusion
+
     def __call__(
         self,
         next_token_logprobs: Tensor,
