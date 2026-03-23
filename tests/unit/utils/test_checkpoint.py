@@ -35,6 +35,7 @@ def checkpoint_config(checkpoint_dir):
         "metric_name": "loss",
         "higher_is_better": False,
         "keep_top_k": 3,
+        "save_optimizer": True,
     }
 
 
@@ -295,6 +296,7 @@ def test_checkpoint_without_keep_top_k(tmp_path):
         "metric_name": "loss",
         "higher_is_better": False,
         "keep_top_k": None,
+        "save_optimizer": True,
     }
     manager = CheckpointManager(config)
 
@@ -394,6 +396,7 @@ def test_get_best_checkpoint_path_some_missing_metric(tmp_path):
         "metric_name": "loss",
         "higher_is_better": False,
         "keep_top_k": None,  # Keep all checkpoints
+        "save_optimizer": True,
     }
     manager = CheckpointManager(config)
 
@@ -437,6 +440,7 @@ def test_get_best_checkpoint_path_all_missing_metric(tmp_path):
         "metric_name": "loss",
         "higher_is_better": False,
         "keep_top_k": None,  # Keep all checkpoints
+        "save_optimizer": True,
     }
     manager = CheckpointManager(config)
 
@@ -478,6 +482,7 @@ def test_get_best_checkpoint_path_higher_is_better(tmp_path):
         "metric_name": "accuracy",
         "higher_is_better": True,
         "keep_top_k": None,  # Keep all
+        "save_optimizer": True,
     }
     manager = CheckpointManager(config)
 
