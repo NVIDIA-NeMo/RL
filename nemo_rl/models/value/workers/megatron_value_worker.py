@@ -725,7 +725,9 @@ class MegatronValueWorker(AbstractPolicyWorker):
                         curr_lr = self.scheduler.get_lr(
                             self.optimizer.param_groups[0]
                         )
+                        curr_wd = self.scheduler.get_wd()
                         loss_metrics["lr"] = curr_lr
+                        loss_metrics["wd"] = curr_wd
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
                         mb_losses.append(loss_metrics["loss"])
@@ -748,8 +750,9 @@ class MegatronValueWorker(AbstractPolicyWorker):
                 all_mb_metrics.extend(gb_loss_metrics)
                 losses.append(torch.tensor(mb_losses).sum().item())
 
-        if not eval_mode:
-            self.scheduler.step(increment=gbs)
+                if not eval_mode:
+                    # step LR scheduler after every optimizer step
+                    self.scheduler.step(increment=gbs)
 
         # Aggregate metrics
         mb_metrics = defaultdict(list)

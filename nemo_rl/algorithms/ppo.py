@@ -1723,34 +1723,25 @@ def ppo_train(
 
                 # Extract critic metrics from value training results
                 value_mb_metrics = value_results.get("all_mb_metrics", {})
-                critic_metrics = {
-                    "critic/loss": value_results["loss"].item()
-                    if hasattr(value_results["loss"], "item")
-                    else float(value_results["loss"]),
-                    "critic/grad_norm": value_results["grad_norm"].item()
-                    if hasattr(value_results["grad_norm"], "item")
-                    else float(value_results["grad_norm"]),
-                }
-                if "lr" in value_mb_metrics:
-                    critic_metrics["critic/lr"] = value_mb_metrics["lr"][-1]
-                if "vf_clipfrac" in value_mb_metrics:
-                    critic_metrics["critic/vf_clipfrac"] = (
-                        sum(value_mb_metrics["vf_clipfrac"])
-                        / len(value_mb_metrics["vf_clipfrac"])
-                    )
-                if "global_valid_seqs" in value_mb_metrics:
-                    critic_metrics["critic/global_valid_seqs"] = sum(
-                        value_mb_metrics["global_valid_seqs"]
-                    )
-                if "global_valid_toks" in value_mb_metrics:
-                    critic_metrics["critic/global_valid_toks"] = sum(
-                        value_mb_metrics["global_valid_toks"]
-                    )
+                critic_metrics = {}
+              
+                for k, v in value_mb_metrics.items():
+                    if k in {
+                        "lr",
+                        "wd",
+                        "global_valid_seqs",
+                        "global_valid_toks",
+                    }:
+                        critic_metrics["critic/" + k] = np.mean(v).item()
+                    elif isinstance(v, (np.ndarray, list)):
+                        critic_metrics["critic/" + k] = np.sum(v).item()
+                    else:
+                        raise ValueError(f"Unknown metric for value don't know how to handle: {k}")
+
                 metrics.update(critic_metrics)
 
                 metrics.update({
                     "reward": rewards.numpy(),
-                    "value_loss": value_results["loss"].item(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
                     "advantages/mean": torch.mean(response_advantages).detach().item()
