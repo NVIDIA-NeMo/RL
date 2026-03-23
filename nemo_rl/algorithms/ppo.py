@@ -1721,6 +1721,33 @@ def ppo_train(
                             {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
                         )
 
+                # Extract critic metrics from value training results
+                value_mb_metrics = value_results.get("all_mb_metrics", {})
+                critic_metrics = {
+                    "critic/loss": value_results["loss"].item()
+                    if hasattr(value_results["loss"], "item")
+                    else float(value_results["loss"]),
+                    "critic/grad_norm": value_results["grad_norm"].item()
+                    if hasattr(value_results["grad_norm"], "item")
+                    else float(value_results["grad_norm"]),
+                }
+                if "lr" in value_mb_metrics:
+                    critic_metrics["critic/lr"] = value_mb_metrics["lr"][-1]
+                if "vf_clipfrac" in value_mb_metrics:
+                    critic_metrics["critic/vf_clipfrac"] = (
+                        sum(value_mb_metrics["vf_clipfrac"])
+                        / len(value_mb_metrics["vf_clipfrac"])
+                    )
+                if "global_valid_seqs" in value_mb_metrics:
+                    critic_metrics["critic/global_valid_seqs"] = sum(
+                        value_mb_metrics["global_valid_seqs"]
+                    )
+                if "global_valid_toks" in value_mb_metrics:
+                    critic_metrics["critic/global_valid_toks"] = sum(
+                        value_mb_metrics["global_valid_toks"]
+                    )
+                metrics.update(critic_metrics)
+
                 metrics.update({
                     "reward": rewards.numpy(),
                     "value_loss": value_results["loss"].item(),
@@ -1881,7 +1908,12 @@ def ppo_train(
             print("\n📊 Training Results:")
             if train_results is not None:
                 print(f"  • Policy Loss: {metrics.get('loss', 'N/A')}")
-            print(f"  • Value Loss: {value_results['loss'].item():.4f}")
+            print(f"  • Critic Loss: {metrics.get('critic/loss', 'N/A')}")
+            print(f"  • Critic Grad Norm: {metrics.get('critic/grad_norm', 'N/A')}")
+            if "critic/lr" in metrics:
+                print(f"  • Critic LR: {metrics['critic/lr']:.2e}")
+            if "critic/vf_clipfrac" in metrics:
+                print(f"  • Critic Clip Frac: {metrics['critic/vf_clipfrac']:.4f}")
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(
                 f"  • Mean Generation Length: {metrics_logging_data['mean_gen_tokens_per_sample']:.4f}",
