@@ -327,7 +327,13 @@ def calculate_rewards(
     sorted_indices = sorted(
         range(len(all_indices_order)), key=lambda k: all_indices_order[k]
     )
-    rewards = torch.tensor([all_rewards[i] for i in sorted_indices])
+
+    # Stack rewards: each element may be scalar (single-reward env) or 1d (multi-reward env).
+    if len(all_rewards) > 0 and isinstance(all_rewards[0], torch.Tensor):
+        rewards = torch.stack([all_rewards[i] for i in sorted_indices])
+    else:
+        rewards = torch.tensor([all_rewards[i] for i in sorted_indices])
+
     env_observations = [all_env_observations[i] for i in sorted_indices]
     terminateds = torch.tensor([all_terminateds[i] for i in sorted_indices])
     next_stop_strings = [all_next_stop_strings[i] for i in sorted_indices]
@@ -373,6 +379,10 @@ def run_multi_turn_rollout(
     batch_size = len(current_batch["message_log"])
     active_indices = torch.arange(batch_size)
     total_rewards = torch.zeros(batch_size, dtype=torch.float32)
+
+    # Multi_rewards: number of components inferred from first env_output (1 for single-reward envs)
+    number_of_rewards: int | None = None
+    multi_rewards: torch.Tensor | None = None
 
     # Initialize stop_strings from the initial batch if present
     current_stop_strings = current_batch.get("stop_strings", [None] * batch_size)
@@ -459,7 +469,25 @@ def run_multi_turn_rollout(
         # Calculate rewards and get environment feedback
         env_output: EnvironmentReturn = calculate_rewards(active_batch, task_to_env)
 
-        total_rewards[active_indices] += env_output.rewards
+        # Infer number of reward components on first turn (supports single- and multi-reward envs)
+        if number_of_rewards is None:
+            if env_output.rewards.ndim >= 2:
+                number_of_rewards = int(env_output.rewards.shape[1])
+                multi_rewards = torch.zeros(
+                    batch_size, number_of_rewards, dtype=torch.float32
+                )
+            else:
+                number_of_rewards = 1
+                # multi_rewards left None: GRPO uses total_reward only; multi_rewards unused
+
+        # Accumulate rewards: env may return shape (N,) or (N, K)
+        if number_of_rewards > 1:
+            # this assert is to infer the type of multi_rewards for pyrefly
+            assert multi_rewards is not None
+            multi_rewards[active_indices] += env_output.rewards
+            total_rewards[active_indices] += env_output.rewards.sum(dim=1)
+        else:
+            total_rewards[active_indices] += env_output.rewards
 
         # Update message log for ALL active samples with env observation
         # This must happen BEFORE filtering based on done flags
@@ -536,6 +564,11 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
     current_batch["truncated"] = sample_truncated
+    # Expose per-component rewards (reward1, reward2, ...) for multi-reward envs only; GRPO uses total_reward
+    if multi_rewards is not None:
+        num_reward_components = multi_rewards.shape[1]
+        for i in range(num_reward_components):
+            current_batch[f"reward{i + 1}"] = multi_rewards[:, i].clone()
 
     # Calculate aggregate metrics
     rollout_metrics = {
@@ -666,6 +699,10 @@ async def run_sample_multi_turn_rollout(
 
     # Sample-level metrics
     total_reward = 0.0
+    reward_acc_list: list[
+        float
+    ] = []  # per-component rewards, length set on first multi-reward
+    multi_reward_seen = False
     turn_count = 0
     token_count = 0
     assistant_token_count = 0
@@ -738,8 +775,17 @@ async def run_sample_multi_turn_rollout(
 
         # Get environment feedback
         env_output = calculate_rewards(sample_batch, task_to_env)
-        # Update total reward
-        total_reward += float(env_output.rewards[0].item())
+        # Update total reward and optional per-reward signals (reward1, reward2, ... rewardN)
+        if env_output.rewards.ndim == 2 and env_output.rewards.shape[1] >= 1:
+            multi_reward_seen = True
+            n = env_output.rewards.shape[1]
+            if len(reward_acc_list) == 0:
+                reward_acc_list = [0.0] * n
+            total_reward += float(env_output.rewards[0].sum().item())
+            for j in range(n):
+                reward_acc_list[j] += float(env_output.rewards[0, j].item())
+        else:
+            total_reward += float(env_output.rewards[0].item())
         # Check termination
         terminated = env_output.terminateds[0].item()
         env_obs_content = env_output.observations[0]["content"]
@@ -789,6 +835,9 @@ async def run_sample_multi_turn_rollout(
         "stop_strings": current_stop_strings,
         "idx": sample_idx,
     }
+    if multi_reward_seen:
+        for j in range(len(reward_acc_list)):
+            final_sample_state[f"reward{j + 1}"] = torch.tensor(reward_acc_list[j])
 
     # Sample metrics
     sample_metrics = {
@@ -912,6 +961,31 @@ def run_async_multi_turn_rollout(
             }
         )
 
+        # Expose per-component rewards (reward1, reward2, ...) for multi-reward envs for GDPO advantage calculation.
+        # Collect all reward component keys from any sample state (samples may come from different envs).
+        reward_component_keys = sorted(
+            set(
+                k
+                for state in final_sample_states
+                for k in state
+                if isinstance(k, str)
+                and k.startswith("reward")
+                and len(k) > 6
+                and k[6:].isdigit()
+            ),
+            key=lambda k: int(k[6:]),
+        )
+        for key in reward_component_keys:
+            # Stack per-sample values; use 0.0 for samples that did not have this component (e.g. single-reward env)
+            final_batch[key] = torch.stack(
+                [
+                    state[key]
+                    if key in state
+                    else torch.tensor(0.0, dtype=torch.float32)
+                    for state in final_sample_states
+                ]
+            )
+
         # Preserve additional fields from the original input_batch
         for key in input_batch.keys():
             if key not in final_batch:
@@ -977,6 +1051,14 @@ def run_async_multi_turn_rollout(
         return final_batch, rollout_metrics
 
     return asyncio.run(_async_rollout_implementation())
+
+
+def _tensorize_by_key(message_logs: list, key: str):
+    if not message_logs or key not in message_logs[0]:
+        return
+
+    for m in message_logs:
+        m[key] = torch.tensor(m[key])
 
 
 @dataclass
@@ -1058,6 +1140,15 @@ def run_async_nemo_gym_rollout(
             )
         )
 
+        # Tensorize all token ids
+        for r in results:
+            _tensorize_by_key(r["input_message_log"], "token_ids")
+            _tensorize_by_key(r["message_log"], "token_ids")
+            _tensorize_by_key(
+                [m for m in r["message_log"] if m["role"] == "assistant"],
+                "generation_logprobs",
+            )
+
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
@@ -1120,8 +1211,10 @@ def run_async_nemo_gym_rollout(
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
         for nemo_gym_row, result in zip(nemo_gym_rows, results):
-            agent_name = nemo_gym_row["agent_ref"]["name"]
+            agent_ref = nemo_gym_row["agent_ref"]
+            agent_name = agent_ref["name"]
             agent_to_results[agent_name].append(result["full_result"])
+            result["agent_ref"] = agent_ref
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
@@ -1168,6 +1261,7 @@ def run_async_nemo_gym_rollout(
 
     final_batch = BatchedDataDict[DatumSpec](
         {
+            "agent_ref": [r["agent_ref"] for r in results],
             "message_log": [r["message_log"] for r in results],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(
@@ -1181,6 +1275,10 @@ def run_async_nemo_gym_rollout(
             # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
             # Extra information not in the DatumSpec used by the GRPO algorithm
             "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
+            # Add truncated field to match other rollout paths (reusing hit_max_tokens logic)
+            "truncated": torch.tensor(
+                [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
+            ),
         }
     )
 

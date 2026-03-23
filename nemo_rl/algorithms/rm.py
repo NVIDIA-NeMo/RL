@@ -22,9 +22,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
-from nemo_rl.algorithms.loss_functions import (
-    PreferenceLoss,
-)
+from nemo_rl.algorithms.loss import PreferenceLossFn
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
@@ -102,7 +100,7 @@ def setup(
     RayVirtualCluster,
     StatefulDataLoader,
     dict[str, StatefulDataLoader],
-    PreferenceLoss,
+    PreferenceLossFn,
     MasterConfig,
     Logger,
     TaskDataSpec,
@@ -226,7 +224,7 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = PreferenceLoss()
+    loss_fn = PreferenceLossFn()
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)

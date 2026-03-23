@@ -21,6 +21,8 @@ from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer import MegatronModule
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+
 
 class MegatronGenerationConfig(TypedDict):
     # Total GPU memory (in GB) allocated for KV cache buffers
@@ -55,6 +57,7 @@ class RuntimeConfig(NamedTuple):
     optimizer_cpu_offload: bool
     offload_optimizer_for_logprob: bool
     is_generation_colocated: Optional[bool]
+    sampling_params: Optional[TrainingSamplingParams]
     final_padded_vocab_size: int
 
 

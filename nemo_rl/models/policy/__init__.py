@@ -108,6 +108,24 @@ class RewardModelConfig(TypedDict):
     reward_model_type: str
 
 
+class MegatronPeftConfigDisabled(TypedDict):
+    enabled: Literal[False]
+
+
+class MegatronPeftConfig(TypedDict):
+    enabled: Literal[True]
+    target_modules: list[str]
+    exclude_modules: list[str]
+    dim: int
+    alpha: int
+    dropout: float
+    dropout_position: Literal["pre", "post"]
+    lora_A_init_method: str
+    lora_B_init_method: str
+    a2a_experimental: bool
+    lora_dtype: str | None
+
+
 class MegatronOptimizerConfig(TypedDict):
     optimizer: str
     lr: float
@@ -187,15 +205,25 @@ class MegatronConfig(TypedDict):
     # Must set moe_token_dispatcher_type to 'flex'
     # Must set moe_shared_expert_overlap to False
     moe_enable_deepep: bool
-    # The type of token dispatcher to use. The default is 'allgather'.
+    # The type of token dispatcher to use. The default is 'alltoall'.
     # Options are 'allgather','alltoall' and 'flex'
     # Use 'flex' when using DeepEP
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
+    # When True, uses chunked linear cross-entropy fusion loss to compute loss
+    # directly from hidden states, avoiding materialization of the full
+    # [batch, seq_len, vocab_size] logit tensor. This significantly reduces peak
+    # GPU memory, extending the maximum trainable sequence length (e.g. from <65K
+    # to >100K tokens). Only applicable to SFT with NLLLoss.
+    use_linear_ce_fusion_loss: NotRequired[bool]
+    # Number of tokens per chunk when computing the fused linear CE loss.
+    # Smaller values reduce peak memory further but may decrease throughput.
+    linear_ce_fusion_chunk_size: NotRequired[int]
 
 
 class TokenizerConfig(TypedDict):
@@ -203,6 +231,9 @@ class TokenizerConfig(TypedDict):
     chat_template: NotRequired[str]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]
+    # Multimodal configs
+    audio: NotRequired[dict[str, Any]]
+    video: NotRequired[dict[str, Any]]
 
 
 class PytorchOptimizerConfig(TypedDict):

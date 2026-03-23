@@ -21,20 +21,20 @@ import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.loss_functions import (
+from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
     DPOLossFn,
-    NLLLoss,
+    NLLLossFn,
 )
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from tests.unit.test_utils import SimpleLoss
+from tests.unit.test_utils import SimpleLossFn
 
 basic_pg_loss_test_config: ClippedPGLossConfig = {
     "ratio_clip_min": 0.2,
@@ -81,9 +81,9 @@ def create_megatron_test_config(
         "generation": {
             "backend": generation_backend,
             "temperature": 1.0,
-            "max_new_tokens": 32,  # Small number of tokens for testing
             "top_p": 1.0,
             "top_k": None,
+            "max_new_tokens": 32,  # Small number of tokens for testing
             "stop_token_ids": None,
             "stop_strings": None,
             "mcore_generation_config": {
@@ -135,9 +135,11 @@ def create_megatron_test_config(
             "bias_activation_fusion": True,
             "moe_per_layer_logging": False,
             "moe_enable_deepep": False,
-            "moe_token_dispatcher_type": "allgather",
+            "moe_token_dispatcher_type": "alltoall",
             "moe_shared_expert_overlap": False,
             "defer_fp32_logits": defer_fp32_logits,
+            "use_linear_ce_fusion_loss": False,
+            "linear_ce_fusion_chunk_size": 256,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -178,6 +180,7 @@ def create_megatron_test_config(
                 "fp8_param": True,
             },
         },
+        "make_sequence_length_divisible_by": tp,
         "optimizer": None,  # Remove default FSDP optimizer
         "scheduler": None,  # Remove default scheduler
         "max_grad_norm": 1.0,
@@ -347,7 +350,7 @@ def training_setup(request):
         )
 
         # Create loss function
-        loss_fn: LossFunction = SimpleLoss()
+        loss_fn: LossFunction = SimpleLossFn()
 
         yield policy, cluster, data, loss_fn
 
@@ -824,7 +827,7 @@ def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
     )
 
     # Test loss functions
-    nll_loss_fn = NLLLoss()
+    nll_loss_fn = NLLLossFn()
     pg_loss_fn = ClippedPGLossFn(basic_pg_loss_test_config)
 
     policy1.prepare_for_training()
@@ -902,7 +905,7 @@ def test_megatron_grad_norm_invariant_to_number_of_microbatches(tiny_llama_model
     )
 
     tokenizer = get_tokenizer({"name": tiny_llama_model_path})
-    nll_loss_fn = NLLLoss()
+    nll_loss_fn = NLLLossFn()
 
     cluster1 = RayVirtualCluster(
         name="test-gradnorm-mbs1",
@@ -1032,7 +1035,7 @@ def test_megatron_reference_policy_functionality(tiny_llama_model_path):
         }
     )
 
-    loss_fn = SimpleLoss()
+    loss_fn = SimpleLossFn()
     policy.prepare_for_training()
 
     # Train for more steps and monitor loss to ensure training is working
@@ -1147,7 +1150,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
                 }
             )
 
-            loss_fn = SimpleLoss()
+            loss_fn = SimpleLossFn()
 
             # Train for several steps to modify model state significantly
             policy1.prepare_for_training()
@@ -1747,6 +1750,7 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
     )
     # Enable context parallel
     config_cp["megatron_cfg"]["context_parallel_size"] = 2
+    config_cp["make_sequence_length_divisible_by"] *= 4
 
     # Enable sequence packing
     config_cp["sequence_packing"] = {
@@ -1842,7 +1846,7 @@ def test_megatron_sft_training(tiny_llama_model_path):
     )
 
     # Create NLL loss function for SFT
-    sft_loss_fn = NLLLoss()
+    sft_loss_fn = NLLLossFn()
 
     try:
         # Prepare for training
@@ -1875,6 +1879,96 @@ def test_megatron_sft_training(tiny_llama_model_path):
     finally:
         policy.shutdown()
         cluster.shutdown()
+
+
+@pytest.mark.timeout(300)
+def test_megatron_sft_linear_ce_fusion_agreement(tiny_qwen2_model_path):
+    """Test that linear CE fusion loss produces the same results as the standard path."""
+    num_gpus = 2
+    batch_size = 8
+    seq_len = 64
+    vocab_size = 151936
+
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    token_mask = torch.triu(torch.ones(batch_size, seq_len), diagonal=1)
+    sample_mask = torch.ones(batch_size)
+    labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "labels": labels,
+        }
+    )
+
+    # --- Standard SFT (no linear CE fusion) ---
+    cluster_std = RayVirtualCluster(
+        name="test-sft-std",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+    config_std = create_megatron_test_config(tiny_qwen2_model_path)
+    tokenizer = get_tokenizer(config_std["tokenizer"])
+    policy_std = Policy(
+        cluster=cluster_std,
+        config=config_std,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    sft_loss_std = NLLLossFn()
+
+    try:
+        policy_std.prepare_for_training()
+        results_std = policy_std.train(data, sft_loss_std)
+        loss_std = results_std["loss"]
+    finally:
+        policy_std.shutdown()
+        cluster_std.shutdown()
+
+    # --- SFT with linear CE fusion ---
+    cluster_fuse = RayVirtualCluster(
+        name="test-sft-fuse",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+    config_fuse = create_megatron_test_config(tiny_qwen2_model_path)
+    config_fuse["megatron_cfg"]["use_linear_ce_fusion_loss"] = True
+    config_fuse["megatron_cfg"]["linear_ce_fusion_chunk_size"] = 256
+    policy_fuse = Policy(
+        cluster=cluster_fuse,
+        config=config_fuse,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    sft_loss_fuse = NLLLossFn(use_linear_ce_fusion=True)
+
+    try:
+        policy_fuse.prepare_for_training()
+        results_fuse = policy_fuse.train(data, sft_loss_fuse)
+        loss_fuse = results_fuse["loss"]
+    finally:
+        policy_fuse.shutdown()
+        cluster_fuse.shutdown()
+
+    # Verify both produce valid losses
+    assert not torch.isnan(loss_std).any(), "Standard loss should not be NaN"
+    assert not torch.isnan(loss_fuse).any(), "Fusion loss should not be NaN"
+    assert not torch.isinf(loss_std).any(), "Standard loss should not be Inf"
+    assert not torch.isinf(loss_fuse).any(), "Fusion loss should not be Inf"
+
+    # Verify losses are numerically close
+    torch.testing.assert_close(loss_std, loss_fuse, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.hf_gated
@@ -2004,6 +2098,7 @@ def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
     )
     # Enable context parallel
     config_cp["megatron_cfg"]["context_parallel_size"] = 2
+    config_cp["make_sequence_length_divisible_by"] *= 4
 
     # Enable sequence packing
     config_cp["sequence_packing"] = {
@@ -2198,6 +2293,7 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
     )
     # Enable context parallel
     config_cp["megatron_cfg"]["context_parallel_size"] = 2
+    config_cp["make_sequence_length_divisible_by"] *= 4
     config_cp["train_global_batch_size"] = 2
 
     # Enable sequence packing
@@ -2358,8 +2454,8 @@ def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_
             init_reference_model=False,
         )
 
-        # Use SimpleLoss for consistent comparison
-        loss_fn = NLLLoss()
+        # Use SimpleLossFn for consistent comparison
+        loss_fn = NLLLossFn()
 
         try:
             # Prepare for training
@@ -2532,7 +2628,7 @@ def test_megatron_policy_flops_range_check(tiny_llama_model_path):
     )
 
     # Create loss function
-    loss_fn = SimpleLoss()
+    loss_fn = SimpleLossFn()
 
     try:
         # Prepare for training

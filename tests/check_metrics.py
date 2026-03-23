@@ -211,8 +211,7 @@ def main():
     # Initialize rich console
     console = Console()
 
-    # Create a table
-    table = Table(title="Metric Checks", min_width=150, width=args.table_width)
+    table = Table(title="Metric Checks", min_width=220, width=args.table_width)
     table.add_column("Status", style="bold")
     table.add_column("Check", style="dim")
     table.add_column("Value", style="cyan")
