@@ -28,6 +28,7 @@ checkpointing:
     checkpoint_must_save_by: null
     model_save_format: "safetensors"
     save_consolidated: false
+    save_optimizer: true
 
 policy: &POLICY_BASE
     model_name: "Qwen/Qwen3-1.7B-Base"

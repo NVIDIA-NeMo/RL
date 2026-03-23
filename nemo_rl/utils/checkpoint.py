@@ -100,6 +100,7 @@ class CheckpointManager:
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
+        self.save_optimizer = config["save_optimizer"]
 
         # Store nemo-automodel specific config options
         self.model_save_format = config.get("model_save_format", "safetensors")
@@ -107,7 +108,6 @@ class CheckpointManager:
         self.model_cache_dir = config.get("model_cache_dir", "")
         self.model_repo_id = config.get("model_repo_id", "")
         self.is_peft = config.get("is_peft", False)
-        self.save_optimizer = config.get("save_optimizer", True)
 
     def get_resume_paths(
         self, last_checkpoint_path: Optional[PathLike]
