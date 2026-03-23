@@ -484,8 +484,6 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # Attention backend configuration
     attention_backend = config["megatron_cfg"].get("attention_backend")
     if attention_backend is not None:
-        from megatron.core.transformer.enums import AttnBackend
-
         try:
             model_cfg.attention_backend = AttnBackend[attention_backend]
         except KeyError:
