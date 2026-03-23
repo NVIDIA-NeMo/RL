@@ -19,6 +19,9 @@ export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR $CHECKPOINT_DIR $DATA_DIR
 
+# clean up checkpoint directory on exit
+trap "rm -rf $CHECKPOINT_DIR" EXIT
+
 cd $PROJECT_ROOT
 
 # Follow nemo-gym instructions here to get this data:
@@ -72,6 +75,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     grpo.num_prompts_per_step=4 \
     grpo.num_generations_per_prompt=2 \
     grpo.max_num_steps=10 \
+    grpo.val_period=5 \
     grpo.async_grpo.enabled=true \
     grpo.async_grpo.max_trajectory_age_steps=1 \
     grpo.async_grpo.in_flight_weight_updates=true \
@@ -83,7 +87,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
-    checkpointing.enabled=false \
+    checkpointing.enabled=true \
+    checkpointing.save_period=5 \
     checkpointing.checkpoint_dir=$CHECKPOINT_DIR \
     data.train.data_path=$TRAIN_PATH \
     data.validation.data_path=$VALIDATION_PATH \
@@ -94,4 +99,5 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Observed to be between 0.8-1.3
 uv run tests/check_metrics.py $JSON_METRICS \
-    'median(data["train/gen_kl_error"]) < 1.3'
+    'median(data["train/gen_kl_error"]) < 1.3' \
+    'data["validation/accuracy"]["10"] > 0.1'

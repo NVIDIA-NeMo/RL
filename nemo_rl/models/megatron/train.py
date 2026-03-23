@@ -34,8 +34,10 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
+    SequencePackingFusionLossWrapper,
     SequencePackingLossWrapper,
     prepare_loss_input,
+    prepare_packed_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
@@ -67,19 +69,20 @@ def model_forward(
     packed_seq_params: Optional[PackedSeqParams] = None,
     defer_fp32_logits: Optional[bool] = False,
     straggler_timer: Optional[StragglerDetector] = None,
+    use_linear_ce_fusion_loss: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
     Args:
         model: The model to run forward pass on
         data_dict: Dictionary containing batch data
-        cfg: Policy configuration dictionary
         input_ids_cp_sharded: Context-parallel sharded input token IDs
         position_ids: Position IDs for tokens
         attention_mask: Attention mask for the sequence
         packed_seq_params: Parameters for packed sequences (optional)
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
         straggler_timer: Straggler detector for profiling the forward pass
+        use_linear_ce_fusion_loss: Whether to use linear CE fusion loss
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -96,6 +99,11 @@ def model_forward(
         additional_kwargs["packed_seq_params"] = packed_seq_params
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
+    if use_linear_ce_fusion_loss:
+        additional_kwargs["labels"] = input_ids_cp_sharded
+        # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
+        # GPTModel.forward signatures do not accept it.
+        additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
 
     with straggler_timer() if straggler_timer is not None else nullcontext():
         output_tensor = model(
@@ -135,6 +143,7 @@ def forward_with_post_processing_fn(
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
+    use_linear_ce_fusion_loss: bool = False,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -178,6 +187,7 @@ def forward_with_post_processing_fn(
         packed_seq_params=packed_seq_params,
         defer_fp32_logits=defer_fp32_logits,
         straggler_timer=straggler_timer,
+        use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
     )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
@@ -231,6 +241,7 @@ def megatron_forward_backward(
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
+    use_linear_ce_fusion_loss: bool = False,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -263,6 +274,7 @@ def megatron_forward_backward(
         global_valid_toks=global_valid_toks,
         sampling_params=sampling_params,
         straggler_timer=straggler_timer,
+        use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
     )
     forward_backward_func = get_forward_backward_func()
     # The interleaved pipeline schedule (VPP) requires data_iterator to be a list with
@@ -332,9 +344,19 @@ class LossPostProcessor:
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
-            loss_fn_wrapped = SequencePackingLossWrapper(
+            fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
+            if fuse_loss:
+                wrapper_cls = SequencePackingFusionLossWrapper
+                prepare_fn = partial(
+                    prepare_packed_loss_input, sampling_params=self.sampling_params
+                )
+            else:
+                wrapper_cls = SequencePackingLossWrapper
+                prepare_fn = prepare_loss_input_wrapped
+
+            loss_fn_wrapped = wrapper_cls(
                 loss_fn=self.loss_fn,
-                prepare_fn=prepare_loss_input_wrapped,
+                prepare_fn=prepare_fn,
                 cu_seqlens_q=packed_seq_params.cu_seqlens_q,
                 cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
