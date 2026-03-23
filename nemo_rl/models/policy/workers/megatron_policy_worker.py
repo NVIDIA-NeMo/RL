@@ -476,11 +476,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 all_mb_metrics.extend(gb_loss_metrics)
                 losses.append(torch.tensor(mb_losses).sum().item())
 
-        if not eval_mode:
-            # take one LR step every rollout batch
-            # we need to scale the step by gbs to counteract the fact that NeMo automatically
-            # scales lr_warmup_steps by gbs during init
-            self.scheduler.step(increment=gbs)
+                if not eval_mode:
+                    # step LR scheduler after every optimizer step
+                    # we scale the step by gbs to counteract the fact that NeMo automatically
+                    # scales lr_warmup_steps by gbs during init
+                    self.scheduler.step(increment=gbs)
 
         # Aggregate metrics across all microbatches
         mb_metrics = defaultdict(list)
