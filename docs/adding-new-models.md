@@ -148,7 +148,7 @@ Test that vLLM yields near-identical token log-probabilities when comparing deco
 
 ```sh
 # Run that is expected to pass
-uv run --extra vllm tools/model_diagnostics/2.long_generation_decode_vs_prefill.py Qwen/Qwen2.5-1.5B
+uv run --extra vllm tools/model_diagnostics/2.long_generation_decode_vs_prefill.py --model Qwen/Qwen2.5-1.5B
 # ...
 # [Qwen/Qwen2.5-1.5B] ALL GOOD!
 ```

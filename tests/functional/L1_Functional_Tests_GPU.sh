@@ -73,6 +73,7 @@ run_test      uv run --no-sync bash ./tests/functional/sft_megatron_lora.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_resume_diamond.sh
 run_test      uv run --no-sync bash ./tests/functional/test_automodel_extra_installed_correctly.sh
 run_test fast uv run --no-sync bash ./tests/functional/test_converters.sh
+run_test      uv run --no-sync bash ./tests/functional/test_decode_vs_prefill.sh
 run_test      uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh
 run_test      uv run --no-sync bash ./tests/functional/vlm_grpo.sh
 
