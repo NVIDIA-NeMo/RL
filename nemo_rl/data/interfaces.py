@@ -60,6 +60,8 @@ class TaskDataSpec:
 
     system_prompt_file: Optional[PathLike] = None
 
+    teacher_prompt_file: Optional[PathLike] = None
+
     def __post_init__(self) -> None:
         def load_prompt_file(
             prompt_file: Optional[PathLike],

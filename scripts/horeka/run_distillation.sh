@@ -20,9 +20,8 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
 cd /hkfs/work/workspace/scratch/tum_hki2875-myspace/RL
 
-# Install core + fsdp (flash-attn for FSDP2) + vllm (vLLM for generation) extras
-# These are the two extras required for FSDP2 distillation with vLLM-based generation
-uv run python examples/run_distillation.py \
-  policy.model_name="Qwen/Qwen3-1.7B-Base" \
-  teacher.model_name="Qwen/Qwen3-4B" \
-  cluster.gpus_per_node=4
+export WANDB_MODE=offline
+export HF_HOME=/hkfs/work/workspace/scratch/tum_hki2875-myspace/.cache/huggingface
+export HF_HUB_OFFLINE=1
+
+uv run python examples/run_distillation.py

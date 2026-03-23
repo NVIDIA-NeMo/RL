@@ -6,31 +6,31 @@ distillation:
     max_num_steps: 1000
     max_num_epochs: 10
     val_batch_size: 64
-    val_period: 20
-    val_at_start: false
+    val_period: 25
+    val_at_start: true
     val_at_end: false
     max_val_samples: 512
     topk_logits_k: 64
     seed: 42
 
 loss_fn:
-    kl_type: "mixed" # forward, reverse, mixed
+    kl_type: "reverse" # forward, reverse, mixed
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
     zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
 
 checkpointing:
     enabled: true
-    checkpoint_dir: "checkpoints/distillation-${policy.model_name}"
+    checkpoint_dir: "/p/scratch/scifi/kryeziu1/opsd/checkpoints/distillation-${policy.model_name}"
     metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
     higher_is_better: true
     keep_top_k: 3
-    save_period: 10
+    save_period: 25
     checkpoint_must_save_by: null
     model_save_format: "safetensors"
     save_consolidated: false
 
 policy: &POLICY_BASE
-    model_name: "Qwen/Qwen3-1.7B-Base"
+    model_name: "Qwen/Qwen3-1.7B"
     tokenizer:
         name: ${..model_name} ## specify if you'd like to use a tokenizer different from the model's default
         chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
@@ -211,7 +211,7 @@ teacher:
     model_name: "Qwen/Qwen3-4B"
     dtensor_cfg:
         <<: *DTENSOR_BASE
-        context_parallel_size: 2 
+        context_parallel_size: 1
         tensor_parallel_size: 4
 
 data:
@@ -223,7 +223,7 @@ data:
         dataset_name: DeepScaler
     validation:
         dataset_name: AIME2024
-        repeat: 16
+        repeat: 4
     # default settings for all datasets
     default:
         prompt_file: "examples/prompts/cot.txt"
@@ -238,25 +238,20 @@ logger:
     log_dir: "logs/distillation"
     num_val_samples_to_print: 5
     wandb_enabled: true
-    tensorboard_enabled: true
+    tensorboard_enabled: false
     mlflow_enabled: false
     swanlab_enabled: false
     monitor_gpus: true
-    wandb:
-        project: "nemo-distillation"
-        name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
-    swanlab:
-        project: "nemo-distillation"
-        name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
-    tensorboard:
-        log_dir: "tb_logs-distillation-${data.train.dataset_name}"
-    mlflow:
-        experiment_name: "distillation-dev"
-        run_name: "distillation-math-cl-logger"
     gpu_monitoring:
         collection_interval: 10
         flush_interval: 10
+    wandb:
+        project: "nemo-distillation"
+        name: "/p/scratch/scifi/kryeziu1/opsd/logs/distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    swanlab:
+        project: "nemo-distillation"
+        name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
 
 cluster:
-    gpus_per_node: 8
+    gpus_per_node: 4
     num_nodes: 1
