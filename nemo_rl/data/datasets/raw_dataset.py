@@ -58,8 +58,10 @@ class RawDataset:
         self.data_config = data_config
         system_prompt_file = self.data_config.get("system_prompt_file", None)
         prompt_file = self.data_config.get("prompt_file", None)
+        teacher_prompt_file = self.data_config.get("teacher_prompt_file", None)
         self.task_spec = TaskDataSpec(
             task_name=self.task_name,
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
+            teacher_prompt_file=teacher_prompt_file,
         )

@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import warnings
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
@@ -503,6 +504,35 @@ def setup(
 # ===============================================================================
 
 
+def _align_teacher_topk_to_student(
+    teacher_topk_logits: torch.Tensor,
+    teacher_topk_indices: torch.Tensor,
+    teacher_token_mask: torch.Tensor,
+    student_token_mask: torch.Tensor,
+    student_seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Align teacher topk logits from teacher sequence positions to student sequence positions.
+
+    When the teacher uses a different prompt than the student, their sequences have different
+    lengths but share identical response tokens. This function extracts teacher logits at
+    response positions and places them at the corresponding student response positions.
+    """
+    B, _, k = teacher_topk_logits.shape
+
+    aligned_logits = torch.zeros(B, student_seq_len, k, dtype=teacher_topk_logits.dtype)
+    aligned_indices = torch.zeros(B, student_seq_len, k, dtype=teacher_topk_indices.dtype)
+
+    for i in range(B):
+        teacher_resp = teacher_token_mask[i].nonzero(as_tuple=True)[0]
+        student_resp = student_token_mask[i].nonzero(as_tuple=True)[0]
+        n = min(len(teacher_resp), len(student_resp))
+        if n > 0:
+            aligned_logits[i, student_resp[:n]] = teacher_topk_logits[i, teacher_resp[:n]]
+            aligned_indices[i, student_resp[:n]] = teacher_topk_indices[i, teacher_resp[:n]]
+
+    return aligned_logits, aligned_indices
+
+
 def distillation_train(
     student_policy: ColocatablePolicyInterface,
     teacher_policy: ColocatablePolicyInterface,
@@ -660,6 +690,8 @@ def distillation_train(
                     student_generation.finish_generation()
 
                 with timer.time("data_processing"):
+                    has_teacher_ml = "teacher_message_log" in repeated_batch
+
                     # Add loss mask and advantages to each message in LLMMessageLogType
                     for message_log in repeated_batch["message_log"]:
                         for message in message_log:
@@ -671,6 +703,21 @@ def distillation_train(
                                 message["token_loss_mask"] = torch.zeros_like(
                                     message["token_ids"]
                                 )
+
+                    # Copy assistant messages to teacher_message_log and add loss masks
+                    if has_teacher_ml:
+                        for i, student_ml in enumerate(repeated_batch["message_log"]):
+                            teacher_ml = repeated_batch["teacher_message_log"][i]
+                            # Copy non-user messages (assistant, environment) from student rollout
+                            for msg in student_ml:
+                                if msg["role"] != "user":
+                                    teacher_ml.append(deepcopy(msg))
+                            # Add loss masks to teacher message log
+                            for msg in teacher_ml:
+                                if msg["role"] == "assistant":
+                                    msg["token_loss_mask"] = torch.ones_like(msg["token_ids"])
+                                else:
+                                    msg["token_loss_mask"] = torch.zeros_like(msg["token_ids"])
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -696,6 +743,27 @@ def distillation_train(
                     )
                     train_data.to("cpu")
 
+                    # Build separate teacher_data if teacher has a different prompt
+                    if has_teacher_ml:
+                        teacher_flat, teacher_lengths = batched_message_log_to_flat_message(
+                            repeated_batch["teacher_message_log"],
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                            make_sequence_length_divisible_by=master_config["teacher"][
+                                "make_sequence_length_divisible_by"
+                            ],
+                        )
+                        teacher_data = BatchedDataDict(
+                            {
+                                "input_ids": teacher_flat["token_ids"],
+                                "input_lengths": teacher_lengths,
+                                "token_mask": teacher_flat["token_loss_mask"],
+                                "sample_mask": repeated_batch["loss_multiplier"],
+                            }
+                        )
+                        teacher_data.to("cpu")
+                    else:
+                        teacher_data = train_data
+
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
                     teacher_policy.prepare_for_lp_inference()
@@ -703,12 +771,25 @@ def distillation_train(
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
                     teacher_topk = teacher_policy.get_topk_logits(
-                        train_data,
+                        teacher_data,
                         k=master_config["distillation"]["topk_logits_k"],
                         timer=timer,
                     )
-                    train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
-                    train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+
+                    if has_teacher_ml:
+                        # Align teacher topk logits to student sequence positions
+                        aligned_logits, aligned_indices = _align_teacher_topk_to_student(
+                            teacher_topk_logits=teacher_topk["topk_logits"],
+                            teacher_topk_indices=teacher_topk["topk_indices"],
+                            teacher_token_mask=teacher_data["token_mask"],
+                            student_token_mask=train_data["token_mask"],
+                            student_seq_len=train_data["input_ids"].shape[1],
+                        )
+                        train_data["teacher_topk_logits"] = aligned_logits
+                        train_data["teacher_topk_indices"] = aligned_indices
+                    else:
+                        train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+                        train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):

@@ -24,4 +24,7 @@ export WANDB_MODE=offline
 export HF_HOME=/p/project1/envcomp/yll/.cache/huggingface
 export HF_HUB_OFFLINE=1
 
-uv run python examples/run_distillation.py
+uv run python examples/run_distillation.py \
+    policy.model_name="Qwen/Qwen3-1.7B-Base" \
+    policy.optimizer.kwargs.lr=2e-5 \
+    loss_fn.kl_type=mixed

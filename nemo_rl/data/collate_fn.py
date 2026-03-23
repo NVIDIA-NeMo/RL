@@ -59,6 +59,13 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         extra_args["vllm_images"] = vllm_images
         extra_args["vllm_videos"] = vllm_videos
 
+    # Collect teacher_message_log if present in any datum
+    if any("teacher_message_log" in ds for ds in data_batch):
+        extra_args["teacher_message_log"] = [
+            ds.get("teacher_message_log", ds["message_log"])
+            for ds in data_batch
+        ]
+
     output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
         length=length,

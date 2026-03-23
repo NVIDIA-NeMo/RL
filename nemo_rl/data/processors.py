@@ -453,9 +453,9 @@ def math_hf_data_processor(
     idx: int,
 ) -> DatumSpec:
     """Process a datum dictionary (directly loaded from data/hf_datasets/openmathinstruct2.py) into a DatumSpec for the Reward Model Environment."""
-    user_message = datum_dict["messages"]
-    problem = user_message[0]["content"]
-    extra_env_info = {"ground_truth": user_message[1]["content"]}
+    original_messages = datum_dict["messages"]
+    problem = original_messages[0]["content"]
+    extra_env_info = {"ground_truth": original_messages[1]["content"]}
 
     message_log: LLMMessageLogType = []
     formatted_content = (
@@ -480,6 +480,31 @@ def math_hf_data_processor(
     user_message["content"] = message
     message_log.append(user_message)
 
+    # Build teacher message_log if teacher_prompt is configured
+    teacher_message_log = None
+    if task_data_spec.teacher_prompt is not None:
+        # Collect template fields: standard fields + any extra string columns from dataset
+        format_kwargs = {"problem": problem, "answer": original_messages[1]["content"]}
+        for key, value in datum_dict.items():
+            if key not in ("messages", "task_name") and isinstance(value, str):
+                format_kwargs.setdefault(key, value)
+
+        teacher_content = task_data_spec.teacher_prompt.format_map(format_kwargs)
+        teacher_user_msg: dict[str, Any] = {"role": "user", "content": teacher_content}
+        teacher_msg_str: list[str] = tokenizer.apply_chat_template(  # type: ignore
+            [teacher_user_msg],
+            tokenize=False,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+        )
+        teacher_user_msg["token_ids"] = tokenizer(
+            teacher_msg_str,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )["input_ids"][0]
+        teacher_user_msg["content"] = teacher_msg_str
+        teacher_message_log = [teacher_user_msg]
+
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
@@ -499,6 +524,8 @@ def math_hf_data_processor(
         "idx": idx,
         "task_name": datum_dict["task_name"],
     }
+    if teacher_message_log is not None:
+        output["teacher_message_log"] = teacher_message_log
     return output
 
 

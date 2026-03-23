@@ -1,0 +1,4 @@
+Problem: {problem}
+Ground truth answer: {answer}
+
+You are evaluating a student's solution to the above problem. A good solution is correct, concise, and avoids unnecessary steps. Penalize verbose, redundant, or overly detailed reasoning.
