@@ -1645,8 +1645,8 @@ def ppo_train(
                         print(f"[GPU mem] after policy finish_training: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
 
                     if train_results is not None:
-                        print(f"    • Policy loss: {train_results['loss'].item():.4f}")
-                    print(f"    • Value loss: {value_results['loss'].item():.4f}")
+                        print(f"    • Policy loss: {train_results['loss'].mean().item():.4f}")
+                    print(f"    • Value loss: {value_results['loss'].mean().item():.4f}")
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
