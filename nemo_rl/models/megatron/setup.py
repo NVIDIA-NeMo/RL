@@ -15,7 +15,7 @@
 import os
 import time
 import warnings
-from typing import Any, Optional, TypeVar
+from typing import Any, Optional, TypeVar, get_args
 
 import torch
 from megatron.bridge import AutoBridge
@@ -74,7 +74,7 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import CudaGraphScope, PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_megatron_checkpoint_dir,
@@ -486,7 +486,14 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     if "enable_cuda_graph" in config["megatron_cfg"]:
         model_cfg.enable_cuda_graph = config["megatron_cfg"]["enable_cuda_graph"]
         if "cuda_graph_scope" in config["megatron_cfg"]:
-            model_cfg.cuda_graph_scope = config["megatron_cfg"]["cuda_graph_scope"]
+            scope = config["megatron_cfg"]["cuda_graph_scope"]
+            valid_scopes = get_args(CudaGraphScope)
+            if scope not in valid_scopes:
+                raise ValueError(
+                    f"Invalid cuda_graph_scope '{scope}'. "
+                    f"Valid options are: {valid_scopes}"
+                )
+            model_cfg.cuda_graph_scope = scope
             if not model_cfg.enable_cuda_graph:
                 warnings.warn(
                     "cuda_graph_scope is configured but enable_cuda_graph is False. "

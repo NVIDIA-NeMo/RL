@@ -2713,10 +2713,10 @@ def test_cuda_graph_config_parsing():
     config_with_scope = create_megatron_test_config(
         model_name="test-model",
         enable_cuda_graph=True,
-        cuda_graph_scope="full_model",
+        cuda_graph_scope="full_iteration",
     )
     assert config_with_scope["megatron_cfg"]["enable_cuda_graph"] is True
-    assert config_with_scope["megatron_cfg"]["cuda_graph_scope"] == "full_model"
+    assert config_with_scope["megatron_cfg"]["cuda_graph_scope"] == "full_iteration"
 
     # Test config with CUDA graph disabled
     config_disabled = create_megatron_test_config(
