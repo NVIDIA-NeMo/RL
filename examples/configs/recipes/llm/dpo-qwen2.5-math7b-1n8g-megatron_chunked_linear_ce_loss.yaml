@@ -1,20 +1,15 @@
 defaults: ../../dpo.yaml
 dpo:
-  max_num_epochs: 100
-  max_num_steps: 100
-  val_period: 0
-  val_at_start: false
-  reference_policy_kl_penalty: 0.5
-  preference_average_log_probs: true
+  max_num_steps: 10
 checkpointing:
   enabled: false
 policy:
   model_name: Qwen/Qwen2.5-Math-7B
   tokenizer:
     name: ${policy.model_name}
-  train_global_batch_size: 4
+  train_global_batch_size: 32
   train_micro_batch_size: 1
-  max_total_sequence_length: 2048
+  max_total_sequence_length: 6000
   dtensor_cfg:
     enabled: false
   megatron_cfg:
@@ -22,35 +17,24 @@ policy:
     use_linear_ce_fusion_loss: true
     linear_ce_fusion_chunk_size: 128
     tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
     attention_backend: unfused
     freeze_moe_router: true
     moe_router_bias_update_rate: 0.0
     moe_permute_fusion: true
     optimizer:
       lr: 1.0e-06
-      min_lr: 1.0e-07
+      min_lr: 1.0e-06
       adam_beta2: 0.999
       use_distributed_optimizer: false
       use_precision_aware_optimizer: false
     scheduler:
-      lr_warmup_iters: 0
-      lr_warmup_init: 1.0e-07
-      lr_decay_iters: 200
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-11
+      lr_decay_iters: 32
   make_sequence_length_divisible_by: 8
 data:
-  num_workers: 4
-  train:
-    dataset_name: BinaryPreferenceDataset
-    data_path: /fsx/peng/workspace/nemo-rl-oss/RL/data/self_identity_dpo_200.jsonl
-    prompt_key: prompt
-    chosen_key: chosen
-    rejected_key: rejected
-  validation: null
-  default:
-    dataset_name: BinaryPreferenceDataset
-    prompt_key: prompt
-    chosen_key: chosen
-    rejected_key: rejected
+  num_workers: 8
 logger:
   wandb:
     project: nemo-rl
