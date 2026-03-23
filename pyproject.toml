@@ -82,6 +82,7 @@ vllm = [
   "vllm==0.17.0",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.4",
+  "nvidia-cutlass-dsl>=4.4.0.dev1",
 ]
 sglang = [
   "sglang",
@@ -250,7 +251,8 @@ override-dependencies = [
   #   megatron-core (3rdparty/Megatron-LM-workspace/Megatron-LM/pyproject.toml): flashinfer-python~=0.5.0
   "flashinfer-python==0.6.4",
   "flashinfer-cubin==0.6.4",
-  # flashinfer 0.6.4 needs nvidia-cutlass-dsl>=4.3.4, but sglang pins 4.2.1. Relax to allow both.
+  # sglang pins nvidia-cutlass-dsl==4.2.1, conflicting with flashinfer 0.6.4 (>=4.3.4) and vllm (>=4.4.0.dev1).
+  # Override to >=4.2.1 so uv can resolve to a version satisfying all three.
   "nvidia-cutlass-dsl>=4.2.1",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
