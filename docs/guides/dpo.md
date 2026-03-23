@@ -195,6 +195,36 @@ The DPO implementation in NeMo RL supports several key parameters that can be ad
 
 These parameters can be adjusted in the config file or via command-line overrides to optimize training for your specific use case.
 
+## Optimizations
+
+### Chunked Linear Cross-Entropy Fusion Loss
+
+During standard DPO training the model materializes a full logit tensor of shape `[batch_size, seq_length, vocab_size]` for both the policy forward-backward pass and the reference model logprob computation. This can cause out-of-memory (OOM) errors for long sequences or large vocabularies. The **chunked linear cross-entropy fusion loss** avoids this by computing log probabilities directly from the hidden states: it chunks the sequence dimension, projects each chunk to logits on the fly, gathers per-token log probabilities, and discards the logits before moving to the next chunk.
+
+**Benefits:**
+
+- Extends the maximum trainable sequence length significantly by eliminating the large logit tensor from GPU memory.
+- Applies to both the training forward-backward pass and the reference model logprob computation.
+- Produces numerically equivalent loss values to the standard path.
+
+**How to enable:**
+
+Add the following to your Megatron config in your YAML file:
+
+```yaml
+policy:
+  megatron_cfg:
+    enabled: true
+    use_linear_ce_fusion_loss: true
+    linear_ce_fusion_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
+```
+
+**Notes:**
+
+- Context parallelism is not supported when linear CE fusion is enabled.
+- Sequence packing is not supported with DPO regardless of this setting (see [#719](https://github.com/NVIDIA-NeMo/RL/issues/719)).
+- The `linear_ce_fusion_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
+
 ## Evaluate the Trained Model
 
 Upon completion of the training process, you can refer to our [evaluation guide](eval.md) to assess model capabilities.
