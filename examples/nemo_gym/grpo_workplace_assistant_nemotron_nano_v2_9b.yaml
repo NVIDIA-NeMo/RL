@@ -66,6 +66,7 @@ checkpointing:
   keep_top_k: 3
   save_period: 6  # Save checkpoint every 6 steps (aligned with val_period)
   checkpoint_must_save_by: null
+  save_optimizer: true
 
 policy:
   model_name: "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
