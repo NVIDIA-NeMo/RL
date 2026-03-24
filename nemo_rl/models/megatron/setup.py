@@ -58,7 +58,6 @@ from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.utils import unwrap_model
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
@@ -76,6 +75,11 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
+from nemo_rl.models.megatron.draft.utils import (
+    build_draft_model,
+    find_draft_owner_chunk,
+    get_attached_draft_model,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -650,161 +654,6 @@ def _create_megatron_config(
     )
 
 
-def build_unwrapped_draft_model(
-    model_provider,
-    draft_config: dict[str, Any],
-    pg_collection: ProcessGroupCollection,
-) -> MegatronModule | None:
-    """Build an Eagle draft model before parent mixed-precision/DDP wrapping."""
-    if not draft_config.get("enabled", False):
-        return None
-
-    from transformers import AutoConfig
-
-    from nemo_rl.models.megatron.draft import (
-        EagleModel,
-        get_eagle3_aux_hidden_state_layers,
-        load_hf_weights_to_eagle,
-    )
-
-    model_name = draft_config.get("model_name")
-    hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
-    draft_num_layers = draft_config.get("num_layers")
-    config = TransformerConfig(
-        normalization="RMSNorm",
-        activation_func=torch.nn.functional.silu,
-        gated_linear_unit=True,
-        hidden_dropout=0.0,
-        attention_softmax_in_fp32=False,
-        tensor_model_parallel_size=model_provider.tensor_model_parallel_size,
-        pipeline_model_parallel_size=model_provider.pipeline_model_parallel_size,
-        expert_tensor_parallel_size=model_provider.expert_tensor_parallel_size,
-        sequence_parallel=model_provider.sequence_parallel,
-        use_cpu_initialization=model_provider.use_cpu_initialization,
-        fp16=model_provider.fp16,
-        bf16=model_provider.bf16,
-        params_dtype=model_provider.params_dtype,
-        pipeline_dtype=model_provider.pipeline_dtype,
-        num_layers=(
-            hf_config.get("num_hidden_layers", 1)
-            if model_name is not None
-            else draft_num_layers or 1
-        ),
-        ffn_hidden_size=hf_config.get(
-            "intermediate_size", model_provider.ffn_hidden_size
-        ),
-        num_attention_heads=hf_config.get(
-            "num_attention_heads", model_provider.num_attention_heads
-        ),
-        kv_channels=hf_config.get("head_dim", model_provider.kv_channels),
-        num_query_groups=hf_config.get(
-            "num_key_value_heads", model_provider.num_query_groups
-        ),
-        init_method_std=model_provider.init_method_std,
-        layernorm_epsilon=hf_config.get(
-            "rms_norm_eps", model_provider.layernorm_epsilon
-        ),
-        add_bias_linear=hf_config.get("mlp_bias", model_provider.add_bias_linear),
-        attention_dropout=hf_config.get(
-            "attention_dropout", model_provider.attention_dropout
-        ),
-    )
-
-    config.transformer_layer_spec = None
-    config.hidden_size = hf_config.get("hidden_size", model_provider.hidden_size)
-    config.vocab_size = config.draft_vocab_size = hf_config.get(
-        "vocab_size", model_provider.vocab_size
-    )
-    config.seq_length = model_provider.seq_length
-    config.gradient_accumulation_fusion = False
-    config.position_embedding_type = hf_config.get(
-        "position_embedding_type", model_provider.position_embedding_type
-    )
-    config.rotary_percent = model_provider.rotary_percent
-    config.rotary_base = hf_config.get("rope_theta", model_provider.rotary_base)
-    config.rope_scaling = (
-        "rope_scaling" in hf_config if hf_config else model_provider.rope_scaling
-    )
-    config.rope_scaling_factor = (
-        hf_config.get("rope_scaling", {}).get("factor")
-        if hf_config
-        else model_provider.rope_scaling_factor
-    )
-
-    config.draft_vocab_size = hf_config.get("vocab_size", model_provider.vocab_size)
-    config.use_input_layernorm_in_first_layer = hf_config.get(
-        "use_input_layernorm_in_first_layer", True
-    )
-    config.use_last_layernorm = hf_config.get("use_last_layernorm", True)
-    config.use_aux_hidden_state = hf_config.get("use_aux_hidden_state", True)
-    if model_name is not None:
-        config.eagle_aux_hidden_state_layer_ids = hf_config.get(
-            "eagle_aux_hidden_state_layer_ids", []
-        )
-    else:
-        config.eagle_aux_hidden_state_layer_ids = (
-            draft_config.get("aux_layer_indices") or []
-        )
-    if (
-        config.use_aux_hidden_state
-        and len(config.eagle_aux_hidden_state_layer_ids) == 0
-    ):
-        config.eagle_aux_hidden_state_layer_ids = get_eagle3_aux_hidden_state_layers(
-            model_provider.num_layers
-        )
-
-    config.parallel_draft_step = 1
-    config.use_mtp_layernorm = config.parallel_draft_heads_num_layers = None
-    config.has_lm_head = False
-
-    draft_model = EagleModel(config=config)
-    tp_group = getattr(pg_collection, "tp", None)
-    if tp_group is not None:
-        for module in draft_model.modules():
-            if hasattr(module, "pg_collection"):
-                module.pg_collection = pg_collection
-            if hasattr(module, "_pg_collection"):
-                module._pg_collection = pg_collection
-            if hasattr(module, "tp_group"):
-                module.tp_group = tp_group
-            if hasattr(module, "_tp_group"):
-                module._tp_group = tp_group
-
-    if model_name is not None:
-        missing_keys, unexpected_keys = load_hf_weights_to_eagle(
-            draft_model, model_name
-        )
-        if missing_keys:
-            print(f"[draft] Missing keys after draft load: {missing_keys}")
-        if unexpected_keys:
-            print(f"[draft] Unexpected keys after draft load: {unexpected_keys}")
-
-    return draft_model
-
-
-def _find_draft_owner_chunk(model: list[MegatronModule]) -> MegatronModule | None:
-    """Return the post-process chunk that should own the nested draft model."""
-    for model_chunk in reversed(model):
-        if getattr(model_chunk, "post_process", False):
-            return model_chunk
-        language_model = getattr(model_chunk, "language_model", None)
-        if language_model is not None and getattr(
-            language_model, "post_process", False
-        ):
-            return model_chunk
-    return None
-
-
-def _get_attached_draft_model(model: list[MegatronModule]) -> MegatronModule | None:
-    """Find an already attached draft model after Megatron wrapping has been applied."""
-    for model_chunk in reversed(model):
-        unwrapped_chunk = unwrap_model(model_chunk)
-        draft_model = getattr(unwrapped_chunk, "draft_model", None)
-        if draft_model is not None:
-            return draft_model
-    return None
-
-
 def _create_draft_pre_wrap_hook(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -842,7 +691,7 @@ def _create_draft_pre_wrap_hook(
                 ignore_ckpt_step=True,
             )
 
-        draft_owner = _find_draft_owner_chunk(model)
+        draft_owner = find_draft_owner_chunk(model)
         if draft_owner is None:
             return model
 
@@ -852,10 +701,11 @@ def _create_draft_pre_wrap_hook(
             )
 
         pg_collection = get_pg_collection(model)
-        draft_model = build_unwrapped_draft_model(
+        draft_model = build_draft_model(
             megatron_cfg.model,
             draft_config=draft_cfg,
             pg_collection=pg_collection,
+            policy_model_chunk=draft_owner,
         )
         if draft_model is not None:
             setattr(draft_owner, "draft_model", draft_model)
@@ -1067,7 +917,7 @@ def setup_model_and_optimizer(
         print("Checkpoint loaded")
     torch.distributed.barrier()
 
-    draft_model = _get_attached_draft_model(model)
+    draft_model = get_attached_draft_model(model)
 
     # Set the param sync function for the model
     param_sync_func = None

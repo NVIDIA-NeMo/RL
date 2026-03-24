@@ -123,6 +123,35 @@ def prepare_loss_input(
             "teacher_topk_logprobs": teacher_topk_logprobs,
             "H_all": H_all,
         }
+    elif loss_fn.input_type == LossInputType.DRAFT:
+        from megatron.core.transformer.multi_token_prediction import roll_tensor
+
+        teacher_logits = roll_tensor(
+            logits.detach(),
+            shifts=-1,
+            dims=1,
+            cp_group=context_parallel_group,
+        )[0]
+        if "t2d" in data:
+            t2d = data["t2d"].to(teacher_logits.device)
+            if vocab_parallel_group is not None:
+                from megatron.core.transformer.utils import (
+                    gather_from_tensor_model_parallel_region,
+                )
+
+                teacher_logits = gather_from_tensor_model_parallel_region(
+                    teacher_logits, vocab_parallel_group
+                )
+            teacher_logits = teacher_logits[:, :, t2d]
+
+        token_mask = roll_tensor(
+            data["token_mask"], shifts=-1, dims=1, cp_group=context_parallel_group
+        )[0]
+        loss_input = {
+            "teacher_logits": teacher_logits,
+            "student_logits": data["student_logits"],
+            "token_mask": token_mask,
+        }
 
     else:
         raise ValueError(f"Unknown loss function input type: {loss_fn.input_type}")

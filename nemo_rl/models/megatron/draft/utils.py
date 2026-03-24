@@ -18,12 +18,13 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
-from megatron.core.transformer import TransformerConfig
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.training.utils import unwrap_model
 from torch import Tensor
 
@@ -91,6 +92,7 @@ def _resolve_optional_key(
 class _EagleModelLayout:
     layers: tuple[_EagleLayerLayout, ...]
     final_norm_key: str | None
+    lm_head_key: str | None
 
     @classmethod
     def detect(cls, model_state: Mapping[str, Tensor]) -> _EagleModelLayout:
@@ -117,6 +119,11 @@ class _EagleModelLayout:
             model_keys,
             "eagle_module.decoder.final_layernorm.weight",
             "eagle_module.norm.weight",
+        )
+        lm_head_key = _resolve_optional_key(
+            model_keys,
+            "eagle_module.eagle_output_layer.weight",
+            "eagle_module.lm_head.weight",
         )
         global_hidden_norm_key = _resolve_optional_key(
             model_keys,
@@ -158,6 +165,7 @@ class _EagleModelLayout:
         return cls(
             layers=layers,
             final_norm_key=final_norm_key,
+            lm_head_key=lm_head_key,
         )
 
     @property
@@ -369,9 +377,27 @@ def _gather_tp_gate_up_weight(
 
 def _gather_tp_weight_if_needed(
     local_weight: Tensor,
-    expected_shape: tuple[int, ...],
-    split_axis: int,
+    expected_shape_or_tp_group: tuple[int, ...] | dist.ProcessGroup | None,
+    split_axis: int | None = None,
 ) -> Tensor:
+    if split_axis is None:
+        tp_group = expected_shape_or_tp_group
+        if tp_group is None or not dist.is_available() or not dist.is_initialized():
+            return local_weight
+
+        tp_world_size = dist.get_world_size(tp_group)
+        if tp_world_size <= 1:
+            return local_weight
+
+        gathered = [torch.empty_like(local_weight) for _ in range(tp_world_size)]
+        dist.all_gather(gathered, local_weight.contiguous(), group=tp_group)
+        return torch.cat(gathered, dim=0).contiguous()
+
+    expected_shape = expected_shape_or_tp_group
+    if not isinstance(expected_shape, tuple):
+        raise TypeError(
+            "expected_shape_or_tp_group must be a shape tuple when split_axis is set."
+        )
     if tuple(local_weight.shape) == expected_shape:
         return local_weight
 
@@ -659,6 +685,8 @@ def _build_split_axis_by_parameter(layout: _EagleModelLayout) -> dict[str, int]:
     split_axis_by_parameter = {
         "eagle_module.fc.weight": 0,
     }
+    if layout.lm_head_key is not None:
+        split_axis_by_parameter[layout.lm_head_key] = 0
     for layer in layout.layers:
         split_axis_by_parameter[layer.qkv_weight_key] = 0
         split_axis_by_parameter[layer.proj_weight_key] = 1
@@ -802,6 +830,14 @@ def _map_hf_state_to_eagle_state(
                 )
             mapped_state[layout.final_norm_key] = hf_weight
             continue
+        if hf_key in {"lm_head.weight", "eagle_output_layer.weight"}:
+            if layout.lm_head_key is None:
+                raise RuntimeError(
+                    "[draft] Checkpoint contains draft LM-head weights but the "
+                    "Eagle model does not expose a matching output layer."
+                )
+            mapped_state[layout.lm_head_key] = hf_weight
+            continue
 
         parsed_layer_key = _parse_layer_checkpoint_key(hf_key)
         if parsed_layer_key is None:
@@ -885,6 +921,29 @@ def _require_state_tensor(
             "exporting weights."
         )
     return source_state[parameter_name]
+
+
+def find_draft_owner_chunk(model: list[MegatronModule]) -> MegatronModule | None:
+    """Return the post-process chunk that should own the nested draft model."""
+    for model_chunk in reversed(model):
+        if getattr(model_chunk, "post_process", False):
+            return model_chunk
+        language_model = getattr(model_chunk, "language_model", None)
+        if language_model is not None and getattr(
+            language_model, "post_process", False
+        ):
+            return model_chunk
+    return None
+
+
+def get_attached_draft_model(model: list[MegatronModule]) -> MegatronModule | None:
+    """Find an already attached draft model after Megatron wrapping has been applied."""
+    for model_chunk in reversed(model):
+        unwrapped_chunk = unwrap_model(model_chunk)
+        draft_model = getattr(unwrapped_chunk, "draft_model", None)
+        if draft_model is not None:
+            return draft_model
+    return None
 
 
 def _export_layer_weights_to_hf(
@@ -999,5 +1058,253 @@ def export_eagle_weights_to_hf(
                 _require_state_tensor(source_state, layout.final_norm_key),
             )
         )
+    if layout.lm_head_key is not None:
+        hf_state.append(
+            (
+                "lm_head.weight",
+                _gather_tp_weight_if_needed(
+                    _require_state_tensor(source_state, layout.lm_head_key),
+                    (config.draft_vocab_size, config.hidden_size),
+                    split_axis=0,
+                ),
+            )
+        )
 
     return hf_state
+
+
+def get_policy_lm_head_weight(policy_model_chunk: MegatronModule) -> torch.Tensor:
+    """Return the local policy LM-head shard for draft initialization."""
+    unwrapped_policy_model = unwrap_model(policy_model_chunk)
+    if getattr(unwrapped_policy_model, "share_embeddings_and_output_weights", False):
+        return unwrapped_policy_model.shared_embedding_or_output_weight()
+    return unwrapped_policy_model.output_layer.weight
+
+
+def _get_draft_output_layer(draft_model: MegatronModule):
+    draft_output_layer = getattr(
+        getattr(draft_model, "eagle_module", None), "eagle_output_layer", None
+    )
+    if draft_output_layer is None:
+        raise RuntimeError(
+            "[draft] Draft model was configured with has_lm_head=True but does not "
+            "expose eagle_output_layer."
+        )
+    return draft_output_layer
+
+
+def _get_draft_to_target_token_mapping(
+    draft_model: MegatronModule,
+    device: torch.device,
+) -> torch.Tensor:
+    draft_vocab_size = int(draft_model.config.draft_vocab_size)
+    reverse_mapping = torch.arange(draft_vocab_size, device=device, dtype=torch.long)
+    d2t = getattr(draft_model.eagle_module, "d2t", None)
+    if d2t is not None:
+        reverse_mapping = reverse_mapping + d2t.to(device=device, dtype=torch.long)
+    return reverse_mapping
+
+
+def copy_policy_lm_head_to_draft(
+    *,
+    draft_model: MegatronModule,
+    policy_model_chunk: MegatronModule,
+) -> None:
+    """Initialize the draft LM head from the policy LM head shard."""
+    draft_output_layer = _get_draft_output_layer(draft_model)
+    tp_group = getattr(draft_output_layer, "tp_group", None) or getattr(
+        draft_output_layer, "_tp_group", None
+    )
+    policy_lm_head_weight = get_policy_lm_head_weight(policy_model_chunk).detach()
+    policy_lm_head_weight = _gather_tp_weight_if_needed(policy_lm_head_weight, tp_group)
+    draft_token_mapping = _get_draft_to_target_token_mapping(
+        draft_model,
+        device=policy_lm_head_weight.device,
+    )
+    if draft_token_mapping.numel() == 0:
+        raise RuntimeError("[draft] Draft token mapping is empty.")
+    if int(draft_token_mapping.max().item()) >= policy_lm_head_weight.shape[0]:
+        raise RuntimeError(
+            "[draft] Cannot initialize draft LM head from policy LM head because "
+            f"the draft token mapping references policy vocab index {int(draft_token_mapping.max().item())}, "
+            f"but the gathered policy LM head only has {policy_lm_head_weight.shape[0]} rows."
+        )
+
+    selected_policy_weight = policy_lm_head_weight.index_select(0, draft_token_mapping)
+    if tp_group is not None and dist.is_initialized():
+        tp_world_size = dist.get_world_size(tp_group)
+        if tp_world_size > 1:
+            if selected_policy_weight.shape[0] % tp_world_size != 0:
+                raise RuntimeError(
+                    "[draft] Cannot shard selected policy LM head rows across TP "
+                    f"world size {tp_world_size}: rows={selected_policy_weight.shape[0]}."
+                )
+            tp_rank = dist.get_rank(tp_group)
+            selected_policy_weight = torch.chunk(
+                selected_policy_weight,
+                tp_world_size,
+                dim=0,
+            )[tp_rank].contiguous()
+
+    if draft_output_layer.weight.shape != selected_policy_weight.shape:
+        raise RuntimeError(
+            "[draft] Cannot initialize draft LM head from policy LM head because "
+            f"their local shard shapes differ after draft-vocab selection: "
+            f"draft={tuple(draft_output_layer.weight.shape)} "
+            f"policy_selected={tuple(selected_policy_weight.shape)}."
+        )
+
+    with torch.no_grad():
+        draft_output_layer.weight.copy_(
+            selected_policy_weight.to(
+                device=draft_output_layer.weight.device,
+                dtype=draft_output_layer.weight.dtype,
+            )
+        )
+
+
+def build_draft_model(
+    model_provider,
+    draft_config: dict[str, Any],
+    pg_collection: ProcessGroupCollection,
+    policy_model_chunk: MegatronModule,
+) -> MegatronModule | None:
+    """Build an Eagle draft model before parent mixed-precision/DDP wrapping."""
+    if not draft_config["enabled"]:
+        return None
+
+    from transformers import AutoConfig
+
+    from nemo_rl.models.megatron.draft.eagle import EagleModel
+    from nemo_rl.models.megatron.draft.hidden_capture import (
+        get_eagle3_aux_hidden_state_layers,
+    )
+
+    model_name = draft_config.get("model_name")
+    hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
+    draft_num_layers = draft_config.get("num_layers")
+    config = TransformerConfig(
+        normalization="RMSNorm",
+        activation_func=torch.nn.functional.silu,
+        gated_linear_unit=True,
+        hidden_dropout=0.0,
+        attention_softmax_in_fp32=False,
+        tensor_model_parallel_size=model_provider.tensor_model_parallel_size,
+        pipeline_model_parallel_size=model_provider.pipeline_model_parallel_size,
+        expert_tensor_parallel_size=model_provider.expert_tensor_parallel_size,
+        sequence_parallel=model_provider.sequence_parallel,
+        use_cpu_initialization=model_provider.use_cpu_initialization,
+        fp16=model_provider.fp16,
+        bf16=model_provider.bf16,
+        params_dtype=model_provider.params_dtype,
+        pipeline_dtype=model_provider.pipeline_dtype,
+        num_layers=(
+            hf_config.get("num_hidden_layers", 1)
+            if model_name is not None
+            else draft_num_layers or 1
+        ),
+        ffn_hidden_size=hf_config.get(
+            "intermediate_size", model_provider.ffn_hidden_size
+        ),
+        num_attention_heads=hf_config.get(
+            "num_attention_heads", model_provider.num_attention_heads
+        ),
+        kv_channels=hf_config.get("head_dim", model_provider.kv_channels),
+        num_query_groups=hf_config.get(
+            "num_key_value_heads", model_provider.num_query_groups
+        ),
+        init_method_std=model_provider.init_method_std,
+        layernorm_epsilon=hf_config.get(
+            "rms_norm_eps", model_provider.layernorm_epsilon
+        ),
+        add_bias_linear=hf_config.get("mlp_bias", model_provider.add_bias_linear),
+        attention_dropout=hf_config.get(
+            "attention_dropout", model_provider.attention_dropout
+        ),
+    )
+
+    config.transformer_layer_spec = None
+    config.hidden_size = hf_config.get("hidden_size", model_provider.hidden_size)
+    config.vocab_size = hf_config.get("vocab_size", model_provider.vocab_size)
+    config.draft_vocab_size = hf_config.get("draft_vocab_size", config.vocab_size)
+    config.seq_length = model_provider.seq_length
+    config.gradient_accumulation_fusion = False
+    config.position_embedding_type = hf_config.get(
+        "position_embedding_type", model_provider.position_embedding_type
+    )
+    config.rotary_percent = model_provider.rotary_percent
+    config.rotary_base = hf_config.get("rope_theta", model_provider.rotary_base)
+    config.rope_scaling = (
+        "rope_scaling" in hf_config if hf_config else model_provider.rope_scaling
+    )
+    config.rope_scaling_factor = (
+        hf_config.get("rope_scaling", {}).get("factor")
+        if hf_config
+        else model_provider.rope_scaling_factor
+    )
+
+    config.use_input_layernorm_in_first_layer = hf_config.get(
+        "use_input_layernorm_in_first_layer", True
+    )
+    config.use_last_layernorm = hf_config.get("use_last_layernorm", True)
+    config.use_aux_hidden_state = hf_config.get("use_aux_hidden_state", True)
+    if model_name is not None:
+        config.eagle_aux_hidden_state_layer_ids = hf_config.get(
+            "eagle_aux_hidden_state_layer_ids", []
+        )
+    else:
+        config.eagle_aux_hidden_state_layer_ids = (
+            draft_config.get("aux_layer_indices") or []
+        )
+    if (
+        config.use_aux_hidden_state
+        and len(config.eagle_aux_hidden_state_layer_ids) == 0
+    ):
+        config.eagle_aux_hidden_state_layer_ids = get_eagle3_aux_hidden_state_layers(
+            model_provider.num_layers
+        )
+
+    config.parallel_draft_step = 1
+    config.use_mtp_layernorm = config.parallel_draft_heads_num_layers = None
+    config.has_lm_head = True
+
+    draft_model = EagleModel(config=config)
+    tp_group = getattr(pg_collection, "tp", None)
+    if tp_group is not None:
+        for module in draft_model.modules():
+            if hasattr(module, "pg_collection"):
+                module.pg_collection = pg_collection
+            if hasattr(module, "_pg_collection"):
+                module._pg_collection = pg_collection
+            if hasattr(module, "tp_group"):
+                module.tp_group = tp_group
+            if hasattr(module, "_tp_group"):
+                module._tp_group = tp_group
+
+    if model_name is not None:
+        missing_keys, unexpected_keys = load_hf_weights_to_eagle(
+            draft_model, model_name
+        )
+        draft_lm_head_key = "eagle_module.eagle_output_layer.weight"
+        if draft_lm_head_key in missing_keys:
+            copy_policy_lm_head_to_draft(
+                draft_model=draft_model,
+                policy_model_chunk=policy_model_chunk,
+            )
+            missing_keys = [key for key in missing_keys if key != draft_lm_head_key]
+            print(
+                "[draft] Draft checkpoint did not contain lm_head.weight; "
+                "initialized draft LM head from the policy output layer."
+            )
+        if missing_keys:
+            print(f"[draft] Missing keys after draft load: {missing_keys}")
+        if unexpected_keys:
+            print(f"[draft] Unexpected keys after draft load: {unexpected_keys}")
+    else:
+        copy_policy_lm_head_to_draft(
+            draft_model=draft_model,
+            policy_model_chunk=policy_model_chunk,
+        )
+        print("[draft] Initialized draft LM head from the policy output layer.")
+
+    return draft_model

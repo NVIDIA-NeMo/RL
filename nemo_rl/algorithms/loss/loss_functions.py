@@ -24,20 +24,39 @@ from nemo_rl.distributed.model_utils import DistributedCrossEntropy
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
-class DraftCrossEntropyLossFn:
+class DraftCrossEntropyLossConfig(TypedDict):
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup]
+
+
+class DraftCrossEntropyLossDataDict(TypedDict):
+    teacher_logits: Tensor
+    student_logits: Tensor
+    token_mask: Tensor
+    sample_mask: Tensor
+    student_vocab_indices: NotRequired[Tensor]
+
+
+class DraftCrossEntropyLossFn(LossFunction):
     """Compute the auxiliary soft-target cross-entropy used for draft-model training."""
+
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.DRAFT
 
     def __init__(
         self,
+        vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
 
     def __call__(
         self,
-        teacher_logits: torch.Tensor,
-        student_logits: torch.Tensor,
-        mask: torch.Tensor,
+        teacher_logits: Tensor,
+        student_logits: Tensor,
+        token_mask: Tensor,
+        data: BatchedDataDict[DraftCrossEntropyLossDataDict],
+        global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
     ) -> torch.Tensor:
         """Reduce the masked per-token draft loss to a scalar."""
@@ -54,6 +73,7 @@ class DraftCrossEntropyLossFn:
             student_log_probs = torch.nn.functional.log_softmax(student_logits, dim=-1)
             per_token_loss = -(teacher_probs * student_log_probs).sum(dim=-1)
 
+        mask = token_mask * data["sample_mask"].unsqueeze(-1)
         return masked_mean(
             per_token_loss,
             mask,

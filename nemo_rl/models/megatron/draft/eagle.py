@@ -19,7 +19,6 @@ from typing import Optional, Tuple
 import torch
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings import RotaryEmbedding
-from megatron.core.tensor_parallel import ColumnParallelLinear
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -27,28 +26,6 @@ from megatron.core.transformer.utils import (
 )
 from modelopt.torch.speculative.plugins.megatron_eagle import EagleModule
 from torch import Tensor
-
-
-def build_default_causal_attention_mask(seq_len: int, device: torch.device) -> Tensor:
-    """Build a standard causal mask in Megatron's `[batch, heads, q, k]` layout."""
-    return torch.triu(
-        torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool, device=device),
-        diagonal=1,
-    )
-
-
-def shift_attention_mask_for_next_token_inputs(attention_mask: Tensor) -> Tensor:
-    """Align a causal mask with left-shifted next-token draft inputs."""
-    if attention_mask.ndim != 4 or attention_mask.shape[-1] != attention_mask.shape[-2]:
-        raise ValueError(
-            "EagleModel.forward expects a square attention mask with shape [b, 1, s, s]."
-        )
-
-    shifted_attention_mask = attention_mask.clone()
-    shifted_attention_mask[:, :, :-1, :-1] = attention_mask[:, :, 1:, 1:]
-    shifted_attention_mask[:, :, -1, :] = True
-    shifted_attention_mask[:, :, :, -1] = True
-    return shifted_attention_mask.contiguous()
 
 
 class EagleModel(MegatronModule):
@@ -72,16 +49,6 @@ class EagleModel(MegatronModule):
         )
         self.eagle_module = EagleModule(
             config=config, rotary_pos_emb=rotary_pos_emb, bias=False
-        )
-        self.lm_head = ColumnParallelLinear(
-            config.hidden_size,
-            config.vocab_size,
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            gather_output=False,
-            skip_bias_add=True,
-            skip_weight_param_allocation=True,
         )
 
     def sharded_state_dict(
@@ -138,11 +105,7 @@ class EagleModel(MegatronModule):
         input_embeds: Tensor,
         attention_mask: Optional[Tensor] = None,
         bootstrap_hidden_states: bool = True,
-        lm_head_weight: Optional[Tensor] = None,
     ) -> Tensor:
-        if lm_head_weight is None:
-            raise ValueError("EagleModel.forward requires an LM head weight tensor.")
-
         if bootstrap_hidden_states:
             hidden_states = self.eagle_module.fc(hidden_states)[0]
         elif hidden_states.shape[-1] != self.config.hidden_size:
@@ -151,13 +114,11 @@ class EagleModel(MegatronModule):
                 f"`bootstrap_hidden_states=False`, got {hidden_states.shape[-1]}."
             )
 
-        attention_mask = shift_attention_mask_for_next_token_inputs(attention_mask)
-
         hidden_states, _ = self.eagle_module(
             embeddings=input_embeds,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
         )
-        logits, _ = self.lm_head(hidden_states, weight=lm_head_weight.detach())
+        logits, _ = self.eagle_module.eagle_output_layer(hidden_states)
         logits = logits.transpose(0, 1).contiguous()
         return logits

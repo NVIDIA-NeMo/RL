@@ -19,11 +19,13 @@ If you are using a separately trained Eagle checkpoint, make sure its `eagle_con
 
 ```json
 {
-  "has_lm_head": false
+  "has_lm_head": true
 }
 ```
 
-NeMo RL shares the policy LM head with the draft model during training and refit, so the Eagle checkpoint should not expect its own LM head.
+NeMo RL now keeps a trainer-owned draft LM head. If the draft checkpoint contains
+`lm_head.weight`, NeMo RL loads it into the draft model. If that weight is absent,
+NeMo RL initializes the draft LM head from the current policy output layer instead.
 
 ## Enablement
 
@@ -167,4 +169,3 @@ where `lambda` is `policy.draft.loss_weight`.
 - When online draft training is enabled, NeMo RL logs `draft_loss`.
 - Resume checkpoints include the nested draft model state when `policy.draft.enabled=true`.
 - If speculative decoding is enabled without trainer-owned draft weights, vLLM must load real draft weights at startup. When the trainer owns the draft model, the first refit pushes both policy and draft parameters.
-

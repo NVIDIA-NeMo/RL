@@ -96,6 +96,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
                 "Set policy.megatron_cfg.enabled=true or disable policy.draft."
             )
+        if draft_enabled and bool(
+            config.get("sequence_packing", {}).get("enabled", False)
+        ):
+            raise ValueError(
+                "policy.draft.enabled=true does not support sequence packing yet. "
+                "Disable policy.sequence_packing.enabled or policy.draft."
+            )
         if megatron_enable:
             worker_builder_cls_fqn = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
