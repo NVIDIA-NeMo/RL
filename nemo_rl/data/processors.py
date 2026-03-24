@@ -533,12 +533,16 @@ def vlm_hf_data_processor(
         pass  # AVQA data is already formatted by AVQADataset.format_data
     elif datum_dict["task_name"] == "aishell":
         pass  # AISHELL data is already formatted by AishellDataset.format_data
+    elif datum_dict["task_name"] == "mmau":
+        pass  # MMAU data is already formatted by MMAUDataset.format_data
     else:
         raise ValueError(f"No data processor for task {datum_dict['task_name']}")
 
     user_message = datum_dict["messages"]
     problem = user_message[0]["content"]
     extra_env_info = {"ground_truth": user_message[1]["content"]}
+    if "choices" in datum_dict:
+        extra_env_info["choices"] = datum_dict["choices"]
 
     message_log: VLMMessageLogType = []
     ### only one round of interaction is assumed, this can easily be extended to a conversational setting

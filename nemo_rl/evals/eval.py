@@ -322,11 +322,43 @@ async def _run_env_eval_impl(
             batch = batch.repeat_interleave(num_tests_per_prompt)
 
         # get input prompt from message_log
-        prompts = []
-        for message_log in batch["message_log"]:
-            content = [message["content"] for message in message_log]
-            content = "\n".join(content)
-            prompts.append(content)
+        is_multimodal = "vllm_content" in batch
+
+        if is_multimodal:
+            # Construct vLLM-compatible prompt dicts with multimodal data
+            prompts = []
+            prompts_for_display = []
+            for i, message_log in enumerate(batch["message_log"]):
+                vllm_content = batch["vllm_content"][i]
+                if vllm_content is not None:
+                    prompt_dict = {"prompt": vllm_content}
+                    multi_modal_data = {}
+                    audios = batch.get("vllm_audios", None)
+                    if audios is not None and len(audios[i]) > 0:
+                        multi_modal_data["audio"] = (
+                            audios[i][0] if len(audios[i]) == 1 else audios[i]
+                        )
+                    images = batch.get("vllm_images", None)
+                    if images is not None and len(images[i]) > 0:
+                        multi_modal_data["image"] = (
+                            images[i][0] if len(images[i]) == 1 else images[i]
+                        )
+                    if multi_modal_data:
+                        prompt_dict["multi_modal_data"] = multi_modal_data
+                    prompts.append(prompt_dict)
+                    prompts_for_display.append(vllm_content)
+                else:
+                    content = [message["content"] for message in message_log]
+                    content = "\n".join(content)
+                    prompts.append(content)
+                    prompts_for_display.append(content)
+        else:
+            prompts = []
+            for message_log in batch["message_log"]:
+                content = [message["content"] for message in message_log]
+                content = "\n".join(content)
+                prompts.append(content)
+            prompts_for_display = prompts
 
         # generate by vllm
         inputs = BatchedDataDict({"prompts": prompts})
@@ -353,7 +385,7 @@ async def _run_env_eval_impl(
         # Collect data for JSON file
         for i, (prompt, output, message_log, reward, extra_info) in enumerate(
             zip(
-                prompts,
+                prompts_for_display,
                 outputs,
                 batch["message_log"],
                 rewards.tolist(),
