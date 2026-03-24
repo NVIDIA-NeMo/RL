@@ -39,6 +39,12 @@ ppo:
     normalize_rewards: true
     use_leave_one_out_baseline: false
     minus_baseline: true
+    # VAPO decoupled GAE (arXiv:2504.05118): separate λ for value vs policy.
+    # null = use gae_lambda for both (standard GAE, no decoupling).
+    gae_lambda_value: null   # VAPO: 1.0 (MC-like unbiased value returns)
+    gae_lambda_policy: null  # VAPO: null (let length_adaptive_alpha decide)
+    # Length-adaptive λ_policy = 1 - 1/(α·l).  0 = disabled.
+    length_adaptive_alpha: 0.0  # VAPO: 0.05
 
   reward_scaling:
     enabled: true
@@ -66,6 +72,8 @@ loss_fn:
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
   value_loss_scale: 0.4
   value_cliprange: 0.2
+  # VAPO: NLL loss on correct samples. 0 = disabled.
+  positive_example_nll_weight: 0.0  # VAPO: 0.1
 
 checkpointing:
   enabled: true
@@ -305,7 +313,7 @@ value:
 
     optimizer:
       optimizer: "adam"
-      lr: 1.0e-6
+      lr: 2.0e-6
       min_lr: 1.0e-7
       weight_decay: 0.1
       bf16: true

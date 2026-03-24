@@ -128,6 +128,10 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
+    # VAPO: weight μ for positive-example NLL loss on correct samples.
+    # L = L_PPO + μ·L_NLL(correct)   (arXiv:2504.05118, Eq. 10)
+    # Set to 0 to disable.
+    positive_example_nll_weight: float = 0.0
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -209,7 +213,15 @@ class ClippedPGLossFn(LossFunction):
         self.force_on_policy_ratio = cfg.force_on_policy_ratio  # Force ratio to 1.0
 
         # Whether to compute importance weights per-sequence instead of per-token.
+<<<<<<< HEAD
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
+=======
+        self.sequence_level_importance_ratios = cfg.get(
+            "sequence_level_importance_ratios",
+            False,
+        )
+        self.positive_example_nll_weight = cfg.get("positive_example_nll_weight", 0.0)
+>>>>>>> 9af9d7f1b (add vapo stuff)
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
         )
@@ -579,7 +591,22 @@ class ClippedPGLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             )
 
-        loss = actor_loss + kl
+        # -----------------------------------------------------------------
+        # VAPO: positive-example NLL loss on correct samples (reward > 0)
+        # L = L_PPO + μ · L_NLL(correct)
+        # -----------------------------------------------------------------
+        nll_loss = torch.tensor(0.0, device=mask.device)
+        if self.positive_example_nll_weight > 0 and "rewards" in data:
+            correct_sample_mask = (data["rewards"] > 0).float()  # [batch]
+            correct_mask = mask * correct_sample_mask.unsqueeze(-1)
+            correct_valid_toks = correct_mask.sum()
+            if correct_valid_toks > 0:
+                nll_loss = masked_mean(
+                    -curr_logprobs, correct_mask,
+                    global_normalization_factor=correct_valid_toks,
+                )
+
+        loss = actor_loss + kl + self.positive_example_nll_weight * nll_loss
         with torch.no_grad():
             probs_ratio = masked_mean(
                 ratios.detach(),
@@ -630,6 +657,7 @@ class ClippedPGLossFn(LossFunction):
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
+                "positive_nll_loss": nll_loss.item(),
             },
         )
 
