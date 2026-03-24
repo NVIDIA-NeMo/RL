@@ -160,6 +160,7 @@ class GRPOConfig(TypedDict):
     adv_estimator: NotRequired[AdvEstimatorConfig]
     # Epoch at which policy training begins. Value model trains from epoch 0;
     # policy training is skipped for epochs < this value. Default 0 (train from start).
+    # VAPO recommends ~50 for value pretraining.
     policy_training_start_epoch: NotRequired[int]
 
 
@@ -1743,7 +1744,6 @@ def ppo_train(
                         raise ValueError(f"Unknown metric for value don't know how to handle: {k}")
                 
                 metrics.update(critic_metrics)
-
                 metrics.update({
                     "reward": rewards.numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
