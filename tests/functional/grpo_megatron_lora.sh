@@ -24,6 +24,7 @@ cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo.py \
     --config $PROJECT_ROOT/examples/configs/grpo_math_1B_megatron.yaml \
+    policy.megatron_recipe=megatron.bridge.recipes.qwen.qwen25_500m_pretrain_config \
     policy.model_name=Qwen/Qwen2.5-0.5B \
     grpo.max_num_steps=3 \
     grpo.num_prompts_per_step=8 \

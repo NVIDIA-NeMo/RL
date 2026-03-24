@@ -24,7 +24,9 @@ cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_distillation.py \
     policy.model_name=Qwen/Qwen3-0.6B \
+    policy.megatron_recipe=megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config \
     teacher.model_name=Qwen/Qwen3-0.6B \
+    teacher.megatron_recipe=megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config \
     cluster.gpus_per_node=2 \
     policy.train_global_batch_size=8 \
     policy.dtensor_cfg.tensor_parallel_size=1 \

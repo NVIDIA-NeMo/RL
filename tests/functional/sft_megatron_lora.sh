@@ -25,6 +25,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     $PROJECT_ROOT/examples/run_sft.py \
     --config $PROJECT_ROOT/examples/configs/sft.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
+    policy.megatron_recipe=megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config \
     policy.tokenizer.name=Qwen/Qwen3-0.6B \
     cluster.gpus_per_node=2 \
     sft.max_num_steps=3 \
