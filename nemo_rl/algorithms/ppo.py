@@ -1723,7 +1723,10 @@ def ppo_train(
 
                 # Extract critic metrics from value training results
                 value_mb_metrics = value_results.get("all_mb_metrics", {})
-                critic_metrics = {}
+                critic_metrics = {
+                    "critic/grad_norm": value_results["grad_norm"].numpy(),
+                    "critic/loss": value_results["loss"].numpy(),
+                }
               
                 for k, v in value_mb_metrics.items():
                     if k in {
@@ -1731,13 +1734,14 @@ def ppo_train(
                         "wd",
                         "global_valid_seqs",
                         "global_valid_toks",
+                        "grad_norm",
                     }:
                         critic_metrics["critic/" + k] = np.mean(v).item()
                     elif isinstance(v, (np.ndarray, list)):
                         critic_metrics["critic/" + k] = np.sum(v).item()
                     else:
                         raise ValueError(f"Unknown metric for value don't know how to handle: {k}")
-
+                
                 metrics.update(critic_metrics)
 
                 metrics.update({
