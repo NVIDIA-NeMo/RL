@@ -286,7 +286,7 @@ jobs:
   build-container:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' && needs.pre-flight.outputs.image_tag == '' }}
     needs: [pre-flight, org-member-pre-flight]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.78.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@b2543e7be161cbc158270cb18aabd7b7ded4548b
     with:
       build-ref: main
       image-name: ${{ vars.CI_CONTAINER_NAME }}
