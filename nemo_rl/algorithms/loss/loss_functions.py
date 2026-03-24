@@ -987,21 +987,24 @@ class DistillationLossFn(LossFunction):
 class MseValueLossFn(LossFunction):
     """Mean Squared Error value loss function."""
 
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.LOGIT
+
     def __init__(self, loss_cfg):
         self.ratio_clip_min = loss_cfg["ratio_clip_min"]
         self.ratio_clip_max = loss_cfg["ratio_clip_max"]
 
     def __call__(
         self,
-        values: torch.Tensor,
+        logits: torch.Tensor,
         data: BatchedDataDict,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute Mean Squared Error value loss."""
 
-        if values.shape[-1] != 1:
-            values = values[..., 0]
+        if logits.shape[-1] != 1:
+            logits = logits[..., 0]
 
         token_mask = data["token_mask"]
         sample_mask = data["sample_mask"]
@@ -1010,13 +1013,13 @@ class MseValueLossFn(LossFunction):
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        values_clamped = values.clamp(
+        values_clamped = logits.clamp(
             old_values - self.ratio_clip_min,
             old_values + self.ratio_clip_max,
         )
 
         loss = torch.max(
-            torch.square(values - returns),
+            torch.square(logits - returns),
             torch.square(values_clamped - returns),
         )
 
@@ -1026,7 +1029,7 @@ class MseValueLossFn(LossFunction):
 
         metrics = {
             "loss": float(loss.item()),
-            "num_valid_samples": int(values.shape[0]),
+            "num_valid_samples": int(logits.shape[0]),
         }
 
         return loss, metrics
