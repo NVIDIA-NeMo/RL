@@ -1,0 +1,57 @@
+eval:
+  metric: "pass@k"
+  num_tests_per_prompt: 1
+  seed: 42
+  k_value: 1
+  save_path: null
+
+generation:
+  backend: "vllm"
+  max_new_tokens: 2048
+  temperature: 0.0
+  top_p: 1.0
+  top_k: -1
+  num_prompts_per_step: -1
+  model_name: "Qwen/Qwen2.5-Omni-3B"
+  stop_token_ids: null
+  stop_strings: null
+  vllm_cfg:
+    async_engine: false
+    precision: "bfloat16"
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    max_model_len: 8000
+    enforce_eager: False
+    skip_tokenizer_init: False
+    limit_mm_per_prompt:
+      audio: 1
+  colocated:
+    enabled: true
+    resources:
+      gpus_per_node: null
+      num_nodes: null
+
+tokenizer:
+  name: ${generation.model_name}
+  chat_template: "default"
+  chat_template_kwargs: null
+
+data:
+  max_input_seq_length: ${generation.vllm_cfg.max_model_len}
+  prompt_file: null
+  system_prompt_file: null
+  dataset_name: "TwinkStart/MMAU"
+  split: "v05.15.25"
+
+env:
+  mmau:
+    num_workers: 8
+    reward_functions:
+    - name: exact_alnum
+      weight: 1.0
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
