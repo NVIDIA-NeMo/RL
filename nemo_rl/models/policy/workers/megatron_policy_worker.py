@@ -265,14 +265,27 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
             mbs = self.cfg["train_micro_batch_size"]
-        local_gbs = gbs // self.dp_size
-        total_dataset_size = torch.tensor(data.size, device="cuda")
-        torch.distributed.all_reduce(
-            total_dataset_size,
-            op=torch.distributed.ReduceOp.SUM,
-            group=parallel_state.get_data_parallel_group(),
-        )
-        num_global_batches = int(total_dataset_size.item()) // gbs
+
+        # Check if HCP is enabled
+        hcp_enabled = self.cfg.get("hybrid_cp", {}).get("enabled", False)
+
+        # For HCP: head node already scheduled and sent one batch
+        # Process entire data as a single batch (no further batching)
+        if hcp_enabled and self.cfg["sequence_packing"]["enabled"]:
+            # print(f"[TRAIN rank={self.rank}] HCP mode: processing pre-scheduled batch, data.size={data.size}")
+            num_global_batches = 1
+            local_gbs = data.size  # Use entire data
+        else:
+            # Non-HCP: calculate batching normally
+            local_gbs = gbs // self.dp_size
+
+            total_dataset_size = torch.tensor(data.size, device="cuda")
+            torch.distributed.all_reduce(
+                total_dataset_size,
+                op=torch.distributed.ReduceOp.SUM,
+                group=parallel_state.get_data_parallel_group(),
+            )
+            num_global_batches = int(total_dataset_size.item()) // gbs
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -286,6 +299,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             all_mb_metrics = []
             losses = []
             total_num_microbatches = 0
+            train_step_counter = [0]
+
+            # Determine if we're in HCP mode for this training call
+            is_hcp_mode = hcp_enabled and self.cfg["sequence_packing"]["enabled"]
+
             for gb_idx in range(num_global_batches):
                 gb_result = process_global_batch(
                     data,
@@ -298,18 +316,28 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
-                (
-                    data_iterator,
-                    num_microbatches,
-                    micro_batch_size,
-                    seq_length,
-                    padded_seq_length,
-                ) = get_microbatch_iterator(
-                    batch,
-                    self.cfg,
-                    mbs,
-                    straggler_timer=self.mcore_state.straggler_timer,
-                )
+                if is_hcp_mode:
+                    from nemo_rl.models.policy.hcp_data_iterator import create_hcp_data_iterator
+
+                    data_iterator = create_hcp_data_iterator(batch, self.cfg)
+                    num_microbatches = 1
+                    micro_batch_size = 1
+                    seq_length = batch["input_ids"].shape[1]
+                    padded_seq_length = batch["input_ids"].shape[1]
+                else:
+                    (
+                        data_iterator,
+                        num_microbatches,
+                        micro_batch_size,
+                        seq_length,
+                        padded_seq_length,
+                    ) = get_microbatch_iterator(
+                        batch,
+                        self.cfg,
+                        mbs,
+                        straggler_timer=self.mcore_state.straggler_timer,
+                    )
+
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
 
@@ -320,8 +348,20 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     sampling_params=self.sampling_params,
                 )
 
+                # Initialize grad_norm in case the loop doesn't execute
+                grad_norm = 0.0
+                num_zeros_in_grad = 0.0
+
                 rerun_state_machine = get_rerun_state_machine()
+                # rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                # mode_str = "HCP (pre-scheduled)" if is_hcp_mode else "normal"
+                # print(f"[TRAIN rank={rank}] About to enter forward_backward loop for batch {gb_idx+1}/{num_global_batches} ({mode_str} mode)")
+                # print(f"[TRAIN rank={rank}] data_iterator_len={data_iterator_len}, batch.size={batch.size}")
+
+                loop_iterations = 0
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
+                    loop_iterations += 1
+
                     # Set grad to zero.
                     self.model.zero_grad_buffer()
                     self.optimizer.zero_grad()
@@ -465,6 +505,32 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        # DEBUG: Log worker input
+        input_batch_size = data["input_ids"].shape[0]
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        # print(f"[EXEC rank={rank}] get_logprobs START: batch_size={input_batch_size}")
+
+        # Log HCP-specific data if available
+        hcp_enabled = self.cfg.get("hybrid_cp", {}).get("enabled", False)
+        shard_sample_ids = None  # Will be set if HCP is enabled
+        if hcp_enabled:
+            shard_sample_ids = data.get("shard_sample_ids", None)
+            input_lengths = data.get("input_lengths", None)
+            if shard_sample_ids is not None:
+                if input_lengths is not None and hasattr(input_lengths, 'tolist'):
+                    lengths_str = str(input_lengths.tolist())
+                else:
+                    lengths_str = str(input_lengths)
+                # print(
+                #     f"[HCP WORKER rank={rank}] Received data: batch_size={input_batch_size}, "
+                #     f"sample_ids={shard_sample_ids}, seq_lengths={lengths_str}"
+                # )
+            # else:
+                # print(f"[HCP WORKER rank={rank}] Received data but no shard_sample_ids found")
+
+        # print(f"[DEBUG megatron_worker get_logprobs] Worker received batch with size: {input_batch_size}")
+        # print(f"[DEBUG megatron_worker get_logprobs] Input keys: {list(data.keys())}")
+
         no_grad = torch.no_grad()
         no_grad.__enter__()
         logprob_batch_size = (
@@ -477,18 +543,27 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         pp_grp = get_pipeline_model_parallel_group()
 
-        (
-            mb_iterator,
-            num_microbatches,
-            micro_batch_size,
-            seq_length,
-            padded_seq_length,
-        ) = get_microbatch_iterator(
-            data,
-            self.cfg,
-            logprob_batch_size,
-            straggler_timer=self.mcore_state.straggler_timer,
-        )
+        if hcp_enabled and self.cfg["sequence_packing"]["enabled"]:
+            from nemo_rl.models.policy.hcp_data_iterator import create_hcp_data_iterator
+
+            mb_iterator = create_hcp_data_iterator(data, self.cfg)
+            num_microbatches = 1
+            micro_batch_size = 1
+            seq_length = data["input_ids"].shape[1]
+            padded_seq_length = data["input_ids"].shape[1]
+        else:
+            (
+                mb_iterator,
+                num_microbatches,
+                micro_batch_size,
+                seq_length,
+                padded_seq_length,
+            ) = get_microbatch_iterator(
+                data,
+                self.cfg,
+                logprob_batch_size,
+                straggler_timer=self.mcore_state.straggler_timer,
+            )
 
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
@@ -526,7 +601,22 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
 
         no_grad.__exit__(None, None, None)
-        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
+
+        # DEBUG: Log worker output
+        output_batch_size = logprobs.shape[0]
+        # print(f"[EXEC rank={rank}] get_logprobs END: returning batch with size {output_batch_size}")
+        # print(f"[DEBUG megatron_worker get_logprobs] Worker returning batch with size: {output_batch_size}")
+        # if output_batch_size != input_batch_size:
+        #     print(f"[DEBUG megatron_worker get_logprobs] WARNING: Output batch size ({output_batch_size}) != Input batch size ({input_batch_size})")
+
+        # Return sample IDs alongside logprobs when HCP is enabled (for deduplication)
+        result = BatchedDataDict[LogprobOutputSpec](logprobs=logprobs)
+        if hcp_enabled and shard_sample_ids is not None:
+            # Add sample_ids as a Python list (not a tensor) for deduplication
+            result["_hcp_sample_ids"] = shard_sample_ids
+            # print(f"[HCP WORKER rank={rank}] Returning {output_batch_size} samples with IDs: {shard_sample_ids}")
+
+        return result.to("cpu")
 
     @contextmanager
     def use_reference_model(self):
@@ -623,18 +713,29 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         pp_grp = get_pipeline_model_parallel_group()
 
-        (
-            mb_iterator,
-            num_microbatches,
-            micro_batch_size,
-            seq_length,
-            padded_seq_length,
-        ) = get_microbatch_iterator(
-            data,
-            self.cfg,
-            logprob_batch_size,
-            straggler_timer=self.mcore_state.straggler_timer,
-        )
+        hcp_enabled = self.cfg.get("hybrid_cp", {}).get("enabled", False)
+
+        if hcp_enabled and self.cfg["sequence_packing"]["enabled"]:
+            from nemo_rl.models.policy.hcp_data_iterator import create_hcp_data_iterator
+
+            mb_iterator = create_hcp_data_iterator(data, self.cfg)
+            num_microbatches = 1
+            micro_batch_size = 1
+            seq_length = data["input_ids"].shape[1]
+            padded_seq_length = data["input_ids"].shape[1]
+        else:
+            (
+                mb_iterator,
+                num_microbatches,
+                micro_batch_size,
+                seq_length,
+                padded_seq_length,
+            ) = get_microbatch_iterator(
+                data,
+                self.cfg,
+                logprob_batch_size,
+                straggler_timer=self.mcore_state.straggler_timer,
+            )
 
         list_of_outputs = megatron_forward_backward(
             model=self.model,

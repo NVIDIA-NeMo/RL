@@ -715,6 +715,12 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 continue
 
             if isinstance(self.data[k], torch.Tensor):
+                if self.data[k].dim() == 0:
+                    # Scalar (0-dim) tensors have no batch dimension; pass through unchanged.
+                    # This can happen with HCP metadata like local_cp_size that Megatron
+                    # attaches to individual samples as scalar tensors.
+                    sliced_batch[k] = self.data[k]
+                    continue
                 assert end <= self.data[k].shape[0], (
                     f"end: {end} is greater than the shape of the tensor: {self.data[k].shape[0]} for key: {k}"
                 )
@@ -789,9 +795,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             and self.micro_batch_lengths is not None
         )
 
-        for seqlen, (start_idx, end_idx) in zip(
+        for i, (seqlen, (start_idx, end_idx)) in enumerate(zip(
             self.micro_batch_lengths[0], self.micro_batch_indices[0]
-        ):
+        )):
             mb = self.slice(start_idx, end_idx)
             yield mb
 

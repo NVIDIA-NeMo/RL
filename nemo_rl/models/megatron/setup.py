@@ -55,6 +55,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers import PreTrainedTokenizerBase
 
@@ -382,6 +383,9 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
             "Context Parallelism is not supported with linear CE fusion loss, please set use_linear_ce_fusion_loss to false"
         )
 
+        # Enable HCP process groups if HCP is configured
+        if config.get("hybrid_cp", {}).get("enabled", False):
+            model_cfg.hybrid_context_parallel = True
 
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Mixture of Experts configuration."""
@@ -497,6 +501,19 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
             )
 
+    if config["megatron_cfg"].get("attention_backend", None) is not None:
+        if config["megatron_cfg"]["attention_backend"] == "flash":
+            model_cfg.attention_backend = AttnBackend.flash
+        elif config["megatron_cfg"]["attention_backend"] == "fused":
+            model_cfg.attention_backend = AttnBackend.fused
+        elif config["megatron_cfg"]["attention_backend"] == "unfused":
+            model_cfg.attention_backend = AttnBackend.unfused
+        elif config["megatron_cfg"]["attention_backend"] == "local":
+            model_cfg.attention_backend = AttnBackend.local
+        elif config["megatron_cfg"]["attention_backend"] == "auto":
+            model_cfg.attention_backend = AttnBackend.auto
+        else:
+            raise ValueError(f"Invalid attention backend: {config['megatron_cfg']['attention_backend']}")
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
     """Validate optimizer configuration."""

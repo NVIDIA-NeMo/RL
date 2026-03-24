@@ -532,6 +532,7 @@ def _get_pack_sequence_parameters_for_megatron(
     megatron_cfg: dict,
     pad_individual_seqs_to_multiple_of: int,
     max_seq_len_in_batch: int,
+    effective_cp_size: Optional[int] = None,
 ):
     """Get pack sequence parameters for Megatron model processing with optional context parallelism.
 
@@ -539,6 +540,10 @@ def _get_pack_sequence_parameters_for_megatron(
         megatron_cfg: Megatron configuration
         pad_individual_seqs_to_multiple_of: Pad individual sequences to a multiple of this value
         max_seq_len_in_batch: Maximum sequence length in batch
+        effective_cp_size: CP size to use for padding calculations. Defaults to
+            megatron_cfg["context_parallel_size"]. Pass local_cp_size here for HCP
+            so that per-group padding is computed against that group's actual CP size
+            rather than the global config value.
 
     Returns:
         Tuple of:
@@ -549,7 +554,7 @@ def _get_pack_sequence_parameters_for_megatron(
     tp_size = megatron_cfg["tensor_model_parallel_size"]
     sp = megatron_cfg["sequence_parallel"]
     pp_size = megatron_cfg["pipeline_model_parallel_size"]
-    cp_size = megatron_cfg["context_parallel_size"]
+    cp_size = effective_cp_size if effective_cp_size is not None else megatron_cfg["context_parallel_size"]
     fp8_cfg = megatron_cfg.get("fp8_cfg", None) or {}
     use_fp8 = fp8_cfg.get("enabled", False)
 

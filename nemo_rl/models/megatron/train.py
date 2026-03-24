@@ -214,11 +214,13 @@ def forward_with_post_processing_fn(
             data_dict=data_dict,
             input_ids=input_ids,
             cu_seqlens_padded=cu_seqlens_padded,
+            packed_seq_params=packed_seq_params,
         )
     elif isinstance(post_processing_fn, TopkLogitsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
+            packed_seq_params=packed_seq_params,
         )
     else:
         raise TypeError(
@@ -351,7 +353,11 @@ class LossPostProcessor:
                 cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
                 vocab_parallel_group=get_tensor_model_parallel_group(),
-                context_parallel_group=get_context_parallel_group(),
+                context_parallel_group=(
+                    packed_seq_params.cp_group
+                    if getattr(packed_seq_params, "cp_group", None) is not None
+                    else get_context_parallel_group()
+                ),
             )
         else:
             loss_fn_wrapped = partial(
@@ -409,6 +415,7 @@ class LogprobsPostProcessor:
         data_dict: BatchedDataDict[Any],
         input_ids: torch.Tensor,
         cu_seqlens_padded: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
 
@@ -419,12 +426,20 @@ class LogprobsPostProcessor:
             data_dict: Batched data dictionary containing input sequences
             input_ids: Processed input token IDs
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
+            packed_seq_params: PackedSeqParams for the current microbatch. When set
+                (e.g. for HCP), its cp_group is used instead of the global CP group.
 
         Returns:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
         """
         unpacked_input_ids = data_dict["input_ids"]
         original_seq_length = unpacked_input_ids.shape[1]
+        cp_group = (
+            packed_seq_params.cp_group
+            if packed_seq_params is not None
+            and getattr(packed_seq_params, "cp_group", None) is not None
+            else get_context_parallel_group()
+        )
 
         def processor_fn_inner(output_tensor):
             tp_grp = get_tensor_model_parallel_group()
@@ -440,7 +455,7 @@ class LogprobsPostProcessor:
                     vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
                     group=tp_grp,
                     inference_only=True,
-                    cp_group=get_context_parallel_group(),
+                    cp_group=cp_group,
                     chunk_size=logprob_chunk_size,
                     sampling_params=self.sampling_params,
                 )
@@ -484,6 +499,7 @@ class TopkLogitsPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         cu_seqlens_padded: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes top-k logits and indices.
 
@@ -494,13 +510,27 @@ class TopkLogitsPostProcessor:
         Args:
             data_dict: Batched data dictionary
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
+            packed_seq_params: PackedSeqParams for the current microbatch. When set
+                (e.g. for HCP), its cp_group and local_cp_size are used instead of
+                the global CP group and size.
 
         Returns:
             Callable: Function that takes output tensor and returns
                       (dummy_loss, {"topk_logits": values, "topk_indices": indices})
         """
         pack = self.cfg["sequence_packing"]["enabled"]
-        cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
+        cp_size = (
+            packed_seq_params.local_cp_size
+            if packed_seq_params is not None
+            and getattr(packed_seq_params, "local_cp_size", None) is not None
+            else self.cfg["megatron_cfg"]["context_parallel_size"]
+        )
+        cp_group = (
+            packed_seq_params.cp_group
+            if packed_seq_params is not None
+            and getattr(packed_seq_params, "cp_group", None) is not None
+            else get_context_parallel_group()
+        )
         unpacked_seqlen = data_dict["input_ids"].shape[1]
         seq_lengths = data_dict["input_lengths"]
 
@@ -523,8 +553,7 @@ class TopkLogitsPostProcessor:
                 chunk_size=chunk_size,
             )
 
-            if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
-                cp_grp = get_context_parallel_group()
+            if cp_size > 1:
                 if pack:
                     # Per-sequence CP allgather following packed-sequence logic
                     batch_size = data_dict["input_ids"].shape[0]
@@ -552,10 +581,10 @@ class TopkLogitsPostProcessor:
                                 :, start_idx // cp_size : end_idx // cp_size, :
                             ]
                             gathered_vals = allgather_cp_sharded_tensor(
-                                local_vals_slice, cp_grp, seq_dim=1
+                                local_vals_slice, cp_group, seq_dim=1
                             )
                             gathered_idx = allgather_cp_sharded_tensor(
-                                local_idx_slice, cp_grp, seq_dim=1
+                                local_idx_slice, cp_group, seq_dim=1
                             )
                             # Some kernels may return [X, Y, k] where X*Y = (end_idx - start_idx).
                             # Flatten leading dims and reshape to [1, expected_len, k] to match target.

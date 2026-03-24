@@ -1,12 +1,13 @@
 defaults: ../../../grpo_math_1B.yaml
 grpo:
-  num_prompts_per_step: 64
+  num_prompts_per_step: 32
   num_generations_per_prompt: 32
 checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n8g
 policy:
   model_name: Qwen/Qwen3-30B-A3B
+  train_global_batch_size: 512
   train_micro_batch_size: 1
   max_total_sequence_length: 40960
   dtensor_cfg:
@@ -18,7 +19,7 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    tensor_model_parallel_size: 4
+    tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 1
     expert_model_parallel_size: 8
     sequence_parallel: true
@@ -32,6 +33,12 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
     activation_checkpointing: true
+    moe_enable_deepep: true
+    moe_token_dispatcher_type: flex
+    moe_shared_expert_overlap: false
+  hybrid_cp:
+    enabled: false
+    max_seqlen_per_dp_cp_rank: 7168
   generation:
     vllm_cfg:
       tensor_parallel_size: 2

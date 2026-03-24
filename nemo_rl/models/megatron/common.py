@@ -31,6 +31,78 @@ def _round_up_to_multiple(value: int, multiple: int) -> int:
     )
 
 
+
+def log_worker_ranks_and_pid() -> str:
+    """Log worker PID and all parallel ranks (TP, PP, CP, DP).
+
+    Returns:
+        Formatted string with worker information
+    """
+    import logging
+    import os
+    from megatron.core.parallel_state import (
+        get_context_parallel_rank,
+        get_data_parallel_rank,
+        get_pipeline_model_parallel_rank,
+        get_tensor_model_parallel_rank,
+    )
+
+    pid = os.getpid()
+    try:
+        if torch.distributed.is_initialized():
+            global_rank = torch.distributed.get_rank()
+            tp_rank = get_tensor_model_parallel_rank()
+            pp_rank = get_pipeline_model_parallel_rank()
+            cp_rank = get_context_parallel_rank()
+            dp_rank = get_data_parallel_rank()
+            return (
+                f"PID={pid}, GlobalRank={global_rank}, "
+                f"DP={dp_rank}, TP={tp_rank}, PP={pp_rank}, CP={cp_rank}"
+            )
+    except Exception as e:
+        return f"PID={pid}, Error getting ranks: {e}"
+    return f"PID={pid}, Distributed not initialized"
+
+
+def log_sequence_length_distribution(
+    cu_seqlens_padded: torch.Tensor,
+    max_seq_len: int,
+    num_bins: int = 5,
+) -> None:
+    """Log sequence length distribution from cu_seqlens_padded.
+
+    Args:
+        cu_seqlens_padded: Cumulative sequence lengths [batch_size + 1]
+        max_seq_len: Maximum sequence length for binning
+        num_bins: Number of bins (default 5 for 0.2 increments)
+    """
+    import logging
+    from collections import defaultdict
+
+    logger = logging.getLogger(__name__)
+
+    seq_lengths = (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]).cpu().tolist()
+
+    bin_size = max_seq_len / num_bins
+    bins = defaultdict(int)
+    for length in seq_lengths:
+        bin_idx = min(int(length / bin_size), num_bins - 1)
+        bin_start = int(bin_idx * bin_size)
+        bin_end = int((bin_idx + 1) * bin_size)
+        bins[f"{bin_start}-{bin_end}"] += 1
+
+    worker_info = log_worker_ranks_and_pid()
+    logger.info(
+        f"[SeqPacking] {worker_info} | "
+        f"cu_seqlens_padded: {cu_seqlens_padded.cpu().tolist()}"
+    )
+    total_seqs = len(seq_lengths)
+    dist_str = ", ".join([f"{k}: {v}" for k, v in sorted(bins.items())])
+    logger.info(
+        f"[SeqPacking] {worker_info} | "
+        f"Sequence length distribution (total={total_seqs}): {dist_str}"
+    )
+
 def broadcast_tensor(
     tensor: torch.Tensor | None, src_rank: int, group: dist.ProcessGroup
 ) -> torch.Tensor:

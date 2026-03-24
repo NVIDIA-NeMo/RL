@@ -146,6 +146,11 @@ class AbstractPolicyWorker:
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
+
+        # Preserve HCP sample IDs if present (needed for deduplication)
+        if "_hcp_sample_ids" in reference_logprobs:
+            return_data["_hcp_sample_ids"] = reference_logprobs["_hcp_sample_ids"]
+
         return return_data
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
