@@ -114,6 +114,13 @@ Create custom reward environments and integrate them with NeMo RL training pipel
 Configure offline and online Eagle3 draft-model workflows to accelerate rollout generation with vLLM.
 :::
 
+:::{grid-item-card} {octicon}`unmute` Audio GRPO on AVQA
+:link: guides/grpo-audio
+:link-type: doc
+
+Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-AQA approach.
+:::
+
 :::{grid-item-card} {octicon}`plus-circle` Adding New Models
 :link: adding-new-models
 :link-type: doc
@@ -220,6 +227,7 @@ guides/prorlv2.md
 guides/grpo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
+guides/grpo-audio.md
 guides/rm.md
 guides/environments.md
 guides/eval.md
