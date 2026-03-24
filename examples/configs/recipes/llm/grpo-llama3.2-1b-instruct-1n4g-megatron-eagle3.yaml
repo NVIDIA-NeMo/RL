@@ -1,0 +1,35 @@
+defaults: ./grpo-llama3.2-1b-instruct-1n4g-megatron.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.2-1b-instruct-1n4g-megatron-eagle3
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 4
+
+policy:
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 256
+  sequence_packing:
+    enabled: false
+  draft:
+    enabled: true
+    model_name: "__set_nrl_eagle3_draft_model__"
+    loss_weight: 1.0
+  generation:
+    max_new_tokens: 256
+    vllm_cfg:
+      max_model_len: 256
+    vllm_kwargs:
+      speculative_config:
+        method: "eagle3"
+        model: ${policy.draft.model_name}
+        num_speculative_tokens: 3
+        draft_tensor_parallel_size: 1
+
+logger:
+  log_dir: logs/grpo-llama3.2-1b-instruct-1n4g-megatron-eagle3
+  wandb:
+    name: grpo-llama3.2-1b-instruct-1n4g-megatron-eagle3
