@@ -1736,9 +1736,17 @@ def ppo_train(
                         "global_valid_seqs",
                         "global_valid_toks",
                         "grad_norm",
+                        "explained_var",
                     }:
                         critic_metrics["critic/" + k] = np.mean(v).item()
+                    elif k in {"values_min"}:
+                        critic_metrics["critic/" + k] = np.min(v).item()
+                    elif k in {"values_max"}:
+                        critic_metrics["critic/" + k] = np.max(v).item()
                     elif isinstance(v, (np.ndarray, list)):
+                        # loss, vf_clipfrac, returns_mean, values_mean, etc.
+                        # are normalized by global_valid_toks in the loss fn,
+                        # so summing across microbatches gives the correct global value.
                         critic_metrics["critic/" + k] = np.sum(v).item()
                     else:
                         raise ValueError(f"Unknown metric for value don't know how to handle: {k}")

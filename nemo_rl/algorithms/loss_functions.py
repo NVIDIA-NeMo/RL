@@ -1340,6 +1340,7 @@ class MseValueLossFn(LossFunction):
             )
             vf_clipfrac = masked_mean(
                 (vf_losses_clipped > vf_losses_unclipped).float(), mask,
+                global_normalization_factor=global_valid_toks,
             ).item()
         else:
             loss = torch.nn.functional.mse_loss(values, returns, reduction="none")
@@ -1348,9 +1349,40 @@ class MseValueLossFn(LossFunction):
             )
             vf_clipfrac = 0.0
 
+        with torch.no_grad():
+            # Use global_valid_toks so each MB contributes local_sum/global_total.
+            # Summing across MBs in ppo.py then gives the correct global mean.
+            returns_mean = masked_mean(
+                returns, mask, global_normalization_factor=global_valid_toks,
+            ).item()
+            values_mean = masked_mean(
+                values, mask, global_normalization_factor=global_valid_toks,
+            ).item()
+
+            # Min/max are per-MB; ppo.py takes min/max across MBs.
+            masked_values = values[mask.bool()]
+            values_min = masked_values.min().item() if masked_values.numel() > 0 else 0.0
+            values_max = masked_values.max().item() if masked_values.numel() > 0 else 0.0
+
+            # Explained variance: approximate — averaged across MBs in ppo.py.
+            # Can't compute exact global EV without a second pass, but this is
+            # close when MBs are similarly sized.
+            masked_returns = returns[mask.bool()]
+            if masked_returns.numel() > 1:
+                var_returns = masked_returns.var().item()
+                var_residual = (masked_returns - masked_values).var().item()
+                explained_var = 1.0 - var_residual / max(var_returns, 1e-8)
+            else:
+                explained_var = 0.0
+
         metrics = {
             "loss": float(loss.item()),
             "vf_clipfrac": vf_clipfrac,
+            "returns_mean": returns_mean,
+            "values_mean": values_mean,
+            "values_min": values_min,
+            "values_max": values_max,
+            "explained_var": explained_var,
             "num_valid_samples": int(values.shape[0]),
         }
 
