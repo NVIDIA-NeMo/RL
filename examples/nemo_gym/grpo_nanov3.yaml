@@ -52,6 +52,7 @@ checkpointing:
   keep_top_k: 1000000
   save_period: 10
   checkpoint_must_save_by: "00:03:40:00"
+  save_optimizer: true
 
 policy:
   model_name: "/path/to/hf_checkpoint"
