@@ -160,7 +160,7 @@ policy:
     stop_strings: null
 
     vllm_cfg:
-      async_engine: false
+      async_engine: true
       precision: ${policy.precision}
       tensor_parallel_size: 2
       pipeline_parallel_size: 1
@@ -169,9 +169,13 @@ policy:
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: false
       use_deep_gemm: false
+      load_format: "dummy"
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       skip_tokenizer_init: false
+      fp8_cfg:
+        dynamic_weight_quant: true
+        is_mx: true
 
     vllm_kwargs:
       mamba_ssm_cache_dtype: "float32"
@@ -200,11 +204,7 @@ data:
     data_path: 3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/inverse_if_8k.jsonl
     processor: nemo_gym_data_processor
     env_name: nemo_gym
-  validation:
-    dataset_name: NemoGymDataset
-    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/turing_vif/data/inverse_if_8k.jsonl
-    processor: nemo_gym_data_processor
-    env_name: nemo_gym
+  validation: null
 
 # ============================================================================
 # Environment Configuration (NeMo-Gym) — Turing VIF
@@ -226,9 +226,9 @@ env:
           judge_base_url: null
           judge_api_key: dummy_key
           judge_model: /lustre/fsw/portfolios/llmservice/users/jiaqiz/models/Qwen3-235B-A22B-Instruct-2507-FP8
-          judge_temperature: 0.7
-          judge_top_p: 0.8
-          judge_max_tokens: 10000
+          judge_temperature: 1.0
+          judge_top_p: 1.0
+          judge_max_tokens: 512
 
     turing_vif_simple_agent:
       responses_api_agents:
