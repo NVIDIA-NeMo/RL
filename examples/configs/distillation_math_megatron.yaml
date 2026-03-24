@@ -34,7 +34,7 @@ policy: &POLICY_BASE
     max_grad_norm: 1.0
 
     make_sequence_length_divisible_by: ${mul:${mul:${.megatron_cfg.tensor_model_parallel_size}, ${.megatron_cfg.context_parallel_size}}, 2}
-    megatron_recipe: megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config
+    megatron_recipe: megatron.bridge.recipes.qwen.qwen3_1p7b_pretrain_config
     megatron_cfg: &MEGATRON_BASE
         enabled: true
         empty_unused_memory_level: 0
@@ -158,7 +158,7 @@ policy: &POLICY_BASE
 teacher:
     <<: *POLICY_BASE
     model_name: "Qwen/Qwen3-4B"
-    megatron_recipe: megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config
+    megatron_recipe: megatron.bridge.recipes.qwen.qwen3_1p7b_pretrain_config
     megatron_cfg:
         <<: *MEGATRON_BASE
         context_parallel_size: 2
