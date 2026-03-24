@@ -92,7 +92,7 @@ tests/test_suites/llm/sft-llama3.2-1b-1n8g-fsdp2tp1.v3.sh
 # Dtensor (8B)
 tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp2.sh
 # dynamic batching
-tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch.sh
+tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp4-dynamicbatch.sh
 # lora
 tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp1-lora.sh
 tests/test_suites/llm/sft-llama3.1-8b-1n8g-megatron-lora.sh
