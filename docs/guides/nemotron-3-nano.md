@@ -20,10 +20,9 @@ tail -n 1000 data/train-full.jsonl > data/val-split.jsonl
 ```
 
 ## Prepare the code
-Note that we currently require using the `nano-v3` branch to train Nemotron 3 Nano.
 ```bash
 # Checkout NeMo RL
-git clone -b nano-v3 https://github.com/NVIDIA-NeMo/RL.git
+git clone https://github.com/NVIDIA-NeMo/RL.git
 cd RL
 
 # Initialize the submodules
