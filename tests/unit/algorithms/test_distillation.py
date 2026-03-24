@@ -141,6 +141,7 @@ def mock_components():
             "make_sequence_length_divisible_by": 8,
             "max_total_sequence_length": 2048,
             "generation": {
+                "max_new_tokens": 2048,
                 "temperature": 1.0,
                 "top_p": 1.0,
                 "top_k": None,

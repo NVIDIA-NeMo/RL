@@ -87,6 +87,9 @@ class DistillationConfig(TypedDict):
     max_val_samples: int
     topk_logits_k: int
     seed: int
+    # Optional overrides for validation rollouts (see validate()).
+    val_max_total_sequence_length: NotRequired[Optional[int]]
+    val_max_new_tokens: NotRequired[Optional[int]]
 
 
 class DistillationSaveState(TypedDict):
@@ -1062,50 +1065,74 @@ def validate(
             master_config["distillation"]["max_val_samples"]
             // master_config["distillation"]["val_batch_size"]
         )
-        for batch_idx, val_batch in enumerate(val_dataloader):
-            if batch_idx >= max_batches:
-                break
+        val_max_seq_len = (
+            master_config["distillation"].get("val_max_total_sequence_length")
+            or master_config["policy"]["max_total_sequence_length"]
+        )
 
-            # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
-            # Use async rollouts if vLLM async engine is enabled
-            if _should_use_async_rollouts(master_config):
-                val_batch, gen_metrics = run_async_multi_turn_rollout(
-                    policy_generation,
-                    val_batch,
-                    tokenizer,
-                    val_task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["distillation"][
-                        "max_rollout_turns"
-                    ],
-                    greedy=False,
+        val_max_new_tokens = master_config["distillation"].get("val_max_new_tokens")
+        gen_cfg = master_config["policy"]["generation"]
+        train_max_new_tokens = (
+            gen_cfg["max_new_tokens"] if gen_cfg is not None else None
+        )
+        swap_max_new_tokens = (
+            val_max_new_tokens is not None
+            and train_max_new_tokens is not None
+            and val_max_new_tokens != train_max_new_tokens
+        )
+        if swap_max_new_tokens:
+            policy_generation.update_generation_params(max_new_tokens=val_max_new_tokens)
+
+        try:
+            for batch_idx, val_batch in enumerate(val_dataloader):
+                if batch_idx >= max_batches:
+                    break
+
+                # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
+                # Use async rollouts if vLLM async engine is enabled
+                if _should_use_async_rollouts(master_config):
+                    val_batch, gen_metrics = run_async_multi_turn_rollout(
+                        policy_generation,
+                        val_batch,
+                        tokenizer,
+                        val_task_to_env,
+                        max_seq_len=val_max_seq_len,
+                        max_rollout_turns=master_config["distillation"][
+                            "max_rollout_turns"
+                        ],
+                        greedy=False,
+                    )
+                else:
+                    val_batch, gen_metrics = run_multi_turn_rollout(
+                        policy_generation,
+                        val_batch,
+                        tokenizer,
+                        val_task_to_env,
+                        max_seq_len=val_max_seq_len,
+                        max_rollout_turns=master_config["distillation"][
+                            "max_rollout_turns"
+                        ],
+                        greedy=False,
+                    )
+                rewards = val_batch["total_reward"]
+
+                total_rewards.extend(rewards.tolist())
+                total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+
+                # Collect message logs for later display
+                to_env = [
+                    get_keys_from_message_log(
+                        val_batch["message_log"][i], ["role", "content"]
+                    )
+                    for i in range(len(val_batch["message_log"]))
+                ]
+
+                all_message_logs.extend(to_env)
+        finally:
+            if swap_max_new_tokens:
+                policy_generation.update_generation_params(
+                    max_new_tokens=train_max_new_tokens
                 )
-            else:
-                val_batch, gen_metrics = run_multi_turn_rollout(
-                    policy_generation,
-                    val_batch,
-                    tokenizer,
-                    val_task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["distillation"][
-                        "max_rollout_turns"
-                    ],
-                    greedy=False,
-                )
-            rewards = val_batch["total_reward"]
-
-            total_rewards.extend(rewards.tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
-
-            # Collect message logs for later display
-            to_env = [
-                get_keys_from_message_log(
-                    val_batch["message_log"][i], ["role", "content"]
-                )
-                for i in range(len(val_batch["message_log"]))
-            ]
-
-            all_message_logs.extend(to_env)
 
         # Calculate validation metrics
         accuracy = (

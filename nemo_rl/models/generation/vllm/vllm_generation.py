@@ -781,6 +781,23 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy preparation: {e}")
             return False
 
+    def update_generation_params(self, **kwargs: Any) -> None:
+        """Update generation config on all vLLM workers and on this coordinator's cfg copy."""
+        if not kwargs:
+            return
+        method_name = (
+            "update_generation_params_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "update_generation_params"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            **kwargs,
+        )
+        ray.get(futures)
+        self.cfg.update(kwargs)
+
     def shutdown(self) -> bool:
         """Shut down all vLLM workers and clean up resources."""
         try:

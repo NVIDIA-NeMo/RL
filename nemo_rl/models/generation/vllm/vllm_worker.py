@@ -553,6 +553,14 @@ class BaseVllmGenerationWorker:
                     metrics[metric.name] = metric.value
         return metrics
 
+    def update_generation_params(self, **kwargs: Any) -> None:
+        """Update generation config fields (e.g., max_new_tokens) on this worker."""
+        self.cfg.update(kwargs)
+
+    def update_generation_params_async(self, **kwargs: Any) -> None:
+        """Same as update_generation_params; async engine path uses this method name."""
+        self.cfg.update(kwargs)
+
 
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}

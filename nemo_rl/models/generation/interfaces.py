@@ -283,3 +283,10 @@ class GenerationInterface(ABC):
             Dictionary of metrics. Format may vary by backend.
         """
         return {}
+
+    def update_generation_params(self, **kwargs: Any) -> None:
+        """Update generation parameters (e.g., max_new_tokens) on the generation backend.
+
+        Default no-op; vLLM and other backends may override to sync remote workers.
+        """
+        pass

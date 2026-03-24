@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import json
 import os
 
 from omegaconf import OmegaConf
@@ -61,6 +62,12 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+
+    print("=" * 60)
+    print("RESOLVED CONFIG")
+    print("=" * 60)
+    print(json.dumps(config, indent=2, default=str))
+    print("=" * 60, flush=True)
 
     # Get the next experiment directory with incremented ID
     config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
