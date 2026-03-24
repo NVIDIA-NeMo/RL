@@ -239,7 +239,6 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
     cpu_offload,
     activation_checkpointing,
 ):
-    pytest.skip(reason="skipped until automodel doesn't update model config in-place")
     """Test that dtensor worker v1 and v2 produce equivalent model configurations.
 
     This test verifies that DTensorPolicyWorkerV2 produces the same model config
@@ -303,6 +302,11 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
     config_v2_dict.pop("nemo_version", None)
     config_v1_dict.pop("pad_token_id", None)
     config_v2_dict.pop("pad_token_id", None)
+
+    # if head_dim doesn't exist in raw HF model config, automodel (dtensor v2 worker) updates model config in-place
+    # so we need to remove the head_dim key from the v2 config
+    if "head_dim" not in config_v1_dict and "head_dim" in config_v2_dict:
+        config_v2_dict.pop("head_dim", None)
 
     discrepancies = compare_model_configs(config_v1_dict, config_v2_dict)
     assert not discrepancies, (
