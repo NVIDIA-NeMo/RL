@@ -525,15 +525,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # so change it back here
         # Note: When HCP is enabled, unsorted_data_indices is None because HCP handles ordering internally
         if (self.use_dynamic_batches or self.use_sequence_packing) and unsorted_data_indices is not None:
-            # print(f"[DEBUG get_logprobs] Before reordering, batch size: {logprobs_batch_size}")
             logprobs.reorder_data(unsorted_data_indices)
-            # reordered_batch_size = logprobs["logprobs"].shape[0] if hasattr(logprobs.get("logprobs"), "shape") else len(logprobs.get("logprobs", []))
-            # print(f"[DEBUG get_logprobs] After reordering, batch size: {reordered_batch_size}")
-        # elif unsorted_data_indices is None:
-        #     print(f"[DEBUG get_logprobs] Skipping reordering (HCP mode - ordering handled internally)")
-
-        # final_batch_size = logprobs["logprobs"].shape[0] if hasattr(logprobs.get("logprobs"), "shape") else len(logprobs.get("logprobs", []))
-        # print(f"[DEBUG get_logprobs] Returning logprobs with batch size: {final_batch_size}")
 
         return logprobs
 

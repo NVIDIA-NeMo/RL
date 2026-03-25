@@ -272,7 +272,6 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # For HCP: head node already scheduled and sent one batch
         # Process entire data as a single batch (no further batching)
         if hcp_enabled and self.cfg["sequence_packing"]["enabled"]:
-            # print(f"[TRAIN rank={self.rank}] HCP mode: processing pre-scheduled batch, data.size={data.size}")
             num_global_batches = 1
             local_gbs = data.size  # Use entire data
         else:
@@ -353,10 +352,6 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 num_zeros_in_grad = 0.0
 
                 rerun_state_machine = get_rerun_state_machine()
-                # rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                # mode_str = "HCP (pre-scheduled)" if is_hcp_mode else "normal"
-                # print(f"[TRAIN rank={rank}] About to enter forward_backward loop for batch {gb_idx+1}/{num_global_batches} ({mode_str} mode)")
-                # print(f"[TRAIN rank={rank}] data_iterator_len={data_iterator_len}, batch.size={batch.size}")
 
                 loop_iterations = 0
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
@@ -505,31 +500,10 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
-        # DEBUG: Log worker input
-        input_batch_size = data["input_ids"].shape[0]
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        # print(f"[EXEC rank={rank}] get_logprobs START: batch_size={input_batch_size}")
-
-        # Log HCP-specific data if available
         hcp_enabled = self.cfg.get("hybrid_cp", {}).get("enabled", False)
-        shard_sample_ids = None  # Will be set if HCP is enabled
+        shard_sample_ids = None
         if hcp_enabled:
             shard_sample_ids = data.get("shard_sample_ids", None)
-            input_lengths = data.get("input_lengths", None)
-            if shard_sample_ids is not None:
-                if input_lengths is not None and hasattr(input_lengths, 'tolist'):
-                    lengths_str = str(input_lengths.tolist())
-                else:
-                    lengths_str = str(input_lengths)
-                # print(
-                #     f"[HCP WORKER rank={rank}] Received data: batch_size={input_batch_size}, "
-                #     f"sample_ids={shard_sample_ids}, seq_lengths={lengths_str}"
-                # )
-            # else:
-                # print(f"[HCP WORKER rank={rank}] Received data but no shard_sample_ids found")
-
-        # print(f"[DEBUG megatron_worker get_logprobs] Worker received batch with size: {input_batch_size}")
-        # print(f"[DEBUG megatron_worker get_logprobs] Input keys: {list(data.keys())}")
 
         no_grad = torch.no_grad()
         no_grad.__enter__()
@@ -602,19 +576,10 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         no_grad.__exit__(None, None, None)
 
-        # DEBUG: Log worker output
-        output_batch_size = logprobs.shape[0]
-        # print(f"[EXEC rank={rank}] get_logprobs END: returning batch with size {output_batch_size}")
-        # print(f"[DEBUG megatron_worker get_logprobs] Worker returning batch with size: {output_batch_size}")
-        # if output_batch_size != input_batch_size:
-        #     print(f"[DEBUG megatron_worker get_logprobs] WARNING: Output batch size ({output_batch_size}) != Input batch size ({input_batch_size})")
-
         # Return sample IDs alongside logprobs when HCP is enabled (for deduplication)
         result = BatchedDataDict[LogprobOutputSpec](logprobs=logprobs)
         if hcp_enabled and shard_sample_ids is not None:
-            # Add sample_ids as a Python list (not a tensor) for deduplication
             result["_hcp_sample_ids"] = shard_sample_ids
-            # print(f"[HCP WORKER rank={rank}] Returning {output_batch_size} samples with IDs: {shard_sample_ids}")
 
         return result.to("cpu")
 
