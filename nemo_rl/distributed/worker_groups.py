@@ -1016,10 +1016,11 @@ class RayWorkerGroup:
                 print(
                     f"Error during graceful shutdown: {e}. Falling back to force termination."
                 )
-                force = True
 
-        # Force kill any remaining workers
-        if force or cleanup_method is None:
+        # Always kill actors to release named actor registrations and resources.
+        # Even after successful graceful cleanup, actors remain alive in Ray's registry
+        # which prevents creating new actors with the same name.
+        if True:
             initializers_to_kill = []
             for worker in self._workers:
                 if hasattr(worker, "_RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC"):
