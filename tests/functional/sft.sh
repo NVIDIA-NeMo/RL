@@ -24,6 +24,7 @@ cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_sft.py \
     policy.model_name=Qwen/Qwen3-0.6B \
+    policy.megatron_recipe=megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config \
     cluster.gpus_per_node=2 \
     sft.max_num_steps=3 \
     sft.val_batches=1 \

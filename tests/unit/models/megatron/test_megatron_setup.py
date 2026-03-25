@@ -106,6 +106,7 @@ class TestApplyParallelismConfig:
         from nemo_rl.models.megatron.setup import _apply_parallelism_config
 
         model_cfg = MagicMock()
+        model_cfg.pipeline_model_parallel_layout = None
         config = {
             "megatron_cfg": {
                 "tensor_model_parallel_size": 4,

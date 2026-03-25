@@ -59,6 +59,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     $PROJECT_ROOT/examples/nemo_gym/run_grpo_nemo_gym.py \
     --config $PROJECT_ROOT/examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
+    policy.megatron_recipe=megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config \
     policy.dtensor_cfg.enabled=false \
     policy.megatron_cfg.enabled=true \
     policy.megatron_cfg.tensor_model_parallel_size=1 \

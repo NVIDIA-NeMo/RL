@@ -89,6 +89,7 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
 
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen25_7b_pretrain_config
   megatron_cfg:
     enabled: false
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.

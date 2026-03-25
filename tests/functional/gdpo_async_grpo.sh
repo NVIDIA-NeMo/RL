@@ -22,6 +22,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     $PROJECT_ROOT/examples/run_grpo.py \
     --config $PROJECT_ROOT/examples/configs/gdpo_math_1B.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
+    policy.megatron_recipe=megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config \
     policy.generation.vllm_cfg.async_engine=true \
     grpo.async_grpo.enabled=true \
     grpo.async_grpo.max_trajectory_age_steps=1 \

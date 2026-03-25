@@ -129,6 +129,7 @@ def get_microbatch_iterator(
     mbs: int,
     straggler_timer: StragglerDetector,
     seq_length_key: Optional[str] = None,
+    model_cfg: Optional[Any] = None,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -141,6 +142,8 @@ def get_microbatch_iterator(
         cfg: Configuration dictionary
         mbs: Microbatch size
         seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
+        model_cfg: Optional Megatron model config (ConfigContainer). When provided,
+            parallelism settings are read from here instead of the raw config dict.
 
     Returns:
         Tuple containing the iterator and metadata
@@ -177,6 +180,7 @@ def get_microbatch_iterator(
             cfg["megatron_cfg"],
             cfg["make_sequence_length_divisible_by"],
             pack_seq_dim_size,
+            model_cfg=model_cfg,
         )
         micro_batch_size = 1
     else:
@@ -532,6 +536,7 @@ def _get_pack_sequence_parameters_for_megatron(
     megatron_cfg: dict,
     pad_individual_seqs_to_multiple_of: int,
     max_seq_len_in_batch: int,
+    model_cfg: Optional[Any] = None,
 ):
     """Get pack sequence parameters for Megatron model processing with optional context parallelism.
 
@@ -539,6 +544,8 @@ def _get_pack_sequence_parameters_for_megatron(
         megatron_cfg: Megatron configuration
         pad_individual_seqs_to_multiple_of: Pad individual sequences to a multiple of this value
         max_seq_len_in_batch: Maximum sequence length in batch
+        model_cfg: Optional Megatron model config (ConfigContainer). When provided,
+            parallelism settings are read from here instead of the raw config dict
 
     Returns:
         Tuple of:
@@ -546,10 +553,16 @@ def _get_pack_sequence_parameters_for_megatron(
         - pad_packed_seq_to_multiple_of: Pad packed sequences to a multiple of this value
         - pad_packed_seq_to: Pad packed sequences to this value (before CP)
     """
-    tp_size = megatron_cfg["tensor_model_parallel_size"]
-    sp = megatron_cfg["sequence_parallel"]
-    pp_size = megatron_cfg["pipeline_model_parallel_size"]
-    cp_size = megatron_cfg["context_parallel_size"]
+    if model_cfg is not None:
+        tp_size = model_cfg.tensor_model_parallel_size
+        sp = model_cfg.sequence_parallel
+        pp_size = model_cfg.pipeline_model_parallel_size
+        cp_size = model_cfg.context_parallel_size
+    else:
+        tp_size = megatron_cfg["tensor_model_parallel_size"]
+        sp = megatron_cfg["sequence_parallel"]
+        pp_size = megatron_cfg["pipeline_model_parallel_size"]
+        cp_size = megatron_cfg["context_parallel_size"]
     fp8_cfg = megatron_cfg.get("fp8_cfg", None) or {}
     use_fp8 = fp8_cfg.get("enabled", False)
 
