@@ -385,7 +385,13 @@ def training_setup(request):
         (2, 1, 1, "tiny_llama_model_path", {"activation_checkpointing": True}),
         (2, 2, 1, "tiny_llama_model_path", {"sequence_parallel": True}),
         (2, 2, 1, "tiny_llama_model_path", {"precision": "bfloat16", "fp8": "hybrid"}),
-        (2, 1, 1, "tiny_llama_model_path", {"attention_backend": "flash", "precision": "bfloat16"}),
+        (
+            2,
+            1,
+            1,
+            "tiny_llama_model_path",
+            {"attention_backend": "flash", "precision": "bfloat16"},
+        ),
     ],
     indirect=True,
     ids=[
