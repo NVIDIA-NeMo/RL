@@ -50,11 +50,11 @@ dependencies = [
   "swanlab",
   "pyzmq",
   "decord2",
-  "nvidia-resiliency-ext",
-  "nccl4py",                                                                                                          # for non-colocated refit
-  "cuda-bindings",                                                                                                    # for non-colocated refit
-  "pybase64",                                                                                                         # for sglang refit
-  "nvidia-cudnn-cu12==9.19.0.56",                                                                                     # for transformer-engine no build isolation
+
+  "nccl4py",                      # for non-colocated refit
+  "cuda-bindings",                # for non-colocated refit
+  "pybase64",                     # for sglang refit
+  "nvidia-cudnn-cu12==9.19.0.56", # for transformer-engine no build isolation
 ]
 
 [project.optional-dependencies]
@@ -175,6 +175,7 @@ triton = [
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
+nvidia-resiliency-ext = { index = "pypi" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 # From JustinTong0323/sglang branch update-transformers-v5 (sgl-project/sglang#17784)
@@ -356,6 +357,7 @@ name = "nv-grouped-gemm"
 version = "v1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
 
+
 [[tool.uv.dependency-metadata]]
 name = "sgl-kernel"
 # This version has to match the version in the commit/rev/tag used
@@ -459,7 +461,7 @@ requires-dist = [
   # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13
   "transformer-engine[pytorch,core_cu12]",
   "mamba-ssm",
-  "nvidia-resiliency-ext~=0.4.1",
+  "nvidia-resiliency-ext>=0.5.dev0",
   "causal-conv1d",
   "flash-linear-attention",
   "timm",

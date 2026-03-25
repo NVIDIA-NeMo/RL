@@ -27,7 +27,6 @@ from typing import Any, Optional
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
-from wandb import Histogram, Table
 
 from nemo_rl.data.interfaces import (
     DatumSpec,
@@ -50,6 +49,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.utils.timer import Timer
+from wandb import Histogram, Table  # pyrefly: ignore[missing-module-attribute]
 
 TokenizerType = PreTrainedTokenizerBase
 

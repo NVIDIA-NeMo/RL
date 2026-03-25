@@ -468,6 +468,11 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # Fusion settings
     model_cfg.apply_rope_fusion = config["megatron_cfg"]["apply_rope_fusion"]
     model_cfg.bias_activation_fusion = config["megatron_cfg"]["bias_activation_fusion"]
+    gradient_accumulation_fusion = config["megatron_cfg"].get(
+        "gradient_accumulation_fusion"
+    )
+    if gradient_accumulation_fusion is not None:
+        model_cfg.gradient_accumulation_fusion = gradient_accumulation_fusion
     # Optional explicit attention backend override for environments where
     # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")
