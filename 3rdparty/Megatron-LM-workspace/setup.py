@@ -49,8 +49,8 @@ CACHED_DEPENDENCIES = [
     # Dev dependencies from pyproject.toml
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
     # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13 base container
-    "transformer-engine[pytorch,core_cu12]>=2.9.0a0,<2.12.0",
-    "nvidia-resiliency-ext",
+    "transformer-engine[pytorch,core_cu12]",
+    "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@v0.5.0",
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
@@ -60,7 +60,6 @@ CACHED_DEPENDENCIES = [
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "flash-linear-attention~=0.4.0",
-    "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
