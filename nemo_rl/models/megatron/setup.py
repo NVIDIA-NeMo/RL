@@ -468,7 +468,8 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # Fusion settings
     model_cfg.apply_rope_fusion = config["megatron_cfg"]["apply_rope_fusion"]
     model_cfg.bias_activation_fusion = config["megatron_cfg"]["bias_activation_fusion"]
-    # Attention backend configuration
+    # Optional explicit attention backend override for environments where
+    # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")
     if attention_backend is not None:
         for _nvte_var in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
