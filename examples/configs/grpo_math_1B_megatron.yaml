@@ -96,10 +96,23 @@ policy:
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     moe_permute_fusion: false
     moe_enable_deepep: false
-    moe_token_dispatcher_type: "allgather"
+    moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
+
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: null
     
     optimizer:
       optimizer: "adam"
@@ -147,14 +160,14 @@ policy:
     top_p: 1.0
     top_k: null
     mcore_generation_config:
-      buffer_size_gb: 20  # Total GPU memory (in GB) allocated for KV cache buffers
+      buffer_size_gb: 10  # Total buffer size is 2x this value (active requests + paused requests)
       num_cuda_graphs: 16  # Number of CUDA graphs to pre-compile for different batch sizes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: false  # Split long prefills into chunks for better memory management
       unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
-      
+
     vllm_cfg:
       tensor_parallel_size: 1
       gpu_memory_utilization: 0.6

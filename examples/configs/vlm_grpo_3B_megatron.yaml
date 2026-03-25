@@ -60,6 +60,7 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
+  save_optimizer: true
 policy:
   model_name: Qwen/Qwen2.5-VL-3B-Instruct
   tokenizer:
@@ -126,6 +127,9 @@ policy:
       enable_expert_parallel: false
       # VLMs require tokenizer to be initialized before generation, so we set skip_tokenizer_init to False.
       skip_tokenizer_init: False
+    vllm_kwargs:
+      # mm_processor_cache_gb=4/8 both failed at step 20 validation due to cache not found in vLLM, disable cache for now.
+      mm_processor_cache_gb: 0
     colocated:
       enabled: true
       resources:
@@ -156,8 +160,20 @@ policy:
     defer_fp32_logits: False
     moe_per_layer_logging: False
     moe_enable_deepep: false
-    moe_token_dispatcher_type: "allgather"
+    moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: null
     optimizer:
       optimizer: adam
       lr: 2.0e-07
@@ -199,6 +215,10 @@ data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
   num_workers: 1
+
+  # use multiple dataloader for train
+  use_multiple_dataloader: false
+
   # dataset
   train:
     dataset_name: clevr-cogent

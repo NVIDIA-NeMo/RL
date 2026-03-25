@@ -115,7 +115,7 @@ def helpsteer3_data_processor(
     extra_env_info = {"ground_truth": ground_truth}
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # Truncate if too long
         for chat_message in message_log:
             chat_message["token_ids"] = chat_message["token_ids"][
@@ -169,7 +169,7 @@ def sft_processor(
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # make smaller and mask out
         for message in message_log:
             message["token_ids"] = message["token_ids"][
@@ -361,7 +361,7 @@ def math_data_processor(
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # make smaller and mask out
         for indiv_message in message_log:
             indiv_message["token_ids"] = indiv_message["token_ids"][
@@ -378,6 +378,70 @@ def math_data_processor(
     }
     if "task_name" in datum_dict:
         output["task_name"] = datum_dict["task_name"]
+    return output
+
+
+# TODO: @yukih: unify to math_hf_data_processor once https://github.com/NVIDIA-NeMo/RL/issues/2060 is resolved.
+def math_gdpo_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from data/hf_datasets/openmathinstruct2.py) into a DatumSpec for the Reward Model Environment."""
+    user_message = datum_dict["messages"]
+    problem = user_message[0]["content"]
+    extra_env_info = {"ground_truth": user_message[1]["content"]}
+
+    # merge system prompt and user prompt
+    message_list = []
+    # system prompt
+    if task_data_spec.system_prompt:
+        message_list.append(
+            {
+                "role": "system",
+                "content": task_data_spec.system_prompt,
+            }
+        )
+    # user prompt
+    if task_data_spec.prompt:
+        problem = task_data_spec.prompt.format(problem)
+    message_list.append({"role": "user", "content": problem})
+
+    message: str = tokenizer.apply_chat_template(  # type: ignore
+        message_list,
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    token_ids = tokenizer(message, return_tensors="pt", add_special_tokens=False)[
+        "input_ids"
+    ][0]
+
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    loss_multiplier = 1.0
+    if length > max_seq_length:
+        # make smaller and mask out
+        for chat_message in message_log:
+            chat_message["token_ids"] = chat_message["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+        loss_multiplier = 0.0
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict["task_name"],
+    }
     return output
 
 
@@ -419,7 +483,7 @@ def math_hf_data_processor(
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # make smaller and mask out
         for chat_message in message_log:
             chat_message["token_ids"] = chat_message["token_ids"][
@@ -541,6 +605,10 @@ def vlm_hf_data_processor(
     # specifically for gemma, we need to add token_type_ids to the user message as a sequence-type value
     if "token_type_ids" in message:
         user_message["token_type_ids"] = message["token_type_ids"][0]
+
+    # for qwen2.5-vl (transformers>=5.3), mm_token_type_ids tells the model which tokens are text/image/video for 3D RoPE
+    if "mm_token_type_ids" in message:
+        user_message["mm_token_type_ids"] = message["mm_token_type_ids"][0]
 
     ### append to user message
     message_log.append(user_message)
@@ -698,6 +766,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "helpsteer3_data_processor": helpsteer3_data_processor,
         "math_data_processor": math_data_processor,
         "math_hf_data_processor": math_hf_data_processor,
+        "math_gdpo_data_processor": math_gdpo_data_processor,
         "multichoice_qa_processor": multichoice_qa_processor,
         "sft_processor": sft_processor,
         "vlm_hf_data_processor": vlm_hf_data_processor,

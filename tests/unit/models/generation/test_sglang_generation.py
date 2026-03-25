@@ -59,6 +59,7 @@ basic_sglang_test_config: SGLangConfig = {
         "pp_size": 1,
         "ep_size": 1,
         "mem_fraction_static": 0.7,
+        "disable_piecewise_cuda_graph": True,
     },
     "colocated": {
         "enabled": True,

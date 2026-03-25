@@ -29,7 +29,19 @@ from megatron.core.parallel_state import (
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.utils import StragglerDetector
 
-from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
+from nemo_rl.algorithms.loss import (
+    SequencePackingFusionLossWrapper,
+    SequencePackingLossWrapper,
+    prepare_loss_input,
+    prepare_packed_loss_input,
+    wrap_loss_fn_with_input_preparation,
+)
+from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -51,26 +63,26 @@ PostProcessingFunction = Union[
 def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
-    cfg: PolicyConfig,
     input_ids_cp_sharded: torch.Tensor,
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     packed_seq_params: Optional[PackedSeqParams] = None,
     defer_fp32_logits: Optional[bool] = False,
     straggler_timer: Optional[StragglerDetector] = None,
+    use_linear_ce_fusion_loss: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
     Args:
         model: The model to run forward pass on
         data_dict: Dictionary containing batch data
-        cfg: Policy configuration dictionary
         input_ids_cp_sharded: Context-parallel sharded input token IDs
         position_ids: Position IDs for tokens
         attention_mask: Attention mask for the sequence
         packed_seq_params: Parameters for packed sequences (optional)
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
         straggler_timer: Straggler detector for profiling the forward pass
+        use_linear_ce_fusion_loss: Whether to use linear CE fusion loss
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -87,6 +99,11 @@ def model_forward(
         additional_kwargs["packed_seq_params"] = packed_seq_params
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
+    if use_linear_ce_fusion_loss:
+        additional_kwargs["labels"] = input_ids_cp_sharded
+        # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
+        # GPTModel.forward signatures do not accept it.
+        additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
 
     with straggler_timer() if straggler_timer is not None else nullcontext():
         output_tensor = model(
@@ -101,32 +118,32 @@ def model_forward(
 
 
 def apply_temperature_scaling(
-    logits: torch.Tensor,
-    cfg: PolicyConfig,
+    logits: torch.Tensor, sampling_params: Optional[TrainingSamplingParams]
 ) -> torch.Tensor:
     """Apply temperature scaling to logits.
 
     Args:
         logits: Logits tensor to scale
-        cfg: Policy configuration containing generation settings
+        sampling_params: Sampling parameters
 
     Returns:
         torch.Tensor: Temperature-scaled logits
     """
-    if "generation" in cfg and cfg["generation"] is not None:
-        logits.div_(cfg["generation"]["temperature"])
+    if sampling_params is not None and sampling_params.temperature != 1.0:
+        logits.div_(sampling_params.temperature)
     return logits
 
 
 def forward_with_post_processing_fn(
     data_iterator: Iterator[ProcessedMicrobatch],
     model: GPTModel,
-    cfg: PolicyConfig,
     post_processing_fn: PostProcessingFunction,
     defer_fp32_logits: Optional[bool] = False,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
+    use_linear_ce_fusion_loss: bool = False,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -137,11 +154,11 @@ def forward_with_post_processing_fn(
     Args:
         data_iterator: Iterator yielding ProcessedMicrobatch objects (already processed)
         model: The model to run forward pass on
-        cfg: Policy configuration dictionary
         post_processing_fn: Post-processing function to post-process the logits
         defer_fp32_logits: Whether to defer FP32 conversion of logits
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
+        sampling_params: Sampling parameters (top-k, top-p, temperature)
         straggler_timer: Straggler detector for profiling the forward pass
 
     Returns:
@@ -164,13 +181,13 @@ def forward_with_post_processing_fn(
     output_tensor = model_forward(
         model=model,
         data_dict=data_dict,
-        cfg=cfg,
         input_ids_cp_sharded=input_ids_cp_sharded,
         position_ids=position_ids,
         attention_mask=attention_mask,
         packed_seq_params=packed_seq_params,
         defer_fp32_logits=defer_fp32_logits,
         straggler_timer=straggler_timer,
+        use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
     )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
@@ -179,7 +196,10 @@ def forward_with_post_processing_fn(
         post_processing_fn,
         (LossPostProcessor, LogprobsPostProcessor, TopkLogitsPostProcessor),
     ):
-        apply_temperature_scaling(output_tensor, cfg)
+        # Temperature scaling is element-wise, directly applying it here.
+        # Other sampling parameters like top-k and top-p need the logits from whole vocabulary,
+        # so applying them when gathering logits from vocab parallel (called in LossPostProcessor and LogprobsPostProcessor).
+        apply_temperature_scaling(output_tensor, sampling_params)
 
     # Use type checking to dispatch to the correct post-processing method
     if isinstance(post_processing_fn, LossPostProcessor):
@@ -210,7 +230,6 @@ def forward_with_post_processing_fn(
 
 def megatron_forward_backward(
     model: GPTModel,
-    cfg: PolicyConfig,
     data_iterator: Iterator[ProcessedMicrobatch],
     num_microbatches: int,
     seq_length: int,
@@ -220,7 +239,9 @@ def megatron_forward_backward(
     defer_fp32_logits: Optional[bool] = False,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
+    use_linear_ce_fusion_loss: bool = False,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -230,7 +251,6 @@ def megatron_forward_backward(
 
     Args:
         model: The model to train
-        cfg: Policy configuration dictionary
         data_iterator: Iterator yielding ProcessedMicrobatch objects (already processed)
         num_microbatches: Number of microbatches to process
         seq_length: Sequence length
@@ -240,6 +260,7 @@ def megatron_forward_backward(
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
+        sampling_params: Sampling parameters (top-k, top-p, temperature)
         straggler_timer: Straggler detector for profiling the forward pass
 
     Returns:
@@ -247,12 +268,13 @@ def megatron_forward_backward(
     """
     forward_step = partial(
         forward_with_post_processing_fn,
-        cfg=cfg,
         post_processing_fn=post_processing_fn,
         defer_fp32_logits=defer_fp32_logits,
         global_valid_seqs=global_valid_seqs,
         global_valid_toks=global_valid_toks,
+        sampling_params=sampling_params,
         straggler_timer=straggler_timer,
+        use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
     )
     forward_backward_func = get_forward_backward_func()
     return forward_backward_func(
@@ -274,11 +296,13 @@ class LossPostProcessor:
         cfg: PolicyConfig,
         num_microbatches: int = 1,
         cp_normalize: bool = True,
+        sampling_params: Optional[TrainingSamplingParams] = None,
     ):
         self.loss_fn = loss_fn
         self.cfg = cfg
         self.num_microbatches = num_microbatches
         self.cp_normalize = cp_normalize
+        self.sampling_params = sampling_params
 
     def __call__(
         self,
@@ -302,24 +326,48 @@ class LossPostProcessor:
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
-        loss_fn = self.loss_fn
+        # wrap prepare_loss_input with sampling_params
+        prepare_loss_input_wrapped = partial(
+            prepare_loss_input, sampling_params=self.sampling_params
+        )
+
+        # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
-            # remove padding
-            loss_fn = SequencePackingLossWrapper(
-                loss_fn=loss_fn,
+            fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
+            if fuse_loss:
+                wrapper_cls = SequencePackingFusionLossWrapper
+                prepare_fn = partial(
+                    prepare_packed_loss_input, sampling_params=self.sampling_params
+                )
+            else:
+                wrapper_cls = SequencePackingLossWrapper
+                prepare_fn = prepare_loss_input_wrapped
+
+            loss_fn_wrapped = wrapper_cls(
+                loss_fn=self.loss_fn,
+                prepare_fn=prepare_fn,
                 cu_seqlens_q=packed_seq_params.cu_seqlens_q,
                 cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                vocab_parallel_group=get_tensor_model_parallel_group(),
+                context_parallel_group=get_context_parallel_group(),
+            )
+        else:
+            loss_fn_wrapped = partial(
+                wrap_loss_fn_with_input_preparation,
+                loss_fn=self.loss_fn,
+                prepare_fn=prepare_loss_input_wrapped,
+                vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                vocab_parallel_group=get_tensor_model_parallel_group(),
+                context_parallel_group=get_context_parallel_group(),
             )
 
         loss_fn_wrapped = partial(
-            loss_fn,
+            loss_fn_wrapped,
             data=data_dict,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
-            vocab_parallel_rank=get_tensor_model_parallel_rank(),
-            vocab_parallel_group=get_tensor_model_parallel_group(),
-            context_parallel_group=get_context_parallel_group(),
         )
 
         if self.cp_normalize:
@@ -348,8 +396,13 @@ class LossPostProcessor:
 
 
 class LogprobsPostProcessor:
-    def __init__(self, cfg: PolicyConfig):
+    def __init__(
+        self,
+        cfg: PolicyConfig,
+        sampling_params: Optional[TrainingSamplingParams] = None,
+    ):
         self.cfg = cfg
+        self.sampling_params = sampling_params
 
     def __call__(
         self,
@@ -389,6 +442,7 @@ class LogprobsPostProcessor:
                     inference_only=True,
                     cp_group=get_context_parallel_group(),
                     chunk_size=logprob_chunk_size,
+                    sampling_params=self.sampling_params,
                 )
             else:
                 token_logprobs = from_parallel_logits_to_logprobs(
@@ -399,12 +453,21 @@ class LogprobsPostProcessor:
                     tp_group=tp_grp,
                     inference_only=True,
                     chunk_size=logprob_chunk_size,
+                    sampling_params=self.sampling_params,
                 )
 
             # Prepend 0 logprob for first token to maintain same sequence length as input
             token_logprobs = torch.cat(
                 [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
             )
+
+            # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
+            if need_top_k_or_top_p_filtering(self.sampling_params):
+                mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
+                token_logprobs = mask_out_neg_inf_logprobs(
+                    token_logprobs, mask, "prev_logprobs"
+                )
+
             return torch.tensor(0.0, device=token_logprobs.device), {
                 "logprobs": token_logprobs
             }

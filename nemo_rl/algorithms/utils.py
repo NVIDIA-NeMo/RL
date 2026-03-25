@@ -14,6 +14,7 @@
 
 import math
 import random
+import re
 import warnings
 from functools import partial, wraps
 from typing import Any, Optional
@@ -29,6 +30,12 @@ from transformers import (
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.logger import Logger
+
+
+def get_gdpo_reward_component_keys(batch) -> list:
+    """Return batch keys that are reward components (reward1, reward2, ...) in sorted order."""
+    keys = [k for k in batch.keys() if re.match(r"reward\d+$", str(k))]
+    return sorted(keys, key=lambda k: int(re.search(r"\d+", str(k)).group()))
 
 
 def calculate_kl(
@@ -182,6 +189,39 @@ def masked_mean(
     return torch.sum(values * mask, dim=dim) / (normalization_factor + 1e-8)
 
 
+def mask_out_neg_inf_logprobs(
+    logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
+) -> torch.Tensor:
+    """Mask out negative infinity log probabilities.
+
+    Handling sampling mask mismatch:
+    vLLM samples token X from top-k/p filtered distribution -> generation_logprobs[X] is always finite (e.g., -5.41)
+    during training: policy computes logprobs with same top-k/p settings, but the distribution can be slightly different
+    token X may fall outside the training policy's top-k/p set -> curr_logprobs[X] = -inf, prev_logprobs[X] = -inf
+    Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
+
+    Args:
+        logprobs: Log probabilities.
+        mask: Mask.
+        logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
+
+    Returns:
+        Masked log probabilities.
+    """
+    is_neginf = torch.isinf(logprobs)
+    neginf_count = (is_neginf & mask.bool()).sum().item()
+    if neginf_count > 0:
+        print(
+            f"[WARNING]: {neginf_count}/{int(mask.sum().item())} valid tokens have -inf in {logprobs_name} "
+            "(policy top-k/top-p mismatch). Masking out these positions."
+        )
+
+    mask = mask * (~is_neginf).float()
+    logprobs = torch.where(mask.bool(), logprobs, 0.0)
+
+    return logprobs
+
+
 def set_seed(seed: int) -> None:
     """Sets the seed for python, numpy, and pytorch."""
     random.seed(seed)
@@ -320,6 +360,39 @@ def get_tokenizer(
         processor.bos_token_id = tokenizer.bos_token_id
         # copy name_or_path from tokenizer to processor for logging
         processor.name_or_path = tokenizer.name_or_path
+        if hasattr(processor, "feature_extractor") and "audio" in tokenizer_config:
+            if (
+                "sampling_rate" in tokenizer_config["audio"]
+                and tokenizer_config["audio"]["sampling_rate"]
+                != processor.feature_extractor.sampling_rate
+            ):
+                new_sampling_rate = tokenizer_config["audio"]["sampling_rate"]
+                warnings.warn(
+                    f"Overriding audio sampling rate from {processor.feature_extractor.sampling_rate} to {new_sampling_rate}"
+                )
+                processor.feature_extractor.sampling_rate = new_sampling_rate
+        if hasattr(processor, "video_processor") and "video" in tokenizer_config:
+            if (
+                "fps" in tokenizer_config["video"]
+                and tokenizer_config["video"]["fps"] != processor.video_processor.fps
+            ):
+                # override the video loading fps
+                new_fps = tokenizer_config["video"]["fps"]
+                warnings.warn(
+                    f"Overriding video fps from {processor.video_processor.fps} to {new_fps}"
+                )
+                processor.video_processor.fps = new_fps
+            # fps and num_frames cannot co-exist, but let it crash later
+            if (
+                "num_frames" in tokenizer_config["video"]
+                and tokenizer_config["video"]["num_frames"]
+                != processor.video_processor.num_frames
+            ):
+                new_num_frames = tokenizer_config["video"]["num_frames"]
+                warnings.warn(
+                    f"Overriding video num_frames from {processor.video_processor.num_frames} to {new_num_frames}"
+                )
+                processor.video_processor.num_frames = new_num_frames
 
     return tokenizer if processor is None else processor
 

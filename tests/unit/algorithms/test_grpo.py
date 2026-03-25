@@ -20,6 +20,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.advantage_estimator import (
+    GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
@@ -31,7 +32,7 @@ from nemo_rl.algorithms.grpo import (
     grpo_train,
     validate,
 )
-from nemo_rl.algorithms.loss_functions import ClippedPGLossFn
+from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
@@ -719,6 +720,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
     master_config = {
         "policy": {
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "vllm",
                 "colocated": {
                     "enabled": False,  # Non-colocated
@@ -755,7 +759,12 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
             "use_dynamic_sampling": False,
             "batch_multiplier": 1,
         },
-        "data": {"shuffle": False, "num_workers": 1, "env_name": None},
+        "data": {
+            "shuffle": False,
+            "num_workers": 1,
+            "env_name": None,
+            "use_multiple_dataloader": False,
+        },
         "logger": {},  # Config extraction requires this key
         "checkpointing": {},  # Config extraction requires this key
         "cluster": {
@@ -793,6 +802,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
     master_config = {
         "policy": {
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "vllm",
                 "colocated": {
                     "enabled": False,  # Non-colocated
@@ -829,7 +841,12 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
             "use_dynamic_sampling": False,
             "batch_multiplier": 1,
         },
-        "data": {"shuffle": False, "num_workers": 1, "env_name": None},
+        "data": {
+            "shuffle": False,
+            "num_workers": 1,
+            "env_name": None,
+            "use_multiple_dataloader": False,
+        },
         "logger": {},  # Config extraction requires this key
         "checkpointing": {},  # Config extraction requires this key
         "cluster": {
@@ -881,6 +898,9 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
 
         def load_training_info(self, _path):
             return None
+
+        def get_resume_paths(self, _path):
+            return None, None
 
     class DummyLoader:
         def __init__(self, *_args, **_kwargs):
@@ -956,6 +976,9 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
             "dtensor_cfg": {"enabled": False},
             "megatron_cfg": {"enabled": False, "pipeline_model_parallel_size": 1},
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "sglang",
                 "colocated": {
                     "enabled": colocated_inference,
@@ -993,7 +1016,12 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
             "reward_shaping": {"enabled": False},
             "overlong_filtering": False,
         },
-        "data": {"shuffle": False, "num_workers": 0, "env_name": None},
+        "data": {
+            "shuffle": False,
+            "num_workers": 0,
+            "env_name": None,
+            "use_multiple_dataloader": False,
+        },
         "logger": {"num_val_samples_to_print": 0},
         "checkpointing": {"enabled": False},
         "cluster": {"num_nodes": 1, "gpus_per_node": 4},
@@ -1323,6 +1351,9 @@ def mock_grpo_components():
             "max_total_sequence_length": 2048,
             "make_sequence_length_divisible_by": 1,
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "backend": "vllm",
                 "colocated": {"enabled": True},
                 "vllm_cfg": {"async_engine": True},  # Support async mode
@@ -1342,6 +1373,9 @@ def mock_grpo_components():
         },
         "logger": {
             "num_val_samples_to_print": 5,
+        },
+        "data": {
+            "use_multiple_dataloader": False,
         },
     }
 
@@ -1625,7 +1659,11 @@ def test_grpo_advantage_estimator_zero_std():
     )  # prompt 0: std=0; prompt 1: std=sqrt(2)
     mask = torch.ones(4, 5)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
 
     # prompt 0: std=0 -> skip normalization, advantage=0 (reward - mean = 0)
     # prompt 1: With Bessel correction for 2 samples, std = sqrt(2), normalized = ±1/sqrt(2) ≈ ±0.7071
@@ -1656,7 +1694,11 @@ def test_grpo_advantage_estimator_tensor_shapes():
     rewards = torch.tensor([1.0, 3.0])  # mean=2, std=sqrt(2) with Bessel
     mask = torch.ones(2, 3)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
     assert result.shape == (2, 3)
 
     # Verify normalized values: (reward - mean) / std
@@ -1670,7 +1712,11 @@ def test_grpo_advantage_estimator_tensor_shapes():
     rewards = torch.arange(10, dtype=torch.float32)  # 0, 1, 2, ..., 9
     mask = torch.ones(10, 5)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
     assert result.shape == (10, 5)
 
     # After normalization, mean should be ~0
@@ -1695,7 +1741,11 @@ def test_grpo_advantage_estimator_negative_advantages():
     rewards = torch.tensor([0.0, 2.0, 4.0])  # mean=2, deviations: -2, 0, +2
     mask = torch.ones(3, 4)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
 
     # Verify ordering: first should be negative, middle ~0, last positive
     assert result[0, 0] < 0  # below mean -> negative advantage
@@ -1725,7 +1775,11 @@ def test_grpo_advantage_estimator_zero_std_and_zero_advantage():
     rewards = torch.tensor([5.0, 5.0, 5.0, 5.0])  # all same
     mask = torch.ones(4, 3)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
 
     # All advantages should be exactly 0
     expected = torch.zeros(4, 3)
@@ -1751,7 +1805,11 @@ def test_grpo_advantage_estimator_small_nonzero_std():
     rewards = torch.tensor([1.0, 1.01])  # small but detectable difference
     mask = torch.ones(2, 3)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
 
     # Even with small std, normalization should still happen
     # After normalization, the values should be ±1/sqrt(2) (for 2 samples with Bessel)
@@ -1761,6 +1819,51 @@ def test_grpo_advantage_estimator_small_nonzero_std():
 
     # Verify opposite signs
     assert result[0, 0] * result[1, 0] < 0
+
+
+# ============================================================================
+# Tests for ReinforcePlusPlusAdvantageEstimator class
+# ============================================================================
+
+
+def test_gdpo_advantage_estimator_multiple_rewards():
+    """Test GDPOAdvantageEstimator with multiple rewards."""
+    estimator_config = {
+        "use_leave_one_out_baseline": False,
+        "normalize_rewards": True,
+    }
+    loss_config = {}
+    estimator = GDPOAdvantageEstimator(estimator_config, loss_config)
+
+    prompt_ids = torch.tensor([[0], [0]])
+    mask = torch.ones(2, 3)
+    repeated_batch = {
+        "reward1": torch.tensor([1.0, 1.0]),
+        "reward2": torch.tensor([1.0, -1.0]),
+        "reward3": torch.tensor([1.0, 0.0]),
+    }
+
+    result = estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
+    assert result.shape == (2, 3)
+    assert torch.allclose(result[0, 0], torch.tensor(0.7071))
+    assert torch.allclose(result[1, 0], torch.tensor(-0.7071))
+
+
+def test_gdpo_advantage_estimator_single_reward():
+    """Test GDPOAdvantageEstimator with multiple rewards."""
+    estimator_config = {
+        "use_leave_one_out_baseline": False,
+        "normalize_rewards": True,
+    }
+    loss_config = {}
+    estimator = GDPOAdvantageEstimator(estimator_config, loss_config)
+
+    prompt_ids = torch.tensor([[0], [0]])
+    mask = torch.ones(2, 3)
+    repeated_batch = {"reward1": torch.tensor([1.0, 3.0])}
+
+    with pytest.raises(ValueError):
+        estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
 
 
 # ============================================================================
@@ -1791,7 +1894,11 @@ def test_reinforce_plus_plus_global_normalization():
     rewards = torch.tensor([0.0, 1.0, 2.0, 3.0])  # mean=1.5
     mask = torch.ones(4, 5)
 
-    result = estimator.compute_advantage(prompt_ids, rewards, mask)
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+    )
 
     # After global normalization, mean should be ~0
     result_mean = (result * mask).sum() / mask.sum()
@@ -1884,6 +1991,9 @@ class TestValidateFunction:
             "policy": {
                 "max_total_sequence_length": 2048,
                 "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
                     "backend": "vllm",
                     "colocated": {"enabled": True},
                     "vllm_cfg": {"async_engine": False},
@@ -1977,6 +2087,9 @@ class TestValidateFunction:
             "policy": {
                 "max_total_sequence_length": 2048,
                 "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
                     "backend": "vllm",
                     "colocated": {"enabled": True},
                     "vllm_cfg": {"async_engine": False},

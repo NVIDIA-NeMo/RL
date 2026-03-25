@@ -27,6 +27,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.loss.interfaces import LossInputType
+
+pytestmark = pytest.mark.mcore
+
 
 class TestModelForward:
     """Tests for model_forward function."""
@@ -46,12 +51,10 @@ class TestModelForward:
         input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
         position_ids = torch.tensor([[0, 1, 2], [0, 1, 2]])
         attention_mask = torch.ones(2, 3)
-        cfg = {}
 
         result = model_forward(
             model=mock_model,
             data_dict=mock_data_dict,
-            cfg=cfg,
             input_ids_cp_sharded=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -78,7 +81,6 @@ class TestModelForward:
         result = model_forward(
             model=mock_model,
             data_dict=mock_data_dict,
-            cfg={},
             input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
             position_ids=torch.tensor([[0, 1, 2]]),
             attention_mask=torch.ones(1, 3),
@@ -106,7 +108,6 @@ class TestModelForward:
         model_forward(
             model=mock_model,
             data_dict=mock_data_dict,
-            cfg={},
             input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
             position_ids=torch.tensor([[0, 1, 2]]),
             attention_mask=torch.ones(1, 3),
@@ -130,7 +131,6 @@ class TestModelForward:
         model_forward(
             model=mock_model,
             data_dict=mock_data_dict,
-            cfg={},
             input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
             position_ids=torch.tensor([[0, 1, 2]]),
             attention_mask=torch.ones(1, 3),
@@ -155,7 +155,6 @@ class TestModelForward:
         model_forward(
             model=mock_model,
             data_dict=mock_data_dict,
-            cfg={},
             input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
             position_ids=torch.tensor([[0, 1, 2]]),
             attention_mask=torch.ones(1, 3),
@@ -168,39 +167,14 @@ class TestModelForward:
 class TestApplyTemperatureScaling:
     """Tests for apply_temperature_scaling function."""
 
-    def test_temperature_scaling_with_generation_config(self):
-        """Test that logits are divided by the configured temperature."""
-        from nemo_rl.models.megatron.train import apply_temperature_scaling
-
-        logits = torch.ones(2, 10, 100) * 4.0
-        cfg = {"generation": {"temperature": 2.0}}
-
-        result = apply_temperature_scaling(logits, cfg)
-
-        # 4.0 / 2.0 = 2.0
-        assert torch.allclose(result, torch.ones_like(result) * 2.0)
-        # Verify in-place: result is the same tensor
-        assert result.data_ptr() == logits.data_ptr()
-
-    def test_temperature_scaling_no_generation_key(self):
-        """Test that logits are unchanged when 'generation' key is absent."""
+    def test_temperature_scaling_sampling_params_is_none(self):
+        """Test that logits are unchanged when sampling_params is None."""
         from nemo_rl.models.megatron.train import apply_temperature_scaling
 
         logits = torch.ones(2, 10, 100) * 3.0
-        cfg = {}
+        sampling_params = None
 
-        result = apply_temperature_scaling(logits, cfg)
-
-        assert torch.allclose(result, torch.ones_like(result) * 3.0)
-
-    def test_temperature_scaling_generation_is_none(self):
-        """Test that logits are unchanged when generation config is None."""
-        from nemo_rl.models.megatron.train import apply_temperature_scaling
-
-        logits = torch.ones(2, 10, 100) * 3.0
-        cfg = {"generation": None}
-
-        result = apply_temperature_scaling(logits, cfg)
+        result = apply_temperature_scaling(logits, sampling_params)
 
         assert torch.allclose(result, torch.ones_like(result) * 3.0)
 
@@ -210,11 +184,25 @@ class TestApplyTemperatureScaling:
 
         logits = torch.randn(2, 10, 100)
         original = logits.clone()
-        cfg = {"generation": {"temperature": 1.0}}
+        sampling_params = TrainingSamplingParams(temperature=1.0)
 
-        result = apply_temperature_scaling(logits, cfg)
+        result = apply_temperature_scaling(logits, sampling_params)
 
         assert torch.allclose(result, original)
+
+    def test_temperature_scaling_with_temperature_two(self):
+        """Test that logits are divided by the configured temperature=2.0."""
+        from nemo_rl.models.megatron.train import apply_temperature_scaling
+
+        logits = torch.ones(2, 10, 100) * 4.0
+        sampling_params = TrainingSamplingParams(temperature=2.0)
+
+        result = apply_temperature_scaling(logits, sampling_params)
+
+        # 4.0 / 2.0 = 2.0
+        assert torch.allclose(result, torch.ones_like(result) * 2.0)
+        # Verify in-place: result is the same tensor
+        assert result.data_ptr() == logits.data_ptr()
 
 
 class TestForwardWithPostProcessingFn:
@@ -266,7 +254,6 @@ class TestForwardWithPostProcessingFn:
         output, wrapped_fn = forward_with_post_processing_fn(
             data_iterator=data_iterator,
             model=mock_model,
-            cfg=cfg,
             post_processing_fn=post_processor,
         )
 
@@ -302,10 +289,9 @@ class TestForwardWithPostProcessingFn:
         post_processor = LogprobsPostProcessor(cfg=cfg)
 
         with patch.object(post_processor, "__call__", return_value=MagicMock()):
-            output, wrapped_fn = forward_with_post_processing_fn(
+            forward_with_post_processing_fn(
                 data_iterator=data_iterator,
                 model=MagicMock(),
-                cfg=cfg,
                 post_processing_fn=post_processor,
             )
 
@@ -340,10 +326,9 @@ class TestForwardWithPostProcessingFn:
         post_processor = TopkLogitsPostProcessor(cfg=cfg, k=5)
 
         with patch.object(post_processor, "__call__", return_value=MagicMock()):
-            output, wrapped_fn = forward_with_post_processing_fn(
+            forward_with_post_processing_fn(
                 data_iterator=data_iterator,
                 model=MagicMock(),
-                cfg=cfg,
                 post_processing_fn=post_processor,
             )
 
@@ -393,19 +378,22 @@ class TestForwardWithPostProcessingFn:
 
         cfg = {
             "sequence_packing": {"enabled": False},
-            "generation": {"temperature": 0.7},
+            "generation": {"temperature": 0.7, "top_p": 1.0, "top_k": None},
         }
         post_processor = LossPostProcessor(loss_fn=MagicMock(), cfg=cfg)
+        sampling_params = TrainingSamplingParams(
+            temperature=cfg["generation"]["temperature"]
+        )
 
         forward_with_post_processing_fn(
             data_iterator=iter([processed_mb]),
             model=MagicMock(),
-            cfg=cfg,
             post_processing_fn=post_processor,
+            sampling_params=sampling_params,
         )
 
         # Verify apply_temperature_scaling was called with the output tensor and cfg
-        mock_temp_scaling.assert_called_once_with(output_tensor, cfg)
+        mock_temp_scaling.assert_called_once_with(output_tensor, sampling_params)
 
     @patch("nemo_rl.models.megatron.train.model_forward")
     @patch("nemo_rl.models.megatron.train.apply_temperature_scaling")
@@ -434,19 +422,22 @@ class TestForwardWithPostProcessingFn:
 
         cfg = {
             "sequence_packing": {"enabled": False},
-            "generation": {"temperature": 0.5},
+            "generation": {"temperature": 0.5, "top_p": 1.0, "top_k": None},
         }
         post_processor = LogprobsPostProcessor(cfg=cfg)
+        sampling_params = TrainingSamplingParams(
+            temperature=cfg["generation"]["temperature"]
+        )
 
         with patch.object(post_processor, "__call__", return_value=MagicMock()):
             forward_with_post_processing_fn(
                 data_iterator=iter([processed_mb]),
                 model=MagicMock(),
-                cfg=cfg,
                 post_processing_fn=post_processor,
+                sampling_params=sampling_params,
             )
 
-        mock_temp_scaling.assert_called_once_with(output_tensor, cfg)
+        mock_temp_scaling.assert_called_once_with(output_tensor, sampling_params)
 
     @patch("nemo_rl.models.megatron.train.model_forward")
     @patch("nemo_rl.models.megatron.train.apply_temperature_scaling")
@@ -476,19 +467,21 @@ class TestForwardWithPostProcessingFn:
         cfg = {
             "sequence_packing": {"enabled": False},
             "megatron_cfg": {"context_parallel_size": 1},
-            "generation": {"temperature": 1.5},
+            "generation": {"temperature": 1.5, "top_p": 1.0, "top_k": None},
         }
         post_processor = TopkLogitsPostProcessor(cfg=cfg, k=5)
-
+        sampling_params = TrainingSamplingParams(
+            temperature=cfg["generation"]["temperature"]
+        )
         with patch.object(post_processor, "__call__", return_value=MagicMock()):
             forward_with_post_processing_fn(
                 data_iterator=iter([processed_mb]),
                 model=MagicMock(),
-                cfg=cfg,
                 post_processing_fn=post_processor,
+                sampling_params=sampling_params,
             )
 
-        mock_temp_scaling.assert_called_once_with(output_tensor, cfg)
+        mock_temp_scaling.assert_called_once_with(output_tensor, sampling_params)
 
     @patch("nemo_rl.models.megatron.train.model_forward")
     @patch("nemo_rl.models.megatron.train.apply_temperature_scaling")
@@ -515,7 +508,6 @@ class TestForwardWithPostProcessingFn:
             forward_with_post_processing_fn(
                 data_iterator=iter([processed_mb]),
                 model=MagicMock(),
-                cfg={"generation": {"temperature": 2.0}},
                 post_processing_fn="not_a_processor",
             )
 
@@ -561,7 +553,6 @@ class TestForwardWithPostProcessingFn:
         forward_with_post_processing_fn(
             data_iterator=iter([processed_mb]),
             model=MagicMock(),
-            cfg=cfg,
             post_processing_fn=post_processor,
             straggler_timer=mock_timer,
         )
@@ -595,7 +586,6 @@ class TestForwardWithPostProcessingFn:
             forward_with_post_processing_fn(
                 data_iterator=data_iterator,
                 model=MagicMock(),
-                cfg={},
                 post_processing_fn=unknown_processor,
             )
 
@@ -619,9 +609,8 @@ class TestMegatronForwardBackward:
         cfg = {"sequence_packing": {"enabled": False}}
         post_processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg)
 
-        result = megatron_forward_backward(
+        megatron_forward_backward(
             model=mock_model,
-            cfg=cfg,
             data_iterator=iter([]),
             num_microbatches=4,
             seq_length=128,
@@ -654,7 +643,6 @@ class TestMegatronForwardBackward:
 
         megatron_forward_backward(
             model=MagicMock(),
-            cfg=cfg,
             data_iterator=iter([]),
             num_microbatches=1,
             seq_length=64,
@@ -685,6 +673,7 @@ class TestLossPostProcessor:
         from nemo_rl.models.megatron.train import LossPostProcessor
 
         mock_loss_fn = MagicMock(return_value=(torch.tensor(0.5), {"loss": 0.5}))
+        mock_loss_fn.input_type = LossInputType.LOGIT
         cfg = {"sequence_packing": {"enabled": False}}
 
         processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg, cp_normalize=False)
@@ -723,6 +712,7 @@ class TestLossPostProcessor:
         from nemo_rl.models.megatron.train import LossPostProcessor
 
         mock_loss_fn = MagicMock(return_value=(torch.tensor(1.0), {}))
+        mock_loss_fn.input_type = LossInputType.LOGIT
         cfg = {"sequence_packing": {"enabled": False}}
 
         processor = LossPostProcessor(

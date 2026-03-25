@@ -34,7 +34,7 @@ def create_batch_from(tokenizer, sentences: list[str]) -> BatchedDataDict:
     sample_mask = torch.ones(input_ids.size(0), dtype=torch.float32)
 
     # For simple NLL training, use the attention mask as token_mask
-    # (loss will be applied to positions 1..len-1 via NLLLoss)
+    # (loss will be applied to positions 1..len-1 via NLLLossFn)
     token_mask = torch.ones_like(input_ids)
 
     return BatchedDataDict(

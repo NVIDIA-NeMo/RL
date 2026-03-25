@@ -21,6 +21,7 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
+  save_optimizer: true
 
 policy:
   model_name: "meta-llama/Llama-3.2-1B"
@@ -46,7 +47,14 @@ policy:
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
-  
+
+    # Automodel kwargs passed to from_pretrained.
+    # Uncomment force_hf if the custom model's adapter doesn't support per-tensor
+    # weight conversion (e.g. Qwen2, Llama). Auto-detected if not set.
+    # See https://github.com/NVIDIA-NeMo/RL/issues/2072
+    automodel_kwargs: {}
+      # force_hf: true
+
     # LoRA (Low-Rank Adaptation) Configuration
     lora_cfg:
       enabled: False  # Set to True to enable LoRA fine-tuning
@@ -91,6 +99,8 @@ policy:
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false
+    use_linear_ce_fusion_loss: false
+    linear_ce_fusion_chunk_size: 256
     env_vars: {}
     empty_unused_memory_level: 1
     activation_checkpointing: false
@@ -115,7 +125,7 @@ policy:
     defer_fp32_logits: False
     moe_per_layer_logging: False
     moe_enable_deepep: false
-    moe_token_dispatcher_type: "allgather"
+    moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
 
     peft:
