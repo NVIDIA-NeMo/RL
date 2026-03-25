@@ -187,7 +187,6 @@ triton = [
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
-nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 sgl-kernel = { git = "https://github.com/sgl-project/sglang", rev = "3167bcc01c3074d5739e8086757cd8c66077d508", subdirectory = "sgl-kernel" }
 
 [tool.uv.workspace]
