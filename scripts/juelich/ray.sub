@@ -1,0 +1,315 @@
+#!/bin/bash
+#SBATCH --job-name=run_distillation
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=32
+#SBATCH --time=24:00:00
+#SBATCH --partition=booster
+#SBATCH --account=envcomp
+#SBATCH --output=/p/project1/envcomp/yll/RL/scripts/logs/%j-%x.out
+
+# Jülich bare-metal Ray multi-node launcher for NeMo-RL
+# Based on /p/project1/envcomp/yll/nemo-rl/ray_bare.sub
+#
+# Usage:
+#   COMMAND="uv run python examples/run_distillation.py ..." sbatch --nodes=2 ray.sub
+
+set -euo pipefail
+
+########################################################
+# Paths
+########################################################
+NEMO_DIR="/p/project1/envcomp/yll/RL"
+VENV="$NEMO_DIR/.venv"
+RAY_BIN="$VENV/bin/ray"
+PY_BIN="$VENV/bin/python"
+
+LOG_DIR="$NEMO_DIR/scripts/logs/${SLURM_JOB_ID}-ray"
+mkdir -p "$LOG_DIR"
+
+GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+CPUS_PER_WORKER="${CPUS_PER_WORKER:-$SLURM_CPUS_PER_TASK}"
+
+# Randomize ports per job to avoid collisions
+RAY_PORT="${RAY_PORT:-$((6379 + SLURM_JOB_ID % 1000))}"
+RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-$((8265 + SLURM_JOB_ID % 1000))}"
+
+########################################################
+# Validate binaries
+########################################################
+if [[ ! -x "$RAY_BIN" ]]; then
+  echo "ERROR: ray binary not found at $RAY_BIN"
+  exit 1
+fi
+
+cd "$NEMO_DIR"
+
+########################################################
+# Environment setup
+########################################################
+module --force purge
+module load Stages/2025
+module load GCC
+module load CUDA
+module load git
+module load cuDNN
+module unload cuDNN >/dev/null 2>&1 || true
+if ! module load NCCL >/dev/null 2>&1; then
+  echo "[WARN] Could not load NCCL module; continuing without it."
+fi
+
+# Strip cuDNN from LD_LIBRARY_PATH to avoid conflicts with pip-installed cudnn
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+  filtered_ld=""
+  IFS=':' read -r -a ld_parts <<< "$LD_LIBRARY_PATH"
+  for part in "${ld_parts[@]}"; do
+    [[ "$part" == *cuDNN* || "$part" == *cudnn* ]] && continue
+    filtered_ld="${filtered_ld:+$filtered_ld:}$part"
+  done
+  export LD_LIBRARY_PATH="$filtered_ld"
+fi
+
+export UV_PROJECT_ENVIRONMENT="$VENV"
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+
+# Caches
+export REPO_CACHE_ROOT="/p/project1/envcomp/yll/.cache"
+export JOB_CACHE_ROOT="${JOB_CACHE_ROOT:-$REPO_CACHE_ROOT/jobs/$SLURM_JOB_ID}"
+export HF_HOME="${HF_HOME:-$REPO_CACHE_ROOT/huggingface}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+# Do NOT set TRANSFORMERS_CACHE — it overrides HF_HOME/hub/ and breaks model lookup
+export WANDB_MODE="${WANDB_MODE:-offline}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$JOB_CACHE_ROOT/xdg-cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$JOB_CACHE_ROOT/xdg-config}"
+export NEMO_RL_VLLM_CACHE_BASE="${NEMO_RL_VLLM_CACHE_BASE:-$JOB_CACHE_ROOT/vllm}"
+export NEMO_RL_VLLM_CONFIG_BASE="${NEMO_RL_VLLM_CONFIG_BASE:-$JOB_CACHE_ROOT/vllm-config}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$JOB_CACHE_ROOT/torch_inductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$JOB_CACHE_ROOT/triton}"
+export FLASHINFER_CACHE_DIR="${FLASHINFER_CACHE_DIR:-$JOB_CACHE_ROOT/flashinfer}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$JOB_CACHE_ROOT/torch_extensions}"
+export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
+export VLLM_DO_NOT_TRACK="${VLLM_DO_NOT_TRACK:-1}"
+
+# Network: pin to InfiniBand interface
+export NETWORK_IFACE="${NETWORK_IFACE:-ib0}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$NETWORK_IFACE}"
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-$NETWORK_IFACE}"
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+
+# JUWELS Booster A100s
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
+
+mkdir -p \
+  "$HF_HOME" \
+  "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
+  "$NEMO_RL_VLLM_CACHE_BASE" "$NEMO_RL_VLLM_CONFIG_BASE" \
+  "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" \
+  "$FLASHINFER_CACHE_DIR" "$TORCH_EXTENSIONS_DIR"
+
+# ulimit per Ray best practices
+if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
+  ulimit -Sn 65535
+fi
+
+########################################################
+# Node discovery (via InfiniBand interface IPs)
+########################################################
+nodes=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
+head_node="${nodes[0]}"
+head_addr=""
+declare -a SRUN_PIDS=()
+TERMINATION_SIGNAL=""
+DRIVER_RC=""
+
+cleanup() {
+  local rc=$?
+  set +e
+  if [[ -n "${TERMINATION_SIGNAL:-}" ]]; then
+    echo "[ERROR] Received $TERMINATION_SIGNAL (possible time limit or manual cancellation)."
+  fi
+  if [[ -n "${DRIVER_RC:-}" ]]; then
+    echo "[INFO] Driver exit code: $DRIVER_RC"
+  fi
+  echo "[INFO] Cleaning up Ray processes..."
+  for pid in "${SRUN_PIDS[@]:-}"; do
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+  for node in "${nodes[@]:-}"; do
+    srun --overlap -N1 -n1 -w "$node" "$RAY_BIN" stop --force >/dev/null 2>&1 || true
+  done
+  return "$rc"
+}
+trap cleanup EXIT
+trap 'TERMINATION_SIGNAL="SIGINT"; exit 130' INT
+trap 'TERMINATION_SIGNAL="SIGTERM"; exit 143' TERM
+
+get_node_iface_ipv4() {
+  local node="$1"
+  srun --overlap -N1 -n1 -w "$node" \
+    bash -lc "ip -4 -o addr show dev '$NETWORK_IFACE' | awk '{split(\$4, a, \"/\"); print a[1]}' | head -n1" \
+    2>/dev/null || true
+}
+
+echo "[INFO] Head node: $head_node"
+echo "[INFO] All nodes: ${nodes[*]}"
+echo "[INFO] Network interface: $NETWORK_IFACE"
+
+head_ip="$(get_node_iface_ipv4 "$head_node")"
+if [[ -z "$head_ip" ]]; then
+  echo "[ERROR] Could not resolve IPv4 for $head_node on interface $NETWORK_IFACE"
+  exit 1
+fi
+
+declare -a worker_nodes=()
+declare -A NODE_IPS=()
+NODE_IPS["$head_node"]="$head_ip"
+for ((i = 1; i < ${#nodes[@]}; i++)); do
+  worker_nodes+=("${nodes[$i]}")
+done
+for node in "${worker_nodes[@]:-}"; do
+  worker_ip="$(get_node_iface_ipv4 "$node")"
+  if [[ -z "$worker_ip" ]]; then
+    echo "[ERROR] Could not resolve IPv4 for $node on interface $NETWORK_IFACE"
+    exit 1
+  fi
+  NODE_IPS["$node"]="$worker_ip"
+done
+
+echo "[INFO] Head IP: $head_ip"
+for node in "${worker_nodes[@]:-}"; do
+  echo "[INFO] Worker: $node -> ${NODE_IPS[$node]}"
+done
+
+########################################################
+# Start Ray head
+########################################################
+echo "[INFO] Starting Ray head on $head_node"
+srun --overlap -N1 -n1 -w "$head_node" -o "$LOG_DIR/ray-head.log" \
+  "$RAY_BIN" start --head \
+  --node-ip-address="$head_ip" \
+  --port="$RAY_PORT" \
+  --dashboard-port="$RAY_DASHBOARD_PORT" \
+  --dashboard-host="$head_ip" \
+  --num-cpus="$CPUS_PER_WORKER" \
+  --num-gpus="$GPUS_PER_NODE" \
+  --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
+  --disable-usage-stats \
+  --block &
+SRUN_PIDS+=($!)
+
+head_addr="${head_ip}:$RAY_PORT"
+
+########################################################
+# Wait for head to be reachable
+########################################################
+echo "[INFO] Waiting for Ray head to become reachable at $head_addr..."
+check_nodes=("${worker_nodes[@]:-}")
+if [[ ${#check_nodes[@]} -eq 0 ]]; then
+  check_nodes=("$head_node")
+fi
+
+for attempt in $(seq 1 30); do
+  if ! kill -0 "${SRUN_PIDS[0]}" >/dev/null 2>&1; then
+    echo "[ERROR] Ray head step exited unexpectedly. Check $LOG_DIR/ray-head.log"
+    cat "$LOG_DIR/ray-head.log" 2>/dev/null || true
+    exit 1
+  fi
+  all_reachable=true
+  for wnode in "${check_nodes[@]}"; do
+    if ! srun --overlap -N1 -n1 -w "$wnode" \
+      "$RAY_BIN" status --address "$head_addr" >/dev/null 2>&1; then
+      all_reachable=false
+      break
+    fi
+  done
+  if $all_reachable; then
+    echo "[INFO] Ray head reachable from all nodes"
+    break
+  fi
+  if [[ "$attempt" -eq 30 ]]; then
+    echo "[ERROR] Timed out waiting for Ray head at $head_addr"
+    exit 1
+  fi
+  sleep 2
+done
+
+########################################################
+# Start Ray workers
+########################################################
+for ((i = 1; i < ${#nodes[@]}; i++)); do
+  worker="${nodes[$i]}"
+  worker_ip="${NODE_IPS[$worker]}"
+  echo "[INFO] Starting Ray worker on $worker ($worker_ip)"
+  srun --overlap -N1 -n1 -w "$worker" -o "$LOG_DIR/ray-worker-$i.log" \
+    "$RAY_BIN" start \
+    --address "$head_addr" \
+    --node-ip-address="$worker_ip" \
+    --num-cpus="$CPUS_PER_WORKER" \
+    --num-gpus="$GPUS_PER_NODE" \
+    --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
+    --disable-usage-stats \
+    --block &
+  SRUN_PIDS+=($!)
+  sleep 2
+done
+
+########################################################
+# Poll until all workers connected
+########################################################
+extract_worker_units() {
+  local status_output
+  status_output="$(srun --overlap -N1 -n1 -w "$head_node" "$RAY_BIN" status --address "$head_addr" 2>&1 || true)"
+  printf '%s\n' "$status_output" >> "$LOG_DIR/ray-status.log"
+  awk '
+    /worker_units/ {
+      if (match($0, /[0-9]+(\.[0-9]+)?\/[0-9]+(\.[0-9]+)?/)) {
+        split(substr($0, RSTART, RLENGTH), a, "/");
+        print int(a[2] + 0);
+        found = 1;
+        exit
+      }
+    }
+    END { if (!found) print 0 }' <<< "$status_output"
+}
+
+EXPECTED_WORKER_UNITS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
+echo "[INFO] Waiting for worker_units=$EXPECTED_WORKER_UNITS..."
+for attempt in $(seq 1 60); do
+  ACTIVE="$(extract_worker_units)"
+  echo "[INFO] [$attempt/60] worker_units: $ACTIVE/$EXPECTED_WORKER_UNITS"
+  if [[ "$ACTIVE" -eq "$EXPECTED_WORKER_UNITS" ]]; then
+    echo "[INFO] All workers connected!"
+    break
+  fi
+  if [[ "$attempt" -eq 60 ]]; then
+    echo "[ERROR] Timed out waiting for Ray workers"
+    exit 1
+  fi
+  sleep 5
+done
+
+########################################################
+# Run driver command
+########################################################
+COMMAND="${COMMAND:-}"
+if [[ -n "$COMMAND" ]]; then
+  echo "[INFO] Running: $COMMAND"
+  # Run driver directly in the SBATCH context (already on head node)
+  # so all exported env vars are inherited without srun stripping them.
+  set +e
+  cd "$NEMO_DIR"
+  eval "$COMMAND" > "$LOG_DIR/ray-driver.log" 2>&1
+  DRIVER_RC=$?
+  set -e
+  echo "=== Driver log (last 100 lines) ==="
+  tail -100 "$LOG_DIR/ray-driver.log" 2>/dev/null || true
+  if [[ "$DRIVER_RC" -ne 0 ]]; then
+    echo "[ERROR] Driver failed with exit code $DRIVER_RC"
+  fi
+  exit "$DRIVER_RC"
+else
+  echo "[INFO] No COMMAND specified. Ray cluster is idle."
+  echo "[INFO] Attach: srun --overlap --jobid $SLURM_JOB_ID -N1 -n1 -w $head_node --pty bash"
+  sleep infinity
+fi
