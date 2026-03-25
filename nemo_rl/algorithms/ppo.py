@@ -1736,7 +1736,6 @@ def ppo_train(
                         "global_valid_seqs",
                         "global_valid_toks",
                         "grad_norm",
-                        "explained_var",
                     }:
                         critic_metrics["critic/" + k] = np.mean(v).item()
                     elif k in {"values_min"}:
@@ -1744,13 +1743,26 @@ def ppo_train(
                     elif k in {"values_max"}:
                         critic_metrics["critic/" + k] = np.max(v).item()
                     elif isinstance(v, (np.ndarray, list)):
-                        # loss, vf_clipfrac, returns_mean, values_mean, etc.
+                        # loss, vf_clipfrac, returns_mean, values_mean,
+                        # returns_sq_mean, residual_sq_mean, etc.
                         # are normalized by global_valid_toks in the loss fn,
                         # so summing across microbatches gives the correct global value.
                         critic_metrics["critic/" + k] = np.sum(v).item()
                     else:
                         raise ValueError(f"Unknown metric for value don't know how to handle: {k}")
-                
+
+                # Compute explained variance from sufficient statistics:
+                # EV = 1 - Var(returns - values) / Var(returns)
+                r_mean = critic_metrics.get("critic/returns_mean", 0)
+                v_mean = critic_metrics.get("critic/values_mean", 0)
+                r_sq = critic_metrics.get("critic/returns_sq_mean", 0)
+                res_sq = critic_metrics.get("critic/residual_sq_mean", 0)
+                var_returns = r_sq - r_mean ** 2
+                var_residual = res_sq - (r_mean - v_mean) ** 2
+                critic_metrics["critic/explained_var"] = (
+                    1.0 - var_residual / max(var_returns, 1e-8)
+                )
+
                 metrics.update(critic_metrics)
                 metrics.update({
                     "reward": rewards.numpy(),
