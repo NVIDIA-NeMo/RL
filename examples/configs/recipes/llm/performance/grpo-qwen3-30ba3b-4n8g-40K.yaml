@@ -14,7 +14,8 @@ policy:
     enabled: false
   optimizer: null
   scheduler: null
-  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
@@ -35,8 +36,9 @@ policy:
     moe_enable_deepep: true
     moe_token_dispatcher_type: flex
     moe_shared_expert_overlap: false
+  attention_backend: flash
   hybrid_cp:
-    enabled: false
+    enabled: true
     max_seqlen_per_dp_cp_rank: 7168
   generation:
     vllm_cfg:

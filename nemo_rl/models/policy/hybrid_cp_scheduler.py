@@ -5,7 +5,8 @@ to DP×CP ranks based on sequence lengths, enabling per-sample CP size assignmen
 """
 
 import logging
-from typing import Any, List, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, List, Tuple
 
 import torch
 
@@ -56,6 +57,8 @@ class HeadNodeHCPScheduler:
         dp_size: Data parallel size
         cp_size: Global context parallel size
         max_seq_len: Maximum sequence length in the model
+        megatron_cfg: Megatron config dict (from policy.megatron_cfg), used to
+            construct the config namespace expected by BalancedCPScheduler.
     """
 
     def __init__(
@@ -64,6 +67,7 @@ class HeadNodeHCPScheduler:
         dp_size: int,
         cp_size: int,
         max_seq_len: int,
+        megatron_cfg: Dict,
     ):
         self.hcp_config = hcp_config
         self.dp_size = dp_size
@@ -84,11 +88,23 @@ class HeadNodeHCPScheduler:
         else:
             self.max_seqlen_per_dp_cp_rank = hcp_config.max_seqlen_per_dp_cp_rank
 
+        # Build a config namespace from megatron_cfg with max_seqlen_per_dp_cp_rank
+        # injected. BalancedCPScheduler expects a TransformerConfig-like object with
+        # attribute access; SimpleNamespace satisfies this without constructing the
+        # full dataclass (which requires model architecture fields not available here).
+        scheduler_config = SimpleNamespace(
+            **megatron_cfg,
+            max_seqlen_per_dp_cp_rank=self.max_seqlen_per_dp_cp_rank,
+        )
+        # Default expert_model_parallel_size to 1 for non-MoE models
+        if not hasattr(scheduler_config, "expert_model_parallel_size"):
+            scheduler_config.expert_model_parallel_size = 1
+
         # Initialize BalancedCPScheduler with mock process group
         # Use mock since head node doesn't have actual distributed process groups
         mock_dp_cp_group = MockProcessGroup(size=self.hdp_size)
         self.scheduler = BalancedCPScheduler(
-            max_seq_len_per_rank=self.max_seqlen_per_dp_cp_rank,
+            config=scheduler_config,
             dp_cp_group=mock_dp_cp_group,
         )
 

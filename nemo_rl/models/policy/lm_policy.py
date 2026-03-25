@@ -399,6 +399,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                         dp_size=dp_size,
                         cp_size=cp_size,
                         max_seq_len=max_seq_len,
+                        megatron_cfg=self.cfg["megatron_cfg"],
                     )
 
                     sharded_data = hcp_scheduler.schedule_and_shard(
@@ -553,6 +554,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                         dp_size=dp_size,
                         cp_size=cp_size,
                         max_seq_len=max_seq_len,
+                        megatron_cfg=self.cfg["megatron_cfg"],
                     )
 
                     sharded_data = hcp_scheduler.schedule_and_shard(
@@ -763,6 +765,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 dp_size=dp_size,
                 cp_size=cp_size,
                 max_seq_len=max_seq_len,
+                megatron_cfg=self.cfg["megatron_cfg"],
             )
 
             # Set axes for HCP (data sharded across DP×CP)

@@ -181,9 +181,11 @@ class HCPDataIterator:
         # Shard the packed sequence for this HCP rank.
         # all_input_ids is [1, T]; squeeze to [T] since get_batch_on_this_hybrid_cp_rank
         # calls torch.stack([data], 0) internally to restore the batch dimension.
+        # TODO: (pmannan) Remove once TE FlashAttention supports pad_between_seqs
+        # (i.e.) cu_seqlens_q and cu_seqlens_q_padded are different.
         batch_out, packed_seq_params = get_batch_on_this_hybrid_cp_rank(
             batch={"tokens": all_input_ids.squeeze(0)},
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=cu_seqlens_padded,
             cu_seqlens_padded=cu_seqlens_padded,
             max_seqlen=max_seqlen,
             local_cp_size=local_cp_size,
