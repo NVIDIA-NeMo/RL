@@ -60,6 +60,7 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
+  save_optimizer: true
 policy:
   model_name: Qwen/Qwen2.5-VL-3B-Instruct
   tokenizer:
@@ -126,6 +127,9 @@ policy:
       enable_expert_parallel: false
       # VLMs require tokenizer to be initialized before generation, so we set skip_tokenizer_init to False.
       skip_tokenizer_init: False
+    vllm_kwargs:
+      # mm_processor_cache_gb=4/8 both failed at step 20 validation due to cache not found in vLLM, disable cache for now.
+      mm_processor_cache_gb: 0
     colocated:
       enabled: true
       resources:

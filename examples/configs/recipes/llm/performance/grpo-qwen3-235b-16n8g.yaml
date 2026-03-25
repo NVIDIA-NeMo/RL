@@ -16,7 +16,7 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 8192
-  make_sequence_length_divisible_by: 1
+  make_sequence_length_divisible_by: 8
   dtensor_cfg:
     enabled: false
   megatron_cfg:

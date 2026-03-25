@@ -18,6 +18,7 @@ import gc
 import threading
 import time
 import uuid
+import warnings
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -150,11 +151,26 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.metrics.loggers import PrometheusStatLogger
 
-        # (TODO: zhiyul) Remove this workaround after upgrading vLLM where the compilation_config passing issue is resolved.
+        # Workaround: convert compilation_config dict to CompilationConfig object
+        # since AsyncEngineArgs doesn't handle the dict-to-pydantic conversion.
         if llm_kwargs.get("compilation_config", None):
-            llm_kwargs["compilation_config"] = CompilationConfig(
-                **llm_kwargs["compilation_config"]
-            )
+            compilation_config = dict(llm_kwargs["compilation_config"])
+            # use_inductor was removed in vLLM v0.12+ (https://github.com/vllm-project/vllm/pull/29323)
+            # and replaced by the `backend` field: use_inductor=True -> backend="" (inductor),
+            # use_inductor=False -> backend="eager".
+            if "use_inductor" in compilation_config:
+                use_inductor = compilation_config.pop("use_inductor")
+                if "backend" not in compilation_config:
+                    compilation_config["backend"] = "" if use_inductor else "eager"
+                warnings.warn(
+                    "compilation_config.use_inductor is deprecated in vLLM v0.12+. "
+                    "Use compilation_config.backend instead: "
+                    "use_inductor=True -> backend='inductor', "
+                    "use_inductor=False -> backend='eager'.",
+                    DeprecationWarning,
+                    stacklevel=1,
+                )
+            llm_kwargs["compilation_config"] = CompilationConfig(**compilation_config)
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.stat_loggers = (
@@ -286,22 +302,25 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
-        from vllm import __version__ as vllm_version
-        from vllm.entrypoints.openai.api_server import (
-            BaseModelPath,
-            OpenAIServingChat,
-            OpenAIServingModels,
-            OpenAIServingTokenization,
-        )
-        from vllm.entrypoints.openai.protocol import (
+        from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
             ChatCompletionResponse,
-            ErrorResponse,
+        )
+        from vllm.entrypoints.openai.chat_completion.serving import (
+            OpenAIServingChat,
+        )
+        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+        from vllm.entrypoints.openai.models.protocol import BaseModelPath
+        from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+        from vllm.entrypoints.serve.tokenize.protocol import (
             TokenizeChatRequest,
             TokenizeCompletionRequest,
             TokenizeResponse,
         )
-        from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+        from vllm.entrypoints.serve.tokenize.serving import (
+            OpenAIServingTokenization,
+        )
+        from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
@@ -322,9 +341,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             base_model_paths=base_model_paths,
             lora_modules=None,
         )
-        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
-        if vllm_version < "0.11.1":
-            openai_serving_models_kwargs["model_config"] = model_config
         openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
 
         class NeMoRLOpenAIChatRequestMixin:
@@ -344,18 +360,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         class NeMoRLOpenAIServingMixin:
             async def _preprocess_chat(
                 self,
-                request: NeMoRLOpenAIChatRequestMixin,
-                tokenizer,
+                request,
                 messages,
-                chat_template,
-                chat_template_content_format,
-                add_generation_prompt=True,
-                continue_final_message=False,
+                default_template,
+                default_template_content_format,
+                default_template_kwargs,
                 tool_dicts=None,
-                documents=None,
-                chat_template_kwargs=None,
                 tool_parser=None,
-                add_special_tokens=False,
             ):
                 # Materialize the message tool calls so we can deepcopy below.
                 for message in messages:
@@ -365,21 +376,16 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 # Deepcopy messages here since _preprocess_chat may be destructive.
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
-                # res is conversation, [request_prompt], [engine_prompt]
+                # res is (conversation, [engine_prompt])
                 try:
                     res = await super()._preprocess_chat(
-                        request,
-                        tokenizer,
-                        messages,
-                        chat_template,
-                        chat_template_content_format,
-                        add_generation_prompt,
-                        continue_final_message,
-                        tool_dicts,
-                        documents,
-                        chat_template_kwargs,
-                        tool_parser,
-                        add_special_tokens,
+                        request=request,
+                        messages=messages,
+                        default_template=default_template,
+                        default_template_content_format=default_template_content_format,
+                        default_template_kwargs=default_template_kwargs,
+                        tool_dicts=tool_dicts,
+                        tool_parser=tool_parser,
                     )
                 except ValueError as e:
                     if "maximum context length" in str(e):
@@ -415,31 +421,34 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         ]
                     )
 
+                # For the prefix token calculation, we need add_generation_prompt=False
+                # to get tokens up to (and including) the last assistant message only.
+                # add_generation_prompt is a field on the request that gets embedded
+                # into ChatParams via build_chat_params().
+                modified_request = request.model_copy(
+                    update={"add_generation_prompt": False}
+                )
+
                 # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
                 corresponding_res = await super()._preprocess_chat(
-                    request,
-                    tokenizer,
-                    messages_to_last_assistant_message,
-                    chat_template,
-                    chat_template_content_format,
-                    add_generation_prompt=False,
-                    continue_final_message=False,
+                    request=modified_request,
+                    messages=messages_to_last_assistant_message,
+                    default_template=default_template,
+                    default_template_content_format=default_template_content_format,
+                    default_template_kwargs=default_template_kwargs,
                     tool_dicts=tool_dicts,
-                    documents=documents,
-                    chat_template_kwargs=chat_template_kwargs,
                     tool_parser=tool_parser,
-                    add_special_tokens=add_special_tokens,
                 )
-                actual_corresponding_token_ids = corresponding_res[2][0][
+                actual_corresponding_token_ids = corresponding_res[1][0][
                     "prompt_token_ids"
                 ]
 
-                engine_prompt = res[2][
+                engine_prompt = res[1][
                     0
                 ]  # We need to modify engine_prompt.prompt_token_ids
 
                 final_prompt_token_ids = _replace_prefix_tokens(
-                    tokenizer=tokenizer,
+                    tokenizer=self.renderer.tokenizer,
                     model_prefix_token_ids=request.required_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
@@ -582,7 +591,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         from logging import getLogger as _getLogger
 
-        _getLogger("vllm.entrypoints.openai.protocol").addFilter(CleanLoggingFilter())
+        _getLogger("vllm.entrypoints.openai.engine.protocol").addFilter(
+            CleanLoggingFilter()
+        )
 
         # Suppress the noisy vLLM traceback when a prompt exceeds max_model_len.
         # This is expected during multi-turn rollouts; we log a clean one-line
