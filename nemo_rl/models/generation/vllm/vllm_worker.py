@@ -49,7 +49,7 @@ class BaseVllmGenerationWorker:
     @staticmethod
     def configure_worker(
         num_gpus: int | float, bundle_indices: Optional[tuple[int, list[int]]] = None
-    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
         """Provides complete worker configuration for vLLM tensor and pipeline parallelism.
 
         This method configures the worker based on its role in tensor and pipeline parallelism,
@@ -64,11 +64,13 @@ class BaseVllmGenerationWorker:
               - 'resources': Resource allocation (e.g., num_gpus)
               - 'env_vars': Environment variables for this worker
               - 'init_kwargs': Parameters to pass to __init__ of the worker
+              - 'runtime_env': Additional runtime_env options (e.g., nsight config)
         """
         # Initialize configuration
         resources: dict[str, Any] = {"num_gpus": num_gpus}
         init_kwargs: dict[str, Any] = {}
         env_vars: dict[str, str] = {}
+        runtime_env: dict[str, Any] = {}
 
         local_bundle_indices = None
         if bundle_indices is not None:
@@ -108,12 +110,18 @@ class BaseVllmGenerationWorker:
             resources["num_gpus"] = 0
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
             init_kwargs["fraction_of_gpus"] = num_gpus
+        else:
+            # TP=1: profile the outer worker directly since it runs the engine in-process.
+            # When TP>1, nsight is NOT applied here to avoid interfering with Ray's compiled
+            # DAG used by the internal vLLM TP workers. Instead, ray_workers_use_nsight is
+            # set in _create_engine_from_config to profile the internal workers.
+            runtime_env = get_nsight_config_if_pattern_matches("vllm_generation_worker")
 
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         # Skip vllm P2P check and rely on driver to report peer to peer capability.
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
 
-        return resources, env_vars, init_kwargs
+        return resources, env_vars, init_kwargs, runtime_env
 
     def __init__(
         self,
@@ -477,12 +485,13 @@ class BaseVllmGenerationWorker:
             and vllm_kwargs["distributed_executor_backend"] == "ray"
         ):
             logger.warning(
-                "Nsight profiling is enabled for vllm generation worker through the vllm ray distributed executor. "
-                "The nsight command-line args and output file names are automatically picked by the ray distributed "
-                "executor. Refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 "
-                "for more information."
+                "Nsight profiling is enabled for vllm internal TP workers via ray_workers_use_nsight. "
+                "The outer VllmGenerationWorker is NOT profiled to avoid interfering with Ray's compiled DAG. "
+                "vLLM's default nsight config is overridden with capture-range=cudaProfilerApi so that "
+                "profiling is deferred until start_gpu_profiling() is called."
             )
             vllm_kwargs["ray_workers_use_nsight"] = True
+            self._patch_vllm_nsight_config()
 
         # Call init_fp8 when precision is fp8
         # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
@@ -627,6 +636,43 @@ class BaseVllmGenerationWorker:
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
+    @staticmethod
+    def _patch_vllm_nsight_config() -> None:
+        """Override vLLM's nsight config for internal TP workers to use deferred capture.
+
+        vLLM's default _configure_ray_workers_use_nsight applies an always-on nsight
+        config (no capture-range, cuda-graph-trace=node) which causes significant
+        overhead and hangs Ray's compiled DAG. This patch replaces it with NeMo RL's
+        lighter config that uses capture-range=cudaProfilerApi, deferring actual
+        tracing until start_gpu_profiling() triggers cudaProfilerStart() on each
+        internal worker via collective_rpc.
+        """
+        from nemo_rl.utils.nsys import NRL_NSYS_PROFILE_STEP_RANGE
+
+        nsight_config = {
+            "t": "cuda,cudnn,cublas,nvtx",
+            "o": f"'vllm_tp_worker_{NRL_NSYS_PROFILE_STEP_RANGE}_%p'",
+            "stop-on-exit": "true",
+            "s": "none",
+            "capture-range": "cudaProfilerApi",
+            "capture-range-end": "repeat",
+            "cuda-graph-trace": "node",
+        }
+
+        try:
+            from vllm.v1.executor.ray_executor import RayDistributedExecutor
+        except ImportError:
+            from vllm.executor.ray_distributed_executor import (
+                RayDistributedExecutor,
+            )
+
+        def _patched_configure(self, ray_remote_kwargs):
+            runtime_env = ray_remote_kwargs.setdefault("runtime_env", {})
+            runtime_env.update({"nsight": nsight_config})
+            return ray_remote_kwargs
+
+        RayDistributedExecutor._configure_ray_workers_use_nsight = _patched_configure
+
     def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
         """Get speculative decoding metrics from the vLLM engine.
 
@@ -657,9 +703,7 @@ class BaseVllmGenerationWorker:
         return metrics
 
 
-@ray.remote(
-    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
-)  # pragma: no cover
+@ray.remote  # pragma: no cover
 class VllmGenerationWorker(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         import vllm

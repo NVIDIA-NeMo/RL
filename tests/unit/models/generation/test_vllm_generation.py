@@ -663,12 +663,12 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
         # Override the configure_worker method to always use the same seed
         def configure_worker_fixed_seed(num_gpus, bundle_indices=None):
-            resources, env_vars, init_kwargs = original_configure_worker(
+            resources, env_vars, init_kwargs, runtime_env = original_configure_worker(
                 num_gpus, bundle_indices
             )
             # Override with fixed seed
             init_kwargs["seed"] = 42
-            return resources, env_vars, init_kwargs
+            return resources, env_vars, init_kwargs, runtime_env
 
         VllmGenerationWorker.configure_worker = configure_worker_fixed_seed
 
