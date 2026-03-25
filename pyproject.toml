@@ -175,7 +175,6 @@ triton = [
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
-nvidia-resiliency-ext = { index = "pypi" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 # From JustinTong0323/sglang branch update-transformers-v5 (sgl-project/sglang#17784)
@@ -442,9 +441,14 @@ name = "megatron-bridge"
 # Must stay in sync with 3rdparty/Megatron-Bridge-workspace/setup.py::CACHED_DEPENDENCIES.
 version = "0.0.0"
 requires-dist = [
-  "transformers>=5.0.0,<=5.2.0",
+  "transformers>=5.0.0,<=5.3.0",
+  "peft>=0.18.1",
   "datasets>=2.20.0",
   "accelerate",
+  "diffusers>=0.36.0",
+  "einops",
+  "imageio",
+  "imageio-ffmpeg",
   "omegaconf>=2.3.0",
   "tensorboard>=2.19.0",
   "typing-extensions",
@@ -461,12 +465,13 @@ requires-dist = [
   # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13
   "transformer-engine[pytorch,core_cu12]",
   "mamba-ssm",
-  "nvidia-resiliency-ext>=0.5.dev0",
+  "nvidia-resiliency-ext~=0.5.0",
   "causal-conv1d",
   "flash-linear-attention",
   "timm",
   "open-clip-torch>=3.2.0",
   "mlflow>=3.5.0",
+  "comet-ml>=3.50.0",
   "torch>=2.6.0",
 ]
 
