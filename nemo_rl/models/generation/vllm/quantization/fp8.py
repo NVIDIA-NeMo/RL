@@ -516,58 +516,68 @@ def process_weights_after_loading(self, layer) -> None:
 
     maybe_post_process_fp8_weight_block(layer)
 
+    # vLLM's apply() forward pass accesses layer.input_scale when block_quant=True.
+    # The original process_weights_after_loading sets input_scale = None for dynamic activation
+    # with block quantization. We must do the same to avoid AttributeError.
+    if not hasattr(layer, "input_scale"):
+        layer.input_scale = None
+
 
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.
 
-    Compared to the original process_weights_after_loading in vllm, we just avoid creation of
-    new torch.nn.Parameter objects, because that removes the weight_loader attribute which we need for refit.
+    Compared to the original process_weights_after_loading in vllm, we use .copy_() instead of
+    replace_parameter() to avoid creating new torch.nn.Parameter objects, because that removes
+    the weight_loader attribute which we need for refit.
+
+    Updated for vLLM 0.17 which refactored the FP8 MoE weight processing to use
+    convert_to_fp8_moe_kernel_format + fp8_backend instead of the old
+    flashinfer_moe_backend / allow_deep_gemm attributes.
     """
-    # Lazy import to avoid importing triton too early.
-    from vllm._aiter_ops import rocm_aiter_ops
-    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
-        swap_w13_to_w31,
-    )
-    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-        deepgemm_post_process_fp8_weight_block,
-    )
-    from vllm.utils.deep_gemm import (
-        is_deep_gemm_e8m0_used,
+    from vllm.model_executor.layers.quantization.fp8 import (
+        convert_to_fp8_moe_kernel_format,
     )
 
-    self.rocm_aiter_moe_enabled = rocm_aiter_ops.is_fused_moe_enabled()
+    w13 = layer.w13_weight.data
+    w2 = layer.w2_weight.data
+    w13_scale = getattr(layer, f"w13_{self.weight_scale_name}").data
+    w2_scale = getattr(layer, f"w2_{self.weight_scale_name}").data
+    w13_input_scale = layer.w13_input_scale
+    w2_input_scale = layer.w2_input_scale
 
-    assert self.block_quant and self.quant_config.is_checkpoint_fp8_serialized
-    assert self.quant_config.activation_scheme == "dynamic"
+    # Use vLLM's backend-specific weight conversion (handles deepgemm,
+    # flashinfer, triton, etc. based on self.fp8_backend).
+    w13, w2, w13_scale, w2_scale = convert_to_fp8_moe_kernel_format(
+        fp8_backend=self.fp8_backend,
+        layer=layer,
+        w13=w13,
+        w2=w2,
+        w13_scale=w13_scale,
+        w2_scale=w2_scale,
+        w13_input_scale=w13_input_scale,
+        w2_input_scale=w2_input_scale,
+    )
 
-    if self.flashinfer_moe_backend is not None:
-        w13_weight = swap_w13_to_w31(layer.w13_weight.data)
-        w13_weight_scale_inv = swap_w13_to_w31(layer.w13_weight_scale_inv.data)
-    else:
-        w13_weight = layer.w13_weight.data
-        w13_weight_scale_inv = layer.w13_weight_scale_inv.data
-    w2_weight = layer.w2_weight.data
-    w2_weight_scale_inv = layer.w2_weight_scale_inv.data
+    # Use .copy_() to preserve weight_loader attribute on Parameters.
+    layer.w13_weight.copy_(w13)
+    layer.w2_weight.copy_(w2)
+    getattr(layer, f"w13_{self.weight_scale_name}").copy_(w13_scale)
+    getattr(layer, f"w2_{self.weight_scale_name}").copy_(w2_scale)
 
-    # DeepGemm scales need to be transposed and aligned. We try to do
-    # it ahead of time for performance reasons.
-    if self.allow_deep_gemm:
-        w13_weight, w13_weight_scale_inv = deepgemm_post_process_fp8_weight_block(
-            wq=w13_weight,
-            ws=w13_weight_scale_inv,
-            quant_block_shape=tuple(layer.weight_block_size),
-            use_e8m0=is_deep_gemm_e8m0_used(),
+    # Set up the MoE kernel (same as upstream _setup_kernel but without replace_parameter).
+    self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+    if self.moe_quant_config:
+        from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
+
+        assert self.experts_cls is not None
+        self.moe_kernel = make_fp8_moe_kernel(
+            moe_quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            fp8_backend=self.fp8_backend,
+            experts_cls=self.experts_cls,
+            routing_tables=layer._maybe_init_expert_routing_tables(),
+            shared_experts=layer.shared_experts,
         )
-        w2_weight, w2_weight_scale_inv = deepgemm_post_process_fp8_weight_block(
-            wq=w2_weight,
-            ws=w2_weight_scale_inv,
-            quant_block_shape=tuple(layer.weight_block_size),
-            use_e8m0=is_deep_gemm_e8m0_used(),
-        )
-    layer.w13_weight.copy_(w13_weight)
-    layer.w13_weight_scale_inv.copy_(w13_weight_scale_inv)
-    layer.w2_weight.copy_(w2_weight)
-    layer.w2_weight_scale_inv.copy_(w2_weight_scale_inv)
 
 
 def process_weights_after_loading_kv(self, layer) -> None:

@@ -232,6 +232,17 @@ uv venv
 > This ensures that the version of python used is always what we prescribe.
 
 Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file.
+
+> [!IMPORTANT]
+> **Bare metal only (skip if using the NeMo RL container):** If you use the Megatron backend (`--extra mcore`), set these environment variables so Transformer Engine uses the pip-installed cuDNN instead of a potentially mismatched system version:
+> ```sh
+> export CUDNN_HOME=.venv/lib/python3.12/site-packages/nvidia/cudnn
+> export LD_LIBRARY_PATH=".venv/lib/python3.12/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
+> # Verify (should match nvidia-cudnn-cu12 version in pyproject.toml, currently 9.19.0):
+> # uv run --extra mcore python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
+> ```
+> See [docs/about/installation.md](docs/about/installation.md#configure-cudnn-for-transformer-engine-bare-metal-only) for details.
+
 > [!NOTE]
 > - It is not recommended to activate the `venv`, and you should use `uv run <command>` instead to execute scripts within the managed environment.
 >   This ensures consistent environment usage across different shells and sessions. Example: `uv run python examples/run_grpo.py`
