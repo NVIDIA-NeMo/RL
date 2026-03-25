@@ -981,6 +981,9 @@ class SequencePackingLossWrapper:
         seq_starts = padded_cu_seqlens[:-1]
         seq_ends = padded_cu_seqlens[1:]
 
+        _MIN_KEYS = {"probs_ratio_min", "probs_ratio_clamped_min", "values_min"}
+        _MAX_KEYS = {"probs_ratio_max", "probs_ratio_clamped_max", "values_max"}
+
         loss_accum = 0
         metrics_accum = {}
         for seq_idx in range(len(seq_starts)):
@@ -1021,9 +1024,9 @@ class SequencePackingLossWrapper:
             loss_accum += loss
             for k, v in metrics.items():
                 if k not in metrics_accum:
-                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                    if k in _MIN_KEYS:
                         metrics_accum[k] = float("inf")
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                    elif k in _MAX_KEYS:
                         metrics_accum[k] = float("-inf")
                     else:
                         metrics_accum[k] = 0
@@ -1031,10 +1034,10 @@ class SequencePackingLossWrapper:
                 val = v.item() if isinstance(v, torch.Tensor) and v.ndim == 0 else v
 
                 # Skip inf/-inf sentinel values (from sequences with no valid tokens)
-                if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                if k in _MIN_KEYS:
                     if not math.isinf(val):
                         metrics_accum[k] = min(metrics_accum[k], val)
-                elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                elif k in _MAX_KEYS:
                     if not math.isinf(val):
                         metrics_accum[k] = max(metrics_accum[k], val)
                 else:
@@ -1364,16 +1367,17 @@ class MseValueLossFn(LossFunction):
             values_min = masked_values.min().item() if masked_values.numel() > 0 else 0.0
             values_max = masked_values.max().item() if masked_values.numel() > 0 else 0.0
 
-            # Explained variance: approximate — averaged across MBs in ppo.py.
-            # Can't compute exact global EV without a second pass, but this is
-            # close when MBs are similarly sized.
-            masked_returns = returns[mask.bool()]
-            if masked_returns.numel() > 1:
-                var_returns = masked_returns.var().item()
-                var_residual = (masked_returns - masked_values).var().item()
-                explained_var = 1.0 - var_residual / max(var_returns, 1e-8)
-            else:
-                explained_var = 0.0
+            # Explained variance sufficient statistics.
+            # EV = 1 - Var(residual) / Var(returns)
+            # We export E[r²] and E[(r-v)²] (both / global_valid_toks so they
+            # sum correctly across MBs).  ppo.py combines them with returns_mean
+            # and values_mean to compute exact global EV.
+            returns_sq_mean = masked_mean(
+                returns ** 2, mask, global_normalization_factor=global_valid_toks,
+            ).item()
+            residual_sq_mean = masked_mean(
+                (returns - values) ** 2, mask, global_normalization_factor=global_valid_toks,
+            ).item()
 
         metrics = {
             "loss": float(loss.item()),
@@ -1382,7 +1386,8 @@ class MseValueLossFn(LossFunction):
             "values_mean": values_mean,
             "values_min": values_min,
             "values_max": values_max,
-            "explained_var": explained_var,
+            "returns_sq_mean": returns_sq_mean,
+            "residual_sq_mean": residual_sq_mean,
             "num_valid_samples": int(values.shape[0]),
         }
 

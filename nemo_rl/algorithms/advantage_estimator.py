@@ -330,13 +330,10 @@ class GeneralizedAdvantageEstimator:
                 token_level_rewards, values, mask,
             )
 
-        # Whiten advantages and zero out masked positions
+        # Whiten advantages (optional) and zero out masked positions (always)
         if self.normalize_advantages:
-            advantages = torch.masked_fill(
-                self._reward_whiten(advantages, mask),
-                ~(mask.bool()),
-                0,
-            )
+            advantages = self._reward_whiten(advantages, mask)
+        advantages = torch.masked_fill(advantages, ~(mask.bool()), 0)
         return advantages, returns
 
     def _compute_gae(
