@@ -43,7 +43,7 @@ dependencies = [
   "sympy>=1.14.0",
   "pillow>=11.3.0",
   "torchvision==0.25.0",
-  "transformers==5.2.0",
+  "transformers==5.3.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
   "mlflow>=3.5.0,<3.6.0",
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
@@ -258,7 +258,7 @@ override-dependencies = [
   "opentelemetry-api>=1.33.1",
   # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
   # Override until vllm officially relaxes the constraint (https://github.com/vllm-project/vllm/issues/30466).
-  "transformers==5.2.0",
+  "transformers==5.3.0",
 ]
 # CVE fixes
 constraint-dependencies = [
@@ -423,7 +423,7 @@ requires-dist = [
   "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')",
   "torchvision",
   "tqdm",
-  "transformers==5.2.0",
+  "transformers==5.3.0",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
@@ -440,9 +440,15 @@ name = "megatron-bridge"
 # Must stay in sync with 3rdparty/Megatron-Bridge-workspace/setup.py::CACHED_DEPENDENCIES.
 version = "0.0.0"
 requires-dist = [
-  "transformers>=5.0.0,<=5.2.0",
+  "transformers>=5.0.0,<=5.3.0",
+  "peft>=0.18.1",
   "datasets>=2.20.0",
   "accelerate",
+  "diffusers>=0.36.0",
+  "peft>=0.18.0",
+  "einops",
+  "imageio",
+  "imageio-ffmpeg",
   "omegaconf>=2.3.0",
   "tensorboard>=2.19.0",
   "typing-extensions",
@@ -459,12 +465,13 @@ requires-dist = [
   # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13
   "transformer-engine[pytorch,core_cu12]",
   "mamba-ssm",
-  "nvidia-resiliency-ext~=0.4.1",
+  "nvidia-resiliency-ext~=0.5.0",
   "causal-conv1d",
   "flash-linear-attention",
   "timm",
   "open-clip-torch>=3.2.0",
   "mlflow>=3.5.0",
+  "comet-ml>=3.50.0",
   "torch>=2.6.0",
 ]
 
