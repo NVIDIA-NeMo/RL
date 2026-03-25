@@ -176,11 +176,11 @@ jobs:
   org-member-pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.80.1
     with:
-      default_runner_prefix: ${{ vars.DEFAULT_RUNNER_PREFIX }}
+      default_runner_prefix: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
       non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
-      default_test_data_path: ${{ vars.DEFAULT_TEST_DATA_PATH }}
+      default_test_data_path: ${{ vars.NON_NVIDIA_TEST_DATA_PATH }}
       non_nvidia_test_data_path: ${{ vars.NON_NVIDIA_TEST_DATA_PATH }}
-      default_registry: ${{ vars.DEFAULT_CONTAINER_REGISTRY }}
+      default_registry: ${{ vars.NON_NVIDIA_CONTAINER_REGISTRY }}
       non_nvidia_registry: ${{ vars.NON_NVIDIA_CONTAINER_REGISTRY }}
       sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
     secrets:
@@ -286,9 +286,9 @@ jobs:
   build-container:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' && needs.pre-flight.outputs.image_tag == '' }}
     needs: [pre-flight, org-member-pre-flight]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.78.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@b2543e7be161cbc158270cb18aabd7b7ded4548b
     with:
-      build-ref: ${{ needs.pre-flight.outputs.test_sha }}
+      build-ref: main
       image-name: ${{ vars.CI_CONTAINER_NAME }}
       dockerfile: docker/Dockerfile
       runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
