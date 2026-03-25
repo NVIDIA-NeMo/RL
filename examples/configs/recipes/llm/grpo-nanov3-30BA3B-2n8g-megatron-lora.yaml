@@ -17,7 +17,6 @@ policy:
   megatron_cfg:
     enabled: true
     bias_activation_fusion: false
-    gradient_accumulation_fusion: false
     tensor_model_parallel_size: 2
     expert_model_parallel_size: 8
     sequence_parallel: true
