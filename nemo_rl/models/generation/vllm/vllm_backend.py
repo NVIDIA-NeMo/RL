@@ -256,6 +256,245 @@ class VllmInternalWorkerExtension:
 
         return True
 
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Store per-layer param metadata for nccl_reshard-based refit."""
+        self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
+            refit_info
+        )
+
+    def _build_hf_to_vllm_mapping(self, refit_info):
+        """Build mapping from HF param names to vLLM (param, dim0_slice).
+
+        vLLM merges certain HF params into combined tensors:
+          - q_proj + k_proj + v_proj  → qkv_proj  (concat along dim 0)
+          - gate_proj + up_proj       → gate_up_proj (concat along dim 0)
+          - lm_head may be tied to embed_tokens
+
+        For TP>1, vLLM shards merged params along dim 0. Each TP rank stores
+        [q_shard, k_shard, v_shard] locally. We compute LOCAL slices by scaling
+        global offsets proportionally: local_offset = global_offset * local_dim0 / global_dim0.
+
+        Returns:
+            dict: hf_name → (vllm_param_tensor, dim0_slice or None)
+                  If dim0_slice is None, the HF param maps 1:1 to the vLLM param.
+                  If dim0_slice is a slice, the HF param occupies that LOCAL slice.
+        """
+        vllm_params = dict(self.model_runner.model.named_parameters())
+        mapping = {}
+
+        # Collect all HF param names and their global shapes from refit_info
+        hf_shapes = {}
+        for layer_name in refit_info["layer_names"]:
+            for p in refit_info["per_layer_params"][layer_name]:
+                hf_shapes[p["name"]] = tuple(p["global_shape"])
+
+        # Merge rules: (list of HF suffixes) → vLLM suffix, concat along dim 0
+        MERGE_RULES = [
+            (["q_proj.weight", "k_proj.weight", "v_proj.weight"], "qkv_proj.weight"),
+            (["q_proj.bias", "k_proj.bias", "v_proj.bias"], "qkv_proj.bias"),
+            (["gate_proj.weight", "up_proj.weight"], "gate_up_proj.weight"),
+        ]
+
+        for hf_name in hf_shapes:
+            # 1) Direct match
+            if hf_name in vllm_params:
+                mapping[hf_name] = (vllm_params[hf_name], None)
+                continue
+
+            # 2) Check merge rules
+            matched = False
+            for hf_suffixes, vllm_suffix in MERGE_RULES:
+                for i, suffix in enumerate(hf_suffixes):
+                    if hf_name.endswith(suffix):
+                        prefix = hf_name[: -len(suffix)]
+                        vllm_name = prefix + vllm_suffix
+                        if vllm_name in vllm_params:
+                            vllm_param = vllm_params[vllm_name]
+                            local_dim0 = vllm_param.shape[0]
+
+                            # Collect global dim0 sizes for all components
+                            global_sizes = []
+                            for s in hf_suffixes:
+                                full_name = prefix + s
+                                global_sizes.append(
+                                    hf_shapes[full_name][0]
+                                    if full_name in hf_shapes
+                                    else 0
+                                )
+                            global_dim0 = sum(global_sizes)
+
+                            # Compute LOCAL sizes per component.
+                            # Linear interpolation (global_size * local_dim0 / global_dim0) fails
+                            # when vLLM replicates KV heads (num_kv_heads < tp_size), because
+                            # q/k/v proportions change between global and local.
+                            tp_size = torch.distributed.get_world_size()
+                            naive_local_sizes = [gs // tp_size for gs in global_sizes]
+                            if sum(naive_local_sizes) == local_dim0:
+                                local_sizes = naive_local_sizes
+                            else:
+                                # KV head replication: q divides evenly, k/v are replicated
+                                local_sizes = [global_sizes[0] // tp_size]
+                                num_rest = len(global_sizes) - 1
+                                rest = local_dim0 - local_sizes[0]
+                                for _ in range(num_rest):
+                                    local_sizes.append(rest // num_rest)
+                            local_offset = sum(local_sizes[:i])
+                            local_size = local_sizes[i]
+
+                            mapping[hf_name] = (
+                                vllm_param,
+                                slice(local_offset, local_offset + local_size),
+                            )
+                            matched = True
+                        break
+                if matched:
+                    break
+
+            # 3) lm_head tied to embed_tokens
+            if not matched and hf_name == "lm_head.weight":
+                if "model.embed_tokens.weight" in vllm_params:
+                    mapping[hf_name] = (
+                        vllm_params["model.embed_tokens.weight"],
+                        None,
+                    )
+                    matched = True
+
+            if not matched:
+                mapping[hf_name] = (None, None)
+
+        return mapping
+
+    def _compute_tp_local_slice(self, full_tensor, param_name, tp_rank, tp_size):
+        """Compute TP-local slice from a full global tensor for merged params.
+
+        Handles KV head replication: when num_kv_heads < tp_size, vLLM gives
+        each TP rank max(1, num_kv_heads // tp_size) KV heads instead of a
+        naive 1/tp_size shard of the global k/v tensor.
+        """
+        global_dim0 = full_tensor.shape[0]
+
+        if any(s in param_name for s in ("k_proj", "v_proj")):
+            hf_config = self.model_runner.model_config.hf_config
+            num_kv_heads = hf_config.num_key_value_heads
+            head_dim: int = hf_config.hidden_size // hf_config.num_attention_heads
+            if hasattr(hf_config, "head_dim"):
+                head_dim = hf_config.head_dim
+            if num_kv_heads >= tp_size:
+                num_kv_heads_per_tp: int = num_kv_heads // tp_size
+                start_head = tp_rank * num_kv_heads_per_tp
+            else:
+                num_kv_heads_per_tp = max(1, num_kv_heads // tp_size)
+                start_head = (tp_rank * num_kv_heads) // tp_size
+            start = start_head * head_dim
+            end = start + num_kv_heads_per_tp * head_dim
+            return full_tensor[start:end]
+        else:
+            # Standard column-parallel shard (q_proj, gate_proj, up_proj)
+            shard_size = global_dim0 // tp_size
+            start = tp_rank * shard_size
+            return full_tensor[start : start + shard_size]
+
+    def nccl_reshard_refit(self) -> bool:
+        """Receive weights from training workers via xferdtensor_golden.
+
+        Writes directly into vLLM parameters using an HF→vLLM name mapping
+        that handles merged params (qkv_proj, gate_up_proj). This approach
+        is compatible with the future nccl_reshard path where each gen worker
+        receives only its local shard.
+
+        For merged params (qkv_proj, gate_up_proj), receives the full global
+        tensor with all-Replicate placement, then locally computes the correct
+        TP slice. This correctly handles KV head replication (num_kv_heads < tp).
+        """
+        from torch.distributed.tensor.placement_types import Replicate
+
+        from nemo_rl.distributed.nccl_reshard_utils import (
+            TensorWrapper,
+            xferdtensor_golden,
+        )
+
+        hf_to_vllm = self._build_hf_to_vllm_mapping(self.nccl_reshard_refit_info)
+        tp_rank = torch.distributed.get_rank()
+        tp_size = torch.distributed.get_world_size()
+
+        rank = self.model_update_group.rank
+        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
+            params = self.nccl_reshard_refit_info["per_layer_params"][layer_name]
+            if rank == 0:
+                print(
+                    f"[vLLM nccl_reshard_refit] layer={layer_name} num_params={len(params)}",
+                    flush=True,
+                )
+            for param_info in params:
+                name = param_info["name"]
+                vllm_param, dim0_slice = hf_to_vllm.get(name, (None, None))
+
+                if vllm_param is None and rank == 0:
+                    print(
+                        f"[vLLM nccl_reshard_refit] WARNING: no vLLM mapping for '{name}', "
+                        f"broadcast will proceed but data discarded",
+                        flush=True,
+                    )
+                    xferdtensor_golden(
+                        src_tensor=None,
+                        src_mesh=param_info["src_mesh_info"],
+                        src_placement=param_info["src_placements"],
+                        dst_tensor=None,
+                        dst_mesh=param_info["dst_mesh_info"],
+                        dst_placement=param_info["dst_placements"],
+                        process_group=self.model_update_group,
+                        global_shape=param_info["global_shape"],
+                        dtype=param_info["dtype"],
+                        param_name=name,
+                    )
+                elif dim0_slice is not None:
+                    # Merged param (qkv_proj or gate_up_proj).
+                    # Receive full tensor with all-Replicate, then locally compute
+                    # the correct TP slice. This handles KV head replication.
+                    global_shape = param_info["global_shape"]
+                    full_buf = torch.empty(
+                        global_shape, device=self.device, dtype=vllm_param.dtype
+                    )
+                    all_replicate = [Replicate() for _ in param_info["dst_placements"]]
+                    xferdtensor_golden(
+                        src_tensor=None,
+                        src_mesh=param_info["src_mesh_info"],
+                        src_placement=param_info["src_placements"],
+                        dst_tensor=TensorWrapper(full_buf),
+                        dst_mesh=param_info["dst_mesh_info"],
+                        dst_placement=all_replicate,
+                        process_group=self.model_update_group,
+                        global_shape=param_info["global_shape"],
+                        dtype=param_info["dtype"],
+                        param_name=name,
+                    )
+                    local_data = self._compute_tp_local_slice(
+                        full_buf, name, tp_rank, tp_size
+                    )
+                    vllm_param.data[dim0_slice].copy_(local_data)
+                    del full_buf
+                else:
+                    # Direct 1:1 mapping — xferdtensor handles sharding
+                    xferdtensor_golden(
+                        src_tensor=None,
+                        src_mesh=param_info["src_mesh_info"],
+                        src_placement=param_info["src_placements"],
+                        dst_tensor=TensorWrapper(vllm_param),
+                        dst_mesh=param_info["dst_mesh_info"],
+                        dst_placement=param_info["dst_placements"],
+                        process_group=self.model_update_group,
+                        global_shape=param_info["global_shape"],
+                        dtype=param_info["dtype"],
+                        param_name=name,
+                    )
+
+        self._maybe_process_fp8_kv_cache()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        return True
+
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""
         # Close ZMQ socket and context if they exist

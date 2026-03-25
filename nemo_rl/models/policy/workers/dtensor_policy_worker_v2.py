@@ -985,6 +985,85 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         if self.cpu_offload:
             self.model = self.move_to_cpu(self.model)
 
+    @torch.no_grad()
+    def prepare_nccl_reshard_refit_info(
+        self, train_parallelism, gen_parallelism, train_world_size, gen_world_size
+    ):
+        """Prepare per-layer parameter metadata for nccl_reshard-based refit."""
+        from nemo_rl.distributed.nccl_reshard_utils import build_nccl_reshard_refit_info
+
+        state_dict_metadata = {}
+        for name, tensor in self.model.state_dict().items():
+            if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+                continue
+            if isinstance(tensor, DTensor):
+                global_shape = list(tensor.shape)  # DTensor.shape returns global shape
+            else:
+                global_shape = list(tensor.shape)
+            state_dict_metadata[name] = {
+                "shape": global_shape,
+                "dtype": str(self.dtype),
+            }
+
+        self.nccl_reshard_refit_info = build_nccl_reshard_refit_info(
+            state_dict_metadata,
+            train_parallelism,
+            gen_parallelism,
+            train_world_size,
+            gen_world_size,
+        )
+        return self.nccl_reshard_refit_info
+
+    @torch.no_grad()
+    def nccl_reshard_refit(self, kv_scales=None):
+        """Transfer weights to generation workers via xferdtensor_golden."""
+        from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
+
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for nccl_reshard refit path."
+            )
+
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
+        state_dict = dict(self.model.state_dict())
+
+        rank = self.model_update_group.rank
+        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
+            params = self.nccl_reshard_refit_info["per_layer_params"][layer_name]
+            if rank == 0:
+                print(
+                    f"[DTensor nccl_reshard_refit] layer={layer_name} num_params={len(params)}",
+                    flush=True,
+                )
+            for param_info in params:
+                name = param_info["name"]
+                src_tensor = state_dict.get(name)
+                if src_tensor is None and rank == 0:
+                    print(
+                        f"[DTensor nccl_reshard_refit] WARNING: param '{name}' not found in state_dict!",
+                        flush=True,
+                    )
+
+                xferdtensor_golden(
+                    src_tensor=src_tensor,
+                    src_mesh=param_info["src_mesh_info"],
+                    src_placement=param_info["src_placements"],
+                    dst_tensor=None,
+                    dst_mesh=param_info["dst_mesh_info"],
+                    dst_placement=param_info["dst_placements"],
+                    process_group=self.model_update_group,
+                    global_shape=param_info["global_shape"],
+                    dtype=param_info["dtype"],
+                    param_name=name,
+                )
+
+        # Manually move model to cpu for cpu offload case
+        if self.cpu_offload:
+            self.model = self.move_to_cpu(self.model)
+
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:
         # onload model to cuda

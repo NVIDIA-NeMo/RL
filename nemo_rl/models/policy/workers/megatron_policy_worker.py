@@ -1046,6 +1046,80 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             post_iter_func=lambda x: x[1],
         )
 
+    @torch.no_grad()
+    def prepare_nccl_reshard_refit_info(
+        self, train_parallelism, gen_parallelism, train_world_size, gen_world_size
+    ):
+        """Prepare per-layer parameter metadata for nccl_reshard-based refit."""
+        from nemo_rl.distributed.nccl_reshard_utils import build_nccl_reshard_refit_info
+
+        # Ensure refit_param_info_mcore is computed (needed by _iter_params_with_optional_kv_scales)
+        if not hasattr(self, "refit_conversion_tasks"):
+            self.refit_param_info_mcore = self._calculate_refit_param_info()
+
+        state_dict_metadata = {}
+        for name, tensor in self._iter_params_with_optional_kv_scales():
+            state_dict_metadata[name] = {
+                "shape": list(tensor.shape),
+                "dtype": str(self.dtype),
+            }
+
+        self.nccl_reshard_refit_info = build_nccl_reshard_refit_info(
+            state_dict_metadata,
+            train_parallelism,
+            gen_parallelism,
+            train_world_size,
+            gen_world_size,
+        )
+        return self.nccl_reshard_refit_info
+
+    @torch.no_grad()
+    def nccl_reshard_refit(self, kv_scales=None):
+        """Transfer weights to generation workers via xferdtensor_golden."""
+        from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
+
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for nccl_reshard refit path."
+            )
+
+        # Build map of param_name -> full HF tensor from Megatron export
+        param_map = {}
+        for name, tensor in self._iter_params_with_optional_kv_scales(
+            kv_scales=kv_scales
+        ):
+            param_map[name] = tensor
+
+        rank = self.model_update_group.rank
+        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
+            params = self.nccl_reshard_refit_info["per_layer_params"][layer_name]
+            if rank == 0:
+                print(
+                    f"[Megatron nccl_reshard_refit] layer={layer_name} num_params={len(params)}",
+                    flush=True,
+                )
+            for param_info in params:
+                name = param_info["name"]
+                src_tensor = param_map.get(name)
+                if src_tensor is None and rank == 0:
+                    print(
+                        f"[Megatron nccl_reshard_refit] WARNING: param '{name}' not found in param_map!",
+                        flush=True,
+                    )
+
+                xferdtensor_golden(
+                    src_tensor=src_tensor,
+                    src_mesh=param_info["src_mesh_info"],
+                    src_placement=param_info["src_placements"],
+                    dst_tensor=None,
+                    dst_mesh=param_info["dst_mesh_info"],
+                    dst_placement=param_info["dst_placements"],
+                    process_group=self.model_update_group,
+                    global_shape=param_info["global_shape"],
+                    dtype=param_info["dtype"],
+                    param_name=name,
+                )
+
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()

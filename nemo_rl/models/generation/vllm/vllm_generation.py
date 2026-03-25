@@ -851,6 +851,36 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Forward per-layer param metadata to vLLM workers for nccl_reshard refit."""
+        method_name = (
+            "prepare_nccl_reshard_refit_info_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "prepare_nccl_reshard_refit_info"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            refit_info=refit_info,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
+        """Receive weights from training workers via nccl_reshard (xferdtensor_golden)."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        method_name = (
+            "nccl_reshard_refit_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "nccl_reshard_refit"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return futures
+
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
         futures = self.worker_group.run_all_workers_single_data("start_gpu_profiling")

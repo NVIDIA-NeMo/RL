@@ -301,3 +301,4 @@ class PolicyConfig(TypedDict):
         | SchedulerMilestones
         | None
     ]
+    nccl_reshard_refit: NotRequired[bool]
