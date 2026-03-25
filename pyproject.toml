@@ -43,7 +43,7 @@ dependencies = [
   "sympy>=1.14.0",
   "pillow>=11.3.0",
   "torchvision==0.25.0",
-  "transformers==5.2.0",
+  "transformers==5.3.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
   "mlflow>=3.5.0,<3.6.0",
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
@@ -65,7 +65,7 @@ automodel = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
-  "transformers>=5.0.0",
+  "transformers>=5.3.0",
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
@@ -258,7 +258,7 @@ override-dependencies = [
   "opentelemetry-api>=1.33.1",
   # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
   # Override until vllm officially relaxes the constraint (https://github.com/vllm-project/vllm/issues/30466).
-  "transformers==5.2.0",
+  "transformers==5.3.0",
 ]
 # CVE fixes
 constraint-dependencies = [
@@ -424,7 +424,7 @@ requires-dist = [
   "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')",
   "torchvision",
   "tqdm",
-  "transformers==5.2.0",
+  "transformers==5.3.0",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
