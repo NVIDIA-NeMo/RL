@@ -20,6 +20,7 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from enum import IntEnum
+from functools import partial
 from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
 import ray
@@ -47,8 +48,14 @@ from transformers import (
 )
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
-from nemo_rl.algorithms.interfaces import LossFunction, LossType
-from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    apply_top_k_top_p,
+    need_top_k_or_top_p_filtering,
+)
+from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -77,7 +84,6 @@ from nemo_rl.models.policy.utils import (
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
-from nemo_rl.models.policy.workers.patches import apply_torch_aten_alias_tensor_patch
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -90,6 +96,24 @@ class PreparedState(IntEnum):
     NOT_READY = 0
     LOGPROB = 1
     TRAIN = 2
+def _attach_context_parallel_hooks(model: nn.Module) -> None:
+    """Attach forward pre-hooks to self_attn modules for context parallelism.
+
+    CP shards Q/K/V on the sequence dimension as DTensors, so explicit 4D
+    attention masks cause shape mismatches. This registers a hook on every
+    ``self_attn`` sub-module that strips ``attention_mask`` and sets
+    ``is_causal=True``, letting SDPA handle causal masking internally.
+    """
+
+    def _hook(_module, module_args, module_kwargs):
+        if "attention_mask" in module_kwargs:
+            module_kwargs["attention_mask"] = None
+            module_kwargs["is_causal"] = True
+        return module_args, module_kwargs
+
+    for name, module in model.named_modules():
+        if name.endswith("self_attn"):
+            module.register_forward_pre_hook(_hook, with_kwargs=True, prepend=True)
 
 
 @contextmanager
@@ -140,10 +164,9 @@ def get_cpu_state_dict(
     return new_state_dict
 
 
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker")
-)  # pragma: no cover
-class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
+# Classes with @ray.remote can't be inherited from, so we split the implementation out.
+# This is useful when using worker extension classes.
+class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -165,9 +188,6 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
-        # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
-        apply_torch_aten_alias_tensor_patch()
-
         """Initialize the DTensorPolicyWorker."""
         self.prepared_state = PreparedState.NOT_READY
         self.tokenizer = tokenizer
@@ -177,8 +197,17 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         print(f"Initializing DTensorPolicyWorker with is_vlm={self.is_vlm}")
 
         self.is_generation_colocated = None
+        self.sampling_params = None
         if "generation" in config and config["generation"] is not None:
-            self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
+            generation_cfg = config["generation"]
+            # set generation colocated
+            self.is_generation_colocated = generation_cfg["colocated"]["enabled"]
+            # set sampling params
+            self.sampling_params = TrainingSamplingParams(
+                top_k=generation_cfg["top_k"],
+                top_p=generation_cfg["top_p"],
+                temperature=generation_cfg["temperature"],
+            )
 
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
@@ -289,7 +318,9 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 trust_remote_code=True,
             )
 
-        if self.model.config.pad_token_id is None:
+        # Some model configs (e.g. Gemma3 in transformers v5) don't have pad_token_id
+        # as a direct attribute. Use getattr to handle missing attribute gracefully.
+        if getattr(self.model.config, "pad_token_id", None) is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
 
         tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
@@ -364,6 +395,13 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             ],
             custom_parallel_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
         )
+
+        # Attach CP attention-mask hooks (strip mask, set is_causal=True).
+        # CP shards Q/K/V as DTensors on the sequence dimension, so explicit
+        # attention masks cause shape mismatches. These hooks ensure SDPA uses
+        # is_causal=True instead.
+        if self.cp_size > 1:
+            _attach_context_parallel_hooks(self.model)
 
         print(f"[Rank {self.rank}] Loading state dict from rank 0...")
         # This will broadcast the state dict from rank 0 to all other ranks
@@ -485,8 +523,18 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
-        if "generation" in self.cfg and self.cfg["generation"] is not None:
-            logits.div_(self.cfg["generation"]["temperature"])
+        if self.sampling_params is not None and self.sampling_params.temperature != 1.0:
+            logits.div_(self.sampling_params.temperature)
+        return logits
+
+    def _apply_top_k_top_p_filtering(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply top-k and top-p filtering to the logits locally when TP is disabled."""
+        if need_top_k_or_top_p_filtering(self.sampling_params):
+            logits, _ = apply_top_k_top_p(
+                logits,
+                top_k=self.sampling_params.top_k,
+                top_p=self.sampling_params.top_p,
+            )
         return logits
 
     @staticmethod
@@ -667,11 +715,22 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             input_ids = mb.get("input_ids").cuda()
                             batch_size, seq_len = input_ids.shape
 
-                            attention_mask = torch.ones(
-                                (batch_size, seq_len),
-                                dtype=torch.bool,
-                                device=input_ids.device,
-                            )
+                            # When sequence parallelism is enabled, hidden states are
+                            # sharded along the sequence dimension after the embedding layer.
+                            # Passing a full-size attention mask causes a shape mismatch in
+                            # both SDPA and eager attention. Pass None instead — the model
+                            # will use its built-in causal mask.
+                            if (
+                                self.cfg["dtensor_cfg"]["sequence_parallel"]
+                                or self.cp_size > 1
+                            ):
+                                attention_mask = None
+                            else:
+                                attention_mask = torch.ones(
+                                    (batch_size, seq_len),
+                                    dtype=torch.bool,
+                                    device=input_ids.device,
+                                )
                             position_ids = torch.arange(
                                 seq_len, device=input_ids.device
                             ).repeat(batch_size, 1)
@@ -789,20 +848,34 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                                     placements=[Shard(sequence_dim), Shard(-1)],
                                 )
 
+                        # Wrap prepare_loss_input with sampling_params
+                        prepare_loss_input_wrapped = partial(
+                            prepare_loss_input, sampling_params=self.sampling_params
+                        )
+                        # Wrap loss function for sequence packing if needed
                         if self.enable_seq_packing:
                             loss_fn_ = SequencePackingLossWrapper(
                                 loss_fn=loss_fn,
+                                prepare_fn=prepare_loss_input_wrapped,
                                 cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
                                 cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
                             )
+                            loss, loss_metrics = loss_fn_(
+                                logits,
+                                mb,
+                                global_valid_seqs,
+                                global_valid_toks,
+                            )
                         else:
-                            loss_fn_ = loss_fn
-                        loss, loss_metrics = loss_fn_(
-                            logits,
-                            mb,
-                            global_valid_seqs,
-                            global_valid_toks,
-                        )
+                            loss_input, mb = prepare_loss_input_wrapped(
+                                logits, mb, loss_fn
+                            )
+                            loss, loss_metrics = loss_fn(
+                                data=mb,
+                                global_valid_seqs=global_valid_seqs,
+                                global_valid_toks=global_valid_toks,
+                                **loss_input,
+                            )
                         del logits
 
                         # skip the update for dummy batches
@@ -1007,11 +1080,15 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # yet our attention mask above is not always all 1s
                     # this is fine because we mask with the actual attention mask
                     # later, but for input it has to be all 1s
-                    attention_mask = torch.ones(
-                        (batch_size, seq_len),
-                        dtype=torch.bool,
-                        device=input_ids.device,
-                    )
+                    if self.cp_size > 1:
+                        # CP doesn't support attention_mask — SDPA uses is_causal=True
+                        attention_mask = None
+                    else:
+                        attention_mask = torch.ones(
+                            (batch_size, seq_len),
+                            dtype=torch.bool,
+                            device=input_ids.device,
+                        )
 
                 # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
                 if len(vlm_kwargs) > 0:
@@ -1097,6 +1174,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             input_ids_dtensor,
                             seq_index_tensor,
                             chunk_size=logprob_chunk_size,
+                            sampling_params=self.sampling_params,
                         )
 
                         assert token_logprobs.shape[1] == seq_len - 1
@@ -1106,6 +1184,7 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 logits,
                                 input_ids,
                                 chunk_size=logprob_chunk_size,
+                                sampling_params=self.sampling_params,
                             )
                         else:
                             if logprob_chunk_size is not None:
@@ -1123,6 +1202,10 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                                     chunk_logits = logits[
                                         :, chunk_start:chunk_end, :
                                     ].to(torch.float32)
+                                    # Apply top-k and top-p filtering
+                                    chunk_logits = self._apply_top_k_top_p_filtering(
+                                        chunk_logits
+                                    )
                                     log_probs = torch.nn.functional.log_softmax(
                                         chunk_logits, dim=-1
                                     )
@@ -1130,7 +1213,9 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 log_probs = torch.cat(chunked_log_probs, dim=1)
                                 del chunked_log_probs
                             else:
+                                # Apply top-k and top-p filtering
                                 logits = logits.to(torch.float32)
+                                logits = self._apply_top_k_top_p_filtering(logits)
                                 log_probs = torch.nn.functional.log_softmax(
                                     logits, dim=-1
                                 )
@@ -1191,8 +1276,16 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     lp, (0, padding_needed), mode="constant", value=0.0
                 )
             all_log_probs_padded.append(lp)
-        return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
+        token_logprobs = torch.cat(all_log_probs_padded, dim=0)
 
+        # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
+        if need_top_k_or_top_p_filtering(self.sampling_params):
+            mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+            token_logprobs = mask_out_neg_inf_logprobs(
+                token_logprobs, mask, "prev_logprobs"
+            )
+
+        return_data["logprobs"] = token_logprobs.cpu()
         return return_data
 
     # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
@@ -1630,30 +1723,48 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def use_reference_model(self) -> Generator[None, None, None]:
         """Context manager that temporarily swaps the reference model and active model.
 
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
-        On exit: Restores original references and re-flips cuda/cpu
+        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
+                  Also disables top-k/top-p filtering since the reference policy's distribution
+                  is different from the current policy, making filtered logprobs incompatible.
+        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         with torch.no_grad():
-            try:
-                # Save train model state_dict
-                curr_state_dict = get_cpu_state_dict(
-                    self.model.state_dict().items(), pin_memory=True
+            # Save train model state_dict
+            curr_state_dict = get_cpu_state_dict(
+                self.model.state_dict().items(), pin_memory=True
+            )
+
+            # Swap reference model state_dict to self.model
+            for k, v in self.model.state_dict().items():
+                val = to_local_if_dtensor(v)
+                val.copy_(self.reference_model_state_dict[k])
+
+            # Temporarily disable top-k/top-p filtering for reference policy logprobs.
+            # The reference policy has different weights, so its top-k/top-p set is
+            # inherently different from the current policy. Using filtered logprobs
+            # would cause -inf mismatches that cannot be resolved by masking.
+            # Note: We keep temperature scaling since it was applied to prev_logprobs.
+            saved_sampling_params = self.sampling_params
+            if saved_sampling_params is not None:
+                self.sampling_params = TrainingSamplingParams(
+                    top_k=None,  # Disable top-k
+                    top_p=1.0,  # Disable top-p
+                    temperature=saved_sampling_params.temperature,  # Keep temperature
                 )
+            else:
+                self.sampling_params = None
 
-                # Swap reference model state_dict to self.model
-                for k, v in self.model.state_dict().items():
-                    val = to_local_if_dtensor(v)
-                    val.copy_(self.reference_model_state_dict[k])
+            # - self.model is the original reference_model, now on CUDA
+            # - curr_state_dict is the train model, now on CPU
+            yield
 
-                # - self.model is the original reference_model, now on CUDA
-                # - curr_state_dict is the train model, now on CPU
-                yield
+            # Restore sampling_params
+            self.sampling_params = saved_sampling_params
 
-            finally:
-                # Restore train model state_dict
-                for k, v in self.model.state_dict().items():
-                    val = to_local_if_dtensor(v)
-                    val.copy_(curr_state_dict[k])
+            # Restore train model state_dict
+            for k, v in self.model.state_dict().items():
+                val = to_local_if_dtensor(v)
+                val.copy_(curr_state_dict[k])
 
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
@@ -1925,3 +2036,10 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             scheduler=self.scheduler if optimizer_path else None,
             optimizer_path=optimizer_path,
         )
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker")
+)  # pragma: no cover
+class DTensorPolicyWorker(DTensorPolicyWorkerImpl):
+    pass

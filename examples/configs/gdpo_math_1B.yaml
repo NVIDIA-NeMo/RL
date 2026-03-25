@@ -1,0 +1,62 @@
+# GDPO: inherits from grpo_math_1B.yaml and overrides only what differs.
+defaults: grpo_math_1B.yaml
+
+grpo:
+  adv_estimator:
+    name: "gdpo"
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+
+checkpointing:
+  checkpoint_dir: "results/gdpo"
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  logprob_batch_size: 4
+  max_total_sequence_length: 1024
+  megatron_cfg:
+    optimizer:
+      weight_decay: 0.0
+    scheduler:
+      lr_decay_style: "cosine"
+      lr_warmup_iters: 10
+
+# GDPO uses a single flat data config (GSM8K + math_gdpo_data_processor); replace parent's train/validation/default.
+data:
+  _override_: true
+
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 1
+
+  use_multiple_dataloader: false
+
+  train:
+    dataset_name: "gsm8k"
+    split: train
+  validation:
+    dataset_name: "gsm8k"
+    split: test
+
+  default:
+    prompt_file: null
+    system_prompt_file: "examples/prompts/gsm8k.txt"
+    processor: "math_gdpo_data_processor"
+    env_name: "math_multi_reward"
+
+env:
+  math_multi_reward:
+    num_workers: 8
+    math_verify_impl: "hf_math_verify"
+
+logger:
+  wandb_enabled: true
+  wandb:
+    project: "gdpo-dev"
+    name: "gdpo-dev-logger"
+  swanlab:
+    project: "gdpo-dev"
+    name: "gdpo-dev-logger"
+  mlflow:
+    experiment_name: "gdpo-dev"
+    run_name: "gdpo-dev-logger"

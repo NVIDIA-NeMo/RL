@@ -35,13 +35,11 @@ from nemo_automodel.components.distributed.tensor_utils import (
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from torch import nn
 from torch.distributed.tensor import DTensor
-from transformers import (
-    AutoProcessor,
-    AutoTokenizer,
-)
 
-from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
     get_microbatch_iterator,
@@ -68,15 +66,11 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ScoreOutputSpec,
 )
-from nemo_rl.models.policy.utils import (
-    get_runtime_env_for_policy_worker,
-)
+from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import (
-    apply_torch_aten_alias_tensor_patch,
     apply_transformer_engine_patch,
 )
-from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
@@ -201,10 +195,9 @@ def get_train_context(
         yield
 
 
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
-)  # pragma: no cover
-class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
+# Classes with @ray.remote can't be inherited from, so we split the implementation out.
+# This is useful when using worker extension classes.
+class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -218,8 +211,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __init__(
         self,
         config: PolicyConfig,
-        tokenizer: AutoTokenizer,
-        processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
@@ -229,16 +220,25 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         """Initialize the DTensorPolicyWorkerV2."""
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
-        # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
-        apply_torch_aten_alias_tensor_patch()
 
         self.prepared_state = PreparedState.NOT_READY
 
-        # Store configuration and tokenizer/processor
+        # Store configuration
         self.cfg = config
-        self.tokenizer = tokenizer
-        self.processor = processor
-        self.is_vlm = processor is not None
+
+        # Reconstruct tokenizer/processor locally to avoid pickling across
+        # incompatible transformers versions (v4 head node → v5 worker).
+        from nemo_rl.models.automodel.setup import get_tokenizer
+
+        use_processor = config["tokenizer"].get("use_processor", False)
+        result = get_tokenizer(config["tokenizer"], get_processor=use_processor)
+        if use_processor:
+            self.processor = result
+            self.tokenizer = result.tokenizer
+        else:
+            self.tokenizer = result
+            self.processor = None
+        self.is_vlm = self.processor is not None
         self.lora_enabled = (
             config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
@@ -255,22 +255,22 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             rank=0,  # Temporary, will be updated after distributed init
         )
 
-        # Set up distributed environment (returns FSDP2Manager)
-        distributed_manager = setup_distributed(
+        # Set up distributed environment (returns DistributedContext)
+        distributed_context = setup_distributed(
             config=config,
             runtime_config=runtime_config,
         )
-        # Set instance attributes from distributed manager (tuple unpacking for mesh attributes)
+        # Set instance attributes from distributed context
         self.rank = torch.distributed.get_rank()
-        self.device_mesh = distributed_manager.device_mesh
+        self.device_mesh = distributed_context.device_mesh
         self.dp_cp_mesh = self.device_mesh["dp_cp"]
         self.dp_mesh = self.device_mesh["dp"]
         self.tp_mesh = self.device_mesh["tp"]
         self.cp_mesh = self.device_mesh["cp"]
-        self.moe_mesh = distributed_manager.moe_mesh
-        self.dp_size = distributed_manager.dp_size
-        self.tp_size = distributed_manager.tp_size
-        self.cp_size = distributed_manager.cp_size
+        self.moe_mesh = distributed_context.moe_mesh
+        self.dp_size = distributed_context.dp_size
+        self.tp_size = distributed_context.tp_size
+        self.cp_size = distributed_context.cp_size
 
         # Initialize checkpoint manager now that distributed is set up
         self._init_checkpoint_manager(
@@ -280,15 +280,16 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     "dequantize_base_checkpoint", False
                 ),
                 "is_peft": self.lora_enabled,
+                "is_async": True,
             },
         )
 
         # Set up model and optimizer
         model_and_optimizer_state = setup_model_and_optimizer(
             config=config,
-            tokenizer=tokenizer,
+            tokenizer=self.tokenizer,
             runtime_config=runtime_config,
-            distributed_manager=distributed_manager,
+            distributed_context=distributed_context,
             checkpoint_manager=self.checkpoint_manager,
             is_vlm=self.is_vlm,
             init_optimizer=init_optimizer,
@@ -299,7 +300,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # Set instance attributes from model and optimizer state (tuple unpacking)
         (
             self.model,
-            self.model_state_dict_keys,
             self.optimizer,
             self.scheduler,
             self.is_hf_model,
@@ -329,6 +329,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.cpu_offload,
             self.offload_optimizer_for_logprob,
             self.is_generation_colocated,
+            self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
@@ -381,6 +382,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             cp_size=self.cp_size,
             dp_size=self.dp_size,
             enable_seq_packing=self.enable_seq_packing,
+            sampling_params=self.sampling_params,
         )
 
         # Create train context factory
@@ -441,7 +443,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # Use automodel_forward_backward for the training loop
                 mb_results = automodel_forward_backward(
                     model=self.model,
-                    cfg=self.cfg,
                     data_iterator=processed_iterator,
                     post_processing_fn=loss_post_processor,
                     forward_only=eval_mode,
@@ -449,6 +450,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     allow_flash_attn_args=self.allow_flash_attn_args,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
+                    sampling_params=self.sampling_params,
                     sequence_dim=sequence_dim,
                     dp_size=self.dp_size,
                     cp_size=self.cp_size,
@@ -560,6 +562,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             tp_mesh=self.tp_mesh,
             cp_size=self.cp_size,
             enable_seq_packing=self.enable_seq_packing,
+            sampling_params=self.sampling_params,
         )
 
         with torch.no_grad():
@@ -588,11 +591,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     token_logprobs, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        cfg=self.cfg,
                         post_processing_fn=logprobs_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=False,
                         allow_flash_attn_args=self.allow_flash_attn_args,
+                        sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
 
@@ -662,11 +665,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     rm_scores, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        cfg=self.cfg,
                         post_processing_fn=score_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=True,
                         allow_flash_attn_args=False,
+                        sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
 
@@ -752,11 +755,11 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     (vals, idx), _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        cfg=self.cfg,
                         post_processing_fn=topk_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=False,
                         allow_flash_attn_args=self.allow_flash_attn_args,
+                        sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
 
@@ -803,30 +806,48 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
     def use_reference_model(self) -> Generator[None, None, None]:
         """Context manager that temporarily swaps the reference model and active model.
 
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
-        On exit: Restores original references and re-flips cuda/cpu
+        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
+                  Also disables top-k/top-p filtering since the reference policy's distribution
+                  is different from the current policy, making filtered logprobs incompatible.
+        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         with torch.no_grad():
-            try:
-                # Save train model state_dict
-                curr_state_dict = get_cpu_state_dict(
-                    self.model.state_dict().items(), pin_memory=True
+            # Save train model state_dict
+            curr_state_dict = get_cpu_state_dict(
+                self.model.state_dict().items(), pin_memory=True
+            )
+
+            # Swap reference model state_dict to self.model
+            for k, v in self.model.state_dict().items():
+                val = to_local_if_dtensor(v)
+                val.copy_(self.reference_model_state_dict[k])
+
+            # Temporarily disable top-k/top-p filtering for reference policy logprobs.
+            # The reference policy has different weights, so its top-k/top-p set is
+            # inherently different from the current policy. Using filtered logprobs
+            # would cause -inf mismatches that cannot be resolved by masking.
+            # Note: We keep temperature scaling since it was applied to prev_logprobs.
+            saved_sampling_params = self.sampling_params
+            if saved_sampling_params is not None:
+                self.sampling_params = TrainingSamplingParams(
+                    top_k=None,
+                    top_p=1.0,
+                    temperature=saved_sampling_params.temperature,
                 )
+            else:
+                self.sampling_params = None
 
-                # Swap reference model state_dict to self.model
-                for k, v in self.model.state_dict().items():
-                    val = to_local_if_dtensor(v)
-                    val.copy_(self.reference_model_state_dict[k])
+            # - self.model is the original reference_model, now on CUDA
+            # - curr_state_dict is the train model, now on CPU
+            yield
 
-                # - self.model is the original reference_model, now on CUDA
-                # - curr_state_dict is the train model, now on CPU
-                yield
+            # Restore sampling_params
+            self.sampling_params = saved_sampling_params
 
-            finally:
-                # Restore train model state_dict
-                for k, v in self.model.state_dict().items():
-                    val = to_local_if_dtensor(v)
-                    val.copy_(curr_state_dict[k])
+            # Restore train model state_dict
+            for k, v in self.model.state_dict().items():
+                val = to_local_if_dtensor(v)
+                val.copy_(curr_state_dict[k])
 
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
@@ -1157,10 +1178,16 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.checkpoint_manager = AutomodelCheckpointManager(
                 dp_mesh=self.dp_mesh,
                 tp_mesh=self.tp_mesh,
-                model_state_dict_keys=getattr(self, "model_state_dict_keys", None),
                 moe_mesh=self.moe_mesh,
             )
             self.checkpoint_manager.init_checkpointer(
                 config_updates=config_updates,
                 checkpoint_root=checkpoint_root,
             )
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+)  # pragma: no cover
+class DTensorPolicyWorkerV2(DTensorPolicyWorkerV2Impl):
+    pass

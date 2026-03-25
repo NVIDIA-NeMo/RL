@@ -652,7 +652,13 @@ class RayWorkerGroup:
         )
 
         worker = self.workers[worker_idx]
-        method = getattr(worker, method_name)
+        try:
+            method = getattr(worker, method_name)
+        except AttributeError as e:
+            print(
+                f"Supported methods: {list(worker._method_shells.keys())}", flush=True
+            )
+            raise e
         return method.remote(*args, **kwargs)
 
     def run_all_workers_multiple_data(
@@ -737,7 +743,14 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
+                try:
+                    method = getattr(worker, method_name)
+                except AttributeError as e:
+                    print(
+                        f"Supported methods: {list(worker._method_shells.keys())}",
+                        flush=True,
+                    )
+                    raise e
                 worker_args = [arg[data_idx] for arg in args]
                 worker_kwargs = {key: value[data_idx] for key, value in kwargs.items()}
                 futures.append(
@@ -793,7 +806,14 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
+                try:
+                    method = getattr(worker, method_name)
+                except AttributeError as e:
+                    print(
+                        f"Supported methods: {list(worker._method_shells.keys())}",
+                        flush=True,
+                    )
+                    raise e
                 futures.append(method.remote(*args, **kwargs))
 
         return futures
@@ -996,10 +1016,11 @@ class RayWorkerGroup:
                 print(
                     f"Error during graceful shutdown: {e}. Falling back to force termination."
                 )
-                force = True
 
-        # Force kill any remaining workers
-        if force or cleanup_method is None:
+        # Always kill actors to release named actor registrations and resources.
+        # Even after successful graceful cleanup, actors remain alive in Ray's registry
+        # which prevents creating new actors with the same name.
+        if True:
             initializers_to_kill = []
             for worker in self._workers:
                 if hasattr(worker, "_RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC"):

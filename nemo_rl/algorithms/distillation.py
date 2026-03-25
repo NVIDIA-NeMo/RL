@@ -13,7 +13,6 @@
 # limitations under the License.
 import os
 import warnings
-from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -24,7 +23,7 @@ from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import _should_use_async_rollouts, refit_policy_generation
-from nemo_rl.algorithms.loss_functions import (
+from nemo_rl.algorithms.loss import (
     DistillationLossConfig,
     DistillationLossDataDict,
     DistillationLossFn,
@@ -431,12 +430,7 @@ def setup(
     print("\n▶ Setting up student policy...", flush=True)
 
     # Checkpoint paths
-    if last_checkpoint_path:
-        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
-        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
-    else:
-        weights_path = None
-        optimizer_path = None
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         ## NOTE: this is equal to the total number of scheduler steps
@@ -850,7 +844,9 @@ def distillation_train(
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            ),
+                            )
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),

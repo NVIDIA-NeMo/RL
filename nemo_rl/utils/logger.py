@@ -50,6 +50,7 @@ _rich_logging_configured = False
 class WandbConfig(TypedDict):
     project: NotRequired[str]
     name: NotRequired[str]
+    entity: NotRequired[str]
 
 
 class SwanlabConfig(TypedDict):

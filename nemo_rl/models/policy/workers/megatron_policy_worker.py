@@ -36,9 +36,7 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
 )
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
+from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -50,7 +48,8 @@ from megatron.core.parallel_state import (
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import (
@@ -100,10 +99,9 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
-)  # pragma: no cover
-class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
+# Classes with @ray.remote can't be inherited from, so we split the implementation out.
+# This is useful when using worker extension classes.
+class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
 
@@ -168,7 +166,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             hf_model_name,
             pretrained_path,
             weights_path,
-            tokenizer,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
@@ -178,6 +175,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             runtime_config.offload_optimizer_for_logprob
         )
         self.is_generation_colocated = runtime_config.is_generation_colocated
+        self.sampling_params = runtime_config.sampling_params
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
 
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
@@ -333,6 +331,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 loss_post_processor = LossPostProcessor(
                     loss_fn=loss_fn,
                     cfg=self.cfg,
+                    num_microbatches=num_microbatches,
+                    sampling_params=self.sampling_params,
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
@@ -344,7 +344,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Forward pass.
                     losses_reduced = megatron_forward_backward(
                         model=self.model,
-                        cfg=self.cfg,
                         data_iterator=data_iterator,
                         num_microbatches=num_microbatches,
                         seq_length=padded_seq_length,
@@ -354,8 +353,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         defer_fp32_logits=self.defer_fp32_logits,
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
-                        do_not_average_loss=True,
+                        sampling_params=self.sampling_params,
                         straggler_timer=self.mcore_state.straggler_timer,
+                        use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
+                            "use_linear_ce_fusion_loss", False
+                        ),
                     )
 
                 # Empty unused memory.
@@ -508,16 +510,21 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
+        logprobs_post_processor = LogprobsPostProcessor(
+            cfg=self.cfg,
+            sampling_params=self.sampling_params,
+        )
+
         list_of_logprobs = megatron_forward_backward(
             model=self.model,
-            cfg=self.cfg,
             data_iterator=mb_iterator,
             seq_length=padded_seq_length,
             mbs=micro_batch_size,
             num_microbatches=num_microbatches,
-            post_processing_fn=LogprobsPostProcessor(cfg=self.cfg),
+            post_processing_fn=logprobs_post_processor,
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
+            sampling_params=self.sampling_params,
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
@@ -541,56 +548,122 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         no_grad.__exit__(None, None, None)
         return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
 
+    def _apply_state_dict_to_model(
+        self,
+        source_state_dict: dict,
+        *,
+        raise_if_key_missing: bool = False,
+    ) -> None:
+        """Apply a state dict to self.model in-place.
+
+        - Tensors with matching shape: in-place copy (parameters / buffers).
+        - _extra_state keys (e.g. FP8 scale/amax) with shape mismatch or non-Tensor value:
+          resolve the submodule and call set_extra_state(); supports DDP and Float16Module unwrap.
+
+        Args:
+            source_state_dict: State dict to apply (e.g. reference_state_dict or saved model_state_dict).
+            raise_if_key_missing: If True, raise when a key in self.model.state_dict() is missing
+                from source_state_dict; if False, skip such keys.
+        """
+        for state_dict_key, param_or_buf in self.model.state_dict().items():
+            if not isinstance(param_or_buf, torch.Tensor):
+                continue
+            if state_dict_key not in source_state_dict:
+                if raise_if_key_missing:
+                    raise ValueError(
+                        f"Key '{state_dict_key}' not in source state_dict."
+                    )
+                continue
+            source_value = source_state_dict[state_dict_key]
+
+            # Case 1: Same shape → in-place copy (parameters / buffers)
+            if (
+                isinstance(source_value, torch.Tensor)
+                and param_or_buf.shape == source_value.shape
+            ):
+                param_or_buf.copy_(source_value)
+                continue
+
+            # Case 2: _extra_state (shape mismatch or non-Tensor) → set_extra_state()
+            assert "extra_state" in state_dict_key, (
+                f"the {state_dict_key} is not an extra_state, but the param_or_buf is mismatched with the reference_state_dict {source_value.shape} != {param_or_buf.shape}."
+            )
+
+            submodule_path = state_dict_key.rsplit("._extra_state", 1)[0]
+            base_module = getattr(self.model, "module", self.model)
+            # Unwrap Float16Module/MoEFloat16Module: state_dict keys are relative to inner .module
+            top_level_name = submodule_path.split(".", 1)[0]
+            if not hasattr(base_module, top_level_name):
+                base_module = getattr(base_module, "module", base_module)
+            target_module = base_module.get_submodule(submodule_path)
+            target_module.set_extra_state(source_value)
+
     @contextmanager
     def use_reference_model(self):
         """Context manager that temporarily swaps the reference model and active model.
 
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
-        On exit: Restores original references and re-flips cuda/cpu
+        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
+                  Also disables top-k/top-p filtering since the reference policy's distribution
+                  is different from the current policy, making filtered logprobs incompatible.
+        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         ## disable overlap param gather when swapping weights
         if self.should_disable_forward_pre_hook:
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
-            try:
-                # Save original references
-                model_state_dict = {}
-                for name, item in self.model.state_dict().items():
-                    if isinstance(item, torch.Tensor):
-                        item = item.detach().to(
-                            device="cpu", non_blocking=True, copy=True
-                        )
-                    model_state_dict[name] = item
+            # Save original references
+            model_state_dict = {}
+            for name, item in self.model.state_dict().items():
+                if isinstance(item, torch.Tensor):
+                    item = item.detach().to(device="cpu", non_blocking=True, copy=True)
+                model_state_dict[name] = item
 
-                self.model.load_state_dict(self.reference_state_dict, strict=True)
-                # for name, item in self.reference_state_dict.items():
-                # if isinstance(item, torch.Tensor):
-                # self.model.state_dict()[name] = item.detach().to(device="cuda", non_blocking=True, copy=True)
+            # Swap reference model state_dict into self.model (reference weights + optional FP8 extra_state)
+            self._apply_state_dict_to_model(
+                self.reference_state_dict,
+                raise_if_key_missing=True,
+            )
 
-                if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
-                    gc.collect()
-                    torch.cuda.empty_cache()
+            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                gc.collect()
+                torch.cuda.empty_cache()
 
-                # - self.model is the original reference_model, now on CUDA
-                # - self.reference_model is the original model, now on CPU
-                yield
+            # Temporarily disable top-k/top-p filtering for reference policy logprobs.
+            # The reference policy has different weights, so its top-k/top-p set is
+            # inherently different from the current policy. Using filtered logprobs
+            # would cause -inf mismatches that cannot be resolved by masking.
+            # Note: We keep temperature scaling since it was applied to prev_logprobs.
+            saved_sampling_params = self.sampling_params
+            if saved_sampling_params is not None:
+                self.sampling_params = TrainingSamplingParams(
+                    top_k=None,
+                    top_p=1.0,
+                    temperature=saved_sampling_params.temperature,
+                )
+            else:
+                self.sampling_params = None
 
-            finally:
-                # Restore original references and device placement
-                self.model.load_state_dict(model_state_dict, strict=True)
-                # for name, item in model_state_dict.items():
-                # if isinstance(item, torch.Tensor):
-                # item = item.detach().to(device="cuda", non_blocking=True, copy=True)
-                # self.model.state_dict()[name] = item
+            # - self.model is the original reference_model, now on CUDA
+            # - self.reference_model is the original model, now on CPU
+            yield
 
-                if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
-                    gc.collect()
-                    torch.cuda.empty_cache()
+            # Restore sampling_params
+            self.sampling_params = saved_sampling_params
 
-                ## re-enable overlap param gather after weight swap
-                if self.should_disable_forward_pre_hook:
-                    self.enable_forward_pre_hook()
+            # Restore original policy state (weights + FP8 extra_state) from saved model_state_dict
+            self._apply_state_dict_to_model(
+                model_state_dict,
+                raise_if_key_missing=True,
+            )
+
+            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            ## re-enable overlap param gather after weight swap
+            if self.should_disable_forward_pre_hook:
+                self.enable_forward_pre_hook()
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
     def get_topk_logits(
@@ -637,7 +710,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         list_of_outputs = megatron_forward_backward(
             model=self.model,
-            cfg=self.cfg,
             data_iterator=mb_iterator,
             seq_length=padded_seq_length,
             mbs=micro_batch_size,
@@ -645,6 +717,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             post_processing_fn=TopkLogitsPostProcessor(cfg=self.cfg, k=k),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
+            sampling_params=self.sampling_params,
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
@@ -726,15 +799,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 f"Input to Megatron Generation worker is not properly right-padded: {error_msg}"
             )
 
-        model_cfg = self.megatron_cfg.model
-        inference_wrapper_config = InferenceWrapperConfig(
-            hidden_size=model_cfg.hidden_size,
-            inference_batch_times_seqlen_threshold=1000000,
-            fp32_residual_connection=model_cfg.fp32_residual_connection,
-            params_dtype=model_cfg.params_dtype,
-            padded_vocab_size=self.final_padded_vocab_size,  # Use the potentially updated value
-            inference_max_seq_length=self.cfg["generation"]["max_new_tokens"],  # type: ignore
-            inference_max_requests=self.cfg["generation_batch_size"],
+        mcore_generation_config = cast(
+            MegatronGenerationConfig, self.cfg["generation"]["mcore_generation_config"]
         )
 
         from megatron.core.inference.contexts.dynamic_context import (
@@ -748,44 +814,31 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
         from megatron.core.inference.sampling_params import SamplingParams
 
-        mcore_generation_config = cast(
-            MegatronGenerationConfig, self.cfg["generation"]["mcore_generation_config"]
-        )
-        buffer_size_gb = mcore_generation_config["buffer_size_gb"]
-
-        num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
-        block_size_tokens = mcore_generation_config["block_size_tokens"]
-        use_cuda_graphs_for_non_decode_steps = mcore_generation_config[
-            "use_cuda_graphs_for_non_decode_steps"
-        ]
-        enable_chunked_prefill = mcore_generation_config["enable_chunked_prefill"]
-        unified_memory_level = mcore_generation_config["unified_memory_level"]
-        max_tokens = mcore_generation_config["max_tokens"]
-
         model_config = self.model.config
         model_config.cuda_graph_impl = "local"
 
-        dynamic_context = DynamicInferenceContext(
-            params_dtype=inference_wrapper_config.params_dtype,
-            num_layers=model_config.num_layers,
-            kv_channels=model_config.kv_channels,
-            num_attention_heads=model_config.num_query_groups,
+        local_rank = torch.cuda.current_device()
+        num_gpus_per_node = torch.cuda.device_count()
+        node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
+        model_config.inference_sampling_seed = (node_idx * 1024) + local_rank
+
+        inference_config = InferenceConfig(
             max_sequence_length=self.cfg["generation"]["max_new_tokens"],
-            buffer_size_gb=buffer_size_gb,
-            materialize_only_last_token_logits=False,
-            num_cuda_graphs=num_cuda_graphs,
-            block_size_tokens=block_size_tokens,
-            tensor_model_parallel_size=self.cfg["megatron_cfg"][
-                "tensor_model_parallel_size"
+            buffer_size_gb=mcore_generation_config["buffer_size_gb"],
+            num_cuda_graphs=mcore_generation_config["num_cuda_graphs"],
+            block_size_tokens=mcore_generation_config["block_size_tokens"],
+            use_cuda_graphs_for_non_decode_steps=mcore_generation_config[
+                "use_cuda_graphs_for_non_decode_steps"
             ],
-            use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
+            enable_chunked_prefill=mcore_generation_config["enable_chunked_prefill"],
+            unified_memory_level=mcore_generation_config["unified_memory_level"],
+            max_tokens=mcore_generation_config["max_tokens"],
+            materialize_only_last_token_logits=False,
             use_flashinfer_fused_rope=False,
-            unified_memory_level=unified_memory_level,
-            max_tokens=max_tokens,
         )
-        inference_wrapped_model = GPTInferenceWrapper(
-            self.model, inference_wrapper_config, dynamic_context
-        )
+
+        dynamic_context = DynamicInferenceContext(model_config, inference_config)
+        inference_wrapped_model = GPTInferenceWrapper(self.model, dynamic_context)
 
         inference_wrapped_model.prep_model_for_inference()
         # Set pipeline parallel flag
@@ -798,21 +851,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             tokenizer=self.megatron_tokenizer,
         )
 
-        # Calculate seed based on node and rank to ensure reproducibility across workers
-        local_rank = torch.cuda.current_device()  # Local GPU index on the node
-        num_gpus_per_node = torch.cuda.device_count()
-        node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
-        seed = (node_idx * 1024) + local_rank
-
-        # New API: DynamicInferenceEngine has additional parameters
         dynamic_engine = DynamicInferenceEngine(
             text_generation_controller,
             dynamic_context,
-            enable_cuda_graph=True,
-            random_seed=seed,
-            track_paused_request_events=False,
-            enable_chunked_prefill=enable_chunked_prefill,
-            inference_logging_step_interval=0,
         )
 
         # Handle None values for top_k - convert to integer as required by Megatron
@@ -1596,3 +1637,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 final_result = obj_list[0]  # type: ignore
 
         return final_result
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
+)  # pragma: no cover
+class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
+    pass

@@ -31,6 +31,10 @@ class SglangSpecificArgs(TypedDict):
     disable_cuda_graph: NotRequired[bool]
     disable_radix_cache: NotRequired[bool]
     disable_cuda_graph_padding: NotRequired[bool]
+    # Enabling piecewise CUDA graph (i.e. setting this to False) currently crashes with
+    # "illegal memory access", likely due to torch 2.10 + sglang incompatibility.
+    # Defaulted to True (disabled) in sglang_worker.py until the upstream sglang fork is updated.
+    disable_piecewise_cuda_graph: NotRequired[bool]
     enable_nccl_nvls: NotRequired[bool]
     disable_outlines_disk_cache: NotRequired[bool]
     disable_custom_all_reduce: NotRequired[bool]

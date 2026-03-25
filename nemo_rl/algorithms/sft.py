@@ -13,7 +13,6 @@
 # limitations under the License.
 import os
 import warnings
-from pathlib import Path
 from typing import NotRequired, Optional, TypedDict, cast
 
 import numpy as np
@@ -21,9 +20,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.loss_functions import (
-    NLLLoss,
-)
+from nemo_rl.algorithms.loss.loss_functions import NLLLossFn
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -98,7 +95,7 @@ def setup(
     RayVirtualCluster,
     StatefulDataLoader,
     Optional[StatefulDataLoader],
-    NLLLoss,
+    NLLLossFn,
     Logger,
     CheckpointManager,
     SFTSaveState,
@@ -193,24 +190,25 @@ def setup(
         processor = tokenizer
         tokenizer = processor.tokenizer
 
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+
     policy = Policy(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
         processor=processor,
-        weights_path=Path(last_checkpoint_path) / "policy" / "weights"
-        if last_checkpoint_path
-        else None,
-        optimizer_path=Path(last_checkpoint_path) / "policy" / "optimizer"
-        if last_checkpoint_path
-        else None,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=False,
     )
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = NLLLoss()
+    loss_fn = NLLLossFn(
+        use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
+        and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"]
+    )
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
@@ -562,14 +560,15 @@ def sft_train(
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             total_steps + 1, sft_save_state, master_config
                         )
-
                         policy.save_checkpoint(
                             weights_path=os.path.join(
                                 checkpoint_path, "policy", "weights"
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            ),
+                            )
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),

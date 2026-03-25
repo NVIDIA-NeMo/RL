@@ -135,7 +135,7 @@ def test_smolvlm_embeddings_differ_from_reference():
 
     patch_attention_mask = torch.ones(
         (
-            bsz,
+            bsz * num_images,
             pixel_values.size(2) // patch_size,
             pixel_values.size(3) // patch_size,
         ),

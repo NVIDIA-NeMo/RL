@@ -36,7 +36,12 @@ TEST_ASSETS_DIR = os.path.join(TESTS_DIR, "test_assets")
 def build_tiny_nemotron5_h_checkpoint(model_path: str) -> None:
     import shutil
 
+    import transformers
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    assert transformers.__version__ < "5.3.0", (
+        "NemotronHConfig is supported in transformers 5.3.0 or later, use NemotronHConfig instead"
+    )
 
     config = AutoConfig.from_pretrained(
         "nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True
@@ -54,6 +59,9 @@ def build_tiny_nemotron5_h_checkpoint(model_path: str) -> None:
     tokenizer = AutoTokenizer.from_pretrained(
         "nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True
     )
+
+    # Disable tied weights for transformers 5.2.0 to avoid error
+    model._tied_weights_keys = None
 
     shutil.rmtree(model_path, ignore_errors=True)
     model.save_pretrained(model_path)
