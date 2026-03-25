@@ -24,7 +24,7 @@ from nemo_rl.algorithms.dpo import (
     add_ref_logprobs_to_data,
     dpo_train,
 )
-from nemo_rl.algorithms.loss_functions import PreferenceLoss
+from nemo_rl.algorithms.loss import PreferenceLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 
@@ -169,7 +169,7 @@ def mock_dpo_components():
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
 
-    loss_fn = PreferenceLoss()
+    loss_fn = PreferenceLossFn()
     logger = MagicMock()
     checkpointer = MagicMock()
 

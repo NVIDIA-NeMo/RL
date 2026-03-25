@@ -29,7 +29,7 @@ from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from tests.unit.test_utils import SimpleLoss
+from tests.unit.test_utils import SimpleLossFn
 
 # Define basic test config
 simple_policy_config = {
@@ -70,8 +70,10 @@ simple_policy_config = {
     },
     "max_grad_norm": 1.0,
     "generation": {
-        "backend": "vllm",
         "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": None,
+        "backend": "vllm",
         "colocated": {"enabled": True},
     },
 }
@@ -310,7 +312,7 @@ def test_convert_dcp_to_hf(policy, num_gpus, request):
             "sample_mask": torch.ones(input_ids.shape[0]),
         }
     )
-    policy.train(dummy_fwd_dict, SimpleLoss())
+    policy.train(dummy_fwd_dict, SimpleLossFn())
     policy_version_is_v2 = request.node.callspec.params["policy"]
 
     with TemporaryDirectory() as tmp_dir:

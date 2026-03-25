@@ -187,7 +187,7 @@ class TestApplyMoeConfig:
                 "moe_router_bias_update_rate": 0.0,
                 "moe_permute_fusion": True,
                 "moe_enable_deepep": False,
-                "moe_token_dispatcher_type": "allgather",
+                "moe_token_dispatcher_type": "alltoall",
                 "moe_shared_expert_overlap": True,
             }
         }
@@ -201,7 +201,7 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_router_bias_update_rate == 0.0
         assert model_cfg.moe_permute_fusion is True
         assert model_cfg.moe_enable_deepep is False
-        assert model_cfg.moe_token_dispatcher_type == "allgather"
+        assert model_cfg.moe_token_dispatcher_type == "alltoall"
         assert model_cfg.moe_shared_expert_overlap is True
 
 
@@ -751,7 +751,6 @@ class TestValidateAndSetConfig:
                 hf_model_name="test-model",
                 pretrained_path="/path/to/model",
                 weights_path=None,
-                tokenizer=MagicMock(),
             )
 
         assert "Reward models are not yet supported" in str(exc_info.value)
@@ -764,6 +763,9 @@ class TestValidateAndSetConfig:
 
         config = {
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "colocated": {"enabled": True},
             },
             "precision": "bfloat16",
@@ -794,7 +796,6 @@ class TestValidateAndSetConfig:
                     hf_model_name="test-model",
                     pretrained_path="/path/to/model",
                     weights_path=None,
-                    tokenizer=MagicMock(),
                 )
 
                 assert runtime_config.is_generation_colocated is True
@@ -815,6 +816,7 @@ class TestRuntimeConfigNamedTuple:
             optimizer_cpu_offload=False,
             offload_optimizer_for_logprob=True,
             is_generation_colocated=True,
+            sampling_params=None,
             final_padded_vocab_size=32000,
         )
 
@@ -822,6 +824,7 @@ class TestRuntimeConfigNamedTuple:
         assert runtime_config.optimizer_cpu_offload is False
         assert runtime_config.offload_optimizer_for_logprob is True
         assert runtime_config.is_generation_colocated is True
+        assert runtime_config.sampling_params is None
         assert runtime_config.final_padded_vocab_size == 32000
 
 

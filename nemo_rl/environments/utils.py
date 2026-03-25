@@ -35,6 +35,9 @@ ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
     "math": {
         "actor_class_fqn": "nemo_rl.environments.math_environment.MathEnvironment",
     },
+    "math_multi_reward": {
+        "actor_class_fqn": "nemo_rl.environments.math_environment.MathMultiRewardEnvironment",
+    },
     "code": {
         "actor_class_fqn": "nemo_rl.environments.code_environment.CodeEnvironment",
     },

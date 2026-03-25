@@ -14,13 +14,10 @@
 name: "CICD NeMo RL"
 
 on:
-  pull_request:
+  push:
     branches:
-      - "main"
-      - "r**"
-    types: [labeled, opened, synchronize, reopened]
-  merge_group:
-    types: [checks_requested]
+      - main
+      - "pull-request/[0-9]+"
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
@@ -31,17 +28,18 @@ on:
         type: choice
         options:
           - docs
+          - Lfast
           - L0
           - L1
           - L2
-        description: Test level to run. docs = doc tests only, L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
-  # TODO: Due to limited compute, disabling pushes to main. This is okay to do since we force PRs to be up to date and the CI tests on pull/$PR_NUM/merge
-  #push:
-  #  branches:
-  #    - 'main'
+        description: Test level to run. docs = doc tests only (reuses main container), Lfast = fast subset (reuses main container), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
+      image_tag:
+        description: "Override container image tag (e.g. 'main'). Skips container build."
+        required: false
+        default: ""
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -49,12 +47,65 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       test_level: ${{ steps.evaluate.outputs.test_level }}
+      image_tag: ${{ steps.evaluate.outputs.image_tag }}
+      base_ref: ${{ steps.base-head-ref.outputs.base_ref }}
+      base_sha: ${{ steps.base-head-ref.outputs.base_sha }}
+      head_ref: ${{ steps.base-head-ref.outputs.head_ref }}
+      head_sha: ${{ steps.base-head-ref.outputs.head_sha }}
+      head_label: ${{ steps.base-head-ref.outputs.head_label }}
+      has_skip_cicd: ${{ steps.base-head-ref.outputs.has_skip_cicd }}
+      test_sha: ${{ steps.base-head-ref.outputs.test_sha }}
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine base and head references
+        id: base-head-ref
+        env:
+          IS_PULL_REQUEST_REF: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+          PR_INFO_JSON: ${{ steps.get-pr-info.outputs.pr-info }}
+        run: |
+          if [[ "$IS_PULL_REQUEST_REF" == "true" && -n "$PR_INFO_JSON" ]]; then
+            base_ref=$(echo "$PR_INFO_JSON" | jq -r '.base.ref')
+            base_sha=$(echo "$PR_INFO_JSON" | jq -r '.base.sha')
+            head_ref=$(echo "$PR_INFO_JSON" | jq -r '.head.ref')
+            head_sha=$(echo "$PR_INFO_JSON" | jq -r '.head.sha')
+            test_sha=$(echo "$PR_INFO_JSON" | jq -r '.merge_commit_sha')
+            head_label=$(echo "$PR_INFO_JSON" | jq -r '.head.label // empty')
+            ci_label=$(echo "$PR_INFO_JSON" | jq -r '[.labels[]? | (if type == "string" then . else .name end) | select(startswith("CI:"))] | first // empty')
+            has_skip_cicd=$(echo "$PR_INFO_JSON" | jq -r '[.labels[]? | (if type == "string" then . else .name end) | select(. == "Skip CICD")] | length > 0')
+          else
+            base_ref="HEAD~1"
+            base_sha=$(git rev-parse HEAD~1)
+            head_ref="HEAD"
+            head_sha="${{ github.sha }}"
+            test_sha="${{ github.sha }}"
+            head_label="${{ github.ref_name }}"
+            ci_label=""
+            has_skip_cicd="false"
+          fi
+          [[ "$has_skip_cicd" != "true" ]] && has_skip_cicd="false"
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "head_label=$head_label" >> "$GITHUB_OUTPUT"
+          echo "ci_label=$ci_label" >> "$GITHUB_OUTPUT"
+          echo "has_skip_cicd=$has_skip_cicd" >> "$GITHUB_OUTPUT"
+
       - name: Get changed files
         id: changed-files
-        if: github.event_name == 'pull_request'
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: step-security/changed-files@v45.0.1
         with:
+          base_sha: ${{ steps.base-head-ref.outputs.base_sha }}
           files_yaml: |
             doc:
               - '**.md'
@@ -69,8 +120,8 @@ jobs:
           DOCS_ONLY: ${{ steps.changed-files.outputs.doc_any_changed == 'true' && steps.changed-files.outputs.src_any_changed == 'false' }}
           CHANGED_DOCS: ${{ steps.changed-files.outputs.doc_all_changed_files }}
           CHANGED_SRC: ${{ steps.changed-files.outputs.src_all_changed_files }}
-          IS_PULLREQUEST: ${{ github.event_name == 'pull_request' }}
-          LABEL: ${{ github.event.label.name }}
+          IS_PULLREQUEST: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+          LABEL: ${{ steps.base-head-ref.outputs.ci_label }}
           MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
         run: |
           # Some output that's helpful for debugging
@@ -85,6 +136,8 @@ jobs:
           if [[ "$DOCS_ONLY" == "true" || "$LABEL" == "CI:docs" ]]; then
             # For doc-only changes, run only doc tests
             TEST_LEVEL="docs"
+          elif [[ "$LABEL" == "CI:Lfast" ]]; then
+            TEST_LEVEL="Lfast"
           elif [[ "$LABEL" == "CI:L0" ]]; then
             TEST_LEVEL="L0"
           elif [[ "$LABEL" == "CI:L1" || "$IS_PULLREQUEST" == "false" || "$MERGE_GROUP" == "true"  ]]; then
@@ -110,10 +163,33 @@ jobs:
 
           echo "test_level=$TEST_LEVEL" | tee -a "$GITHUB_OUTPUT"
 
+          # Determine image tag: Lfast and docs reuse the main container, workflow_dispatch can override
+          IMAGE_TAG=""
+          if [[ "$TEST_LEVEL" == "Lfast" || "$TEST_LEVEL" == "docs" ]]; then
+            IMAGE_TAG="main"
+          fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.image_tag }}" ]]; then
+            IMAGE_TAG="${{ inputs.image_tag }}"
+          fi
+          echo "image_tag=$IMAGE_TAG" | tee -a "$GITHUB_OUTPUT"
+
+  org-member-pre-flight:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.80.1
+    with:
+      default_runner_prefix: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
+      non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
+      default_test_data_path: ${{ vars.NON_NVIDIA_TEST_DATA_PATH }}
+      non_nvidia_test_data_path: ${{ vars.NON_NVIDIA_TEST_DATA_PATH }}
+      default_registry: ${{ vars.NON_NVIDIA_CONTAINER_REGISTRY }}
+      non_nvidia_registry: ${{ vars.NON_NVIDIA_CONTAINER_REGISTRY }}
+      sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
+    secrets:
+      NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
+
   pr-branch-up-to-date-check:
     name: Check if PR branch is up to date
     needs: [pre-flight]
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
     runs-on: ubuntu-latest
     env:
       MAX_COMMITS_BEHIND: 10
@@ -122,10 +198,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BASE_REF: ${{ github.base_ref }}
-          HEAD_LABEL: ${{ github.event.pull_request.head.label }}
+          BASE_SHA: ${{ needs.pre-flight.outputs.base_sha }}
+          HEAD_SHA: ${{ needs.pre-flight.outputs.head_sha }}
+          BASE_REF: ${{ needs.pre-flight.outputs.base_ref }}
+          HEAD_LABEL: ${{ needs.pre-flight.outputs.head_label }}
         run: |
           echo "Repository: $REPO"
           echo "Base branch: $BASE_REF (SHA: $BASE_SHA)"
@@ -170,7 +246,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: "recursive"
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -208,20 +284,22 @@ jobs:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.57.0
 
   build-container:
-    if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
-    needs: [pre-flight]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.52.0
+    if: ${{ needs.pre-flight.outputs.test_level != 'none' && needs.pre-flight.outputs.image_tag == '' }}
+    needs: [pre-flight, org-member-pre-flight]
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@b2543e7be161cbc158270cb18aabd7b7ded4548b
     with:
-      build-ref: ${{ github.sha }}
-      image-name: nemo_rl_container
+      build-ref: main
+      image-name: ${{ vars.CI_CONTAINER_NAME }}
       dockerfile: docker/Dockerfile
-      image-label: nemo-rl
+      runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+      image-label: ${{ vars.CI_CONTAINER_NAME }}
       target: release
+      registry: ${{ needs.org-member-pre-flight.outputs.registry }}
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
       build-args: |
         MAX_JOBS=4
-        NEMO_RL_COMMIT=${{ github.sha }}
+        NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
 
   cicd-doc-tests:
     strategy:
@@ -229,9 +307,17 @@ jobs:
       matrix:
         include:
           - script: Docs_Tests
-            runner: self-hosted-azure
-    needs: [pre-flight, build-container]
-    if: ${{ contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) }}
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+    needs: [pre-flight, build-container, org-member-pre-flight]
+    if: >-
+      ${{
+        (
+          always() &&
+          contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) &&
+          needs.pre-flight.result == 'success' &&
+          (needs.build-container.result == 'success' || needs.build-container.result == 'skipped')
+        ) && !cancelled()
+      }}
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
     environment: nemo-ci
@@ -242,9 +328,13 @@ jobs:
         uses: ./.github/actions/test-template
         with:
           runner: ${{ runner.name }}
+          registry: ${{ needs.org-member-pre-flight.outputs.registry }}
+          image: ${{ vars.CI_CONTAINER_NAME }}
+          image-tag: ${{ needs.pre-flight.outputs.image_tag }}
+          test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           script: ${{ matrix.script }}
           is_doc_test: "true"
-          is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
+          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   cicd-unit-tests:
     strategy:
@@ -252,13 +342,24 @@ jobs:
       matrix:
         include:
           - script: L0_Unit_Tests_Generation
-            runner: self-hosted-azure
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
           - script: L0_Unit_Tests_Policy
-            runner: self-hosted-azure
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
           - script: L0_Unit_Tests_Other
-            runner: self-hosted-azure
-    needs: [pre-flight, build-container, cicd-doc-tests]
-    if: ${{ contains('L0 L1 L2', needs.pre-flight.outputs.test_level) }}
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+    needs: [pre-flight, build-container, cicd-doc-tests, org-member-pre-flight]
+    if: >-
+      ${{
+        (
+          always() &&
+          contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) &&
+          needs.pre-flight.result == 'success' &&
+          (needs.build-container.result == 'success' || needs.build-container.result == 'skipped') &&
+          (needs.cicd-doc-tests.result == 'success' || needs.cicd-doc-tests.result == 'skipped')
+        ) && !cancelled()
+      }}
+
+
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.script }}
     steps:
@@ -271,9 +372,13 @@ jobs:
         with:
           runner: ${{ runner.name }}
           script: ${{ matrix.script }}
+          registry: ${{ needs.org-member-pre-flight.outputs.registry }}
+          test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
+          image: ${{ vars.CI_CONTAINER_NAME }}
+          image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           is_unit_test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
-          is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
+          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   cicd-functional-tests:
     strategy:
@@ -281,8 +386,8 @@ jobs:
       matrix:
         include:
           - script: L1_Functional_Tests_GPU
-            runner: self-hosted-azure
-    needs: [pre-flight, build-container, cicd-unit-tests]
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+    needs: [pre-flight, build-container, cicd-unit-tests, org-member-pre-flight]
     runs-on: ${{ matrix.runner }}
     if: ${{ contains('L1 L2', needs.pre-flight.outputs.test_level) }}
     name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
@@ -296,8 +401,39 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
           runner: ${{ runner.name }}
+          registry: ${{ needs.org-member-pre-flight.outputs.registry }}
+          image: ${{ vars.CI_CONTAINER_NAME }}
+          test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           script: ${{ matrix.script }}
-          is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
+          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
+
+  cicd-fast-functional-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - script: L1_Functional_Tests_GPU
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+    needs: [pre-flight, org-member-pre-flight]
+    if: ${{ contains('Lfast', needs.pre-flight.outputs.test_level) }}
+    runs-on: ${{ matrix.runner }}
+    name: fast_${{ matrix.script }}
+    environment: nemo-ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: main
+        uses: ./.github/actions/test-template
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        with:
+          runner: ${{ runner.name }}
+          script: ${{ matrix.script }}
+          image-tag: ${{ needs.pre-flight.outputs.image_tag }}
+          registry: ${{ needs.org-member-pre-flight.outputs.registry }}
+          image: ${{ vars.CI_CONTAINER_NAME }}
+          test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
+          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   CI_QA_Gate:
     name: "CI quality check${{ needs.pre-flight.outputs.test_level == 'none' && ' (No tests run: Label CI:L*)' || '' }}"
@@ -312,6 +448,7 @@ jobs:
       - cicd-doc-tests
       - cicd-unit-tests
       - cicd-functional-tests
+      - cicd-fast-functional-tests
     steps:
       - name: main
         env:
@@ -324,17 +461,20 @@ jobs:
               (
                 needs.pre-flight.outputs.test_level != 'none' &&
                 needs.sphinx-build.result == 'success' &&
-                needs.build-container.result == 'success' &&
+                (needs.build-container.result == 'success' || needs.build-container.result == 'skipped') &&
                 (
                   (
-                    needs.cicd-doc-tests.result == 'success' &&
+                    (needs.cicd-doc-tests.result == 'success' || needs.cicd-doc-tests.result == 'skipped') &&
                     (needs.cicd-unit-tests.result == 'skipped' || needs.cicd-unit-tests.result == 'success') &&
-                    (needs.cicd-functional-tests.result == 'skipped' || needs.cicd-functional-tests.result == 'success')
+                    (needs.cicd-functional-tests.result == 'skipped' || needs.cicd-functional-tests.result == 'success') &&
+                    (needs.cicd-fast-functional-tests.result == 'skipped' || needs.cicd-fast-functional-tests.result == 'success')
                   )
                 )
               )
             }}
-          CI_SKIP: ${{ github.event.label.name == 'Skip CICD' }}
+
+
+          CI_SKIP: ${{ needs.pre-flight.outputs.has_cicd_skip_label }}
           TEST_LEVEL: ${{ needs.pre-flight.outputs.test_level }}
         run: |
           SUMMARY=$(echo $JOB_RESULTS | jq 'to_entries[] | .key + ": " + .value.result' | tr -d '"')

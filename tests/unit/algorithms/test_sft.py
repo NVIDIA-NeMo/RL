@@ -18,7 +18,7 @@ import pytest
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from nemo_rl.algorithms.loss_functions import NLLLoss
+from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.sft import _default_sft_save_state, sft_train
 
 
@@ -58,7 +58,7 @@ def mock_components():
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
 
-    loss_fn = NLLLoss()
+    loss_fn = NLLLossFn()
     logger = MagicMock()
     checkpointer = MagicMock()
 

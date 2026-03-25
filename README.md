@@ -10,6 +10,12 @@
 </div>
 
 ## 📣 News
+* [03/12/2026] GDPO Support
+    * Enabling [Group reward-Decoupled Normalization Policy Optimization](https://arxiv.org/abs/2601.05242) (GDPO) for multi-reward RL training is now supported.
+    * Example: [gdpo_math_1B.yaml](/examples/configs/gdpo_math_1B.yaml)
+    * Support Async RL training 
+    * WIP: Nemo-gym compatibility
+* [03/11/2026] [Nemotron-3-Super](https://research.nvidia.com/labs/nemotron/Nemotron-3-Super/) was post-trained with NeMo-RL! Follow [this guide](https://github.com/NVIDIA-NeMo/RL/blob/super-v3/docs/guides/nemotron-3-super.md) to reproduce the full RL training recipe.
 * [02/04/2026] LoRA Support
     * LoRA SFT is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1556) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1629) backends.
     * DTensor [GRPO](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [DPO](https://github.com/NVIDIA-NeMo/RL/pull/1826) both support LoRA; (Megatron Core coming soon).
@@ -226,6 +232,17 @@ uv venv
 > This ensures that the version of python used is always what we prescribe.
 
 Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file.
+
+> [!IMPORTANT]
+> **Bare metal only (skip if using the NeMo RL container):** If you use the Megatron backend (`--extra mcore`), set these environment variables so Transformer Engine uses the pip-installed cuDNN instead of a potentially mismatched system version:
+> ```sh
+> export CUDNN_HOME=.venv/lib/python3.12/site-packages/nvidia/cudnn
+> export LD_LIBRARY_PATH=".venv/lib/python3.12/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
+> # Verify (should match nvidia-cudnn-cu12 version in pyproject.toml, currently 9.19.0):
+> # uv run --extra mcore python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
+> ```
+> See [docs/about/installation.md](docs/about/installation.md#configure-cudnn-for-transformer-engine-bare-metal-only) for details.
+
 > [!NOTE]
 > - It is not recommended to activate the `venv`, and you should use `uv run <command>` instead to execute scripts within the managed environment.
 >   This ensures consistent environment usage across different shells and sessions. Example: `uv run python examples/run_grpo.py`

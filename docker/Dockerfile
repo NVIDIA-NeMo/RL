@@ -45,7 +45,7 @@ apt-get install -y --no-install-recommends \
 # Nsight
 apt install -y --no-install-recommends gnupg
 echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list
-apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub
+apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(uname -m | sed 's/aarch64/sbsa/')/7fa2af80.pub
 apt update
 apt install -y nsight-systems-cli
 
@@ -155,6 +155,15 @@ EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+# Point TE at the pip-installed cuDNN (nvidia-cudnn-cu12) instead of the system one.
+# The container's system cuDNN (/lib/x86_64-linux-gnu/libcudnn*.so.9) may be a different
+# version than what pip installed. TE prioritizes system libraries by default, causing a
+# version mismatch crash (e.g. system 9.10.1 vs pip 9.19.0). CUDNN_HOME makes TE's Python
+# code find the pip version first, and LD_LIBRARY_PATH makes the dynamic linker resolve
+# cuDNN sub-libraries from pip when loading libtransformer_engine.so.
+ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.12/site-packages/nvidia/cudnn
+ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.12/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
+# Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 
 WORKDIR /opt/nemo-rl
 
