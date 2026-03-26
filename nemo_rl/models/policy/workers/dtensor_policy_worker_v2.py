@@ -1031,6 +1031,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         state_dict = dict(self.model.state_dict())
 
         rank = self.model_update_group.rank
+        dtype_mismatch_count = 0
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
             params = self.nccl_reshard_refit_info["per_layer_params"][layer_name]
             if rank == 0:
@@ -1047,6 +1048,32 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                         flush=True,
                     )
 
+                # Pre-convert DTensor to a regular, contiguous tensor in the
+                # target dtype.  This matches what dtensor_params_generator()
+                # does in the working broadcast path and avoids two classes of
+                # bugs:
+                #   1) Dtype mismatch: DTensor params may be float32 (e.g.
+                #      layernorms) while the gen side allocates bfloat16
+                #      buffers — causing an NCCL size mismatch that corrupts
+                #      all subsequent broadcasts.
+                #   2) Non-contiguity: full_tensor() may return a view; NCCL
+                #      broadcast needs contiguous memory.
+                if src_tensor is not None:
+                    if isinstance(src_tensor, DTensor):
+                        src_tensor = src_tensor.full_tensor()
+                        # full_tensor() may launch all-gather on the NCCL
+                        # stream; synchronize before touching the data.
+                        torch.cuda.synchronize()
+                    orig_dtype = src_tensor.dtype
+                    src_tensor = src_tensor.to(self.dtype).contiguous()
+                    if rank == 0 and orig_dtype != self.dtype:
+                        dtype_mismatch_count += 1
+                        print(
+                            f"[DTensor nccl_reshard_refit] dtype converted: {name} "
+                            f"{orig_dtype} -> {self.dtype}",
+                            flush=True,
+                        )
+
                 xferdtensor_golden(
                     src_tensor=src_tensor,
                     src_mesh=param_info["src_mesh_info"],
@@ -1059,6 +1086,12 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     dtype=param_info["dtype"],
                     param_name=name,
                 )
+
+        if rank == 0:
+            print(
+                f"[DTensor nccl_reshard_refit] Done. dtype_mismatch_count={dtype_mismatch_count}",
+                flush=True,
+            )
 
         # Manually move model to cpu for cpu offload case
         if self.cpu_offload:

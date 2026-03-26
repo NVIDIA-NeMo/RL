@@ -418,9 +418,14 @@ class VllmInternalWorkerExtension:
         tp_size = torch.distributed.get_world_size()
 
         rank = self.model_update_group.rank
+        if tp_rank == 0:
+            print(
+                f"[vLLM nccl_reshard_refit] ENTERING method, global_rank={rank}, tp_rank={tp_rank}, tp_size={tp_size}, num_layers={len(self.nccl_reshard_refit_info['layer_names'])}",
+                flush=True,
+            )
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
             params = self.nccl_reshard_refit_info["per_layer_params"][layer_name]
-            if rank == 0:
+            if tp_rank == 0:
                 print(
                     f"[vLLM nccl_reshard_refit] layer={layer_name} num_params={len(params)}",
                     flush=True,
@@ -429,12 +434,15 @@ class VllmInternalWorkerExtension:
                 name = param_info["name"]
                 vllm_param, dim0_slice = hf_to_vllm.get(name, (None, None))
 
-                if vllm_param is None and rank == 0:
-                    print(
-                        f"[vLLM nccl_reshard_refit] WARNING: no vLLM mapping for '{name}', "
-                        f"broadcast will proceed but data discarded",
-                        flush=True,
-                    )
+                if vllm_param is None:
+                    # No vLLM mapping — still must participate in broadcast
+                    # (all ranks must call xferdtensor_golden collectively)
+                    if tp_rank == 0:
+                        print(
+                            f"[vLLM nccl_reshard_refit] WARNING: no vLLM mapping for '{name}', "
+                            f"broadcast will proceed but data discarded",
+                            flush=True,
+                        )
                     xferdtensor_golden(
                         src_tensor=None,
                         src_mesh=param_info["src_mesh_info"],
@@ -488,11 +496,17 @@ class VllmInternalWorkerExtension:
                         param_name=name,
                     )
 
+        # Synchronize to ensure all NCCL broadcasts and copy_ ops are complete
+        # before the vLLM engine resumes model execution.
+        torch.cuda.synchronize()
+
+        if tp_rank == 0:
+            print("[vLLM nccl_reshard_refit] broadcast loop DONE", flush=True)
+
         self._maybe_process_fp8_kv_cache()
 
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if tp_rank == 0:
+            print("[vLLM nccl_reshard_refit] RETURNING True", flush=True)
         return True
 
     def cleanup(self) -> None:

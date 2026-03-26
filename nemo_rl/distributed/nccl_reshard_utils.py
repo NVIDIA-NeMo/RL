@@ -321,6 +321,10 @@ def xferdtensor_golden(
     if src_tensor is not None:
         if hasattr(src_tensor, "full_tensor"):
             full_tensor = src_tensor.full_tensor()
+            # full_tensor() runs all-gather on PyTorch's NCCL stream.
+            # Synchronize to ensure data is visible before broadcasting
+            # on the StatelessProcessGroup's stream.
+            torch.cuda.synchronize()
         elif hasattr(src_tensor, "_local_tensor"):
             full_tensor = src_tensor._local_tensor
         else:

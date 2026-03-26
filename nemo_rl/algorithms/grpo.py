@@ -1223,10 +1223,23 @@ def refit_policy_generation(
                 )
             if nccl_reshard_refit:
                 # nccl_reshard path: per-parameter xferdtensor_golden transfer
+                print(
+                    "[refit] dispatching nccl_reshard_refit to train workers...",
+                    flush=True,
+                )
                 futures_train = policy.nccl_reshard_refit(kv_scales=kv_scales)
+                print(
+                    "[refit] dispatching nccl_reshard_refit to gen workers...",
+                    flush=True,
+                )
                 futures_inference = policy_generation.nccl_reshard_refit()
+                print("[refit] waiting for train workers...", flush=True)
                 ray.get(futures_train)
+                print(
+                    "[refit] train workers done. waiting for gen workers...", flush=True
+                )
                 results = ray.get(futures_inference)
+                print("[refit] gen workers done.", flush=True)
                 update_success = all(result for result in results if result is not None)
             else:
                 futures_train = policy.broadcast_weights_for_collective(
@@ -2531,7 +2544,7 @@ def async_grpo_train(
     # Ensure the buffer has at least one step worth of prompt-groups before training
     min_trajectories_needed = num_prompts_per_step
 
-    print("📊 Buffer requirements calculation:")
+    print("📊 Buffer requirements calculation:", flush=True)
     print(f"   - num_prompts_per_step: {num_prompts_per_step}")
     print(f"   - num_generations_per_prompt: {samples_per_prompt_group}")
     print(f"   - samples_per_prompt_group: {samples_per_prompt_group}")
@@ -2612,9 +2625,9 @@ def async_grpo_train(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
     )
 
-    print("⏳ Preparing policy generation for training...")
+    print("⏳ Preparing policy generation for training...", flush=True)
     if NEED_REFIT and POLICY_GENERATION_STALE:
-        print("🔄 Refitting policy generation with actual model weights...")
+        print("🔄 Refitting policy generation with actual model weights...", flush=True)
         try:
             refit_policy_generation(
                 policy,
@@ -2622,7 +2635,7 @@ def async_grpo_train(
                 colocated_inference,
                 nccl_reshard_refit=nccl_reshard_refit_enabled,
             )
-            print("✅ Policy generation refit completed successfully")
+            print("✅ Policy generation refit completed successfully", flush=True)
             POLICY_GENERATION_STALE = False
         except Exception as e:
             print(f"❌ Policy generation refit failed: {e}")
