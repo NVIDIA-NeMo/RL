@@ -1114,6 +1114,28 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
+    async def init_pp_comm_groups_async(
+        self,
+        rank_prefix: int,
+        ip: str,
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> None:
+        """Async version of init_pp_comm_groups."""
+        await self.llm.collective_rpc(
+            "init_pp_comm_groups",
+            args=(
+                rank_prefix,
+                ip,
+                pp_ports,
+                pp_size,
+                train_ranks_per_stage,
+                sub_world_size,
+            ),
+        )
+
     async def prepare_nccl_reshard_refit_info_async(self, refit_info: dict) -> None:
         """Async version of prepare_nccl_reshard_refit_info."""
         await self.llm.collective_rpc(
@@ -1127,16 +1149,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
             )
 
-            print(
-                "[vLLM async] nccl_reshard_refit_async: calling collective_rpc...",
-                flush=True,
-            )
             result_or_coro = await self.llm.collective_rpc(
                 "nccl_reshard_refit", args=tuple()
-            )
-            print(
-                f"[vLLM async] nccl_reshard_refit_async: collective_rpc returned, type={type(result_or_coro)}",
-                flush=True,
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1144,10 +1158,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             else:
                 worker_results = result_or_coro
 
-            print(
-                f"[vLLM async] nccl_reshard_refit_async: worker_results={worker_results}",
-                flush=True,
-            )
             worker_result = worker_results[0]
 
             if not worker_result:
@@ -1155,7 +1165,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     f"Error: Worker failed nccl_reshard_refit. Result: {worker_result}"
                 )
                 return False
-            print("[vLLM async] nccl_reshard_refit_async: returning True", flush=True)
             return True
         except Exception as e:
             print(f"Exception during nccl_reshard_refit: {e}", flush=True)
