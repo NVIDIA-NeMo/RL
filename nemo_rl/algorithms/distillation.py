@@ -536,6 +536,76 @@ def _align_teacher_topk_to_student(
     return aligned_logits, aligned_indices
 
 
+def _debug_print_first_sample(
+    train_data: BatchedDataDict[Any],
+    teacher_data: BatchedDataDict[Any],
+    tokenizer: TokenizerType,
+) -> None:
+    """Print one-shot debug traces for sample 0 in distillation."""
+    if train_data.size == 0:
+        print("[DISTILL_DEBUG] Empty batch; skipping debug print.", flush=True)
+        return
+
+    student_ids = train_data["input_ids"][0].detach().cpu()
+    teacher_ids = teacher_data["input_ids"][0].detach().cpu()
+    teacher_mask = train_data["token_mask"][0].detach().cpu()
+    teacher_topk_logits = train_data["teacher_topk_logits"][0].detach().cpu()
+    teacher_topk_indices = train_data["teacher_topk_indices"][0].detach().cpu()
+
+    student_text = tokenizer.decode(
+        student_ids.tolist(),
+        skip_special_tokens=False,
+    )
+    teacher_text = tokenizer.decode(
+        teacher_ids.tolist(),
+        skip_special_tokens=False,
+    )
+
+    scored_positions = teacher_mask.nonzero(as_tuple=True)[0]
+    preview_n = min(10, len(scored_positions))
+
+    print("\n[DISTILL_DEBUG] ===== FIRST-STEP DEBUG (sample 0) =====", flush=True)
+    print("[DISTILL_DEBUG] Full student sequence (raw decode):", flush=True)
+    print(student_text, flush=True)
+    print("[DISTILL_DEBUG] Full teacher input sequence (raw decode):", flush=True)
+    print(teacher_text, flush=True)
+    print(
+        f"[DISTILL_DEBUG] Teacher scored positions count: {len(scored_positions)}",
+        flush=True,
+    )
+    print(
+        f"[DISTILL_DEBUG] First scored positions: {scored_positions[:preview_n].tolist()}",
+        flush=True,
+    )
+
+    for rank, pos in enumerate(scored_positions[:preview_n].tolist(), start=1):
+        token_id = int(train_data["input_ids"][0, pos].item())
+        token_text = tokenizer.decode([token_id], skip_special_tokens=False)
+        logits_at_pos = teacher_topk_logits[pos]
+        indices_at_pos = teacher_topk_indices[pos]
+        top_vals, top_order = torch.topk(logits_at_pos, k=min(5, logits_at_pos.shape[0]))
+
+        print(
+            (
+                f"[DISTILL_DEBUG] scored_token_{rank:02d} pos={pos} "
+                f"student_token_id={token_id} student_token_text={token_text!r}"
+            ),
+            flush=True,
+        )
+        for j in range(top_vals.shape[0]):
+            idx_in_k = int(top_order[j].item())
+            cand_id = int(indices_at_pos[idx_in_k].item())
+            cand_text = tokenizer.decode([cand_id], skip_special_tokens=False)
+            cand_logit = float(top_vals[j].item())
+            print(
+                (
+                    f"[DISTILL_DEBUG]   top{j + 1}: token_id={cand_id} "
+                    f"token_text={cand_text!r} logit={cand_logit:.6f}"
+                ),
+                flush=True,
+            )
+
+
 def distillation_train(
     student_policy: ColocatablePolicyInterface,
     teacher_policy: ColocatablePolicyInterface,
@@ -793,6 +863,8 @@ def distillation_train(
                     else:
                         train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                         train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                    if total_steps == 0:
+                        _debug_print_first_sample(train_data, teacher_data, tokenizer)
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
