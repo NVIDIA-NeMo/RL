@@ -519,6 +519,10 @@ def _align_teacher_topk_to_student(
     When the teacher uses a different prompt than the student, their sequences have different
     lengths but share identical response tokens. This function extracts teacher logits at
     response positions and places them at the corresponding student response positions.
+
+    Because logits[i] predicts token[i+1] (autoregressive convention), the teacher
+    logits at the last prompt position predict the first response token. We include
+    this position so the loss can properly score the first response token.
     """
     B, _, k = teacher_topk_logits.shape
 
@@ -532,6 +536,14 @@ def _align_teacher_topk_to_student(
         if n > 0:
             aligned_logits[i, student_resp[:n]] = teacher_topk_logits[i, teacher_resp[:n]]
             aligned_indices[i, student_resp[:n]] = teacher_topk_indices[i, teacher_resp[:n]]
+
+            # Also copy the teacher logits from the position just before the first
+            # response token: logits[resp[0]-1] predicts the first response token.
+            t_prev = int(teacher_resp[0].item()) - 1
+            s_prev = int(student_resp[0].item()) - 1
+            if t_prev >= 0 and s_prev >= 0:
+                aligned_logits[i, s_prev] = teacher_topk_logits[i, t_prev]
+                aligned_indices[i, s_prev] = teacher_topk_indices[i, t_prev]
 
     return aligned_logits, aligned_indices
 
@@ -581,14 +593,28 @@ def _debug_print_first_sample(
     for rank, pos in enumerate(scored_positions[:preview_n].tolist(), start=1):
         token_id = int(train_data["input_ids"][0, pos].item())
         token_text = tokenizer.decode([token_id], skip_special_tokens=False)
-        logits_at_pos = teacher_topk_logits[pos]
-        indices_at_pos = teacher_topk_indices[pos]
+
+        # teacher logits[i] predicts token[i+1], so the distribution used to
+        # score the student token at *pos* comes from teacher logits at pos-1.
+        teacher_pos = pos - 1
+        if teacher_pos < 0:
+            print(
+                f"[DISTILL_DEBUG] scored_token_{rank:02d} pos={pos} "
+                f"student_token_id={token_id} student_token_text={token_text!r} "
+                f"(skipped: no teacher logit at pos-1)",
+                flush=True,
+            )
+            continue
+
+        logits_at_pos = teacher_topk_logits[teacher_pos]
+        indices_at_pos = teacher_topk_indices[teacher_pos]
         top_vals, top_order = torch.topk(logits_at_pos, k=min(5, logits_at_pos.shape[0]))
 
         print(
             (
                 f"[DISTILL_DEBUG] scored_token_{rank:02d} pos={pos} "
-                f"student_token_id={token_id} student_token_text={token_text!r}"
+                f"student_token_id={token_id} student_token_text={token_text!r} "
+                f"(teacher logits from pos={teacher_pos})"
             ),
             flush=True,
         )
