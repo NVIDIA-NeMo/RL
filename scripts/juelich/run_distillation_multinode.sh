@@ -14,4 +14,4 @@ export COMMAND="uv run python examples/run_distillation.py --config ${CONFIG} \
     data.default.prompt_file=examples/prompts/prefix.txt \
     data.default.teacher_prompt_file=examples/prompts/teacher-concise.txt"
 
-sbatch --time=02:00:00 --partition=develbooster --nodes=2 --job-name="distill-1.7b-self" "$SCRIPT_DIR/ray.sub"
+sbatch --nodes=2 --job-name="distill-1.7b-self" "$SCRIPT_DIR/ray.sub"
