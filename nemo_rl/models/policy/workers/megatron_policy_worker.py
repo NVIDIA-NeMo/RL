@@ -1090,22 +1090,12 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         ):
             param_map[name] = tensor
 
-        rank = self.model_update_group.rank
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
-            params = self.nccl_reshard_refit_info["per_layer_params"][layer_name]
-            if rank == 0:
-                print(
-                    f"[Megatron nccl_reshard_refit] layer={layer_name} num_params={len(params)}",
-                    flush=True,
-                )
-            for param_info in params:
+            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
+                layer_name
+            ]:
                 name = param_info["name"]
                 src_tensor = param_map.get(name)
-                if src_tensor is None and rank == 0:
-                    print(
-                        f"[Megatron nccl_reshard_refit] WARNING: param '{name}' not found in param_map!",
-                        flush=True,
-                    )
 
                 xferdtensor_golden(
                     src_tensor=src_tensor,

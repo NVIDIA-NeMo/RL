@@ -1223,23 +1223,10 @@ def refit_policy_generation(
                 )
             if nccl_reshard_refit:
                 # nccl_reshard path: per-parameter xferdtensor_golden transfer
-                print(
-                    "[refit] dispatching nccl_reshard_refit to train workers...",
-                    flush=True,
-                )
                 futures_train = policy.nccl_reshard_refit(kv_scales=kv_scales)
-                print(
-                    "[refit] dispatching nccl_reshard_refit to gen workers...",
-                    flush=True,
-                )
                 futures_inference = policy_generation.nccl_reshard_refit()
-                print("[refit] waiting for train workers...", flush=True)
                 ray.get(futures_train)
-                print(
-                    "[refit] train workers done. waiting for gen workers...", flush=True
-                )
                 results = ray.get(futures_inference)
-                print("[refit] gen workers done.", flush=True)
                 update_success = all(result for result in results if result is not None)
             else:
                 futures_train = policy.broadcast_weights_for_collective(

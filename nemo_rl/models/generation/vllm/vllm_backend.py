@@ -394,87 +394,71 @@ class VllmInternalWorkerExtension:
             start = tp_rank * shard_size
             return full_tensor[start : start + shard_size]
 
-    def nccl_reshard_refit(self) -> bool:
-        """Receive weights from training workers via xferdtensor_golden.
+    def _recv_broadcast(self, param_info, dst_tensor=None, all_replicate=False):
+        """Receive a single parameter broadcast from training workers.
 
-        Writes directly into vLLM parameters using an HF→vLLM name mapping
-        that handles merged params (qkv_proj, gate_up_proj). This approach
-        is compatible with the future nccl_reshard path where each gen worker
-        receives only its local shard.
-
-        For merged params (qkv_proj, gate_up_proj), receives the full global
-        tensor with all-Replicate placement, then locally computes the correct
-        TP slice. This correctly handles KV head replication (num_kv_heads < tp).
+        Args:
+            param_info: Per-parameter metadata from nccl_reshard_refit_info.
+            dst_tensor: TensorWrapper to write into, or None to discard.
+            all_replicate: If True, override dst_placements with all-Replicate
+                (used for merged params that need the full global tensor).
         """
         from torch.distributed.tensor.placement_types import Replicate
 
-        from nemo_rl.distributed.nccl_reshard_utils import (
-            TensorWrapper,
-            xferdtensor_golden,
+        from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
+
+        dst_placement = (
+            [Replicate() for _ in param_info["dst_placements"]]
+            if all_replicate
+            else param_info["dst_placements"]
         )
+        xferdtensor_golden(
+            src_tensor=None,
+            src_mesh=param_info["src_mesh_info"],
+            src_placement=param_info["src_placements"],
+            dst_tensor=dst_tensor,
+            dst_mesh=param_info["dst_mesh_info"],
+            dst_placement=dst_placement,
+            process_group=self.model_update_group,
+            global_shape=param_info["global_shape"],
+            dtype=param_info["dtype"],
+            param_name=param_info["name"],
+        )
+
+    def nccl_reshard_refit(self) -> bool:
+        """Receive weights from training workers via xferdtensor_golden.
+
+        Writes directly into vLLM parameters using an HF->vLLM name mapping
+        that handles merged params (qkv_proj, gate_up_proj). For merged params,
+        receives the full global tensor (all-Replicate), then locally computes
+        the correct TP slice (handling KV head replication).
+        """
+        from nemo_rl.distributed.nccl_reshard_utils import TensorWrapper
 
         hf_to_vllm = self._build_hf_to_vllm_mapping(self.nccl_reshard_refit_info)
         tp_rank = torch.distributed.get_rank()
         tp_size = torch.distributed.get_world_size()
 
-        rank = self.model_update_group.rank
-        if tp_rank == 0:
-            print(
-                f"[vLLM nccl_reshard_refit] ENTERING method, global_rank={rank}, tp_rank={tp_rank}, tp_size={tp_size}, num_layers={len(self.nccl_reshard_refit_info['layer_names'])}",
-                flush=True,
-            )
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
-            params = self.nccl_reshard_refit_info["per_layer_params"][layer_name]
-            if tp_rank == 0:
-                print(
-                    f"[vLLM nccl_reshard_refit] layer={layer_name} num_params={len(params)}",
-                    flush=True,
-                )
-            for param_info in params:
+            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
+                layer_name
+            ]:
                 name = param_info["name"]
                 vllm_param, dim0_slice = hf_to_vllm.get(name, (None, None))
 
                 if vllm_param is None:
-                    # No vLLM mapping — still must participate in broadcast
-                    # (all ranks must call xferdtensor_golden collectively)
-                    if tp_rank == 0:
-                        print(
-                            f"[vLLM nccl_reshard_refit] WARNING: no vLLM mapping for '{name}', "
-                            f"broadcast will proceed but data discarded",
-                            flush=True,
-                        )
-                    xferdtensor_golden(
-                        src_tensor=None,
-                        src_mesh=param_info["src_mesh_info"],
-                        src_placement=param_info["src_placements"],
-                        dst_tensor=None,
-                        dst_mesh=param_info["dst_mesh_info"],
-                        dst_placement=param_info["dst_placements"],
-                        process_group=self.model_update_group,
-                        global_shape=param_info["global_shape"],
-                        dtype=param_info["dtype"],
-                        param_name=name,
-                    )
+                    # No vLLM mapping — must still participate in collective broadcast
+                    self._recv_broadcast(param_info)
                 elif dim0_slice is not None:
-                    # Merged param (qkv_proj or gate_up_proj).
-                    # Receive full tensor with all-Replicate, then locally compute
-                    # the correct TP slice. This handles KV head replication.
-                    global_shape = param_info["global_shape"]
+                    # Merged param (qkv_proj, gate_up_proj): receive full tensor,
+                    # then compute the correct TP-local slice.
                     full_buf = torch.empty(
-                        global_shape, device=self.device, dtype=vllm_param.dtype
+                        param_info["global_shape"],
+                        device=self.device,
+                        dtype=vllm_param.dtype,
                     )
-                    all_replicate = [Replicate() for _ in param_info["dst_placements"]]
-                    xferdtensor_golden(
-                        src_tensor=None,
-                        src_mesh=param_info["src_mesh_info"],
-                        src_placement=param_info["src_placements"],
-                        dst_tensor=TensorWrapper(full_buf),
-                        dst_mesh=param_info["dst_mesh_info"],
-                        dst_placement=all_replicate,
-                        process_group=self.model_update_group,
-                        global_shape=param_info["global_shape"],
-                        dtype=param_info["dtype"],
-                        param_name=name,
+                    self._recv_broadcast(
+                        param_info, TensorWrapper(full_buf), all_replicate=True
                     )
                     local_data = self._compute_tp_local_slice(
                         full_buf, name, tp_rank, tp_size
@@ -483,30 +467,11 @@ class VllmInternalWorkerExtension:
                     del full_buf
                 else:
                     # Direct 1:1 mapping — xferdtensor handles sharding
-                    xferdtensor_golden(
-                        src_tensor=None,
-                        src_mesh=param_info["src_mesh_info"],
-                        src_placement=param_info["src_placements"],
-                        dst_tensor=TensorWrapper(vllm_param),
-                        dst_mesh=param_info["dst_mesh_info"],
-                        dst_placement=param_info["dst_placements"],
-                        process_group=self.model_update_group,
-                        global_shape=param_info["global_shape"],
-                        dtype=param_info["dtype"],
-                        param_name=name,
-                    )
+                    self._recv_broadcast(param_info, TensorWrapper(vllm_param))
 
-        # Synchronize to ensure all NCCL broadcasts and copy_ ops are complete
-        # before the vLLM engine resumes model execution.
+        # Ensure all NCCL broadcasts and copy_ ops complete before vLLM resumes.
         torch.cuda.synchronize()
-
-        if tp_rank == 0:
-            print("[vLLM nccl_reshard_refit] broadcast loop DONE", flush=True)
-
         self._maybe_process_fp8_kv_cache()
-
-        if tp_rank == 0:
-            print("[vLLM nccl_reshard_refit] RETURNING True", flush=True)
         return True
 
     def cleanup(self) -> None:
