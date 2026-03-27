@@ -5161,16 +5161,15 @@ wheels = [
 
 [[package]]
 name = "nv-grouped-gemm"
-version = "1.1.4.post7"
+version = "1.1.4.post8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "absl-py" },
     { name = "numpy" },
-    { name = "setuptools" },
     { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "wheel" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/63/36/13d0a1e1af31c3b2a297c15b6e7da532b13361730b32d11d9698854bdbe3/nv_grouped_gemm-1.1.4.post7.tar.gz", hash = "sha256:bc9f7906c9b0bd7fefea5a776acbc277577c65b103181340fd26ca2b8460c6a5", size = 26520, upload-time = "2025-12-16T19:42:33.176Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/02/ad/046a097b63a96c1ba1d85f0031dbe7fcbdb33e6c445dfbaba2ffaefdd497/nv_grouped_gemm-1.1.4.post8.tar.gz", hash = "sha256:ab321693f0292cfd8a26dc7b6f14decd9eb00e209494de7218e4fad36191275d", size = 20821209, upload-time = "2025-12-17T02:22:38.432Z" }
 
 [[package]]
 name = "nvidia-cublas-cu12"
