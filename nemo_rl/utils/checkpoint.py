@@ -144,7 +144,8 @@ class CheckpointManager:
             warnings.warn(
                 f"Optimizer state not found at {optimizer_path} (DTensor path), and no embedded "
                 f"optimizer state detected under {weights_path} (Megatron path). "
-                "Optimizer will be freshly initialized."
+                "Optimizer will be freshly initialized.",
+                stacklevel=2,
             )
             optimizer_path = None
             return weights_path, optimizer_path
