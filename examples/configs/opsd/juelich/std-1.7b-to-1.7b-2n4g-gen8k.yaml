@@ -19,16 +19,17 @@ sampled_token_distillation:
     val_max_total_sequence_length: 33280
     val_max_new_tokens: 32768
     kl_penalty_coef: 1.0
-    kl_discount_factor: 1.0
+    kl_discount_factor: 0.0           # 0 = no discounting (tinker-cookbook default)
 
-# Policy gradient loss (ClippedPGLossFn)
+# Policy gradient loss — plain importance sampling (no PPO clipping)
+# Matches tinker-cookbook's loss_fn="importance_sampling"
 loss_fn:
     reference_policy_kl_penalty: 0.0
     reference_policy_kl_type: "k3"
-    kl_input_clamp_value: 20.0
-    kl_output_clamp_value: 10.0
-    ratio_clip_min: 0.2
-    ratio_clip_max: 0.2
+    kl_input_clamp_value: null
+    kl_output_clamp_value: null
+    ratio_clip_min: 1e6               # effectively no clipping
+    ratio_clip_max: 1e6               # effectively no clipping
     ratio_clip_c: null
     use_on_policy_kl_approximation: false
     use_importance_sampling_correction: false

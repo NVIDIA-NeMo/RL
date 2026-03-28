@@ -28,6 +28,7 @@ Reference: https://thinkingmachines.ai/blog/on-policy-distillation/
 """
 import os
 import warnings
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
@@ -138,23 +139,38 @@ def _default_save_state() -> SampledTokenDistillationSaveState:
 # ===============================================================================
 # KL Advantage Computation
 # ===============================================================================
+def _discounted_future_sum(x: torch.Tensor, gamma: float) -> torch.Tensor:
+    """Compute discounted sum of future values for each position.
+
+    For position i, computes: sum_{k=0}^{T-1-i} gamma^k * x[i+k]
+
+    Matches tinker-cookbook's discounted_future_sum_vectorized exactly.
+    """
+    result = torch.empty_like(x)
+    running = torch.zeros(1, dtype=x.dtype, device=x.device)
+    for t in range(len(x) - 1, -1, -1):
+        running = x[t] + gamma * running
+        result[t] = running
+    return result
+
+
 def compute_kl_advantages(
     student_logprobs: torch.Tensor,
     teacher_logprobs: torch.Tensor,
     token_mask: torch.Tensor,
     sample_mask: torch.Tensor,
     kl_penalty_coef: float,
-    kl_discount_factor: float = 1.0,
+    kl_discount_factor: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute per-token advantages from reverse KL divergence.
 
-    reverse_kl_per_token = student_logprobs - teacher_logprobs
-    avg_kl = mean(reverse_kl) over all valid tokens in the batch
-    advantages = kl_penalty_coef * (avg_kl - reverse_kl_per_token)
+    Matches tinker-cookbook's incorporate_kl_penalty:
+      reverse_kl = student_logprobs - teacher_logprobs  (masked)
+      avg_kl = mean(reverse_kl) over all valid tokens in the batch
+      advantages = kl_penalty_coef * mask * (avg_kl - reverse_kl)
 
-    Intuition: tokens where student diverges MORE from teacher than average
-    get NEGATIVE advantage (penalized), tokens where student matches teacher
-    better than average get POSITIVE advantage (reinforced).
+    When kl_discount_factor > 0, applies discounted future sum per sample:
+      advantages[t] = adv[t] + γ*adv[t+1] + γ²*adv[t+2] + ...
 
     Args:
         student_logprobs: Student log-probs for sampled tokens [B, S].
@@ -162,26 +178,29 @@ def compute_kl_advantages(
         token_mask: Mask for valid response tokens [B, S].
         sample_mask: Mask for valid samples [B].
         kl_penalty_coef: Coefficient scaling the KL advantages.
-        kl_discount_factor: Temporal discount factor. 1.0 = no discount.
-            Values < 1.0 discount earlier tokens more.
+        kl_discount_factor: Discount factor for future sum. 0.0 = no discounting.
+            When > 0, each position's advantage includes discounted future advantages.
 
     Returns:
         (advantages, metrics_dict)
     """
     mask = token_mask * sample_mask.unsqueeze(-1)
 
-    reverse_kl_per_token = student_logprobs - teacher_logprobs  # [B, S]
-    avg_reverse_kl = masked_mean(reverse_kl_per_token, mask)  # scalar
+    # Masked reverse KL per token (zeroed where mask=0, matching tinker-cookbook)
+    reverse_kl_per_token = (student_logprobs - teacher_logprobs) * mask  # [B, S]
 
-    kl_advantages = kl_penalty_coef * (avg_reverse_kl - reverse_kl_per_token)
+    # Global baseline: mean reverse KL across all valid tokens in batch
+    total_kl = reverse_kl_per_token.sum()
+    total_mask = mask.sum()
+    avg_reverse_kl = total_kl / (total_mask + 1e-8)  # scalar
 
-    # Optional temporal discounting: earlier tokens get discounted more
-    if kl_discount_factor < 1.0:
-        seq_len = kl_advantages.shape[1]
-        positions = torch.arange(seq_len, device=kl_advantages.device).float()
-        # Discount from end: token at position t gets discount^(S-1-t)
-        discount = kl_discount_factor ** (seq_len - 1 - positions)
-        kl_advantages = kl_advantages * discount.unsqueeze(0)
+    # Per-token KL advantages
+    kl_advantages = kl_penalty_coef * mask * (avg_reverse_kl - reverse_kl_per_token)
+
+    # Optional: discounted future sum (tinker-cookbook style)
+    if kl_discount_factor > 0:
+        for i in range(kl_advantages.shape[0]):
+            kl_advantages[i] = _discounted_future_sum(kl_advantages[i], kl_discount_factor)
 
     metrics = {
         "avg_reverse_kl": avg_reverse_kl.item(),
@@ -190,6 +209,165 @@ def compute_kl_advantages(
     }
 
     return kl_advantages, metrics
+
+
+def _align_teacher_logprobs_to_student(
+    teacher_logprobs: torch.Tensor,
+    teacher_token_mask: torch.Tensor,
+    student_token_mask: torch.Tensor,
+    student_seq_len: int,
+) -> torch.Tensor:
+    """Align teacher token logprobs to student sequence positions.
+
+    Teacher and student may use different prompt prefixes, so response tokens can
+    appear at different absolute positions. This function maps teacher response
+    logprobs to the corresponding student response positions in-order.
+    """
+    B = teacher_logprobs.shape[0]
+    aligned = torch.zeros(
+        B,
+        student_seq_len,
+        dtype=teacher_logprobs.dtype,
+        device=teacher_logprobs.device,
+    )
+
+    for i in range(B):
+        teacher_resp = teacher_token_mask[i].nonzero(as_tuple=True)[0]
+        student_resp = student_token_mask[i].nonzero(as_tuple=True)[0]
+        n = min(len(teacher_resp), len(student_resp))
+        if n > 0:
+            aligned[i, student_resp[:n]] = teacher_logprobs[i, teacher_resp[:n]]
+
+    return aligned
+
+
+def _debug_print_first_sample_sequences(
+    train_data: BatchedDataDict[Any],
+    teacher_data: BatchedDataDict[Any],
+    teacher_logprobs_aligned: torch.Tensor,
+    tokenizer: TokenizerType,
+) -> None:
+    """Print one-shot first-sample sequence debug for sampled token distillation."""
+    if train_data.size == 0:
+        print("[STD_DEBUG] Empty batch; skipping debug print.", flush=True)
+        return
+
+    student_ids = train_data["input_ids"][0].detach().cpu()
+    teacher_ids = teacher_data["input_ids"][0].detach().cpu()
+    student_mask = train_data["token_mask"][0].detach().cpu()
+
+    student_text = tokenizer.decode(
+        student_ids.tolist(),
+        skip_special_tokens=False,
+    )
+    teacher_text = tokenizer.decode(
+        teacher_ids.tolist(),
+        skip_special_tokens=False,
+    )
+
+    scored_positions = student_mask.nonzero(as_tuple=True)[0]
+    preview_n = min(10, len(scored_positions))
+
+    print("\n[STD_DEBUG] ===== FIRST-STEP DEBUG (sample 0) =====", flush=True)
+    print("[STD_DEBUG] Full student sequence (raw decode):", flush=True)
+    print(student_text, flush=True)
+    print("[STD_DEBUG] Full teacher scoring sequence (raw decode):", flush=True)
+    print(teacher_text, flush=True)
+    print(
+        f"[STD_DEBUG] Teacher scored positions count: {len(scored_positions)}",
+        flush=True,
+    )
+    print(
+        f"[STD_DEBUG] First scored positions: {scored_positions[:preview_n].tolist()}",
+        flush=True,
+    )
+
+    for rank, pos in enumerate(scored_positions[:preview_n].tolist(), start=1):
+        token_id = int(train_data["input_ids"][0, pos].item())
+        token_text = tokenizer.decode([token_id], skip_special_tokens=False)
+        teacher_lp = float(teacher_logprobs_aligned[0, pos].item())
+        print(
+            (
+                f"[STD_DEBUG] scored_token_{rank:02d} pos={pos} "
+                f"student_token_id={token_id} student_token_text={token_text!r} "
+                f"teacher_logprob={teacher_lp:.6f}"
+            ),
+            flush=True,
+        )
+
+
+def _log_first_sample_debug(
+    student_logprobs: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    kl_advantages: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    input_ids: torch.Tensor,
+    tokenizer,
+    kl_metrics: dict,
+) -> None:
+    """Log detailed debug info for the first sample of the first batch."""
+    print("\n" + "=" * 70)
+    print("DEBUG: First sample, first batch — token-level breakdown")
+    print("=" * 70)
+
+    # Use first sample
+    s_lp = student_logprobs[0]  # [S]
+    t_lp = teacher_logprobs[0]  # [S]
+    adv = kl_advantages[0]      # [S]
+    mask = token_mask[0]        # [S]
+    ids = input_ids[0]          # [S]
+
+    # Find valid response token positions (mask=1, starting from position 1)
+    valid_positions = (mask[1:] > 0).nonzero(as_tuple=True)[0] + 1
+    num_valid = len(valid_positions)
+
+    print(f"  Sample mask: {sample_mask[0].item()}")
+    print(f"  Sequence length: {s_lp.shape[0]}")
+    print(f"  Valid response tokens: {num_valid}")
+    print(f"  Batch-level KL metrics: {kl_metrics}")
+
+    if num_valid == 0:
+        print("  (no valid tokens to display)")
+        print("=" * 70 + "\n", flush=True)
+        return
+
+    # Show first 20 and last 5 valid tokens
+    show_first = min(20, num_valid)
+    show_last = min(5, max(0, num_valid - show_first))
+    positions_to_show = list(valid_positions[:show_first])
+    if show_last > 0:
+        positions_to_show.append(None)  # sentinel for "..."
+        positions_to_show.extend(valid_positions[-show_last:])
+
+    print(f"\n  {'pos':>5} | {'token':>20} | {'student_lp':>11} | {'teacher_lp':>11} | {'reverse_kl':>11} | {'advantage':>11}")
+    print("  " + "-" * 88)
+
+    for pos in positions_to_show:
+        if pos is None:
+            print(f"  {'...':>5} | {'...':>20} | {'...':>11} | {'...':>11} | {'...':>11} | {'...':>11}")
+            continue
+        p = pos.item()
+        token_str = tokenizer.decode([ids[p].item()])
+        token_str = repr(token_str)[:20]
+        s = s_lp[p].item()
+        t = t_lp[p].item()
+        rkl = s - t
+        a = adv[p].item()
+        print(f"  {p:>5} | {token_str:>20} | {s:>11.4f} | {t:>11.4f} | {rkl:>11.4f} | {a:>11.4f}")
+
+    # Summary stats over valid tokens
+    valid_s = s_lp[valid_positions]
+    valid_t = t_lp[valid_positions]
+    valid_rkl = valid_s - valid_t
+    valid_adv = adv[valid_positions]
+
+    print(f"\n  Summary (this sample):")
+    print(f"    student logprobs:  mean={valid_s.mean():.4f}  std={valid_s.std():.4f}")
+    print(f"    teacher logprobs:  mean={valid_t.mean():.4f}  std={valid_t.std():.4f}")
+    print(f"    reverse KL:        mean={valid_rkl.mean():.4f}  std={valid_rkl.std():.4f}  min={valid_rkl.min():.4f}  max={valid_rkl.max():.4f}")
+    print(f"    advantages:        mean={valid_adv.mean():.4f}  std={valid_adv.std():.4f}  min={valid_adv.min():.4f}  max={valid_adv.max():.4f}")
+    print("=" * 70 + "\n", flush=True)
 
 
 # ===============================================================================
@@ -639,6 +817,7 @@ def sampled_token_distillation_train(
                 # 3. Data processing
                 # ==========================================
                 with timer.time("data_processing"):
+                    has_teacher_ml = "teacher_message_log" in repeated_batch
                     use_overlong_filtering = algo_config.get("overlong_filtering", False)
                     if use_overlong_filtering:
                         loss_multiplier = repeated_batch["loss_multiplier"].clone()
@@ -664,6 +843,33 @@ def sampled_token_distillation_train(
                                     message["token_ids"], dtype=torch.float32
                                 )
 
+                    # Build teacher message logs with the same rollout injections
+                    # (assistant/environment turns) but teacher-specific prompt.
+                    if has_teacher_ml:
+                        for i, student_ml in enumerate(repeated_batch["message_log"]):
+                            teacher_ml = repeated_batch["teacher_message_log"][i]
+                            if teacher_ml is student_ml:
+                                teacher_ml = deepcopy(teacher_ml)
+                                repeated_batch["teacher_message_log"][i] = teacher_ml
+
+                            for msg in student_ml:
+                                if msg["role"] != "user":
+                                    teacher_ml.append(deepcopy(msg))
+
+                            for msg in teacher_ml:
+                                if msg["role"] == "assistant":
+                                    msg["token_loss_mask"] = torch.ones_like(
+                                        msg["token_ids"]
+                                    )
+                                else:
+                                    msg["token_loss_mask"] = torch.zeros_like(
+                                        msg["token_ids"]
+                                    )
+                                if "generation_logprobs" not in msg:
+                                    msg["generation_logprobs"] = torch.zeros_like(
+                                        msg["token_ids"], dtype=torch.float32
+                                    )
+
                     # Flatten to training format
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
@@ -687,6 +893,31 @@ def sampled_token_distillation_train(
                     )
                     train_data.update(extra_multimodal_data)
                     train_data.to("cpu")
+
+                    if has_teacher_ml:
+                        teacher_flat, teacher_lengths = batched_message_log_to_flat_message(
+                            repeated_batch["teacher_message_log"],
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                            make_sequence_length_divisible_by=master_config["teacher"][
+                                "make_sequence_length_divisible_by"
+                            ],
+                        )
+                        teacher_extra_multimodal_data = teacher_flat.get_multimodal_dict(
+                            as_tensors=False
+                        )
+                        teacher_data = BatchedDataDict[Any](
+                            {
+                                "input_ids": teacher_flat["token_ids"],
+                                "input_lengths": teacher_lengths,
+                                "token_mask": teacher_flat["token_loss_mask"],
+                                "sample_mask": repeated_batch["loss_multiplier"],
+                                **teacher_extra_multimodal_data,
+                            }
+                        )
+                        teacher_data.to("cpu")
+                    else:
+                        teacher_extra_multimodal_data = None
+                        teacher_data = train_data
 
                 # ==========================================
                 # 4. Compute student logprobs (prev_logprobs)
@@ -718,9 +949,29 @@ def sampled_token_distillation_train(
                     teacher_policy.prepare_for_lp_inference()
 
                 with timer.time("teacher_logprob_inference"):
+                    teacher_logprob_data = (
+                        BatchedDataDict[Any](
+                            {
+                                "input_ids": teacher_data["input_ids"],
+                                "input_lengths": teacher_data["input_lengths"],
+                                "token_mask": teacher_data["token_mask"],
+                                "sample_mask": teacher_data["sample_mask"],
+                                **(teacher_extra_multimodal_data or {}),
+                            }
+                        )
+                        if has_teacher_ml
+                        else logprob_data
+                    )
                     teacher_logprobs = teacher_policy.get_logprobs(
-                        logprob_data, timer=timer
+                        teacher_logprob_data, timer=timer
                     )["logprobs"]
+                    if has_teacher_ml:
+                        teacher_logprobs = _align_teacher_logprobs_to_student(
+                            teacher_logprobs=teacher_logprobs,
+                            teacher_token_mask=teacher_data["token_mask"],
+                            student_token_mask=train_data["token_mask"],
+                            student_seq_len=train_data["input_ids"].shape[1],
+                        )
 
                 with timer.time("teacher_offload"):
                     teacher_policy.offload_after_refit()
@@ -768,6 +1019,25 @@ def sampled_token_distillation_train(
                     advantages_full = torch.zeros_like(train_data["prev_logprobs"])
                     advantages_full[:, 1:] = kl_advantages
                     train_data["advantages"] = advantages_full
+
+                    # Debug: log first sample of first batch
+                    if total_steps == 0:
+                        _debug_print_first_sample_sequences(
+                            train_data=train_data,
+                            teacher_data=teacher_data,
+                            teacher_logprobs_aligned=teacher_logprobs,
+                            tokenizer=tokenizer,
+                        )
+                        _log_first_sample_debug(
+                            student_logprobs=train_data["prev_logprobs"],
+                            teacher_logprobs=teacher_logprobs,
+                            kl_advantages=advantages_full,
+                            token_mask=token_mask,
+                            sample_mask=sample_mask,
+                            input_ids=train_data["input_ids"],
+                            tokenizer=tokenizer,
+                            kl_metrics=kl_metrics,
+                        )
 
                     del teacher_logprobs
 
@@ -832,7 +1102,6 @@ def sampled_token_distillation_train(
                     "total_num_tokens": input_lengths.numpy(),
                 }
                 metrics.update(train_results["all_mb_metrics"])
-                metrics.update(kl_metrics)
                 for k, v in metrics.items():
                     if k in {
                         "lr",
@@ -842,8 +1111,9 @@ def sampled_token_distillation_train(
                         "mean_prompt_length",
                     }:
                         metrics[k] = np.mean(v).item()
-                    elif isinstance(v, np.ndarray):
+                    else:
                         metrics[k] = np.sum(v).item()
+                metrics.update(kl_metrics)
                 metrics.update(rollout_metrics)
                 total_valid_tokens += metrics.get("global_valid_toks", 0)
 

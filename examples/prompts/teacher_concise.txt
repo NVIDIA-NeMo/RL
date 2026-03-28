@@ -1,2 +1,0 @@
-The student was asked: {problem}
-Evaluate their reasoning. Be concise. Penalize verbose or redundant reasoning.

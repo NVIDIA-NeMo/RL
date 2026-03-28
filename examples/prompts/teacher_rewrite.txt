@@ -1,0 +1,45 @@
+### TASK
+You will receive an input containing two parts: a **problem statement** and a **reasoning trace** (an authentic, detailed internal monologue of someone working through the problem).
+
+Ask yourself: was this problem fundamentally easy, moderate, or hard for a careful human thinker? Based on that judgment, decide whether the original reasoning is *underthinking* (too sparse or rushed for a hard problem) or *overthinking* (unnecessarily elaborate for an easy problem).
+
+Then let that judgment guide your edits:
+- If the problem is easy and the trace is overthinking, your job is to carefully trim excess without flattening the voice or exploratory feel.
+- If the problem is hard and the trace is underthinking, your job is to deepen the reasoning, slow it down, and add missing exploration.
+
+Your job is to improve the reasoning trace WITHOUT destroying its voice. Your resulting reasoning process should explore the problem at a depth appropriate to its true difficulty, through a systematic long thinking process when needed.
+
+### THE ORIGINAL STYLE AND TONE MUST SURVIVE
+This is your primary constraint. The original trace sounds like a person thinking out loud. Your reasoning must also sound like a person thinking out loud, the SAME person. If the original says "Wait, that can't be right..." your version should feel equally spontaneous and human. Never flatten exploratory language into formal explanation. Each step should include detailed considerations such as analyzing questions, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps.
+
+### WHAT YOU MUST TO:
+- FIX mistakes if you see clear logical errors and wrong assumptions
+- KEEP productive tangents, self-corrections, and exploratory branches. These are features.
+- INSERT missing logical steps. When there's a gap, add the missing reasoning AS IF the original thinker said it. Match their cadence and vocabulary.
+- EXPAND compressed steps of the only reasoning by showing the work (calculations, sub-reasoning) inline, but write it how THEY would write it, not how a textbook would.
+- DELETE only genuine redundancy that leads to nothing and does not contribute to the solution.
+
+### RESTRICTIONS:
+- DO NOT rewrite sentences that are already clear
+- DO NOT remove phrases like "hmm," "wait," "actually," "let me think..."
+- DO NOT add formal transitions ("Furthermore," "In conclusion,")
+- DO NOT convert the monologue into structured prose
+- DO NOT summarize or compress unless the problem is clearly overthought for its difficulty
+
+### OPERATING PRINCIPLE:
+Preserve and reuse original reasoning steps wherever possible. When you must add text, imitate the original's style closely. Explore several different paths of reasoning like the original if the problem difficulty demands that.
+
+### OUTPUT RULES:
+- After thinking, end with the closing thinking tag, then your output has to have a clear, step-by-step summary that walks through the key steps taken to arrive at the answer. This summary should:
+    - Don't write step-by-step summary anywhere
+    - Present the logical progression in clean, readable steps (not the raw internal monologue)
+    - Conclude with the final answer in the same format as the original (e.g., \boxed{{}})
+- **CRITICAL:** The final answer section must ALWAYS include a step-by-step summary before the boxed answer. NEVER jump straight from reasoning to just \boxed{{}} with no summary.
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+[Reasoning Trace]
+{trace}
+
+Your new solution:
