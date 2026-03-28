@@ -107,8 +107,58 @@ Depending on your data shape, you may want to change these values."""
         )
         self.rch = RolloutCollectionHelper()
 
+        # Discover model server base URLs for invalidate_kv_cache notification.
+        from nemo_gym.global_config import get_first_server_config_dict
+        from nemo_gym.server_utils import ServerClient
+
+        sc = ServerClient.load_from_global_config(self.head_server_config)
+        self._model_server_base_urls: list[str] = []
+        for key, value in sc.global_config_dict.items():
+            try:
+                has_models = "responses_api_models" in value
+            except TypeError:
+                has_models = False
+            if has_models:
+                try:
+                    cfg = get_first_server_config_dict(sc.global_config_dict, key)
+                    self._model_server_base_urls.append(
+                        f"http://{cfg.host}:{cfg.port}"
+                    )
+                except Exception:
+                    pass
+        print(
+            f"NemoGym: discovered {len(self._model_server_base_urls)} model server(s) "
+            f"for invalidate_kv_cache notification: {self._model_server_base_urls}"
+        )
+
     def health_check(self) -> bool:
         return True
+
+    async def notify_kv_cache_invalidated(self) -> None:
+        """Notify all Gym model servers that the KV cache has been invalidated.
+
+        Calls POST /invalidate_kv_cache on every responses_api_models server so that
+        custom routing policies (e.g. DynamoKvRoutingPolicy) can reset their
+        KV-cache state after the vLLM workers discard their KV cache.
+        """
+        if not self._model_server_base_urls:
+            return
+
+        import asyncio
+
+        import aiohttp
+
+        async def _post_invalidate_kv_cache(url: str) -> None:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{url}/invalidate_kv_cache") as resp:
+                    if resp.status != 200:
+                        print(
+                            f"Warning: POST {url}/invalidate_kv_cache returned status {resp.status}"
+                        )
+
+        await asyncio.gather(
+            *[_post_invalidate_kv_cache(url) for url in self._model_server_base_urls]
+        )
 
     async def run_rollouts(
         self,

@@ -591,6 +591,9 @@ class AsyncTrajectoryCollector:
                 invalidated = self.policy_generation.invalidate_kv_cache()
                 if invalidated:
                     print("✅ Invalidated vLLM prefix/KV caches after weight update")
+                    nemo_gym_actor = self.task_to_env.get("nemo_gym")
+                    if nemo_gym_actor is not None:
+                        ray.get(nemo_gym_actor.notify_kv_cache_invalidated.remote())
                 else:
                     print(
                         "⚠️ vLLM cache invalidation reported partial/unsuccessful on some workers"
