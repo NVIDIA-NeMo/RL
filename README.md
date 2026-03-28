@@ -53,7 +53,7 @@
 
 ## Overview
 
-**NeMo RL** is an open-source post-training library under the [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs etc.). Designed for flexibility, reproducibility, and scale, NeMo RL enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+**NeMo RL** is an open-source post-training library under the [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs, etc.). Designed for flexibility, reproducibility, and scale, NeMo RL enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
 
 ![NeMo RL Architecture Diagram](https://raw.githubusercontent.com/NVIDIA-NeMo/RL/refs/heads/main/docs/assets/RL_diagram.png)
 
@@ -91,8 +91,8 @@ For detailed information on backend selection, configuration, and examples, see 
 - 🔜 **SGLang Inference** - SGLang rollout support for optimized inference.
 - 🔜 **Improved Native Performance** - Improve training time for native PyTorch models.
 - 🔜 **Improved Large MoE Performance** - Improve Megatron Core training performance and generation performance.
-- 🔜 **New Models** -  Qwen3-Next, Nemotron-Super.
-- 🔜 **Expand Algorithms** - GDPO, LoRA support for RL(GRPO) and DPO
+- 🔜 **New Models** - Qwen3-Next, Nemotron-Super.
+- 🔜 **Expanded Algorithms** - GDPO, LoRA support for RL(GRPO) and DPO
 - 🔜 **Resiliency** - Fault tolerance and auto-scaling support
 - 🔜 **On-Policy Distillation** - Multi-teacher and cross tokenizer distillation support
 - 🔜 **Speculative Decoding** - Speculative Decoding support for rollout acceleration
@@ -100,7 +100,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **Distributed Training** - Ray-based infrastructure.
 - ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
-- ✅ **Learning Algorithms** - GRPO/GSPO/DAPO, SFT(with LoRA), DPO, and On-policy distillation.
+- ✅ **Learning Algorithms** - GRPO/GSPO/DAPO, SFT (with LoRA), DPO, and On-policy distillation.
 - ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
 - ✅ **Advanced Parallelism with DTensor** - PyTorch FSDP2, TP, CP, and SP for efficient training (through NeMo AutoModel).
 - ✅ **Larger Model Support with Longer Sequences** - Performant parallelisms with Megatron Core (TP/PP/CP/SP/EP/FSDP) (through NeMo Megatron Bridge). 
@@ -111,7 +111,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs.
 - ✅ **Megatron Inference** - Megatron Inference for fast Day-0 support for new Megatron models (avoid weight conversion).
 - ✅ **Async RL** - Support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GRPO.
-- ✅ **Nemo-Gym Integration** - RL Environment Integration.
+- ✅ **NeMo-Gym Integration** - RL Environment Integration.
 - ✅ **GB200** - container support for GB200.
 
 ## Table of Contents
@@ -255,7 +255,7 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 
 We provide a reference GRPO configuration for math benchmarks using the [OpenInstructMath2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2) dataset.
 
-You can read about the details of the GRPO implementation [here](docs/guides/grpo.md)
+You can read about the details of the GRPO implementation [here](docs/guides/grpo.md).
 
 ### GRPO Single Node
 
@@ -413,7 +413,7 @@ The default SFT configuration is set to run on a single GPU. To start the experi
 uv run python examples/run_sft.py
 ```
 
-This fine-tunes the `Llama3.2-1B` model on the SQuAD dataset using a 1 GPU.
+This fine-tunes the `Llama3.2-1B` model on the SQuAD dataset using 1 GPU.
 
 To use multiple GPUs on a single node, you can modify the cluster configuration. This adjustment will also let you potentially increase the model and batch size:
 
@@ -522,7 +522,7 @@ The default RM experiment is configured to run on a single GPU. To launch the ex
 uv run python examples/run_rm.py
 ```
 
-This trains a RM based on `meta-llama/Llama-3.2-1B-Instruct` on 1 GPU.
+This trains an RM based on `meta-llama/Llama-3.2-1B-Instruct` on 1 GPU.
 
 If you have access to more GPUs, you can update the experiment accordingly. To run on 8 GPUs, we update the cluster configuration:
 
@@ -670,7 +670,7 @@ note = {GitHub repository},
 
 ## Acknowledgement and Contribution Guide
 
-NeMo RL would like to acknowledge the adoption and contribution by the following community partners - Google, Argonne National Labs, Atlassian, Camfer, Domyn, Future House, Inflection AI, Lila, Paypal, Pegatron, PyTorch, Radical AI, Samsung, SB Instituition, Shanghai AI Lab, Speakleash, Sword Health, TII, NVIDIA Nemotron team, and many others.
+NeMo RL would like to acknowledge the adoption and contribution by the following community partners - Google, Argonne National Labs, Atlassian, Camfer, Domyn, Future House, Inflection AI, Lila, Paypal, Pegatron, PyTorch, Radical AI, Samsung, SB Institution, Shanghai AI Lab, Speakleash, Sword Health, TII, NVIDIA Nemotron team, and many others.
 
 NeMo RL is the re-architected repo of [NeMo Aligner](https://github.com/NVIDIA/NeMo-Aligner), which was one of the earliest LLM Reinforcement Learning libraries, and has inspired other open-source libraries such as [VeRL](https://github.com/volcengine/verl), [SkyRL](https://github.com/NovaSky-AI/SkyRL) and [ROLL](https://github.com/alibaba/ROLL).
 
