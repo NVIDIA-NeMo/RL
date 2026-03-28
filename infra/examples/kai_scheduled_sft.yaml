@@ -1,0 +1,130 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Licensed under the Apache License, Version 2.0
+#
+# Gang-schedule two 1-GPU SFT RayJobs via KAI scheduler.
+# Each runs SFT with cluster.gpus_per_node=1, then tears down.
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: sft-job-a
+  labels:
+    kai.scheduler/queue: team-a
+spec:
+  entrypoint: "cd /opt/nemo-rl && bash tests/functional/sft.sh cluster.gpus_per_node=1"
+  # HTTPMode required with KAI scheduler (K8sJobMode breaks gang scheduling).
+  submissionMode: HTTPMode
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 60
+  rayClusterSpec:
+    rayVersion: "2.52.0"
+    headGroupSpec:
+      rayStartParams:
+        object-store-memory: "200000000"
+      template:
+        spec:
+          schedulerName: kai-scheduler
+          imagePullSecrets:
+          - name: nvcr-secret
+          containers:
+          - name: ray-head
+            image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+            resources:
+              limits:
+                cpu: "4"
+                memory: "16Gi"
+              requests:
+                cpu: "1"
+                memory: "4Gi"
+            ports:
+            - containerPort: 6379
+              name: gcs-server
+            - containerPort: 8265
+              name: dashboard
+    workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 1
+      rayStartParams:
+        num-gpus: "1"
+        object-store-memory: "200000000"
+      template:
+        spec:
+          schedulerName: kai-scheduler
+          imagePullSecrets:
+          - name: nvcr-secret
+          containers:
+          - name: ray-worker
+            image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+            resources:
+              limits:
+                cpu: "4"
+                memory: "16Gi"
+                nvidia.com/gpu: "1"
+              requests:
+                cpu: "1"
+                memory: "4Gi"
+                nvidia.com/gpu: "1"
+---
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: sft-job-b
+  labels:
+    kai.scheduler/queue: team-a
+spec:
+  entrypoint: "cd /opt/nemo-rl && bash tests/functional/sft.sh cluster.gpus_per_node=1"
+  # HTTPMode required with KAI scheduler (K8sJobMode breaks gang scheduling).
+  submissionMode: HTTPMode
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 60
+  rayClusterSpec:
+    rayVersion: "2.52.0"
+    headGroupSpec:
+      rayStartParams:
+        object-store-memory: "200000000"
+      template:
+        spec:
+          schedulerName: kai-scheduler
+          imagePullSecrets:
+          - name: nvcr-secret
+          containers:
+          - name: ray-head
+            image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+            resources:
+              limits:
+                cpu: "4"
+                memory: "16Gi"
+              requests:
+                cpu: "1"
+                memory: "4Gi"
+            ports:
+            - containerPort: 6379
+              name: gcs-server
+            - containerPort: 8265
+              name: dashboard
+    workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 1
+      rayStartParams:
+        num-gpus: "1"
+        object-store-memory: "200000000"
+      template:
+        spec:
+          schedulerName: kai-scheduler
+          imagePullSecrets:
+          - name: nvcr-secret
+          containers:
+          - name: ray-worker
+            image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+            resources:
+              limits:
+                cpu: "4"
+                memory: "16Gi"
+                nvidia.com/gpu: "1"
+              requests:
+                cpu: "1"
+                memory: "4Gi"
+                nvidia.com/gpu: "1"

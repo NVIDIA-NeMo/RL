@@ -1,0 +1,114 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Licensed under the Apache License, Version 2.0
+#
+# Gang-schedule two RayClusters via KAI scheduler.
+# Each cluster gets 1 GPU worker. Both clusters should come up simultaneously.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: raycluster-a
+  labels:
+    kai.scheduler/queue: team-a
+spec:
+  rayVersion: "2.52.0"
+  headGroupSpec:
+    rayStartParams:
+      object-store-memory: "100000000"  # 100MB, minimum for kind
+    template:
+      spec:
+        schedulerName: kai-scheduler
+        containers:
+        - name: ray-head
+          image: rayproject/ray:2.52.0
+          resources:
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+          ports:
+          - containerPort: 6379
+            name: gcs-server
+          - containerPort: 8265
+            name: dashboard
+          - containerPort: 10001
+            name: client
+  workerGroupSpecs:
+  - groupName: gpu-workers
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+    rayStartParams:
+      num-gpus: "1"
+      object-store-memory: "100000000"
+    template:
+      spec:
+        schedulerName: kai-scheduler
+        containers:
+        - name: ray-worker
+          image: rayproject/ray:2.52.0-gpu
+          resources:
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              nvidia.com/gpu: "1"
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+              nvidia.com/gpu: "1"
+---
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: raycluster-b
+  labels:
+    kai.scheduler/queue: team-a
+spec:
+  rayVersion: "2.52.0"
+  headGroupSpec:
+    rayStartParams:
+      object-store-memory: "100000000"
+    template:
+      spec:
+        schedulerName: kai-scheduler
+        containers:
+        - name: ray-head
+          image: rayproject/ray:2.52.0
+          resources:
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+          ports:
+          - containerPort: 6379
+            name: gcs-server
+          - containerPort: 8265
+            name: dashboard
+          - containerPort: 10001
+            name: client
+  workerGroupSpecs:
+  - groupName: gpu-workers
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+    rayStartParams:
+      num-gpus: "1"
+      object-store-memory: "100000000"
+    template:
+      spec:
+        schedulerName: kai-scheduler
+        containers:
+        - name: ray-worker
+          image: rayproject/ray:2.52.0-gpu
+          resources:
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              nvidia.com/gpu: "1"
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+              nvidia.com/gpu: "1"
