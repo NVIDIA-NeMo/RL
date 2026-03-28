@@ -1118,6 +1118,19 @@ def run_async_nemo_gym_rollout(
     timer_prefix = "timing/rollout"
     timer.start(f"{timer_prefix}/total")
 
+    # Parse global logits processor defaults so per-sample budgets can inherit
+    # grace_period and end_token_ids without repeating them in every datum.
+    _lp_defaults: dict = {}
+    _lp_args_str = (
+        (policy_generation.cfg.get("vllm_cfg") or {})
+        .get("logits_processor_env_vars") or {}
+    ).get("THINKING_BUDGET_LOGITS_PROCESSOR_ARGS")
+    if _lp_args_str:
+        try:
+            _lp_defaults = json.loads(_lp_args_str)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
     for rowidx, row in enumerate(nemo_gym_rows):
         # We may need better handling here. The max tokens set here would be the max new generated tokens, not the total max tokens.
         # Currently, we just rely on the underlying vLLM engine to do the truncation for us using the max model seq len set in the config.
@@ -1126,6 +1139,23 @@ def run_async_nemo_gym_rollout(
         responses_create_params = row["responses_create_params"]
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
+
+        # Per-sample thinking budget: inject vllm_xargs so the logits processor
+        # picks up the per-request budget override alongside global defaults.
+        if "thinking_budget" in row:
+            vllm_xargs = {
+                "thinking_budget": row["thinking_budget"],
+                "thinking_budget_grace_period": row.get(
+                    "thinking_budget_grace_period",
+                    _lp_defaults.get("thinking_budget_grace_period", 30),
+                ),
+                "end_token_ids": json.dumps(
+                    row.get("end_token_ids", _lp_defaults.get("end_token_ids", []))
+                ),
+            }
+            metadata = responses_create_params.get("metadata") or {}
+            metadata["extra_body"] = json.dumps({"vllm_xargs": vllm_xargs})
+            responses_create_params["metadata"] = metadata
 
         # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
         # generation_config["max_new_tokens"]
