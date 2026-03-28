@@ -203,7 +203,6 @@ constraints = [
 ]
 overrides = [
     { name = "llguidance", specifier = ">=1.3.0,<1.4.0" },
-    { name = "nemo-run", marker = "sys_platform == 'never'", git = "https://github.com/NVIDIA-NeMo/Run?rev=414f0077c648fde2c71bb1186e97ccbf96d6844c" },
     { name = "nvidia-cutlass-dsl", specifier = ">=4.3.1" },
     { name = "nvidia-modelopt", extras = ["torch"], specifier = ">=0.39.0" },
     { name = "opencv-python-headless", specifier = ">=4.11.0" },

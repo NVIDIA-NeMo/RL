@@ -219,7 +219,6 @@ no-build-isolation-package = [
   "transformer-engine-torch",
   "transformer-engine",
   "flash-attn",
-  "flash-mla",
   "mamba-ssm",
   "causal-conv1d",
   "deep_gemm",
@@ -253,8 +252,6 @@ override-dependencies = [
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
   "nvidia-cutlass-dsl>=4.3.1",
-  # Megatron-Bridge uses nemo-run but it is not required by RL
-  "nemo-run; sys_platform == 'never'",
 ]
 # CVE fixes
 constraint-dependencies = [
