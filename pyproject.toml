@@ -54,6 +54,7 @@ dependencies = [
   "nccl4py",                                                                                                          # for non-colocated refit
   "cuda-bindings",                                                                                                    # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
+  "megatron-core[dev,mlm]",
 ]
 
 [project.optional-dependencies]
@@ -110,7 +111,6 @@ mcore = [
   # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
   # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
   "transformer-engine[pytorch]>=2.9.0a0,<2.12.0",
-  "megatron-core",
   "megatron-bridge",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
@@ -190,7 +190,7 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed
 sgl-kernel = { git = "https://github.com/sgl-project/sglang", rev = "3167bcc01c3074d5739e8086757cd8c66077d508", subdirectory = "sgl-kernel" }
 
 [tool.uv.workspace]
-members = [
+members = [  
   "3rdparty/Automodel-workspace/Automodel",
   "3rdparty/Megatron-Bridge-workspace",
   "3rdparty/Gym-workspace/Gym",
@@ -219,6 +219,7 @@ no-build-isolation-package = [
   "transformer-engine-torch",
   "transformer-engine",
   "flash-attn",
+  "flash-mla",
   "mamba-ssm",
   "causal-conv1d",
   "deep_gemm",
@@ -252,6 +253,8 @@ override-dependencies = [
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
   "nvidia-cutlass-dsl>=4.3.1",
+  # Megatron-Bridge uses nemo-run but it is not required by RL
+  "nemo-run; sys_platform == 'never'",
 ]
 # CVE fixes
 constraint-dependencies = [
