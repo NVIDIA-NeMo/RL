@@ -1,0 +1,43 @@
+# Disaggregated Gym RayCluster.
+# Runs NeMo Gym servers as a standalone HTTP service.
+# Uses K8s ConfigMap endpoint registry for service discovery with the RL cluster.
+#
+# Prerequisites:
+#   kubectl apply -f endpoint-registry-rbac.yaml
+#
+# The Gym server registers its address and waits for the RL cluster to
+# register vLLM URLs, all via the shared ConfigMap.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: raycluster-gym
+  labels:
+    kai.scheduler/queue: team-a
+spec:
+  rayVersion: "2.52.0"
+  headGroupSpec:
+    rayStartParams:
+      object-store-memory: "200000000"
+    template:
+      spec:
+        serviceAccountName: nemo-rl-endpoint-registry
+        schedulerName: kai-scheduler
+        imagePullSecrets:
+        - name: nvcr-secret
+        containers:
+        - name: ray-head
+          image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+          resources:
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+            requests:
+              cpu: "1"
+              memory: "4Gi"
+          ports:
+          - containerPort: 6379
+            name: gcs-server
+          - containerPort: 8265
+            name: dashboard
+          - containerPort: 8080
+            name: head-server

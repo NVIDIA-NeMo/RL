@@ -1,0 +1,90 @@
+# Disaggregated RL RayCluster.
+# Runs nemo-rl GRPO training with vLLM workers.
+# Uses K8s ConfigMap endpoint registry for service discovery with the Gym cluster.
+#
+# Prerequisites:
+#   kubectl apply -f endpoint-registry-rbac.yaml
+#
+# Usage:
+#   kubectl apply -f disagg_rl_raycluster.yaml
+#   kubectl exec into head pod, then run GRPO with:
+#     env.disagg_job_id=my-job-123
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: raycluster-rl
+  labels:
+    kai.scheduler/queue: team-a
+spec:
+  rayVersion: "2.52.0"
+  headGroupSpec:
+    rayStartParams:
+      object-store-memory: "200000000"
+    template:
+      spec:
+        serviceAccountName: nemo-rl-endpoint-registry
+        schedulerName: kai-scheduler
+        imagePullSecrets:
+        - name: nvcr-secret
+        containers:
+        - name: ray-head
+          image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+          env:
+          - name: RAY_CLUSTER_NAME
+            value: raycluster-rl
+          resources:
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+            requests:
+              cpu: "1"
+              memory: "4Gi"
+          ports:
+          - containerPort: 6379
+            name: gcs-server
+          - containerPort: 8265
+            name: dashboard
+          - containerPort: 10001
+            name: client
+          volumeMounts:
+          - name: nemo-rl-src
+            mountPath: /workspace/nemo-rl
+        volumes:
+        - name: nemo-rl-src
+          hostPath:
+            path: /workspace/nemo-rl
+            type: DirectoryOrCreate
+  workerGroupSpecs:
+  - groupName: gpu-workers
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+    rayStartParams:
+      num-gpus: "2"
+      object-store-memory: "200000000"
+    template:
+      spec:
+        serviceAccountName: nemo-rl-endpoint-registry
+        schedulerName: kai-scheduler
+        imagePullSecrets:
+        - name: nvcr-secret
+        containers:
+        - name: ray-worker
+          image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+          resources:
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+              nvidia.com/gpu: "2"
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+              nvidia.com/gpu: "2"
+          volumeMounts:
+          - name: nemo-rl-src
+            mountPath: /workspace/nemo-rl
+        volumes:
+        - name: nemo-rl-src
+          hostPath:
+            path: /workspace/nemo-rl
+            type: DirectoryOrCreate
