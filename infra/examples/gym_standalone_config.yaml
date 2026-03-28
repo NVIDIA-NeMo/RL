@@ -1,0 +1,15 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Licensed under the Apache License, Version 2.0
+#
+# Gym standalone server config (extracted from env.nemo_gym section).
+# Used with: python -m nemo_gym.standalone_server --config-yaml this_file.yaml
+config_paths:
+- responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+- resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+policy_model:
+  responses_api_models:
+    vllm_model:
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+      uses_reasoning_parser: false
