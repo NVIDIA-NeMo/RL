@@ -84,22 +84,32 @@ kind delete cluster --name nemo-rl
 
 ```
 infra/
-├── kind/           # Cluster setup (local dev only)
-│   ├── create-cluster.sh
-│   ├── install-nvkind.sh
-│   ├── get-kubectl.sh / get-helm.sh
-│   └── nvkind-config-values.yaml
-├── helm/           # Infrastructure (helmfile)
-│   ├── helmfile.yaml               # environments: kind, prod
+├── kind/                              # Cluster setup (local dev only)
+│   ├── create-cluster.sh             # Creates nvkind cluster
+│   ├── install-nvkind.sh             # Installs kind + nvkind
+│   ├── get-kubectl.sh / get-helm.sh  # Tool installers
+│   ├── nvkind-config-values.yaml     # Default: workers with all GPUs
+│   ├── nvkind-config-values-dev.yaml # Dev: + local code mount
+│   └── nvkind-config-template.yaml   # Custom template with extraMounts
+├── helm/                              # Infrastructure (helmfile)
+│   ├── helmfile.yaml                 # environments: kind, prod
 │   └── values/
-│       ├── nvidia-device-plugin.yaml   # kind only
-│       ├── gpu-operator.yaml           # prod only
+│       ├── nvidia-device-plugin.yaml # kind only
+│       ├── gpu-operator.yaml         # prod only
 │       ├── kai-scheduler.yaml
 │       └── kuberay-operator.yaml
-└── examples/       # Test manifests
-    ├── kai-queue.yaml
-    ├── kai_scheduled_pods.yaml
-    └── kai_scheduled_rayclusters.yaml
+└── examples/
+    ├── kai-queue.yaml                # KAI queue hierarchy
+    ├── kai_scheduled_pods.yaml       # Gang-scheduled GPU test pods
+    ├── kai_scheduled_rayclusters.yaml # Gang-scheduled RayClusters
+    ├── kai_scheduled_sft.yaml        # Two gang-scheduled SFT RayJobs
+    ├── sft_rayjob.yaml               # 2-GPU SFT RayJob
+    ├── raycluster-blocker.yaml       # GPU blocker for testing KAI
+    ├── gym_standalone_config.yaml    # Gym standalone server config
+    ├── disagg_rl_raycluster.yaml     # Disagg RL cluster + peer-watcher
+    ├── disagg_gym_raycluster.yaml    # Disagg Gym cluster + peer-watcher
+    ├── endpoint-registry-rbac.yaml   # RBAC for ConfigMap endpoint registry
+    └── peer-watcher.py               # Sidecar for failure cascading
 ```
 
 ## Notes

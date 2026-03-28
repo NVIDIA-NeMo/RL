@@ -1,14 +1,14 @@
-# Disaggregated RL RayCluster.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Licensed under the Apache License, Version 2.0
+#
+# Disaggregated RL RayCluster with peer-watcher sidecar.
 # Runs nemo-rl GRPO training with vLLM workers.
 # Uses K8s ConfigMap endpoint registry for service discovery with the Gym cluster.
+# The peer-watcher sidecar monitors raycluster-gym and tears down both clusters
+# if the Gym cluster fails or the application signals an error.
 #
 # Prerequisites:
 #   kubectl apply -f endpoint-registry-rbac.yaml
-#
-# Usage:
-#   kubectl apply -f disagg_rl_raycluster.yaml
-#   kubectl exec into head pod, then run GRPO with:
-#     env.disagg_job_id=my-job-123
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
@@ -49,11 +49,44 @@ spec:
           volumeMounts:
           - name: nemo-rl-src
             mountPath: /workspace/nemo-rl
+          - name: peer-watcher-script
+            mountPath: /opt/peer-watcher
+        # Sidecar: monitors raycluster-gym, tears down both on failure.
+        - name: peer-watcher
+          image: python:3.12-slim
+          command: ["python3", "/opt/peer-watcher/peer-watcher.py"]
+          env:
+          - name: SELF_CLUSTER_NAME
+            value: raycluster-rl
+          - name: PEER_CLUSTER_NAME
+            value: raycluster-gym
+          - name: POLL_INTERVAL
+            value: "10"
+          - name: MAX_PEER_FAILURES
+            value: "3"
+          # JOB_ID should be set to match +env.disagg_job_id in the GRPO command.
+          # Uncomment and set when using the endpoint registry.
+          # - name: JOB_ID
+          #   value: "my-job-id"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+          volumeMounts:
+          - name: peer-watcher-script
+            mountPath: /opt/peer-watcher
         volumes:
         - name: nemo-rl-src
           hostPath:
             path: /workspace/nemo-rl
             type: DirectoryOrCreate
+        - name: peer-watcher-script
+          configMap:
+            name: peer-watcher-script
+            defaultMode: 0755
   workerGroupSpecs:
   - groupName: gpu-workers
     replicas: 1
