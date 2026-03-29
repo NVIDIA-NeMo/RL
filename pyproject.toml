@@ -167,7 +167,7 @@ test = [
 ]
 
 [tool.uv.sources]
-megatron-core = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM", editable = true }
+megatron-core = { workspace = true }
 nemo-automodel = { workspace = true }
 megatron-bridge = { workspace = true }
 nemo_gym = { workspace = true }
@@ -193,6 +193,7 @@ sgl-kernel = { git = "https://github.com/sgl-project/sglang", rev = "3167bcc01c3
 members = [
   "3rdparty/Automodel-workspace/Automodel",
   "3rdparty/Megatron-Bridge-workspace",
+  "3rdparty/Megatron-LM-workspace",
   "3rdparty/Gym-workspace/Gym",
   # Research projects are also added here in order for them to share the global root level uv.lock.
   # If we don't do this, the research projects do not see the global uv.lock, and may mistakenly
