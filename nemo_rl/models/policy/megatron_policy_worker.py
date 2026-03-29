@@ -891,7 +891,7 @@ class MegatronPolicyWorker:
         if not self.is_prepared:
             raise RuntimeError(
                 "Model is not prepared for GPU execution. "
-                "Did you forget to call prepare_for_training() or prepare_for_lp_inference()?"
+                "Did you forget to call prepare_for_training()?"
             )
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
