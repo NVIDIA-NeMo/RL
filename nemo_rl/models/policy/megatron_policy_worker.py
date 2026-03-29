@@ -1450,16 +1450,13 @@ class MegatronPolicyWorker:
                 - output_ids: input + generated token IDs
                 - logprobs: Log probabilities for each token
                 - generation_lengths: Lengths of each response
-        """
-<<<<<<< HEAD:nemo_rl/models/policy/megatron_policy_worker.py
-=======
+       """
         # 512 bATCH SIZE (200 tokens)
         if not self.is_prepared:
             raise RuntimeError(
                 "Model is not prepared for GPU execution. "
                 "Did you forget to call prepare_for_training() or prepare_for_lp_inference()?"
             )
->>>>>>> d72b6222 (Add helpful error message if prepare_for_* not called):nemo_rl/models/policy/workers/megatron_policy_worker.py
         no_grad = torch.no_grad()
         no_grad.__enter__()
         self.model.config.flash_decode = True
