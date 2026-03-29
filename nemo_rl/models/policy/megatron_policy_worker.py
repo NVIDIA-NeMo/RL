@@ -1159,7 +1159,7 @@ class MegatronPolicyWorker:
         if not self.is_prepared:
             raise RuntimeError(
                 "Model is not prepared for GPU execution. "
-                "Did you forget to call prepare_for_training() or prepare_for_lp_inference()?"
+                "Did you forget to call prepare_for_lp_inference()?"
             )
         no_grad = torch.no_grad()
         no_grad.__enter__()
