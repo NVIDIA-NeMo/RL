@@ -16,6 +16,7 @@ import contextlib
 import gc
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from enum import IntEnum
 from typing import Any, Generator, Optional
 
 import ray
@@ -73,6 +74,12 @@ from nemo_rl.models.policy.workers.patches import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+
+class PreparedState(IntEnum):
+    NOT_READY = 0
+    LOGPROB = 1
+    TRAIN = 2
 
 
 def dtensor_params_generator(
@@ -214,6 +221,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
 
+        self.prepared_state = PreparedState.NOT_READY
+
         # Store configuration
         self.cfg = config
 
@@ -334,6 +343,11 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        if self.prepared_state != PreparedState.TRAIN:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_training()?"
+            )
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -523,6 +537,11 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        if self.prepared_state == PreparedState.NOT_READY:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_lp_inference() (or prepare_for_training())?"
+            )
         logprob_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -603,6 +622,11 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/score")
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
+        if self.prepared_state == PreparedState.NOT_READY:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_lp_inference() (or prepare_for_training())?"
+            )
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
         # Validate sequence dimension
@@ -989,6 +1013,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:
+        self.prepared_state = PreparedState.LOGPROB
         # onload model to cuda
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
@@ -1007,6 +1032,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
+        self.prepared_state = PreparedState.TRAIN
         # onload models and optimizer state to cuda
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
@@ -1062,7 +1088,18 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
         model = self.move_buffer_to_device(model, device)
-        return model.to(device)
+        model = model.to(device)
+        try:
+            any_on_cuda = any(
+                (hasattr(p, "is_cuda") and p.is_cuda)
+                for p in model.parameters()
+                if isinstance(p, torch.Tensor)
+            )
+            if not any_on_cuda:
+                self.prepared_state = PreparedState.NOT_READY
+        except Exception:
+            pass
+        return model
 
     def move_buffer_to_device(
         self, model: nn.Module, device: str | torch.device
