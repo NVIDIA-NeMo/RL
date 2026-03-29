@@ -186,6 +186,7 @@ conflicts = [[
 [manifest]
 members = [
     "megatron-bridge",
+    "megatron-core",
     "nemo-automodel",
     "nemo-gym",
     "nemo-rl",
@@ -473,15 +474,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/83/52/72e791b75c6b1efa803e491f7cbab78e963695e76d4ada05385252927e76/alembic-1.16.4.tar.gz", hash = "sha256:efab6ada0dd0fae2c92060800e0bf5c1dc26af15a10e02fb4babff164b4725e2", size = 1968161, upload-time = "2025-07-10T16:17:20.192Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c2/62/96b5217b742805236614f05904541000f55422a6060a90d7fd4ce26c172d/alembic-1.16.4-py3-none-any.whl", hash = "sha256:b05e51e8e82efc1abd14ba2af6392897e145930c3e0a2faf2b0da2f7f7fd660d", size = 247026, upload-time = "2025-07-10T16:17:21.845Z" },
-]
-
-[[package]]
-name = "aniso8601"
-version = "10.0.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/8b/8d/52179c4e3f1978d3d9a285f98c706642522750ef343e9738286130423730/aniso8601-10.0.1.tar.gz", hash = "sha256:25488f8663dd1528ae1f54f94ac1ea51ae25b4d531539b8bc707fed184d16845", size = 47190, upload-time = "2025-04-18T17:29:42.995Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/59/75/e0e10dc7ed1408c28e03a6cb2d7a407f99320eb953f229d008a7a6d05546/aniso8601-10.0.1-py2.py3-none-any.whl", hash = "sha256:eb19717fd4e0db6de1aab06f12450ab92144246b257423fe020af5748c0cb89e", size = 52848, upload-time = "2025-04-18T17:29:41.492Z" },
 ]
 
 [[package]]
@@ -2175,21 +2167,6 @@ wheels = [
 ]
 
 [[package]]
-name = "flask-restful"
-version = "0.3.10"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "aniso8601" },
-    { name = "flask" },
-    { name = "pytz" },
-    { name = "six" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c0/ce/a0a133db616ea47f78a41e15c4c68b9f08cab3df31eb960f61899200a119/Flask-RESTful-0.3.10.tar.gz", hash = "sha256:fe4af2ef0027df8f9b4f797aba20c5566801b6ade995ac63b588abf1a59cec37", size = 110453, upload-time = "2023-05-21T03:58:55.781Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d7/7b/f0b45f0df7d2978e5ae51804bb5939b7897b2ace24306009da0cc34d8d1f/Flask_RESTful-0.3.10-py2.py3-none-any.whl", hash = "sha256:1cf93c535172f112e080b0d4503a8d15f93a48c88bdd36dd87269bdaf405051b", size = 26217, upload-time = "2023-05-21T03:58:54.004Z" },
-]
-
-[[package]]
 name = "fonttools"
 version = "4.59.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3645,7 +3622,7 @@ dependencies = [
     { name = "flash-linear-attention" },
     { name = "hydra-core" },
     { name = "mamba-ssm" },
-    { name = "megatron-core", extra = ["dev", "mlm"] },
+    { name = "megatron-core" },
     { name = "mlflow" },
     { name = "nvidia-resiliency-ext" },
     { name = "omegaconf" },
@@ -3674,7 +3651,7 @@ requires-dist = [
     { name = "flash-linear-attention" },
     { name = "hydra-core", specifier = ">1.3,<=1.3.2" },
     { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" },
-    { name = "megatron-core", extras = ["dev", "mlm"], editable = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM" },
+    { name = "megatron-core", extras = ["dev", "mlm"], editable = "3rdparty/Megatron-LM-workspace" },
     { name = "mlflow", specifier = ">=3.5.0" },
     { name = "nvidia-resiliency-ext" },
     { name = "omegaconf", specifier = ">=2.3.0" },
@@ -3697,16 +3674,8 @@ requires-dist = [
 
 [[package]]
 name = "megatron-core"
-source = { editable = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM" }
+source = { editable = "3rdparty/Megatron-LM-workspace" }
 dependencies = [
-    { name = "numpy" },
-    { name = "packaging" },
-    { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-]
-
-[package.optional-dependencies]
-dev = [
     { name = "av" },
     { name = "causal-conv1d" },
     { name = "datasets" },
@@ -3721,6 +3690,7 @@ dev = [
     { name = "mamba-ssm" },
     { name = "megatron-energon", extra = ["av-decode"] },
     { name = "multi-storage-client" },
+    { name = "numpy" },
     { name = "nv-grouped-gemm" },
     { name = "nvidia-modelopt" },
     { name = "nvidia-resiliency-ext" },
@@ -3728,124 +3698,46 @@ dev = [
     { name = "onnxscript" },
     { name = "openai" },
     { name = "opentelemetry-api" },
+    { name = "packaging" },
     { name = "tensorstore", version = "0.1.74", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "tensorstore", version = "0.1.76", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "tqdm" },
     { name = "transformer-engine", extra = ["pytorch"] },
     { name = "wget" },
 ]
-mlm = [
-    { name = "accelerate" },
-    { name = "flask-restful" },
-    { name = "sentencepiece" },
-    { name = "tiktoken" },
-    { name = "transformers" },
-    { name = "wandb" },
-]
 
 [package.metadata]
 requires-dist = [
-    { name = "accelerate", marker = "extra == 'mlm'" },
-    { name = "av", marker = "extra == 'dev'" },
-    { name = "av", marker = "extra == 'lts'" },
-    { name = "causal-conv1d", marker = "extra == 'dev'", specifier = "~=1.5" },
-    { name = "causal-conv1d", marker = "extra == 'lts'", specifier = "~=1.5" },
-    { name = "datasets", marker = "extra == 'dev'" },
-    { name = "datasets", marker = "extra == 'lts'" },
-    { name = "einops", marker = "extra == 'dev'", specifier = "~=0.8" },
-    { name = "einops", marker = "extra == 'lts'", specifier = "~=0.8" },
-    { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.1.0" },
-    { name = "emerging-optimizers", marker = "extra == 'lts'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.1.0" },
-    { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
-    { name = "fastapi", marker = "extra == 'lts'", specifier = "~=0.50" },
-    { name = "flash-linear-attention", marker = "extra == 'dev'", specifier = "~=0.4.0" },
-    { name = "flashinfer-python", marker = "extra == 'dev'", specifier = "~=0.5.0" },
-    { name = "flashinfer-python", marker = "extra == 'lts'", specifier = "~=0.5.0" },
-    { name = "flask", extras = ["async"], marker = "extra == 'dev'" },
-    { name = "flask-restful", marker = "extra == 'mlm'" },
-    { name = "hypercorn", marker = "extra == 'dev'" },
-    { name = "mamba-ssm", marker = "extra == 'dev'", specifier = "~=2.2" },
-    { name = "mamba-ssm", marker = "extra == 'lts'", specifier = "~=2.2" },
-    { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=6.0" },
-    { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'lts'", specifier = "~=6.0" },
-    { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.27" },
-    { name = "multi-storage-client", marker = "extra == 'lts'", specifier = "~=0.27" },
-    { name = "numpy" },
-    { name = "nv-grouped-gemm", marker = "extra == 'dev'", specifier = "~=1.1" },
-    { name = "nv-grouped-gemm", marker = "extra == 'lts'", specifier = "~=1.1" },
-    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'" },
-    { name = "nvidia-resiliency-ext", marker = "extra == 'dev'" },
-    { name = "nvtx", marker = "extra == 'dev'", specifier = "~=0.2" },
-    { name = "nvtx", marker = "extra == 'lts'", specifier = "~=0.2" },
-    { name = "onnxscript", marker = "extra == 'dev'" },
-    { name = "onnxscript", marker = "extra == 'lts'" },
-    { name = "openai", marker = "extra == 'dev'" },
-    { name = "opentelemetry-api", marker = "extra == 'dev'", specifier = "~=1.33.1" },
-    { name = "opentelemetry-api", marker = "extra == 'lts'", specifier = "~=1.33.1" },
-    { name = "packaging", specifier = ">=24.2" },
-    { name = "sentencepiece", marker = "extra == 'mlm'" },
-    { name = "tensorstore", marker = "extra == 'dev'", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
-    { name = "tensorstore", marker = "extra == 'lts'", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
-    { name = "tiktoken", marker = "extra == 'mlm'" },
-    { name = "torch", specifier = ">=2.6.0" },
-    { name = "tqdm", marker = "extra == 'dev'" },
-    { name = "tqdm", marker = "extra == 'lts'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=5671fd3675906cda1ade26c24a65d3dedd88eb89" },
-    { name = "transformers", marker = "extra == 'mlm'" },
-    { name = "wandb", marker = "extra == 'mlm'" },
-    { name = "wget", marker = "extra == 'dev'" },
-    { name = "wget", marker = "extra == 'lts'" },
-]
-provides-extras = ["mlm", "dev", "lts"]
-
-[package.metadata.requires-dev]
-build = [
-    { name = "cython", specifier = ">=3.0.0" },
-    { name = "hatchling" },
-    { name = "nvidia-mathdx" },
-    { name = "packaging", specifier = ">=24.2" },
-    { name = "pybind11" },
-    { name = "setuptools", specifier = ">=77.0.0,<80.0.0" },
-    { name = "torch" },
-]
-ci = [
-    { name = "pandas" },
-    { name = "python-gitlab" },
-    { name = "slack-sdk" },
-]
-docs = [
-    { name = "myst-parser" },
-    { name = "nvidia-sphinx-theme" },
-    { name = "sphinx" },
-    { name = "sphinx-autobuild" },
-    { name = "sphinx-autodoc2" },
-    { name = "sphinx-copybutton" },
-]
-linting = [
-    { name = "black", specifier = "==24.4.2" },
-    { name = "flake8", specifier = "==7.1.0" },
-    { name = "isort", specifier = "==5.13.2" },
-    { name = "pylint", specifier = "==3.2.6" },
-    { name = "ruff", specifier = "~=0.9.0" },
-]
-no-pypi-wheels = [
+    { name = "av" },
+    { name = "causal-conv1d", git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" },
+    { name = "datasets" },
+    { name = "einops", specifier = "~=0.8" },
     { name = "emerging-optimizers", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.1.0" },
-    { name = "flash-mla", git = "https://github.com/deepseek-ai/FlashMLA?rev=9edee0c022cd0938148a18e334203b0aab43aa19" },
-]
-test = [
-    { name = "coverage" },
-    { name = "nemo-run", git = "https://github.com/NVIDIA-NeMo/Run.git?rev=01a9a8ba360f7b2908728ad0516e0ad9d936966d" },
-    { name = "nltk" },
-    { name = "pydantic" },
-    { name = "pygithub" },
-    { name = "pytest", specifier = "==8.3.5" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-    { name = "pytest-mock" },
-    { name = "pytest-random-order" },
-    { name = "pyyaml" },
-    { name = "tensorboard" },
-    { name = "wrapt" },
+    { name = "fastapi", specifier = "~=0.50" },
+    { name = "flash-linear-attention", specifier = "~=0.4.0" },
+    { name = "flashinfer-python", specifier = "~=0.5.0" },
+    { name = "flask", extras = ["async"] },
+    { name = "hypercorn" },
+    { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" },
+    { name = "megatron-energon", extras = ["av-decode"], specifier = "~=6.0" },
+    { name = "multi-storage-client", specifier = "~=0.27" },
+    { name = "numpy" },
+    { name = "nv-grouped-gemm", specifier = "~=1.1" },
+    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'" },
+    { name = "nvidia-resiliency-ext" },
+    { name = "nvtx", specifier = "~=0.2" },
+    { name = "onnxscript" },
+    { name = "openai" },
+    { name = "opentelemetry-api", specifier = "~=1.33.1" },
+    { name = "packaging", specifier = ">=24.2" },
+    { name = "tensorstore", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
+    { name = "torch", marker = "sys_platform != 'darwin'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.6.0", index = "https://pypi.org/simple" },
+    { name = "tqdm" },
+    { name = "transformer-engine", extras = ["core-cu12", "pytorch"], specifier = ">=2.9.0a0,<2.12.0" },
+    { name = "wget" },
 ]
 
 [[package]]
@@ -4808,7 +4700,6 @@ dependencies = [
     { name = "hydra-core" },
     { name = "math-verify" },
     { name = "matplotlib" },
-    { name = "megatron-core" },
     { name = "mlflow" },
     { name = "nccl4py" },
     { name = "ninja" },
@@ -4862,6 +4753,7 @@ mcore = [
     { name = "emerging-optimizers" },
     { name = "flash-attn" },
     { name = "megatron-bridge" },
+    { name = "megatron-core" },
     { name = "transformer-engine", extra = ["pytorch"], marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
 nemo-gym = [
@@ -4962,7 +4854,7 @@ requires-dist = [
     { name = "math-verify" },
     { name = "matplotlib" },
     { name = "megatron-bridge", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-Bridge-workspace" },
-    { name = "megatron-core", editable = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM" },
+    { name = "megatron-core", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-LM-workspace" },
     { name = "mlflow", specifier = ">=3.5.0,<3.6.0" },
     { name = "msgspec", marker = "extra == 'sglang'" },
     { name = "nccl4py" },

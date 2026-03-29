@@ -54,7 +54,6 @@ dependencies = [
   "nccl4py",                                                                                                          # for non-colocated refit
   "cuda-bindings",                                                                                                    # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
-  "megatron-core",
 ]
 
 [project.optional-dependencies]
@@ -111,6 +110,7 @@ mcore = [
   # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
   # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
   "transformer-engine[pytorch]>=2.9.0a0,<2.12.0",
+  "megatron-core",
   "megatron-bridge",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
@@ -167,7 +167,7 @@ test = [
 ]
 
 [tool.uv.sources]
-megatron-core = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM", editable = true }
+megatron-core = { workspace = true }
 nemo-automodel = { workspace = true }
 megatron-bridge = { workspace = true }
 nemo_gym = { workspace = true }
@@ -190,9 +190,10 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed
 sgl-kernel = { git = "https://github.com/sgl-project/sglang", rev = "3167bcc01c3074d5739e8086757cd8c66077d508", subdirectory = "sgl-kernel" }
 
 [tool.uv.workspace]
-members = [  
+members = [
   "3rdparty/Automodel-workspace/Automodel",
   "3rdparty/Megatron-Bridge-workspace",
+  "3rdparty/Megatron-LM-workspace",
   "3rdparty/Gym-workspace/Gym",
   # Research projects are also added here in order for them to share the global root level uv.lock.
   # If we don't do this, the research projects do not see the global uv.lock, and may mistakenly
