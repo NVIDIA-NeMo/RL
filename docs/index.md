@@ -142,6 +142,13 @@ Tools and techniques for debugging distributed Ray applications and RL training 
 Optimize large language models with FP8 quantization for faster training and inference.
 :::
 
+:::{grid-item-card} {octicon}`package` Quantization-Aware RL
+:link: guides/quantization-aware-rl
+:link-type: doc
+
+Run GRPO and distillation with quantized models using NVIDIA ModelOpt (NVFP4, FP8).
+:::
+
 :::{grid-item-card} {octicon}`container` Docker Containers
 :link: docker
 :link-type: doc
@@ -219,6 +226,7 @@ guides/eval.md
 guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
+guides/quantization-aware-rl.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
 guides/ft-launcher-guide.md
