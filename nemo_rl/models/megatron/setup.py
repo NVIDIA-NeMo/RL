@@ -472,13 +472,14 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")
     if attention_backend is not None:
-        if isinstance(attention_backend, str):
+        for _nvte_var in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
+            os.environ.pop(_nvte_var, None)
+        try:
             model_cfg.attention_backend = AttnBackend[attention_backend]
-        elif isinstance(attention_backend, int):
-            model_cfg.attention_backend = AttnBackend(attention_backend)
-        else:
+        except KeyError:
             raise ValueError(
-                f"Unsupported {type(attention_backend)=}, expected str or int"
+                f"Invalid attention backend: {attention_backend}. "
+                f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
 
     # FP8 configuration
