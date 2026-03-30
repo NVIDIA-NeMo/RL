@@ -39,7 +39,7 @@ policy:
     max_new_tokens: 4096
     vllm_cfg:
       precision: fp8
-      gpu_memory_utilization: 0.5
+      gpu_memory_utilization: 0.4
       max_model_len: 4096
       use_deep_gemm: true
 data:

@@ -115,7 +115,7 @@ def helpsteer3_data_processor(
     extra_env_info = {"ground_truth": ground_truth}
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # Truncate if too long
         for chat_message in message_log:
             chat_message["token_ids"] = chat_message["token_ids"][
@@ -169,7 +169,7 @@ def sft_processor(
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # make smaller and mask out
         for message in message_log:
             message["token_ids"] = message["token_ids"][
@@ -216,9 +216,7 @@ def preference_preprocessor(
         ...     ]
         ... }
         >>>
-        >>> processed = preference_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)  # doctest: +ELLIPSIS
-        <BLANKLINE>
-        ...
+        >>> processed = preference_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)
         >>> len(processed["message_log_chosen"])
         2
         >>> processed["message_log_chosen"][0]["content"]
@@ -361,7 +359,7 @@ def math_data_processor(
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # make smaller and mask out
         for indiv_message in message_log:
             indiv_message["token_ids"] = indiv_message["token_ids"][
@@ -483,7 +481,7 @@ def math_hf_data_processor(
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # make smaller and mask out
         for chat_message in message_log:
             chat_message["token_ids"] = chat_message["token_ids"][
@@ -605,6 +603,10 @@ def vlm_hf_data_processor(
     # specifically for gemma, we need to add token_type_ids to the user message as a sequence-type value
     if "token_type_ids" in message:
         user_message["token_type_ids"] = message["token_type_ids"][0]
+
+    # for qwen2.5-vl (transformers>=5.3), mm_token_type_ids tells the model which tokens are text/image/video for 3D RoPE
+    if "mm_token_type_ids" in message:
+        user_message["mm_token_type_ids"] = message["mm_token_type_ids"][0]
 
     ### append to user message
     message_log.append(user_message)
