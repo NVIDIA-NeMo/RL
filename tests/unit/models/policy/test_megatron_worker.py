@@ -34,9 +34,8 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
-
-pytestmark = pytest.mark.mcore
 
 pytestmark = pytest.mark.mcore
 
@@ -1095,16 +1094,16 @@ def test_megatron_reference_policy_functionality(tiny_llama_model_path):
 @pytest.mark.timeout(400)
 @pytest.mark.hf_gated
 @pytest.mark.parametrize(
-    "num_gpus,tp,pp",
+    "num_gpus,tp,pp,save_optimizer",
     [
-        (2, 1, 1),  # Data parallel
-        (2, 1, 2),  # Pipeline parallel
-        (2, 2, 1),  # Tensor parallel
+        (2, 1, 1, False),  # Data parallel
+        (2, 1, 2, True),  # Pipeline parallel
+        (2, 2, 1, True),  # Tensor parallel
     ],
     ids=["2gpu_dp2_save_restore", "2gpu_pp2_save_restore", "2gpu_tp2_save_restore"],
 )
 def test_megatron_checkpoint_save_kill_and_restore(
-    num_gpus, tp, pp, tiny_llama_model_path
+    num_gpus, tp, pp, tiny_llama_model_path, save_optimizer
 ):
     """Test full checkpoint save/restore cycle: save -> kill worker -> restart -> verify restore."""
     from copy import deepcopy
@@ -1115,6 +1114,15 @@ def test_megatron_checkpoint_save_kill_and_restore(
 
     with tempfile.TemporaryDirectory(prefix="megatron_save_restore_") as temp_dir:
         checkpoint_dir = os.path.join(temp_dir, "full_restore_test")
+        weights_path = os.path.join(checkpoint_dir, "policy", "weights")
+        # In Megatron, optimizer_path is only a flag to indicate that the optimizer
+        # state is embedded in the weights_path. We will actually load the optimizer
+        # state from the weights_path.
+        optimizer_path = (
+            os.path.join(checkpoint_dir, "policy", "optimizer")
+            if save_optimizer
+            else None
+        )
 
         # Create initial config
         initial_config = create_megatron_test_config(
@@ -1132,7 +1140,6 @@ def test_megatron_checkpoint_save_kill_and_restore(
         )
 
         policy1 = None
-        param_sample_before_save = {}
         try:
             policy1 = Policy(
                 cluster=cluster1, config=initial_config, tokenizer=tokenizer
@@ -1189,13 +1196,13 @@ def test_megatron_checkpoint_save_kill_and_restore(
             # Save checkpoint
             print("Saving checkpoint...")
             policy1.save_checkpoint(
-                weights_path=checkpoint_dir,
-                optimizer_path=checkpoint_dir,
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
             )
 
             # Verify checkpoint was created
             assert os.path.exists(checkpoint_dir), "Checkpoint directory not created"
-            iter_dirs = [d for d in os.listdir(checkpoint_dir) if d.startswith("iter_")]
+            iter_dirs = [d for d in os.listdir(weights_path) if d.startswith("iter_")]
             assert len(iter_dirs) > 0, "No iteration directories found in checkpoint"
             latest_iter = sorted(iter_dirs)[-1]
             print(f"Checkpoint saved to iteration: {latest_iter}")
@@ -1253,13 +1260,24 @@ def test_megatron_checkpoint_save_kill_and_restore(
             print(f"Creating policy with checkpoint loading from: {checkpoint_dir}")
             restore_config = deepcopy(initial_config)
 
+            # Check if the optimizer exists in the checkpoint
+            # checkpointer = CheckpointManager(restore_config["checkpointing"])
+            weights_path, optimizer_path = CheckpointManager.get_resume_paths(
+                checkpoint_dir
+            )
+            if save_optimizer:
+                assert optimizer_path is not None, "Optimizer path should not be None"
+            else:
+                assert optimizer_path is None, "Optimizer path should be None"
+
             # The key is to pass weights_path to the Policy constructor
             # This gets passed to MegatronPolicyWorker which configures CheckpointConfig.load
             policy3 = Policy(
                 cluster=cluster2,
                 config=restore_config,
                 tokenizer=tokenizer,
-                weights_path=checkpoint_dir,  # This should trigger checkpoint loading
+                weights_path=weights_path,  # This should trigger checkpoint loading
+                optimizer_path=optimizer_path,
                 init_reference_model=False,
             )
 

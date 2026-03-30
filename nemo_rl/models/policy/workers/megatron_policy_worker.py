@@ -157,6 +157,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             hf_model_name,
             pretrained_path,
             weights_path,
+            optimizer_path,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
