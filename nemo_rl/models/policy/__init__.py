@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict, Union
+from typing import Any, Literal, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+
+CudaGraphScope = Literal[
+    "full_iteration", "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba"
+]
 
 
 class LoRAConfigDisabled(TypedDict):
@@ -246,6 +250,8 @@ class MegatronConfig(TypedDict):
     # Number of tokens per chunk when computing the fused linear CE loss.
     # Smaller values reduce peak memory further but may decrease throughput.
     linear_ce_fusion_chunk_size: NotRequired[int]
+    enable_cuda_graph: bool
+    cuda_graph_scope: CudaGraphScope
 
 
 class TokenizerConfig(TypedDict):
