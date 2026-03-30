@@ -585,37 +585,50 @@ def _debug_print_first_sample(
         f"[DISTILL_DEBUG] Teacher scored positions count: {len(scored_positions)}",
         flush=True,
     )
+
+    # Print the full scored token sequence (ids + text)
+    scored_ids = train_data["input_ids"][0][scored_positions].detach().cpu()
+    scored_texts = [
+        tokenizer.decode([int(t)], skip_special_tokens=False) for t in scored_ids
+    ]
     print(
-        f"[DISTILL_DEBUG] First scored positions: {scored_positions[:preview_n].tolist()}",
+        "[DISTILL_DEBUG] Scored token sequence (raw decode):",
+        flush=True,
+    )
+    print(
+        tokenizer.decode(scored_ids.tolist(), skip_special_tokens=False),
+        flush=True,
+    )
+    print(
+        f"[DISTILL_DEBUG] Scored token ids: {scored_ids.tolist()}",
+        flush=True,
+    )
+    print(
+        f"[DISTILL_DEBUG] Scored token texts: {scored_texts}",
         flush=True,
     )
 
-    for rank, pos in enumerate(scored_positions[:preview_n].tolist(), start=1):
+    def _print_token_with_topk(rank: int, pos: int, label: str) -> None:
         token_id = int(train_data["input_ids"][0, pos].item())
         token_text = tokenizer.decode([token_id], skip_special_tokens=False)
-
         # teacher logits[i] predicts token[i+1], so the distribution used to
         # score the student token at *pos* comes from teacher logits at pos-1.
         teacher_pos = pos - 1
         if teacher_pos < 0:
             print(
-                f"[DISTILL_DEBUG] scored_token_{rank:02d} pos={pos} "
+                f"[DISTILL_DEBUG] {label} pos={pos} "
                 f"student_token_id={token_id} student_token_text={token_text!r} "
                 f"(skipped: no teacher logit at pos-1)",
                 flush=True,
             )
-            continue
-
+            return
         logits_at_pos = teacher_topk_logits[teacher_pos]
         indices_at_pos = teacher_topk_indices[teacher_pos]
         top_vals, top_order = torch.topk(logits_at_pos, k=min(5, logits_at_pos.shape[0]))
-
         print(
-            (
-                f"[DISTILL_DEBUG] scored_token_{rank:02d} pos={pos} "
-                f"student_token_id={token_id} student_token_text={token_text!r} "
-                f"(teacher logits from pos={teacher_pos})"
-            ),
+            f"[DISTILL_DEBUG] {label} pos={pos} "
+            f"student_token_id={token_id} student_token_text={token_text!r} "
+            f"(teacher logits from pos={teacher_pos})",
             flush=True,
         )
         for j in range(top_vals.shape[0]):
@@ -624,12 +637,25 @@ def _debug_print_first_sample(
             cand_text = tokenizer.decode([cand_id], skip_special_tokens=False)
             cand_logit = float(top_vals[j].item())
             print(
-                (
-                    f"[DISTILL_DEBUG]   top{j + 1}: token_id={cand_id} "
-                    f"token_text={cand_text!r} logit={cand_logit:.6f}"
-                ),
+                f"[DISTILL_DEBUG]   top{j + 1}: token_id={cand_id} "
+                f"token_text={cand_text!r} logit={cand_logit:.6f}",
                 flush=True,
             )
+
+    print(
+        f"[DISTILL_DEBUG] First scored positions: {scored_positions[:preview_n].tolist()}",
+        flush=True,
+    )
+    for rank, pos in enumerate(scored_positions[:preview_n].tolist(), start=1):
+        _print_token_with_topk(rank, pos, f"scored_token_first_{rank:02d}")
+
+    print(
+        f"[DISTILL_DEBUG] Last scored positions: {scored_positions[-preview_n:].tolist()}",
+        flush=True,
+    )
+    last_positions = scored_positions[-preview_n:].tolist()
+    for rank, pos in enumerate(last_positions, start=len(scored_positions) - len(last_positions) + 1):
+        _print_token_with_topk(rank, pos, f"scored_token_last_{rank:02d}")
 
 
 def distillation_train(
