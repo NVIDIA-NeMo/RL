@@ -30,6 +30,7 @@ import ray
 import requests
 import swanlab
 import torch
+import trackio
 import wandb
 from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
@@ -68,6 +69,28 @@ class MLflowConfig(TypedDict):
     run_name: NotRequired[str | None]
     tracking_uri: NotRequired[str | None]
     artifact_location: NotRequired[str | None]
+
+
+class TrackioConfig(TypedDict):
+    project: NotRequired[str]
+    name: NotRequired[str]
+    group: NotRequired[str]
+
+    # HF-native features
+    space_id: NotRequired[str]
+    dataset_id: NotRequired[str]
+
+    # GPU logging
+    auto_log_gpu: NotRequired[bool]
+    gpu_log_interval: NotRequired[float]
+
+    # Alerts
+    webhook_url: NotRequired[str | None]
+    webhook_min_level: NotRequired[str | None]
+
+    # misc
+    config: NotRequired[dict[str, Any]]
+    rank_zero_only: NotRequired[bool]
 
 
 class GPUMonitoringConfig(TypedDict):
@@ -881,6 +904,145 @@ class MLflowLogger(LoggerInterface):
             pass
 
 
+class TrackioLogger(LoggerInterface):
+    """Trackio logger backend."""
+
+    def __init__(self, cfg: TrackioConfig, log_dir: Optional[str] = None):
+        import os
+
+        self.cfg = cfg
+
+        self.rank = int(os.environ.get("RANK", 0))
+        self.enabled = not cfg.get("rank_zero_only", True) or self.rank == 0
+
+        if not self.enabled:
+            return
+
+        self.run = trackio.init(
+            project=cfg.get("project", "nemo_rl"),
+            name=cfg.get("name"),
+            group=cfg.get("group"),
+            space_id=cfg.get("space_id"),
+            dataset_id=cfg.get("dataset_id"),
+            # GPU logging (native)
+            auto_log_gpu=cfg.get("auto_log_gpu", True),
+            gpu_log_interval=cfg.get("gpu_log_interval", 10.0),
+            # alerts
+            webhook_url=cfg.get("webhook_url"),
+            webhook_min_level=cfg.get("webhook_min_level"),
+            # config
+            config=cfg.get("config", {}),
+        )
+
+        print(
+            f"Initialized TrackioLogger for project {cfg.get('project')}, run {cfg.get('name')}"
+        )
+
+    def log_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: Optional[str] = "",
+        step_metric: Optional[str] = None,
+        step_finished: bool = False,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        if prefix:
+            metrics = {
+                f"{prefix}/{k}" if k != step_metric else k: v
+                for k, v in metrics.items()
+            }
+
+        processed = {}
+
+        for k, v in metrics.items():
+            # Scalars
+            if isinstance(v, (int, float)):
+                processed[k] = v
+
+            # Histogram (native Trackio)
+            elif isinstance(v, (list, np.ndarray)):
+                processed[k] = trackio.Histogram(v)
+
+            # Torch tensors → convert safely
+            elif isinstance(v, torch.Tensor):
+                if v.numel() == 1:
+                    processed[k] = v.item()
+                else:
+                    processed[k] = trackio.Histogram(v.detach().cpu().numpy())
+
+            # Images (numpy / tensor)
+            elif hasattr(v, "shape") and len(getattr(v, "shape", [])) in [2, 3]:
+                processed[k] = trackio.Image(v)
+
+            else:
+                print(
+                    f"Warning: Skipping metric '{k}' for Trackio logging "
+                    f"(unsupported type: {type(v).__name__})"
+                )
+
+        if processed:
+            trackio.log(processed, step=step)
+
+    def log_hyperparams(self, params: Mapping[str, Any]) -> None:
+        if not self.enabled:
+            return
+
+        try:
+            self.run.config.update(params)
+        except Exception:
+            trackio.log({f"hp/{k}": v for k, v in params.items()}, step=0)
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        if not self.enabled:
+            return
+
+        trackio.log({name: trackio.Histogram(histogram)}, step=step)
+
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Convert matplotlib figure → image for Trackio."""
+        if not self.enabled:
+            return
+
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        figure.savefig(buf, format="png", bbox_inches="tight")
+        buf.seek(0)
+
+        image = Image.open(buf)
+        trackio.log({name: trackio.Image(image)}, step=step)
+
+    # -------------------------
+    # Optional Trackio features
+    # -------------------------
+
+    def log_system_metrics(self, metrics: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        trackio.log_system(metrics)
+
+    def log_gpu(self) -> None:
+        if not self.enabled:
+            return
+        trackio.log_gpu()
+
+    def save_artifact(self, path: str) -> None:
+        if not self.enabled:
+            return
+        trackio.save(path)
+
+    def log_table(self, name: str, dataframe) -> None:
+        if not self.enabled:
+            return
+        table = trackio.Table(dataframe=dataframe)
+        trackio.log({name: table})
+
+
 class Logger(LoggerInterface):
     """Main logger class that delegates to multiple backend loggers."""
 
@@ -901,6 +1063,8 @@ class Logger(LoggerInterface):
 
         self.base_log_dir = cfg["log_dir"]
         os.makedirs(self.base_log_dir, exist_ok=True)
+
+        self.trackio_logger = None
 
         if cfg["wandb_enabled"]:
             wandb_log_dir = os.path.join(self.base_log_dir, "wandb")
@@ -948,6 +1112,13 @@ class Logger(LoggerInterface):
                 parent_logger=self,
             )
             self.gpu_monitor.start()
+
+        if cfg.get("trackio_enabled", False):
+            trackio_log_dir = os.path.join(self.base_log_dir, "trackio")
+            os.makedirs(trackio_log_dir, exist_ok=True)
+
+            self.trackio_logger = TrackioLogger(cfg["trackio"], log_dir=trackio_log_dir)
+            self.loggers.append(self.trackio_logger)
 
         if not self.loggers:
             print("No loggers initialized")
