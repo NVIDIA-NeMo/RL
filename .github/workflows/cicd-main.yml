@@ -313,7 +313,7 @@ jobs:
       ${{
         (
           always() &&
-          contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) &&
+          contains('docs Lfast L0 L1 L2', needs.pre-flight.outputs.test_level) &&
           needs.pre-flight.result == 'success' &&
           (needs.build-container.result == 'success' || needs.build-container.result == 'skipped')
         ) && !cancelled()
