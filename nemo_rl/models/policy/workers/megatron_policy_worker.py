@@ -1356,6 +1356,49 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             "Loading checkpoints outside of the init function is not yet implemented for Megatron policy."
         )
 
+    def get_model_state_dict(self) -> dict[str, torch.Tensor]:
+        """Get the model's state dict for EMA teacher updates.
+
+        Returns:
+            dict: Model state dict (returns model parameters, not full state dict for Megatron)
+        """
+        # For Megatron, return named parameters as a dict
+        return {name: param.data.clone() for name, param in self.model.named_parameters()}
+
+    def load_model_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
+        """Load a state dict into the model for EMA teacher initialization.
+
+        Args:
+            state_dict: State dict to load into the model
+        """
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if name in state_dict:
+                    param.data.copy_(state_dict[name])
+
+    def update_model_with_ema(
+        self, student_state_dict: dict[str, torch.Tensor], ema_decay: float
+    ) -> None:
+        """Update model parameters using EMA from student state dict.
+
+        Formula: teacher_param = ema_decay * teacher_param + (1 - ema_decay) * student_param
+
+        Args:
+            student_state_dict: State dict from the student model
+            ema_decay: EMA decay rate (e.g., 0.999)
+        """
+        with torch.no_grad():
+            for name, teacher_param in self.model.named_parameters():
+                if name in student_state_dict:
+                    student_param = student_state_dict[name]
+                    # Move student param to same device as teacher param (handles CPU/GPU mismatch)
+                    if student_param.device != teacher_param.device:
+                        student_param = student_param.to(teacher_param.device)
+                    # EMA update: teacher = decay * teacher + (1 - decay) * student
+                    teacher_param.data.mul_(ema_decay).add_(
+                        student_param, alpha=(1.0 - ema_decay)
+                    )
+
     def check_tensor_parallel_attributes(self) -> dict[str, Any]:
         """Check tensor parallel attributes on model parameters.
 

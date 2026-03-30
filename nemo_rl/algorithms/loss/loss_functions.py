@@ -908,7 +908,7 @@ class DistillationLossFn(LossFunction):
         self.zero_outside_topk = cfg["zero_outside_topk"]
         self.log_infinitesimal = -100
 
-        assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
+        assert self.kl_type in ["forward", "reverse", "mixed", "jsd"], "Invalid KL type"
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
@@ -923,6 +923,7 @@ class DistillationLossFn(LossFunction):
         global_valid_toks: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute distillation loss between teacher and student logits."""
+
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
@@ -936,6 +937,11 @@ class DistillationLossFn(LossFunction):
                 loss_correction_term = loss_correction_term * (
                     1.0 - self.mixed_kl_weight
                 )
+            elif self.kl_type == "jsd":
+                # Teacher assigns ~0 prob to tail tokens, so M_tail ≈ 0.5 * S_tail.
+                # KL(T_tail || M_tail) ≈ 0; KL(S_tail || M_tail) = P_rest * log(2)
+                # JSD tail correction = 0.5 * KL(S_tail || M_tail)
+                loss_correction_term = 0.5 * math.log(2) * P_rest  # [B, S-1]
 
         if self.kl_type == "forward":
             per_token_kl = teacher_probs * (
@@ -945,6 +951,15 @@ class DistillationLossFn(LossFunction):
             per_token_kl = student_probs * (
                 student_topk_logprobs - teacher_topk_logprobs
             )
+        elif self.kl_type == "jsd":
+            # JSD(T || S) = 0.5 * KL(T || M) + 0.5 * KL(S || M), where M = 0.5 * (T + S)
+            # log(M) via logaddexp for numerical stability: log(0.5*(T+S)) = logaddexp(log_T, log_S) - log(2)
+            log_mixture = (
+                torch.logaddexp(teacher_topk_logprobs, student_topk_logprobs) - math.log(2)
+            )
+            kl_T_M = teacher_probs * (teacher_topk_logprobs - log_mixture)
+            kl_S_M = student_probs * (student_topk_logprobs - log_mixture)
+            per_token_kl = 0.5 * kl_T_M + 0.5 * kl_S_M
         else:
             # mixed KL
             kl_forward = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
