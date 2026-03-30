@@ -542,7 +542,8 @@ class ClippedPGLossFn(LossFunction):
             correct_valid_toks = correct_mask.sum()
             if correct_valid_toks > 0:
                 nll_loss = masked_mean(
-                    -curr_logprobs, correct_mask,
+                    -curr_logprobs,
+                    correct_mask,
                     global_normalization_factor=correct_valid_toks,
                 )
 
@@ -1012,7 +1013,6 @@ class SequencePackingLossWrapper:
         return loss_accum, metrics_accum
 
 
-
 class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
@@ -1124,7 +1124,7 @@ class MseValueLossFn(LossFunction):
     """
 
     loss_type = LossType.TOKEN_LEVEL
-    input_type = LossInputType.LOGPROB
+    input_type = LossInputType.LOGIT
 
     def __init__(self, scale: float = 1.0, cliprange: float | None = None):
         self.scale = scale
@@ -1133,7 +1133,7 @@ class MseValueLossFn(LossFunction):
 
     def __call__(
         self,
-        values: torch.Tensor,
+        logits: torch.Tensor,
         data: BatchedDataDict,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
@@ -1141,8 +1141,15 @@ class MseValueLossFn(LossFunction):
         """Compute Mean Squared Error value loss, optionally with clipping."""
 
         # Squeeze trailing singleton from value head output: [B, S, 1] -> [B, S]
-        if values.ndim > 2 and values.shape[-1] == 1:
-            values = values.squeeze(-1)
+
+        if logits.ndim > 2:
+            if logits.shape[-1] == 1:
+                logits = logits.squeeze(-1)
+            else:
+                # Automodel TokenClassifier cannot return single output
+                # For some internal reasons it always return at least 2 outputs per token
+                logits = logits[..., :1]
+        values = logits
 
         token_mask = data["token_mask"]
         sample_mask = data["sample_mask"]
@@ -1159,17 +1166,26 @@ class MseValueLossFn(LossFunction):
             vf_losses_unclipped = (values - returns) ** 2
             vf_losses_clipped = (vpred_clipped - returns) ** 2
             vf_losses = torch.max(vf_losses_unclipped, vf_losses_clipped)
-            loss = 0.5 * self.scale * masked_mean(
-                vf_losses, mask, global_normalization_factor=global_valid_toks,
+            loss = (
+                0.5
+                * self.scale
+                * masked_mean(
+                    vf_losses,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
             )
             vf_clipfrac = masked_mean(
-                (vf_losses_clipped > vf_losses_unclipped).float(), mask,
+                (vf_losses_clipped > vf_losses_unclipped).float(),
+                mask,
                 global_normalization_factor=global_valid_toks,
             ).item()
         else:
             loss = torch.nn.functional.mse_loss(values, returns, reduction="none")
             loss = self.scale * masked_mean(
-                loss, mask, global_normalization_factor=global_valid_toks,
+                loss,
+                mask,
+                global_normalization_factor=global_valid_toks,
             )
             vf_clipfrac = 0.0
 
@@ -1177,16 +1193,24 @@ class MseValueLossFn(LossFunction):
             # Use global_valid_toks so each MB contributes local_sum/global_total.
             # Summing across MBs in ppo.py then gives the correct global mean.
             returns_mean = masked_mean(
-                returns, mask, global_normalization_factor=global_valid_toks,
+                returns,
+                mask,
+                global_normalization_factor=global_valid_toks,
             ).item()
             values_mean = masked_mean(
-                values, mask, global_normalization_factor=global_valid_toks,
+                values,
+                mask,
+                global_normalization_factor=global_valid_toks,
             ).item()
 
             # Min/max are per-MB; ppo.py takes min/max across MBs.
             masked_values = values[mask.bool()]
-            values_min = masked_values.min().item() if masked_values.numel() > 0 else 0.0
-            values_max = masked_values.max().item() if masked_values.numel() > 0 else 0.0
+            values_min = (
+                masked_values.min().item() if masked_values.numel() > 0 else 0.0
+            )
+            values_max = (
+                masked_values.max().item() if masked_values.numel() > 0 else 0.0
+            )
 
             # Explained variance sufficient statistics.
             # EV = 1 - Var(residual) / Var(returns)
@@ -1194,10 +1218,14 @@ class MseValueLossFn(LossFunction):
             # sum correctly across MBs).  ppo.py combines them with returns_mean
             # and values_mean to compute exact global EV.
             returns_sq_mean = masked_mean(
-                returns ** 2, mask, global_normalization_factor=global_valid_toks,
+                returns**2,
+                mask,
+                global_normalization_factor=global_valid_toks,
             ).item()
             residual_sq_mean = masked_mean(
-                (returns - values) ** 2, mask, global_normalization_factor=global_valid_toks,
+                (returns - values) ** 2,
+                mask,
+                global_normalization_factor=global_valid_toks,
             ).item()
 
         metrics = {
