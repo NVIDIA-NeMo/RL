@@ -85,10 +85,23 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
+        draft_enabled = bool(config.get("draft", {}).get("enabled", False))
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
+            )
+        if draft_enabled and not megatron_enable:
+            raise ValueError(
+                "policy.draft.enabled=true is only supported with the Megatron backend. "
+                "Set policy.megatron_cfg.enabled=true or disable policy.draft."
+            )
+        if draft_enabled and bool(
+            config.get("sequence_packing", {}).get("enabled", False)
+        ):
+            raise ValueError(
+                "policy.draft.enabled=true does not support sequence packing yet. "
+                "Disable policy.sequence_packing.enabled or policy.draft."
             )
         if megatron_enable:
             worker_builder_cls_fqn = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"

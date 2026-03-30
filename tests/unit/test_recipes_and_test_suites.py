@@ -51,7 +51,7 @@ ALGO_MAPPING_TO_BASE_YAML = {
 # Configuration keys that are allowed to be added to base configs during testing
 # These keys may exist in recipe configs but not in base configs, so we need to
 # manually add them to avoid merge conflicts during config validation
-ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.generation.vllm_kwargs"]
+ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.draft", "policy.generation.vllm_kwargs"]
 
 
 @pytest.fixture

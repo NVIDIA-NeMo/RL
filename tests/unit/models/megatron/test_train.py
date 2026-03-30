@@ -22,6 +22,8 @@ focusing on:
 - Loss/logprobs/topk post-processors
 """
 
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -588,6 +590,119 @@ class TestForwardWithPostProcessingFn:
                 model=MagicMock(),
                 post_processing_fn=unknown_processor,
             )
+
+    @patch("nemo_rl.models.megatron.train.get_capture_context")
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    def test_forward_without_draft_model_does_not_inject_student_logits(
+        self, mock_model_forward, mock_get_capture_context
+    ):
+        """Without a draft model, the forward path should remain unchanged."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LogprobsPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        mock_model_forward.return_value = torch.randn(2, 3, 5)
+        mock_get_capture_context.return_value = (nullcontext(), None)
+
+        data_dict = MagicMock()
+        processed_mb = ProcessedMicrobatch(
+            data_dict=data_dict,
+            input_ids=torch.tensor([[1, 2, 3]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            attention_mask=torch.ones(1, 3),
+            position_ids=torch.tensor([[0, 1, 2]]),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+        )
+        post_processor = LogprobsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}}
+        )
+
+        with patch.object(post_processor, "__call__", return_value=MagicMock()):
+            output, wrapped_fn = forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=post_processor,
+                draft_model=None,
+            )
+
+        assert "student_logits" not in data_dict
+        assert callable(wrapped_fn)
+        assert torch.equal(output, mock_model_forward.return_value)
+
+    @patch("megatron.core.transformer.multi_token_prediction.roll_tensor")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_capture_context")
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    def test_forward_with_draft_model_rolls_input_embeds_before_draft_forward(
+        self,
+        mock_model_forward,
+        mock_get_capture_context,
+        mock_get_cp_group,
+        mock_roll_tensor,
+    ):
+        """Draft forward should consume the one-token-shifted input embeddings."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LogprobsPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        output_tensor = torch.randn(2, 3, 5)
+        student_logits = torch.randn(2, 3, 5)
+        hidden_states = torch.randn(3, 1, 4)
+        inputs_embeds = torch.randn(3, 1, 4)
+        shifted_embeds = torch.randn(3, 1, 4)
+        cp_group = MagicMock()
+
+        mock_model_forward.return_value = output_tensor
+        mock_get_cp_group.return_value = cp_group
+        mock_roll_tensor.return_value = (shifted_embeds, None)
+        mock_capture = MagicMock()
+        mock_capture.get_captured_states.return_value = SimpleNamespace(
+            hidden_states=hidden_states,
+            inputs_embeds=inputs_embeds,
+        )
+        mock_get_capture_context.return_value = (nullcontext(), mock_capture)
+
+        data_dict = {}
+        attention_mask = torch.ones(1, 3)
+        processed_mb = ProcessedMicrobatch(
+            data_dict=data_dict,
+            input_ids=torch.tensor([[1, 2, 3]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            attention_mask=attention_mask,
+            position_ids=torch.tensor([[0, 1, 2]]),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+        )
+        post_processor = LogprobsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}}
+        )
+        draft_model = MagicMock(return_value=student_logits)
+
+        with patch.object(post_processor, "__call__", return_value=MagicMock()):
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=post_processor,
+                draft_model=draft_model,
+            )
+
+        mock_roll_tensor.assert_called_once_with(
+            inputs_embeds,
+            shifts=-1,
+            dims=0,
+            cp_group=cp_group,
+        )
+        draft_model.assert_called_once_with(
+            hidden_states=hidden_states,
+            input_embeds=shifted_embeds,
+            attention_mask=attention_mask,
+        )
+        assert data_dict["student_logits"] is student_logits
 
 
 class TestMegatronForwardBackward:
