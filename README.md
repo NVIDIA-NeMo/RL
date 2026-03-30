@@ -22,20 +22,21 @@
     * Nano v3 LoRA recipes:
         * [sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
         * [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
-        
+        * [grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml)
 * [01/30/2026] [Release v0.5.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.5.0)
     * Both linux/amd64 and linux/arm64 Docker containers are available on NGC [nvcr.io/nvidia/nemo-rl:v0.5.0](https://registry.ngc.nvidia.com/orgs/nvidia/containers/nemo-rl/tags).
     * NeMo-Gym + NeMo-RL support
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1Xgg8D7mNkWnz6t2uL8BbPfPb7UTkN1H0?usp=sharing) to get a head start on your experimentation.
+
+<details>
+<summary>Previous News</summary>
+
 * [12/15/2025] NeMo-RL is the framework that trained [NVIDIA-NeMotron-3-Nano-30B-A3B-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8)! [This guide](docs/guides/nemotron-3-nano.md) provides reproducible instructions for the post-training process.
 * [10/10/2025] **DAPO Algorithm Support**  
   NeMo RL now supports [Decoupled Clip and Dynamic Sampling Policy Optimization (DAPO)](https://arxiv.org/pdf/2503.14476) algorithm that extends GRPO with **Clip-Higher**, **Dynamic Sampling**, **Token-Level Policy Gradient Loss**, and **Overlong Reward Shaping** for more stable and efficient RL training. See the [DAPO guide](docs/guides/dapo.md) for more details.
 * [9/27/2025] [FP8 Quantization in NeMo RL](https://github.com/NVIDIA-NeMo/RL/discussions/1216)
 * [9/25/2025] On-policy Distillation 
     * Student generates on-policy sequences and aligns logits to a larger teacher via KL, achieving near-larger-model quality at lower cost than RL. See [On-policy Distillation](#on-policy-distillation).
-
-<details>
-<summary>Previous News</summary>
 * [12/1/2025] [Release v0.4.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.4.0)
     * First release with official NGC Container [nvcr.io/nvidia/nemo-rl:v0.4.0](https://registry.ngc.nvidia.com/orgs/nvidia/containers/nemo-rl/tags).
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1u5lmjHOsYpJqXaeYstjw7Qbzvbo67U0v?usp=sharing) to get a head start on your experimentation.  
