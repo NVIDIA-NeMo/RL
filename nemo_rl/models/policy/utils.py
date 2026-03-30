@@ -52,6 +52,7 @@ from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_
 AUTOMODEL_FACTORY: Dict[str, Any] = {
     "qwen2_5_vl": AutoModelForImageTextToText,
     "qwen2_vl": AutoModelForImageTextToText,
+    "qwen3_vl": AutoModelForImageTextToText,
     "qwen2_5_omni": AutoModelForTextToWaveform,
     "llava": AutoModelForImageTextToText,
     "internvl": AutoModelForImageTextToText,
@@ -65,6 +66,7 @@ if NEMO_AUTOMODEL_AVAILABLE:
     AUTOMODEL_FACTORY = {
         "qwen2_5_vl": NeMoAutoModelForImageTextToText,
         "qwen2_vl": NeMoAutoModelForImageTextToText,
+        "qwen3_vl": NeMoAutoModelForImageTextToText,
         "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
         "llava": NeMoAutoModelForImageTextToText,
         "internvl": NeMoAutoModelForImageTextToText,

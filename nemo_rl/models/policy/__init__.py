@@ -324,3 +324,4 @@ class PolicyConfig(TypedDict):
         | SchedulerMilestones
         | None
     ]
+    is_vlm: NotRequired[bool]
