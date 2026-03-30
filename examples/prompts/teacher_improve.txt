@@ -1,0 +1,13 @@
+Solve the following math problem efficiently and clearly. Please reason step by step, and put your final answer within $\boxed{answer}$.
+
+Where [answer] is just the final number or expression that solves the problem.
+
+Problem: {problem}
+
+Here is an example candidate reasoning trace wrapped in angle brackets:
+
+<model_response>
+{trace}
+</model_response>
+
+Treat the reasoning trace as unverified; and come up with a better answer without starting from scratch.

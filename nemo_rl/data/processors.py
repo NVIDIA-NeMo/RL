@@ -487,7 +487,8 @@ def math_hf_data_processor(
         format_kwargs = {"problem": problem, "answer": original_messages[1]["content"]}
         for key, value in datum_dict.items():
             if key not in ("messages", "task_name") and isinstance(value, str):
-                format_kwargs.setdefault(key, value)
+                mapped_key = task_data_spec.column_mapping.get(key, key)
+                format_kwargs.setdefault(mapped_key, value)
 
         teacher_content = task_data_spec.teacher_prompt.format_map(format_kwargs)
         teacher_user_msg: dict[str, Any] = {"role": "user", "content": teacher_content}
