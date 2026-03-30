@@ -842,6 +842,8 @@ class MLflowLogger(LoggerInterface):
         for name, value in flattened_metrics.items():
             if prefix:
                 name = f"{prefix}/{name}"
+            # Replace "/" with "." in metric names for compatibility with MLflow's local filesystem backend.
+            name = name.replace("/", ".")
             metrics_to_log[name] = value
 
         mlflow.log_metrics(metrics_to_log, step=step, run_id=self.run_id)
