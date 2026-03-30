@@ -238,6 +238,17 @@ class GeneralizedAdvantageEstimator:
     This is computed recursively backwards:
         A_t = δ_t + γλ * (1 - done_t) * A_{t+1}
 
+    KL penalty is applied to token-level rewards *externally* before calling the
+    pure GAE computation, following veRL's separation-of-concerns approach.  This
+    keeps the core GAE loop agnostic to reward construction and makes it easy to
+    swap in different reward signals (process reward models, no KL, etc.) without
+    touching the advantage estimator.
+
+    The GAE loop uses carry-forward masking: at masked positions the running
+    accumulators (next_values, last_gae_lam) are preserved from the last valid
+    token rather than being zeroed.  This correctly skips over non-response tokens
+    (padding, separators in multi-turn) without introducing phantom TD errors.
+
     Args:
         gae_lambda: GAE λ parameter (decay factor for advantage estimation, typically 0.95-0.98)
         gae_gamma: Discount factor γ (typically 0.99)
@@ -249,9 +260,15 @@ class GeneralizedAdvantageEstimator:
         self.gae_gamma = estimator_config.get("gae_gamma", 0.99)
         self.normalize_advantages = estimator_config.get("normalize_advantages", True)
 
+        # VAPO decoupled GAE: separate λ for value returns vs policy advantages.
+        # Defaults to gae_lambda for both (standard GAE, no decoupling).
+        self.gae_lambda_value = estimator_config.get("gae_lambda_value", None)
+        self.gae_lambda_policy = estimator_config.get("gae_lambda_policy", None)
+        # Length-adaptive λ_policy = 1 - 1/(α·l).  0 = disabled (use fixed λ).
+        self.length_adaptive_alpha = estimator_config.get("length_adaptive_alpha", 0.0)
+
         self.kl_coef = loss_config.get("reference_policy_kl_penalty", 0.1)
-        self.kl_enabled = loss_config.get("use_kl_in_reward", False)
-        self.kl_type = loss_config.get("reference_policy_kl_type", "k3")
+        self.kl_type = loss_config.get("reference_policy_kl_type", "k1")
 
     def _reward_whiten(
         self,
@@ -268,6 +285,79 @@ class GeneralizedAdvantageEstimator:
             whitened_rewards = whitened_rewards + mean
         return whitened_rewards
 
+    def _build_token_level_rewards(
+        self,
+        rewards: torch.Tensor,
+        lengths: torch.Tensor,
+        mask: torch.Tensor,
+        logprobs: torch.Tensor | None = None,
+        reference_logprobs: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Build per-token reward tensor with optional KL penalty.
+
+        Constructs token_level_rewards = -kl_coef * KL  (at every response token)
+                                        + terminal_reward  (at last valid token)
+
+        Args:
+            rewards: Scalar reward per sample, shape [batch_size].
+            lengths: Total sequence lengths, shape [batch_size].
+            mask: Response token mask, shape [batch_size, seq_len].
+            logprobs: Current policy log probs, shape [batch_size, seq_len].
+            reference_logprobs: Reference policy log probs, shape [batch_size, seq_len].
+
+        Returns:
+            token_level_rewards: shape [batch_size, seq_len].
+        """
+        seq_len = mask.shape[1]
+        token_level_rewards = torch.zeros(
+            rewards.shape[0], seq_len, device=rewards.device, dtype=rewards.dtype
+        )
+
+        # Apply KL penalty at every response token
+        if (
+            self.kl_coef > 0
+            and logprobs is not None
+            and reference_logprobs is not None
+        ):
+            kl = calculate_kl(logprobs, reference_logprobs, self.kl_type)
+            token_level_rewards = token_level_rewards - self.kl_coef * kl
+
+        # Place terminal reward at last response token (last mask=1 position)
+        # for each sample. Using mask instead of lengths ensures the reward
+        # lands on an assistant token even in multi-turn scenarios where the
+        # sequence may end with a non-assistant message.
+        last_response_idx = mask.shape[1] - 1 - mask.fliplr().argmax(dim=1)
+        has_response = mask.any(dim=1)
+        token_level_rewards[has_response, last_response_idx[has_response]] += rewards[has_response]
+
+        # Zero out prompt/padding positions
+        token_level_rewards = token_level_rewards * mask
+
+        return token_level_rewards
+
+    def _resolve_lambda_policy(self, mask: torch.Tensor) -> float | torch.Tensor:
+        """Return the λ to use for policy advantages.
+
+        Priority: length_adaptive_alpha > gae_lambda_policy > gae_lambda.
+        """
+        if self.length_adaptive_alpha > 0:
+            resp_lens = mask.sum(dim=1).float()  # [batch_size]
+            lam = 1.0 - 1.0 / (self.length_adaptive_alpha * resp_lens).clamp(min=1.0)
+            return lam.clamp(min=0.0, max=1.0)
+        if self.gae_lambda_policy is not None:
+            return self.gae_lambda_policy
+        return self.gae_lambda
+
+    def _resolve_lambda_value(self) -> float:
+        """Return the λ to use for value returns.
+
+        Returns gae_lambda_value if set, else gae_lambda (standard GAE).
+        """
+        if self.gae_lambda_value is not None:
+            return self.gae_lambda_value
+        return self.gae_lambda
+
+
     def compute_advantage(
         self,
         prompt_ids,
@@ -275,82 +365,99 @@ class GeneralizedAdvantageEstimator:
         mask,
         lengths,
         values,
-        reference_logprobs,
-        logprobs,
+        logprobs=None,
+        reference_logprobs=None,
         **kwargs,
     ):
         """Compute GAE advantages with temporal bootstrapping.
 
-        Args:
-            prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
-            rewards: Tensor of shape [batch_size] containing reward for each sample.
-                    In PPO, this is typically the final reward at the end of the trajectory.
-            mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
-            lengths: Input lengths of shape [batch_size].
-            values: Value predictions of shape [batch_size, seq_len]. Required for GAE.
-            reference_logprobs: Reference policy log probabilities of shape [batch_size, seq_len]. Required for GAE.
-            **kwargs: Additional arguments (unused).
+        Supports VAPO-style decoupled GAE when gae_lambda_value or
+        gae_lambda_policy or length_adaptive_alpha are set:
+        - Value returns use gae_lambda_value (default: gae_lambda)
+        - Policy advantages use gae_lambda_policy or length-adaptive λ
+          (default: gae_lambda)
+        When none of these are set, this is standard GAE.
 
         Returns:
-            Advantages tensor of shape [batch_size, seq_len].
+            Tuple of (advantages, returns), each of shape [batch_size, seq_len].
         """
-        if self.kl_enabled:
-            kl = calculate_kl(logprobs, reference_logprobs, self.kl_type) * self.kl_coef
-        else:
-            kl = None
-        advantages, returns = self.compute_advantage_reference(
-            rewards, lengths, values, kl, mask=mask
+        token_level_rewards = self._build_token_level_rewards(
+            rewards, lengths, mask, logprobs, reference_logprobs,
         )
 
-        advantages = torch.masked_fill(
-            self._reward_whiten(advantages, mask),
-            # advantages,
-            ~(mask.bool()),
-            0,
+        lam_value = self._resolve_lambda_value()
+        lam_policy = self._resolve_lambda_policy(mask)
+
+        # If lambdas differ, compute GAE twice (decoupled); otherwise once.
+        need_decouple = (
+            self.gae_lambda_value is not None
+            or self.gae_lambda_policy is not None
+            or self.length_adaptive_alpha > 0
         )
+        if need_decouple:
+            _, returns = self._compute_gae(
+                token_level_rewards, values, mask, gae_lambda=lam_value,
+            )
+            advantages, _ = self._compute_gae(
+                token_level_rewards, values, mask, gae_lambda=lam_policy,
+            )
+        else:
+            advantages, returns = self._compute_gae(
+                token_level_rewards, values, mask,
+            )
+
+        # Whiten advantages (optional) and zero out masked positions (always)
+        if self.normalize_advantages:
+            advantages = self._reward_whiten(advantages, mask)
+        advantages = torch.masked_fill(advantages, ~(mask.bool()), 0)
         return advantages, returns
 
-    def compute_advantage_reference(
+    def _compute_gae(
         self,
-        rewards,
-        lengths,
-        values,
-        kl,
-        **kwargs,
-    ):
-        """Reference GAE implementation for correctness validation.
+        token_level_rewards: torch.Tensor,
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        gae_lambda: torch.Tensor | float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pure GAE computation with carry-forward masking.
 
-        Fixes two issues in compute_advantage:
-        1. Terminal state: uses V=0 at t=L (not a padding token's value).
-        2. No cross-sequence contamination: accumulation resets per sequence.
+        At masked positions the running accumulators (next_values, last_gae_lam)
+        are preserved from the last valid token rather than being corrupted by
+        zeroed-out values.  This correctly handles non-contiguous response masks
+        (multi-turn conversations, tool-use delimiters, packed sequences).
 
         Args:
-            rewards: Tensor of shape [batch_size].
-            lengths: Total sequence lengths of shape [batch_size].
-            values: Value predictions of shape [batch_size, seq_len].
+            token_level_rewards: Per-token rewards, shape [batch_size, response_length].
+            values: Value predictions, shape [batch_size, response_length].
+            mask: Response token mask, shape [batch_size, response_length].
+            gae_lambda: Override for self.gae_lambda.  Can be a scalar or a
+                per-sample tensor of shape [batch_size] (VAPO length-adaptive).
 
         Returns:
-            advantages: Tensor of shape [batch_size, seq_len].
-            returns: advantages + values, shape [batch_size, seq_len].
+            advantages: shape [batch_size, response_length].
+            returns: advantages + values, shape [batch_size, response_length].
         """
-        advantages = torch.zeros_like(values)
-        if kl is None:
-            kl = torch.zeros_like(values)
+        lam = gae_lambda if gae_lambda is not None else self.gae_lambda
 
-        for i in range(values.shape[0]):
-            L = int(lengths[i])
+        gen_len = token_level_rewards.shape[-1]
+        next_values: torch.Tensor = torch.zeros(
+            values.shape[0], device=values.device, dtype=values.dtype
+        )
+        last_gae_lam: torch.Tensor = torch.zeros_like(next_values)
+        advantages_reversed = []
 
-            last_adv = 0.0
-            v_next = 0.0
-            r = rewards[i].item()
+        for t in reversed(range(gen_len)):
+            delta = token_level_rewards[:, t] + self.gae_gamma * next_values - values[:, t]
+            new_gae_lam = delta + self.gae_gamma * lam * last_gae_lam
 
-            for t in reversed(range(L)):
-                delta = r - kl[i, t] + self.gae_gamma * v_next - values[i, t]
-                last_adv = delta + self.gae_gamma * self.gae_lambda * last_adv
-                advantages[i, t] = last_adv
+            # Carry-forward: at masked positions, preserve accumulators from
+            # the last valid token instead of updating them.
+            m = mask[:, t]
+            next_values = values[:, t] * m + (1 - m) * next_values
+            last_gae_lam = new_gae_lam * m + (1 - m) * last_gae_lam
 
-                v_next = values[i, t]
-                r = 0.0
+            advantages_reversed.append(last_gae_lam)
 
+        advantages = torch.stack(advantages_reversed[::-1], dim=1)
         returns = advantages + values
         return advantages, returns

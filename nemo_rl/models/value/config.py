@@ -19,6 +19,8 @@ from nemo_rl.models.policy import (
     DTensorConfigDisabled,
     DynamicBatchingConfig,
     DynamicBatchingConfigDisabled,
+    MegatronConfig,
+    MegatronConfigDisabled,
     PytorchOptimizerConfig,
     RewardModelConfig,
     SchedulerMilestones,
@@ -51,8 +53,9 @@ class ValueConfig(TypedDict):
     # Reward model config (value models use regression head)
     reward_model_cfg: RewardModelConfig
 
-    # Backend configuration - only DTensor is supported for value models
+    # Backend configuration - DTensor or Megatron
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
+    megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
 
     # HuggingFace config overrides
     hf_config_overrides: NotRequired[dict[str, Any]]
@@ -70,6 +73,9 @@ class ValueConfig(TypedDict):
 
     # Checkpoint loading
     dequantize_base_checkpoint: NotRequired[bool]
+
+    # Load value head weights from the HF checkpoint specified by model_name
+    load_value_head_from_model: NotRequired[bool]
 
     # Optimizer and scheduler
     optimizer: NotRequired[PytorchOptimizerConfig | None]

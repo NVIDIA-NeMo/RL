@@ -338,7 +338,10 @@ def setup(
     #        Loss Function
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
-    value_loss_fn = MseValueLossFn(loss_config)
+    value_loss_fn = MseValueLossFn(
+        scale=loss_config["value_loss_scale"],
+        cliprange=loss_config.get("value_cliprange", None),
+    )
 
     # Validate force_on_policy_ratio
     if loss_config.get("force_on_policy_ratio", False):

@@ -107,7 +107,7 @@ def main() -> None:
         value_loss_fn,
         logger,
         checkpointer,
-        grpo_state,
+        ppo_state,
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
@@ -127,7 +127,7 @@ def main() -> None:
         val_task_to_env,
         logger,
         checkpointer,
-        grpo_state,
+        ppo_state,
         master_config,
     )
 

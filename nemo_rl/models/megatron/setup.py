@@ -653,6 +653,7 @@ def setup_model_and_optimizer(
     load_optimizer: bool = True,
     get_embedding_ranks=None,  # TODO @sahilj: What is this?
     get_position_embedding_ranks=None,
+    additional_pre_wrap_hooks: Optional[list] = None,
 ):
     state = GlobalState()
     state.cfg = megatron_cfg
@@ -766,6 +767,9 @@ def setup_model_and_optimizer(
             return model
 
         pre_wrap_hook.extend([composed_peft_hook])
+
+    if additional_pre_wrap_hooks:
+        pre_wrap_hook.extend(additional_pre_wrap_hooks)
 
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()

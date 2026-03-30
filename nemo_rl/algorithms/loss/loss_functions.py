@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict, TypeVar
+import math
+from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
 
@@ -56,6 +57,16 @@ class ClippedPGLossConfig(TypedDict):
     force_on_policy_ratio: NotRequired[bool]
     # If True, add KL penalty to reward instead of loss (used by Reinforce++)
     use_kl_in_reward: NotRequired[bool]
+    # Scale factor for the value loss (PPO). Default 1.0.
+    value_loss_scale: NotRequired[float]
+    # Clip range for value function loss. If set, value predictions are clipped
+    # to [old_values - clip, old_values + clip] and the loss is max(unclipped, clipped).
+    # Set to None or 0 to disable (plain MSE). Typical value: 0.2.
+    value_cliprange: NotRequired[float | None]
+    # VAPO: weight μ for positive-example NLL loss on correct samples.
+    # L = L_PPO + μ·L_NLL(correct)   (arXiv:2504.05118, Eq. 10)
+    # Set to 0 or omit to disable.
+    positive_example_nll_weight: NotRequired[float]
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -150,6 +161,7 @@ class ClippedPGLossFn(LossFunction):
             "sequence_level_importance_ratios",
             False,
         )
+        self.positive_example_nll_weight = cfg.get("positive_example_nll_weight", 0.0)
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
         )
@@ -519,7 +531,22 @@ class ClippedPGLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             )
 
-        loss = actor_loss + kl
+        # -----------------------------------------------------------------
+        # VAPO: positive-example NLL loss on correct samples (reward > 0)
+        # L = L_PPO + μ · L_NLL(correct)
+        # -----------------------------------------------------------------
+        nll_loss = torch.tensor(0.0, device=mask.device)
+        if self.positive_example_nll_weight > 0 and "rewards" in data:
+            correct_sample_mask = (data["rewards"] > 0).float()  # [batch]
+            correct_mask = mask * correct_sample_mask.unsqueeze(-1)
+            correct_valid_toks = correct_mask.sum()
+            if correct_valid_toks > 0:
+                nll_loss = masked_mean(
+                    -curr_logprobs, correct_mask,
+                    global_normalization_factor=correct_valid_toks,
+                )
+
+        loss = actor_loss + kl + self.positive_example_nll_weight * nll_loss
         with torch.no_grad():
             probs_ratio = masked_mean(
                 ratios.detach(),
@@ -570,6 +597,7 @@ class ClippedPGLossFn(LossFunction):
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
+                "positive_nll_loss": nll_loss.item(),
             },
         )
 
@@ -884,6 +912,107 @@ class DPOLossFn(PreferenceLossFn):
         }
 
 
+class SequencePackingLossWrapper:
+    def __init__(
+        self,
+        loss_fn: LossFunction,
+        cu_seqlens_q: Tensor,
+        cu_seqlens_q_padded: Optional[Tensor] = None,
+    ):
+        self.loss_fn = loss_fn
+        self.cu_seqlens_q = cu_seqlens_q
+        self.cu_seqlens_q_padded = cu_seqlens_q_padded
+
+    def __call__(
+        self,
+        next_token_logits: Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: Tensor | None,
+        global_valid_toks: Tensor | None,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[Tensor, dict[str, Any]]:
+        """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
+        unpadded_cu_seqlens = self.cu_seqlens_q
+        unpadded_seq_lengths = self.cu_seqlens_q[1:] - self.cu_seqlens_q[:-1]
+        if self.cu_seqlens_q_padded is not None:
+            padded_cu_seqlens = self.cu_seqlens_q_padded
+            padded_seq_lengths = (
+                self.cu_seqlens_q_padded[1:] - self.cu_seqlens_q_padded[:-1]
+            )
+        else:
+            padded_cu_seqlens = unpadded_cu_seqlens
+            padded_seq_lengths = unpadded_seq_lengths
+        seq_starts = padded_cu_seqlens[:-1]
+        seq_ends = padded_cu_seqlens[1:]
+
+        _MIN_KEYS = {"probs_ratio_min", "probs_ratio_clamped_min", "values_min"}
+        _MAX_KEYS = {"probs_ratio_max", "probs_ratio_clamped_max", "values_max"}
+
+        loss_accum = 0
+        metrics_accum = {}
+        for seq_idx in range(len(seq_starts)):
+            seq_start = seq_starts[seq_idx].item()
+            seq_end = seq_ends[seq_idx].item()
+
+            # get sequence and unpad all 'data' tensors. The data dict is a BatchedDataDict of unpacked tensors
+            seq_data = data.slice(seq_idx, seq_idx + 1)
+            unpadded_seq_data = {}
+            for k, v in seq_data.items():
+                if isinstance(v, torch.Tensor) and v.ndim > 1 and v.shape[1] > 1:
+                    unpadded_seq_data[k] = v[:, : unpadded_seq_lengths[seq_idx]]
+                else:
+                    unpadded_seq_data[k] = v
+
+            # get next_token_logits
+            cp_size = (
+                1
+                if context_parallel_group is None
+                else torch.distributed.get_world_size(context_parallel_group)
+            )
+            logit_start = seq_start // cp_size
+            logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
+            logit_length = logit_end - logit_start
+            next_token_logits_slice = next_token_logits.narrow(
+                1, logit_start, logit_length
+            )
+
+            loss, metrics = self.loss_fn(
+                next_token_logits_slice,
+                unpadded_seq_data,
+                global_valid_seqs,
+                global_valid_toks,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+            )
+            loss_accum += loss
+            for k, v in metrics.items():
+                if k not in metrics_accum:
+                    if k in _MIN_KEYS:
+                        metrics_accum[k] = float("inf")
+                    elif k in _MAX_KEYS:
+                        metrics_accum[k] = float("-inf")
+                    else:
+                        metrics_accum[k] = 0
+
+                val = v.item() if isinstance(v, torch.Tensor) and v.ndim == 0 else v
+
+                # Skip inf/-inf sentinel values (from sequences with no valid tokens)
+                if k in _MIN_KEYS:
+                    if not math.isinf(val):
+                        metrics_accum[k] = min(metrics_accum[k], val)
+                elif k in _MAX_KEYS:
+                    if not math.isinf(val):
+                        metrics_accum[k] = max(metrics_accum[k], val)
+                else:
+                    metrics_accum[k] += val
+
+        return loss_accum, metrics_accum
+
+
+
 class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
@@ -985,51 +1114,99 @@ class DistillationLossFn(LossFunction):
 
 
 class MseValueLossFn(LossFunction):
-    """Mean Squared Error value loss function."""
+    """Mean Squared Error value loss function with optional clipping (PPO-style).
 
-    loss_type = LossType.TOKEN_LEVEL
-    input_type = LossInputType.LOGIT
+    When ``cliprange`` is set, value predictions are clipped to
+    ``[old_values - cliprange, old_values + cliprange]`` and the loss is
+    ``0.5 * max(mse(vpred, returns), mse(vpred_clipped, returns))``.
+    This prevents the value function from changing too drastically in a
+    single update, mirroring the policy ratio clipping in PPO.
+    """
 
-    def __init__(self, loss_cfg):
-        self.ratio_clip_min = loss_cfg["ratio_clip_min"]
-        self.ratio_clip_max = loss_cfg["ratio_clip_max"]
+    def __init__(self, scale: float = 1.0, cliprange: float | None = None):
+        self.scale = scale
+        self.cliprange = cliprange
+        self.loss_type = LossType.TOKEN_LEVEL
 
     def __call__(
         self,
-        logits: torch.Tensor,
+        values: torch.Tensor,
         data: BatchedDataDict,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute Mean Squared Error value loss."""
+        """Compute Mean Squared Error value loss, optionally with clipping."""
 
-        if logits.shape[-1] != 1:
-            logits = logits[..., 0]
+        # Squeeze trailing singleton from value head output: [B, S, 1] -> [B, S]
+        if values.ndim > 2 and values.shape[-1] == 1:
+            values = values.squeeze(-1)
 
         token_mask = data["token_mask"]
         sample_mask = data["sample_mask"]
         returns = data["returns"]
-        old_values = data["values"]
-
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        values_clamped = logits.clamp(
-            old_values - self.ratio_clip_min,
-            old_values + self.ratio_clip_max,
-        )
+        if self.cliprange and self.cliprange > 0:
+            old_values = data["values"]
+            vpred_clipped = torch.clamp(
+                values,
+                old_values - self.cliprange,
+                old_values + self.cliprange,
+            )
+            vf_losses_unclipped = (values - returns) ** 2
+            vf_losses_clipped = (vpred_clipped - returns) ** 2
+            vf_losses = torch.max(vf_losses_unclipped, vf_losses_clipped)
+            loss = 0.5 * self.scale * masked_mean(
+                vf_losses, mask, global_normalization_factor=global_valid_toks,
+            )
+            vf_clipfrac = masked_mean(
+                (vf_losses_clipped > vf_losses_unclipped).float(), mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+        else:
+            loss = torch.nn.functional.mse_loss(values, returns, reduction="none")
+            loss = self.scale * masked_mean(
+                loss, mask, global_normalization_factor=global_valid_toks,
+            )
+            vf_clipfrac = 0.0
 
-        loss = torch.max(
-            torch.square(logits - returns),
-            torch.square(values_clamped - returns),
-        )
+        with torch.no_grad():
+            # Use global_valid_toks so each MB contributes local_sum/global_total.
+            # Summing across MBs in ppo.py then gives the correct global mean.
+            returns_mean = masked_mean(
+                returns, mask, global_normalization_factor=global_valid_toks,
+            ).item()
+            values_mean = masked_mean(
+                values, mask, global_normalization_factor=global_valid_toks,
+            ).item()
 
-        loss = 0.5 * masked_mean(
-            loss, mask, global_normalization_factor=global_valid_toks
-        )
+            # Min/max are per-MB; ppo.py takes min/max across MBs.
+            masked_values = values[mask.bool()]
+            values_min = masked_values.min().item() if masked_values.numel() > 0 else 0.0
+            values_max = masked_values.max().item() if masked_values.numel() > 0 else 0.0
+
+            # Explained variance sufficient statistics.
+            # EV = 1 - Var(residual) / Var(returns)
+            # We export E[r²] and E[(r-v)²] (both / global_valid_toks so they
+            # sum correctly across MBs).  ppo.py combines them with returns_mean
+            # and values_mean to compute exact global EV.
+            returns_sq_mean = masked_mean(
+                returns ** 2, mask, global_normalization_factor=global_valid_toks,
+            ).item()
+            residual_sq_mean = masked_mean(
+                (returns - values) ** 2, mask, global_normalization_factor=global_valid_toks,
+            ).item()
 
         metrics = {
             "loss": float(loss.item()),
-            "num_valid_samples": int(logits.shape[0]),
+            "vf_clipfrac": vf_clipfrac,
+            "returns_mean": returns_mean,
+            "values_mean": values_mean,
+            "values_min": values_min,
+            "values_max": values_max,
+            "returns_sq_mean": returns_sq_mean,
+            "residual_sq_mean": residual_sq_mean,
+            "num_valid_samples": int(values.shape[0]),
         }
 
         return loss, metrics
