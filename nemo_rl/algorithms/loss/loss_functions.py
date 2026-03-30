@@ -1123,6 +1123,9 @@ class MseValueLossFn(LossFunction):
     single update, mirroring the policy ratio clipping in PPO.
     """
 
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.LOGPROB
+
     def __init__(self, scale: float = 1.0, cliprange: float | None = None):
         self.scale = scale
         self.cliprange = cliprange

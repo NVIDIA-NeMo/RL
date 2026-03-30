@@ -22,9 +22,7 @@ from unittest import skip
 
 import ray
 import torch
-from nemo_automodel.components.distributed.cp_utils import (
-    create_context_parallel_ctx,
-)
+from nemo_automodel.components.distributed.cp_utils import create_context_parallel_ctx
 from nemo_automodel.components.distributed.cp_utils import (
     get_train_context as get_train_context_automodel,
 )
@@ -235,6 +233,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             self.cpu_offload,
             self.offload_optimizer_for_logprob,
             self.is_generation_colocated,
+            self.sampling_params,
             _runtime_is_reward_model,
         ) = runtime_config
 
@@ -340,7 +339,6 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
                 # Use automodel_forward_backward for the training loop
                 mb_results = automodel_forward_backward(
                     model=self.model,
-                    cfg=self.cfg,
                     data_iterator=processed_iterator,
                     post_processing_fn=loss_post_processor,
                     forward_only=eval_mode,
@@ -348,6 +346,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
                     allow_flash_attn_args=False,  # Typically False for value models
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
+                    sampling_params=self.sampling_params,
                     sequence_dim=sequence_dim,
                     dp_size=self.dp_size,
                     cp_size=self.cp_size,
@@ -464,11 +463,11 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
                     # Use forward_with_post_processing_fn for forward pass
                     values, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        cfg=self.cfg,
                         post_processing_fn=value_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=True,  # Value models use reward model architecture
                         allow_flash_attn_args=False,
+                        sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
 
@@ -511,10 +510,16 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
 
         torch.cuda.empty_cache()
 
+    def finish_training(self, *args, **kwargs) -> None:
+        pass
+
     def prepare_for_inference(self, *args, **kwargs) -> None:
         """Prepare for inference by setting model to eval mode."""
         self.model.eval()
         torch.cuda.empty_cache()
+
+    def finish_inference(self, *args, **kwargs) -> None:
+        pass
 
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
         """Move optimizer state to specified device."""
