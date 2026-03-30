@@ -67,6 +67,7 @@ class CheckpointingConfig(TypedDict):
     model_repo_id: NotRequired[str]  # Default: ""
     is_peft: NotRequired[bool]  # Default: False
     peft_config: NotRequired[Any]  # Default: None
+    is_async: NotRequired[bool]  # Default: False
 
 
 class CheckpointManager:
@@ -109,8 +110,9 @@ class CheckpointManager:
         self.model_repo_id = config.get("model_repo_id", "")
         self.is_peft = config.get("is_peft", False)
 
+    @staticmethod
     def get_resume_paths(
-        self, last_checkpoint_path: Optional[PathLike]
+        last_checkpoint_path: Optional[PathLike],
     ) -> tuple[Optional[Path], Optional[Path]]:
         """Get weights and optimizer paths for resuming from a checkpoint.
 
@@ -124,12 +126,28 @@ class CheckpointManager:
         if last_checkpoint_path:
             weights_path = Path(last_checkpoint_path) / "policy" / "weights"
             optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
-            if not optimizer_path.exists():
-                warnings.warn(
-                    f"Optimizer state not found at {optimizer_path}. "
-                    "Optimizer will be freshly initialized."
-                )
-                optimizer_path = None
+
+            # DTensor path
+            if optimizer_path.exists():
+                return weights_path, optimizer_path
+
+            # Megatron path
+            common_pt_path = weights_path / "iter_0000000" / "common.pt"
+            if common_pt_path.exists():
+                common_pt_obj = torch.load(common_pt_path, map_location="cpu")
+                if "optimizer" in common_pt_obj:
+                    # In Megatron, optimizer_path is only a flag to indicate that the optimizer
+                    # state is embedded in the weights_path. We will actually load the optimizer
+                    # state from the weights_path.
+                    return weights_path, optimizer_path
+
+            warnings.warn(
+                f"Optimizer state not found at {optimizer_path} (DTensor path), and no embedded "
+                f"optimizer state detected under {weights_path} (Megatron path). "
+                "Optimizer will be freshly initialized.",
+                stacklevel=2,
+            )
+            optimizer_path = None
             return weights_path, optimizer_path
         return None, None
 

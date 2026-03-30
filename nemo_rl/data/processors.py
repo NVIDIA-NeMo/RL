@@ -216,9 +216,7 @@ def preference_preprocessor(
         ...     ]
         ... }
         >>>
-        >>> processed = preference_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)  # doctest: +ELLIPSIS
-        <BLANKLINE>
-        ...
+        >>> processed = preference_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)
         >>> len(processed["message_log_chosen"])
         2
         >>> processed["message_log_chosen"][0]["content"]
