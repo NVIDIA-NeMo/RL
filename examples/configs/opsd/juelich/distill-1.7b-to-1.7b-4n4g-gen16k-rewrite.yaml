@@ -227,8 +227,7 @@ data:
         system_prompt_file: null
         teacher_prompt_file: "examples/prompts/teacher_rewrite.txt"
         env_name: "math"
-        column_mapping:
-            qwen3_1b7_answer: trace  # maps dataset column → {trace} in teacher_rewrite.txt
+        column_mapping: {}  # set per-run via +data.default.column_mapping.COLUMN=trace
 
 env:
     math:
