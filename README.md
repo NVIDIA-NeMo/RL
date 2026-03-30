@@ -18,7 +18,8 @@
 * [03/11/2026] [Nemotron-3-Super](https://research.nvidia.com/labs/nemotron/Nemotron-3-Super/) was post-trained with NeMo-RL! Follow [this guide](https://github.com/NVIDIA-NeMo/RL/blob/super-v3/docs/guides/nemotron-3-super.md) to reproduce the full RL training recipe.
 * [02/04/2026] LoRA Support
     * LoRA SFT is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1556) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1629) backends.
-    * DTensor [GRPO](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [DPO](https://github.com/NVIDIA-NeMo/RL/pull/1826) both support LoRA; (Megatron Core coming soon).
+    * LoRA GRPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1889) backends.
+    * LoRA [DPO](https://github.com/NVIDIA-NeMo/RL/pull/1826) is supported on DTensor.
     * Nano v3 LoRA recipes:
         * [sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
         * [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
