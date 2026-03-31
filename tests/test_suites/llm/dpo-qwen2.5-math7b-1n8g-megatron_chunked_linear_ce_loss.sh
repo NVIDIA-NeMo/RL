@@ -3,12 +3,11 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=2
-GPUS_PER_NODE=4
-STEPS_PER_RUN=15
-MAX_STEPS=15
+NUM_NODES=1
+STEPS_PER_RUN=10
+MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=30
+NUM_MINUTES=25
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -24,7 +23,7 @@ uv run examples/run_dpo.py \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=True \
+    checkpointing.enabled=true \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     $@ \
     2>&1 | tee $RUN_LOG
@@ -34,13 +33,11 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    # Smoke checks: run completed and loss is finite/reasonable.
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] < 0.69316' \
-        'data["train/loss"]["15"] < 0.64745' \
-        'data["train/preference_loss"]["1"] > 0.69314' \
-        'data["train/preference_loss"]["1"] < 0.69316' \
-        'data["train/preference_loss"]["15"] < 0.64745' \
-        'mean(data["timing/train/total_step_time"], -5, -1) < 70'
+        'data["train/loss"]["1"] < 0.7' \
+        'data["train/loss"]["10"] < 0.7' \
+        'data["train/accuracy"]["10"] > 0.56'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

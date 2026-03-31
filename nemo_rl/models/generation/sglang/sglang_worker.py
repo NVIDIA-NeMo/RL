@@ -217,6 +217,7 @@ class SGLangGenerationWorker:
             "log_level",
             "mem_fraction_static",
             "allow_auto_truncate",
+            "disable_piecewise_cuda_graph",
         ]:
             if key in self.sglang_cfg:
                 kwargs[key] = self.sglang_cfg[key]

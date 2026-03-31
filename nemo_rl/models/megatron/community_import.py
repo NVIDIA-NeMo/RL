@@ -77,6 +77,12 @@ def import_model_from_hf_name(
         ]
         model_provider.pipeline_dtype = megatron_config["pipeline_dtype"]
         model_provider.sequence_parallel = megatron_config["sequence_parallel"]
+        if (
+            gradient_accumulation_fusion := megatron_config.get(
+                "gradient_accumulation_fusion"
+            )
+        ) is not None:
+            model_provider.gradient_accumulation_fusion = gradient_accumulation_fusion
     model_provider.finalize()
 
     from megatron.core import parallel_state

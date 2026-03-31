@@ -26,29 +26,37 @@ bridge_src_dir = "Megatron-Bridge/src/megatron/bridge"
 bridge_package_name = "megatron.bridge"
 
 CACHED_DEPENDENCIES = [
-    "transformers<5.0.0",
+    "transformers>=5.0.0,<=5.3.0",
+    "peft>=0.18.1",
     "datasets>=2.20.0",
     "accelerate",
+    "diffusers>=0.36.0",
+    "peft>=0.18.0",
+    "einops",
+    "imageio",
+    "imageio-ffmpeg",
     "omegaconf>=2.3.0",
     "tensorboard>=2.19.0",
     "typing-extensions",
     "rich",
-    "wandb>=0.19.10",
+    "wandb>=0.25.0",
     "six>=1.17.0",
     "regex>=2024.11.6",
     "pyyaml>=6.0.2",
     "tqdm>=4.67.1",
     "hydra-core>1.3,<=1.3.2",
-    "megatron-core[dev,mlm]>=0.15.0a0,<0.17.0",
+    "megatron-core[dev,mlm]",
     "qwen-vl-utils",
-    "transformer-engine[pytorch,core_cu13]>=2.10.0a0,<2.13.0",
+    # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13 base container
+    "transformer-engine[pytorch,core_cu12]",
     "mamba-ssm",
-    "nvidia-resiliency-ext",
+    "nvidia-resiliency-ext~=0.5.0",
     "causal-conv1d",
     "flash-linear-attention",
     "timm",
     "open-clip-torch>=3.2.0",
     "mlflow>=3.5.0",
+    "comet-ml>=3.50.0",
     "torch>=2.6.0",
 ]
 
@@ -66,8 +74,19 @@ if os.path.exists(bridge_src_dir):
     deps_list = project["dependencies"]
     submodule_deps = set(str(d).strip() for d in deps_list)
 
-    missing_in_cached = submodule_deps - set(CACHED_DEPENDENCIES)
-    extra_in_cached = set(CACHED_DEPENDENCIES) - submodule_deps
+    # Normalize the transformer-engine CUDA variant extra (core_cu12 vs core_cu13)
+    # so our CUDA 12 override doesn't trip the consistency check against the
+    # submodule's CUDA 13 default.
+    # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): remove this when we upgrade to CUDA 13
+    def _normalize_te_cuda(dep):
+        if dep.startswith("transformer-engine") or dep.startswith("transformer_engine"):
+            return dep.replace("core_cu13", "core_cu12")
+        return dep
+
+    normalized_submodule = set(_normalize_te_cuda(d) for d in submodule_deps)
+    normalized_cached = set(_normalize_te_cuda(d) for d in CACHED_DEPENDENCIES)
+    missing_in_cached = normalized_submodule - normalized_cached
+    extra_in_cached = normalized_cached - normalized_submodule
 
     if missing_in_cached or extra_in_cached:
         print(

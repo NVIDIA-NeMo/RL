@@ -4,19 +4,19 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
-STEPS_PER_RUN=250
-MAX_STEPS=250
+STEPS_PER_RUN=15
+MAX_STEPS=15
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=120
+NUM_MINUTES=30
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_sft.py \
+uv run examples/run_dpo.py \
     --config $CONFIG_PATH \
-    sft.max_num_steps=$MAX_STEPS \
+    dpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
@@ -31,15 +31,15 @@ uv run examples/run_sft.py \
 # Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# TODO: the memory check is known to OOM. see https://github.com/NVIDIA-NeMo/RL/issues/263
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    # Last observed memory around 72.6 (But can be noisy)
     uv run tests/check_metrics.py $JSON_METRICS \
-	    'data["train/loss"]["1"] < 0.6' \
-        'data["train/loss"]["250"] < 0.36' \
-        'max(data["ray/node.0.gpu.0.mem_gb"]) < 75' \
-        'mean(data["timing/train/total_step_time"], -6, -1) < 10'
+        'data["train/loss"]["1"] < 0.69316' \
+        'data["train/loss"]["15"] < 0.63263' \
+        'data["train/preference_loss"]["1"] > 0.69314' \
+        'data["train/preference_loss"]["1"] < 0.69316' \
+        'data["train/preference_loss"]["15"] < 0.63263' \
+        'mean(data["timing/train/total_step_time"], -5, -1) < 5'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
