@@ -1,0 +1,53 @@
+# ServiceMonitors for KAI scheduler components.
+# These tell Prometheus to scrape metrics from the scheduler, binder, and queue-controller.
+#
+# Prerequisites: kube-prometheus-stack must be installed (provides Prometheus Operator).
+# Apply after: helmfile sync
+
+# Scheduler metrics: scheduling latency, fairshare allocation, preemption counts.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kai-scheduler
+  namespace: kai-scheduler
+  labels:
+    app: kai-scheduler
+spec:
+  selector:
+    matchLabels:
+      app: kai-scheduler-default
+  endpoints:
+  - port: metrics
+    interval: 15s
+---
+# Binder metrics: bind latency, bind success/failure rates.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kai-binder
+  namespace: kai-scheduler
+  labels:
+    app: kai-binder
+spec:
+  selector:
+    matchLabels:
+      app: binder
+  endpoints:
+  - port: metrics
+    interval: 15s
+---
+# Queue controller metrics: queue allocation, deserved GPUs, fair share.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kai-queue-controller
+  namespace: kai-scheduler
+  labels:
+    app: kai-queue-controller
+spec:
+  selector:
+    matchLabels:
+      app: queue-controller
+  endpoints:
+  - port: metrics
+    interval: 15s

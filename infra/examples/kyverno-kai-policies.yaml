@@ -1,0 +1,106 @@
+# Kyverno policies for KAI scheduler queue enforcement.
+#
+# Policy 1: RayCluster and RayJob must have a kai.scheduler/queue label.
+#   Validates at the CRD level (not Pod level) because the KubeRay operator
+#   creates pods — pod-level validation would check the operator's identity,
+#   not the actual user who submitted the workload.
+#
+# Policy 2 (optional): Validate that the queue is allowed for the requesting user.
+#   Uses a ConfigMap (kai-queue-permissions) for user→queue mapping.
+#   The user identity comes from the K8s AdmissionReview userInfo (OIDC email,
+#   certificate CN, or ServiceAccount name).
+#
+# Prerequisites:
+#   helm install kyverno kyverno/kyverno -n kyverno --create-namespace
+
+# --- Policy 1: Require queue label ---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-kai-queue-label
+  annotations:
+    policies.kyverno.io/title: Require KAI queue label on Ray workloads
+    policies.kyverno.io/description: >-
+      RayCluster and RayJob resources must specify a kai.scheduler/queue label
+      so the KAI scheduler can assign them to the correct fairshare queue.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+  - name: require-kai-queue-on-raycluster
+    match:
+      any:
+      - resources:
+          kinds:
+          - ray.io/v1/RayCluster
+    validate:
+      message: >-
+        RayCluster "{{request.object.metadata.name}}" must have a
+        'kai.scheduler/queue' label. Add it to metadata.labels.
+      pattern:
+        metadata:
+          labels:
+            kai.scheduler/queue: "?*"
+  - name: require-kai-queue-on-rayjob
+    match:
+      any:
+      - resources:
+          kinds:
+          - ray.io/v1/RayJob
+    validate:
+      message: >-
+        RayJob "{{request.object.metadata.name}}" must have a
+        'kai.scheduler/queue' label. Add it to metadata.labels.
+      pattern:
+        metadata:
+          labels:
+            kai.scheduler/queue: "?*"
+
+---
+# --- Policy 2: Validate user is allowed to use the queue (optional) ---
+# Uncomment and configure the ConfigMap below to enable.
+# The ConfigMap maps K8s usernames to comma-separated allowed queues.
+#
+# apiVersion: v1
+# kind: ConfigMap
+# metadata:
+#   name: kai-queue-permissions
+#   namespace: kyverno
+# data:
+#   # K8s username → allowed queues (comma-separated)
+#   alice@company.com: "team-a,team-b"
+#   bob@company.com: "team-b"
+#   # ServiceAccounts use the format: system:serviceaccount:namespace:name
+#   system:serviceaccount:default:nemo-rl-endpoint-registry: "team-a,team-b"
+# ---
+# apiVersion: kyverno.io/v1
+# kind: ClusterPolicy
+# metadata:
+#   name: validate-kai-queue-permission
+# spec:
+#   validationFailureAction: Enforce
+#   background: false
+#   rules:
+#   - name: check-queue-permission
+#     match:
+#       any:
+#       - resources:
+#           kinds:
+#           - ray.io/v1/RayCluster
+#           - ray.io/v1/RayJob
+#     context:
+#     - name: permissions
+#       configMap:
+#         name: kai-queue-permissions
+#         namespace: kyverno
+#     validate:
+#       message: >-
+#         User "{{request.userInfo.username}}" is not allowed to use queue
+#         "{{request.object.metadata.labels."kai.scheduler/queue"}}".
+#         Allowed queues: {{permissions.data[request.userInfo.username] || 'none'}}
+#       deny:
+#         conditions:
+#           all:
+#           - key: "{{request.object.metadata.labels.\"kai.scheduler/queue\"}}"
+#             operator: AnyNotIn
+#             value: "{{permissions.data[request.userInfo.username] || '' | split(@, ',')}}"

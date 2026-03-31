@@ -5,7 +5,7 @@ kind: RayCluster
 metadata:
   name: raycluster-a
   labels:
-    kai.scheduler/queue: team-a
+    kai.scheduler/queue: priority-team
 spec:
   rayVersion: "2.52.0"
   headGroupSpec:
@@ -60,7 +60,7 @@ kind: RayCluster
 metadata:
   name: raycluster-b
   labels:
-    kai.scheduler/queue: team-a
+    kai.scheduler/queue: priority-team
 spec:
   rayVersion: "2.52.0"
   headGroupSpec:

@@ -97,7 +97,9 @@ infra/
 │       ├── nvidia-device-plugin.yaml # kind only
 │       ├── gpu-operator.yaml         # prod only
 │       ├── kai-scheduler.yaml
-│       └── kuberay-operator.yaml
+│       ├── kuberay-operator.yaml
+│       ├── kyverno.yaml              # Kyverno policy engine
+│       └── kube-prometheus-stack.yaml # Prometheus + Grafana
 └── examples/
     ├── kai-queue.yaml                # KAI queue hierarchy
     ├── kai_scheduled_pods.yaml       # Gang-scheduled GPU test pods
@@ -109,7 +111,11 @@ infra/
     ├── disagg_rl_raycluster.yaml     # Disagg RL cluster + peer-watcher
     ├── disagg_gym_raycluster.yaml    # Disagg Gym cluster + peer-watcher
     ├── endpoint-registry-rbac.yaml   # RBAC for ConfigMap endpoint registry
-    └── peer-watcher.py               # Sidecar for failure cascading
+    ├── peer-watcher.py               # Sidecar for failure cascading
+    ├── kai-queue-prod.yaml           # 256-GPU prod queue config
+    ├── kyverno-kai-policies.yaml     # Queue enforcement policies
+    ├── kai-service-monitors.yaml     # Prometheus ServiceMonitors for KAI
+    └── kai-grafana-dashboard.yaml    # Grafana dashboard for fairshare
 ```
 
 ## Notes
@@ -134,6 +140,49 @@ Setup:
 kubectl create configmap peer-watcher-script --from-file=peer-watcher.py=infra/examples/peer-watcher.py
 kubectl apply -f infra/examples/endpoint-registry-rbac.yaml
 ```
+
+## Fairshare scheduling
+
+KAI distributes GPU resources using hierarchical fair-share with two phases:
+1. **Guaranteed quota**: Each queue gets its `quota` first, unconditionally.
+2. **Over-quota surplus**: Remaining GPUs distributed by `priority` (higher served first), then `overQuotaWeight` within the same priority level.
+
+### Queue fields
+
+| Field | Description |
+|-------|-------------|
+| `quota` | Guaranteed GPUs. `-1` = unlimited, `0` = no guarantee |
+| `limit` | Hard cap on total GPUs. `-1` = no limit |
+| `overQuotaWeight` | Weight for surplus distribution (higher = bigger share) |
+| `priority` | Over-quota allocation order (higher = served first, reclaimed last) |
+| `preemptMinRuntime` | Min runtime before a higher-priority queue can preempt (default: `"4h"`) |
+| `reclaimMinRuntime` | Min runtime before over-quota resources can be reclaimed (default: `"15m"`) |
+
+### Preempt vs reclaim
+
+- **Preempt**: A higher-priority queue takes from a lower-priority queue. (VIP takes your table.)
+- **Reclaim**: A queue takes back what it's entitled to from an over-allocated queue. (Fairness — give back what you owe.)
+
+`reclaimMinRuntime` is shorter than `preemptMinRuntime` because reclaim is about fairness (returning over-quota resources quickly), while preempt protects long-running jobs from priority-based interruption.
+
+### Example configs
+
+- `kai-queue.yaml` — 2-GPU kind cluster (team-a, team-b, equal quotas)
+- `kai-queue-prod.yaml` — 256-GPU production cluster (3 departments, 6 teams)
+
+### Monitoring (Grafana)
+
+```sh
+kubectl port-forward svc/kube-prometheus-stack-grafana -n monitoring 3000:80
+# Login: admin / prom-operator
+# Dashboard: "KAI Scheduler Fairshare"
+```
+
+Key metrics: `queue_allocated_gpus`, `queue_fair_share_gpu`, `queue_deserved_gpus`, `total_preemption_attempts`.
+
+### Kyverno queue enforcement
+
+RayCluster and RayJob resources must have a `kai.scheduler/queue` label or they're rejected by Kyverno. To enable user→queue access control, uncomment Policy 2 in `kyverno-kai-policies.yaml` and configure the `kai-queue-permissions` ConfigMap.
 
 ## TODO: Log persistence
 

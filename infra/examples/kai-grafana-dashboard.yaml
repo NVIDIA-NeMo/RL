@@ -1,0 +1,122 @@
+# Grafana dashboard for KAI scheduler fairshare monitoring.
+# Deployed as a ConfigMap — Grafana's sidecar auto-discovers it.
+#
+# Panels:
+#   1. GPU Allocation vs Fair Share per Queue (bar chart)
+#   2. GPU Allocation Over Time (time series)
+#   3. Preemption Events (counter)
+#   4. Scheduling Latency (gauge)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kai-fairshare-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  kai-fairshare.json: |
+    {
+      "annotations": { "list": [] },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "links": [],
+      "panels": [
+        {
+          "title": "GPU Allocation vs Fair Share per Queue",
+          "description": "Current GPU allocation (solid) vs computed fair share (dashed) for each queue. Queues above their fair share may have resources reclaimed.",
+          "type": "bargauge",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+          "targets": [
+            {
+              "expr": "queue_allocated_gpus",
+              "legendFormat": "{{queue_name}} allocated",
+              "refId": "A"
+            },
+            {
+              "expr": "queue_fair_share_gpu",
+              "legendFormat": "{{queue_name}} fair share",
+              "refId": "B"
+            },
+            {
+              "expr": "queue_deserved_gpus",
+              "legendFormat": "{{queue_name}} deserved (quota)",
+              "refId": "C"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+            }
+          }
+        },
+        {
+          "title": "GPU Allocation Over Time",
+          "description": "How GPU allocation per queue changes over time. Useful for observing fairshare oscillation and reclaim events.",
+          "type": "timeseries",
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 8 },
+          "targets": [
+            {
+              "expr": "queue_allocated_gpus",
+              "legendFormat": "{{queue_name}} allocated",
+              "refId": "A"
+            },
+            {
+              "expr": "queue_fair_share_gpu",
+              "legendFormat": "{{queue_name}} fair share",
+              "refId": "B"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": { "lineWidth": 2, "fillOpacity": 10 }
+            }
+          }
+        },
+        {
+          "title": "Preemption & Eviction Events",
+          "description": "Count of preemption attempts and pod evictions. Spikes indicate resource contention between queues.",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+          "targets": [
+            {
+              "expr": "rate(total_preemption_attempts[5m])",
+              "legendFormat": "preemption attempts/s",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(pod_group_evicted_pods_total[5m])",
+              "legendFormat": "evictions/s ({{queue_name}})",
+              "refId": "B"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": { "unit": "ops", "custom": { "lineWidth": 2 } }
+          }
+        },
+        {
+          "title": "Scheduling Latency",
+          "description": "End-to-end scheduling cycle latency. High latency may indicate resource fragmentation or too many pending workloads.",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+          "targets": [
+            {
+              "expr": "e2e_scheduling_latency_milliseconds",
+              "legendFormat": "e2e latency (ms)",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } }
+          }
+        }
+      ],
+      "schemaVersion": 39,
+      "tags": ["kai", "fairshare", "gpu"],
+      "templating": { "list": [] },
+      "time": { "from": "now-1h", "to": "now" },
+      "title": "KAI Scheduler Fairshare",
+      "uid": "kai-fairshare"
+    }
