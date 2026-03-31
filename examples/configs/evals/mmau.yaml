@@ -44,6 +44,7 @@ data:
   system_prompt_file: null
   dataset_name: "TwinkStart/MMAU"
   split: "v05.15.25"
+  env_name: vlm
 
 env:
   mmau:

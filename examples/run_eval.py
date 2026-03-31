@@ -20,7 +20,6 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omegaconf import OmegaConf
-from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
@@ -30,8 +29,6 @@ from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config
-
-TokenizerType = PreTrainedTokenizerBase
 
 
 def parse_args():
@@ -57,20 +54,11 @@ def setup_data(tokenizer, data_config, env_configs):
     base_dataset = load_eval_dataset(data_config)
     rekeyed_ds = base_dataset.rekeyed_ds
 
-    is_multimodal = _is_multimodal_dataset(data_config["dataset_name"])
-
-    if is_multimodal:
-        # Use VLMEnvironment for multimodal datasets
-        env_key = next((k for k in env_configs if k in ("mmau",)), None)
-        if env_key is None:
-            raise ValueError(
-                f"No environment config found for multimodal dataset. "
-                f"Available env configs: {list(env_configs.keys())}"
-            )
-        env = create_env(env_name="vlm", env_config=env_configs[env_key])
-    else:
-        # Original text-only path
-        env = create_env(env_name="math", env_config=env_configs["math"])
+    # Determine env from config: use explicit env_name if provided,
+    # otherwise fall back to the single key in env_configs.
+    env_key = next(iter(env_configs))
+    env_name = data_config.get("env_name", env_key)
+    env = create_env(env_name=env_name, env_config=env_configs[env_key])
 
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,
@@ -112,23 +100,12 @@ def main():
     # Init ray
     init_ray()
 
-    # Determine if this is a multimodal dataset
+    # Setup tokenizer — get_tokenizer handles both text-only and multimodal
     is_multimodal = _is_multimodal_dataset(config["data"]["dataset_name"])
-
-    # Setup tokenizer — use AutoProcessor for multimodal, AutoTokenizer for text
-    if is_multimodal:
-        tokenizer = AutoProcessor.from_pretrained(
-            config["tokenizer"]["name"], trust_remote_code=True
-        )
-        # configure_generation_config expects tokenizer with pad_token_id/eos_token_id
-        config["generation"] = configure_generation_config(
-            config["generation"], tokenizer.tokenizer, is_eval=True
-        )
-    else:
-        tokenizer = get_tokenizer(config["tokenizer"])
-        config["generation"] = configure_generation_config(
-            config["generation"], tokenizer, is_eval=True
-        )
+    tokenizer = get_tokenizer(config["tokenizer"], get_processor=is_multimodal)
+    config["generation"] = configure_generation_config(
+        config["generation"], tokenizer, is_eval=True
+    )
 
     # Setup data
     (
