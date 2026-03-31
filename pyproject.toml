@@ -446,6 +446,7 @@ requires-dist = [
   "datasets>=2.20.0",
   "accelerate",
   "diffusers>=0.36.0",
+  "peft>=0.18.0",
   "einops",
   "imageio",
   "imageio-ffmpeg",
