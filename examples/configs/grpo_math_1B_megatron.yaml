@@ -78,6 +78,7 @@ policy:
 
   megatron_cfg:
     enabled: true
+    force_reimport_model: False # Set to True to force reimport of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false
     converter_type: "Qwen2ForCausalLM"

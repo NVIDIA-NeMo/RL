@@ -121,6 +121,7 @@ policy:
     enabled: false
     use_linear_ce_fusion_loss: false
     linear_ce_fusion_chunk_size: 256
+    force_reimport_model: False # Set to True to force reimport of the model from Hugging Face
     empty_unused_memory_level: 1
     activation_checkpointing: false
     tensor_model_parallel_size: 2

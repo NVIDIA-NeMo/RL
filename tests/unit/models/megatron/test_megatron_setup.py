@@ -925,6 +925,47 @@ class TestHandleModelImport:
         captured = capsys.readouterr()
         assert "Reinitializing model parallel" in captured.out
 
+    @patch("nemo_rl.models.megatron.setup.import_model_from_hf_name")
+    @patch("nemo_rl.models.megatron.setup.parallel_state")
+    def test_yarn_config_triggers_reimport_when_checkpoint_exists(
+        self, mock_ps, mock_import, tmp_path
+    ):
+        """Test that non-empty hf_config_overrides (e.g. YaRN) forces reimport even when
+        checkpoint already exists, because the overrides change the model's rope config."""
+        from nemo_rl.models.megatron.setup import handle_model_import
+
+        mock_ps.model_parallel_is_initialized.return_value = False
+
+        pretrained_path = str(tmp_path / "model")
+        yarn_overrides = {
+            "rope_scaling": {
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            }
+        }
+        config = {
+            "model_name": "test-model",
+            "megatron_cfg": {"force_reimport_model": False},
+            "hf_config_overrides": yarn_overrides,
+        }
+
+        handle_model_import(
+            config, "test-model", pretrained_path, pt_checkpoint_exists=True
+        )
+
+        # Even though checkpoint exists, non-empty hf_config_overrides must trigger reimport
+        mock_import.assert_called_once_with(
+            "test-model",
+            pretrained_path,
+            {"force_reimport_model": False},
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            },
+        )
+
 
 @pytest.mark.mcore
 class TestSetupModelAndOptimizer:
