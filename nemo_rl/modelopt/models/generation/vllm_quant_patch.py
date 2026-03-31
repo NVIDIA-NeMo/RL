@@ -14,36 +14,15 @@
 # limitations under the License.
 
 import os
-from contextlib import contextmanager
 from typing import Any
 
 import modelopt.torch.quantization as mtq
 import torch
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+from modelopt.torch.quantization.plugins.vllm import disable_compilation
 from vllm.v1.worker.gpu_worker import Worker as BaseWorker
 
 from nemo_rl.modelopt.utils import resolve_quant_cfg
-
-
-@contextmanager
-def disable_compilation(model):
-    do_not_compile = True
-    if hasattr(model, "model"):
-        do_not_compile = model.model.do_not_compile
-        model.model.do_not_compile = True
-    elif hasattr(model, "language_model"):
-        do_not_compile = model.language_model.model.do_not_compile
-        model.language_model.model.do_not_compile = True
-    else:
-        raise ValueError("Model does not have a model or language_model attribute")
-
-    try:
-        yield
-    finally:
-        if hasattr(model, "model"):
-            model.model.do_not_compile = do_not_compile
-        elif hasattr(model, "language_model"):
-            model.language_model.model.do_not_compile = do_not_compile
 
 
 def _fakequant_run_prolog_worker(self) -> None:
