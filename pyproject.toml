@@ -108,6 +108,7 @@ mcore = [
   "emerging-optimizers==0.1.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
 ]
+modelopt = ["nvidia-modelopt"]
 nemo_gym = ["nemo_gym"]
 
 [dependency-groups]
@@ -180,6 +181,7 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 # From JustinTong0323/sglang branch update-transformers-v5 (sgl-project/sglang#17784)
 sglang = { git = "https://github.com/JustinTong0323/sglang.git", rev = "70aa688742dd2b75bf9e8e980249303f39295b0d", subdirectory = "python" }
 sgl-kernel = { git = "https://github.com/JustinTong0323/sglang.git", rev = "70aa688742dd2b75bf9e8e980249303f39295b0d", subdirectory = "sgl-kernel" }
+nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "bc96f1ce39d28e2073fda076c119263094b619ee" }
 
 [tool.uv.workspace]
 members = [
@@ -260,6 +262,7 @@ override-dependencies = [
   # Override until vllm officially relaxes the constraint (https://github.com/vllm-project/vllm/issues/30466).
   "transformers==5.2.0",
 ]
+
 # CVE fixes
 constraint-dependencies = [
   "brotli>=1.2.0",            # Address CVE GHSA-2qfp-q593-8484
