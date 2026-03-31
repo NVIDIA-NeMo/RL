@@ -15,14 +15,6 @@ Use the offline path when you already have a good drafter and only want faster r
 
 For the best results, start from an Eagle checkpoint that was already pretrained as a draft model, then use NeMo RL's online draft loss to keep it aligned with the policy during RL. For training or adapting an Eagle checkpoint, see the [Model Optimizer speculative decoding example](https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/speculative_decoding/README.md).
 
-If you are using a separately trained Eagle checkpoint, make sure its `eagle_config.json` contains:
-
-```json
-{
-  "has_lm_head": true
-}
-```
-
 NeMo RL now keeps a trainer-owned draft LM head. If the draft checkpoint contains
 `lm_head.weight`, NeMo RL loads it into the draft model. If that weight is absent,
 NeMo RL initializes the draft LM head from the current policy output layer instead.
@@ -50,11 +42,16 @@ This enables Eagle3 in vLLM, but the trainer does not own or update the draft mo
 policy:
   megatron_cfg:
     enabled: true
+  dtensor_cfg:
+    enabled: false
 
   draft:
     enabled: true
     model_name: ${policy.generation.vllm_kwargs.speculative_config.model}
     loss_weight: 1.0
+
+  sequence_packing:
+    enabled: false
 
   generation:
     backend: "vllm"
@@ -67,7 +64,7 @@ policy:
 ```
 
 > [!NOTE]
-> Online draft training currently requires the Megatron backend. NeMo RL rejects `policy.draft.enabled=true` on the DTensor path.
+> Online draft training currently requires the Megatron backend and does not support sequence packing yet. Set `policy.megatron_cfg.enabled=true`, `policy.dtensor_cfg.enabled=false`, and `policy.sequence_packing.enabled=false`.
 
 ## How It Works
 
@@ -87,7 +84,7 @@ During the policy forward pass, NeMo RL captures:
 - token input embeddings
 - a small set of intermediate hidden states from auxiliary policy layers
 
-Those captured activations are the Eagle inputs. If `policy.draft.aux_layer_indices` is not set, NeMo RL chooses a default early/middle/late set of policy layers. The draft model then predicts logits in the same vocabulary space by reusing the policy LM head.
+Those captured activations are the Eagle inputs. NeMo RL captures an early/middle/late-style set of policy layers for Eagle3, then the draft model predicts logits with its own draft LM head. That LM head is loaded from the draft checkpoint when `lm_head.weight` is present and otherwise initialized from the current policy output layer.
 
 ### Draft Loss and Time-Step Alignment
 
@@ -161,7 +158,8 @@ where `lambda` is `policy.draft.loss_weight`.
 - `policy.draft.enabled`: attach and train the Eagle draft model
 - `policy.draft.model_name`: checkpoint used to initialize the draft model
 - `policy.draft.loss_weight`: weight on the auxiliary draft loss
-- `policy.draft.aux_layer_indices`: policy layers whose hidden states feed Eagle
+- `policy.generation.vllm_kwargs.speculative_config.model`: draft checkpoint used by the vLLM drafter
+- `policy.generation.vllm_kwargs.speculative_config.draft_tensor_parallel_size`: tensor parallelism used by the drafter inside vLLM
 - `policy.generation.vllm_kwargs.speculative_config.num_speculative_tokens`: number of speculative tokens proposed by vLLM
 
 ## Notes
@@ -169,3 +167,4 @@ where `lambda` is `policy.draft.loss_weight`.
 - When online draft training is enabled, NeMo RL logs `draft_loss`.
 - Resume checkpoints include the nested draft model state when `policy.draft.enabled=true`.
 - If speculative decoding is enabled without trainer-owned draft weights, vLLM must load real draft weights at startup. When the trainer owns the draft model, the first refit pushes both policy and draft parameters.
+- Online draft training does not currently support `policy.sequence_packing.enabled=true`.

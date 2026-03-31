@@ -39,7 +39,7 @@ def prepare_loss_input(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
-    d2t: Optional[torch.Tensor] = None
+    d2t: Optional[torch.Tensor] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -140,10 +140,14 @@ def prepare_loss_input(
         )[0]
         if d2t is not None:
             reverse_mapping = (
-                torch.arange(len(d2t), device=teacher_logits.device, dtype=d2t.dtype) + d2t
+                torch.arange(len(d2t), device=teacher_logits.device, dtype=d2t.dtype)
+                + d2t
             )
             if vocab_parallel_group is not None:
-                from megatron.core.tensor_parallel import gather_from_tensor_model_parallel_region 
+                from megatron.core.tensor_parallel import (
+                    gather_from_tensor_model_parallel_region,
+                )
+
                 teacher_logits = gather_from_tensor_model_parallel_region(
                     teacher_logits, vocab_parallel_group
                 )
