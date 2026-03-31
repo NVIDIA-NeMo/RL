@@ -35,12 +35,12 @@ def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> N
         tokenizer: Tokenizer
     """
     # AutoProcessor wraps a tokenizer; unwrap if needed
-    if hasattr(tokenizer, "bos_token_id"):
+    if isinstance(tokenizer, PreTrainedTokenizerBase):
         _tok = tokenizer
-    elif hasattr(tokenizer, "tokenizer"):
+    elif isinstance(tokenizer, AutoProcessor):
         _tok = tokenizer.tokenizer
     else:
-        return  # cannot check, skip
+        raise TypeError(f"Unsupported tokenizer type: {type(tokenizer)}")
 
     if _tok.bos_token_id is not None:
         token_ids_list = token_ids.tolist()
