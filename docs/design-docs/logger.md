@@ -107,8 +107,28 @@ MLflow can be configured with the following parameters:
 mlflow:
   experiment_name: "nemo-rl-experiment"  # Name of the MLflow experiment
   run_name: "my-training-run"            # Run name
-  tracking_uri: "http://localhost:5000"  # Optional tracking server URI
+  tracking_uri: "http://localhost:5000"  # Optional tracking server URI. Defaults to this value when unset.
 ```
+
+> [!WARNING]
+> Using MLflow's default file-based backend (for example, the `mlruns/` directory store) is not recommended for NeMo RL.
+> NeMo RL logs hierarchical metric names such as `timing/train/policy_training` and
+> `timing/train/policy_training/sharding_data`. With MLflow's file-based backend, `/` is treated
+> as a path separator, which can lead to file-versus-directory conflicts and raise
+> `IsADirectoryError`.
+>
+> If you want to use a local filesystem-backed MLflow store, prefer a SQLite backend instead of
+> the default file store. For example:
+>
+> ```python
+> mlflow:
+>   experiment_name: "nemo-rl-experiment"
+>   run_name: "my-training-run"
+>   tracking_uri: "sqlite:////path/to/mlflow.db"
+> ```
+>
+> This keeps the tracking data on the local filesystem while avoiding the metric name path
+> collisions that can happen with the file-based backend.
 
 
 #### MLflow UI
@@ -118,6 +138,12 @@ After starting training with MLflow enabled, you can view the MLflow UI to monit
 ```bash
 # Start MLflow UI (run in a separate terminal)
 mlflow ui --host 0.0.0.0 --port 5000
+```
+
+If you are using SQLite as the MLflow backend, point the UI at the same database file:
+
+```bash
+mlflow ui --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:////path/to/mlflow.db
 ```
 
 Then access the UI at `http://127.0.0.1:5000/` to view:

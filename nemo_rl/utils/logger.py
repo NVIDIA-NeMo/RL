@@ -773,7 +773,13 @@ class MLflowLogger(LoggerInterface):
             cfg: MLflow configuration
             log_dir: Optional log directory (used as fallback if artifact_location not in cfg)
         """
-        tracking_uri = cfg.get("tracking_uri") or os.getenv("MLFLOW_TRACKING_URI")
+        # Default to local tracking server if not configured
+        # If not use local tracking server, it will default to file-based backend, which is not compatible with auto group.
+        tracking_uri = (
+            cfg.get("tracking_uri")
+            or os.getenv("MLFLOW_TRACKING_URI")
+            or "http://localhost:5000"
+        )
         if tracking_uri and not mlflow.is_tracking_uri_set():
             mlflow.set_tracking_uri(tracking_uri)
 
@@ -842,8 +848,6 @@ class MLflowLogger(LoggerInterface):
         for name, value in flattened_metrics.items():
             if prefix:
                 name = f"{prefix}/{name}"
-            # Replace "/" with "." in metric names for compatibility with MLflow's local filesystem backend.
-            name = name.replace("/", ".")
             metrics_to_log[name] = value
 
         mlflow.log_metrics(metrics_to_log, step=step, run_id=self.run_id)
