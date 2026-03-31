@@ -44,10 +44,8 @@ class DraftCrossEntropyLossFn(LossFunction):
 
     def __init__(
         self,
-        vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
 
     def __call__(

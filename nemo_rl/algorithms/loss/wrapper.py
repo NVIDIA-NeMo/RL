@@ -249,7 +249,6 @@ class DraftLossWrapper:
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
         self.draft_loss_fn = DraftCrossEntropyLossFn(
-            vocab_parallel_rank=vocab_parallel_rank,
             vocab_parallel_group=vocab_parallel_group,
         )
 
@@ -272,12 +271,12 @@ class DraftLossWrapper:
         )
 
         loss_input, data = self.prepare_fn(
-            next_token_logits,
-            data,
-            self.draft_loss_fn,
-            self.vocab_parallel_rank,
-            self.vocab_parallel_group,
-            self.context_parallel_group,
+            logits=next_token_logits,
+            data=data,
+            loss_fn=self.draft_loss_fn,
+            vocab_parallel_rank=self.vocab_parallel_rank,
+            vocab_parallel_group=self.vocab_parallel_group,
+            context_parallel_group=self.context_parallel_group,
         )
         draft_loss = self.draft_loss_fn(
             data=data,
