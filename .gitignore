@@ -18,6 +18,9 @@ dist/
 release_run*
 ckpts/
 mlruns/
+*.so
+**/libcudnn*.so*
+**/libcudnn*.a
 
 # Test
 coverage.json

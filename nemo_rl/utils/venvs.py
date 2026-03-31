@@ -76,6 +76,8 @@ def create_local_venv(
 
     logger.info(f"Creating new venv at {venv_path}")
 
+    print(f"Creating new venv at {venv_path}")
+
     # Create the virtual environment
     uv_venv_cmd = ["uv", "venv", "--allow-existing", venv_path]
     subprocess.run(uv_venv_cmd, check=True)
@@ -87,6 +89,10 @@ def create_local_venv(
     #  context.
     #  https://docs.astral.sh/uv/concepts/projects/config/#project-environment-path
     env["UV_PROJECT_ENVIRONMENT"] = venv_path
+    # Ray sets CUDA_VISIBLE_DEVICES="" in actors that don't request GPU resources,
+    # which causes package builds (e.g. nv-grouped-gemm) to fail when they try to
+    # detect GPU architecture at compile time. Remove it so the subprocess can see GPUs.
+    env.pop("CUDA_VISIBLE_DEVICES", None)
 
     # Split the py_executable into command and arguments
     exec_cmd = shlex.split(py_executable)

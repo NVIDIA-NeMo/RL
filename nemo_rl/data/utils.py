@@ -109,7 +109,9 @@ def setup_response_data(
         )
         # bind task_name to task_data_processors and task_to_env
         task_name = data.task_name
+        print(data.task_spec, data.processor)
         task_data_processors[task_name] = (data.task_spec, data.processor)
+
         if hasattr(data, "preprocessor") and data.preprocessor is not None:
             task_data_preprocessors[task_name] = data.preprocessor
         if has_envs:
@@ -145,6 +147,7 @@ def setup_response_data(
         )
     sample_count = sum(len(data.dataset) for data in data_list)
     print(f"  ✓ Training dataset loaded with {sample_count} samples.")
+
 
     # ==========================
     # Setup Validation Dataset

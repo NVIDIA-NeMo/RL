@@ -70,6 +70,27 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         stop_strings=stop_strings,
         **extra_args,
     )
+
+    standard_keys = {
+        "message_log",
+        "length",
+        "loss_multiplier",
+        "extra_env_info",
+        "task_name",
+        "idx",
+        "batch_max_length",
+        "stop_strings",
+        "vllm_content",
+        "vllm_images",
+        "vllm_videos",
+    }
+    extra_keys: set[str] = set()
+    for datum_spec in data_batch:
+        extra_keys.update(k for k in datum_spec.keys() if k not in standard_keys)
+    for key in extra_keys:
+        output[key] = [datum_spec.get(key, None) for datum_spec in data_batch]
+
+        
     return output
 
 

@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import warnings
+from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -38,8 +39,12 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+)
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
+    PY_EXECUTABLES,
     RayVirtualCluster,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -63,13 +68,19 @@ from nemo_rl.utils.logger import (
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
+# Register the distillation worker extension so Ray knows which venv to use
+DISTILLATION_WORKER_V2_FQN = (
+    "nemo_rl.algorithms.distillation_worker_extension.DistillationWorkerV2"
+)
+ACTOR_ENVIRONMENT_REGISTRY[DISTILLATION_WORKER_V2_FQN] = PY_EXECUTABLES.AUTOMODEL
+
 # ===============================================================================
 # Configuration
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-class DistillationConfig(TypedDict):
+class SelfDistillationConfig(TypedDict):
     # Training configuration
     num_prompts_per_step: int
     num_generations_per_prompt: int
@@ -85,9 +96,10 @@ class DistillationConfig(TypedDict):
     max_val_samples: int
     topk_logits_k: int
     seed: int
+    ema_decay: float  # EMA decay rate for teacher updates (e.g., 0.999). Set to 1.0 to disable EMA.
 
 
-class DistillationSaveState(TypedDict):
+class SelfDistillationSaveState(TypedDict):
     total_steps: int  # Track total number of steps across all epochs
     current_epoch: int  # Track current epoch
     current_step: int  # Track step within current epoch
@@ -98,7 +110,7 @@ class DistillationSaveState(TypedDict):
     total_valid_tokens: int  # Track total number of non-padding tokens during training
 
 
-def _default_distillation_save_state() -> DistillationSaveState:
+def _default_distillation_save_state() -> SelfDistillationSaveState:
     return {
         "current_epoch": 0,
         "current_step": 0,
@@ -117,7 +129,7 @@ class MasterConfig(TypedDict):
     loss_fn: DistillationLossConfig  # Loss function configuration
     env: dict[str, Any]  # Environment configuration
     data: DataConfig  # Data configuration
-    distillation: DistillationConfig  # Distillation configuration
+    distillation: SelfDistillationConfig  # Distillation configuration
     logger: LoggerConfig  # Logger configuration
     cluster: ClusterConfig  # Cluster configuration
     checkpointing: CheckpointingConfig  # Checkpointing configuration
@@ -154,6 +166,300 @@ def check_vocab_equality(
     )
 
 
+def _normalize_text_field(
+    value: Any, batch_size: int, default: str = ""
+) -> list[str]:
+    """Normalize a batch field into a list of strings with length batch_size."""
+    if value is None:
+        return [default for _ in range(batch_size)]
+    if isinstance(value, list):
+        return [default if v is None else str(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [default if v is None else str(v) for v in value.tolist()]
+    if torch.is_tensor(value):
+        # Best-effort string conversion for tensor-backed text fields.
+        try:
+            return [default if v is None else str(v) for v in value.tolist()]
+        except Exception:
+            return [default for _ in range(batch_size)]
+    # Scalar fallback: repeat for batch
+    return [default if value is None else str(value) for _ in range(batch_size)]
+
+
+
+def _build_cot_gt_texts(
+    batch: BatchedDataDict[Any], batch_size: int
+) -> list[str]:
+    """Build COT + ground-truth strings from batch fields."""
+    cot_texts = _normalize_text_field(batch.get("deepseek_reasoning"), batch_size)
+    # Element-wise fallback: "ground_truth_solution" is present as a key in the
+    # batch for ALL rows (it's in passthrough_keys), but its value is None for
+    # rows where the HF dataset doesn't have that field.  dict.get() only uses
+    # its default when the key is ABSENT, so the fallback to deepseek_solution
+    # never fires.  Do the fallback element-wise instead.
+    _gt_primary = _normalize_text_field(batch.get("ground_truth_solution"), batch_size)
+    _gt_fallback = _normalize_text_field(batch.get("deepseek_solution"), batch_size)
+    gt_texts = [a or b for a, b in zip(_gt_primary, _gt_fallback)]
+
+    print("=====================")
+    print("CHAIN OF THOUGHT TEXTS")
+    print("=====================")
+
+    # pring average length of cot texts 
+    cot_lengths = [len(cot.split()) for cot in cot_texts]
+    avg_cot_length = sum(cot_lengths) / len(cot_lengths) if cot_lengths else 0
+    print(f"Average CoT length (in tokens): {avg_cot_length:.2f}")
+    #print(cot_texts)
+
+    gt_lengths = [len(gt.split()) for gt in gt_texts]
+    avg_gt_length = sum(gt_lengths) / len(gt_lengths) if gt_lengths else 0
+    print(f"Average GT length (in tokens): {avg_gt_length:.2f}")
+
+    # ideally these should be the same? 
+    print(f"number of cot texts: {len(cot_texts)}")
+    print(f"number of gt texts: {len(gt_texts)}")
+
+
+
+    _PREFIX = "\nHere is a reference solution to this problem:\n"
+    _TRANSITION = "\nAfter understanding the reference reasoning + solution, please try to solve this problem using your own approach below:\n Please reason step by step, and put your final answer within \\boxed{{}}"
+
+    combined: list[str] = []
+    for cot, gt in zip(cot_texts, gt_texts):
+        cot = cot.strip() if cot else ""
+        gt = gt.strip() if gt else ""
+
+
+        print("---------------------")
+        print(gt)
+        if cot and gt:
+            combined.append(f"{_PREFIX}\n{cot}\n{gt}{_TRANSITION}")
+        else:
+            text = gt or ""
+            combined.append(f"{_PREFIX}{text}{_TRANSITION}" if text else text)
+    return combined
+
+
+
+''' 
+In the original OPSD implementation, the data_collator takes care of constructing the proper format for the teacher user message 
+
+check https://github.com/siyan-zhao/OPSD/blob/main/data_collator.py
+
+The problem with doing that here is that the message_logs have already been flattened with the chat_template applied 
+
+So we work at token level and insert the COT + GT text right before the first <|im_end|> token in the user portion of the message log, which is the boundary between the user message content and the chat template suffix + assistant response.
+
+'''
+def _build_teacher_inputs_with_cot_in_user_turn(
+    message_logs: list,
+    cot_texts: list[str],
+    tokenizer: TokenizerType,
+    input_ids: torch.Tensor,
+    input_lengths: torch.Tensor,
+    token_mask: torch.Tensor,
+    max_seq_len: Optional[int],
+    make_sequence_length_divisible_by: int,
+    chat_template_kwargs: Optional[dict] = None,
+) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int]]:
+    """Build teacher inputs by inserting COT+GT tokens into the user turn.
+
+    Rather than re-tokenizing via apply_chat_template (which would double-wrap
+    the already-formatted content stored in message_log), this function works
+    directly at the token level:
+
+      1. Locate the first <|im_end|> token in the user portion of the student
+         sequence.  This is the boundary between the user message content and the
+         `<|im_end|>\\n<|im_start|>assistant\\n` suffix.
+      2. Tokenize the reference text and splice it in right before that token.
+
+    Teacher sequence structure:
+        <|im_start|>user
+        {original problem}
+        {reference COT + GT + transition}
+        <|im_end|>
+        <|im_start|>assistant
+        {student's generated response}
+        <|im_end|>
+
+    insert_pos  = position of the first <|im_end|> in the user portion
+                  (used as the alignment boundary in _align_teacher_topk_to_student).
+    cot_len     = number of reference tokens inserted (= teacher_len - student_len).
+    """
+    batch_size = input_ids.shape[0]
+    pad_token_id = tokenizer.pad_token_id or 0
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+
+    teacher_ids_list: list[torch.Tensor] = []
+    insert_positions: list[int] = []
+    cot_lengths: list[int] = []
+
+    for i in range(batch_size):
+        seq_len = int(input_lengths[i].item())
+        seq_mask = token_mask[i, :seq_len]
+
+        # Position of first assistant token (used as fallback insert point)
+        assistant_positions = (seq_mask == 1).nonzero(as_tuple=False)
+        first_assistant_pos = (
+            int(assistant_positions[0].item())
+            if assistant_positions.numel() > 0
+            else seq_len
+        )
+
+        cot_text = cot_texts[i] if i < len(cot_texts) else ""
+
+        if not cot_text:
+            teacher_ids_list.append(input_ids[i, :seq_len].clone())
+            insert_positions.append(first_assistant_pos)
+            cot_lengths.append(0)
+            continue
+
+        # Find the first <|im_end|> in the user portion of the student sequence.
+        # Everything before this position is user message content; everything from
+        # this position onward is the chat-template suffix + assistant response.
+        user_portion = input_ids[i, :first_assistant_pos]
+        im_end_positions = (user_portion == im_end_id).nonzero(as_tuple=False)
+        im_end_pos = (
+            int(im_end_positions[0].item())
+            if im_end_positions.numel() > 0
+            else first_assistant_pos
+        )
+
+        # Tokenize the reference text (no chat-template tokens)
+        cot_token_ids = tokenizer(
+            cot_text, add_special_tokens=False, return_tensors="pt"
+        )["input_ids"][0].to(input_ids.device, dtype=input_ids.dtype)
+
+        # Clamp to max_seq_len budget
+        if max_seq_len is not None:
+            max_cot_len = max(0, max_seq_len - seq_len)
+            if cot_token_ids.shape[0] > max_cot_len:
+                cot_token_ids = cot_token_ids[:max_cot_len]
+
+        cot_len = int(cot_token_ids.shape[0])
+
+        # Splice: user content | cot tokens | <|im_end|> ... assistant ... response
+        teacher_ids_tensor = torch.cat(
+            [
+                input_ids[i, :im_end_pos],       # user content (before <|im_end|>)
+                cot_token_ids,                    # reference text
+                input_ids[i, im_end_pos:seq_len], # <|im_end|> + assistant turn
+            ]
+        )
+
+        teacher_ids_list.append(teacher_ids_tensor)
+        insert_positions.append(im_end_pos)  # alignment boundary
+        cot_lengths.append(cot_len)
+
+    teacher_padded = torch.nn.utils.rnn.pad_sequence(
+        teacher_ids_list, batch_first=True, padding_value=pad_token_id
+    )
+    teacher_input_lengths = torch.tensor(
+        [t.numel() for t in teacher_ids_list],
+        dtype=input_lengths.dtype,
+        device=input_lengths.device,
+    )
+
+    if make_sequence_length_divisible_by > 1:
+        max_len = teacher_padded.shape[1]
+        if max_len % make_sequence_length_divisible_by != 0:
+            padded_len = (
+                (max_len // make_sequence_length_divisible_by) + 1
+            ) * make_sequence_length_divisible_by
+            pad_len = padded_len - max_len
+            teacher_padded = torch.nn.functional.pad(
+                teacher_padded, (0, pad_len), value=pad_token_id
+            )
+
+    return teacher_padded, teacher_input_lengths, insert_positions, cot_lengths
+
+
+def _align_teacher_topk_to_student(
+    teacher_topk_logits: torch.Tensor,
+    teacher_topk_indices: torch.Tensor,
+    input_lengths: torch.Tensor,
+    insert_positions: list[int],
+    cot_lengths: list[int],
+    student_seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Align teacher top-k outputs with student input length after COT insertion."""
+    batch_size = teacher_topk_logits.shape[0]
+    k = teacher_topk_logits.shape[-1]
+
+    aligned_logits = torch.zeros(
+        (batch_size, student_seq_len, k),
+        dtype=teacher_topk_logits.dtype,
+        device=teacher_topk_logits.device,
+    )
+    aligned_indices = torch.zeros(
+        (batch_size, student_seq_len, k),
+        dtype=teacher_topk_indices.dtype,
+        device=teacher_topk_indices.device,
+    )
+
+    for i in range(batch_size):
+        seq_len = int(input_lengths[i].item())
+        insert_pos = insert_positions[i]
+        cot_len = cot_lengths[i]
+
+        if insert_pos > 0:
+            aligned_logits[i, :insert_pos, :] = teacher_topk_logits[
+                i, :insert_pos, :
+            ]
+            aligned_indices[i, :insert_pos, :] = teacher_topk_indices[
+                i, :insert_pos, :
+            ]
+
+        if seq_len > insert_pos:
+            src_start = insert_pos + cot_len
+            src_end = src_start + (seq_len - insert_pos)
+            aligned_logits[i, insert_pos:seq_len, :] = teacher_topk_logits[
+                i, src_start:src_end, :
+            ]
+            aligned_indices[i, insert_pos:seq_len, :] = teacher_topk_indices[
+                i, src_start:src_end, :
+            ]
+
+    return aligned_logits, aligned_indices
+
+
+
+def _copy_weights(source_policy: Policy, target_policy: Policy) -> None:
+    """Copy weights from source policy to target policy via worker extension methods."""
+    source_states = source_policy.run_all_workers_single_data("get_model_state_dict")
+    target_futures = []
+    for worker_idx, state_dict in enumerate(source_states):
+        future = target_policy.worker_group.workers[worker_idx].load_model_state_dict.remote(
+            state_dict=state_dict
+        )
+        target_futures.append(future)
+    ray.get(target_futures)
+
+
+def _update_ema_teacher(
+    student_policy: Policy,
+    teacher_policy: Policy,
+    ema_decay: float,
+) -> None:
+    """Update teacher parameters using exponential moving average (EMA) of student parameters.
+
+    Formula: teacher_param = ema_decay * teacher_param + (1 - ema_decay) * student_param
+    Uses worker extension methods (get_model_state_dict, update_model_with_ema)
+    via run_all_workers_single_data instead of modifying the base worker classes.
+    """
+    if ema_decay >= 1.0:
+        return
+
+    student_states = student_policy.run_all_workers_single_data("get_model_state_dict")
+    teacher_futures = []
+    for worker_idx, student_state_dict in enumerate(student_states):
+        future = teacher_policy.worker_group.workers[worker_idx].update_model_with_ema.remote(
+            student_state_dict=student_state_dict,
+            ema_decay=ema_decay,
+        )
+        teacher_futures.append(future)
+    ray.get(teacher_futures)
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -168,7 +474,7 @@ def setup(
     DistillationLossFn,
     Logger,
     CheckpointManager,
-    DistillationSaveState,
+    SelfDistillationSaveState,
     MasterConfig,
 ]:
     """Main entry point for distillation algorithm.
@@ -180,7 +486,7 @@ def setup(
     """
     # Extract configuration
     policy_config = master_config["policy"]
-    teacher_config = master_config["teacher"]
+    teacher_config = master_config.get("teacher", policy_config)
     generation_config = master_config["policy"]["generation"]
     loss_config = master_config["loss_fn"]
     distillation_config = master_config["distillation"]
@@ -193,7 +499,10 @@ def setup(
     )
 
     # Disallow SP + packing for dtensor path
-    for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
+    cfgs_to_check = [(policy_config, "student")]
+    if "teacher" in master_config:
+        cfgs_to_check.append((teacher_config, "teacher"))
+    for cfg, who in cfgs_to_check:
         # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
         # This incompatibility is enforced in DTensor workers during initialization.
         # Additionally, SP may not be compatible with sequence packing for some models.
@@ -228,8 +537,8 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    distillation_save_state: Optional[DistillationSaveState] = cast(
-        Optional[DistillationSaveState],
+    distillation_save_state: Optional[SelfDistillationSaveState] = cast(
+        Optional[SelfDistillationSaveState],
         checkpointer.load_training_info(last_checkpoint_path),
     )
     if distillation_save_state is None:
@@ -367,38 +676,38 @@ def setup(
             flush=True,
         )
 
-    # ==========================
-    #      Teacher Policy
-    # ==========================
-    print("\n▶ Setting up teacher policy...", flush=True)
-    # Checkpoint paths
-    weights_path = None
-    optimizer_path = None
+    # # ==========================
+    # #      Teacher Policy
+    # # ==========================
+    # print("\n▶ Setting up teacher policy...", flush=True)
+    # # Checkpoint paths
+    # weights_path = None
+    # optimizer_path = None
 
-    if not bool(os.getenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", False)):
-        check_vocab_equality(
-            tokenizer, policy_config["model_name"], teacher_config["model_name"]
-        )
+    # if not bool(os.getenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", False)):
+    #     check_vocab_equality(
+    #         tokenizer, policy_config["model_name"], teacher_config["model_name"]
+    #     )
 
-    if "megatron_cfg" in teacher_config and teacher_config["megatron_cfg"]["enabled"]:
-        ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
-            distillation_config["max_num_steps"],
-            distillation_config["max_num_epochs"] * len(dataloader),
-        )
-        teacher_config["megatron_cfg"]["train_iters"] = total_train_iters
+    # if "megatron_cfg" in teacher_config and teacher_config["megatron_cfg"]["enabled"]:
+    #     ## NOTE: this is equal to the total number of scheduler steps
+    #     total_train_iters = min(
+    #         distillation_config["max_num_steps"],
+    #         distillation_config["max_num_epochs"] * len(dataloader),
+    #     )
+    #     teacher_config["megatron_cfg"]["train_iters"] = total_train_iters
 
-    teacher_policy = Policy(
-        name_prefix="teacher",
-        cluster=train_cluster,
-        config=teacher_config,
-        tokenizer=tokenizer,
-        weights_path=weights_path,
-        optimizer_path=optimizer_path,
-        init_optimizer=False,
-        init_reference_model=False,
-    )
-    teacher_policy.offload_after_refit()
+    # teacher_policy = Policy(
+    #     name_prefix="teacher",
+    #     cluster=train_cluster,
+    #     config=teacher_config,
+    #     tokenizer=tokenizer,
+    #     weights_path=weights_path,
+    #     optimizer_path=optimizer_path,
+    #     init_optimizer=False,
+    #     init_reference_model=False,
+    # )
+    # teacher_policy.offload_after_refit()
 
     # ==========================
     #    Student Generation Interface
@@ -430,7 +739,12 @@ def setup(
     print("\n▶ Setting up student policy...", flush=True)
 
     # Checkpoint paths
-    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    if last_checkpoint_path:
+        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+    else:
+        weights_path = None
+        optimizer_path = None
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         ## NOTE: this is equal to the total number of scheduler steps
@@ -449,6 +763,7 @@ def setup(
         optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=False,
+        worker_extension_cls_fqn=DISTILLATION_WORKER_V2_FQN,
     )
 
     if student_generation is not None:
@@ -474,6 +789,55 @@ def setup(
 
     loss_fn = DistillationLossFn(loss_config)
 
+    # ==========================
+    #      EMA Teacher Policy
+    # ==========================
+    # The teacher policy can be configured to use Exponential Moving Average (EMA) updates:
+    # - If ema_decay = 1.0 (default): teacher shares parameters with student (no separate teacher)
+    # - If ema_decay < 1.0: separate teacher policy is created and updated after each training step
+    #   Formula: teacher_params = ema_decay * teacher_params + (1 - ema_decay) * student_params
+    #   Example: ema_decay=0.999 means teacher slowly tracks student with 99.9% of old values
+    ema_decay = distillation_config.get("ema_decay", 1.0)
+
+    if ema_decay >= 1.0:
+        # No EMA: teacher and student share parameters (self-distillation mode)
+        print("\n▶ Using shared parameters for teacher (no EMA)", flush=True)
+        teacher_policy = student_policy
+    else:
+        # EMA enabled: create separate teacher policy that will be updated via EMA
+        print(f"\n▶ Setting up EMA teacher policy (decay={ema_decay})...", flush=True)
+
+        # Determine teacher checkpoint paths
+        if last_checkpoint_path:
+            teacher_weights_path = Path(last_checkpoint_path) / "teacher" / "weights"
+            # Check if teacher checkpoint exists; if not, use student weights as initialization
+            if not teacher_weights_path.exists():
+                print("  ⚠️ No teacher checkpoint found, initializing from student weights", flush=True)
+                teacher_weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+        else:
+            # No checkpoint: teacher will be initialized from student weights after creation
+            teacher_weights_path = None
+
+        # Create teacher policy (same architecture as student)
+        teacher_policy = Policy(
+            name_prefix="teacher",
+            cluster=train_cluster,
+            config=policy_config,  # Same config as student
+            tokenizer=tokenizer,
+            weights_path=teacher_weights_path,
+            optimizer_path=None,  # Teacher doesn't need optimizer
+            init_optimizer=False,
+            init_reference_model=False,
+            worker_extension_cls_fqn=DISTILLATION_WORKER_V2_FQN,
+        )
+
+        # If no checkpoint, copy student weights to teacher
+        if teacher_weights_path is None:
+            print("  ⚠️ Initializing teacher from current student weights...", flush=True)
+            _copy_weights(student_policy, teacher_policy)
+
+        print(f"  ✓ EMA teacher initialized with decay={ema_decay}", flush=True)
+
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
     print("=" * 60 + "\n", flush=True)
@@ -492,9 +856,11 @@ def setup(
     )
 
 
+
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
+
 
 
 def distillation_train(
@@ -509,7 +875,7 @@ def distillation_train(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     logger: Logger,
     checkpointer: CheckpointManager,
-    distillation_save_state: DistillationSaveState,
+    distillation_save_state: SelfDistillationSaveState,
     master_config: MasterConfig,
 ) -> None:
     """Run Distillation training algorithm."""
@@ -600,7 +966,9 @@ def distillation_train(
                             master_config["distillation"]["num_generations_per_prompt"]
                         )
                     )
-
+                print(f"REPEATED BATCH")
+                #print(repeated_batch)
+                
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 print(
                     f"▶ Generating responses for batch of size {repeated_batch.size}...",
@@ -675,8 +1043,6 @@ def distillation_train(
                         ],
                     )
 
-                    # TODO: append COT + ground truth answer to teacher train data 
-
                     # Create training data from flattened messages
                     train_data = BatchedDataDict[DistillationLossDataDict](
                         {
@@ -692,23 +1058,139 @@ def distillation_train(
                     )
                     train_data.to("cpu")
 
-                print("▶ Preparing for teacher logprob inference...", flush=True)
+                # Build self-teacher inputs by inserting COT + GT before assistant tokens.
+
+                #print("Batch:", repeated_batch)
+                cot_texts = _build_cot_gt_texts(repeated_batch, repeated_batch.size)
+                max_seq_len = master_config["policy"].get(
+                    "max_total_sequence_length", None
+                )
+                make_seq_divisible_by = master_config["policy"].get(
+                    "make_sequence_length_divisible_by", 1
+                )
+                (
+                    teacher_input_ids,
+                    teacher_input_lengths,
+                    insert_positions,
+                    cot_lengths,
+                ) = _build_teacher_inputs_with_cot_in_user_turn(
+                    repeated_batch["message_log"],
+                    cot_texts,
+                    tokenizer,
+                    train_data["input_ids"],
+                    train_data["input_lengths"],
+                    train_data["token_mask"],
+                    max_seq_len,
+                    make_seq_divisible_by,
+                    chat_template_kwargs=master_config["policy"]["tokenizer"].get(
+                        "chat_template_kwargs"
+                    )
+                    or {},
+                )
+
+                # DEBUG: verify COT tokens are inserted into teacher context
+                if total_steps == 0:
+                    i = 0
+                    t_len = int(teacher_input_lengths[i].item())
+                    teacher_text = tokenizer.decode(teacher_input_ids[i, :t_len], skip_special_tokens=False)
+                    
+                    s_len = int(train_data["input_lengths"][i].item())
+                    student_text = tokenizer.decode(train_data["input_ids"][i, :s_len], skip_special_tokens=False)
+                    
+                    print("=== STUDENT INPUT (decoded) ===")
+                    print(student_text)
+                    print(f"\n=== TEACHER INPUT (decoded) ===")
+                    print(teacher_text)
+                    print(f"\n=== COT TEXT (raw string) ===")
+                    print(cot_texts[i][:1000])
+                    print(f"\nInsert pos: {insert_positions[i]}, COT len: {cot_lengths[i]}")
+                    print(f"Student len: {s_len}, Teacher len: {t_len}")
+
+                teacher_data = BatchedDataDict(
+                    {
+                        "input_ids": teacher_input_ids,
+                        "input_lengths": teacher_input_lengths,
+                    }
+                )
+                teacher_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
+                teacher_data.to("cpu")
+
+                print("▶ Preparing for self-teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
                     teacher_policy.prepare_for_lp_inference()
 
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
-                    teacher_topk = teacher_policy.get_topk_logits(
-                        train_data,
-                        k=master_config["distillation"]["topk_logits_k"],
-                        timer=timer,
+                    with torch.no_grad(): 
+                        teacher_topk = teacher_policy.get_topk_logits(
+                            teacher_data,
+                            k=master_config["distillation"]["topk_logits_k"],
+                            timer=timer,
+                        )
+                    aligned_logits, aligned_indices = _align_teacher_topk_to_student(
+                        teacher_topk["topk_logits"],
+                        teacher_topk["topk_indices"],
+                        train_data["input_lengths"],
+                        insert_positions,
+                        cot_lengths,
+                        train_data["input_ids"].shape[1],
                     )
-                    train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
-                    train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                    if aligned_logits.device.type != "cpu":
+                        aligned_logits = aligned_logits.cpu()
+                    if aligned_indices.device.type != "cpu":
+                        aligned_indices = aligned_indices.cpu()
+                    train_data["teacher_topk_logits"] = aligned_logits
+                    train_data["teacher_topk_indices"] = aligned_indices
+
+                # Diagnostic: on the first step, measure how much the COT actually
+                # changes the teacher's predictions vs. having no COT (student proxy).
+                # If top-1 agreement is ~1.0, the COT isn't influencing the model and
+                # the training signal will be effectively zero.
+                if total_steps == 0:
+                    print("\n check measuring COT effect on teacher predictions...", flush=True)
+                    with torch.no_grad():
+                        no_cot_topk = teacher_policy.get_topk_logits(
+                            train_data,
+                            k=master_config["distillation"]["topk_logits_k"],
+                            timer=timer,
+                        )
+                    no_cot_indices = no_cot_topk["topk_indices"]
+                    if no_cot_indices.device.type != "cpu":
+                        no_cot_indices = no_cot_indices.cpu()
+
+                    # Compare at assistant token positions (shifted for next-token prediction)
+                    asst_mask = train_data["token_mask"][:, 1:].bool()  # [B, S-1]
+                    S = min(aligned_indices.shape[1] - 1, no_cot_indices.shape[1] - 1)
+
+                    cot_top1    = aligned_indices[:, :S, 0][asst_mask[:, :S]]
+                    no_cot_top1 = no_cot_indices[:, :S, 0][asst_mask[:, :S]]
+                    top1_agree = (cot_top1 == no_cot_top1).float().mean().item()
+
+                    # Top-k recall: fraction of teacher's (COT) top-k_diag tokens
+                    # that appear anywhere in the no-COT top-k_diag list.
+                    k_diag = min(aligned_indices.shape[-1], 50)
+                    n_diag = 500
+                    cot_flat    = aligned_indices[:, :S, :k_diag][asst_mask[:, :S]][:n_diag]
+                    no_cot_flat = no_cot_indices[:, :S, :k_diag][asst_mask[:, :S]][:n_diag]
+                    recall = (
+                        cot_flat.unsqueeze(2) == no_cot_flat.unsqueeze(1)
+                    ).any(dim=2).float().mean().item()
+
+                    print(f"  Assistant token positions sampled : {asst_mask.sum().item()}")
+                    print(f"  Top-1 token agreement (COT vs no-COT): {top1_agree:.3f}")
+                    print(f"  Top-{k_diag} recall (COT top-{k_diag} found in no-COT top-{k_diag}): {recall:.3f}")
+                    if top1_agree > 0.90:
+                        print("  ⚠️  WARNING: COT barely changes predictions — training signal will be near-zero")
+                    elif top1_agree < 0.60:
+                        print("  ✓  COT meaningfully shifts predictions")
+                    else:
+                        print("  COT has moderate effect on predictions")
+                    print(flush=True)
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
-                    teacher_policy.offload_after_refit()
+                    if teacher_policy is not student_policy:
+                        teacher_policy.offload_after_refit()
                     student_policy.prepare_for_training()  # set model train and reload optim to GPU
                     POLICY_GENERATION_STALE = True
 
@@ -719,6 +1201,13 @@ def distillation_train(
                         loss_fn,
                         timer=timer,
                     )
+
+                # Update EMA teacher parameters after training step
+                ema_decay = master_config["distillation"].get("ema_decay", 1.0)
+                if ema_decay < 1.0 and teacher_policy is not student_policy:
+                    with timer.time("ema_update"):
+                        print("▶ Updating EMA teacher parameters...", flush=True)
+                        #_update_ema_teacher(student_policy, teacher_policy, ema_decay)
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
@@ -846,14 +1335,26 @@ def distillation_train(
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            )
-                            if checkpointer.save_optimizer
-                            else None,
+                            ),
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
                             checkpointing_cfg=master_config["checkpointing"],
                         )
+
+                        # Save teacher weights separately if EMA is enabled
+                        ema_decay = master_config["distillation"].get("ema_decay", 1.0)
+                        if ema_decay < 1.0 and teacher_policy is not student_policy:
+                            print("  • Saving EMA teacher weights...", flush=True)
+                            teacher_policy.save_checkpoint(
+                                weights_path=os.path.join(
+                                    checkpoint_path, "teacher", "weights"
+                                ),
+                                optimizer_path=None,  # Teacher doesn't need optimizer
+                                tokenizer_path=None,  # Already saved with student
+                                checkpointing_cfg=master_config["checkpointing"],
+                            )
+
                         torch.save(
                             dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
