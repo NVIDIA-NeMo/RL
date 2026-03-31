@@ -254,6 +254,7 @@ logger:
     mlflow:
         experiment_name: "distillation-dev"
         run_name: "distillation-math-cl-logger"
+        tracking_uri: "http://localhost:5000"
     gpu_monitoring:
         collection_interval: 10
         flush_interval: 10

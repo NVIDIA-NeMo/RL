@@ -773,13 +773,7 @@ class MLflowLogger(LoggerInterface):
             cfg: MLflow configuration
             log_dir: Optional log directory (used as fallback if artifact_location not in cfg)
         """
-        # Default to local tracking server if not configured
-        # If not use local tracking server, it will default to file-based backend, which is not compatible with auto group.
-        tracking_uri = (
-            cfg.get("tracking_uri")
-            or os.getenv("MLFLOW_TRACKING_URI")
-            or "http://localhost:5000"
-        )
+        tracking_uri = cfg.get("tracking_uri") or os.getenv("MLFLOW_TRACKING_URI")
         if tracking_uri and not mlflow.is_tracking_uri_set():
             mlflow.set_tracking_uri(tracking_uri)
 

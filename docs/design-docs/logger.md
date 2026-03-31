@@ -107,7 +107,7 @@ MLflow can be configured with the following parameters:
 mlflow:
   experiment_name: "nemo-rl-experiment"  # Name of the MLflow experiment
   run_name: "my-training-run"            # Run name
-  tracking_uri: "http://localhost:5000"  # Optional tracking server URI. Defaults to this value when unset.
+  tracking_uri: "http://localhost:5000"  # Optional tracking server URI
 ```
 
 > [!WARNING]
