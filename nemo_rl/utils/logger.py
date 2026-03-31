@@ -1003,8 +1003,9 @@ class Logger(LoggerInterface):
                 for key, value in sample.items():
                     if isinstance(value, torch.Tensor):
                         sample[key] = value.tolist()
-                    elif hasattr(value, "tolist"):  # numpy arrays
+                    elif isinstance(value, np.ndarray):
                         sample[key] = value.tolist()
+                # default=str is a fallback for non-JSON-serializable types (e.g., datetime, custom objects)
                 f.write(json.dumps({**sample, "idx": i}, default=str) + "\n")
 
         print(f"Logged data to {filepath}")

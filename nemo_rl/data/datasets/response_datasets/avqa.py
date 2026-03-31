@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 import torch
 import torchaudio
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
@@ -74,21 +74,35 @@ class AVQADataset(RawDataset):
 
     task_name = "avqa"
 
-    def __init__(self, split: str = "train", **kwargs):
+    def __init__(
+        self,
+        split: str = "train",
+        split_validation_size: float = 0,
+        seed: int = 42,
+        max_samples: int | None = None,
+        **kwargs,
+    ):
         VALID_SPLITS = ("train", "validation")
         if split not in VALID_SPLITS:
             raise ValueError(
                 f"Invalid split: {split}. Please use one of {VALID_SPLITS}."
             )
 
-        self.dataset = load_dataset("gijs/avqa-processed", split=split)
+        if max_samples is not None:
+            ds = load_dataset("gijs/avqa-processed", split=split, streaming=True)
+            self.dataset = Dataset.from_list(list(ds.take(max_samples)))
+        else:
+            self.dataset = load_dataset("gijs/avqa-processed", split=split)
 
         self.dataset = self.dataset.add_column(
             "task_name", [self.task_name] * len(self.dataset)
         )
 
         self.preprocessor = self.format_data
+
+        # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
         self.val_dataset = None
+        self.split_train_validation(split_validation_size, seed)
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         audio_data = data["audio"]

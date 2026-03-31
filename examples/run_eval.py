@@ -24,19 +24,14 @@ from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
-from nemo_rl.data.datasets.eval_datasets.mmau import MMAUDataset
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+from nemo_rl.data.datasets.eval_datasets import _is_multimodal_dataset
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.math_environment import MathEnvironment
-from nemo_rl.environments.vlm_environment import VLMEnvironment
+from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config
 
 TokenizerType = PreTrainedTokenizerBase
-
-# Dataset names that require multimodal (VLM) processing
-MULTIMODAL_DATASETS = {"mmau", "TwinkStart/MMAU"}
 
 
 def parse_args():
@@ -55,11 +50,6 @@ def parse_args():
     return args, overrides
 
 
-def _is_multimodal_dataset(dataset_name):
-    """Check if the dataset requires multimodal processing."""
-    return dataset_name in MULTIMODAL_DATASETS
-
-
 def setup_data(tokenizer, data_config, env_configs):
     print("Setting up data...")
 
@@ -67,7 +57,7 @@ def setup_data(tokenizer, data_config, env_configs):
     base_dataset = load_eval_dataset(data_config)
     rekeyed_ds = base_dataset.rekeyed_ds
 
-    is_multimodal = isinstance(base_dataset, MMAUDataset)
+    is_multimodal = _is_multimodal_dataset(data_config["dataset_name"])
 
     if is_multimodal:
         # Use VLMEnvironment for multimodal datasets
@@ -77,39 +67,19 @@ def setup_data(tokenizer, data_config, env_configs):
                 f"No environment config found for multimodal dataset. "
                 f"Available env configs: {list(env_configs.keys())}"
             )
-        env = VLMEnvironment.options(
-            runtime_env={
-                "py_executable": get_actor_python_env(
-                    "nemo_rl.environments.vlm_environment.VLMEnvironment"
-                )
-            }
-        ).remote(env_configs[env_key])
-
-        dataset = AllTaskProcessedDataset(
-            dataset=rekeyed_ds,
-            tokenizer=tokenizer,
-            default_task_data_spec=base_dataset.task_spec,
-            task_data_processors=base_dataset.processor,
-            task_data_preprocessors=base_dataset.preprocessor,
-            max_seq_length=data_config["max_input_seq_length"],
-        )
+        env = create_env(env_name="vlm", env_config=env_configs[env_key])
     else:
         # Original text-only path
-        env = MathEnvironment.options(
-            runtime_env={
-                "py_executable": get_actor_python_env(
-                    "nemo_rl.environments.math_environment.MathEnvironment"
-                )
-            }
-        ).remote(env_configs["math"])
+        env = create_env(env_name="math", env_config=env_configs["math"])
 
-        dataset = AllTaskProcessedDataset(
-            dataset=rekeyed_ds,
-            tokenizer=tokenizer,
-            default_task_data_spec=base_dataset.task_spec,
-            task_data_processors=base_dataset.processor,
-            max_seq_length=data_config["max_input_seq_length"],
-        )
+    dataset = AllTaskProcessedDataset(
+        dataset=rekeyed_ds,
+        tokenizer=tokenizer,
+        default_task_data_spec=base_dataset.task_spec,
+        task_data_processors=base_dataset.processor,
+        task_data_preprocessors=getattr(base_dataset, "preprocessor", None),
+        max_seq_length=data_config["max_input_seq_length"],
+    )
 
     return dataset, env, tokenizer
 

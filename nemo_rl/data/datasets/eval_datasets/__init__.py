@@ -20,6 +20,14 @@ from nemo_rl.data.datasets.eval_datasets.mmau import MMAUDataset
 from nemo_rl.data.datasets.eval_datasets.mmlu import MMLUDataset
 from nemo_rl.data.datasets.eval_datasets.mmlu_pro import MMLUProDataset
 
+# Dataset names that require multimodal (VLM) processing
+MULTIMODAL_DATASETS = {"mmau", "TwinkStart/MMAU"}
+
+
+def _is_multimodal_dataset(dataset_name):
+    """Check if the dataset requires multimodal processing."""
+    return dataset_name in MULTIMODAL_DATASETS
+
 
 def load_eval_dataset(data_config):
     """Loads evaluation dataset."""
@@ -114,4 +122,6 @@ __all__ = [
     "MMAUDataset",
     "MMLUDataset",
     "MMLUProDataset",
+    "MULTIMODAL_DATASETS",
+    "_is_multimodal_dataset",
 ]
