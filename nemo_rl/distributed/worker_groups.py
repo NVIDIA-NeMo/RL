@@ -447,6 +447,28 @@ class RayWorkerGroup:
                 py_executable=actor_python_env,
                 venv_name=remote_worker_builder.ray_actor_class_fqn,
             )
+            # Prepend the venv's CUDA runtime libraries to LD_LIBRARY_PATH so they take
+            # precedence over any system CUDA libraries (e.g. system CUDA 12.4 vs the
+            # venv's bundled CUDA 12.9 from nvidia-cuda-runtime-cu12). py_executable is
+            # the path to the venv's python binary (.../bin/python), so the venv root is
+            # two levels up. We glob for the nvidia cuda_runtime lib dir because the
+            # Python version in the venv may differ from the driver's Python version.
+            import glob as _glob
+            _venv_root = os.path.dirname(os.path.dirname(py_executable))
+            _cuda_lib_matches = _glob.glob(
+                os.path.join(
+                    _venv_root,
+                    "lib/python*/site-packages/nvidia/cuda_runtime/lib",
+                )
+            )
+            if _cuda_lib_matches:
+                _nvidia_cuda_lib = _cuda_lib_matches[0]
+                _existing_ldpath = env_vars.get("LD_LIBRARY_PATH", "")
+                env_vars["LD_LIBRARY_PATH"] = (
+                    f"{_nvidia_cuda_lib}:{_existing_ldpath}"
+                    if _existing_ldpath
+                    else _nvidia_cuda_lib
+                )
         else:
             py_executable = actor_python_env
 

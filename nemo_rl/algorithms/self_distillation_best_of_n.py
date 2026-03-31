@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations.
 # limitations under the License.
+import math
 import os
 import warnings
 from pathlib import Path
@@ -24,7 +25,7 @@ from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import _should_use_async_rollouts, refit_policy_generation
-from nemo_rl.algorithms.loss_functions import (
+from nemo_rl.algorithms.loss import (
     DistillationLossConfig,
     DistillationLossDataDict,
     DistillationLossFn,
