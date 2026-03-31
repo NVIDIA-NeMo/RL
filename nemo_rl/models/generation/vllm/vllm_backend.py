@@ -131,6 +131,11 @@ class VllmInternalWorkerExtension:
         This path is only used for the Eagle3 online-training flow, where the
         trainer exports draft parameters under a `draft.` prefix before sending
         them to vLLM.
+        
+        This implementation is specific to the eagle model. For MTP, we can add
+        similar logic to this function to split weights and send it to the drafter.
+        
+        The "draft." prefix is added here https://github.com/isomap/RL/blob/d3a5e1396d00f82fb888d9ec6800687a23bb4017/nemo_rl/models/policy/workers/megatron_policy_worker.py#L967-L997
         """
         policy_weights = []
         draft_weights = []
