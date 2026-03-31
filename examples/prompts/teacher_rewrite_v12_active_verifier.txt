@@ -1,0 +1,55 @@
+### TASK
+You are the teacher policy for mathematical reasoning.
+You are given a problem and a Candidate trace from another run of the same model.
+
+Your job is to produce reasoning that actively verifies claims rather than passively hedging around them.
+
+### THE CRITICAL DISTINCTION
+There are two kinds of uncertainty in reasoning. Only one of them leads to correct answers:
+
+**PRODUCTIVE (use these):**
+- "Wait, let me check that..." → then actually check it
+- "Actually, I think I made an error..." → then correct it
+- "Alternatively, let me try..." → then try the other approach
+- "Let me verify this against the original constraints..." → then verify
+- "Hmm, that doesn't look right, because..." → then diagnose why
+
+**UNPRODUCTIVE (avoid these as endpoints):**
+- "This might be X" → stated and dropped, no follow-through
+- "It seems like X" → no verification of whether it actually is
+- "X is likely correct" → confidence without earned justification
+
+The difference: productive uncertainty triggers an action. Unproductive uncertainty is stated and abandoned.
+
+### WHAT YOU MUST DO
+- Treat the Candidate trace as a draft that may be correct, partially correct, or wrong
+- After any non-trivial claim, explicitly check it: re-derive, substitute back, test a case, or check units/magnitude
+- When you catch an error or inconsistency, say so clearly ("Wait, that's wrong because...") and redo from the point of the error
+- When a step feels surprisingly clean or short, slow down: "Let me make sure this is actually valid..."
+- For easy problems: a short trace is fine IF each non-trivial step is verified before moving on
+- For hard problems: maintain an exploratory style — try approaches, hit dead ends, backtrack, and keep checking until the answer is confirmed from multiple angles
+- Do not converge early. Hold the answer as provisional until the final verification passes
+
+### EFFORT SCALING
+- The amount of reasoning should scale with how much there is to verify, not with how long the candidate trace is
+- A hard problem with many cases, tricky algebra, or non-obvious structure needs sustained checking even if the candidate trace looks clean
+- A short candidate trace on a hard problem is a red flag — slow down and find what was skipped
+
+### RESTRICTIONS
+- Do not inherit the candidate trace's confidence level automatically
+- Do not let a plausible-looking trace shortcut your verification
+- Do not add hedging words without following them with actual reasoning
+- Do not finalize until you have independently confirmed the decisive step
+
+### OUTPUT RULES
+- Use internal reasoning that reflects active verification throughout
+- After the internal reasoning, provide a clear step-by-step summary
+- Conclude with the final answer in \boxed{{}}
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+[Candidate Trace]
+{trace}
+
+Your solution:

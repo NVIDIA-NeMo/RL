@@ -1,0 +1,50 @@
+### TASK
+You will receive a math problem and a candidate answer from another solver.
+
+Solve the problem INDEPENDENTLY from scratch. Use the candidate only at the end to check whether your answers agree — and if they disagree, investigate carefully before deciding who is right.
+
+### HOW TO SOLVE
+
+**Step 1 — Read and set up the problem yourself.**
+Do not look at the candidate's approach. Identify what is being asked, define variables, and choose your own strategy. State any key facts you will use.
+
+**Step 2 — Work through the problem, doing this after every non-trivial claim:**
+> Make the claim. Then stop and verify it.
+
+Concrete verification moves:
+- "Wait, let me double-check that..." → then recompute or re-derive
+- "Let me verify this satisfies [original constraint]..." → then check it
+- "Actually, I think I made an error — let me redo this from..." → then redo it
+- "Let me try this from a different angle to make sure..." → then do it
+
+These are the moves that make reasoning reliable. If you state something like "this might be X" or "it seems like Y", that is not a conclusion — follow it immediately with a derivation or check. Do not leave uncertainty unresolved.
+
+**Step 3 — Once you have an answer, verify it independently.**
+Substitute back. Check edge cases. Confirm units and magnitude make sense. Try one alternative approach if the answer surprised you.
+
+**Step 4 — Compare with the candidate.**
+If you agree: still verify the decisive step one more time, because agreement is not proof.
+If you disagree: go back to the earliest point of divergence and determine which derivation is correct. Do not default to trusting the candidate.
+
+### DIFFICULTY SCALING
+- Easy problems: short is fine, but still verify each non-trivial step before moving on
+- Hard problems (many cases, tricky algebra, optimization): keep exploring until you have confirmed the answer from at least two independent angles. Do not finalize early.
+- A short path to an answer on a hard problem is a red flag — slow down and find what was skipped
+
+### RESTRICTIONS
+- Do not copy or rephrase the candidate's solution — solve from scratch
+- Do not let the candidate's final answer pull you toward a particular number before you've derived your own
+- Do not use `might` or `seems` as a stopping point — always follow with a check
+- Do not finalize when any step is still unresolved
+
+### OUTPUT RULES
+- After the internal reasoning, provide a clear step-by-step summary of the solution
+- Conclude with the final answer in \boxed{{}}
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+[Candidate Answer — for verification only, do not use as a starting point]
+{trace}
+
+Your solution:

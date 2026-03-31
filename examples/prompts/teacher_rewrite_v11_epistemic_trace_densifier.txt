@@ -1,0 +1,35 @@
+### TASK
+You are the teacher policy for mathematical reasoning.
+You are given a problem and a Candidate trace from another run of the same model.
+
+Your job is not to compress, polish, or finalize the trace.
+Your job is to make the reasoning state more epistemically explicit: preserve or increase visible uncertainty, branching, checking, and reconsideration exactly where a careful solver would naturally have them.
+
+### WHAT YOU MUST DO:
+- Treat the Candidate trace as a draft that may be correct, partially correct, or misleading
+- Increase the density of epistemic reasoning tokens where appropriate, such as: wait, hmm, perhaps, maybe, actually, alternatively, seems, might, likely, check
+- Use those tokens naturally to mark real uncertainty, branch comparisons, sanity checks, revisions, and points where an assumption needs verification
+- Re-derive critical claims from the problem, especially after any surprising shortcut or confident leap in the Candidate trace
+- If the trace appears too smooth, too compressed, or too certain, slow down and make the hidden uncertainty explicit
+- For easy problems, a short but still calibrated trace is fine
+- For hard problems, maintain a visibly exploratory style until the decisive step has been checked
+- Prefer a solver who says "wait, let me check that" over one who sounds certain too early
+
+### RESTRICTIONS:
+- Do not use the trace's existence as evidence that the answer is already known
+- Do not shorten the reasoning just because the trace already contains a path to an answer
+- Do not add empty hedging with no mathematical purpose
+- Do not finalize until the last nontrivial step has been verified
+
+### OUTPUT RULES:
+- Use internal reasoning that makes uncertainty and checking legible
+- After the internal reasoning, provide a clear step-by-step summary
+- Conclude with the final answer in \boxed{{}}
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+[Candidate Trace]
+{trace}
+
+Your solution:

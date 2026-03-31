@@ -1,0 +1,45 @@
+### TASK
+You will receive an input containing two parts: a **problem statement** and a **reasoning trace** (an authentic, detailed internal monologue of someone working through the problem).
+
+Your job is to produce an IMPROVED and EXTENDED reasoning trace. You should reason LONGER and MORE THOROUGHLY than the original, not shorter. Think of yourself as a meticulous mathematician who checks everything twice and explores alternative approaches even when the first one works.
+
+### WHY LONGER IS BETTER:
+Extended reasoning with verification, alternative approaches, and sanity checks produces more reliable answers. Your goal is to demonstrate the kind of careful, exhaustive thinking that leads to correct solutions. A trace that reasons for 2000 tokens when it should reason for 5000 tokens will miss edge cases, skip verification, and make avoidable errors.
+
+### THE ORIGINAL STYLE AND TONE MUST SURVIVE
+The original trace sounds like a person thinking out loud. Your reasoning must also sound like a person thinking out loud, the SAME person. If the original says "Wait, that can't be right..." your version should feel equally spontaneous and human. Never flatten exploratory language into formal explanation. Each step should include detailed considerations such as analyzing questions, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps.
+
+### WHAT YOU MUST DO:
+- FIX mistakes if you see clear logical errors and wrong assumptions
+- KEEP ALL productive tangents, self-corrections, and exploratory branches
+- INSERT missing logical steps with full working shown
+- EXPAND compressed steps by showing detailed work (calculations, sub-reasoning) inline
+- ADD at least one alternative approach or verification method that the original did not try
+- ADD sanity checks: does the answer make sense? Is it in the right range? Does it satisfy the original constraints?
+- ADD exploration of edge cases or potential pitfalls, even if the original didn't consider them
+- When fixing errors, show the wrong path, explain why it's wrong, then show the correct path — do not silently correct
+
+### RESTRICTIONS:
+- DO NOT produce a trace shorter than the original under any circumstances
+- DO NOT remove phrases like "hmm," "wait," "actually," "let me think..."
+- DO NOT add formal transitions ("Furthermore," "In conclusion,")
+- DO NOT convert the monologue into structured prose
+- DO NOT summarize or compress. If you feel the urge to compress, ADD a verification step instead.
+
+### OPERATING PRINCIPLE:
+More thinking is almost always better. Preserve all original reasoning, then enrich it. When in doubt between adding more reasoning or cutting, always add more. Explore several different paths of reasoning. Verify intermediate results. Check the final answer from a different angle.
+
+### OUTPUT RULES:
+- After thinking, end with the closing thinking tag, then your output has to have a clear, step-by-step summary that walks through the key steps taken to arrive at the answer. This summary should:
+    - Don't write step-by-step summary anywhere
+    - Present the logical progression in clean, readable steps (not the raw internal monologue)
+    - Conclude with the final answer in the same format as the original (e.g., \boxed{{}})
+- **CRITICAL:** The final answer section must ALWAYS include a step-by-step summary before the boxed answer. NEVER jump straight from reasoning to just \boxed{{}} with no summary.
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+[Reasoning Trace]
+{trace}
+
+Your new solution:

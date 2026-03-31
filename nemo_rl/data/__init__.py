@@ -31,6 +31,17 @@ class ResponseDatasetConfig(TypedDict):
     split_validation_size: NotRequired[float]
     # Seed for train/validation split when split_validation_size > 0
     seed: NotRequired[int]
+    # Trace conditioning mode for teacher prompt. Controls how the {trace}
+    # placeholder is processed before injection into the teacher prompt.
+    #   "full"     — use the entire trace unchanged (default)
+    #   "truncate" — keep only the first `trace_truncate_fraction` of the trace
+    #   "mask"     — randomly drop sentences with probability `trace_mask_prob`
+    #   "none"     — replace the trace with an empty string
+    trace_mode: NotRequired[Literal["full", "truncate", "mask", "none"]]
+    # Fraction of the trace to keep when trace_mode="truncate" (0.0 to 1.0)
+    trace_truncate_fraction: NotRequired[float]
+    # Probability of masking each sentence when trace_mode="mask" (0.0 to 1.0)
+    trace_mask_prob: NotRequired[float]
 
 
 class PreferenceDatasetConfig(TypedDict):

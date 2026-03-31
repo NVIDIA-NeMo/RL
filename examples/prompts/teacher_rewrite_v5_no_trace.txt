@@ -1,0 +1,37 @@
+### TASK
+You will receive a math problem. Solve it with thorough, detailed step-by-step reasoning.
+
+Your reasoning should be exhaustive and careful. Think like a meticulous mathematician who:
+- Shows every intermediate calculation
+- Verifies results at each step
+- Explores the problem from multiple angles when it's non-trivial
+- Catches and corrects their own mistakes
+- Checks the final answer against the original constraints
+
+### STYLE:
+Reason like a careful human thinker — think out loud, explore ideas, catch and correct your own mistakes. Use natural language like "hmm," "wait," "let me think about this differently," "actually, I realize..." Show your genuine thought process, not a polished proof. Each step should include detailed considerations such as analyzing questions, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps.
+
+### WHAT YOU MUST DO:
+- Work through the problem step by step with full detail
+- Show all intermediate calculations explicitly
+- Verify your answer through at least one alternative method or sanity check
+- For hard problems, explore multiple solution approaches
+- For easy problems, still show your work clearly but don't pad unnecessarily
+
+### RESTRICTIONS:
+- DO NOT skip steps or say "it's obvious that..."
+- DO NOT use formal academic prose — keep it conversational and exploratory
+- DO NOT compress your reasoning — thoroughness produces correctness
+
+### OUTPUT RULES:
+- After thinking, end with the closing thinking tag, then your output has to have a clear, step-by-step summary that walks through the key steps taken to arrive at the answer. This summary should:
+    - Don't write step-by-step summary anywhere
+    - Present the logical progression in clean, readable steps (not the raw internal monologue)
+    - Conclude with the final answer in the same format as the original (e.g., \boxed{{}})
+- **CRITICAL:** The final answer section must ALWAYS include a step-by-step summary before the boxed answer. NEVER jump straight from reasoning to just \boxed{{}} with no summary.
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+
+Your solution:

@@ -1,0 +1,47 @@
+### TASK
+You will receive an input containing two parts: a **problem statement** and a **reasoning trace** (an authentic, detailed internal monologue of someone working through the problem).
+
+Ask yourself: was this problem fundamentally easy, moderate, or hard for a careful human thinker? Based on that judgment, decide how to improve the reasoning.
+
+**LENGTH RULES BASED ON DIFFICULTY:**
+- **EASY problems**: The trace should be at MINIMUM 60% of the original length. You may tighten the logic and remove truly circular repetition, but you must preserve the core reasoning chain, all verification steps, and the exploratory style. Even easy problems benefit from showing work.
+- **MODERATE problems**: The trace should be at MINIMUM 100% of the original length. Keep everything and add any missing verification or intermediate steps.
+- **HARD problems**: The trace should be LONGER than the original — at minimum 120% of the original length. Add missing exploration, alternative approaches, deeper verification, and thorough sanity checks. Hard problems demand extended reasoning.
+
+**If you are unsure about difficulty, treat it as MODERATE or HARD. Never default to compression.**
+
+### THE ORIGINAL STYLE AND TONE MUST SURVIVE
+This is your primary constraint. The original trace sounds like a person thinking out loud. Your reasoning must also sound like a person thinking out loud, the SAME person. If the original says "Wait, that can't be right..." your version should feel equally spontaneous and human. Never flatten exploratory language into formal explanation. Each step should include detailed considerations such as analyzing questions, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps.
+
+### WHAT YOU MUST DO:
+- FIX mistakes if you see clear logical errors and wrong assumptions
+- KEEP productive tangents, self-corrections, and exploratory branches. These are features.
+- INSERT missing logical steps. When there's a gap, add the missing reasoning AS IF the original thinker said it.
+- EXPAND compressed steps by showing the work inline
+- PRESERVE all verification and double-checking steps — these are never redundant
+- When removing anything (easy problems only), ensure you are removing truly circular repetition, not verification or alternative approaches
+
+### RESTRICTIONS:
+- DO NOT rewrite sentences that are already clear
+- DO NOT remove phrases like "hmm," "wait," "actually," "let me think..."
+- DO NOT add formal transitions ("Furthermore," "In conclusion,")
+- DO NOT convert the monologue into structured prose
+- NEVER compress hard problems. NEVER compress moderate problems. For easy problems, compress MINIMALLY.
+
+### OPERATING PRINCIPLE:
+Preserve and reuse original reasoning steps wherever possible. When you must add text, imitate the original's style closely. The default action is to KEEP, not to CUT.
+
+### OUTPUT RULES:
+- After thinking, end with the closing thinking tag, then your output has to have a clear, step-by-step summary that walks through the key steps taken to arrive at the answer. This summary should:
+    - Don't write step-by-step summary anywhere
+    - Present the logical progression in clean, readable steps (not the raw internal monologue)
+    - Conclude with the final answer in the same format as the original (e.g., \boxed{{}})
+- **CRITICAL:** The final answer section must ALWAYS include a step-by-step summary before the boxed answer. NEVER jump straight from reasoning to just \boxed{{}} with no summary.
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+[Reasoning Trace]
+{trace}
+
+Your new solution:

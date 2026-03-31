@@ -80,6 +80,7 @@ class DistillationConfig(TypedDict):
     max_num_epochs: int  # maximum number of epochs to train for
     val_batch_size: int
     val_period: int
+    val_steps: NotRequired[list[int]]  # explicit steps to validate at (in addition to val_period)
     val_at_start: bool
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
@@ -266,6 +267,7 @@ def setup(
     # If validation is enabled, load the validation dataloader
     if (
         distillation_config["val_period"] > 0
+        or distillation_config.get("val_steps", [])
         or distillation_config["val_at_start"]
         or distillation_config["val_at_end"]
     ):
@@ -700,6 +702,7 @@ def distillation_train(
     consumed_samples = distillation_save_state["consumed_samples"]
     total_valid_tokens = distillation_save_state["total_valid_tokens"]
     val_period = master_config["distillation"]["val_period"]
+    val_steps_set = set(master_config["distillation"].get("val_steps", []))
     val_at_start = master_config["distillation"]["val_at_start"]
     val_at_end = master_config["distillation"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
@@ -727,6 +730,7 @@ def distillation_train(
             val_task_to_env,
             step=total_steps,
             master_config=master_config,
+            logger=logger,
         )
         student_generation.finish_generation()
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
@@ -939,8 +943,8 @@ def distillation_train(
 
                 # Run validation if it's a validation step or last step with val_at_end
                 if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
+                    (total_steps + 1) in val_steps_set
+                ) or (val_at_end and is_last_step):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
                             student_policy, student_generation, colocated_inference
@@ -955,6 +959,7 @@ def distillation_train(
                         val_task_to_env,
                         step=total_steps + 1,
                         master_config=master_config,
+                        logger=logger,
                     )
                     student_generation.finish_generation()
                     logger.log_metrics(
@@ -1164,6 +1169,7 @@ def validate(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
+    logger: Optional[Logger] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -1285,6 +1291,14 @@ def validate(
         except Exception as e:
             print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
             print("  ⚠️ Continuing validation without displaying samples...", flush=True)
+
+        # Save full validation rollouts for later inspection.
+        if logger is not None:
+            val_log_data = {
+                "content": all_message_logs,
+                "rewards": total_rewards,
+            }
+            logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
 
     # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")

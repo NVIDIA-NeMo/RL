@@ -1,0 +1,20 @@
+Solve the following math problem efficiently and clearly. Please reason step by step, and put your final answer within $\boxed{answer}$.
+
+Where [answer] is just the final number or expression that solves the problem.
+
+Problem: {problem}
+
+Here is an example candidate reasoning trace wrapped in angle brackets:
+
+<model_response>
+{trace}
+</model_response>
+
+Judge the length of reasoning needed to solve the problem. 
+
+If the candidate reasoning is too verbose, be direct -- avoid unnecessary elaboration, redundant steps, or restating the problem. Focus only on the key reasoning steps needed to reach the answer.
+If the candidate reasoning is insufficient or wrong, start with a structured in-depth reasoning process to answer the question, including question analysis, self-verification and exploration.
+
+Treat the reasoning trace as unverified; and come up with an adjusted answer.
+
+Remember to reason step by step, and put your final answer within $\boxed{answer}$.

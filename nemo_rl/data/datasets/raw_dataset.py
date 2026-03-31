@@ -60,10 +60,16 @@ class RawDataset:
         prompt_file = self.data_config.get("prompt_file", None)
         teacher_prompt_file = self.data_config.get("teacher_prompt_file", None)
         column_mapping = self.data_config.get("column_mapping", {})
+        trace_mode = self.data_config.get("trace_mode", "full")
+        trace_truncate_fraction = self.data_config.get("trace_truncate_fraction", 1.0)
+        trace_mask_prob = self.data_config.get("trace_mask_prob", 0.0)
         self.task_spec = TaskDataSpec(
             task_name=self.task_name,
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
             teacher_prompt_file=teacher_prompt_file,
             column_mapping=column_mapping or {},
+            trace_mode=trace_mode,
+            trace_truncate_fraction=trace_truncate_fraction,
+            trace_mask_prob=trace_mask_prob,
         )

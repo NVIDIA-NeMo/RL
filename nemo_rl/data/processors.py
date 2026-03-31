@@ -16,6 +16,8 @@
 
 import json
 import logging
+import random
+import re
 from typing import Any, Dict, cast
 
 import torch
@@ -445,6 +447,41 @@ def math_gdpo_data_processor(
     return output
 
 
+def _process_trace(trace: str, task_data_spec: TaskDataSpec) -> str:
+    """Apply trace conditioning mode to a candidate trace string.
+
+    Supports four modes controlled by task_data_spec.trace_mode:
+      - "full":     return the trace unchanged
+      - "truncate": keep only the first trace_truncate_fraction of characters
+      - "mask":     randomly drop sentences with probability trace_mask_prob
+      - "none":     return empty string (removes trace from teacher context)
+    """
+    mode = task_data_spec.trace_mode
+    if mode == "full":
+        return trace
+    if mode == "none":
+        return ""
+    if mode == "truncate":
+        frac = task_data_spec.trace_truncate_fraction
+        cut = int(len(trace) * frac)
+        # Cut at the last sentence boundary before the cutoff point
+        truncated = trace[:cut]
+        last_period = max(truncated.rfind(". "), truncated.rfind(".\n"))
+        if last_period > 0:
+            truncated = truncated[: last_period + 1]
+        return truncated
+    if mode == "mask":
+        prob = task_data_spec.trace_mask_prob
+        # Split on sentence boundaries (period/newline), keep each with 1-prob
+        sentences = re.split(r"(?<=[.!?\n])\s+", trace)
+        kept = [s for s in sentences if random.random() > prob]
+        if not kept:
+            # Always keep at least one sentence to avoid empty trace
+            kept = [sentences[0]] if sentences else [""]
+        return " ".join(kept)
+    return trace
+
+
 def math_hf_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -489,6 +526,12 @@ def math_hf_data_processor(
             if key not in ("messages", "task_name") and isinstance(value, str):
                 mapped_key = task_data_spec.column_mapping.get(key, key)
                 format_kwargs.setdefault(mapped_key, value)
+
+        # Apply trace conditioning mode (truncate/mask/none) before formatting
+        if "trace" in format_kwargs and task_data_spec.trace_mode != "full":
+            format_kwargs["trace"] = _process_trace(
+                format_kwargs["trace"], task_data_spec
+            )
 
         teacher_content = task_data_spec.teacher_prompt.format_map(format_kwargs)
         teacher_user_msg: dict[str, Any] = {"role": "user", "content": teacher_content}

@@ -1,0 +1,45 @@
+### TASK
+You will receive a **problem statement** and a **candidate answer** from a student. The candidate answer may or may not be correct.
+
+Your job is to solve the problem INDEPENDENTLY from scratch with thorough, careful reasoning. Use the candidate answer ONLY as a reference point to double-check your own work at the end — do NOT let it guide or shorten your reasoning process.
+
+**IMPORTANT: You must solve the problem yourself through detailed step-by-step reasoning. Do NOT simply verify or edit the candidate answer. Produce your own complete solution.**
+
+### YOUR APPROACH:
+1. Read the problem carefully and identify what is being asked
+2. Develop your own solution strategy WITHOUT looking at the candidate
+3. Work through the problem step by step, showing all calculations
+4. Only after reaching your own answer, compare it with the candidate's answer
+5. If they disagree, carefully re-examine both approaches to determine which is correct
+6. If they agree, add an independent verification step to build confidence
+
+### STYLE:
+Reason like a careful human thinker — think out loud, explore ideas, catch and correct your own mistakes. Use natural language like "hmm," "wait," "let me think about this differently," "actually, I realize..." Show your genuine thought process, not a polished proof.
+
+### WHAT YOU MUST DO:
+- Solve the problem from scratch with detailed reasoning
+- Show all intermediate calculations and logical steps
+- Verify your answer through at least one alternative method
+- Consider edge cases and potential pitfalls
+- If the problem is hard, explore multiple approaches before settling on one
+
+### RESTRICTIONS:
+- DO NOT simply rewrite or edit the candidate answer
+- DO NOT let the candidate's approach constrain your reasoning
+- DO NOT skip steps because "the candidate already showed this"
+- DO NOT compress your reasoning — thoroughness produces correctness
+
+### OUTPUT RULES:
+- After thinking, end with the closing thinking tag, then your output has to have a clear, step-by-step summary that walks through the key steps taken to arrive at the answer. This summary should:
+    - Don't write step-by-step summary anywhere
+    - Present the logical progression in clean, readable steps (not the raw internal monologue)
+    - Conclude with the final answer in the same format as the original (e.g., \boxed{{}})
+- **CRITICAL:** The final answer section must ALWAYS include a step-by-step summary before the boxed answer. NEVER jump straight from reasoning to just \boxed{{}} with no summary.
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+[Candidate Answer — use only for verification, not as a starting point]
+{trace}
+
+Your independent solution:

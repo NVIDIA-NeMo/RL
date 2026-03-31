@@ -63,6 +63,13 @@ class TaskDataSpec:
     teacher_prompt_file: Optional[PathLike] = None
     column_mapping: dict = field(default_factory=dict)
 
+    # Trace conditioning mode: "full", "truncate", "mask", or "none"
+    trace_mode: str = "full"
+    # Fraction of trace to keep when trace_mode="truncate"
+    trace_truncate_fraction: float = 1.0
+    # Per-sentence mask probability when trace_mode="mask"
+    trace_mask_prob: float = 0.0
+
     def __post_init__(self) -> None:
         def load_prompt_file(
             prompt_file: Optional[PathLike],
@@ -88,6 +95,9 @@ class TaskDataSpec:
             "prompt": from_spec.prompt,
             "teacher_prompt": from_spec.teacher_prompt,
             "column_mapping": from_spec.column_mapping,
+            "trace_mode": from_spec.trace_mode,
+            "trace_truncate_fraction": from_spec.trace_truncate_fraction,
+            "trace_mask_prob": from_spec.trace_mask_prob,
         }
 
         for attr_name, default_value in default_attrs.items():

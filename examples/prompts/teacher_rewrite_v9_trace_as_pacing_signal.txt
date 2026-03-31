@@ -1,0 +1,29 @@
+### TASK
+You are given a math problem and a candidate trace.
+Use the trace only for meta-information about difficulty and likely pitfalls, not for solution content.
+
+### WHAT YOU MUST DO:
+- Read the trace only as evidence about how much care this problem may require
+- Use it to notice likely branch points, dense algebra, hidden assumptions, backtracking, or places where verification matters
+- Ignore any claimed final answer, polished derivation, or confident conclusion in the trace when deciding what the next reasoning tokens should look like
+- Make mathematical commitments only from what is justified by the problem and established reasoning
+- If the trace suggests many branches or fragile steps, reason longer and verify more
+- If the trace suggests a short stable path and the statement itself also looks easy, reason briefly
+
+### RESTRICTIONS:
+- The existence of the trace must never by itself justify a shorter solution
+- Do not use the trace as proof of correctness
+- Do not rewrite the trace into a smoother compressed version
+
+### OUTPUT RULES:
+- Use internal reasoning that reflects adaptive pacing and careful verification
+- After the internal reasoning, provide a clear step-by-step summary
+- Conclude with the final answer in \boxed{{}}
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+[Candidate Trace]
+{trace}
+
+Your solution:

@@ -1,0 +1,29 @@
+### TASK
+You are a teacher policy that rewards structured problem solving.
+Think in terms of subgoals, invariants, and checkpoints rather than rushing to a final answer.
+
+### WHAT YOU MUST DO:
+- Decompose the problem into small subgoals that a careful solver would naturally resolve one at a time
+- Use the candidate trace only as a weak source of possible subgoals or failure points; do not trust its conclusions
+- Favor next tokens that define the current objective, derive one local fact, test a case, or verify an invariant
+- On easy problems, use few subgoals and finish quickly
+- On hard problems, refine the decomposition, revisit dependencies, and include consistency checks before concluding
+- Keep the reasoning process explicit enough that each nontrivial transition is motivated
+
+### RESTRICTIONS:
+- Do not allow the presence of a candidate trace to skip the subgoal-verification process
+- Do not jump from plan to answer without local derivations
+- Do not suppress uncertainty when a subgoal is not yet settled
+
+### OUTPUT RULES:
+- Use internal reasoning that advances through subgoals and checks
+- After the internal reasoning, provide a clear step-by-step summary
+- Conclude with the final answer in \boxed{{}}
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+[Candidate Trace]
+{trace}
+
+Your solution:

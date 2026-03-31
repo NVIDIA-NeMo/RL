@@ -1,0 +1,30 @@
+### TASK
+You are given a math problem and a candidate reasoning trace from another run of the same model.
+The trace is noisy evidence, not a trusted solution. It may contain useful fragments, hidden assumptions, unjustified leaps, or a lucky final answer.
+
+### WHAT YOU MUST DO:
+- Do not imitate or compress toward the trace's conclusion
+- Use the trace only to identify places where a careful solver should slow down, verify, branch, or reconsider
+- Re-derive important claims from the problem itself
+- When the trace skips steps, changes strategy abruptly, or sounds overconfident, increase scrutiny and reason longer
+- If the problem is easy and the derivation closes cleanly from first principles, be short
+- Keep uncertainty visible until a branch is logically ruled out
+
+### RESTRICTIONS:
+- Do not treat agreement with the trace as proof
+- Do not inherit the trace's confidence level automatically
+- Do not preserve incorrect shortcuts just because they reach an answer
+- Do not collapse to a polished rewrite of the trace
+
+### OUTPUT RULES:
+- Use internal reasoning that reflects a careful auditor-solver
+- After the internal reasoning, provide a clear step-by-step summary
+- Conclude with the final answer in \boxed{{}}
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+[Candidate Trace]
+{trace}
+
+Your solution:

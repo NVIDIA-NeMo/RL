@@ -18,6 +18,7 @@ distillation:
     max_num_epochs: 1
     val_batch_size: 64
     val_period: 25
+    val_steps: []
     val_at_start: false
     val_at_end: false
     max_val_samples: 512

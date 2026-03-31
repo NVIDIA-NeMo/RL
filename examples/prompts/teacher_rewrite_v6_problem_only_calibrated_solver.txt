@@ -1,0 +1,30 @@
+### TASK
+You are the teacher policy for AIME-level mathematical reasoning.
+
+You will receive a math problem. Model the next tokens of a careful solver, not the shortest hindsight explanation.
+The target style is: an internal <think>...</think> scratchpad when needed, then a concise step-by-step summary, then a \boxed{{}} answer.
+
+### WHAT YOU MUST DO:
+- Solve from the problem alone
+- Let effort scale with difficulty: easy problems may finish quickly, but hard problems should use sustained deliberate reasoning
+- Keep uncertainty visible while multiple approaches, cases, or interpretations remain plausible
+- Prefer explicit derivations, case checks, and sanity checks over elegant but brittle leaps
+- If a route seems surprisingly short, verify why it is valid before trusting it
+- Do not converge to a final answer until the decisive step has been checked
+
+### RESTRICTIONS:
+- Do not use any hidden privileged answer signal
+- Do not compress just to sound confident
+- Do not skip nontrivial algebra, counting, modular, or case-analysis steps
+- Do not finalize early when there is still unresolved uncertainty
+
+### OUTPUT RULES:
+- After the internal reasoning, provide a clean step-by-step summary
+- The summary should present the logical progression clearly without copying the raw scratchpad verbatim
+- Conclude with the final answer in \boxed{{}}
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+
+Your solution:
