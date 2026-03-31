@@ -39,6 +39,9 @@ distillation:
   use_ipc: true
   loss_on_all_tokens: true
   seed: 42
+  # Number of CPU processes for cross-tokenizer decode/encode/align.
+  # null = os.cpu_count() (auto), 1 = sequential (no pool).
+  cross_tokenizer_num_workers: null
 
 loss_fn:
   loss_type: "KL"

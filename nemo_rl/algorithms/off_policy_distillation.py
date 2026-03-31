@@ -26,8 +26,11 @@ Key difference from on-policy distillation (in distillation.py):
 - Simpler training loop without rollout generation
 """
 
+import math
+import multiprocessing
 import os
 import warnings
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 import sys
 if sys.version_info >= (3, 11):
@@ -111,6 +114,8 @@ class OffPolicyDistillationConfig(TypedDict):
     val_global_batch_size: NotRequired[int]  # Validation batch size
     val_micro_batch_size: NotRequired[int]  # Validation micro batch size
     val_at_start: NotRequired[bool]  # Run validation before training starts
+    # CPU processes for parallel cross-tokenizer decode/encode/align (None = auto, 1 = sequential)
+    cross_tokenizer_num_workers: NotRequired[Optional[int]]
 
 
 class OffPolicyDistillationSaveState(TypedDict):
@@ -147,6 +152,41 @@ class OffPolicyMasterConfig(TypedDict):
     cluster: ClusterConfig  # Cluster configuration
     checkpointing: CheckpointingConfig  # Checkpointing configuration
     token_aligner: NotRequired[TokenAlignerConfig]  # Cross-tokenizer config (optional)
+
+
+# ===============================================================================
+# Cross-Tokenizer Parallel Processing
+# ===============================================================================
+
+# Module-level global set by _init_align_worker for each pool process.
+_ct_token_aligner = None
+
+
+def _init_align_worker(token_aligner):
+    """Initializer for ProcessPoolExecutor workers.
+
+    Stores the TokenAligner once per process to avoid re-pickling every call.
+    """
+    global _ct_token_aligner
+    _ct_token_aligner = token_aligner
+
+
+def _align_chunk(args):
+    """Align a chunk of (student, teacher) token-ID pairs.
+
+    Called by ProcessPoolExecutor.  Only the alignment (the expensive DP step)
+    runs in the worker; fast batch decode/encode stays on the driver.
+
+    Args:
+        args: (student_ids_chunk, teacher_ids_chunk) — both list[list[int]].
+
+    Returns:
+        aligned_pairs from ``TokenAligner.align``.
+    """
+    student_ids_chunk, teacher_ids_chunk = args
+    student_t = torch.tensor(student_ids_chunk)
+    teacher_t = torch.tensor(teacher_ids_chunk)
+    return _ct_token_aligner.align(student_t, teacher_t)
 
 
 # ===============================================================================
@@ -723,6 +763,25 @@ def off_policy_distillation_train(
     # Run off-policy distillation training
     batch: BatchedDataDict[DatumSpec]
 
+    # Create a process pool for cross-tokenizer processing (if enabled).
+    cross_tokenizer_enabled = token_aligner is not None and teacher_tokenizer is not None
+    ct_num_workers = master_config["distillation"].get("cross_tokenizer_num_workers", None)
+    if ct_num_workers is None:
+        ct_num_workers = os.cpu_count() or 1
+    ct_pool: Optional[ProcessPoolExecutor] = None
+    if cross_tokenizer_enabled and ct_num_workers > 1:
+        mp_ctx = multiprocessing.get_context("forkserver")
+        ct_pool = ProcessPoolExecutor(
+            max_workers=ct_num_workers,
+            mp_context=mp_ctx,
+            initializer=_init_align_worker,
+            initargs=(token_aligner,),
+        )
+        print(
+            f"  ✓ Cross-tokenizer process pool created with {ct_num_workers} workers",
+            flush=True,
+        )
+
     while total_steps < max_steps and current_epoch < max_epochs:
         print(
             f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_epochs} {'=' * 25}",
@@ -782,7 +841,6 @@ def off_policy_distillation_train(
                     train_data.to("cpu")
 
                 # ==== Cross-Tokenizer Data Processing ====
-                cross_tokenizer_enabled = token_aligner is not None and teacher_tokenizer is not None
                 teacher_data = None
 
                 if cross_tokenizer_enabled:
@@ -790,29 +848,44 @@ def off_policy_distillation_train(
                         student_ids = train_data["input_ids"]
                         batch_size_ct = student_ids.shape[0]
 
-                        texts = [
-                            tokenizer.decode(student_ids[i].tolist(), skip_special_tokens=True)
-                            for i in range(batch_size_ct)
-                        ]
-
-                        max_teacher_len = master_config["teacher"].get(
+                        max_teacher_len_rt = master_config["teacher"].get(
                             "max_total_sequence_length",
                             master_config["policy"]["max_total_sequence_length"],
                         )
+
+                        texts = tokenizer.batch_decode(
+                            student_ids.tolist(), skip_special_tokens=True
+                        )
                         teacher_encoded = teacher_tokenizer(
                             texts,
-                            max_length=max_teacher_len,
+                            max_length=max_teacher_len_rt,
                             padding="max_length",
                             truncation=True,
                             return_tensors="pt",
                         )
                         teacher_input_ids = teacher_encoded["input_ids"]
                         teacher_attention_mask = teacher_encoded["attention_mask"]
-                        teacher_input_lengths_ct = teacher_attention_mask.sum(dim=1)
 
-                        aligned_pairs = token_aligner.align(
-                            student_ids, teacher_input_ids
-                        )
+                        if ct_pool is not None and batch_size_ct > 1:
+                            n_chunks = min(batch_size_ct, ct_num_workers)
+                            chunk_size = math.ceil(batch_size_ct / n_chunks)
+                            student_ids_list = student_ids.tolist()
+                            teacher_ids_list = teacher_input_ids.tolist()
+                            chunk_args = [
+                                (student_ids_list[i : i + chunk_size],
+                                 teacher_ids_list[i : i + chunk_size])
+                                for i in range(0, batch_size_ct, chunk_size)
+                            ]
+                            results = list(ct_pool.map(_align_chunk, chunk_args))
+                            aligned_pairs = []
+                            for r in results:
+                                aligned_pairs.extend(r)
+                        else:
+                            aligned_pairs = token_aligner.align(
+                                student_ids, teacher_input_ids
+                            )
+
+                        teacher_input_lengths_ct = teacher_attention_mask.sum(dim=1)
 
                         loss_fn.set_cross_tokenizer_data(
                             teacher_input_ids=teacher_input_ids,
@@ -852,7 +925,7 @@ def off_policy_distillation_train(
                     with timer.time("teacher_logprob_inference"):
                         teacher_logits = teacher_policy.train(
                             teacher_fwd_data,
-                            loss_fn,
+                            None,
                             eval_mode=True,
                             is_teacher=True,
                             topk_logits=teacher_topk_k,
@@ -1111,3 +1184,6 @@ def off_policy_distillation_train(
         # End of epoch
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+
+    if ct_pool is not None:
+        ct_pool.shutdown(wait=False)
