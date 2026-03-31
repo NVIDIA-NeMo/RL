@@ -1757,46 +1757,6 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
     def return_state_dict(self):
         return self.model.state_dict()
 
-    def get_model_state_dict(self) -> dict[str, torch.Tensor]:
-        """Get the model's state dict for EMA teacher updates.
-
-        Returns:
-            dict: Model state dict
-        """
-        return self.model.state_dict()
-
-    def load_model_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """Load a state dict into the model for EMA teacher initialization.
-
-        Args:
-            state_dict: State dict to load into the model
-        """
-        self.model.load_state_dict(state_dict, strict=True)
-
-    def update_model_with_ema(
-        self, student_state_dict: dict[str, torch.Tensor], ema_decay: float
-    ) -> None:
-        """Update model parameters using EMA from student state dict.
-
-        Formula: teacher_param = ema_decay * teacher_param + (1 - ema_decay) * student_param
-
-        Args:
-            student_state_dict: State dict from the student model
-            ema_decay: EMA decay rate (e.g., 0.999)
-        """
-        with torch.no_grad():
-            teacher_state_dict = self.model.state_dict()
-            for name, teacher_param in teacher_state_dict.items():
-                if name in student_state_dict:
-                    student_param = student_state_dict[name]
-                    # Move student param to same device as teacher param (handles CPU/GPU mismatch)
-                    if student_param.device != teacher_param.device:
-                        student_param = student_param.to(teacher_param.device)
-                    # EMA update: teacher = decay * teacher + (1 - decay) * student
-                    teacher_param.mul_(ema_decay).add_(
-                        student_param, alpha=(1.0 - ema_decay)
-                    )
-
     def return_model_config(self) -> dict[str, Any]:
         """Return the model configuration as a dictionary.
 

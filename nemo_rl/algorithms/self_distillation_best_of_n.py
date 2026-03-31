@@ -40,8 +40,12 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+)
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
+    PY_EXECUTABLES,
     RayVirtualCluster,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -64,6 +68,12 @@ from nemo_rl.utils.logger import (
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+
+# Register the distillation worker extension so Ray knows which venv to use
+DISTILLATION_WORKER_V2_FQN = (
+    "nemo_rl.algorithms.distillation_worker_extension.DistillationWorkerV2"
+)
+ACTOR_ENVIRONMENT_REGISTRY[DISTILLATION_WORKER_V2_FQN] = PY_EXECUTABLES.AUTOMODEL
 
 # ===============================================================================
 # Configuration
@@ -492,29 +502,42 @@ def _align_teacher_topk_to_student(
     return aligned_logits, aligned_indices
 
 
+def _copy_weights(source_policy: Policy, target_policy: Policy) -> None:
+    """Copy weights from source policy to target policy via worker extension methods."""
+    source_states = source_policy.run_all_workers_single_data("get_model_state_dict")
+    target_futures = []
+    for worker_idx, state_dict in enumerate(source_states):
+        future = target_policy.worker_group.workers[worker_idx].load_model_state_dict.remote(
+            state_dict=state_dict
+        )
+        target_futures.append(future)
+    ray.get(target_futures)
+
+
 def _update_ema_teacher(
-    student_policy: ColocatablePolicyInterface,
-    teacher_policy: ColocatablePolicyInterface,
+    student_policy: Policy,
+    teacher_policy: Policy,
     ema_decay: float,
 ) -> None:
     """Update teacher parameters using exponential moving average (EMA) of student parameters.
 
     Formula: teacher_param = ema_decay * teacher_param + (1 - ema_decay) * student_param
 
-    Args:
-        student_policy: The student policy whose parameters will be used for update
-        teacher_policy: The teacher policy whose parameters will be updated via EMA
-        ema_decay: EMA decay rate (typically 0.999 or 0.9999). Higher = slower teacher updates.
+    Uses worker extension methods (get_model_state_dict, update_model_with_ema)
+    via run_all_workers_single_data instead of modifying the base worker classes.
     """
     if ema_decay >= 1.0:
-        # No EMA update needed
         return
 
-    # Get policy update through remote call
-    update_info = {
-        "ema_decay": ema_decay,
-    }
-    teacher_policy.update_from_ema(student_policy, update_info)
+    student_states = student_policy.run_all_workers_single_data("get_model_state_dict")
+    teacher_futures = []
+    for worker_idx, student_state_dict in enumerate(student_states):
+        future = teacher_policy.worker_group.workers[worker_idx].update_model_with_ema.remote(
+            student_state_dict=student_state_dict,
+            ema_decay=ema_decay,
+        )
+        teacher_futures.append(future)
+    ray.get(teacher_futures)
 
 
 def setup(
@@ -820,6 +843,7 @@ def setup(
         optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=False,
+        worker_extension_cls_fqn=DISTILLATION_WORKER_V2_FQN,
     )
 
     if student_generation is not None:
@@ -884,12 +908,13 @@ def setup(
             optimizer_path=None,  # Teacher doesn't need optimizer
             init_optimizer=False,
             init_reference_model=False,
+            worker_extension_cls_fqn=DISTILLATION_WORKER_V2_FQN,
         )
 
         # If no checkpoint, copy student weights to teacher
         if teacher_weights_path is None:
             print("  ⚠️ Initializing teacher from current student weights...", flush=True)
-            teacher_policy.copy_weights_from(student_policy)
+            _copy_weights(student_policy, teacher_policy)
 
         print(f"  ✓ EMA teacher initialized with decay={ema_decay}", flush=True)
 
