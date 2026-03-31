@@ -17,6 +17,7 @@ dist/
 *.vscode/
 release_run*
 ckpts/
+mlruns/
 
 # Test
 coverage.json
