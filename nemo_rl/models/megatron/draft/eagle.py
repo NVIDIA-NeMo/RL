@@ -47,6 +47,7 @@ class EagleModel(MegatronModule):
                 not torch.cuda.is_available(),
             ),
         )
+        # Many specdec libraries use LlamaForCausalLMEagle3 class by default so rope is hardcoded
         self.eagle_module = EagleModule(
             config=config, rotary_pos_emb=rotary_pos_emb, bias=False
         )
