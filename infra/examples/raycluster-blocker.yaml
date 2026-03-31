@@ -1,0 +1,17 @@
+# A simple pod that occupies 1 GPU, used to test KAI gang scheduling.
+# Uses the default scheduler (not KAI) so it won't be preempted.
+# Deploy this first, then try to deploy kai_scheduled_rayclusters.yaml.
+# With only 1 GPU free, KAI should hold BOTH rayclusters pending (all-or-nothing).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-blocker
+spec:
+  restartPolicy: Never
+  containers:
+  - name: blocker
+    image: nvidia/cuda:12.8.1-base-ubuntu24.04
+    command: ["sleep", "infinity"]
+    resources:
+      limits:
+        nvidia.com/gpu: "1"

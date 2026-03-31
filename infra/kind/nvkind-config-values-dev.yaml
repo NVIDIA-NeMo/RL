@@ -1,0 +1,7 @@
+# Dev config: mount local nemo-rl source into kind nodes.
+# Pods can then use hostPath: /workspace/nemo-rl to access the code.
+workers:
+- devices: all
+extraMounts:
+- hostPath: /home/terryk/nemo-rl
+  containerPath: /workspace/nemo-rl

@@ -1,0 +1,40 @@
+# KAI Scheduler queue hierarchy for local dev.
+# Unlimited quotas — appropriate for single-user kind clusters.
+apiVersion: scheduling.run.ai/v2
+kind: Queue
+metadata:
+  name: department-1
+spec:
+  resources:
+    gpu:
+      quota: -1
+      limit: -1
+      overQuotaWeight: 1
+    cpu:
+      quota: -1
+      limit: -1
+      overQuotaWeight: 1
+    memory:
+      quota: -1
+      limit: -1
+      overQuotaWeight: 1
+---
+apiVersion: scheduling.run.ai/v2
+kind: Queue
+metadata:
+  name: team-a
+spec:
+  parentQueue: department-1
+  resources:
+    gpu:
+      quota: -1
+      limit: -1
+      overQuotaWeight: 1
+    cpu:
+      quota: -1
+      limit: -1
+      overQuotaWeight: 1
+    memory:
+      quota: -1
+      limit: -1
+      overQuotaWeight: 1

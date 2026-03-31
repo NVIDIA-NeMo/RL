@@ -1,0 +1,4 @@
+# GPU Operator values for production clusters.
+# Set driver.enabled=false if the host already has the NVIDIA driver installed.
+driver:
+  enabled: true
