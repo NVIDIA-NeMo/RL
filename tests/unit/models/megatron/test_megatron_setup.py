@@ -508,11 +508,15 @@ class TestCreateCheckpointConfig:
 
         pretrained_path = str(tmp_path / "pretrained")
         weights_path = str(tmp_path / "weights")
+        optimizer_path = str(tmp_path / "optimizer")
 
-        checkpoint_config = _create_checkpoint_config(pretrained_path, weights_path)
+        checkpoint_config = _create_checkpoint_config(
+            pretrained_path, weights_path, optimizer_path
+        )
 
         assert checkpoint_config.save == weights_path
         assert checkpoint_config.load == weights_path
+        assert checkpoint_config.load_optim is True
         assert checkpoint_config.pretrained_checkpoint == pretrained_path
         assert checkpoint_config.async_save is False
         assert checkpoint_config.fully_parallel_save is True
@@ -752,6 +756,7 @@ class TestValidateAndSetConfig:
                 hf_model_name="test-model",
                 pretrained_path="/path/to/model",
                 weights_path=None,
+                optimizer_path=None,
             )
 
         assert "Reward models are not yet supported" in str(exc_info.value)
@@ -797,6 +802,7 @@ class TestValidateAndSetConfig:
                     hf_model_name="test-model",
                     pretrained_path="/path/to/model",
                     weights_path=None,
+                    optimizer_path=None,
                 )
 
                 assert runtime_config.is_generation_colocated is True

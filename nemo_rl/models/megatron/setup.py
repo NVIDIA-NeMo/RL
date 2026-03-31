@@ -205,6 +205,7 @@ def validate_and_set_config(
     hf_model_name,
     pretrained_path,
     weights_path,
+    optimizer_path,
 ):
     # Handle generation configuration
     is_generation_colocated = None
@@ -245,7 +246,13 @@ def validate_and_set_config(
         )
 
     megatron_cfg, model_cfg = setup_model_config(
-        config, rank, dtype, hf_model_name, pretrained_path, weights_path
+        config,
+        rank,
+        dtype,
+        hf_model_name,
+        pretrained_path,
+        weights_path,
+        optimizer_path,
     )
 
     final_padded_vocab_size = calculate_padded_vocab_size(
@@ -291,6 +298,7 @@ def setup_model_config(
     hf_model_name: str,
     pretrained_path: str,
     weights_path: Optional[str] = None,
+    optimizer_path: Optional[str] = None,
 ) -> tuple[ConfigContainer, Any]:
     """Handle all the model configuration logic."""
     # Load pretrained run config
@@ -349,7 +357,9 @@ def setup_model_config(
     _validate_chunking_config(config)
 
     # Create checkpoint configs
-    checkpoint_config = _create_checkpoint_config(pretrained_path, weights_path)
+    checkpoint_config = _create_checkpoint_config(
+        pretrained_path, weights_path, optimizer_path
+    )
 
     # Validate training configuration
     _validate_training_config(config, model_cfg)
@@ -479,13 +489,14 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")
     if attention_backend is not None:
-        if isinstance(attention_backend, str):
+        for _nvte_var in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
+            os.environ.pop(_nvte_var, None)
+        try:
             model_cfg.attention_backend = AttnBackend[attention_backend]
-        elif isinstance(attention_backend, int):
-            model_cfg.attention_backend = AttnBackend(attention_backend)
-        else:
+        except KeyError:
             raise ValueError(
-                f"Unsupported {type(attention_backend)=}, expected str or int"
+                f"Invalid attention backend: {attention_backend}. "
+                f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
 
     # FP8 configuration
@@ -533,13 +544,14 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
 
 
 def _create_checkpoint_config(
-    pretrained_path: str, weights_path: Optional[str]
+    pretrained_path: str, weights_path: Optional[str], optimizer_path: Optional[str]
 ) -> CheckpointConfig:
     """Create checkpoint configurations."""
     return CheckpointConfig(
         save_interval=100,
         save=weights_path,
         load=weights_path,
+        load_optim=optimizer_path is not None,
         pretrained_checkpoint=pretrained_path,
         async_save=False,
         fully_parallel_save=True,
