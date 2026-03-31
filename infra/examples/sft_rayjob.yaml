@@ -1,0 +1,83 @@
+# 2-GPU RayJob for running nemo-rl SFT training.
+# Creates a cluster, runs SFT, then tears down automatically.
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: sft-job
+  labels:
+    kai.scheduler/queue: team-a
+spec:
+  entrypoint: "cd /opt/nemo-rl && bash tests/functional/sft.sh"
+  # HTTPMode is required with KAI scheduler — K8sJobMode creates a separate
+  # submitter pod after the cluster is ready, which breaks gang scheduling.
+  submissionMode: HTTPMode
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 60
+  rayClusterSpec:
+    rayVersion: "2.52.0"
+    headGroupSpec:
+      rayStartParams:
+        object-store-memory: "200000000"
+      template:
+        spec:
+          schedulerName: kai-scheduler
+          imagePullSecrets:
+          - name: nvcr-secret
+          containers:
+          - name: ray-head
+            image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+            resources:
+              limits:
+                cpu: "4"
+                memory: "16Gi"
+              requests:
+                cpu: "1"
+                memory: "4Gi"
+            ports:
+            - containerPort: 6379
+              name: gcs-server
+            - containerPort: 8265
+              name: dashboard
+            - containerPort: 10001
+              name: client
+            volumeMounts:
+            - name: nemo-rl-src
+              mountPath: /workspace/nemo-rl
+          volumes:
+          - name: nemo-rl-src
+            hostPath:
+              path: /workspace/nemo-rl
+              type: DirectoryOrCreate
+    workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 1
+      rayStartParams:
+        num-gpus: "2"
+        object-store-memory: "200000000"
+      template:
+        spec:
+          schedulerName: kai-scheduler
+          imagePullSecrets:
+          - name: nvcr-secret
+          containers:
+          - name: ray-worker
+            image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+            resources:
+              limits:
+                cpu: "8"
+                memory: "32Gi"
+                nvidia.com/gpu: "2"
+              requests:
+                cpu: "2"
+                memory: "8Gi"
+                nvidia.com/gpu: "2"
+            volumeMounts:
+            - name: nemo-rl-src
+              mountPath: /workspace/nemo-rl
+          volumes:
+          - name: nemo-rl-src
+            hostPath:
+              path: /workspace/nemo-rl
+              type: DirectoryOrCreate

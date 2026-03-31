@@ -1,0 +1,18 @@
+# NOTE: These overrides are kind-specific. On a real cluster with the GPU Operator,
+# you would NOT use this file at all — the GPU Operator deploys its own device plugin.
+
+# Override default affinity which requires NFD labels (not available in kind).
+# On a real cluster, NFD is deployed by the GPU Operator, so the default affinity works.
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/os
+          operator: In
+          values:
+          - linux
+
+# The device plugin pod needs the nvidia runtime to access NVML for GPU discovery.
+# On a real cluster, the GPU Operator handles this automatically.
+runtimeClassName: nvidia

@@ -1,0 +1,70 @@
+environments:
+  kind:
+    values:
+    - gpu_backend: device-plugin   # nvkind handles toolkit/runtime, only need device plugin
+  prod:
+    values:
+    - gpu_backend: gpu-operator    # full operator manages driver, toolkit, device plugin, NFD
+
+---
+
+repositories:
+- name: nvdp
+  url: https://nvidia.github.io/k8s-device-plugin
+- name: nvidia
+  url: https://helm.ngc.nvidia.com/nvidia
+- name: kuberay
+  url: https://ray-project.github.io/kuberay-helm/
+- name: prometheus-community
+  url: https://prometheus-community.github.io/helm-charts
+
+releases:
+#
+# GPU: device plugin only (kind) — nvkind handles the rest
+#
+{{ if eq .Environment.Values.gpu_backend "device-plugin" }}
+- name: nvidia-device-plugin
+  namespace: nvidia
+  createNamespace: true
+  chart: nvdp/nvidia-device-plugin
+  wait: true
+  values:
+  - values/nvidia-device-plugin.yaml
+{{ end }}
+
+#
+# GPU: full operator (prod) — manages driver, toolkit, device plugin, NFD, DCGM
+#
+{{ if eq .Environment.Values.gpu_backend "gpu-operator" }}
+- name: gpu-operator
+  namespace: gpu-operator
+  createNamespace: true
+  chart: nvidia/gpu-operator
+  wait: true
+  waitForJobs: true
+  values:
+  - values/gpu-operator.yaml
+{{ end }}
+
+#
+# KAI Scheduler: gang scheduling for GPU workloads
+#
+- name: kai-scheduler
+  namespace: kai-scheduler
+  createNamespace: true
+  chart: https://github.com/NVIDIA/KAI-Scheduler/releases/download/v0.13.4/kai-scheduler-v0.13.4.tgz
+  wait: true
+  values:
+  - values/kai-scheduler.yaml
+
+#
+# KubeRay Operator: manages RayCluster CRDs, integrated with KAI for gang scheduling
+#
+- name: kuberay-operator
+  namespace: kuberay-system
+  createNamespace: true
+  chart: kuberay/kuberay-operator
+  version: 1.6.0
+  wait: true
+  values:
+  - values/kuberay-operator.yaml
