@@ -319,6 +319,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     cfg=self.cfg,
                     num_microbatches=num_microbatches,
                     sampling_params=self.sampling_params,
+                    draft_model=self.draft_model,
                 )
 
                 rerun_state_machine = get_rerun_state_machine()

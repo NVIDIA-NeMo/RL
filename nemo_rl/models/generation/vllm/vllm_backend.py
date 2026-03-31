@@ -126,6 +126,12 @@ class VllmInternalWorkerExtension:
     def _split_policy_and_draft_weights(
         weights: list[tuple[str, torch.Tensor]],
     ) -> tuple[list[tuple[str, torch.Tensor]], list[tuple[str, torch.Tensor]]]:
+        """Split trainer-owned draft weights from policy weights.
+
+        This path is only used for the Eagle3 online-training flow, where the
+        trainer exports draft parameters under a `draft.` prefix before sending
+        them to vLLM.
+        """
         policy_weights = []
         draft_weights = []
         for key, tensor in weights:
@@ -143,12 +149,12 @@ class VllmInternalWorkerExtension:
 
         draft_owner = getattr(self.model_runner, "drafter", None)
         draft_model = getattr(draft_owner, "model", None) if draft_owner else None
+
         if draft_model is None:
             print(
                 "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
             )
             return
-
         draft_model.load_weights(weights=draft_weights)
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")

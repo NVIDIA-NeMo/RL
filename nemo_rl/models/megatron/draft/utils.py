@@ -838,6 +838,11 @@ def _map_hf_state_to_eagle_state(
                 )
             mapped_state[layout.lm_head_key] = hf_weight
             continue
+        if hf_key == "d2t":
+            d2t_key = "eagle_module.d2t"
+            if d2t_key in model_state:
+                mapped_state[d2t_key] = hf_weight
+            continue
 
         parsed_layer_key = _parse_layer_checkpoint_key(hf_key)
         if parsed_layer_key is None:

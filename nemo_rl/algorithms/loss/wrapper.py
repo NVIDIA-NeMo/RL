@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 import torch
 import torch.distributed
@@ -21,9 +21,6 @@ import torch.distributed
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-
-if TYPE_CHECKING:
-    pass
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -252,7 +249,8 @@ class DraftLossWrapper:
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
         self.draft_loss_fn = DraftCrossEntropyLossFn(
-            vocab_parallel_group=vocab_parallel_group
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
         )
 
     def __call__(
@@ -277,7 +275,7 @@ class DraftLossWrapper:
             next_token_logits,
             data,
             self.draft_loss_fn,
-            self.vocab_parallel_group,
+            self.vocab_parallel_rank,
             self.vocab_parallel_group,
             self.context_parallel_group,
         )

@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -89,3 +90,30 @@ def test_draft_loss_wrapper_reports_draft_loss_when_weight_is_zero(
 
     assert combined_loss.item() == policy_loss.item()
     assert metrics["draft_loss"] == draft_loss.item()
+
+
+@patch("nemo_rl.algorithms.loss.loss_functions.DistributedCrossEntropy.apply")
+def test_draft_cross_entropy_loss_uses_distributed_path_for_tp(
+    mock_distributed_ce,
+):
+    """DraftCrossEntropyLossFn should delegate to DistributedCrossEntropy under TP."""
+    teacher_logits = torch.randn(2, 3, 5)
+    student_logits = torch.randn(2, 3, 5)
+    token_mask = torch.ones(2, 3)
+    sample_mask = torch.ones(2)
+    global_valid = torch.tensor(6.0)
+    per_token_loss = torch.full((2, 3), 2.0)
+    mock_distributed_ce.return_value = per_token_loss
+
+    loss_fn = DraftCrossEntropyLossFn(vocab_parallel_group=MagicMock())
+    loss = loss_fn(
+        teacher_logits=teacher_logits,
+        student_logits=student_logits,
+        token_mask=token_mask,
+        data=BatchedDataDict({"sample_mask": sample_mask}),
+        global_valid_seqs=global_valid,
+        global_valid_toks=global_valid,
+    )
+
+    mock_distributed_ce.assert_called_once()
+    assert loss.item() == 2.0

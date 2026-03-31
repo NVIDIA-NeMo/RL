@@ -331,12 +331,14 @@ class LossPostProcessor:
         num_microbatches: int = 1,
         cp_normalize: bool = True,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        draft_model: Optional[MegatronModule] = None,
     ):
         self.loss_fn = loss_fn
         self.cfg = cfg
         self.num_microbatches = num_microbatches
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
+        self.d2t = draft_model.eagle_module.d2t if draft_model.eagle_module is not None else None
 
     def __call__(
         self,
@@ -360,9 +362,9 @@ class LossPostProcessor:
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
-        # wrap prepare_loss_input with sampling_params
+        # wrap prepare_loss_input with sampling_params and optional d2t mapping
         prepare_loss_input_wrapped = partial(
-            prepare_loss_input, sampling_params=self.sampling_params
+            prepare_loss_input, sampling_params=self.sampling_params, d2t=self.d2t
         )
 
         # wrap loss function with loss input preparation

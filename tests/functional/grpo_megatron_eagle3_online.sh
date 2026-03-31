@@ -12,16 +12,12 @@ JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
-if [[ -z "${NRL_EAGLE3_DRAFT_MODEL:-}" ]]; then
-    echo "Skipping Eagle3 online functional test: set NRL_EAGLE3_DRAFT_MODEL to a compatible Eagle3 draft checkpoint."
-    exit 0
-fi
-
 # Mark the current repo as safe, since wandb fetches metadata about the repo
 git config --global --add safe.directory $PROJECT_ROOT
 
-POLICY_MODEL=${NRL_EAGLE3_POLICY_MODEL:-meta-llama/Llama-3.2-1B-Instruct}
-CONFIG_PATH=$PROJECT_ROOT/examples/configs/recipes/llm/grpo-llama3.2-1b-instruct-1n4g-megatron-eagle3.yaml
+POLICY_MODEL=${NRL_EAGLE3_POLICY_MODEL:-Qwen/Qwen3-1.7B}
+DRAFT_MODEL=${NRL_EAGLE3_DRAFT_MODEL:-AngelSlim/Qwen3-1.7B_eagle3}
+CONFIG_PATH=$PROJECT_ROOT/examples/configs/recipes/llm/grpo-qwen3-1.7b-1n4g-megatron-eagle3.yaml
 
 rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
@@ -32,14 +28,15 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     --config $CONFIG_PATH \
     policy.model_name="$POLICY_MODEL" \
     policy.tokenizer.name="$POLICY_MODEL" \
-    policy.draft.model_name="$NRL_EAGLE3_DRAFT_MODEL" \
-    policy.generation.vllm_kwargs.speculative_config.model="$NRL_EAGLE3_DRAFT_MODEL" \
+    policy.draft.model_name="$DRAFT_MODEL" \
+    policy.generation.vllm_kwargs.speculative_config.model="$DRAFT_MODEL" \
     grpo.max_num_steps=2 \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
     checkpointing.enabled=false \
+    cluster.gpus_per_node=2 \
     $@ \
     2>&1 | tee $RUN_LOG
 

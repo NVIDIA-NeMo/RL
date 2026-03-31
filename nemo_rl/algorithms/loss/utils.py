@@ -39,6 +39,7 @@ def prepare_loss_input(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    d2t: Optional[torch.Tensor] = None
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -50,10 +51,12 @@ def prepare_loss_input(
         vocab_parallel_group: Vocab parallel group.
         context_parallel_group: Context parallel group.
         sampling_params: Sampling parameters.
+        d2t: Draft to target token mapping.
 
     Notes:
         vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
         sampling_params is only used for LossInputType.LOGPROB, and currently only supported for ClippedPGLossFn.
+        d2t is only used for LossInputType.DRAFT.
 
     Returns:
         tuple(loss_input, maybe_updated_data)
@@ -132,21 +135,24 @@ def prepare_loss_input(
             dims=1,
             cp_group=context_parallel_group,
         )[0]
-        if "t2d" in data:
-            t2d = data["t2d"].to(teacher_logits.device)
-            if vocab_parallel_group is not None:
-                from megatron.core.transformer.utils import (
-                    gather_from_tensor_model_parallel_region,
-                )
-
-                teacher_logits = gather_from_tensor_model_parallel_region(
-                    teacher_logits, vocab_parallel_group
-                )
-            teacher_logits = teacher_logits[:, :, t2d]
-
         token_mask = roll_tensor(
             data["token_mask"], shifts=-1, dims=1, cp_group=context_parallel_group
         )[0]
+        if d2t is not None:
+            reverse_mapping = (
+                torch.arange(len(d2t), device=teacher_logits.device, dtype=d2t.dtype) + d2t
+            )
+            if vocab_parallel_group is not None:
+                from megatron.core.tensor_parallel import gather_from_tensor_model_parallel_region 
+                teacher_logits = gather_from_tensor_model_parallel_region(
+                    teacher_logits, vocab_parallel_group
+                )
+                tp_size = torch.distributed.get_world_size(vocab_parallel_group)
+                local_draft_size = len(d2t) // tp_size
+                start_index = vocab_parallel_rank * local_draft_size
+                end_index = (vocab_parallel_rank + 1) * local_draft_size
+                reverse_mapping = reverse_mapping[start_index:end_index]
+            teacher_logits = teacher_logits[:, :, reverse_mapping]
         loss_input = {
             "teacher_logits": teacher_logits,
             "student_logits": data["student_logits"],
