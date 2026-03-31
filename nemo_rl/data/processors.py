@@ -545,6 +545,7 @@ def math_gdpo_data_processor(
         "idx": idx,
         "task_name": datum_dict["task_name"],
     }
+
     return output
 
 

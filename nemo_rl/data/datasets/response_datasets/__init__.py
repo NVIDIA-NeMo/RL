@@ -21,6 +21,9 @@ from nemo_rl.data.datasets.response_datasets.dapo_math import (
     DAPOMathAIME2024Dataset,
 )
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
+
+from nemo_rl.data.datasets.response_datasets.openthoughts import OpenThoughtsDataset
+
 from nemo_rl.data.datasets.response_datasets.general_conversations_dataset import (
     GeneralConversationsJsonlDataset,
 )

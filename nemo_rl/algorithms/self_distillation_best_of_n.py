@@ -46,7 +46,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
     PY_EXECUTABLES,
-    RayVirtualCluster,
+    RayVirtualCluster, 
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
@@ -502,6 +502,7 @@ def _align_teacher_topk_to_student(
     return aligned_logits, aligned_indices
 
 
+
 def _copy_weights(source_policy: Policy, target_policy: Policy) -> None:
     """Copy weights from source policy to target policy via worker extension methods."""
     source_states = source_policy.run_all_workers_single_data("get_model_state_dict")
@@ -538,6 +539,7 @@ def _update_ema_teacher(
         )
         teacher_futures.append(future)
     ray.get(teacher_futures)
+
 
 
 def setup(
@@ -915,6 +917,7 @@ def setup(
         if teacher_weights_path is None:
             print("  ⚠️ Initializing teacher from current student weights...", flush=True)
             _copy_weights(student_policy, teacher_policy)
+
 
         print(f"  ✓ EMA teacher initialized with decay={ema_decay}", flush=True)
 

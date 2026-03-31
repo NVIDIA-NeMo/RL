@@ -423,6 +423,7 @@ def _align_teacher_topk_to_student(
     return aligned_logits, aligned_indices
 
 
+
 def _copy_weights(source_policy: Policy, target_policy: Policy) -> None:
     """Copy weights from source policy to target policy via worker extension methods."""
     source_states = source_policy.run_all_workers_single_data("get_model_state_dict")
@@ -443,7 +444,6 @@ def _update_ema_teacher(
     """Update teacher parameters using exponential moving average (EMA) of student parameters.
 
     Formula: teacher_param = ema_decay * teacher_param + (1 - ema_decay) * student_param
-
     Uses worker extension methods (get_model_state_dict, update_model_with_ema)
     via run_all_workers_single_data instead of modifying the base worker classes.
     """
@@ -459,7 +459,6 @@ def _update_ema_teacher(
         )
         teacher_futures.append(future)
     ray.get(teacher_futures)
-
 
 def setup(
     master_config: MasterConfig,
