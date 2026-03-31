@@ -1,0 +1,131 @@
+# KAI Scheduler queue hierarchy for a 256-GPU production cluster.
+# Imbalanced setup: priority teams get guarantees and preferential treatment,
+# community teams run best-effort on idle resources.
+#
+# Queue hierarchy:
+#   org (root, unlimited)
+#   ├── priority (department, priority 200, 192 GPU quota, burst to 240)
+#   │   ├── priority-training   (128 GPU quota, burst to 192, weight 2)
+#   │   └── priority-inference  (64 GPU quota, burst to 80, weight 3)
+#   └── community (department, priority 50, 32 GPU quota, burst to 128)
+#       ├── community-team-a    (16 GPU quota, burst to 64)
+#       └── community-team-b    (16 GPU quota, burst to 64)
+#
+# Total guaranteed: 192 + 32 = 224 GPUs (out of 256).
+# Remaining 32 GPUs go to priority department first (priority 200 > 50).
+#
+# preemptMinRuntime: "4h" — protects running jobs from higher-priority preemption
+#   for at least 4 hours. Prevents expensive training runs from being killed early.
+# reclaimMinRuntime: "15m" — allows fast reclaim of over-quota resources.
+#   When a team is using more than its fair share and another team needs its
+#   guaranteed quota, reclaim happens after a 15-minute grace period.
+#   This is shorter than preempt because reclaim is about fairness (giving back
+#   what you owe), not priority (a VIP taking your resources).
+
+# ---------- Root ----------
+apiVersion: scheduling.run.ai/v2
+kind: Queue
+metadata:
+  name: org
+spec:
+  resources:
+    gpu:    { quota: -1, limit: -1, overQuotaWeight: 1 }
+    cpu:    { quota: -1, limit: -1, overQuotaWeight: 1 }
+    memory: { quota: -1, limit: -1, overQuotaWeight: 1 }
+
+---
+# ---------- Priority department ----------
+# VIP teams with guaranteed resources and highest over-quota priority.
+# Gets surplus GPUs before community, reclaimed last.
+apiVersion: scheduling.run.ai/v2
+kind: Queue
+metadata:
+  name: priority
+spec:
+  parentQueue: org
+  priority: 200                  # served first for over-quota, reclaimed last
+  resources:
+    gpu:    { quota: 192, limit: 240, overQuotaWeight: 3 }
+    cpu:    { quota: -1,  limit: -1,  overQuotaWeight: 3 }
+    memory: { quota: -1,  limit: -1,  overQuotaWeight: 3 }
+
+---
+# Priority training — large distributed training jobs.
+# 128 GPUs guaranteed, burst to 192 for big runs.
+# Weight 2 within priority department (gets 2/5 of priority's surplus vs inference's 3/5).
+apiVersion: scheduling.run.ai/v2
+kind: Queue
+metadata:
+  name: priority-training
+spec:
+  parentQueue: priority
+  preemptMinRuntime: "4h"
+  reclaimMinRuntime: "15m"
+  resources:
+    gpu:    { quota: 128, limit: 192, overQuotaWeight: 2 }
+    cpu:    { quota: -1,  limit: -1,  overQuotaWeight: 2 }
+    memory: { quota: -1,  limit: -1,  overQuotaWeight: 2 }
+
+---
+# Priority inference — latency-sensitive serving.
+# 64 GPUs guaranteed, capped at 80 (don't over-provision serving).
+# Weight 3 within priority department (gets 3/5 of priority's surplus).
+apiVersion: scheduling.run.ai/v2
+kind: Queue
+metadata:
+  name: priority-inference
+spec:
+  parentQueue: priority
+  preemptMinRuntime: "4h"
+  reclaimMinRuntime: "15m"
+  resources:
+    gpu:    { quota: 64, limit: 80, overQuotaWeight: 3 }
+    cpu:    { quota: -1, limit: -1, overQuotaWeight: 3 }
+    memory: { quota: -1, limit: -1, overQuotaWeight: 3 }
+
+---
+# ---------- Community department ----------
+# Best-effort teams that use idle resources. Low priority, small guarantees.
+# First to be reclaimed when priority department needs resources.
+apiVersion: scheduling.run.ai/v2
+kind: Queue
+metadata:
+  name: community
+spec:
+  parentQueue: org
+  priority: 50                   # lowest priority — served last, reclaimed first
+  resources:
+    gpu:    { quota: 32, limit: 128, overQuotaWeight: 1 }
+    cpu:    { quota: -1, limit: -1,  overQuotaWeight: 1 }
+    memory: { quota: -1, limit: -1,  overQuotaWeight: 1 }
+
+---
+# Community Team A — equal split of community's small guarantee.
+# Can burst to 64 GPUs when the cluster is idle.
+apiVersion: scheduling.run.ai/v2
+kind: Queue
+metadata:
+  name: community-team-a
+spec:
+  parentQueue: community
+  preemptMinRuntime: "4h"
+  reclaimMinRuntime: "15m"
+  resources:
+    gpu:    { quota: 16, limit: 64, overQuotaWeight: 1 }
+    cpu:    { quota: -1, limit: -1, overQuotaWeight: 1 }
+    memory: { quota: -1, limit: -1, overQuotaWeight: 1 }
+
+---
+# Community Team B — same as Team A.
+apiVersion: scheduling.run.ai/v2
+kind: Queue
+metadata:
+  name: community-team-b
+spec:
+  parentQueue: community
+  preemptMinRuntime: "4h"
+  reclaimMinRuntime: "15m"
+  resources:
+    gpu:    { quota: 16, limit: 64, overQuotaWeight: 1 }
+    cpu:    { quota: -1, limit: -1, overQuotaWeight: 1 }
+    memory: { quota: -1, limit: -1, overQuotaWeight: 1 }

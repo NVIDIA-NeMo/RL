@@ -1,2 +1,10 @@
+# KAI Scheduler configuration.
+# Creates a default queue and enables Prometheus metrics for fairshare monitoring.
 defaultQueue:
   createDefaultQueue: true
+
+# Enable Prometheus metrics endpoint on KAI components.
+# Metrics are scraped by the kube-prometheus-stack ServiceMonitors.
+global:
+  prometheus:
+    enabled: true

@@ -17,6 +17,8 @@ repositories:
   url: https://ray-project.github.io/kuberay-helm/
 - name: prometheus-community
   url: https://prometheus-community.github.io/helm-charts
+- name: kyverno
+  url: https://kyverno.github.io/kyverno/
 
 releases:
 #
@@ -47,7 +49,7 @@ releases:
 {{ end }}
 
 #
-# KAI Scheduler: gang scheduling for GPU workloads
+# KAI Scheduler: gang scheduling + fairshare for GPU workloads
 #
 - name: kai-scheduler
   namespace: kai-scheduler
@@ -58,7 +60,7 @@ releases:
   - values/kai-scheduler.yaml
 
 #
-# KubeRay Operator: manages RayCluster CRDs, integrated with KAI for gang scheduling
+# KubeRay Operator: manages RayCluster/RayJob CRDs, integrated with KAI
 #
 - name: kuberay-operator
   namespace: kuberay-system
@@ -68,3 +70,29 @@ releases:
   wait: true
   values:
   - values/kuberay-operator.yaml
+
+#
+# Kyverno: policy engine for enforcing queue labels on Ray workloads.
+# Policies are applied separately: kubectl apply -f kyverno-kai-policies.yaml
+#
+- name: kyverno
+  namespace: kyverno
+  createNamespace: true
+  chart: kyverno/kyverno
+  version: 3.7.1
+  wait: true
+  values:
+  - values/kyverno.yaml
+
+#
+# Prometheus + Grafana: fairshare monitoring and dashboards.
+# Access Grafana: kubectl port-forward svc/kube-prometheus-stack-grafana -n monitoring 3000:80
+#
+- name: kube-prometheus-stack
+  namespace: monitoring
+  createNamespace: true
+  chart: prometheus-community/kube-prometheus-stack
+  wait: true
+  waitForJobs: true
+  values:
+  - values/kube-prometheus-stack.yaml

@@ -1,40 +1,61 @@
-# KAI Scheduler queue hierarchy for local dev.
-# Unlimited quotas — appropriate for single-user kind clusters.
+# KAI Scheduler queue hierarchy for a 2-GPU kind cluster.
+# One priority team and one best-effort team to demonstrate fairshare imbalance.
+#
+# Queue hierarchy:
+#   org (root, unlimited)
+#   ├── priority-team (1 GPU guaranteed, burst to 2, higher priority + weight)
+#   └── community    (0 GPU guaranteed, uses idle GPUs only, lower priority)
+#
+# Behavior:
+#   - priority-team always gets its 1 GPU quota, and gets surplus first (priority 200).
+#   - community has no guarantee — it runs on whatever priority-team isn't using.
+#   - If both compete, priority-team gets 2x the surplus (overQuotaWeight 2 vs 1).
+#   - community jobs can be reclaimed after 15m if priority-team needs resources back.
+#   - priority-team jobs are protected from preemption for 4 hours.
+
 apiVersion: scheduling.run.ai/v2
 kind: Queue
 metadata:
-  name: department-1
+  name: org
 spec:
   resources:
-    gpu:
-      quota: -1
-      limit: -1
-      overQuotaWeight: 1
-    cpu:
-      quota: -1
-      limit: -1
-      overQuotaWeight: 1
-    memory:
-      quota: -1
-      limit: -1
-      overQuotaWeight: 1
+    gpu:    { quota: -1, limit: -1, overQuotaWeight: 1 }
+    cpu:    { quota: -1, limit: -1, overQuotaWeight: 1 }
+    memory: { quota: -1, limit: -1, overQuotaWeight: 1 }
 ---
+# Priority team — guaranteed resources, high priority, protected from preemption.
 apiVersion: scheduling.run.ai/v2
 kind: Queue
 metadata:
-  name: team-a
+  name: priority-team
 spec:
-  parentQueue: department-1
+  parentQueue: org
+  priority: 200                  # served first for over-quota, reclaimed last
+  preemptMinRuntime: "4h"        # 4 hours before a higher-priority queue can preempt
+  reclaimMinRuntime: "15m"       # 15 min grace before over-quota resources reclaimed
   resources:
     gpu:
-      quota: -1
-      limit: -1
-      overQuotaWeight: 1
-    cpu:
-      quota: -1
-      limit: -1
-      overQuotaWeight: 1
-    memory:
-      quota: -1
-      limit: -1
-      overQuotaWeight: 1
+      quota: 1                   # guaranteed 1 GPU
+      limit: 2                   # can burst to full cluster when idle
+      overQuotaWeight: 2         # gets 2x surplus share vs community
+    cpu:    { quota: -1, limit: -1, overQuotaWeight: 2 }
+    memory: { quota: -1, limit: -1, overQuotaWeight: 2 }
+---
+# Community — best-effort, no guarantee, uses idle resources.
+# First to be reclaimed when priority-team needs resources back.
+apiVersion: scheduling.run.ai/v2
+kind: Queue
+metadata:
+  name: community
+spec:
+  parentQueue: org
+  priority: 50                   # lowest priority — served last, reclaimed first
+  preemptMinRuntime: "4h"        # still protect running jobs for 4 hours
+  reclaimMinRuntime: "15m"       # 15 min grace (same as priority-team for fairness)
+  resources:
+    gpu:
+      quota: 0                   # no guaranteed GPUs
+      limit: 2                   # can use the whole cluster if nobody else needs it
+      overQuotaWeight: 1         # half the surplus weight of priority-team
+    cpu:    { quota: -1, limit: -1, overQuotaWeight: 1 }
+    memory: { quota: -1, limit: -1, overQuotaWeight: 1 }

@@ -5,7 +5,7 @@ kind: RayJob
 metadata:
   name: sft-job
   labels:
-    kai.scheduler/queue: team-a
+    kai.scheduler/queue: priority-team
 spec:
   entrypoint: "cd /opt/nemo-rl && bash tests/functional/sft.sh"
   # HTTPMode is required with KAI scheduler — K8sJobMode creates a separate
