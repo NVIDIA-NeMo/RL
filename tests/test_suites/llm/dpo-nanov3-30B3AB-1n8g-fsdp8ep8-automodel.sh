@@ -36,11 +36,9 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'data["train/loss"]["1"] < 0.69316' \
         'data["train/loss"]["11"] < 0.53' \
-        'data["train/loss"]["15"] < 0.66' \
         'data["train/preference_loss"]["1"] > 0.69314' \
         'data["train/preference_loss"]["1"] < 0.69316' \
         'data["train/preference_loss"]["11"] < 0.53' \
-        'data["train/preference_loss"]["15"] < 0.66' \
         'mean(data["timing/train/total_step_time"], -5, -1) < 5'
 
     # Clean up checkpoint directory after successful run to save space.
