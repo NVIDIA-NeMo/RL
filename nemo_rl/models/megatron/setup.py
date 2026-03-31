@@ -245,6 +245,25 @@ def validate_and_set_config(
             "tracked in https://github.com/NVIDIA-NeMo/RL/issues/720"
         )
 
+    # Validate yarn rope_scaling fields are fully specified
+    rope_scaling = (config.get("hf_config_overrides") or {}).get("rope_scaling") or {}
+    if rope_scaling.get("rope_type") == "yarn":
+        _YARN_REQUIRED_FIELDS = (
+            "factor",
+            "original_max_position_embeddings",
+            "truncate",
+            "beta_fast",
+            "beta_slow",
+            "mscale",
+            "mscale_all_dim",
+        )
+        missing = [f for f in _YARN_REQUIRED_FIELDS if f not in rope_scaling]
+        assert not missing, (
+            f"rope_scaling.rope_type is 'yarn' but the following required fields are not set: "
+            f"{missing}. Please specify all of {list(_YARN_REQUIRED_FIELDS)} in "
+            f"policy.hf_config_overrides.rope_scaling."
+        )
+
     megatron_cfg, model_cfg = setup_model_config(
         config,
         rank,
