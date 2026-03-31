@@ -153,6 +153,7 @@ def prepare_loss_input(
                 )
                 tp_size = torch.distributed.get_world_size(vocab_parallel_group)
                 local_draft_size = len(d2t) // tp_size
+                assert vocab_parallel_rank is not None
                 start_index = vocab_parallel_rank * local_draft_size
                 end_index = (vocab_parallel_rank + 1) * local_draft_size
                 reverse_mapping = reverse_mapping[start_index:end_index]
