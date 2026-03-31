@@ -1,10 +1,2 @@
-[
-  {
-    "uri": "https://docs.nvidia.com/nsight-systems/UserGuide/index.html#viewing-multiple-reports-in-the-same-timeline",
-    "reason": "NVIDIA reorganized their docs and removed this anchor; the page itself is valid"
-  },
-  {
-    "uri": "https://platform.openai.com/docs/guides/function-calling",
-    "reason": "OpenAI docs occasionally block automated link checkers"
-  }
-]
+{"uri": "https://docs.nvidia.com/nsight-systems/UserGuide/index.html#viewing-multiple-reports-in-the-same-timeline"}
+{"uri": "https://platform.openai.com/docs/guides/function-calling"}
