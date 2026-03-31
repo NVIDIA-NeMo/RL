@@ -148,7 +148,7 @@ Test that vLLM yields near-identical token log-probabilities when comparing deco
 
 ```sh
 # Run that is expected to pass
-uv run --extra vllm tools/model_diagnostics/2.long_generation_decode_vs_prefill.py Qwen/Qwen2.5-1.5B
+uv run --extra vllm tools/model_diagnostics/2.long_generation_decode_vs_prefill.py --model Qwen/Qwen2.5-1.5B
 # ...
 # [Qwen/Qwen2.5-1.5B] ALL GOOD!
 ```
@@ -205,7 +205,7 @@ uv run --extra vllm tools/model_diagnostics/4.vllm_precision_compilation_test.py
 ...
 # Eager and cuda graph mode lps with torch inductor precision flag: FAILED - Arrays are different  
 ...
-# Eager and cuda graph mode lps with use_inductor disabled: PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
+# Eager and cuda graph mode lps with backend=eager: PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
 ```
 
 See example for model `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`
@@ -268,8 +268,8 @@ nan location mismatch:
        [-8.610202e+00, -1.067061e+01, -4.593382e-01, ..., -1.060957e-05,...
 ====================================================================================================
 ...
-Eager and cuda graph mode lps with use_inductor disabled (prompt lps): PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
-Eager and cuda graph mode lps with use_inductor disabled (generation lps): PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
+Eager and cuda graph mode lps with backend=eager (prompt lps): PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
+Eager and cuda graph mode lps with backend=eager (generation lps): PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
 ```
 
 **What this script tests:**
@@ -280,19 +280,19 @@ The script is to compare both prompt and generation logprobs under the following
    - **⚠️ Commonly fails**: This comparison often shows discrepancies due to compilation optimizations
 2. **Torch Inductor Precision**: Tests with `TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1` environment variable
    - **⚠️ May help**: This flag may help but typically doesn't resolve all the numerical differences
-3. **Inductor Disabled**: Verifies that disabling Torch Inductor compilation (`use_inductor=False`) maintains output consistency
+3. **Inductor Disabled**: Verifies that disabling Torch Inductor compilation (`backend="eager"`) maintains output consistency
    - **✅ Usually works well**: This configuration often produces results very close to eager mode
-   - **Note**: `use_inductor=False` disables Inductor compilation but keeps CUDA graph capture active for compatible operations
+   - **Note**: `backend="eager"` disables Inductor compilation but keeps CUDA graph capture active for compatible operations
 
 **Performance vs Accuracy Trade-offs:**
 
 The different compilation modes offer distinct trade-offs between accuracy and performance:
 
 - **Eager Mode** (`enforce_eager=True`): Highest accuracy (ground truth) but slowest execution
-- **CUDA Graph Mode with Inductor Disabled** (`enforce_eager=False` and `compilation_config={"use_inductor": False}`): Near-eager accuracy with significant speedup from CUDA graph optimization
-- **CUDA Graph Mode with Inductor Enabled** (`enforce_eager=False` and `compilation_config={"use_inductor": True}`): Potentially fastest execution with custom Triton kernels (since Triton is the current backend of Inductor), but may introduce numerical differences. For accuracy improvement, try the torch inductor precision flag: `export TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1`
+- **CUDA Graph Mode with Inductor Disabled** (`enforce_eager=False` and `compilation_config={"backend": "eager"}`): Near-eager accuracy with significant speedup from CUDA graph optimization
+- **CUDA Graph Mode with Inductor Enabled** (`enforce_eager=False` and `compilation_config={"backend": "inductor"}` or default): Potentially fastest execution with custom Triton kernels (since Triton is the current backend of Inductor), but may introduce numerical differences. For accuracy improvement, try the torch inductor precision flag: `export TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1`
 
-**Note**: Performance characteristics vary by model. For example, `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` shows similar speed performance between `use_inductor=True` and `use_inductor=False`, making the accuracy-preserving option preferable.
+**Note**: Performance characteristics vary by model. For example, `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` shows similar speed performance between `backend="inductor"` and `backend="eager"`, making the accuracy-preserving option preferable.
 
 **Why this matters:**
 

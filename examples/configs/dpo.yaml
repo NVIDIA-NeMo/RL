@@ -60,6 +60,14 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
     clear_cache_every_n_steps: null
+
+    # Automodel kwargs passed to from_pretrained.
+    # Uncomment force_hf if the custom model's adapter doesn't support per-tensor
+    # weight conversion (e.g. Qwen2, Llama). Auto-detected if not set.
+    # See https://github.com/NVIDIA-NeMo/RL/issues/2072
+    automodel_kwargs: {}
+      # force_hf: true
+
     # LoRA (Low-Rank Adaptation) Configuration
     lora_cfg:
       enabled: False  # Set to True to enable LoRA fine-tuning
@@ -111,6 +119,8 @@ policy:
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false
+    use_linear_ce_fusion_loss: false
+    linear_ce_fusion_chunk_size: 256
     empty_unused_memory_level: 1
     activation_checkpointing: false
     tensor_model_parallel_size: 2
@@ -275,6 +285,7 @@ logger:
   mlflow:
     experiment_name: "dpo-dev"
     run_name: "dpo"
+    tracking_uri: "http://localhost:5000"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

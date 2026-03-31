@@ -81,6 +81,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         tp_size = 1
         pp_size = 1
         cp_size = 1
+        use_v2 = False
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
@@ -195,17 +196,28 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
 
         pre_init_queue = RayQueue()
-        worker_builder = RayWorkerBuilder(
-            worker_builder_cls_fqn,
-            config,
-            tokenizer=tokenizer,
-            processor=processor,
+
+        worker_kwargs = dict(
             init_optimizer=init_optimizer,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_reference_model=init_reference_model,
             worker_sharding_annotations=self.sharding_annotations,
             pre_init_communication_queue=pre_init_queue,
+        )
+
+        if use_v2:
+            # DTensor v2 workers reconstruct tokenizer/processor locally to avoid
+            # pickling across incompatible transformers versions (v4 head → v5 worker).
+            config["tokenizer"]["use_processor"] = processor is not None
+        else:
+            worker_kwargs["tokenizer"] = tokenizer
+            worker_kwargs["processor"] = processor
+
+        worker_builder = RayWorkerBuilder(
+            worker_builder_cls_fqn,
+            config,
+            **worker_kwargs,
         )
 
         if cluster._sorted_bundle_indices is not None:

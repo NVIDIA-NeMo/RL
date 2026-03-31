@@ -130,8 +130,7 @@ policy:
     top_p: 1.0
     top_k: null
     mcore_generation_config:
-      buffer_size_gb: 20              # Memory buffer size for inference context
-      buffer_guaranteed_fraction: 0.1  # Fraction of buffer guaranteed to be available for active requests
+      buffer_size_gb: 10               # Memory buffer size for requests, total buffer size is 2x this value (active requests + paused requests)
       num_cuda_graphs: 16              # Number of CUDA graphs to pre-allocate
       max_tokens: 16384                # Maximum number of tokens for inference
 ```
@@ -140,8 +139,7 @@ policy:
 
 The `mcore_generation_config` section controls Megatron Core inference engine behavior:
 
-- **buffer_size_gb**: Total memory buffer size (in GB) allocated for the dynamic inference context. This determines how much GPU memory is reserved for KV caches and intermediate states. Keeping this higher will pull in more requests at once. 
-- **buffer_guaranteed_fraction**: Fraction of the buffer that is guaranteed to be available (between 0.0 and 1.0). This helps to make sure that there is always some memory for active requests to complete. 
+- **buffer_size_gb**: Buffer size reserved for active requests that live on the GPU. The total buffer size (stored in unified memory) is 2x this value, with the the other half of the buffer reserved for paused requests that live on the CPU.
 - **num_cuda_graphs**: Number of CUDA graphs to pre-allocate for different batch sizes. More graphs can improve performance by avoiding runtime graph capture, but consume more memory.
 - **max_tokens**: Maximum total number of tokens (across all requests) that can be processed simultaneously. This limits the maximum batch size and sequence length combinations. Increasing this might throw OOM depending on vocab size and buffer size allocated. 
 
@@ -207,8 +205,7 @@ policy:
     top_p: 1.0
     top_k: null
     mcore_generation_config:
-      buffer_size_gb: 20
-      buffer_guaranteed_fraction: 0.1
+      buffer_size_gb: 10
       num_cuda_graphs: 16
       max_tokens: 16384
 ```

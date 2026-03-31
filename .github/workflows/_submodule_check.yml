@@ -44,7 +44,7 @@ jobs:
       comment_body: ${{ steps.check.outputs.comment_body }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: 'recursive'
 
@@ -232,7 +232,7 @@ jobs:
     if: always() && needs.check.outputs.changed == '1'
     steps:
       - name: Create comment file
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
@@ -253,7 +253,7 @@ jobs:
             console.log('Comment body written to comment.txt');
 
       - name: Upload comment artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: submodule-check
           path: comment.txt

@@ -26,6 +26,7 @@ policy:
     num_layers_in_first_pipeline_stage: 7
     num_layers_in_last_pipeline_stage: 6
     apply_rope_fusion: false
+    gradient_accumulation_fusion: false
     fp8_cfg:
       enabled: true
     optimizer:

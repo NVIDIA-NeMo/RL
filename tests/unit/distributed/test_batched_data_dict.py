@@ -506,6 +506,36 @@ def test_shard_by_batch_size_with_packed_multimodal():
     assert tuple(shards[1]["pixel_values"].as_tensor().shape) == (6, 3, 8, 8)
 
 
+def test_shard_by_batch_size_allow_uneven_empty_shards_preserve_all_keys():
+    """Empty trailing shards should preserve all keys with empty values."""
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "pixel_values": PackedTensor(
+                [torch.randn(2, 3, 8, 8), torch.randn(1, 3, 8, 8)], dim_to_pack=0
+            ),
+            "labels": [0, 1],
+        }
+    )
+
+    # total_batch_size=2, shards=4 -> trailing two shards are empty
+    shards = batch.shard_by_batch_size(shards=4, allow_uneven_shards=True)
+    assert len(shards) == 4
+
+    # Empty trailing shards should preserve all keys and use empty values.
+    for empty_shard in shards[2:]:
+        for key, original_value in batch.items():
+            assert key in empty_shard
+            shard_value = empty_shard[key]
+            if torch.is_tensor(original_value):
+                assert shard_value.shape[0] == 0
+            elif isinstance(original_value, PackedTensor):
+                assert isinstance(shard_value, PackedTensor)
+                assert shard_value.as_tensor() is None
+            else:
+                assert shard_value == []
+
+
 def test_get_multimodal_dict_mixed_content_and_device_move():
     """get_multimodal_dict should include PackedTensor and optional keys, and support device movement."""
     images = [torch.randn(2, 3, 8, 8), torch.randn(1, 3, 8, 8)]

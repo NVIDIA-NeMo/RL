@@ -62,7 +62,7 @@ jobs:
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -244,7 +244,7 @@ jobs:
           pip cache purge || true
           sudo npm cache clean --force || true
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: "recursive"
       - name: Install uv
@@ -255,7 +255,7 @@ jobs:
           prune-cache: false
       # Faster than uv python install since it caches python alongside runner
       - name: "Set up Python"
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version-file: ".python-version"
       - name: Check lint
@@ -313,7 +313,7 @@ jobs:
       ${{
         (
           always() &&
-          contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) &&
+          contains('docs Lfast L0 L1 L2', needs.pre-flight.outputs.test_level) &&
           needs.pre-flight.result == 'success' &&
           (needs.build-container.result == 'success' || needs.build-container.result == 'skipped')
         ) && !cancelled()
@@ -323,7 +323,7 @@ jobs:
     environment: nemo-ci
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/test-template
         with:
@@ -364,7 +364,7 @@ jobs:
     name: ${{ matrix.script }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/test-template
         env:
@@ -394,7 +394,7 @@ jobs:
     environment: nemo-ci
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/test-template
         env:
@@ -421,7 +421,7 @@ jobs:
     environment: nemo-ci
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/test-template
         env:
@@ -520,10 +520,10 @@ jobs:
         flag: [doc-test, unit-test, e2e]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download coverage reports of current branch
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: coverage-${{ matrix.flag }}-*
 
@@ -567,7 +567,7 @@ jobs:
 
       - name: Upload artifacts
         if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-${{ matrix.flag }}-aggregated
           path: |
