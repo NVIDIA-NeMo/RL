@@ -6,14 +6,14 @@ metadata:
   name: gpu-test-group
 spec:
   minMember: 2
-  queue: team-a
+  queue: priority-team
 ---
 apiVersion: v1
 kind: Pod
 metadata:
   name: gpu-test-0
   labels:
-    kai.scheduler/queue: team-a
+    kai.scheduler/queue: priority-team
   annotations:
     pod-group-name: gpu-test-group
 spec:
@@ -32,7 +32,7 @@ kind: Pod
 metadata:
   name: gpu-test-1
   labels:
-    kai.scheduler/queue: team-a
+    kai.scheduler/queue: priority-team
   annotations:
     pod-group-name: gpu-test-group
 spec:
