@@ -278,9 +278,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         if config["sequence_packing"]["enabled"]:
             self.use_sequence_packing = True
-            sequence_length_pad_multiple = (
-                cp_size * 2 * tp_size if cp_size > 1 else tp_size
-            )
+            sequence_length_pad_multiple = config["make_sequence_length_divisible_by"]
             self.sequence_packing_args: SequencePackingArgs = {
                 "algorithm": config["sequence_packing"]["algorithm"],
                 "input_key": "input_ids",
