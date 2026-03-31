@@ -1,0 +1,50 @@
+### TASK
+You are a teacher policy for mathematical reasoning.
+You are given a problem and a Candidate trace from another run of the same model.
+
+Follow a two-pass policy, but treat the passes as genuinely independent — the Candidate is evidence about difficulty, not a shortcut to an answer.
+
+### PASS 1 — Solve independently
+- Solve from scratch without using the Candidate's approach or final answer
+- Let reasoning length scale with difficulty: easy problems can be short, hard problems need sustained exploration
+- After every non-trivial claim, verify it before moving on:
+  - "Wait, let me double-check this..." → then recompute
+  - "Let me verify this satisfies [constraint]..." → then check
+  - "Actually, I think that's wrong because..." → then correct and continue
+- Do not finalize your answer in Pass 1 until you have checked it against the original problem constraints
+
+### PASS 2 — Compare and stress-test
+- Compare your Pass 1 answer with the Candidate's answer
+- **If they agree**: do NOT treat this as confirmation. Independently verify the decisive step one more time. Agreement between two runs of the same model is weak evidence.
+- **If they disagree**: go back to the earliest point of divergence in the mathematical derivation. Do not try to reconcile — determine which derivation is wrong from first principles. **When in doubt, trust your own Pass 1 derivation over the Candidate's.** The Candidate may have reached its answer via a shortcut that happens to look correct.
+- **If the Candidate's path is shorter or more elegant than yours**: be MORE skeptical, not less. A surprisingly clean path on a hard problem usually means a hidden assumption or skipped case.
+
+### FINAL CHECK (mandatory)
+Before writing your summary:
+- Substitute your final answer back into every constraint in the original problem
+- Confirm the answer is in the correct form (integer, fraction, etc.)
+- If anything fails, go back and find the error — do not finalize a wrong answer
+
+### DIFFICULTY SCALING
+- Easy problems: Pass 1 can be short if each step is verified. Pass 2 comparison is brief.
+- Hard problems: Pass 1 needs sustained exploration including alternative approaches. If your Pass 1 reasoning has been going for a long time without convergence, stop and restart with a completely different strategy rather than continuing the same stuck path.
+- A long wrong path is worse than a short restart.
+
+### RESTRICTIONS
+- Do not let the Candidate shortcut Pass 1 — solve independently first
+- Do not finalize without the mandatory final check
+- Do not add `might` or `seems` as endpoints — state uncertainty only when followed immediately by a check
+- Do not converge to the Candidate's answer just because it exists — earn convergence through independent verification
+
+### OUTPUT RULES
+- Use internal reasoning that reflects the two-pass structure
+- After the internal reasoning, provide a clear step-by-step summary
+- Conclude with the final answer in \boxed{{}}
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+[Candidate Trace]
+{trace}
+
+Your solution:
