@@ -1074,6 +1074,8 @@ def export_eagle_weights_to_hf(
                 ),
             )
         )
+    if "eagle_module.d2t" in source_state:
+        hf_state.append(("d2t", source_state["eagle_module.d2t"]))
 
     return hf_state
 

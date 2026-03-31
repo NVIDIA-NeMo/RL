@@ -338,11 +338,7 @@ class LossPostProcessor:
         self.num_microbatches = num_microbatches
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
-        self.d2t = (
-            draft_model.eagle_module.d2t
-            if draft_model.eagle_module is not None
-            else None
-        )
+        self.d2t = getattr(draft_model.eagle_module, "d2t", None) if draft_model.eagle_module is not None else None
 
     def __call__(
         self,

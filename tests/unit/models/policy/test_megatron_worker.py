@@ -185,6 +185,13 @@ def create_megatron_test_config(
             },
             "attention_backend": attention_backend,
         },
+        "draft": {
+            "enabled": False,
+            "model_name": None,
+            "loss_weight": 0.1,
+            "num_layers": None,
+            "aux_layer_indices": None,
+        },
         "make_sequence_length_divisible_by": tp,
         "optimizer": None,  # Remove default FSDP optimizer
         "scheduler": None,  # Remove default scheduler
