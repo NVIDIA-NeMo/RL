@@ -531,7 +531,9 @@ class RayWorkerGroup:
                     "env_vars": worker_env_vars,
                     "py_executable": py_executable,
                 }
-                py_venv = os.path.dirname(os.path.dirname(py_executable)) # to remove the "bin/python" suffix
+                py_venv = os.path.dirname(
+                    os.path.dirname(py_executable)
+                )  # to remove the "bin/python" suffix
                 runtime_env["env_vars"]["VIRTUAL_ENV"] = py_venv
                 runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_venv
 

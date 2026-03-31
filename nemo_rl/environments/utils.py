@@ -116,7 +116,9 @@ def create_env(env_name: str, env_config: dict) -> EnvironmentInterface:
             actor_py_exec,
             actor_class_fqn,
         )
-        actor_py_venv = os.path.dirname(os.path.dirname(actor_py_exec)) # to remove the "bin/python" suffix
+        actor_py_venv = os.path.dirname(
+            os.path.dirname(actor_py_exec)
+        )  # to remove the "bin/python" suffix
         extra_env_vars = {
             "VIRTUAL_ENV": actor_py_venv,
             "UV_PROJECT_ENVIRONMENT": actor_py_venv,

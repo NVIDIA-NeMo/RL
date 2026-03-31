@@ -2473,7 +2473,9 @@ def async_grpo_train(
             "nemo_rl.algorithms.async_utils.ReplayBuffer",
         )
 
-    _replay_py_venv = os.path.dirname(os.path.dirname(_replay_py_exec)) # to remove the "bin/python" suffix
+    _replay_py_venv = os.path.dirname(
+        os.path.dirname(_replay_py_exec)
+    )  # to remove the "bin/python" suffix
 
     _replay_runtime_env = {
         "py_executable": _replay_py_exec,
@@ -2506,7 +2508,9 @@ def async_grpo_train(
             "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
         )
 
-    _tc_py_venv = os.path.dirname(os.path.dirname(_tc_py_exec)) # to remove the "bin/python" suffix
+    _tc_py_venv = os.path.dirname(
+        os.path.dirname(_tc_py_exec)
+    )  # to remove the "bin/python" suffix
 
     _tc_runtime_env = {
         "py_executable": _tc_py_exec,
