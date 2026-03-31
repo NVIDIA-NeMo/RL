@@ -15,7 +15,7 @@
 import os
 import time
 import warnings
-from typing import Any, Optional, TypeVar
+from typing import Any, Optional, TypeVar, get_args
 
 import torch
 from megatron.bridge import AutoBridge
@@ -33,6 +33,7 @@ from megatron.bridge.training.config import (
     DistributedDataParallelConfig,
     LoggerConfig,
     OptimizerConfig,
+    RNGConfig,
     SchedulerConfig,
     TokenizerConfig,
     TrainingConfig,
@@ -73,7 +74,7 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import CudaGraphScope, PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_megatron_checkpoint_dir,
@@ -491,6 +492,28 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Unsupported {type(attention_backend)=}, expected str or int"
             )
 
+    # CUDA Graph configuration
+    if "enable_cuda_graph" in config["megatron_cfg"]:
+        model_cfg.enable_cuda_graph = config["megatron_cfg"]["enable_cuda_graph"]
+        if "cuda_graph_scope" in config["megatron_cfg"]:
+            scope = config["megatron_cfg"]["cuda_graph_scope"]
+            valid_scopes = get_args(CudaGraphScope)
+            if scope not in valid_scopes:
+                raise ValueError(
+                    f"Invalid cuda_graph_scope '{scope}'. "
+                    f"Valid options are: {valid_scopes}"
+                )
+            model_cfg.cuda_graph_scope = scope
+            if not model_cfg.enable_cuda_graph:
+                warnings.warn(
+                    "cuda_graph_scope is configured but enable_cuda_graph is False. "
+                    "The cuda_graph_scope setting will have no effect."
+                )
+        if model_cfg.enable_cuda_graph:
+            model_cfg.use_te_rng_tracker = True
+        else:
+            model_cfg.use_te_rng_tracker = False
+
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
     if fp8_cfg is not None and fp8_cfg.get("enabled", False):
@@ -618,10 +641,16 @@ def _create_megatron_config(
     dtype: torch.dtype,
 ) -> ConfigContainer:
     """Create the final Megatron configuration container."""
+    # Create RNG config with CUDA graph support
+    rng_config = RNGConfig(
+        te_rng_tracker=config["megatron_cfg"].get("enable_cuda_graph", False),
+    )
+
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
         logger=LoggerConfig(logging_level=0),
+        rng=rng_config,
         train=TrainingConfig(
             micro_batch_size=1,  # ignored
             global_batch_size=config["train_global_batch_size"],  # ignored
