@@ -667,7 +667,7 @@ class TestForwardWithPostProcessingFn:
         )
         mock_get_capture_context.return_value = (nullcontext(), mock_capture)
 
-        data_dict = {}
+        data_dict = {"input_ids": torch.tensor([[1, 2, 3]])}
         attention_mask = torch.ones(1, 3)
         processed_mb = ProcessedMicrobatch(
             data_dict=data_dict,
