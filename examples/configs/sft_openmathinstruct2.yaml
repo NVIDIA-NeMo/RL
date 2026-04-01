@@ -30,8 +30,8 @@ data:
     dataset_name: OpenMathInstruct-2
     output_key: generated_solution
     split: train_1M
-    split_validation_size: 0.05 # use 5% of the training data as validation data
-    seed: ${sft.seed} # seed for train/validation split when split_validation_size > 0
+    split_validation_size: 0.05
+    seed: ${sft.seed}
   validation: null
   default:
     prompt_file: examples/prompts/math.txt
