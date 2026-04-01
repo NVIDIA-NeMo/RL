@@ -582,7 +582,7 @@ def validate(
             if use_ipc:
                 teacher_logits = teacher_policy.train(
                     val_data,
-                    loss_fn,
+                    None,
                     eval_mode=True,
                     is_teacher=True,
                     topk_logits=topk_k,
@@ -607,7 +607,7 @@ def validate(
             if use_ipc:
                 val_results = student_policy.train(
                     val_data,
-                    loss_fn,
+                    None,
                     eval_mode=True,
                     gbs=val_data.size,
                     mbs=val_mbs,
@@ -617,7 +617,7 @@ def validate(
             else:
                 val_results = student_policy.train(
                     val_data,
-                    loss_fn,
+                    None,
                     eval_mode=True,
                     gbs=val_data.size,
                     mbs=val_mbs,
@@ -951,15 +951,23 @@ def off_policy_distillation_train(
                     teacher_policy.offload_after_refit()
                     student_policy.prepare_for_training()
 
+                if cross_tokenizer_enabled:
+                    if current_step == 0 and current_epoch == 0:
+                        student_policy.set_loss_fn(loss_fn)
+                    student_policy.update_cross_tokenizer_data(
+                        teacher_input_ids=teacher_input_ids,
+                        aligned_pairs=aligned_pairs,
+                    )
+
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
                     if use_ipc:
                         train_results = student_policy.train(
-                            train_data, loss_fn, teacher_logits=teacher_logits
+                            train_data, None, teacher_logits=teacher_logits
                         )
                         del teacher_logits
                     else:
-                        train_results = student_policy.train(train_data, loss_fn)
+                        train_results = student_policy.train(train_data, None)
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)

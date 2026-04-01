@@ -1434,12 +1434,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             and self.token_aligner.sparse_transformation_matrix is not None
         )
         if has_sparse:
-            projected_full = self.token_aligner.project_token_likelihoods_instance(
+            sparse_mat = self.token_aligner.sparse_transformation_matrix
+            reduced_sparse = sparse_mat.index_select(1, global_top_indices).coalesce()
+            projected = self.token_aligner.project_token_likelihoods_instance(
                 student_probs, None, None, None, device,
                 use_sparse_format=True,
-                sparse_matrix=self.token_aligner.sparse_transformation_matrix,
+                sparse_matrix=reduced_sparse,
             )
-            return projected_full[:, :, global_top_indices]
+            return projected
 
         proj_values = self.token_aligner.likelihood_projection_matrix
         if getattr(self.token_aligner, 'learnable', False):

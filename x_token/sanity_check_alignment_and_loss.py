@@ -242,8 +242,9 @@ def main():
         student_logits_a = student_logits
         teacher_logits_a = teacher_logits
     else:
-        s_vocab = student_tokenizer.vocab_size
-        t_vocab = teacher_tokenizer.vocab_size
+        from transformers import AutoConfig
+        s_vocab = AutoConfig.from_pretrained(args.student_model).vocab_size
+        t_vocab = AutoConfig.from_pretrained(args.teacher_model).vocab_size
         torch.manual_seed(42)
         student_logits_a = torch.randn(
             batch_size, input_ids_student_a.shape[1], s_vocab,
