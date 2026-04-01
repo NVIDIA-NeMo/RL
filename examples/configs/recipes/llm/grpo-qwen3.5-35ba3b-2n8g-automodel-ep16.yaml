@@ -14,6 +14,8 @@ policy:
     tensor_parallel_size: 1
     expert_parallel_size: 16
     activation_checkpointing: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
@@ -30,9 +32,9 @@ policy:
     enabled: true
   generation:
     vllm_cfg:
-      tensor_parallel_size: 4
+      tensor_parallel_size: 8
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.75
+      gpu_memory_utilization: 0.6
       enforce_eager: true
 logger:
   wandb_enabled: true
