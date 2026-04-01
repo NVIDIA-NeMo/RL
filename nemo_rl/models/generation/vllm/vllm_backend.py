@@ -63,6 +63,12 @@ def fix_gemma3_vision_weight_name(key: str) -> str:
 
 
 class VllmInternalWorkerExtension:
+    def bind_numa(self) -> bool:
+        """Pin this TP worker to the NUMA-local CPUs of its GPU."""
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        return bind_to_gpu_numa()
+
     def init_collective(
         self,
         rank_prefix: int,
