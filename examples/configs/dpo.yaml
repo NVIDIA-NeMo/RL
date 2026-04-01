@@ -119,6 +119,8 @@ policy:
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false
+    use_linear_ce_fusion_loss: false
+    linear_ce_fusion_chunk_size: 256
     empty_unused_memory_level: 1
     activation_checkpointing: false
     tensor_model_parallel_size: 2
@@ -283,6 +285,7 @@ logger:
   mlflow:
     experiment_name: "dpo-dev"
     run_name: "dpo"
+    tracking_uri: "http://localhost:5000"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

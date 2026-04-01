@@ -35,10 +35,10 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'data["train/loss"]["1"] < 0.69316' \
-        'data["train/loss"]["15"] < 0.63263' \
+        'data["train/loss"]["11"] < 0.53' \
         'data["train/preference_loss"]["1"] > 0.69314' \
         'data["train/preference_loss"]["1"] < 0.69316' \
-        'data["train/preference_loss"]["15"] < 0.63263' \
+        'data["train/preference_loss"]["11"] < 0.53' \
         'mean(data["timing/train/total_step_time"], -5, -1) < 5'
 
     # Clean up checkpoint directory after successful run to save space.

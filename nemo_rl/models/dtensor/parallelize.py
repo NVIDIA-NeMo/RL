@@ -489,9 +489,10 @@ def _parallelize_nm5_h(
         "mixer.down_proj": RowwiseParallel(),
     }
 
-    # Native transformers NemotronH uses model.model.layers, custom uses model.backbone.layers
-    inner_model = model.backbone if hasattr(model, "backbone") else model.model
+    # NemotronH uses .backbone (trust_remote_code) or .model (native transformers >= 5.3.0)
+    inner_model = getattr(model, "backbone", model.model)
     layers: torch.nn.ModuleList = inner_model.layers
+
     parallelize_module(model, tp_mesh, model_tp_plan)
 
     for layer in inner_model.layers:
@@ -522,13 +523,21 @@ def _parallelize_nm5_h(
 
     # do not reshard after forward for root model
     # because its parameters will be used in backward immediately
-    return fully_shard(
+    result = fully_shard(
         model,
         mesh=dp_mesh,
         mp_policy=mp_policy,
         offload_policy=offload_policy,
         reshard_after_forward=False,
     )
+
+    # Register .model so the native transformers forward() (self.model(...)) resolves
+    # correctly after FSDP2 wrapping, regardless of whether the class uses .backbone
+    # (trust_remote_code) or .model (native transformers). kernel_patches.py wraps
+    # the native forward which always calls self.model(...).
+    result.register_module("model", inner_model)
+
+    return result
 
 
 def _parallelize_model(

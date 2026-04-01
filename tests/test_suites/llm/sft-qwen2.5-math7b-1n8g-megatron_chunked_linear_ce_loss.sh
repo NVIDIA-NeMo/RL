@@ -36,8 +36,8 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     # Smoke checks: run completed and loss is finite/reasonable.
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["10"] > 0.0' \
-        'data["train/loss"]["10"] < 20.0'
+        'data["train/loss"]["1"] < 0.49' \
+        'data["train/loss"]["10"] < 0.45'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
