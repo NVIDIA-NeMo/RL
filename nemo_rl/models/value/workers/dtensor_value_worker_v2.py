@@ -32,6 +32,7 @@ from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
     get_microbatch_iterator,
@@ -51,13 +52,9 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
-from nemo_rl.models.policy.workers.patches import (
-    apply_torch_aten_alias_tensor_patch,
-    apply_transformer_engine_patch,
-)
+from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
-from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
@@ -125,7 +122,6 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
         """
         # Apply patches
         apply_transformer_engine_patch()
-        apply_torch_aten_alias_tensor_patch()
 
         # Store configuration and tokenizer
         self.cfg = config
@@ -162,22 +158,22 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
         )
 
         # Set up distributed environment
-        distributed_manager = setup_distributed(
+        distributed_context = setup_distributed(
             config=config,
             runtime_config=runtime_config,
         )
 
         # Set instance attributes from distributed manager
         self.rank = torch.distributed.get_rank()
-        self.device_mesh = distributed_manager.device_mesh
+        self.device_mesh = distributed_context.device_mesh
         self.dp_cp_mesh = self.device_mesh["dp_cp"]
         self.dp_mesh = self.device_mesh["dp"]
         self.tp_mesh = self.device_mesh["tp"]
         self.cp_mesh = self.device_mesh["cp"]
-        self.moe_mesh = distributed_manager.moe_mesh
-        self.dp_size = distributed_manager.dp_size
-        self.tp_size = distributed_manager.tp_size
-        self.cp_size = distributed_manager.cp_size
+        self.moe_mesh = distributed_context.moe_mesh
+        self.dp_size = distributed_context.dp_size
+        self.tp_size = distributed_context.tp_size
+        self.cp_size = distributed_context.cp_size
 
         # Initialize checkpoint manager
         self._init_checkpoint_manager(
@@ -188,6 +184,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
                 ),
                 "is_peft": self.lora_enabled,
                 "skip_task_head_prefixes_for_base_model": ["score."],
+                "is_async": True,
             },
         )
 
@@ -196,7 +193,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             config=config,
             tokenizer=tokenizer,
             runtime_config=runtime_config,
-            distributed_manager=distributed_manager,
+            distributed_context=distributed_context,
             checkpoint_manager=self.checkpoint_manager,
             is_vlm=False,  # Value models don't use vision
             init_optimizer=init_optimizer,
@@ -208,7 +205,6 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
         # Set instance attributes from model and optimizer state
         (
             self.model,
-            self.model_state_dict_keys,
             self.optimizer,
             self.scheduler,
             self.is_hf_model,
@@ -602,7 +598,6 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             self.checkpoint_manager = AutomodelCheckpointManager(
                 dp_mesh=self.dp_mesh,
                 tp_mesh=self.tp_mesh,
-                model_state_dict_keys=getattr(self, "model_state_dict_keys", None),
                 moe_mesh=self.moe_mesh,
             )
             self.checkpoint_manager.init_checkpointer(
