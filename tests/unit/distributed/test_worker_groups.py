@@ -101,7 +101,7 @@ class MyTestActor:
         }
         resources = {"num_gpus": num_gpus}
         env_vars_update = {"CONFIGURED_WORKER_CALLED": "1"}
-        return resources, env_vars_update, init_kwargs_update
+        return resources, env_vars_update, init_kwargs_update, {}
 
 
 @ray.remote(
@@ -138,6 +138,7 @@ class PrecedenceActor:
                 "WORKER_VAR": "worker_only",
             },  # env_vars
             {},  # init_kwargs
+            {},  # runtime_env_overrides
         )
 
 
