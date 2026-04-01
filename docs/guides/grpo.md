@@ -456,20 +456,6 @@ grpo:
 
 Set `overlong_filtering` to true when training on tasks where truncation at the maximum sequence length is expected, such as long-form reasoning or mathematical proofs.
 
-#### CISPO (Clipped IS-weight Policy Optimization)
-
-CISPO introduced in [MiniMax-M1 paper](https://arxiv.org/abs/2506.13585) clips the importance sampling weight itself and applies stop-gradient.
-
-The loss is:
-
-$$
-L(\theta) = E_{x \sim \pi_{\theta_{\text{old}}}} \Big[ \text{sg}\big(\text{clip}(r(\theta), 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}})\big) \cdot A_t \cdot \log \pi_\theta(x) \Big]
-$$
-
-where $r(\theta) = \frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$, $\text{sg}$ denotes stop-gradient, and $\varepsilon_{\text{low}}$, $\varepsilon_{\text{high}}$ are the IS-weight clipping bounds. Dual-clipping (`ratio_clip_c`) is ignored when CISPO is enabled.
-
-To use CISPO, set `loss_fn.use_cispo: true` in your config. Tune `ratio_clip_min` and `ratio_clip_max` (mapping to $\varepsilon_{\text{low}}$ and $\varepsilon_{\text{high}}$). It is recommended to use a large `ratio_clip_min` (e.g. 1.0) and tune `ratio_clip_max` (e.g. 0.8). Example: [examples/configs/cispo_math_8B.yaml](../../examples/configs/cispo_math_8B.yaml).
-
 #### Top-p and top-k filtering
 
 The implementation aligns with vLLM’s top-p and top-k filtering by applying an equivalent process to the logits.

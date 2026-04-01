@@ -221,10 +221,6 @@ class ClippedPGLossFn(LossFunction):
             assert not self.disable_ppo_ratio, (
                 "use_cispo is incompatible with disable_ppo_ratio; "
             )
-            assert not self.sequence_level_importance_ratios, (
-                "use_cispo is incompatible with sequence_level_importance_ratios; "
-                "CISPO is a token-level loss function"
-            )
         if self.truncated_importance_sampling_ratio is not None:
             assert self.use_importance_sampling_correction, (
                 "truncated_importance_sampling_ratio is only supported when use_importance_sampling_correction is True"

@@ -1,8 +1,7 @@
-# CISPO Algorithm Configuration
 defaults: "grpo_math_1B.yaml"
 
   # ============================================================================
-  # CISPO: Clipped IS-weight Policy Optimization
+  # CISPO: Clipped Importance Sampling Policy Optimization
   # CISPO clips the IS weight itself and applies stop-gradient, then multiplies by
   # advantage and log-probability. 
   # ratio_clip_min / ratio_clip_max control the IS weight clipping bounds (ε_IS_low / ε_IS_high).
