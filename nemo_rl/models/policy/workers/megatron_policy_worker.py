@@ -330,6 +330,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     self.optimizer.zero_grad()
 
                     # Forward pass.
+                    draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
                     losses_reduced = megatron_forward_backward(
                         model=self.model,
                         data_iterator=data_iterator,
@@ -344,7 +345,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                         sampling_params=self.sampling_params,
                         straggler_timer=self.mcore_state.straggler_timer,
                         draft_model=self.draft_model,
-                        enable_hidden_capture=self.cfg["draft"]["enabled"],
+                        enable_hidden_capture=draft_enabled,
                         use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
                             "use_linear_ce_fusion_loss", False
                         ),
