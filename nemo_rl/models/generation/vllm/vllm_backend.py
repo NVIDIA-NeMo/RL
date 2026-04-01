@@ -92,6 +92,12 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension:
+    def bind_numa(self) -> bool:
+        """Pin this TP worker to the NUMA-local CPUs of its GPU."""
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        return bind_to_gpu_numa()
+
     def init_collective(
         self,
         rank_prefix: int,

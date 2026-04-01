@@ -412,6 +412,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.generation_tokens = []
 
     async def post_init_async(self):
+        if self.llm is not None:
+            await self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = await self.report_device_id_async()
         if self._mtp_load_from_disk:
             await self.llm.collective_rpc(
