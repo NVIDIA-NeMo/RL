@@ -789,8 +789,7 @@ def setup_model_and_optimizer(
     pre_wrap_hook = []
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
-    draft_cfg = policy_cfg["draft"]
-    draft_enabled = draft_cfg["enabled"]
+    draft_enabled = "draft" in policy_cfg and policy_cfg["draft"]["enabled"]
     resume_checkpoint_exists = (
         megatron_cfg.checkpoint.load is not None
         and checkpoint_exists(megatron_cfg.checkpoint.load)

@@ -278,10 +278,8 @@ def get_basic_megatron_test_config(
                 "overlap_param_gather": False,
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
-            "draft": {
-                "enabled": False,
-            },
         },
+        "draft": {"enabled": False},
         "optimizer": None,  # Remove default FSDP optimizer
         "scheduler": None,  # Remove default scheduler
         "max_grad_norm": 1.0,
