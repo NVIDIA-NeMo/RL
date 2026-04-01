@@ -70,6 +70,9 @@ class AVQADataset(RawDataset):
 
     Args:
         split: Split name for the dataset. Supported: "train", "validation".
+        max_samples: Maximum number of samples to load.
+        seed: Random seed for splitting the dataset.
+        split_validation_size: Size of the validation set.
     """
 
     task_name = "avqa"

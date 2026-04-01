@@ -510,7 +510,9 @@ def vlm_hf_data_processor(
             elif content["type"] == "audio":
                 user_message["content"].append(content)
                 # Store as (audio_array, sample_rate) tuple for vLLM
-                audios.append((content["audio"], 16000))
+                audios.append(
+                    (content["audio"], processor.feature_extractor.sampling_rate)
+                )
             else:
                 raise ValueError(f"Unsupported content type: {content['type']}")
     else:

@@ -84,7 +84,10 @@ def format_prompt_for_vllm_generation(
             prompt_dict["multi_modal_data"] = multi_modal_data
             prompts.append(prompt_dict)
     else:
-        # Regular LLM generation using token_ids
+        # Regular LLM generation using token_ids (pre-tokenized).
+        # Note: eval.py uses raw prompt strings instead of token IDs because its
+        # collate function produces message_log dicts, not tokenized tensors.
+        # Both are valid vLLM input formats but may tokenize slightly differently.
         for i in range(start_idx, end_idx):
             # Use input_lengths to get only valid tokens (not padding)
             prompts.append(_get_regular_prompt(i))

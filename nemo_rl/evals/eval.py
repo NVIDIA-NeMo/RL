@@ -345,6 +345,11 @@ async def _run_env_eval_impl(
                 prompts.append(prompt_dict)
                 prompts_for_display.append(vllm_content)
             else:
+                # Text-only fallback: use raw prompt strings (vLLM will tokenize them).
+                # Note: utils.py's format_prompt_for_vllm_generation uses pre-tokenized
+                # prompt_token_ids instead, since the training pipeline already has
+                # input_ids tensors. Both are valid vLLM inputs but may tokenize
+                # slightly differently.
                 content = [message["content"] for message in message_log]
                 content = "\n".join(content)
                 prompts.append(content)
