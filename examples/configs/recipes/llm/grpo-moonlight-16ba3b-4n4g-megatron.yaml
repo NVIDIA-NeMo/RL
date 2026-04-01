@@ -7,6 +7,9 @@ policy:
     pipeline_model_parallel_size: 2
     num_layers_in_first_pipeline_stage: 14
     num_layers_in_last_pipeline_stage: 13
+    # DeepEP is supported for Ampere, Hopper, and Blackwell (B200/B300) GPUs
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
 logger:
   wandb:
     name: grpo-moonlight-16ba3b-4n4g-megatron
