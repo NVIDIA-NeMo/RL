@@ -1231,8 +1231,8 @@ class TestDraftSetup:
         )
 
     @patch("nemo_rl.models.megatron.draft.utils.copy_policy_lm_head_to_draft")
-    @patch("nemo_rl.models.megatron.draft.load_hf_weights_to_eagle")
-    @patch("nemo_rl.models.megatron.draft.EagleModel")
+    @patch("nemo_rl.models.megatron.draft.utils.load_hf_weights_to_eagle")
+    @patch("nemo_rl.models.megatron.draft.eagle.EagleModel")
     @patch("transformers.AutoConfig.from_pretrained")
     def test_build_draft_model_falls_back_to_policy_lm_head(
         self,
