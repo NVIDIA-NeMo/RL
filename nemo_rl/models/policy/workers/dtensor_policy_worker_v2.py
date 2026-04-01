@@ -582,9 +582,26 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         return True
 
-    def set_loss_fn(self, loss_fn: LossFunction) -> None:
-        """Cache a loss function on this worker to avoid Ray re-serialization."""
-        self._cached_loss_fn = loss_fn
+    def init_cross_tokenizer_loss_fn(self, loss_config, token_aligner_config):
+        """Build CrossTokenizerDistillationLossFn locally from config + shared filesystem."""
+        from nemo_rl.algorithms.x_token import TokenAligner
+        from nemo_rl.algorithms.loss_functions import CrossTokenizerDistillationLossFn
+
+        aligner = TokenAligner(
+            teacher_tokenizer_name=token_aligner_config["teacher_model"],
+            student_tokenizer_name=token_aligner_config["student_model"],
+            max_comb_len=token_aligner_config.get("max_comb_len", 4),
+            projection_matrix_multiplier=token_aligner_config.get("projection_matrix_multiplier", 1.0),
+        )
+        aligner._load_logits_projection_map(
+            file_path=token_aligner_config["projection_matrix_path"],
+            use_sparse_format=token_aligner_config.get("use_sparse_format", True),
+            learnable=token_aligner_config.get("learnable", False),
+            device="cpu",
+        )
+        if token_aligner_config.get("project_teacher_to_student", False):
+            aligner.create_reverse_projection_matrix(device="cpu")
+        self._cached_loss_fn = CrossTokenizerDistillationLossFn(loss_config, aligner)
 
     def update_cross_tokenizer_data(self, teacher_input_ids, aligned_pairs) -> None:
         """Update per-step cross-tokenizer data on the cached loss function."""
