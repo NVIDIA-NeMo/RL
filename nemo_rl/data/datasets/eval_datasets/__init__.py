@@ -56,6 +56,12 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
+    elif dataset_name == "aime2026":
+        base_dataset = AIMEDataset(
+            variant="2026",
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+        )
     # gpqa
     elif dataset_name == "gpqa":
         base_dataset = GPQADataset(

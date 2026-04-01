@@ -1297,6 +1297,7 @@ def validate(
         print(f"▶ Starting validation at step {step}...", flush=True)
 
         total_rewards = []  # Can be any metric. Setted to 'accuracy' by default.
+        total_task_names = []  # Track which dataset each reward belongs to
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
@@ -1356,7 +1357,13 @@ def validate(
                 rewards = val_batch["total_reward"]
 
                 total_rewards.extend(rewards.tolist())
-                total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+                if "task_name" in val_batch:
+                    total_task_names.extend(val_batch["task_name"])
+                # Collect per-sample generation lengths for per-task breakdown
+                for ml in val_batch["message_log"]:
+                    total_lengths.append(
+                        sum(len(t["token_ids"]) for t in ml if t["role"] == "assistant")
+                    )
 
                 # Collect message logs for later display
                 to_env = [
@@ -1385,6 +1392,28 @@ def validate(
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
+
+        # Per-dataset breakdown (accuracy and avg_length)
+        if total_task_names:
+            from collections import defaultdict
+
+            per_task_rewards: dict[str, list[float]] = defaultdict(list)
+            per_task_lengths: dict[str, list[float]] = defaultdict(list)
+            for task_name, reward, length in zip(
+                total_task_names, total_rewards, total_lengths
+            ):
+                if task_name is not None:
+                    per_task_rewards[task_name].append(reward)
+                    per_task_lengths[task_name].append(length)
+            for task_name in sorted(per_task_rewards):
+                rewards_list = per_task_rewards[task_name]
+                lengths_list = per_task_lengths[task_name]
+                val_metrics[f"accuracy/{task_name}"] = (
+                    sum(rewards_list) / len(rewards_list)
+                )
+                val_metrics[f"avg_length/{task_name}"] = (
+                    sum(lengths_list) / len(lengths_list)
+                )
 
         # Print sample conversations only once at the end of validation
         try:
@@ -1417,6 +1446,9 @@ def validate(
     print("\n📊 Validation Results:")
     print(f"    • Accuracy: {accuracy:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
+    for key, value in sorted(val_metrics.items()):
+        if key.startswith("accuracy/") or key.startswith("avg_length/"):
+            print(f"    • {key}: {value:.4f}")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 
     # Print timing information
