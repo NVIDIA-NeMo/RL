@@ -268,6 +268,10 @@ class MegatronPolicyWorkerImpl(
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
 
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        bind_to_gpu_numa()
+
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
 
