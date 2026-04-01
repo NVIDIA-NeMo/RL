@@ -239,6 +239,9 @@ class ClippedPGLossFn(LossFunction):
             assert self.ratio_clip_c is None, (
                 "use_cispo is incompatible with ratio_clip_c; "
                 "ratio_clip_c is not supported when use_cispo=True"
+        if self.truncated_importance_sampling_ratio is not None:
+            assert self.use_importance_sampling_correction, (
+                "truncated_importance_sampling_ratio is only supported when use_importance_sampling_correction is True"
             )
         if self.truncated_importance_sampling_type is not None:
             assert self.use_importance_sampling_correction, (
