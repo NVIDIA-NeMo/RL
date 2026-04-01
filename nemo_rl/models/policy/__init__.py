@@ -251,6 +251,22 @@ class MegatronConfig(TypedDict):
     linear_ce_fusion_chunk_size: NotRequired[int]
 
 
+class DraftConfigDisabled(TypedDict):
+    """Configuration shape for the disabled draft-model training path."""
+
+    enabled: Literal[False]
+
+
+class DraftConfig(TypedDict):
+    """Configuration for Eagle draft-model training alongside the policy model."""
+
+    enabled: Literal[True]
+    model_name: NotRequired[str | None]
+    loss_weight: NotRequired[float]
+    num_layers: NotRequired[int | None]
+    aux_layer_indices: NotRequired[list[int] | None]
+
+
 class TokenizerConfig(TypedDict):
     name: str
     chat_template: NotRequired[str]
@@ -313,6 +329,7 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
+    draft: NotRequired[DraftConfig | DraftConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
