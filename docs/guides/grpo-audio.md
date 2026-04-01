@@ -7,7 +7,7 @@ This guide explains how to use NeMo RL to train [Qwen2.5-Omni-3B](https://huggin
 Run GRPO training with the provided config:
 
 ```
-uv run examples/run_grpo.py --config examples/configs/audio_grpo_3B_megatron.yaml
+uv run examples/run_vlm_grpo.py --config examples/configs/audio_grpo_3B_megatron.yaml
 ```
 
 Config: `examples/configs/audio_grpo_3B_megatron.yaml`

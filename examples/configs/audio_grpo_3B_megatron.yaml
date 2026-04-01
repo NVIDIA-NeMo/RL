@@ -33,6 +33,9 @@ policy:
       skip_tokenizer_init: False
       limit_mm_per_prompt:
         audio: 1
+    vllm_kwargs:
+      # Disable mm processor cache to avoid vLLM cache eviction assertion error during validation.
+      mm_processor_cache_gb: 0
 
   megatron_cfg:
     converter_type: Qwen2_5OmniForConditionalGeneration

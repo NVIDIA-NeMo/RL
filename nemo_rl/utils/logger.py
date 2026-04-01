@@ -401,7 +401,12 @@ class WandbLogger(LoggerInterface):
             step: Global step value
             name: Name of the metric
         """
-        self.run.log({name: wandb.Histogram(histogram)}, step=step)
+        try:
+            self.run.log({name: wandb.Histogram(histogram)}, step=step)
+        except ValueError:
+            # When all values are identical, numpy cannot create finite-sized bins.
+            # Log the scalar value instead.
+            self.run.log({name: histogram[0] if len(histogram) > 0 else 0}, step=step)
 
 
 class SwanlabLogger(LoggerInterface):
