@@ -52,6 +52,12 @@ def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor
 
 
 class VllmInternalWorkerExtension:
+    def bind_numa(self) -> bool:
+        """Pin this TP worker to the NUMA-local CPUs of its GPU."""
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        return bind_to_gpu_numa()
+
     def init_collective(
         self,
         rank_prefix: int,
