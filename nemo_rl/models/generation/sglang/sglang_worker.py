@@ -74,7 +74,7 @@ class SGLangGenerationWorker:
     @staticmethod
     def configure_worker(
         num_gpus: int | float, bundle_indices: Optional[tuple[int, list[int]]] = None
-    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
         """Provides complete worker configuration for SGLang server.
 
         This method configures the worker based on bundle_indices which tells us
@@ -127,7 +127,8 @@ class SGLangGenerationWorker:
         else:
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
 
-        return resources, env_vars, init_kwargs
+        # runtime_env_overrides not used by SGLang workers
+        return resources, env_vars, init_kwargs, {}
 
     def __init__(
         self,
