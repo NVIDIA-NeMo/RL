@@ -175,17 +175,13 @@ class RayWorkerBuilder:
             # Use the worker's configuration interface if available
             if hasattr(worker_class, "configure_worker"):
                 # Get complete worker configuration from the worker class.
-                # configure_worker returns (resources, env_vars, init_kwargs)
-                # with an optional 4th element for runtime_env overrides.
-                result = worker_class.configure_worker(
-                    num_gpus=num_gpus,
-                    bundle_indices=bundle_indices,
+                # Returns (resources, env_vars, init_kwargs, runtime_env_overrides).
+                resources, env_vars, init_kwargs, runtime_env_overrides = (
+                    worker_class.configure_worker(
+                        num_gpus=num_gpus,
+                        bundle_indices=bundle_indices,
+                    )
                 )
-                if len(result) == 4:
-                    resources, env_vars, init_kwargs, runtime_env_overrides = result
-                else:
-                    resources, env_vars, init_kwargs = result
-                    runtime_env_overrides = {}
 
                 # Apply resource configuration
                 if resources and "num_gpus" in resources:
@@ -204,8 +200,9 @@ class RayWorkerBuilder:
                 if runtime_env_overrides:
                     if "runtime_env" not in options:
                         options["runtime_env"] = {}
-                    for k, v in runtime_env_overrides.items():
-                        options["runtime_env"][k] = v  # type: ignore
+                    options["runtime_env"] = recursive_merge_options(
+                        options["runtime_env"], runtime_env_overrides
+                    )
 
                 # Apply initialization parameters
                 if init_kwargs:
