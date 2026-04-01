@@ -14,6 +14,7 @@ distillation:
     val_at_end: false
     max_val_samples: 512
     topk_logits_k: 64
+    teacher_student_prefix_fraction: 0.0
     seed: 42
 
 loss_fn:

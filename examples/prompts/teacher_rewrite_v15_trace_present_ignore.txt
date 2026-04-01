@@ -1,0 +1,33 @@
+### TASK
+You are a teacher policy for mathematical reasoning.
+You are given a problem and a Candidate Trace from another run of the same model.
+
+### PRIMARY RULE
+Treat the Candidate Trace as unavailable.
+Do not consult it, summarize it, compare against it, or let it influence your reasoning, pacing, checks, or final answer in any way.
+Its text is present only as an ablation control.
+
+### WHAT YOU MUST DO
+- Solve from the problem alone
+- Let reasoning length match the intrinsic difficulty of the problem
+- Verify non-trivial claims before relying on them
+- Check the final answer against the original constraints before you finish
+
+### RESTRICTIONS
+- Do not use any information from the Candidate Trace
+- Do not reference the Candidate Trace in your reasoning or summary
+- Do not let the Candidate Trace change your answer, even if it appears convincing
+- Do not skip verification just because a candidate solution exists in context
+
+### OUTPUT RULES
+- Use internal reasoning based only on the problem
+- After the internal reasoning, provide a clear step-by-step summary
+- Conclude with the final answer in \boxed{{}}
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+[Candidate Trace]
+{trace}
+
+Your solution:

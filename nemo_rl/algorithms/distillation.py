@@ -88,6 +88,7 @@ class DistillationConfig(TypedDict):
     max_val_samples: int
     topk_logits_k: int
     seed: int
+    teacher_student_prefix_fraction: NotRequired[float]
     # Optional overrides for validation rollouts (see validate()).
     val_max_total_sequence_length: NotRequired[Optional[int]]
     val_max_new_tokens: NotRequired[Optional[int]]
@@ -550,6 +551,116 @@ def _align_teacher_topk_to_student(
     return aligned_logits, aligned_indices
 
 
+def _get_teacher_student_prefix_indices(
+    batch_size: int,
+    fraction: float,
+    seed: int,
+    total_steps: int,
+) -> torch.Tensor:
+    """Select a deterministic per-step subset that reuses the student prefix."""
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError(
+            f"distillation.teacher_student_prefix_fraction must be in [0, 1], got {fraction}"
+        )
+    if batch_size <= 0 or fraction <= 0.0:
+        return torch.empty(0, dtype=torch.long)
+
+    selected_count = min(batch_size, int(np.floor(batch_size * fraction + 0.5)))
+    if selected_count <= 0:
+        return torch.empty(0, dtype=torch.long)
+    if selected_count >= batch_size:
+        return torch.arange(batch_size, dtype=torch.long)
+
+    step_seed = (seed * 1_000_003) + total_steps
+    rng = np.random.default_rng(step_seed)
+    selected = np.sort(rng.choice(batch_size, size=selected_count, replace=False))
+    return torch.tensor(selected, dtype=torch.long)
+
+
+def _apply_teacher_student_prefix_mix(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    fraction: float,
+    seed: int,
+    total_steps: int,
+) -> dict[str, float]:
+    """Swap a deterministic subset of teacher prompts to the student prefix."""
+    metrics = {
+        "teacher_student_prefix_fraction_configured": float(fraction),
+        "teacher_student_prefix_selected_count": 0.0,
+        "teacher_student_prefix_realized_fraction": 0.0,
+        "teacher_prompt_count": 0.0,
+        "teacher_student_prefix_mean_teacher_input_length": 0.0,
+        "teacher_prompt_mean_teacher_input_length": 0.0,
+    }
+
+    selected_indices = _get_teacher_student_prefix_indices(
+        batch_size=repeated_batch.size,
+        fraction=fraction,
+        seed=seed,
+        total_steps=total_steps,
+    )
+    if "teacher_message_log" not in repeated_batch or repeated_batch.size == 0:
+        return metrics
+
+    selected_index_set = {int(idx) for idx in selected_indices.tolist()}
+    selected_prefix_lengths: list[int] = []
+    teacher_prompt_lengths: list[int] = []
+
+    for i in range(repeated_batch.size):
+        if i in selected_index_set:
+            repeated_batch["teacher_message_log"][i] = repeated_batch["message_log"][i]
+            selected_prefix_lengths.append(
+                len(repeated_batch["teacher_message_log"][i][0]["token_ids"])
+            )
+        else:
+            teacher_prompt_lengths.append(
+                len(repeated_batch["teacher_message_log"][i][0]["token_ids"])
+            )
+
+    selected_count = float(len(selected_index_set))
+    teacher_prompt_count = float(repeated_batch.size - len(selected_index_set))
+    metrics.update(
+        {
+            "teacher_student_prefix_selected_count": selected_count,
+            "teacher_student_prefix_realized_fraction": (
+                selected_count / repeated_batch.size if repeated_batch.size > 0 else 0.0
+            ),
+            "teacher_prompt_count": teacher_prompt_count,
+            "teacher_student_prefix_mean_teacher_input_length": (
+                float(np.mean(selected_prefix_lengths))
+                if selected_prefix_lengths
+                else 0.0
+            ),
+            "teacher_prompt_mean_teacher_input_length": (
+                float(np.mean(teacher_prompt_lengths)) if teacher_prompt_lengths else 0.0
+            ),
+        }
+    )
+    return metrics
+
+
+def _inject_student_rollout_into_teacher_message_logs(
+    repeated_batch: BatchedDataDict[DatumSpec],
+) -> None:
+    """Populate teacher logs with student rollout turns without double-injecting."""
+    for i, student_ml in enumerate(repeated_batch["message_log"]):
+        teacher_ml = repeated_batch["teacher_message_log"][i]
+        teacher_already_has_rollout = teacher_ml is student_ml
+        if teacher_already_has_rollout:
+            teacher_ml = deepcopy(teacher_ml)
+            repeated_batch["teacher_message_log"][i] = teacher_ml
+        else:
+            for msg in student_ml:
+                if msg["role"] != "user":
+                    teacher_ml.append(deepcopy(msg))
+
+        for msg in teacher_ml:
+            if msg["role"] == "assistant":
+                msg["token_loss_mask"] = torch.ones_like(msg["token_ids"])
+            else:
+                msg["token_loss_mask"] = torch.zeros_like(msg["token_ids"])
+
+
 def _debug_print_first_sample(
     train_data: BatchedDataDict[Any],
     teacher_data: BatchedDataDict[Any],
@@ -820,6 +931,14 @@ def distillation_train(
 
                 with timer.time("data_processing"):
                     has_teacher_ml = "teacher_message_log" in repeated_batch
+                    teacher_context_metrics = _apply_teacher_student_prefix_mix(
+                        repeated_batch,
+                        fraction=master_config["distillation"].get(
+                            "teacher_student_prefix_fraction", 0.0
+                        ),
+                        seed=master_config["distillation"]["seed"],
+                        total_steps=total_steps,
+                    )
 
                     # Add loss mask and advantages to each message in LLMMessageLogType
                     for message_log in repeated_batch["message_log"]:
@@ -835,18 +954,7 @@ def distillation_train(
 
                     # Copy assistant messages to teacher_message_log and add loss masks
                     if has_teacher_ml:
-                        for i, student_ml in enumerate(repeated_batch["message_log"]):
-                            teacher_ml = repeated_batch["teacher_message_log"][i]
-                            # Copy non-user messages (assistant, environment) from student rollout
-                            for msg in student_ml:
-                                if msg["role"] != "user":
-                                    teacher_ml.append(deepcopy(msg))
-                            # Add loss masks to teacher message log
-                            for msg in teacher_ml:
-                                if msg["role"] == "assistant":
-                                    msg["token_loss_mask"] = torch.ones_like(msg["token_ids"])
-                                else:
-                                    msg["token_loss_mask"] = torch.zeros_like(msg["token_ids"])
+                        _inject_student_rollout_into_teacher_message_logs(repeated_batch)
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -987,6 +1095,7 @@ def distillation_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
+                metrics.update(teacher_context_metrics)
                 metrics.update(rollout_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
 

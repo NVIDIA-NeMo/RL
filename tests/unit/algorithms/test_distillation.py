@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,13 +21,17 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
+    _apply_teacher_student_prefix_mix,
     _default_distillation_save_state,
+    _get_teacher_student_prefix_indices,
+    _inject_student_rollout_into_teacher_message_logs,
     check_vocab_equality,
     distillation_train,
     validate,
 )
 from nemo_rl.algorithms.loss import DistillationLossFn
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -293,6 +298,147 @@ def test_validate_function(mock_components):
     # For distillation, we don't need environment interaction since max_rollout_turns=0
     # The validation focuses on generation and teacher-student knowledge transfer
     # Note: validate() function itself doesn't call logger.log_metrics - that's done by the caller
+
+
+@pytest.mark.parametrize(
+    ("fraction", "expected_count"),
+    [(0.10, 3), (0.25, 8), (0.50, 16)],
+)
+def test_teacher_student_prefix_indices_count_rounding(fraction, expected_count):
+    indices = _get_teacher_student_prefix_indices(
+        batch_size=32,
+        fraction=fraction,
+        seed=42,
+        total_steps=0,
+    )
+
+    assert len(indices) == expected_count
+
+
+def test_teacher_student_prefix_indices_are_reproducible():
+    indices_first = _get_teacher_student_prefix_indices(
+        batch_size=32,
+        fraction=0.25,
+        seed=42,
+        total_steps=7,
+    )
+    indices_second = _get_teacher_student_prefix_indices(
+        batch_size=32,
+        fraction=0.25,
+        seed=42,
+        total_steps=7,
+    )
+    indices_different_step = _get_teacher_student_prefix_indices(
+        batch_size=32,
+        fraction=0.25,
+        seed=42,
+        total_steps=8,
+    )
+
+    assert torch.equal(indices_first, indices_second)
+    assert not torch.equal(indices_first, indices_different_step)
+
+
+def test_teacher_student_prefix_mix_preserves_student_logs_and_flattens_cleanly():
+    def user_msg(token_ids, content):
+        return {
+            "role": "user",
+            "content": content,
+            "token_ids": torch.tensor(token_ids),
+        }
+
+    def assistant_msg(token_ids, content):
+        return {
+            "role": "assistant",
+            "content": content,
+            "token_ids": torch.tensor(token_ids),
+        }
+
+    student_message_logs = [
+        [user_msg([1, 2, 3], "p0"), assistant_msg([10, 11], "a0")],
+        [user_msg([4, 5, 6, 7], "p1"), assistant_msg([12, 13], "a1")],
+        [user_msg([8, 9, 10], "p2"), assistant_msg([14, 15], "a2")],
+        [user_msg([11, 12], "p3"), assistant_msg([16, 17], "a3")],
+    ]
+    teacher_message_logs = [
+        [user_msg([21, 22, 23, 24, 25, 26], "tp0")],
+        [user_msg([27, 28, 29, 30, 31, 32], "tp1")],
+        [user_msg([33, 34, 35, 36, 37, 38], "tp2")],
+        [user_msg([39, 40, 41, 42, 43, 44], "tp3")],
+    ]
+
+    repeated_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": deepcopy(student_message_logs),
+            "teacher_message_log": deepcopy(teacher_message_logs),
+            "loss_multiplier": torch.ones(4),
+            "task_name": ["math"] * 4,
+            "extra_env_info": [{} for _ in range(4)],
+            "length": torch.tensor([5, 6, 5, 4]),
+            "idx": torch.tensor([0, 1, 2, 3]),
+        }
+    )
+
+    metrics = _apply_teacher_student_prefix_mix(
+        repeated_batch,
+        fraction=0.5,
+        seed=42,
+        total_steps=0,
+    )
+    selected_indices = [
+        i
+        for i in range(repeated_batch.size)
+        if repeated_batch["teacher_message_log"][i] is repeated_batch["message_log"][i]
+    ]
+    unselected_indices = [
+        i for i in range(repeated_batch.size) if i not in selected_indices
+    ]
+
+    assert len(selected_indices) == 2
+    assert metrics["teacher_student_prefix_selected_count"] == 2.0
+    assert metrics["teacher_prompt_count"] == 2.0
+    assert metrics["teacher_student_prefix_realized_fraction"] == 0.5
+
+    for message_log in repeated_batch["message_log"]:
+        for message in message_log:
+            if message["role"] == "assistant":
+                message["token_loss_mask"] = torch.ones_like(message["token_ids"])
+            else:
+                message["token_loss_mask"] = torch.zeros_like(message["token_ids"])
+
+    _inject_student_rollout_into_teacher_message_logs(repeated_batch)
+
+    for student_ml in repeated_batch["message_log"]:
+        assert len(student_ml) == 2
+
+    for teacher_ml, student_ml in zip(
+        repeated_batch["teacher_message_log"], repeated_batch["message_log"]
+    ):
+        assert len(teacher_ml) == len(student_ml)
+        assert teacher_ml is not student_ml
+
+    tokenizer = MagicMock()
+    tokenizer.pad_token_id = 0
+    student_flat, student_lengths = batched_message_log_to_flat_message(
+        repeated_batch["message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+        make_sequence_length_divisible_by=8,
+    )
+    teacher_flat, teacher_lengths = batched_message_log_to_flat_message(
+        repeated_batch["teacher_message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+        make_sequence_length_divisible_by=8,
+    )
+
+    assert student_flat["token_ids"].shape[0] == 4
+    assert teacher_flat["token_ids"].shape[0] == 4
+    assert student_flat["token_loss_mask"].shape[0] == 4
+    assert teacher_flat["token_loss_mask"].shape[0] == 4
+
+    for idx in selected_indices:
+        assert int(teacher_lengths[idx].item()) == int(student_lengths[idx].item())
+    for idx in unselected_indices:
+        assert int(teacher_lengths[idx].item()) > int(student_lengths[idx].item())
 
 
 def test_check_vocab_equality_pass(monkeypatch):

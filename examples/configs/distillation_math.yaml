@@ -11,6 +11,7 @@ distillation:
     val_at_end: false
     max_val_samples: 512
     topk_logits_k: 64
+    teacher_student_prefix_fraction: 0.0
     val_max_total_sequence_length: null # when set, validation generation uses this instead of policy.max_total_sequence_length
     val_max_new_tokens: null # when set, validation generation uses this instead of policy.generation.max_new_tokens
     seed: 42
