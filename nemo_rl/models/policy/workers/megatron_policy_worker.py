@@ -416,11 +416,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 all_mb_metrics.extend(gb_loss_metrics)
                 losses.append(torch.tensor(mb_losses).sum().item())
 
-        if not eval_mode:
-            # take one LR step every rollout batch
-            # we need to scale the step by gbs to counteract the fact that NeMo automatically
-            # scales lr_warmup_steps by gbs during init
-            self.scheduler.step(increment=gbs)
+                if not eval_mode:
+                    # step LR scheduler after every optimizer step
+                    # we scale the step by gbs to counteract the fact that NeMo automatically
+                    # scales lr_warmup_steps by gbs during init
+                    self.scheduler.step(increment=gbs)
 
         # Aggregate metrics across all microbatches
         mb_metrics, global_loss = aggregate_training_statistics(
@@ -1145,11 +1145,40 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
 
+    def finish_inference(self, *args, **kwargs):
+        """Offload model params to CPU after inference."""
+        self.model = self.move_model(self.model, "cpu", move_params=True, move_grads=False)
+        self.model.eval()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def finish_training(self, *args, **kwargs):
+        """Offload model, gradients, and optimizer to CPU after training."""
+        self.model = self.move_model(self.model, "cpu", move_params=True, move_grads=True)
+        self.model.eval()
+
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and not self.optimizer_cpu_offload
+        ):
+            self.move_optimizer("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
-        """Offload the optimizer and buffers to the CPU."""
+        """Offload the optimizer and buffers to the CPU, keeping params on GPU for refit."""
         no_grad = torch.no_grad()
         no_grad.__enter__()
+
+        # Ensure model params are on GPU (they may have been offloaded by finish_training)
+        self.model = self.move_model(
+            self.model, "cuda", move_params=True, move_grads=False
+        )
+
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(

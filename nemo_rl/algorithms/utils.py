@@ -17,15 +17,12 @@ import random
 import re
 import warnings
 from functools import partial, wraps
+from locale import normalize
 from typing import Any, Optional
 
 import numpy as np
 import torch
-from transformers import (
-    AutoProcessor,
-    AutoTokenizer,
-    PreTrainedTokenizerBase,
-)
+from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
@@ -220,6 +217,24 @@ def mask_out_neg_inf_logprobs(
     logprobs = torch.where(mask.bool(), logprobs, 0.0)
 
     return logprobs
+
+
+
+def masked_var(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    mean: Optional[torch.Tensor | float] = None,
+    unbiased: bool = True,
+) -> torch.Tensor:
+    if mean is None:
+        mean = masked_mean(values, mask)
+    centered_values = values - mean
+    variance = masked_mean(centered_values**2, mask)
+
+    if unbiased:
+        normalization_factor = torch.sum(mask)
+        variance = variance * (normalization_factor / (normalization_factor - 1))
+    return variance
 
 
 def set_seed(seed: int) -> None:
@@ -640,24 +655,24 @@ def print_performance_metrics(
     # Throughputs
     # =====================================================
 
-    policy_and_reference_logprobs_time = timing_metrics["policy_and_reference_logprobs"]
-    policy_training_time = timing_metrics["policy_training"]
+    policy_and_reference_logprobs_time = timing_metrics.get("policy_and_reference_logprobs", 0)
+    policy_training_time = timing_metrics.get("policy_training", 0)
     total_time = timing_metrics["total_step_time"]
     refit_time = (
         timing_metrics["weight_sync"]
         if "weight_sync" in timing_metrics
-        else timing_metrics["prepare_for_generation/total"]
+        else timing_metrics.get("prepare_for_generation/total", 0)
     )
-    if "generation" in timing_metrics:  # Sync GRPO
+    if "generation" in timing_metrics:  # Sync
         generation_time = timing_metrics["generation"]
-    else:  # Async GRPO
+    else:  # Async
         # If the training time is greater than the generation time, we include the idle time caused by training as part of the generation time.
         # if training time > generation time, generation time = training time
         # if training time < generation time, generation time = training time + exposed generation time
         generation_time = (
-            timing_metrics["exposed_generation"]
-            + timing_metrics["policy_and_reference_logprobs"]
-            + timing_metrics["policy_training"]
+            timing_metrics.get("exposed_generation", 0)
+            + policy_and_reference_logprobs_time
+            + policy_training_time
         )
 
     num_nodes = master_config["cluster"]["num_nodes"]
@@ -669,7 +684,6 @@ def print_performance_metrics(
     if (
         "async_grpo" in master_config and master_config["async_grpo"]["enabled"]
     ) and not colocated_inference:
-        # async grpo
         exposed_generation_time = timing_metrics["exposed_generation"]
         training_worker_idle_time_ratio = (
             0
@@ -689,9 +703,11 @@ def print_performance_metrics(
             training_worker_idle_time_ratio
         )
 
+    # Detect which algorithm config key is being used
+    algo_config = master_config.get("grpo") or master_config.get("ppo") or {}
     number_of_samples_per_step = (
-        master_config["grpo"]["num_prompts_per_step"]
-        * master_config["grpo"]["num_generations_per_prompt"]
+        algo_config.get("num_prompts_per_step", 1)
+        * algo_config.get("num_generations_per_prompt", 1)
     )
 
     if colocated_inference:
@@ -710,28 +726,43 @@ def print_performance_metrics(
         )
         training_num_gpus = total_num_gpus - generation_num_gpus
 
+    total_num_tokens = metrics.get("total_num_tokens", 0)
+
     e2e_samples_per_sec_per_gpu = (
         number_of_samples_per_step / total_time / total_num_gpus
+        if total_time > 0
+        else 0
     )
 
     e2e_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / total_time / total_num_gpus
+        total_num_tokens / total_time / total_num_gpus
+        if total_time > 0
+        else 0
     )
     policy_training_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / policy_training_time / training_num_gpus
+        total_num_tokens / policy_training_time / training_num_gpus
+        if policy_training_time > 0
+        else 0
     )
     policy_and_reference_logprobs_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"]
+        total_num_tokens
         / policy_and_reference_logprobs_time
         / training_num_gpus
+        if policy_and_reference_logprobs_time > 0
+        else 0
     )
+    training_worker_group_time = policy_training_time + policy_and_reference_logprobs_time
     training_worker_group_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"]
-        / (policy_training_time + policy_and_reference_logprobs_time)
+        total_num_tokens
+        / training_worker_group_time
         / training_num_gpus
+        if training_worker_group_time > 0
+        else 0
     )
     generation_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / generation_time / generation_num_gpus
+        total_num_tokens / generation_time / generation_num_gpus
+        if generation_time > 0
+        else 0
     )
 
     print("  • Throughputs (per GPU):")
