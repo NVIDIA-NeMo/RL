@@ -18,7 +18,7 @@ distillation:
     max_rollout_turns: 1
     max_num_steps: 1000
     max_num_epochs: 1
-    val_batch_size: 64
+    val_batch_size: 256
     val_period: 25
     val_steps: [10]
     val_at_start: true
@@ -52,7 +52,7 @@ policy: &POLICY_BASE
         name: ${..model_name}
         chat_template_kwargs: null
     train_global_batch_size: 64
-    train_micro_batch_size: 1
+    train_micro_batch_size: 2
     generation_batch_size: 64
     logprob_batch_size: 1
     max_total_sequence_length: 17408  # 800 prompt + 16384 generation, div by TP×CP×2=16
@@ -190,7 +190,7 @@ policy: &POLICY_BASE
             tensor_parallel_size: 4
             pipeline_parallel_size: 1
             expert_parallel_size: 1
-            gpu_memory_utilization: 0.4
+            gpu_memory_utilization: 0.6
             max_model_len: 33280  # kept for validation coverage (val generates up to 32768)
             enforce_eager: False
             use_deep_gemm: False
