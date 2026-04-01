@@ -1234,7 +1234,7 @@ class TestDraftSetup:
     @patch("nemo_rl.models.megatron.draft.load_hf_weights_to_eagle")
     @patch("nemo_rl.models.megatron.draft.EagleModel")
     @patch("transformers.AutoConfig.from_pretrained")
-    def test_build_unwrapped_draft_model_falls_back_to_policy_lm_head(
+    def test_build_draft_model_falls_back_to_policy_lm_head(
         self,
         mock_auto_config,
         mock_eagle_model,
@@ -1242,7 +1242,7 @@ class TestDraftSetup:
         mock_copy_lm_head,
     ):
         """Missing draft LM-head weights should fall back to the policy LM head."""
-        from nemo_rl.models.megatron.setup import build_unwrapped_draft_model
+        from nemo_rl.models.megatron.setup import build_draft_model
 
         mock_auto_config.return_value.to_dict.return_value = {
             "num_hidden_layers": 2,
@@ -1265,7 +1265,7 @@ class TestDraftSetup:
         )
         policy_model_chunk = MagicMock()
 
-        returned_model = build_unwrapped_draft_model(
+        returned_model = build_draft_model(
             model_provider=self._build_model_provider(),
             draft_config={"enabled": True, "model_name": "dummy-draft"},
             pg_collection=SimpleNamespace(tp=None),
