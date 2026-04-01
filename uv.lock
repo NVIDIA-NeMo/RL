@@ -107,7 +107,7 @@ overrides = [
     { name = "llguidance", specifier = ">=1.3.0,<1.4.0" },
     { name = "nvidia-cudnn-cu12", specifier = "==9.19.0.56" },
     { name = "nvidia-cutlass-dsl", specifier = ">=4.2.1" },
-    { name = "nvidia-modelopt", extras = ["torch"], git = "https://github.com/NVIDIA/Model-Optimizer?rev=bc96f1ce39d28e2073fda076c119263094b619ee" },
+    { name = "nvidia-modelopt", extras = ["torch"], git = "https://github.com/NVIDIA/Model-Optimizer?rev=f1beaba36f2df02304eceea2293c99c595f73711" },
     { name = "opencv-python-headless", specifier = ">=4.11.0" },
     { name = "opentelemetry-api", specifier = ">=1.33.1" },
     { name = "setuptools", specifier = ">=80.10.2" },
@@ -3547,7 +3547,7 @@ requires-dist = [
     { name = "multi-storage-client", specifier = "~=0.27" },
     { name = "numpy" },
     { name = "nv-grouped-gemm", git = "https://github.com/fanshiqing/grouped_gemm?tag=v1.1.4.post7" },
-    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'", git = "https://github.com/NVIDIA/Model-Optimizer?rev=bc96f1ce39d28e2073fda076c119263094b619ee" },
+    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'", git = "https://github.com/NVIDIA/Model-Optimizer?rev=f1beaba36f2df02304eceea2293c99c595f73711" },
     { name = "nvidia-resiliency-ext" },
     { name = "nvtx", specifier = "~=0.2" },
     { name = "onnxscript" },
@@ -4489,7 +4489,7 @@ requires-dist = [
     { name = "nvidia-cudnn-cu12", specifier = "==9.19.0.56" },
     { name = "nvidia-cutlass-dsl", marker = "extra == 'vllm'", specifier = ">=4.4.0.dev1" },
     { name = "nvidia-ml-py" },
-    { name = "nvidia-modelopt", marker = "extra == 'modelopt'", git = "https://github.com/NVIDIA/Model-Optimizer?rev=bc96f1ce39d28e2073fda076c119263094b619ee" },
+    { name = "nvidia-modelopt", marker = "extra == 'modelopt'", git = "https://github.com/NVIDIA/Model-Optimizer?rev=f1beaba36f2df02304eceea2293c99c595f73711" },
     { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "nvidia-resiliency-ext" },
     { name = "nvtx" },
@@ -5002,16 +5002,18 @@ wheels = [
 
 [[package]]
 name = "nvidia-modelopt"
-version = "0.43.0.dev107+gbc96f1ce3"
-source = { git = "https://github.com/NVIDIA/Model-Optimizer?rev=bc96f1ce39d28e2073fda076c119263094b619ee#bc96f1ce39d28e2073fda076c119263094b619ee" }
+version = "0.43.0rc2.dev45+gf1beaba36"
+source = { git = "https://github.com/NVIDIA/Model-Optimizer?rev=f1beaba36f2df02304eceea2293c99c595f73711#f1beaba36f2df02304eceea2293c99c595f73711" }
 dependencies = [
     { name = "ninja" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
     { name = "nvidia-ml-py" },
+    { name = "omegaconf" },
     { name = "packaging" },
     { name = "pulp" },
     { name = "pydantic" },
+    { name = "pyyaml" },
     { name = "regex" },
     { name = "rich" },
     { name = "safetensors" },
