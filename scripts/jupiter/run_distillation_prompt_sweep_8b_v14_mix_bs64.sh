@@ -1,13 +1,11 @@
 #!/bin/bash
-# Submit 8B v14 teacher-context mix sweep via JUPITER Ray launcher.
+# Submit 8B mix sweep via JUPITER Ray launcher (val_temperature=0.6).
 #
-# 4 runs, all Qwen3-8B self-distill on 2 nodes, train_global_batch_size=64:
-#   v14-mix25: 25% of teacher-scored samples reuse the student prefix
-#   v14-mix50: 50% of teacher-scored samples reuse the student prefix
-#   v14-mix75: 75% of teacher-scored samples reuse the student prefix
-#   v14-mix95: 95% of teacher-scored samples reuse the student prefix
+# 8 runs, all Qwen3-8B self-distill on 2 nodes, train_global_batch_size=64:
+#   v14 teacher prompt (mix 25/50/75/95)
+#   v1  teacher prompt (mix 25/50/75/95)
 #
-# Evals: math500, aime2024, aime2025, aime2026 (each avg@4)
+# Evals: math500, aime2024, aime2025, aime2026 (each avg@4, temperature=0.6)
 
 set -euo pipefail
 
@@ -42,6 +40,7 @@ submit_job() {
   sbatch --nodes="$nodes" --time="$SBATCH_TIME" --job-name="$job_name" "$RAY_SUB"
 }
 
+# --- v14 teacher prompt runs ---
 RUN_TAG="distill-8b-v14-independent-check-improved"
 
 for mix in 25 50 75 95; do
@@ -56,4 +55,20 @@ for mix in 25 50 75 95; do
     logger.wandb.name=${name}"
 done
 
-echo "All 4 v14 mix bs64 runs submitted through ${RAY_SUB}."
+# --- v1 teacher prompt runs ---
+V1_TAG="distill-8b-v1-rewrite"
+
+for mix in 25 50 75 95; do
+  fraction=$(printf "0.%02d" "$mix")
+  name="${V1_TAG}-mix${mix}-bs64"
+
+  submit_job "d-8b-v1-mix${mix}-bs64" 2 \
+    "uv run python examples/run_distillation.py --config ${CONFIG} \
+    distillation.teacher_student_prefix_fraction=${fraction} \
+    data.default.teacher_prompt_file=examples/prompts/teacher_rewrite.txt \
+    checkpointing.checkpoint_dir=${CKPT_ROOT}/${name} \
+    logger.log_dir=${LOG_ROOT}/${name} \
+    logger.wandb.name=${name}"
+done
+
+echo "All 8 runs (4 v14 + 4 v1) submitted through ${RAY_SUB}."

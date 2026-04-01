@@ -92,6 +92,7 @@ class DistillationConfig(TypedDict):
     # Optional overrides for validation rollouts (see validate()).
     val_max_total_sequence_length: NotRequired[Optional[int]]
     val_max_new_tokens: NotRequired[Optional[int]]
+    val_temperature: NotRequired[Optional[float]]
 
 
 class DistillationSaveState(TypedDict):
@@ -1323,6 +1324,16 @@ def validate(
         if swap_max_new_tokens:
             policy_generation.update_generation_params(max_new_tokens=val_max_new_tokens)
 
+        val_temperature = master_config["distillation"].get("val_temperature")
+        train_temperature = gen_cfg.get("temperature") if gen_cfg is not None else None
+        swap_temperature = (
+            val_temperature is not None
+            and train_temperature is not None
+            and val_temperature != train_temperature
+        )
+        if swap_temperature:
+            policy_generation.update_generation_params(temperature=val_temperature)
+
         try:
             for batch_idx, val_batch in enumerate(val_dataloader):
                 if batch_idx >= max_batches:
@@ -1378,6 +1389,10 @@ def validate(
             if swap_max_new_tokens:
                 policy_generation.update_generation_params(
                     max_new_tokens=train_max_new_tokens
+                )
+            if swap_temperature:
+                policy_generation.update_generation_params(
+                    temperature=train_temperature
                 )
 
         # Calculate validation metrics

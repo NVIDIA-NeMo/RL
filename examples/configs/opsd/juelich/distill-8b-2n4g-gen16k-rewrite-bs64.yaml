@@ -28,6 +28,7 @@ distillation:
     teacher_student_prefix_fraction: 0.0
     val_max_total_sequence_length: 33280
     val_max_new_tokens: 32768
+    val_temperature: 0.6
     seed: 42
 
 loss_fn:
@@ -38,7 +39,7 @@ loss_fn:
 checkpointing:
     enabled: true
     checkpoint_dir: "/p/scratch/scifi/kryeziu1/opsd/checkpoints/distillation-${policy.model_name}-${loss_fn.kl_type}-lr${policy.optimizer.kwargs.lr}-bs${policy.train_global_batch_size}-topk${distillation.topk_logits_k}-rewrite"
-    metric_name: "val:accuracy"
+    metric_name: null
     higher_is_better: true
     keep_top_k: 3
     save_period: 25
@@ -187,7 +188,7 @@ policy: &POLICY_BASE
             async_engine: false
             precision: ${...precision}
             kv_cache_dtype: "auto"
-            tensor_parallel_size: 2
+            tensor_parallel_size: 4
             pipeline_parallel_size: 1
             expert_parallel_size: 1
             gpu_memory_utilization: 0.85
