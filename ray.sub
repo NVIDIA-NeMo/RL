@@ -267,6 +267,18 @@ else
   fi
 fi
 
+# Write GPU→cpulist mapping for NUMA binding.
+# IMPORTANT: The env var name NRL_GPU_CPU_AFFINITY_FILE and default path must stay
+# in sync with GPU_CPU_AFFINITY_PATH in nemo_rl/distributed/numa_utils.py.
+export NRL_GPU_CPU_AFFINITY_FILE="/tmp/nrl_gpu_cpu_affinity"
+nvidia-smi topo -m 2>/dev/null | awk '/^GPU[0-9]/ { gpu = \$1; sub(/GPU/, "", gpu); print gpu ":" \$(NF-2) }' > "\$NRL_GPU_CPU_AFFINITY_FILE" || true
+if [[ -s "\$NRL_GPU_CPU_AFFINITY_FILE" ]]; then
+  echo "NUMA affinity map written to \$NRL_GPU_CPU_AFFINITY_FILE:"
+  cat "\$NRL_GPU_CPU_AFFINITY_FILE"
+else
+  echo "WARNING: Could not generate NUMA affinity map (nvidia-smi topo unavailable)"
+fi
+
 # Use \\\" so that when --resources="\$RAY_RESOURCES" expands, we pass valid JSON to ray
 # IMPORTANT: The key names "nvlink_domain_" and "topo_rank" below must stay in sync
 # with the constants NVLINK_DOMAIN_PREFIX and TOPO_RANK_KEY defined in

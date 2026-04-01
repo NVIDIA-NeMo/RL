@@ -131,6 +131,17 @@ class BaseVllmGenerationWorker:
             fraction_of_gpus: Fraction of GPUs to use for this worker
             seed: Random seed for initialization
         """
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        # Only bind single-GPU workers to their GPU's NUMA node.
+        # For TP>1 workers, the parent process spans multiple NUMA nodes;
+        # binding it would incorrectly constrain the EngineCore subprocess
+        # (which inherits sched_setaffinity + numa_set_membind via fork).
+        # Individual TP workers get their own NUMA binding via collective_rpc
+        # in post_init / post_init_async.
+        if bundle_indices is not None and len(bundle_indices) == 1:
+            bind_to_gpu_numa()
+
         self.cfg = config
         self.model_name = self.cfg["model_name"]
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
@@ -667,6 +678,8 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         self.llm = vllm.LLM(**llm_kwargs)
 
     def post_init(self):
+        if self.llm is not None:
+            self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = self.report_device_id()
 
     def init_collective(
