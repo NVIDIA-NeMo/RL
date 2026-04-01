@@ -1,0 +1,32 @@
+defaults: ../../grpo_math_1B_megatron.yaml
+grpo:
+  max_num_steps: 20
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-0.6B-1n8g-megatron-yarn-64k
+  save_period: 20
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  max_total_sequence_length: 65536
+  make_sequence_length_divisible_by: 16
+  megatron_cfg:
+    context_parallel_size: 8
+    force_reimport_model: true
+  hf_config_overrides:
+    rope_scaling:
+      rope_type: yarn
+      rope_theta: 1000000
+      factor: 1.6
+      original_max_position_embeddings: 40960
+      truncate: true
+      beta_fast: 32
+      beta_slow: 1
+      mscale: 1
+      mscale_all_dim: 0
+logger:
+  wandb:
+    project: yarn
+    name: grpo-qwen3-0.6B-1n8g-megatron-yarn-64k
+cluster:
+  gpus_per_node: 8
