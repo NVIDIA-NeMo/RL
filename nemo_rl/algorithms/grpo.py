@@ -1757,6 +1757,10 @@ def grpo_train(
                                 timer=timer,
                             )["reference_logprobs"]
                         )
+                    else:
+                        train_data["reference_policy_logprobs"] = torch.zeros_like(
+                            train_data["prev_logprobs"]
+                        )
 
                     del logprob_data
                     del extra_multimodal_data
@@ -2789,12 +2793,18 @@ def async_grpo_train(
                         train_data,
                         timer=timer,
                     )["logprobs"]
-                    reference_logprobs = policy.get_reference_policy_logprobs(
-                        train_data,
-                        timer=timer,
-                    )["reference_logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
-                    train_data["reference_policy_logprobs"] = reference_logprobs
+
+                    if not master_config["grpo"].get(
+                        "skip_reference_policy_logprobs_calculation"
+                    ):
+                        reference_logprobs = policy.get_reference_policy_logprobs(
+                            train_data,
+                            timer=timer,
+                        )["reference_logprobs"]
+                        train_data["reference_policy_logprobs"] = reference_logprobs
+                    else:
+                        train_data["reference_policy_logprobs"] = torch.zeros_like(fprop_logprobs)
 
                     (
                         max_seq_mult_prob_error,
