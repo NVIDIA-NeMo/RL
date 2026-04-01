@@ -1191,7 +1191,7 @@ class TestDraftSetup:
         )
 
     @patch("nemo_rl.models.megatron.setup.get_pg_collection")
-    @patch("nemo_rl.models.megatron.setup.build_unwrapped_draft_model")
+    @patch("nemo_rl.models.megatron.setup.build_draft_model")
     def test_draft_pre_wrap_hook_attaches_only_owner_chunk(
         self, mock_build_draft_model, mock_get_pg_collection
     ):
@@ -1230,7 +1230,7 @@ class TestDraftSetup:
             mock_build_draft_model.call_args.kwargs["policy_model_chunk"] is chunks[1]
         )
 
-    @patch("nemo_rl.models.megatron.setup.copy_policy_lm_head_to_draft")
+    @patch("nemo_rl.models.megatron.draft.utils.copy_policy_lm_head_to_draft")
     @patch("nemo_rl.models.megatron.draft.load_hf_weights_to_eagle")
     @patch("nemo_rl.models.megatron.draft.EagleModel")
     @patch("transformers.AutoConfig.from_pretrained")
@@ -1278,12 +1278,12 @@ class TestDraftSetup:
             policy_model_chunk=policy_model_chunk,
         )
 
-    @patch("nemo_rl.models.megatron.setup.unwrap_model")
+    @patch("nemo_rl.models.megatron.draft.utils.unwrap_model")
     def test_copy_policy_lm_head_to_draft_raises_on_shape_mismatch(
         self, mock_unwrap_model
     ):
         """Selected policy rows must match the draft LM-head shard shape."""
-        from nemo_rl.models.megatron.setup import copy_policy_lm_head_to_draft
+        from nemo_rl.models.megatron.draft.utils import copy_policy_lm_head_to_draft
 
         policy_model = SimpleNamespace(
             share_embeddings_and_output_weights=False,
@@ -1305,7 +1305,7 @@ class TestDraftSetup:
             )
 
     @patch("nemo_rl.models.megatron.setup.get_pg_collection")
-    @patch("nemo_rl.models.megatron.setup.build_unwrapped_draft_model")
+    @patch("nemo_rl.models.megatron.setup.build_draft_model")
     def test_attached_draft_state_is_serializable(
         self, mock_build_draft_model, mock_get_pg_collection
     ):
