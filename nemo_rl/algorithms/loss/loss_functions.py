@@ -220,10 +220,6 @@ class ClippedPGLossFn(LossFunction):
         if self.use_cispo:
             assert not self.disable_ppo_ratio, (
                 "use_cispo is incompatible with disable_ppo_ratio; "
-                "CISPO computes its own IS-weight-based policy gradient loss"
-            )
-            assert not self.force_on_policy_ratio, (
-                "use_cispo is incompatible with force_on_policy_ratio"
             )
             assert not self.sequence_level_importance_ratios, (
                 "use_cispo is incompatible with sequence_level_importance_ratios; "
@@ -432,7 +428,7 @@ class ClippedPGLossFn(LossFunction):
         if self.use_cispo:
             ratios_clamped = ratios.clamp(
                 1.0 - self.ratio_clip_min, 1.0 + self.ratio_clip_max
-                )
+            )
             clip_loss = -advantages * ratios_clamped.detach() * curr_logprobs
         # Dual-clipping see https://arxiv.org/pdf/1912.09729
         if self.ratio_clip_c is not None:
