@@ -540,20 +540,6 @@ def setup(
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
-    # If policy uses yarn rope_scaling, generation must also use yarn rope_scaling.
-    policy_rope_scaling = (policy_config.get("hf_config_overrides") or {}).get(
-        "rope_scaling"
-    ) or {}
-    if policy_rope_scaling.get("rope_type") == "yarn":
-        gen_rope_scaling = (
-            (generation_config.get("vllm_cfg") or {}).get("hf_overrides") or {}
-        ).get("rope_scaling") or {}
-        assert gen_rope_scaling.get("rope_type") == "yarn", (
-            "policy.hf_config_overrides.rope_scaling.rope_type is 'yarn' but "
-            "policy.generation.vllm_cfg.hf_overrides.rope_scaling.rope_type is not set to 'yarn'. "
-            "This may lead to incorrect results. Please configure rope_scaling for the generation backend as well."
-        )
-
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
 
@@ -694,7 +680,7 @@ def setup(
             )
 
         ## make vllm hf overrides match the training policy
-        generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
+        generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
             "hf_config_overrides", {}
         )
 

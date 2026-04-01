@@ -250,6 +250,7 @@ def validate_and_set_config(
     if rope_scaling.get("rope_type") == "yarn":
         _YARN_REQUIRED_FIELDS = (
             "factor",
+            "rope_theta",
             "original_max_position_embeddings",
             "truncate",
             "beta_fast",
