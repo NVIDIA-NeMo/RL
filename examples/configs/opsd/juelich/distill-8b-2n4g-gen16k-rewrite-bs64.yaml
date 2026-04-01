@@ -18,7 +18,7 @@ distillation:
     max_rollout_turns: 1
     max_num_steps: 1000
     max_num_epochs: 1
-    val_batch_size: 256
+    val_batch_size: 512
     val_period: 25
     val_steps: [10]
     val_at_start: true
@@ -54,7 +54,7 @@ policy: &POLICY_BASE
     train_global_batch_size: 64
     train_micro_batch_size: 2
     generation_batch_size: 64
-    logprob_batch_size: 1
+    logprob_batch_size: 2
     max_total_sequence_length: 17408  # 800 prompt + 16384 generation, div by TP×CP×2=16
     precision: "bfloat16"
     logprob_chunk_size: null
@@ -187,10 +187,10 @@ policy: &POLICY_BASE
             async_engine: false
             precision: ${...precision}
             kv_cache_dtype: "auto"
-            tensor_parallel_size: 4
+            tensor_parallel_size: 2
             pipeline_parallel_size: 1
             expert_parallel_size: 1
-            gpu_memory_utilization: 0.6
+            gpu_memory_utilization: 0.85
             max_model_len: 33280  # kept for validation coverage (val generates up to 32768)
             enforce_eager: False
             use_deep_gemm: False
@@ -223,16 +223,16 @@ data:
     train:
         dataset_name: OpenThoughtsMath
     validation:
-        - dataset_name: aime2024
-          repeat: 4
-          teacher_prompt_file: null
         - dataset_name: math500
           repeat: 4
           teacher_prompt_file: null
-        - dataset_name: aime2025
+        - dataset_name: AIME2024
           repeat: 4
           teacher_prompt_file: null
-        - dataset_name: aime2026
+        - dataset_name: AIME2025
+          repeat: 4
+          teacher_prompt_file: null
+        - dataset_name: AIME2026
           repeat: 4
           teacher_prompt_file: null
     default:
