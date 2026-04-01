@@ -18,6 +18,8 @@ jobs:
       prompt: |
         You are doing a light code review. Keep it concise and actionable.
 
+        Read and follow the review guidelines in CLAUDE.md and the coding guideline skills in .claude/skills/ at the repository root.
+
         Focus ONLY on:
         - Critical bugs or logic errors
         - Typos in code, comments, or strings

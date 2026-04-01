@@ -1,0 +1,45 @@
+defaults: ../../dpo.yaml
+dpo:
+  max_num_steps: 10
+checkpointing:
+  enabled: false
+policy:
+  model_name: Qwen/Qwen2.5-Math-7B
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  max_total_sequence_length: 3200
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    use_linear_ce_fusion_loss: true
+    linear_ce_fusion_chunk_size: 128
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    attention_backend: unfused
+    freeze_moe_router: true
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: true
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      adam_beta2: 0.999
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-11
+      lr_decay_iters: 32
+  make_sequence_length_divisible_by: 8
+data:
+  num_workers: 8
+logger:
+  wandb:
+    project: nemo-rl
+    name: dpo-qwen2.5-math-7b-megatron-chunked-linear-ce-loss-1n8g
+  tensorboard:
+    log_dir: tb_logs-dpo-qwen2.5-math-7b-megatron-chunked-linear-ce-loss-1n8g
+  mlflow:
+    run_name: dpo-qwen2.5-math-7b-megatron-chunked-linear-ce-loss-1n8g
+cluster:
+  gpus_per_node: 8
