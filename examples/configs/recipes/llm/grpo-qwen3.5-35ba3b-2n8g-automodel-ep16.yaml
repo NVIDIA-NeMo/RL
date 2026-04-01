@@ -1,0 +1,45 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16
+policy:
+  model_name: Qwen/Qwen3-30B-A3B-Base
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  precision: "bfloat16"
+  max_total_sequence_length: 4096
+  dtensor_cfg:
+    tensor_parallel_size: 1
+    expert_parallel_size: 16
+    activation_checkpointing: true
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: te
+        enable_deepep: true
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 4
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.75
+      enforce_eager: true
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3.5-35ba3b-2n8g-automodel-ep16
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
