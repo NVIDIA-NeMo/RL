@@ -13,12 +13,12 @@
 # limitations under the License.
 
 import re
+from math import gcd
 from typing import Any
 
 import numpy as np
-import torch
-import torchaudio
 from datasets import Dataset, load_dataset
+from scipy.signal import resample_poly
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
@@ -30,17 +30,13 @@ DEFAULT_TEMPLATE = (
 
 def _resample_audio(audio_array, orig_sr, target_sr=16000):
     """Resample audio to target sample rate."""
-    if isinstance(audio_array, np.ndarray):
-        waveform = torch.from_numpy(audio_array).float()
+    if not isinstance(audio_array, np.ndarray):
+        audio_array = np.array(audio_array, dtype=np.float64)
     else:
-        waveform = audio_array.float()
+        audio_array = audio_array.astype(np.float64)
 
-    if waveform.dim() == 1:
-        waveform = waveform.unsqueeze(0)
-
-    resampler = torchaudio.transforms.Resample(orig_freq=orig_sr, new_freq=target_sr)
-    resampled = resampler(waveform)
-    return resampled[0].numpy()
+    g = gcd(int(orig_sr), int(target_sr))
+    return resample_poly(audio_array, target_sr // g, orig_sr // g)
 
 
 def _parse_question(question_text):
