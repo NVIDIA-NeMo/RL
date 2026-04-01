@@ -519,6 +519,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         self.worker_group.get_all_worker_results(futures)
 
+    def set_loss_fn(self, loss_fn) -> None:
+        """Cache a loss function on all workers to avoid Ray re-serialization each step."""
+        futures = self.worker_group.run_all_workers_single_data("set_loss_fn", loss_fn=loss_fn)
+        ray.get(futures)
+
+    def update_cross_tokenizer_data(self, teacher_input_ids, aligned_pairs) -> None:
+        """Update per-step cross-tokenizer data on all workers' cached loss functions."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_cross_tokenizer_data",
+            teacher_input_ids=teacher_input_ids,
+            aligned_pairs=aligned_pairs,
+        )
+        ray.get(futures)
+
     def train(
         self,
         data: BatchedDataDict[Any],

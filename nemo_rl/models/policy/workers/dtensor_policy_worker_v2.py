@@ -582,6 +582,18 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         return True
 
+    def set_loss_fn(self, loss_fn: LossFunction) -> None:
+        """Cache a loss function on this worker to avoid Ray re-serialization."""
+        self._cached_loss_fn = loss_fn
+
+    def update_cross_tokenizer_data(self, teacher_input_ids, aligned_pairs) -> None:
+        """Update per-step cross-tokenizer data on the cached loss function."""
+        if hasattr(self, '_cached_loss_fn') and self._cached_loss_fn is not None:
+            self._cached_loss_fn.set_cross_tokenizer_data(
+                teacher_input_ids=teacher_input_ids,
+                aligned_pairs=aligned_pairs,
+            )
+
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
         self,
@@ -595,6 +607,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         topk_logits: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        if loss_fn is None:
+            loss_fn = getattr(self, '_cached_loss_fn', None)
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
