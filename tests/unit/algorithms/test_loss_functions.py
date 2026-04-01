@@ -637,6 +637,56 @@ def test_clipped_pg_loss_force_on_policy_ratio():
     assert metrics["probs_ratio_clamped_max"] == 1.0
 
 
+def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
+    """Tests that force_on_policy_ratio ignores prev_logprobs from data and uses curr_logprobs instead.
+
+    When force_on_policy_ratio=True, the loss function should use curr_logprobs.detach()
+    as prev_logprobs, so the actual prev_logprobs in data are irrelevant. This allows
+    skipping the expensive prev_logprobs computation upstream.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
+
+    cfg = deepcopy(basic_pg_loss_test_config)
+    cfg["force_on_policy_ratio"] = True
+    loss_fn = ClippedPGLossFn(cfg)
+
+    curr_lp = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    input_ids = data["input_ids"]
+    dummy_logits = _create_exact_logits(
+        curr_lp, input_ids, batch_size, seq_len, vocab_size, device
+    )
+
+    # Run with correct prev_logprobs
+    data_1, _, _, _ = _setup_clipped_pg_test_data(device=device)
+    data_1["prev_logprobs"][0, 1:] = curr_lp
+    loss_input_1, data_1 = prepare_loss_input(dummy_logits.clone(), data_1, loss_fn)
+    loss_1, metrics_1 = loss_fn(
+        data=data_1,
+        global_valid_seqs=torch.sum(data_1["sample_mask"]),
+        global_valid_toks=torch.sum(data_1["sample_mask"].unsqueeze(-1) * data_1["token_mask"]),
+        **loss_input_1,
+    )
+
+    # Run with wildly different prev_logprobs (should be ignored)
+    data_2, _, _, _ = _setup_clipped_pg_test_data(device=device)
+    data_2["prev_logprobs"][0, 1:] = torch.tensor([-10.0, -10.0, -10.0], device=device)
+    loss_input_2, data_2 = prepare_loss_input(dummy_logits.clone(), data_2, loss_fn)
+    loss_2, metrics_2 = loss_fn(
+        data=data_2,
+        global_valid_seqs=torch.sum(data_2["sample_mask"]),
+        global_valid_toks=torch.sum(data_2["sample_mask"].unsqueeze(-1) * data_2["token_mask"]),
+        **loss_input_2,
+    )
+
+    # Both should produce identical loss and ratios since prev_logprobs is ignored
+    torch.testing.assert_close(loss_1, loss_2)
+    assert metrics_1["probs_ratio"] == metrics_2["probs_ratio"] == 1.0
+
+
 @pytest.mark.parametrize("kl_type", ["k1", "k2", "k3"])
 def test_calculate_kl(kl_type):
     """Tests KL calculations."""
