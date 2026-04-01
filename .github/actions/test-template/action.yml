@@ -140,6 +140,7 @@ runs:
           --volume ${{ inputs.test_data_path }}/nemo-rl/hf_datasets_cache:/home/TestData/nemo-rl/hf_datasets_cache \
           ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }} bash -eux -o pipefail -c '\
             git config --global --add safe.directory /opt/nemo-rl
+            git config --global --add safe.directory /opt/nemo-rl/3rdparty/Gym-workspace/Gym
             # This is needed since we create virtualenvs in the workspace, so this allows it to be cleaned up if necessary
             umask 000
             # When reusing a pre-built container (FAST=1), prefetch venvs and regenerate the
