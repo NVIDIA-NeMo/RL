@@ -607,7 +607,7 @@ def validate(
             if use_ipc:
                 val_results = student_policy.train(
                     val_data,
-                    None,
+                    loss_fn,
                     eval_mode=True,
                     gbs=val_data.size,
                     mbs=val_mbs,
@@ -617,7 +617,7 @@ def validate(
             else:
                 val_results = student_policy.train(
                     val_data,
-                    None,
+                    loss_fn,
                     eval_mode=True,
                     gbs=val_data.size,
                     mbs=val_mbs,
@@ -952,22 +952,37 @@ def off_policy_distillation_train(
                     student_policy.prepare_for_training()
 
                 if cross_tokenizer_enabled:
-                    if current_step == 0 and current_epoch == 0:
-                        student_policy.set_loss_fn(loss_fn)
+                    if not getattr(student_policy, '_loss_fn_initialized', False):
+                        student_policy._loss_fn_initialized = True
+                        token_aligner_cfg = master_config.get("token_aligner", {})
+                        student_policy.init_cross_tokenizer_loss_fn(
+                            loss_config=master_config["loss_fn"],
+                            token_aligner_config={
+                                "teacher_model": master_config["teacher"]["model_name"],
+                                "student_model": master_config["policy"]["model_name"],
+                                "projection_matrix_path": token_aligner_cfg["projection_matrix_path"],
+                                "use_sparse_format": token_aligner_cfg.get("use_sparse_format", True),
+                                "learnable": token_aligner_cfg.get("learnable", False),
+                                "max_comb_len": token_aligner_cfg.get("max_comb_len", 4),
+                                "projection_matrix_multiplier": token_aligner_cfg.get("projection_matrix_multiplier", 1.0),
+                                "project_teacher_to_student": token_aligner_cfg.get("project_teacher_to_student", False),
+                            },
+                        )
                     student_policy.update_cross_tokenizer_data(
                         teacher_input_ids=teacher_input_ids,
                         aligned_pairs=aligned_pairs,
                     )
 
+                student_loss_fn = None if cross_tokenizer_enabled else loss_fn
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
                     if use_ipc:
                         train_results = student_policy.train(
-                            train_data, None, teacher_logits=teacher_logits
+                            train_data, student_loss_fn, teacher_logits=teacher_logits
                         )
                         del teacher_logits
                     else:
-                        train_results = student_policy.train(train_data, None)
+                        train_results = student_policy.train(train_data, student_loss_fn)
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)

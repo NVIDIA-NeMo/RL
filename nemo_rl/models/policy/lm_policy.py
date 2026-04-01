@@ -519,17 +519,34 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         self.worker_group.get_all_worker_results(futures)
 
-    def set_loss_fn(self, loss_fn) -> None:
-        """Cache a loss function on all workers to avoid Ray re-serialization each step."""
-        futures = self.worker_group.run_all_workers_single_data("set_loss_fn", loss_fn=loss_fn)
+    def init_cross_tokenizer_loss_fn(self, loss_config, token_aligner_config) -> None:
+        """Have each worker build its own CrossTokenizerDistillationLossFn from config + shared filesystem."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "init_cross_tokenizer_loss_fn",
+            loss_config=loss_config,
+            token_aligner_config=token_aligner_config,
+        )
         ray.get(futures)
 
     def update_cross_tokenizer_data(self, teacher_input_ids, aligned_pairs) -> None:
-        """Update per-step cross-tokenizer data on all workers' cached loss functions."""
-        futures = self.worker_group.run_all_workers_single_data(
+        """Update per-step cross-tokenizer data on all workers' cached loss functions.
+
+        Shards the data so each worker only receives its slice, not the full batch.
+        """
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        batch_size = teacher_input_ids.shape[0]
+        shard_size = batch_size // dp_size
+
+        futures = self.worker_group.run_all_workers_multiple_data(
             "update_cross_tokenizer_data",
-            teacher_input_ids=teacher_input_ids,
-            aligned_pairs=aligned_pairs,
+            teacher_input_ids=[
+                teacher_input_ids[i * shard_size : (i + 1) * shard_size]
+                for i in range(dp_size)
+            ],
+            aligned_pairs=[
+                aligned_pairs[i * shard_size : (i + 1) * shard_size]
+                for i in range(dp_size)
+            ],
         )
         ray.get(futures)
 
