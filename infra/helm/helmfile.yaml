@@ -54,7 +54,7 @@ releases:
 - name: kai-scheduler
   namespace: kai-scheduler
   createNamespace: true
-  chart: https://github.com/NVIDIA/KAI-Scheduler/releases/download/v0.13.4/kai-scheduler-v0.13.4.tgz
+  chart: https://github.com/kai-scheduler/KAI-Scheduler/releases/download/v0.14.0/kai-scheduler-v0.14.0.tgz
   wait: true
   values:
   - values/kai-scheduler.yaml
