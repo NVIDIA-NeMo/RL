@@ -233,7 +233,7 @@ def test_all_recipe_yamls_accounted_for_in_test_suites(
     )
 
 
-def test_nightly_compute_stays_below_1350_hours(nightly_test_suite, tracker):
+def test_nightly_compute_stays_below_1500_hours(nightly_test_suite, tracker):
     command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(nightly_test_suite)}"
 
     print(f"Running command: {command}")
