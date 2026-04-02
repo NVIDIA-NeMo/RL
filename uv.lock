@@ -107,7 +107,7 @@ overrides = [
     { name = "llguidance", specifier = ">=1.3.0,<1.4.0" },
     { name = "nvidia-cudnn-cu12", specifier = "==9.19.0.56" },
     { name = "nvidia-cutlass-dsl", specifier = ">=4.2.1" },
-    { name = "nvidia-modelopt", extras = ["torch"], specifier = ">=0.39.0" },
+    { name = "nvidia-modelopt", extras = ["torch"], git = "https://github.com/NVIDIA/Model-Optimizer?rev=f1beaba36f2df02304eceea2293c99c595f73711" },
     { name = "opencv-python-headless", specifier = ">=4.11.0" },
     { name = "opentelemetry-api", specifier = ">=1.33.1" },
     { name = "setuptools", specifier = ">=80.10.2" },
@@ -3680,7 +3680,7 @@ requires-dist = [
     { name = "megatron-energon", extras = ["av-decode"], specifier = "~=6.0" },
     { name = "multi-storage-client", specifier = "~=0.27" },
     { name = "numpy" },
-    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'" },
+    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin'", git = "https://github.com/NVIDIA/Model-Optimizer?rev=f1beaba36f2df02304eceea2293c99c595f73711" },
     { name = "nvidia-resiliency-ext", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=v0.5.0" },
     { name = "nvtx", specifier = "~=0.2" },
     { name = "onnxscript" },
@@ -4521,6 +4521,9 @@ mcore = [
     { name = "megatron-core" },
     { name = "transformer-engine", extra = ["pytorch"], marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
+modelopt = [
+    { name = "nvidia-modelopt" },
+]
 nemo-gym = [
     { name = "nemo-gym" },
 ]
@@ -4618,6 +4621,7 @@ requires-dist = [
     { name = "nvidia-cudnn-cu12", specifier = "==9.19.0.56" },
     { name = "nvidia-cutlass-dsl", marker = "extra == 'vllm'", specifier = ">=4.4.0.dev1" },
     { name = "nvidia-ml-py" },
+    { name = "nvidia-modelopt", marker = "extra == 'modelopt'", git = "https://github.com/NVIDIA/Model-Optimizer?rev=f1beaba36f2df02304eceea2293c99c595f73711" },
     { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "nvtx" },
     { name = "omegaconf" },
@@ -4648,7 +4652,7 @@ requires-dist = [
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.17.0" },
     { name = "wandb", specifier = ">=0.25.0" },
 ]
-provides-extras = ["fsdp", "automodel", "vllm", "sglang", "mcore", "nemo-gym"]
+provides-extras = ["fsdp", "automodel", "vllm", "sglang", "mcore", "modelopt", "nemo-gym"]
 
 [package.metadata.requires-dev]
 build = [
@@ -5158,27 +5162,26 @@ wheels = [
 
 [[package]]
 name = "nvidia-modelopt"
-version = "0.40.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.43.0rc2.dev45+gf1beaba36"
+source = { git = "https://github.com/NVIDIA/Model-Optimizer?rev=f1beaba36f2df02304eceea2293c99c595f73711#f1beaba36f2df02304eceea2293c99c595f73711" }
 dependencies = [
     { name = "ninja" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
     { name = "nvidia-ml-py" },
+    { name = "omegaconf" },
     { name = "packaging" },
     { name = "pulp" },
     { name = "pydantic" },
+    { name = "pyyaml" },
     { name = "regex" },
     { name = "rich" },
     { name = "safetensors" },
     { name = "scipy" },
+    { name = "setuptools" },
     { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.10.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "torchprofile" },
     { name = "tqdm" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/4a/4b4c339637fdbd54bc98b92c87c8b22f5efee05ca9e31e40a8d49ee66187/nvidia_modelopt-0.40.0-py3-none-any.whl", hash = "sha256:0315f53aef014b902866e427038db5803e3c6787a8e1f09c3650031550885051", size = 901421, upload-time = "2025-12-12T10:35:28.506Z" },
 ]
 
 [[package]]
@@ -8575,23 +8578,6 @@ dependencies = [
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/95/d4/af694ef718aedbe95a72760ab9ff7a6a7a44ace2d7f70c27bfeb67c5c503/torchdata-0.11.0-py3-none-any.whl", hash = "sha256:52b940fbbe0e00fb21cabddf528449d1bec5bfb0d0823b7487b15f951658ee33", size = 61968, upload-time = "2025-02-20T22:26:30.666Z" },
-]
-
-[[package]]
-name = "torchprofile"
-version = "0.0.4"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-vllm'" },
-    { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "torch", version = "2.10.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "torchvision", version = "0.25.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "torchvision", version = "0.25.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/6f/36/574c0c46e818533b78b3c09505211162918188325ab4165ef11a3f295755/torchprofile-0.0.4.tar.gz", hash = "sha256:96b6da17d752a06b02977e078aea95614893b31d4117dd5dcd081f30ce65611b", size = 4557, upload-time = "2021-06-22T04:58:03.592Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/62/15/71ad4ed163b03cba1315f1d96e0bc8e39d5a97f92974ffa610a729b273ab/torchprofile-0.0.4-py3-none-any.whl", hash = "sha256:7151fe88dc770f0eeec241244a4c7feaec2c5e8c7852386bc2d6a8d7dde7384d", size = 7694, upload-time = "2021-06-22T04:58:02.485Z" },
 ]
 
 [[package]]

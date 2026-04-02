@@ -63,10 +63,10 @@ class FakeQuantWorker(BaseWorker):
         with disable_compilation(model):
             return super().determine_available_memory()
 
-    def compile_or_warm_up_model(self) -> None:
+    def compile_or_warm_up_model(self) -> float:
         print(
             "os.environ.get('VLLM_QUANT_CFG'): ", os.environ.get("VLLM_QUANT_CFG", None)
         )
         if os.environ.get("VLLM_QUANT_CFG", None) is not None:
             _fakequant_run_prolog_worker(self)
-        super().compile_or_warm_up_model()
+        return super().compile_or_warm_up_model()
