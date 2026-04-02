@@ -4503,7 +4503,7 @@ requires-dist = [
     { name = "transformers", specifier = "==5.3.0" },
     { name = "transformers", marker = "extra == 'automodel'", specifier = ">=5.3.0" },
     { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu129" },
-    { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.17.0" },
+    { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.17.1" },
     { name = "wandb", specifier = ">=0.25.0" },
 ]
 provides-extras = ["fsdp", "automodel", "vllm", "sglang", "mcore", "nemo-gym"]
@@ -8844,7 +8844,7 @@ wheels = [
 
 [[package]]
 name = "vllm"
-version = "0.17.0"
+version = "0.17.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -8875,6 +8875,7 @@ dependencies = [
     { name = "ninja" },
     { name = "numba" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-cudnn-frontend" },
     { name = "nvidia-cutlass-dsl" },
     { name = "openai" },
     { name = "openai-harmony" },
@@ -8918,10 +8919,10 @@ dependencies = [
     { name = "watchfiles" },
     { name = "xgrammar", version = "0.1.29", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/13/d5/af83a4262ca4d5692a93b3c322ae954e3e6c4e23f8f9db3ab87bd79c919e/vllm-0.17.0.tar.gz", hash = "sha256:b0b62e58ef4eb633ef371f2726976372cf6dfcb7ff2ea9ddf7194c1930d5629a", size = 30541311, upload-time = "2026-03-07T03:54:54.333Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4c/7c/79ef306c71f3de2e73beb3c03c3f2966f966df61b8dd1f01dbdc65184050/vllm-0.17.1.tar.gz", hash = "sha256:d26a95dcb92e2ff78ed4b48bff247d845b0c768edf6c0acf2401376a56c57b61", size = 30547577, upload-time = "2026-03-11T11:03:58.693Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f2/72/78a48668f2631def18bbaaa331d7878bcfc5c3137455422aafb0748e1261/vllm-0.17.0-cp38-abi3-manylinux_2_31_aarch64.whl", hash = "sha256:310fb82fe061ed75dceeb4aeb803cd8ee0d590337ec720f7abfb03a69314d710", size = 385329399, upload-time = "2026-03-07T03:54:34.261Z" },
-    { url = "https://files.pythonhosted.org/packages/25/4f/972726f9a501f01203b5c4796e1932abbe435fae6d7715a4c3f1aad14a58/vllm-0.17.0-cp38-abi3-manylinux_2_31_x86_64.whl", hash = "sha256:0296670a09d392ee43455d9bebf590d05a9bc2ebce5e25e2919222fc815158da", size = 432927988, upload-time = "2026-03-07T03:54:02.312Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/02/ff63919abb341b0819f33a400c83698d095e5fd461ae3e44f3ff91f6489f/vllm-0.17.1-cp38-abi3-manylinux_2_31_aarch64.whl", hash = "sha256:f04d63a94d0415b2323b0a0d3ab89a8d4d9bd346251ff60d47a7df679f7b3ff8", size = 385333057, upload-time = "2026-03-11T11:06:44.106Z" },
+    { url = "https://files.pythonhosted.org/packages/18/28/f85e67b390082481298e27a5c9f1da540d2d5abb1a06a594545cdc320818/vllm-0.17.1-cp38-abi3-manylinux_2_31_x86_64.whl", hash = "sha256:c52e892309532b4e51cb94d022c5e3c0087300cdb56e4645708601443299d871", size = 432931666, upload-time = "2026-03-11T11:06:00.955Z" },
 ]
 
 [[package]]
