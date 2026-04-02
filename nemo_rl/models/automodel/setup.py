@@ -556,6 +556,21 @@ def setup_model_and_optimizer(
                 "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
             )
 
+        if model_config.model_type == "qwen3_5":
+            raise AssertionError(
+                "Context parallel is not supported for Qwen3.5 dense models (only torch attention backend is available). "
+                "Please set cp_size = 1. For Qwen3.5 MoE models, CP is supported with the TE backend."
+            )
+
+        if model_config.model_type == "qwen3_5_moe":
+            try:
+                import fla  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "Qwen3.5 MoE requires flash-linear-attention for context parallel. "
+                    "Please install it in your Automodel venv: pip install flash-linear-attention"
+                )
+
     # LoRA configuration
     lora_cfg = config["dtensor_cfg"].get("lora_cfg", None)
     peft_config = None
