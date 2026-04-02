@@ -1,0 +1,58 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16
+policy:
+  model_name: Qwen/Qwen3.5-35B-A3B-Base
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  precision: "bfloat16"
+  max_total_sequence_length: 4096
+  dtensor_cfg:
+    enabled: false
+
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 16
+    sequence_parallel: false
+    pipeline_dtype: ${policy.precision}
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "allgather"
+    moe_shared_expert_overlap: false
+    apply_rope_fusion: false
+    activation_checkpointing: true
+    defer_fp32_logits: true
+
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 8
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      enforce_eager: false
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3.5-35ba3b-2n8g-megatron-ep16
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
