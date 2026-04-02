@@ -76,6 +76,7 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
 
+  megatron_recipe: megatron.bridge.recipes.nemotronh.nemotron_3_nano_pretrain_config
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1

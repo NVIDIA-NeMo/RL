@@ -22,7 +22,6 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     $PROJECT_ROOT/examples/run_grpo.py \
     --config $PROJECT_ROOT/examples/configs/prorlv2.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
-    policy.megatron_recipe=megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config \
     policy.tokenizer.name=Qwen/Qwen3-0.6B \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \

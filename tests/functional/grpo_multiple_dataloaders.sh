@@ -29,7 +29,6 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     $PROJECT_ROOT/examples/run_grpo.py \
     --config $PROJECT_ROOT/examples/configs/grpo_multiple_datasets.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
-    policy.megatron_recipe=megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config \
     data.use_multiple_dataloader=true \
     data.num_prompts_per_dataloader=1 \
     data.custom_dataloader=examples.custom_dataloader.custom_dataloader.example_custom_dataloader \
