@@ -20,7 +20,6 @@ mkdir -p $EXP_DIR $LOG_DIR
 cd $PROJECT_ROOT
 uv run $PROJECT_ROOT/examples/run_vlm_grpo.py \
     policy.model_name=Qwen/Qwen2.5-VL-3B-Instruct \
-    policy.megatron_recipe=megatron.bridge.recipes.qwen.qwen3_vl_8b_pretrain_config \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
     policy.train_global_batch_size=4 \
