@@ -1,6 +1,8 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
+# ignore tensor parallel accuracy check to avoid FP8 precision issue
+export NRL_IGNORE_TP_ACCURACY_CHECK=1
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
@@ -24,6 +26,7 @@ uv run examples/run_grpo.py \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
+    checkpointing.save_period=5 \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     $@ \
     2>&1 | tee $RUN_LOG
