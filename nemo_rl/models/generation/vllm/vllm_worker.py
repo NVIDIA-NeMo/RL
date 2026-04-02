@@ -546,7 +546,9 @@ class BaseVllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            enable_prefix_caching=self.cfg["vllm_cfg"].get("enable_prefix_caching", torch.cuda.get_device_capability()[0] >= 8),
+            enable_prefix_caching=self.cfg["vllm_cfg"].get(
+                "enable_prefix_caching", torch.cuda.get_device_capability()[0] >= 8
+            ),
             dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
@@ -1000,7 +1002,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         # cached on the receiver and sends data=None, causing an assertion
         # error.  We only clear the renderer (sender) cache here — the
         # receiver and worker-level caches are reset by sleep() internally.
-        if hasattr(self.llm, "renderer") and hasattr(self.llm.renderer, "clear_mm_cache"):
+        if hasattr(self.llm, "renderer") and hasattr(
+            self.llm.renderer, "clear_mm_cache"
+        ):
             self.llm.renderer.clear_mm_cache()
         self.llm.sleep(level=1)
 
