@@ -278,6 +278,19 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
     hf_model_name = config["model_name"]
 
+    megatron_ckpt = config.get("megatron_cfg", {}).get(
+        "pretrained_megatron_checkpoint", None
+    )
+    if megatron_ckpt is not None:
+        run_config_path = os.path.join(megatron_ckpt, "run_config.yaml")
+        if not os.path.exists(run_config_path):
+            raise FileNotFoundError(
+                f"pretrained_megatron_checkpoint='{megatron_ckpt}' "
+                f"does not contain run_config.yaml. Provide a specific "
+                f"iteration directory (e.g., /path/to/checkpoints/iter_1234567/)."
+            )
+        return hf_model_name, megatron_ckpt, True
+
     # Check if the checkpoint already exists
     hf_model_subdir = hf_model_name
     if os.path.exists(hf_model_name):
@@ -301,21 +314,26 @@ def setup_model_config(
     optimizer_path: Optional[str] = None,
 ) -> tuple[ConfigContainer, Any]:
     """Handle all the model configuration logic."""
-    # Load pretrained run config
-    pretrained_run_config = os.path.join(
-        pretrained_path, "iter_0000000/run_config.yaml"
+    megatron_ckpt = config.get("megatron_cfg", {}).get(
+        "pretrained_megatron_checkpoint", None
     )
+    if megatron_ckpt is not None:
+        run_config_path = os.path.join(megatron_ckpt, "run_config.yaml")
+    else:
+        run_config_path = os.path.join(
+            pretrained_path, "iter_0000000", "run_config.yaml"
+        )
 
-    if not os.path.exists(pretrained_run_config):
+    if not os.path.exists(run_config_path):
         raise FileNotFoundError(
-            f"Pretrained run config not found at {pretrained_run_config} on rank={rank}. "
+            f"run_config.yaml not found at {run_config_path} on rank={rank}. "
             "This usually means that the one-time HF->mcore conversion on rank=0 saved to a directory "
             "not being mounted on this node. Please check"
         )
 
     try:
         cfg_from_pretrained = ConfigContainer.from_yaml(
-            pretrained_run_config, mode=InstantiationMode.STRICT
+            run_config_path, mode=InstantiationMode.STRICT
         )
     except Exception as e:
         # Add helpful context as a note to the exception

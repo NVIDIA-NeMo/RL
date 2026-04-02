@@ -97,6 +97,64 @@ class TestValidateModelPaths:
         assert hf_model_name == "test-model"
         assert pt_checkpoint_exists is True
 
+    def test_pretrained_megatron_checkpoint_valid(self, tmp_path):
+        """Test with a valid pretrained_megatron_checkpoint pointing to an iteration dir."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        iter_dir = tmp_path / "checkpoints" / "iter_0001000"
+        iter_dir.mkdir(parents=True)
+        (iter_dir / "run_config.yaml").touch()
+
+        config = {
+            "model_name": "Qwen/Qwen2.5-1.5B",
+            "megatron_cfg": {
+                "pretrained_megatron_checkpoint": str(iter_dir),
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "Qwen/Qwen2.5-1.5B"
+        assert pretrained_path == str(iter_dir)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_megatron_checkpoint_invalid(self, tmp_path):
+        """Test with a pretrained_megatron_checkpoint missing run_config.yaml."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        iter_dir = tmp_path / "checkpoints" / "iter_0001000"
+        iter_dir.mkdir(parents=True)
+
+        config = {
+            "model_name": "Qwen/Qwen2.5-1.5B",
+            "megatron_cfg": {
+                "pretrained_megatron_checkpoint": str(iter_dir),
+            },
+        }
+
+        with pytest.raises(FileNotFoundError, match="does not contain run_config.yaml"):
+            validate_model_paths(config)
+
+    def test_pretrained_megatron_checkpoint_absent(self, tmp_path):
+        """Test default behavior when pretrained_megatron_checkpoint is not set."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        config = {"model_name": "meta-llama/Llama-3.2-1B"}
+
+        with patch(
+            "nemo_rl.models.megatron.setup.get_megatron_checkpoint_dir",
+            return_value=str(tmp_path),
+        ):
+            hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+                config
+            )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        assert pretrained_path == f"{tmp_path}/meta-llama/Llama-3.2-1B"
+        assert pt_checkpoint_exists is False
+
 
 @pytest.mark.mcore
 class TestApplyParallelismConfig:

@@ -236,6 +236,11 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Optional path to a specific Megatron checkpoint iteration directory
+    # (e.g., "/path/to/checkpoints/iter_1234567/").
+    # If provided, skips the HF -> Megatron conversion at startup.
+    # model_name is still required for tokenizer and refit/export.
+    pretrained_megatron_checkpoint: NotRequired[str | None]
     peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
