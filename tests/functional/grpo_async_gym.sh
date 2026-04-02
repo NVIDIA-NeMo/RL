@@ -37,10 +37,7 @@ if [[ ! -f env.yaml ]]; then
     echo "hf_token: $HF_TOKEN" >> env.yaml
 fi
 
-config_paths="responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,\
-resources_servers/workplace_assistant/configs/workplace_assistant.yaml"
-
-uv run ng_prepare_data "+config_paths=[${config_paths}]" \
+uv run ng_prepare_data "+config_paths=[resources_servers/workplace_assistant/configs/workplace_assistant.yaml]" \
     +output_dirpath=data/workplace_assistant \
     +mode=train_preparation \
     +should_download=true \
