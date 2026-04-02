@@ -9,6 +9,9 @@ policy:
     expert_model_parallel_size: 16
     num_layers_in_first_pipeline_stage: 7
     num_layers_in_last_pipeline_stage: 6
+    # DeepEP is supported for Ampere, Hopper, and Blackwell (B200/B300) GPUs
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
   generation:
     colocated:
       resources:
