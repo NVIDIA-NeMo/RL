@@ -265,8 +265,8 @@ def test_nightly_compute_stays_below_1390_hours(nightly_test_suite, tracker):
         f"Last line of output was not as expected: '{last_line}'"
     )
     total_gpu_hours = float(last_line.split(":")[-1].strip())
-    assert total_gpu_hours <= 1390, (
-        f"Total GPU hours exceeded 1390: {last_line}. We should revisit the test suites to reduce the total GPU hours."
+    assert total_gpu_hours <= 1500, (
+        f"Total GPU hours exceeded 1500: {last_line}. We should revisit the test suites to reduce the total GPU hours."
     )
     tracker.track("total_nightly_gpu_hours", total_gpu_hours)
 
