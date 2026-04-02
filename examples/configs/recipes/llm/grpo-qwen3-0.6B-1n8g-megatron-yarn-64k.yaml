@@ -1,6 +1,8 @@
 defaults: ../../grpo_math_1B_megatron.yaml
 grpo:
-  max_num_steps: 20
+  max_num_steps: 100
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 8
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-0.6B-1n8g-megatron-yarn-64k
   save_period: 20
