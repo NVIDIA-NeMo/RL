@@ -340,6 +340,9 @@ def setup_model_config(
     # Apply MoE settings
     _apply_moe_config(model_cfg, config)
 
+    # Apply MTP settings
+    _apply_mtp_config(model_cfg, config)
+
     # Apply precision settings
     _apply_precision_config(model_cfg, config, dtype)
 
@@ -437,6 +440,11 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     ]
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
+
+
+def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
+    if "mtp_num_layers" in config["megatron_cfg"]:
+        model_cfg.mtp_num_layers = config["megatron_cfg"]["mtp_num_layers"]
 
 
 def _apply_precision_config(
