@@ -5,13 +5,13 @@ defaults: "grpo_math_1B_megatron.yaml"
 grpo:
   num_prompts_per_step: 8
   num_generations_per_prompt: 8
-  max_num_steps: 200
+  max_num_steps: 500
   max_val_samples: 32
   val_batch_size: 32
 
 checkpointing:
   enabled: true
-  checkpoint_dir: results/audio_grpo_3B_megatron
+  checkpoint_dir: results/audio_grpo_3B_megatron_2_gpus
   keep_top_k: 10
   save_period: 100
 
@@ -77,10 +77,10 @@ logger:
   monitor_gpus: false
   wandb:
     project: grpo-dev
-    name: audio-grpo-3b-megatron-large-lr
+    name: audio-grpo-3b-megatron
   swanlab:
     project: grpo-dev
-    name: audio-grpo-3b-megatron-large-lr
+    name: audio-grpo-3b-megatron
 
 cluster:
-  gpus_per_node: 8
+  gpus_per_node: 2

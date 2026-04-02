@@ -34,8 +34,8 @@ Throughout training, checkpoints are saved to the `results/audio_grpo_3B_megatro
 ```
 uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
     --config results/audio_grpo_3B_megatron/step_200/config.yaml \
-    --megatron-ckpt-path results/audio_grpo_3B_megatron/step_200/policy/weights/iter_0000200 \
-    --hf-ckpt-path results/audio_grpo_3B_megatron/step_200/hf
+    --megatron-ckpt-path results/audio_grpo_3B_megatron/step_200/policy/weights/iter_0000000 \
+    --hf-ckpt-path results/audio_grpo_3B_megatron/step_200/hf --no-strict
 ```
 
 Replace the step number with the checkpoint you want to evaluate. Note the `--extra mcore` flag is required for the Megatron converter.
