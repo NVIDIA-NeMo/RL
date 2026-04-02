@@ -1,16 +1,9 @@
 defaults: ../../grpo_math_1B.yaml
 grpo:
-  num_prompts_per_step: 32
-  num_generations_per_prompt: 16
-  batch_multiplier: 1
   use_leave_one_out_baseline: false
-  use_dynamic_sampling: false
   reward_scaling:
     enabled: true
-    source_min: 0.0
-    source_max: 1.0
     target_min: -1.0
-    target_max: 1.0
   reward_shaping:
     enabled: true
     overlong_buffer_length: 512
@@ -25,10 +18,8 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel
 policy:
   model_name: Qwen/Qwen3.5-35B-A3B-Base
-  train_global_batch_size: 512
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  precision: "bfloat16"
   max_total_sequence_length: 9216
   logprob_chunk_size: 4096
   offload_optimizer_for_logprob: true
@@ -37,19 +28,18 @@ policy:
       lr: 1.0e-06
       weight_decay: 0.1
   scheduler:
-    - name: torch.optim.lr_scheduler.LinearLR
-      kwargs:
-        start_factor: 1.0e-08
-        end_factor: 1.0
-        total_iters: 10
-    - name: torch.optim.lr_scheduler.ConstantLR
-      kwargs:
-        factor: 1.0
-        total_iters: 10000000000
-    - milestones:
-      - 10
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
   dtensor_cfg:
-    tensor_parallel_size: 1
     expert_parallel_size: 32
     activation_checkpointing: true
     automodel_kwargs:
@@ -70,9 +60,7 @@ policy:
     max_new_tokens: 8192
     vllm_cfg:
       tensor_parallel_size: 4
-      expert_parallel_size: 1
       gpu_memory_utilization: 0.5
-      enforce_eager: false
 data:
   max_input_seq_length: 2048
   train:
@@ -84,7 +72,7 @@ data:
 env:
   math:
     num_workers: 16
-    math_verify_impl: "dapo_math_verify"
+    math_verify_impl: dapo_math_verify
 logger:
   wandb_enabled: true
   tensorboard_enabled: true
