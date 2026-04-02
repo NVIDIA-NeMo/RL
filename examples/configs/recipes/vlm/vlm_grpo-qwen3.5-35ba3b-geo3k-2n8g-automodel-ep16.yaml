@@ -12,7 +12,7 @@ loss_fn:
 checkpointing:
   checkpoint_dir: results/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16
 policy:
-  model_name: Qwen/Qwen3-30B-A3B-Base
+  model_name: Qwen/Qwen3.5-35B-A3B-Base
   train_global_batch_size: 512
   train_micro_batch_size: 1
   logprob_batch_size: 1
