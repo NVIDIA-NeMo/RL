@@ -77,7 +77,7 @@ policy:
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false
-    force_reimport_model: False # Set to True to force reimport of the model from Hugging Face
+    force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1
     activation_checkpointing: false
     tensor_model_parallel_size: 2

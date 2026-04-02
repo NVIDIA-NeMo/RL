@@ -87,7 +87,7 @@ policy: &POLICY_BASE
 
     megatron_cfg: &MEGATRON_BASE
         enabled: false
-        force_reimport_model: False # Set to True to force reimport of the model from Hugging Face
+        force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
         empty_unused_memory_level: 0
         activation_checkpointing: false
         converter_type: "Qwen3ForCausalLM"
