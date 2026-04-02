@@ -1,37 +1,26 @@
 defaults: ../../vlm_grpo_3B.yaml
 grpo:
   num_prompts_per_step: 32
-  num_generations_per_prompt: 16
-  use_leave_one_out_baseline: true
-  normalize_rewards: true
 loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
   truncated_importance_sampling_ratio: 2
-  token_level_loss: true
 checkpointing:
   checkpoint_dir: results/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16
 policy:
   model_name: Qwen/Qwen3.5-35B-A3B-Base
   train_global_batch_size: 512
-  train_micro_batch_size: 1
   logprob_batch_size: 1
-  precision: "bfloat16"
   max_total_sequence_length: 3072
-  dynamic_batching:
-    enabled: true
-  sequence_packing:
-    enabled: false
   optimizer:
     kwargs:
       lr: 1.0e-06
       weight_decay: 0.1
   dtensor_cfg:
-    tensor_parallel_size: 1
     expert_parallel_size: 16
     activation_checkpointing: true
     env_vars:
-      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
@@ -46,26 +35,20 @@ policy:
     max_new_tokens: 2048
     vllm_cfg:
       tensor_parallel_size: 8
-      expert_parallel_size: 1
-      gpu_memory_utilization: 0.6
       enforce_eager: true
       max_model_len: 3072
-      skip_tokenizer_init: false
 data:
   max_input_seq_length: 1024
   train:
     dataset_name: geometry3k
-    split: train
   validation:
     dataset_name: geometry3k
     split: test
   default:
     prompt_file: examples/prompts/geo3k.txt
-    processor: vlm_hf_data_processor
     env_name: geometry3k
 logger:
   wandb_enabled: true
-  tensorboard_enabled: true
   wandb:
     project: nemo-rl
     name: vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16
