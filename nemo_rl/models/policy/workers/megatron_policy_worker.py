@@ -157,6 +157,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             hf_model_name,
             pretrained_path,
             weights_path,
+            optimizer_path,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
@@ -190,6 +191,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         self.scheduler = model_and_optimizer_state.scheduler
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
+        self.draft_model = model_and_optimizer_state.draft_model
 
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
@@ -319,6 +321,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     cfg=self.cfg,
                     num_microbatches=num_microbatches,
                     sampling_params=self.sampling_params,
+                    draft_model=self.draft_model,
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
@@ -328,6 +331,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     self.optimizer.zero_grad()
 
                     # Forward pass.
+                    draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
                     losses_reduced = megatron_forward_backward(
                         model=self.model,
                         data_iterator=data_iterator,
@@ -341,6 +345,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                         global_valid_toks=global_valid_toks,
                         sampling_params=self.sampling_params,
                         straggler_timer=self.mcore_state.straggler_timer,
+                        draft_model=self.draft_model,
+                        enable_hidden_capture=draft_enabled,
                         use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
                             "use_linear_ce_fusion_loss", False
                         ),
@@ -554,6 +560,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             # Swap reference model state_dict to self.model
             for k, v in self.model.state_dict().items():
                 if isinstance(v, torch.Tensor):
+                    if "draft_model." in k:
+                        continue
                     v.copy_(self.reference_state_dict[k])
 
             if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -921,9 +929,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         Returns:
             List of (parameter_name, size_in_bytes) tuples.
         """
-        self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
-            [self.model]
-        )
+        self.refit_conversion_tasks = [
+            task
+            for task in self.megatron_bridge.get_conversion_tasks([self.model])
+            if task is not None
+        ]
         param_info = []
 
         def calculate_size_in_bytes(param, tp_size, ep_size):
@@ -980,6 +990,15 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # Yield the original parameters first.
         for name, tensor in base_iter:
             yield name, tensor
+
+        if self.draft_model is not None:
+            from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
+
+            draft_weights = export_eagle_weights_to_hf(
+                self.draft_model,
+            )
+            for name, tensor in draft_weights:
+                yield f"draft.{name}", tensor
 
         # Check whether FP8 KV cache is enabled.
         use_fp8_kv_cache = False

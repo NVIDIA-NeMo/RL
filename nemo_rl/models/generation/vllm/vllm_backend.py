@@ -122,6 +122,44 @@ class VllmInternalWorkerExtension:
             target_device,
         )
 
+    @staticmethod
+    def _split_policy_and_draft_weights(
+        weights: list[tuple[str, torch.Tensor]],
+    ) -> tuple[list[tuple[str, torch.Tensor]], list[tuple[str, torch.Tensor]]]:
+        """Split trainer-owned draft weights from policy weights.
+
+        This path is only used for the Eagle3 online-training flow, where the
+        trainer exports draft parameters under a `draft.` prefix before sending
+        them to vLLM.
+        This implementation is specific to the eagle model. For MTP, we can add
+        similar logic to this function to split weights and send it to the drafter.
+        The "draft." prefix is added here https://github.com/isomap/RL/blob/d3a5e1396d00f82fb888d9ec6800687a23bb4017/nemo_rl/models/policy/workers/megatron_policy_worker.py#L967-L997
+        """
+        policy_weights = []
+        draft_weights = []
+        for key, tensor in weights:
+            if key.startswith("draft."):
+                draft_weights.append((key.removeprefix("draft."), tensor))
+            else:
+                policy_weights.append((key, tensor))
+        return policy_weights, draft_weights
+
+    def _load_draft_weights(
+        self, draft_weights: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        if not draft_weights:
+            return
+
+        draft_owner = getattr(self.model_runner, "drafter", None)
+        draft_model = getattr(draft_owner, "model", None) if draft_owner else None
+
+        if draft_model is None:
+            print(
+                "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
+            )
+            return
+        draft_model.load_weights(weights=draft_weights)
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
@@ -131,6 +169,8 @@ class VllmInternalWorkerExtension:
         """
         buffer = None
         weights = None
+        policy_weights = None
+        draft_weights = None
 
         try:
             self.maybe_init_zmq()
@@ -176,11 +216,16 @@ class VllmInternalWorkerExtension:
                 # Load weights into the model
                 from nemo_rl.models.generation.vllm.quantization import fp8
 
+                policy_weights, draft_weights = self._split_policy_and_draft_weights(
+                    weights
+                )
                 if fp8.is_fp8_model(self.model_runner.vllm_config):
                     # the fp8 load_weights additionally casts bf16 weights into fp8
-                    fp8.load_weights(weights, self.model_runner)
+                    fp8.load_weights(policy_weights, self.model_runner)
                 else:
-                    self.model_runner.model.load_weights(weights=weights)
+                    self.model_runner.model.load_weights(weights=policy_weights)
+
+                self._load_draft_weights(draft_weights)
 
                 torch.cuda.current_stream().synchronize()
 
@@ -189,8 +234,10 @@ class VllmInternalWorkerExtension:
                 # copied the data, Python may not garbage collect these view objects immediately.
                 # If sender reuses the buffer before GC runs, old views would read corrupted data.
                 # Explicit del ensures immediate cleanup before sending ACK.
-                del weights, buffer
+                del weights, policy_weights, draft_weights, buffer
                 weights = None
+                policy_weights = None
+                draft_weights = None
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
@@ -229,11 +276,17 @@ class VllmInternalWorkerExtension:
             """
             from nemo_rl.models.generation.vllm.quantization import fp8
 
+            policy_weights, draft_weights = self._split_policy_and_draft_weights(
+                weights
+            )
+
             if fp8.is_fp8_model(model_runner.vllm_config):
                 # the fp8 load_weights additionally casts bf16 weights into fp8
-                fp8.load_weights(weights, model_runner)
+                fp8.load_weights(policy_weights, model_runner)
             else:
-                model_runner.model.load_weights(weights=weights)
+                model_runner.model.load_weights(weights=policy_weights)
+
+            self._load_draft_weights(draft_weights)
 
         load_model_weight_func = lambda x: _load_model_weights(x, self.model_runner)
 

@@ -3,11 +3,12 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=2
+NUM_NODES=1
+GPUS_PER_NODE=4
 STEPS_PER_RUN=15
 MAX_STEPS=15
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=35
+NUM_MINUTES=30
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -39,7 +40,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'data["train/preference_loss"]["1"] > 0.69314' \
         'data["train/preference_loss"]["1"] < 0.69316' \
         'data["train/preference_loss"]["15"] < 0.63263' \
-        'mean(data["timing/train/total_step_time"], -5, -1) < 70'
+        'mean(data["timing/train/total_step_time"], -5, -1) < 5'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

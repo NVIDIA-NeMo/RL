@@ -36,6 +36,7 @@ teacher:
     enabled: true
     tensor_model_parallel_size: 4
     context_parallel_size: 1
+  make_sequence_length_divisible_by: 4
 logger:
   log_dir: logs/distillation-qwen3-32b-to-1.7b-base-megatron-tp2pp2cp2-pack
   wandb:

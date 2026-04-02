@@ -19,6 +19,10 @@ policy:
     moe_router_dtype: fp64
     moe_router_bias_update_rate: 0.0
     moe_permute_fusion: true
+    # overlap_param_gather requires use_distributed_optimizer=true in mcore.
+    # Without it, start_param_sync tries to use layerwise params that were never set.
+    distributed_data_parallel_config:
+      overlap_param_gather: false
     optimizer:
       lr: 1.0e-06
       min_lr: 1.0e-06

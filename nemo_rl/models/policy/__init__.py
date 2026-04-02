@@ -42,7 +42,7 @@ class AutomodelBackendConfig(TypedDict):
     to the HuggingFace implementation.
     """
 
-    # Hydra target class path (e.g., "nemo_automodel.components.moe.utils.BackendConfig")
+    # Hydra target class path (e.g., "nemo_automodel.components.models.common.utils.BackendConfig")
     _target_: str
     # Attention implementation: "te" (Transformer Engine), "flex" (FlexAttention), etc.
     attn: NotRequired[str]
@@ -68,7 +68,11 @@ class AutomodelKwargs(TypedDict):
     use_liger_kernel: NotRequired[bool]
     # Backend configuration for MoE models
     backend: NotRequired[AutomodelBackendConfig]
-    # Whether to force use of the HuggingFace implementation for MoE models
+    # Force the HuggingFace model implementation instead of the custom one.
+    # Set to true if the custom model's state_dict_adapter doesn't implement
+    # convert_single_tensor_to_hf (required for weight syncing). This is
+    # auto-detected and set at runtime if not explicitly configured.
+    # See: https://github.com/NVIDIA-NeMo/RL/issues/2072
     force_hf: NotRequired[bool]
 
 
@@ -76,19 +80,37 @@ class DTensorConfigDisabled(TypedDict):
     enabled: Literal[False]
 
 
+class MoEParallelizerOptions(TypedDict):
+    """MoE parallelizer config options (mirrors Automodel's MoEParallelizerConfig)."""
+
+    ignore_router_for_ac: NotRequired[bool]
+    reshard_after_forward: NotRequired[bool]
+    lm_head_precision: NotRequired[str | None]
+    wrap_outer_model: NotRequired[bool]
+
+
 class DTensorConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
     _v2: NotRequired[bool]
-    cpu_offload: bool
-    sequence_parallel: bool
-    activation_checkpointing: bool
+    # Distributed parallelism sizes
+    # data_parallel_size is derived from world_size / (tp * cp * ep)
     tensor_parallel_size: int
     context_parallel_size: int
-    custom_parallel_plan: str | None
-    clear_cache_every_n_steps: NotRequired[int | None]
+    expert_parallel_size: NotRequired[int]
+    # Distributed config options (mirrors Automodel's FSDP2Config)
+    sequence_parallel: bool
+    activation_checkpointing: bool
+    cpu_offload: bool
+    custom_parallel_plan: NotRequired[str | None]
+    defer_fsdp_grad_sync: NotRequired[bool]
+    # MoE parallelizer config
+    moe_parallelizer: NotRequired[MoEParallelizerOptions]
+    # Model config
     lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
     automodel_kwargs: NotRequired[AutomodelKwargs]
+    # Runtime
+    clear_cache_every_n_steps: NotRequired[int | None]
 
 
 class SequencePackingConfigDisabled(TypedDict):
@@ -200,6 +222,9 @@ class MegatronConfig(TypedDict):
     bias_activation_fusion: bool
     # Force overwrite of the initial checkpoint even if it exists (default: False)
     force_overwrite_initial_ckpt: NotRequired[bool]
+    # Attention backend available values:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/enums.py#L60
+    attention_backend: NotRequired[str]
     moe_per_layer_logging: bool
     # Set to true to enable DeepEP for expert parallel communication
     # Must set moe_token_dispatcher_type to 'flex'
@@ -226,6 +251,22 @@ class MegatronConfig(TypedDict):
     linear_ce_fusion_chunk_size: NotRequired[int]
 
 
+class DraftConfigDisabled(TypedDict):
+    """Configuration shape for the disabled draft-model training path."""
+
+    enabled: Literal[False]
+
+
+class DraftConfig(TypedDict):
+    """Configuration for Eagle draft-model training alongside the policy model."""
+
+    enabled: Literal[True]
+    model_name: NotRequired[str | None]
+    loss_weight: NotRequired[float]
+    num_layers: NotRequired[int | None]
+    aux_layer_indices: NotRequired[list[int] | None]
+
+
 class TokenizerConfig(TypedDict):
     name: str
     chat_template: NotRequired[str]
@@ -234,6 +275,7 @@ class TokenizerConfig(TypedDict):
     # Multimodal configs
     audio: NotRequired[dict[str, Any]]
     video: NotRequired[dict[str, Any]]
+    use_processor: NotRequired[bool]
 
 
 class PytorchOptimizerConfig(TypedDict):
@@ -292,6 +334,7 @@ class PolicyConfig(TypedDict):
     # Example: "megatron.bridge.recipes.llama.llama31_8b_pretrain_config"
     megatron_recipe: NotRequired[str | None]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
+    draft: NotRequired[DraftConfig | DraftConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
