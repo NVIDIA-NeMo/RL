@@ -48,8 +48,8 @@ CACHED_DEPENDENCIES = [
     "packaging>=24.2",
     # Dev dependencies from pyproject.toml
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
-    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
-    "nvidia-resiliency-ext",
+    "transformer-engine[pytorch,core_cu13]",
+    "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@v0.5.0",
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
@@ -69,9 +69,10 @@ CACHED_DEPENDENCIES = [
     "emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.1.0",
     "datasets",
     "fastapi~=0.50",
-    "flask[async]",
     "hypercorn",
-    "openai",
+    "quart",
+    "openai[aiohttp]",
+    "orjson",
 ]
 
 
