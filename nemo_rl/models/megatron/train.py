@@ -377,12 +377,27 @@ class LossPostProcessor:
         )
 
         if self.cp_normalize:
-            cp_size = get_context_parallel_world_size()
+            # For HCP, packed_seq_params.cp_group is the local CP group for this microbatch/group.
+            # AllGatherCPTensor.backward all_reduces over that local group (size = local_cp_size),
+            # so we must divide by local_cp_size here to cancel it out.
+            # For non-HCP, fall back to the global CP world size (same behaviour as before).
+            _is_hcp_group = getattr(packed_seq_params, "cp_group", None) is not None
+            _local_cp_size = (
+                torch.distributed.get_world_size(packed_seq_params.cp_group)
+                if _is_hcp_group
+                else get_context_parallel_world_size()
+            )
             prev_loss_fn = loss_fn_wrapped
 
             def _div_by_cp_size(*args, **kwargs):
                 loss, metrics = prev_loss_fn(*args, **kwargs)
-                return loss / cp_size, metrics
+                # For HCP with local_cp_size > 1, also scale metrics["loss"] by
+                # 1/_local_cp_size to cancel overcounting in the DP×CP all_reduce.
+                # In HCP each sample lives on _local_cp_size CP ranks, so the
+                # DP×CP reduce sums its contribution _local_cp_size times.
+                if _is_hcp_group and _local_cp_size > 1:
+                    metrics = {**metrics, "loss": metrics["loss"] / _local_cp_size}
+                return loss / _local_cp_size, metrics
 
             loss_fn_wrapped = _div_by_cp_size
 

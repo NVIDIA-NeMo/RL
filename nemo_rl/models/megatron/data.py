@@ -303,7 +303,9 @@ def process_global_batch(
     Args:
         data: Full dataset to extract a batch from
         loss_fn: Loss function (used to check loss type for token-level validation)
-        dp_group: Data parallel process group for all-reduce
+        dp_group: Data parallel process group for all-reduce.  For HCP, pass
+            get_data_parallel_group(with_context_parallel=True) so the reduce
+            covers all ranks that hold portions of the global batch.
         batch_idx: Index of batch to extract
         batch_size: Size of batch to extract
 
@@ -317,17 +319,36 @@ def process_global_batch(
 
     assert "sample_mask" in batch, "sample_mask must be present in the data!"
 
-    # Get the normalization factor for the loss
-    local_valid_seqs = torch.sum(batch["sample_mask"])
-
-    if "token_mask" not in batch:
-        local_valid_toks = local_valid_seqs * batch["input_ids"].shape[1]
+    if "local_cp_sizes" in batch:
+        # HCP mode: each sample i is shared by local_cp_sizes[i] CP ranks, so
+        # it contributes T_i / local_cp_sizes[i] to the local count.  The
+        # caller must pass dp_group = DP×CP group so the all_reduce covers all
+        # ranks that hold any portion of the global batch.
+        # Pop here so the field never reaches Megatron-LM's data iterators,
+        # which may try to CP-shard or otherwise transform every key in the dict.
+        lcp = batch.pop("local_cp_sizes").float().cuda()
+        smask = batch["sample_mask"].float()
+        local_valid_seqs = (smask / lcp).sum()
+        if "token_mask" not in batch:
+            local_valid_toks = (
+                smask * float(batch["input_ids"].shape[1]) / lcp
+            ).sum()
+        else:
+            tmask = batch["token_mask"][:, 1:].float()
+            local_valid_toks = (
+                (tmask * smask.unsqueeze(-1)) / lcp.unsqueeze(-1)
+            ).sum()
     else:
-        local_valid_toks = torch.sum(
-            batch["token_mask"][:, 1:] * batch["sample_mask"].unsqueeze(-1)
-        )
+        # Standard (non-HCP) path.
+        local_valid_seqs = torch.sum(batch["sample_mask"])
+        if "token_mask" not in batch:
+            local_valid_toks = local_valid_seqs * batch["input_ids"].shape[1]
+        else:
+            local_valid_toks = torch.sum(
+                batch["token_mask"][:, 1:] * batch["sample_mask"].unsqueeze(-1)
+            )
 
-    to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
+    to_reduce = torch.stack([local_valid_seqs, local_valid_toks]).cuda()
     torch.distributed.all_reduce(to_reduce, group=dp_group)
     global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
 

@@ -230,6 +230,7 @@ class HeadNodeHCPScheduler:
         self,
         data: BatchedDataDict,
         sample_id_groups: List[List[List[int]]],
+        sample_local_cp_size: List[int],
     ) -> List[SlicedDataDict]:
         """Shard data according to DP×CP rank assignments with HCP metadata.
 
@@ -237,13 +238,12 @@ class HeadNodeHCPScheduler:
             data: Input data batch
             sample_id_groups: Sample ID assignments from scheduler
                 Shape: [num_rounds][hdp_rank] -> list of sample IDs
+            sample_local_cp_size: Per-sample local CP size indexed by global sample ID.
+                Attached to each shard as "local_cp_sizes" so workers can compute
+                normalization factors without re-scanning sample_id_groups.
 
         Returns:
             List of SlicedDataDict, one per DP×CP rank, with HCP metadata attached
-
-        Note:
-            We don't attach local_cp_size per sample here since Megatron-LM's
-            hybrid_context_parallel_forward_backward calculates it from sample_id_groups.
         """
         # Log input data info
         # print(f"HCP: Sharding data - total samples: {data.size}")
@@ -291,6 +291,14 @@ class HeadNodeHCPScheduler:
                 # Add the list of global sample IDs in this shard
                 # This is needed by HCPDataIterator to create a dict with sample IDs as keys
                 shard["shard_sample_ids"] = shard_sample_ids[hdp_rank]
+
+                # Per-sample local CP sizes in local-index order, pre-computed so
+                # workers can normalise valid-token counts without re-scanning
+                # sample_id_groups (see process_global_batch in data.py).
+                shard["local_cp_sizes"] = torch.tensor(
+                    [sample_local_cp_size[gid] for gid in shard_sample_ids[hdp_rank]],
+                    dtype=torch.float32,
+                )
 
                 # Log shard details
                 shard_input_lengths = shard.get("input_lengths", None)
@@ -376,7 +384,7 @@ class HeadNodeHCPScheduler:
         # but not passed to workers (Megatron calculates it from sample_id_groups)
 
         # Step 4: Shard data with HCP metadata (flat list, one per DP×CP rank)
-        flat_shards = self.shard_data_by_hdp_rank(data, sample_id_groups)
+        flat_shards = self.shard_data_by_hdp_rank(data, sample_id_groups, sample_local_cp_size)
 
         # Step 5: Reshape to 2D [dp_idx][cp_idx] for run_all_workers_sharded_data
         return [

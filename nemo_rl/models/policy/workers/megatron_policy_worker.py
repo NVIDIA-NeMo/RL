@@ -303,11 +303,19 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             # Determine if we're in HCP mode for this training call
             is_hcp_mode = hcp_enabled and self.cfg["sequence_packing"]["enabled"]
 
+            # For HCP, CP ranks hold different samples, so the reduction for
+            # global_valid_toks/seqs must cover the full DP×CP group.
+            gb_dp_group = (
+                parallel_state.get_data_parallel_group(with_context_parallel=True)
+                if is_hcp_mode
+                else parallel_state.get_data_parallel_group()
+            )
+
             for gb_idx in range(num_global_batches):
                 gb_result = process_global_batch(
                     data,
                     loss_fn=loss_fn,
-                    dp_group=parallel_state.get_data_parallel_group(),
+                    dp_group=gb_dp_group,
                     batch_idx=gb_idx,
                     batch_size=local_gbs,
                 )
@@ -319,11 +327,14 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     from nemo_rl.models.policy.hcp_data_iterator import create_hcp_data_iterator
 
                     data_iterator = create_hcp_data_iterator(batch, self.cfg)
+                    # len(sample_id_groups) is the HCP equivalent of num_microbatches
+                    hcp_num_groups = len(data_iterator.sample_id_groups)
                     num_microbatches = 1
                     micro_batch_size = 1
                     seq_length = batch["input_ids"].shape[1]
                     padded_seq_length = batch["input_ids"].shape[1]
                 else:
+                    hcp_num_groups = None
                     (
                         data_iterator,
                         num_microbatches,
@@ -337,8 +348,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                         straggler_timer=self.mcore_state.straggler_timer,
                     )
 
-                # Track total microbatches for MoE aux-loss averaging
-                total_num_microbatches += int(num_microbatches)
+                # Track total microbatches for MoE aux-loss averaging.
+                total_num_microbatches += hcp_num_groups if is_hcp_mode else int(num_microbatches)
 
                 loss_post_processor = LossPostProcessor(
                     loss_fn=loss_fn,
@@ -456,11 +467,20 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             # scales lr_warmup_steps by gbs during init
             self.scheduler.step(increment=gbs)
 
-        # Aggregate metrics across all microbatches
+        # Aggregate metrics across all microbatches.
+        # For HCP, data is sharded across DP×CP ranks (different CP ranks hold different
+        # samples), so the reduction must cover the full DP×CP group. For non-HCP, CP ranks
+        # all hold the same data and their losses are identical, so reducing over DP alone is
+        # sufficient (and avoids multiplying by cp_size).
+        dp_group = (
+            parallel_state.get_data_parallel_group(with_context_parallel=True)
+            if is_hcp_mode
+            else parallel_state.get_data_parallel_group()
+        )
         mb_metrics, global_loss = aggregate_training_statistics(
             all_mb_metrics=all_mb_metrics,
             losses=losses,
-            data_parallel_group=parallel_state.get_data_parallel_group(),
+            data_parallel_group=dp_group,
         )
 
         metrics = {
@@ -481,6 +501,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
+        if is_hcp_mode:
+            metrics["hcp_num_groups"] = hcp_num_groups
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")

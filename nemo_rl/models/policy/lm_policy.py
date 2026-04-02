@@ -773,8 +773,40 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 batch_results = self.worker_group.get_all_worker_results(futures)
                 all_batch_results.append(batch_results[0])
 
-            # Use last batch results as final (could also average)
-            results = [all_batch_results[-1]]
+            # Combine results across all global batches.
+            combined_result = dict(all_batch_results[-1])
+            # Each HCP worker call returns a 1-element global_loss tensor already
+            # all-reduced across the full DP×CP group (not just DP). Concatenating
+            # gives shape [num_global_batches], matching the non-HCP worker which
+            # accumulates one loss entry per global batch before all_reduce.
+            combined_result["global_loss"] = torch.cat(
+                [r["global_loss"] for r in all_batch_results]
+            )
+            # Take the max grad_norm across all global batches. The non-HCP worker
+            # only keeps the last batch's grad_norm (loop overwrites the variable),
+            # but here we have all values available so max is more informative for
+            # detecting gradient instability across any of the training steps.
+            combined_result["grad_norm"] = torch.stack(
+                [r["grad_norm"] for r in all_batch_results]
+            ).max(dim=0).values
+            # Combine moe_metrics with a weighted average by hcp_num_groups per batch.
+            # Each batch's values are already normalized by its own hcp_num_groups
+            # (moe_loss_scale = 1/hcp_num_groups in the worker), so we multiply back to
+            # recover the raw sum, accumulate, then divide by the total group count.
+            if "moe_metrics" in all_batch_results[0]:
+                num_groups_list = [r["hcp_num_groups"] for r in all_batch_results]
+                total_groups = sum(num_groups_list)
+                combined_moe = {}
+                for key in all_batch_results[0]["moe_metrics"]:
+                    combined_moe[key] = (
+                        sum(
+                            r["moe_metrics"][key] * n
+                            for r, n in zip(all_batch_results, num_groups_list)
+                        )
+                        / total_groups
+                    )
+                combined_result["moe_metrics"] = combined_moe
+            results = [combined_result]
 
         else:
             with timer.time("policy_training/sharding_data") if timer else nullcontext():
