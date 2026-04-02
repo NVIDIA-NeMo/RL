@@ -518,9 +518,19 @@ class BaseVllmGenerationWorker:
                 "Qwen3_5MoeForConditionalGeneration",
             )
         ):
+            detected_arch = [
+                arch
+                for arch in getattr(hf_config, "architectures", [])
+                if arch
+                in (
+                    "Gemma3ForConditionalGeneration",
+                    "Qwen3_5ForConditionalGeneration",
+                    "Qwen3_5MoeForConditionalGeneration",
+                )
+            ]
             if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
                 print(
-                    "ForConditionalGeneration models may crash when skip_tokenizer_init is True. "
+                    f"Detected {detected_arch} which may crash when skip_tokenizer_init is True. "
                     "NeMo-RL is forcing it to False for this architecture. "
                     "See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
                 )
@@ -990,7 +1000,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         # cached on the receiver and sends data=None, causing an assertion
         # error.  We only clear the renderer (sender) cache here — the
         # receiver and worker-level caches are reset by sleep() internally.
-        if hasattr(self.llm, "renderer"):
+        if hasattr(self.llm, "renderer") and hasattr(self.llm.renderer, "clear_mm_cache"):
             self.llm.renderer.clear_mm_cache()
         self.llm.sleep(level=1)
 
