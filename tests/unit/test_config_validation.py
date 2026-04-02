@@ -144,6 +144,15 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
     Related document: https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause.
     """
 
+    skip_config_files = [
+        "grpo-qwen3-30ba3b-4n8g-40K.yaml",
+        "grpo-qwen3-30ba3b-8n8g-megatron.yaml",
+    ]
+    if os.path.basename(config_file) in skip_config_files:
+        pytest.skip(
+            f"Skipping config file {config_file} because it sets NRL_IGNORE_TP_ACCURACY_CHECK=1"
+        )
+
     print(f"\nValidating config file: {config_file}")
 
     # Load the config file with inheritance
