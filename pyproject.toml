@@ -79,7 +79,7 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  "vllm==0.17.0",
+  "vllm==0.17.1",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.4",
   "nvidia-cutlass-dsl>=4.4.0.dev1",
