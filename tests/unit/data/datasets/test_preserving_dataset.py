@@ -17,7 +17,12 @@ import tempfile
 
 import pytest
 from datasets import Dataset
+from torch.utils.data import ConcatDataset
 
+from nemo_rl.data.datasets import (
+    AllTaskProcessedDataset,
+    merge_map_style_datasets,
+)
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     PreservingDataset,
 )
@@ -313,3 +318,55 @@ class TestOpenAIFormatDatasetWithHeterogeneousTools:
         preserving_dataset = PreservingDataset(data)
         assert preserving_dataset[0]["tool_id"] == "123"
         assert "tool_id" not in preserving_dataset[1]  # Key doesn't exist
+
+
+def _passthrough_processor(entry, task_data_spec, tokenizer, max_seq_length, idx):
+    return {
+        "message_log": [],
+        "task_name": entry["task_name"],
+        "idx": idx,
+    }
+
+
+def test_merge_map_style_datasets_uses_hf_concatenation():
+    dataset_a = Dataset.from_list([{"task_name": "hf_a", "value": 1}])
+    dataset_b = Dataset.from_list([{"task_name": "hf_b", "value": 2}])
+
+    merged = merge_map_style_datasets([dataset_a, dataset_b])
+
+    assert isinstance(merged, Dataset)
+    assert len(merged) == 2
+    assert merged[0]["task_name"] == "hf_a"
+    assert merged[1]["task_name"] == "hf_b"
+
+
+def test_merge_map_style_datasets_supports_preserving_dataset():
+    dataset_a = PreservingDataset([{"task_name": "preserving_a", "tool_id": "123"}])
+    dataset_b = PreservingDataset([{"task_name": "preserving_b"}])
+
+    merged = merge_map_style_datasets([dataset_a, dataset_b])
+
+    assert isinstance(merged, ConcatDataset)
+    assert len(merged) == 2
+    assert merged[0]["tool_id"] == "123"
+    assert "tool_id" not in merged[1]
+
+
+def test_all_task_processed_dataset_accepts_mixed_merged_dataset():
+    dataset_a = Dataset.from_list([{"task_name": "hf_task", "value": 1}])
+    dataset_b = PreservingDataset([{"task_name": "preserving_task", "value": 2}])
+
+    merged = merge_map_style_datasets([dataset_a, dataset_b])
+    dataset = AllTaskProcessedDataset(
+        merged,
+        tokenizer=None,
+        default_task_data_spec=None,
+        task_data_processors={
+            "hf_task": (None, _passthrough_processor),
+            "preserving_task": (None, _passthrough_processor),
+        },
+        max_seq_length=128,
+    )
+
+    assert dataset[0]["task_name"] == "hf_task"
+    assert dataset[1]["task_name"] == "preserving_task"
