@@ -3,14 +3,16 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=1
-STEPS_PER_RUN=20
-MAX_STEPS=20
+NUM_NODES=4
+STEPS_PER_RUN=100
+MAX_STEPS=100
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=30
+NUM_MINUTES=120
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
+
+time_start=$(date +%s)
 
 # Run the experiment
 cd $PROJECT_ROOT
@@ -40,3 +42,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
 fi
+
+time_end=$(date +%s)
+time_elapsed=$((time_end - time_start))
+echo "Time elapsed: $((time_elapsed / 60)) minutes"
