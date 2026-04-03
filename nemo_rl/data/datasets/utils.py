@@ -16,12 +16,19 @@ import base64
 import io
 import os
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
-from datasets import DatasetDict, load_dataset, load_from_disk
+from datasets import (
+    Dataset,
+    DatasetDict,
+    concatenate_datasets,
+    load_dataset,
+    load_from_disk,
+)
 from huggingface_hub.utils._cache_manager import _scan_cached_repo
 from PIL import Image
+from torch.utils.data import ConcatDataset
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
@@ -119,6 +126,27 @@ def update_single_dataset_config(data_config: dict, default_data_config: dict) -
     for key in default_data_config.keys():
         if key not in data_config:
             data_config[key] = default_data_config[key]
+
+
+def merge_map_style_datasets(datasets: list[Any]) -> Any:
+    """Merge map-style datasets while supporting non-HF wrappers.
+
+    Hugging Face's ``concatenate_datasets`` only accepts HF ``Dataset`` objects.
+    Some response datasets, such as ``PreservingDataset``, intentionally bypass the
+    HF schema machinery to preserve heterogeneous nested structures. When those
+    datasets are present, fall back to a generic concatenation wrapper that still
+    provides ``__len__`` and integer ``__getitem__`` for downstream processing.
+    """
+    if not datasets:
+        raise ValueError("Expected at least one dataset to merge.")
+
+    if len(datasets) == 1:
+        return datasets[0]
+
+    if all(isinstance(dataset, Dataset) for dataset in datasets):
+        return concatenate_datasets(datasets)
+
+    return ConcatDataset(datasets)
 
 
 def extract_necessary_env_names(data_config: dict) -> list[str]:
