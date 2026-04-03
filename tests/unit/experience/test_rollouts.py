@@ -17,6 +17,8 @@ import json
 import tempfile
 from copy import deepcopy
 from dataclasses import asdict
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -38,6 +40,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
 )
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
+    run_multi_turn_rollout_async_generation,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -99,6 +102,162 @@ class TestCalculateSingleMetric:
         result = _calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
 
         assert result["test/stddev"] == 0.0
+
+
+class _FakeRemoteMethod:
+    def __init__(self, fn):
+        self._fn = fn
+
+    def remote(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
+class _RecordingEnvHandle:
+    def __init__(self, reward_offset: float = 0.0):
+        self.calls = []
+        self.reward_offset = reward_offset
+        self.step = _FakeRemoteMethod(self._step)
+
+    def _step(self, messages, env_info):
+        self.calls.append(len(messages))
+        batch_size = len(messages)
+        rewards = torch.tensor(
+            [self.reward_offset + i + 1 for i in range(batch_size)],
+            dtype=torch.float32,
+        )
+        return (
+            [{"role": "environment", "content": "done"} for _ in range(batch_size)],
+            [None] * batch_size,
+            [None] * batch_size,
+            rewards,
+            torch.ones(batch_size, dtype=torch.bool),
+            [None] * batch_size,
+        )
+
+
+class _FakeTokenizer:
+    pad_token_id = 0
+
+    def __call__(self, text, return_tensors="pt", add_special_tokens=False):
+        del text, return_tensors, add_special_tokens
+        return SimpleNamespace(input_ids=torch.tensor([[1]], dtype=torch.int64))
+
+
+def _make_test_rollout_batch(task_names: list[str]) -> BatchedDataDict[DatumSpec]:
+    message_logs = []
+    for idx, task_name in enumerate(task_names):
+        del task_name
+        message_logs.append(
+            [
+                {
+                    "role": "user",
+                    "content": f"prompt-{idx}",
+                    "token_ids": torch.tensor([idx + 1, idx + 2], dtype=torch.int64),
+                }
+            ]
+        )
+
+    return BatchedDataDict[DatumSpec](
+        {
+            "message_log": message_logs,
+            "task_name": task_names,
+            "extra_env_info": [{} for _ in task_names],
+            "idx": torch.tensor(list(range(len(task_names)))),
+        }
+    )
+
+
+def test_run_multi_turn_rollout_async_generation_batches_same_task(monkeypatch):
+    async def fake_generate_responses_async(
+        policy_generation,
+        generation_input_data,
+        batch,
+        tokenizer,
+        input_lengths,
+        include_logprobs=True,
+        greedy=False,
+    ):
+        del policy_generation, generation_input_data, tokenizer, input_lengths
+        del include_logprobs, greedy
+        generated_ids = []
+        for i, message_log in enumerate(batch["message_log"]):
+            token_ids = torch.tensor([10 + i], dtype=torch.int64)
+            message_log.append(
+                {
+                    "role": "assistant",
+                    "content": f"answer-{i}",
+                    "token_ids": token_ids,
+                }
+            )
+            generated_ids.append(token_ids)
+        return batch, generated_ids, {"mean_generation_length": 1.0}
+
+    monkeypatch.setattr(ray, "get", lambda refs: refs if isinstance(refs, list) else refs)
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollouts.generate_responses_async",
+        fake_generate_responses_async,
+    )
+
+    env = _RecordingEnvHandle()
+    final_batch, rollout_metrics = run_multi_turn_rollout_async_generation(
+        policy_generation=MagicMock(),
+        input_batch=_make_test_rollout_batch(["math", "math"]),
+        tokenizer=_FakeTokenizer(),
+        task_to_env={"math": env},
+        max_seq_len=32,
+        max_rollout_turns=1,
+    )
+
+    assert env.calls == [2]
+    assert torch.equal(final_batch["total_reward"], torch.tensor([1.0, 2.0]))
+    assert rollout_metrics["total_turns"] == 2
+
+
+def test_run_multi_turn_rollout_async_generation_keeps_task_grouping(monkeypatch):
+    async def fake_generate_responses_async(
+        policy_generation,
+        generation_input_data,
+        batch,
+        tokenizer,
+        input_lengths,
+        include_logprobs=True,
+        greedy=False,
+    ):
+        del policy_generation, generation_input_data, tokenizer, input_lengths
+        del include_logprobs, greedy
+        generated_ids = []
+        for i, message_log in enumerate(batch["message_log"]):
+            token_ids = torch.tensor([20 + i], dtype=torch.int64)
+            message_log.append(
+                {
+                    "role": "assistant",
+                    "content": f"mixed-answer-{i}",
+                    "token_ids": token_ids,
+                }
+            )
+            generated_ids.append(token_ids)
+        return batch, generated_ids, {"mean_generation_length": 1.0}
+
+    monkeypatch.setattr(ray, "get", lambda refs: refs if isinstance(refs, list) else refs)
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollouts.generate_responses_async",
+        fake_generate_responses_async,
+    )
+
+    math_env = _RecordingEnvHandle(reward_offset=0.0)
+    code_env = _RecordingEnvHandle(reward_offset=10.0)
+    final_batch, _ = run_multi_turn_rollout_async_generation(
+        policy_generation=MagicMock(),
+        input_batch=_make_test_rollout_batch(["math", "code"]),
+        tokenizer=_FakeTokenizer(),
+        task_to_env={"math": math_env, "code": code_env},
+        max_seq_len=32,
+        max_rollout_turns=1,
+    )
+
+    assert math_env.calls == [1]
+    assert code_env.calls == [1]
+    assert torch.equal(final_batch["total_reward"], torch.tensor([1.0, 11.0]))
 
 
 @pytest.fixture(scope="function")
