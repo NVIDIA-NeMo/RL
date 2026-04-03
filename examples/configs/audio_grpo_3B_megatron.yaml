@@ -5,15 +5,15 @@ defaults: "grpo_math_1B_megatron.yaml"
 grpo:
   num_prompts_per_step: 8
   num_generations_per_prompt: 8
-  max_num_steps: 500
+  max_num_steps: 1000
   max_val_samples: 32
   val_batch_size: 32
 
 checkpointing:
   enabled: true
-  checkpoint_dir: results/audio_grpo_3B_megatron_2_gpus
+  checkpoint_dir: results/audio_grpo_3B_megatron
   keep_top_k: 10
-  save_period: 100
+  save_period: 400
 
 policy:
   model_name: Qwen/Qwen2.5-Omni-3B
