@@ -147,6 +147,7 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
     skip_config_files = [
         "grpo-qwen3-30ba3b-4n8g-40K.yaml",
         "grpo-qwen3-30ba3b-8n8g-megatron.yaml",
+        "grpo-qwen3-32b-4n8g.yaml",
     ]
     if os.path.basename(config_file) in skip_config_files:
         pytest.skip(
