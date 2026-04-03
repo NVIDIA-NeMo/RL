@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import argparse
-
+import os
 import yaml
 
 from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf
@@ -49,14 +49,21 @@ def main():
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
 
-    model_name_or_path = config["policy"]["model_name"]
-    # TODO: After the following PR gets merged:
-    # https://github.com/NVIDIA-NeMo/RL/pull/148/files
-    # tokenizer should be copied from policy/tokenizer/* instead of relying on the model name
-    # We can expose a arg at the top level --tokenizer_path to plumb that through.
-    # This is more stable than relying on the current NeMo-RL get_tokenizer() which can
-    # change release to release.
-    tokenizer_name_or_path = config["policy"]["model_name"]
+    model_name_or_path = config["policy"]["model_name"]    
+    # Since we have now merged https://github.com/NVIDIA-NeMo/RL/pull/148/files
+    # we want to copy the tokenizer from policy/tokenizer/* instead of relying on the model name
+    # from the config file
+    # The reason is that some algos may change the tokenizer.chat_template property at runtime
+    # and we want this to persist correctly from DCP ckpts down to HF converted ckpts
+    
+    # this (somewhat brittle) logic assumes that dcp_ckpt_path will always be policy/weights/ and the
+    # tokenizer files are always located at policy/tokenizer/*
+    if os.path.exists(tokenizer_path := os.path.join(args.dcp_ckpt_path, "..", "tokenizer")):
+        print(f"Using local tokenizer path at {tokenizer_path} for HF conversion")
+        tokenizer_name_or_path = tokenizer_path
+    else:
+        print(f"WARNING: No local tokenizer path found at {tokenizer_path}. Falling back to loading the vanilla tokenizer based on the config file. Please ensure this is what you want.")
+        tokenizer_name_or_path = config["policy"]["model_name"]
     hf_overrides = config["policy"].get("hf_overrides", {}) or {}
 
     hf_ckpt = convert_dcp_to_hf(
