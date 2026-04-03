@@ -24,6 +24,7 @@ nemo_rl.models.megatron.setup, focusing on:
 - Model path validation
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -507,11 +508,15 @@ class TestCreateCheckpointConfig:
 
         pretrained_path = str(tmp_path / "pretrained")
         weights_path = str(tmp_path / "weights")
+        optimizer_path = str(tmp_path / "optimizer")
 
-        checkpoint_config = _create_checkpoint_config(pretrained_path, weights_path)
+        checkpoint_config = _create_checkpoint_config(
+            pretrained_path, weights_path, optimizer_path
+        )
 
         assert checkpoint_config.save == weights_path
         assert checkpoint_config.load == weights_path
+        assert checkpoint_config.load_optim is True
         assert checkpoint_config.pretrained_checkpoint == pretrained_path
         assert checkpoint_config.async_save is False
         assert checkpoint_config.fully_parallel_save is True
@@ -751,6 +756,7 @@ class TestValidateAndSetConfig:
                 hf_model_name="test-model",
                 pretrained_path="/path/to/model",
                 weights_path=None,
+                optimizer_path=None,
             )
 
         assert "Reward models are not yet supported" in str(exc_info.value)
@@ -796,6 +802,7 @@ class TestValidateAndSetConfig:
                     hf_model_name="test-model",
                     pretrained_path="/path/to/model",
                     weights_path=None,
+                    optimizer_path=None,
                 )
 
                 assert runtime_config.is_generation_colocated is True
@@ -1145,4 +1152,200 @@ class TestFinalizeMegatronSetup:
         mock_build_tokenizer.assert_called_once()
         mock_auto_bridge.from_hf_pretrained.assert_called_once_with(
             "test-model", trust_remote_code=True
+        )
+
+
+@pytest.mark.mcore
+class TestDraftSetup:
+    """Tests for Eagle draft-model setup utilities."""
+
+    @staticmethod
+    def _build_model_provider():
+        return SimpleNamespace(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            sequence_parallel=False,
+            use_cpu_initialization=True,
+            fp16=False,
+            bf16=False,
+            params_dtype=torch.float32,
+            pipeline_dtype=torch.float32,
+            ffn_hidden_size=16,
+            num_attention_heads=2,
+            kv_channels=4,
+            num_query_groups=2,
+            init_method_std=0.02,
+            layernorm_epsilon=1e-5,
+            add_bias_linear=False,
+            attention_dropout=0.0,
+            hidden_size=8,
+            vocab_size=8,
+            seq_length=16,
+            position_embedding_type="rope",
+            rotary_percent=1.0,
+            rotary_base=10000,
+            rope_scaling=None,
+            rope_scaling_factor=None,
+            num_layers=4,
+        )
+
+    @patch("nemo_rl.models.megatron.setup.get_pg_collection")
+    @patch("nemo_rl.models.megatron.setup.build_draft_model")
+    def test_draft_pre_wrap_hook_attaches_only_owner_chunk(
+        self, mock_build_draft_model, mock_get_pg_collection
+    ):
+        """The nested draft model should attach only to the owner post-process chunk."""
+        from nemo_rl.models.megatron.setup import _create_draft_pre_wrap_hook
+
+        class DummyChunk(torch.nn.Module):
+            def __init__(self, *, post_process: bool = False):
+                super().__init__()
+                self.post_process = post_process
+
+        chunks = [
+            DummyChunk(post_process=False),
+            DummyChunk(post_process=True),
+            DummyChunk(post_process=False),
+        ]
+        draft_model = torch.nn.Linear(2, 2, bias=False)
+        mock_build_draft_model.return_value = draft_model
+        mock_get_pg_collection.return_value = MagicMock()
+
+        hook = _create_draft_pre_wrap_hook(
+            policy_cfg={"draft": {"enabled": True, "model_name": None}},
+            megatron_cfg=MagicMock(),
+            state=MagicMock(),
+            preload_policy_from_pretrained=False,
+        )
+
+        returned_model = hook(chunks)
+
+        assert returned_model is chunks
+        assert getattr(chunks[0], "draft_model", None) is None
+        assert chunks[1].draft_model is draft_model
+        assert getattr(chunks[2], "draft_model", None) is None
+        mock_build_draft_model.assert_called_once()
+        assert (
+            mock_build_draft_model.call_args.kwargs["policy_model_chunk"] is chunks[1]
+        )
+
+    @patch("nemo_rl.models.megatron.draft.utils.copy_policy_lm_head_to_draft")
+    @patch("nemo_rl.models.megatron.draft.utils.load_hf_weights_to_eagle")
+    @patch("nemo_rl.models.megatron.draft.eagle.EagleModel")
+    @patch("transformers.AutoConfig.from_pretrained")
+    def test_build_draft_model_falls_back_to_policy_lm_head(
+        self,
+        mock_auto_config,
+        mock_eagle_model,
+        mock_load_hf_weights,
+        mock_copy_lm_head,
+    ):
+        """Missing draft LM-head weights should fall back to the policy LM head."""
+        from nemo_rl.models.megatron.setup import build_draft_model
+
+        mock_auto_config.return_value.to_dict.return_value = {
+            "num_hidden_layers": 2,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "head_dim": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-5,
+            "attention_dropout": 0.0,
+            "hidden_size": 8,
+            "vocab_size": 8,
+            "eagle_aux_hidden_state_layer_ids": [0, 2],
+        }
+        draft_model = MagicMock()
+        draft_model.modules.return_value = []
+        mock_eagle_model.return_value = draft_model
+        mock_load_hf_weights.return_value = (
+            ["eagle_module.eagle_output_layer.weight"],
+            [],
+        )
+        policy_model_chunk = MagicMock()
+
+        returned_model = build_draft_model(
+            model_provider=self._build_model_provider(),
+            draft_config={"enabled": True, "model_name": "dummy-draft"},
+            pg_collection=SimpleNamespace(tp=None),
+            policy_model_chunk=policy_model_chunk,
+        )
+
+        assert returned_model is draft_model
+        mock_copy_lm_head.assert_called_once_with(
+            draft_model=draft_model,
+            policy_model_chunk=policy_model_chunk,
+        )
+
+    @patch("nemo_rl.models.megatron.draft.utils.unwrap_model")
+    def test_copy_policy_lm_head_to_draft_raises_on_shape_mismatch(
+        self, mock_unwrap_model
+    ):
+        """Selected policy rows must match the draft LM-head shard shape."""
+        from nemo_rl.models.megatron.draft.utils import copy_policy_lm_head_to_draft
+
+        policy_model = SimpleNamespace(
+            share_embeddings_and_output_weights=False,
+            output_layer=SimpleNamespace(weight=torch.randn(2, 4)),
+        )
+        mock_unwrap_model.return_value = policy_model
+        draft_model = SimpleNamespace(
+            config=SimpleNamespace(draft_vocab_size=2),
+            eagle_module=SimpleNamespace(
+                eagle_output_layer=SimpleNamespace(weight=torch.zeros(3, 4)),
+                d2t=None,
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="local shard shapes differ"):
+            copy_policy_lm_head_to_draft(
+                draft_model=draft_model,
+                policy_model_chunk=MagicMock(),
+            )
+
+    @patch("nemo_rl.models.megatron.setup.get_pg_collection")
+    @patch("nemo_rl.models.megatron.setup.build_draft_model")
+    def test_attached_draft_state_is_serializable(
+        self, mock_build_draft_model, mock_get_pg_collection
+    ):
+        """Attached draft modules should be part of the owner chunk state_dict."""
+        from nemo_rl.models.megatron.setup import _create_draft_pre_wrap_hook
+
+        class DummyChunk(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.post_process = True
+                self.base = torch.nn.Linear(2, 2, bias=False)
+
+        mock_get_pg_collection.return_value = MagicMock()
+
+        def attach_fresh_draft():
+            chunk = DummyChunk()
+            hook = _create_draft_pre_wrap_hook(
+                policy_cfg={"draft": {"enabled": True, "model_name": None}},
+                megatron_cfg=MagicMock(),
+                state=MagicMock(),
+                preload_policy_from_pretrained=False,
+            )
+            hook([chunk])
+            return chunk
+
+        original_draft = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            original_draft.weight.fill_(3.14)
+        mock_build_draft_model.return_value = original_draft
+        owner_chunk = attach_fresh_draft()
+        state_dict = owner_chunk.state_dict()
+
+        assert "draft_model.weight" in state_dict
+
+        restored_draft = torch.nn.Linear(2, 2, bias=False)
+        mock_build_draft_model.return_value = restored_draft
+        restored_chunk = attach_fresh_draft()
+        restored_chunk.load_state_dict(state_dict)
+
+        torch.testing.assert_close(
+            restored_chunk.draft_model.weight,
+            owner_chunk.draft_model.weight,
         )

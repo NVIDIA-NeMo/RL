@@ -15,7 +15,7 @@
 import os
 import time
 import warnings
-from typing import Any, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 import torch
 from megatron.bridge import AutoBridge
@@ -23,6 +23,7 @@ from megatron.bridge.models.model_provider import get_model
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.checkpointing import (
+    _load_checkpoint_from_path,
     checkpoint_exists,
     init_checkpointing_context,
     load_checkpoint,
@@ -48,6 +49,7 @@ from megatron.bridge.training.setup import (
 )
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
+from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
@@ -73,6 +75,11 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
+from nemo_rl.models.megatron.draft.utils import (
+    build_draft_model,
+    find_draft_owner_chunk,
+    get_attached_draft_model,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -198,6 +205,7 @@ def validate_and_set_config(
     hf_model_name,
     pretrained_path,
     weights_path,
+    optimizer_path,
 ):
     # Handle generation configuration
     is_generation_colocated = None
@@ -238,7 +246,13 @@ def validate_and_set_config(
         )
 
     megatron_cfg, model_cfg = setup_model_config(
-        config, rank, dtype, hf_model_name, pretrained_path, weights_path
+        config,
+        rank,
+        dtype,
+        hf_model_name,
+        pretrained_path,
+        weights_path,
+        optimizer_path,
     )
 
     final_padded_vocab_size = calculate_padded_vocab_size(
@@ -284,6 +298,7 @@ def setup_model_config(
     hf_model_name: str,
     pretrained_path: str,
     weights_path: Optional[str] = None,
+    optimizer_path: Optional[str] = None,
 ) -> tuple[ConfigContainer, Any]:
     """Handle all the model configuration logic."""
     # Load pretrained run config
@@ -325,6 +340,9 @@ def setup_model_config(
     # Apply MoE settings
     _apply_moe_config(model_cfg, config)
 
+    # Apply MTP settings
+    _apply_mtp_config(model_cfg, config)
+
     # Apply precision settings
     _apply_precision_config(model_cfg, config, dtype)
 
@@ -342,7 +360,9 @@ def setup_model_config(
     _validate_chunking_config(config)
 
     # Create checkpoint configs
-    checkpoint_config = _create_checkpoint_config(pretrained_path, weights_path)
+    checkpoint_config = _create_checkpoint_config(
+        pretrained_path, weights_path, optimizer_path
+    )
 
     # Validate training configuration
     _validate_training_config(config, model_cfg)
@@ -422,6 +442,11 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
 
+def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
+    if "mtp_num_layers" in config["megatron_cfg"]:
+        model_cfg.mtp_num_layers = config["megatron_cfg"]["mtp_num_layers"]
+
+
 def _apply_precision_config(
     model_cfg: Any, config: PolicyConfig, dtype: torch.dtype
 ) -> None:
@@ -472,13 +497,14 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")
     if attention_backend is not None:
-        if isinstance(attention_backend, str):
+        for _nvte_var in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
+            os.environ.pop(_nvte_var, None)
+        try:
             model_cfg.attention_backend = AttnBackend[attention_backend]
-        elif isinstance(attention_backend, int):
-            model_cfg.attention_backend = AttnBackend(attention_backend)
-        else:
+        except KeyError:
             raise ValueError(
-                f"Unsupported {type(attention_backend)=}, expected str or int"
+                f"Invalid attention backend: {attention_backend}. "
+                f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
 
     # FP8 configuration
@@ -526,13 +552,14 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
 
 
 def _create_checkpoint_config(
-    pretrained_path: str, weights_path: Optional[str]
+    pretrained_path: str, weights_path: Optional[str], optimizer_path: Optional[str]
 ) -> CheckpointConfig:
     """Create checkpoint configurations."""
     return CheckpointConfig(
         save_interval=100,
         save=weights_path,
         load=weights_path,
+        load_optim=optimizer_path is not None,
         pretrained_checkpoint=pretrained_path,
         async_save=False,
         fully_parallel_save=True,
@@ -647,6 +674,67 @@ def _create_megatron_config(
     )
 
 
+def _create_draft_pre_wrap_hook(
+    policy_cfg: PolicyConfig,
+    megatron_cfg: ConfigContainer,
+    state: GlobalState,
+    *,
+    preload_policy_from_pretrained: bool,
+) -> Callable[[list[MegatronModule]], list[MegatronModule]]:
+    """Create the hook that attaches draft weights before mixed-precision/DDP wrapping."""
+    draft_cfg = policy_cfg["draft"]
+
+    def draft_pre_wrap_hook(model: list[MegatronModule]) -> list[MegatronModule]:
+        """Optionally preload the base policy, then attach the draft module to the owner chunk."""
+        if not draft_cfg["enabled"]:
+            return model
+
+        # Base pretrained checkpoints do not contain draft weights, so load the
+        # policy weights before attaching the nested draft module.
+        if preload_policy_from_pretrained:
+            pretrained_checkpoint = megatron_cfg.checkpoint.pretrained_checkpoint
+            if pretrained_checkpoint is None or not checkpoint_exists(
+                pretrained_checkpoint
+            ):
+                raise ValueError(
+                    f"Invalid pretrained checkpoint directory found: {pretrained_checkpoint}"
+                )
+            megatron_cfg.checkpoint.finetune = True
+            _load_checkpoint_from_path(
+                load_dir=pretrained_checkpoint,
+                state=state,
+                model=model,
+                optimizer=None,
+                opt_param_scheduler=None,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+                ignore_ckpt_step=True,
+            )
+
+        draft_owner = find_draft_owner_chunk(model)
+        if draft_owner is None:
+            return model
+
+        if getattr(draft_owner, "draft_model", None) is not None:
+            raise RuntimeError(
+                "Policy model chunk already has an attached `draft_model`."
+            )
+
+        pg_collection = get_pg_collection(model)
+        draft_model = build_draft_model(
+            megatron_cfg.model,
+            draft_config=draft_cfg,
+            pg_collection=pg_collection,
+            policy_model_chunk=draft_owner,
+        )
+        if draft_model is not None:
+            setattr(draft_owner, "draft_model", draft_model)
+
+        return model
+
+    return draft_pre_wrap_hook
+
+
 def setup_model_and_optimizer(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -709,6 +797,21 @@ def setup_model_and_optimizer(
     pre_wrap_hook = []
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
+    draft_enabled = "draft" in policy_cfg and policy_cfg["draft"]["enabled"]
+    resume_checkpoint_exists = (
+        megatron_cfg.checkpoint.load is not None
+        and checkpoint_exists(megatron_cfg.checkpoint.load)
+    )
+    pretrained_checkpoint_exists = (
+        megatron_cfg.checkpoint.pretrained_checkpoint is not None
+        and checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
+    )
+    preload_policy_from_pretrained_for_draft = (
+        draft_enabled
+        and not use_peft  # The PEFT pre-wrap hook loads the pretrained base policy before adapters are attached.
+        and not resume_checkpoint_exists  # Resume checkpoints already carry the attached draft module state.
+        and pretrained_checkpoint_exists
+    )
 
     mixed_precision_wrapper = Float16Module
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
@@ -767,6 +870,15 @@ def setup_model_and_optimizer(
 
         pre_wrap_hook.extend([composed_peft_hook])
 
+    if draft_enabled:
+        draft_pre_wrap_hook = _create_draft_pre_wrap_hook(
+            policy_cfg,
+            megatron_cfg,
+            state,
+            preload_policy_from_pretrained=preload_policy_from_pretrained_for_draft,
+        )
+        pre_wrap_hook.extend([draft_pre_wrap_hook])
+
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     setattr(megatron_cfg.model, "_pg_collection", pg_collection)
@@ -784,6 +896,7 @@ def setup_model_and_optimizer(
         mixed_precision_wrapper=mixed_precision_wrapper,
         pg_collection=pg_collection,
     )
+
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
             optimizer_config=megatron_cfg.optimizer,
@@ -799,21 +912,15 @@ def setup_model_and_optimizer(
     torch.distributed.barrier()
 
     if megatron_cfg.peft is not None:
-        should_load_checkpoint = (
-            megatron_cfg.checkpoint.load is not None
-            and checkpoint_exists(megatron_cfg.checkpoint.load)
-        )
+        should_load_checkpoint = resume_checkpoint_exists
         if should_load_checkpoint:
             # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
             # This is switched off here in order to load these states from the checkpoint
             megatron_cfg.checkpoint.finetune = False
     else:
-        should_load_checkpoint = (
-            megatron_cfg.checkpoint.load is not None
-            and checkpoint_exists(megatron_cfg.checkpoint.load)
-        ) or (
-            megatron_cfg.checkpoint.pretrained_checkpoint is not None
-            and checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
+        should_load_checkpoint = resume_checkpoint_exists or (
+            pretrained_checkpoint_exists
+            and not preload_policy_from_pretrained_for_draft
         )
 
     # Load checkpoint if applicable
@@ -828,6 +935,8 @@ def setup_model_and_optimizer(
         )
         print("Checkpoint loaded")
     torch.distributed.barrier()
+
+    draft_model = get_attached_draft_model(model)
 
     # Set the param sync function for the model
     param_sync_func = None
@@ -846,6 +955,7 @@ def setup_model_and_optimizer(
         scheduler,
         checkpointing_context,
         param_sync_func,
+        draft_model=draft_model,
     )
 
 

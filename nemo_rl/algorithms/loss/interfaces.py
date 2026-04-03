@@ -29,6 +29,7 @@ class LossInputType(enum.Enum):
     LOGIT = "logit"
     LOGPROB = "logprob"
     DISTILLATION = "distillation"
+    DRAFT = "draft"
 
 
 class LossFunction(Protocol):
@@ -66,6 +67,7 @@ class LossFunction(Protocol):
                 - For LossInputType.LOGPROB: next_token_logprobs (torch.Tensor)
                 - For LossInputType.LOGIT: logits (torch.Tensor)
                 - For LossInputType.DISTILLATION: student_topk_logprobs, teacher_topk_logprobs, H_all (torch.Tensor)
+                - For LossInputType.DRAFT: teacher_logits, student_logits, mask (torch.Tensor)
 
         Returns:
             tuple: (loss, metrics)

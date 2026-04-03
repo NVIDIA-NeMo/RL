@@ -9,7 +9,7 @@ policy:
     name: ${policy.model_name}
   train_global_batch_size: 32
   train_micro_batch_size: 1
-  max_total_sequence_length: 6000
+  max_total_sequence_length: 3200
   dtensor_cfg:
     enabled: false
   megatron_cfg:
@@ -26,8 +26,6 @@ policy:
       lr: 1.0e-06
       min_lr: 1.0e-06
       adam_beta2: 0.999
-      use_distributed_optimizer: false
-      use_precision_aware_optimizer: false
     scheduler:
       lr_warmup_iters: 10
       lr_warmup_init: 1.0e-11
