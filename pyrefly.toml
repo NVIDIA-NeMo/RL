@@ -73,6 +73,7 @@ project-includes = [
   "nemo_rl/data/datasets/response_datasets/gsm8k.py",
   "nemo_rl/data/datasets/response_datasets/helpsteer3.py",
   "nemo_rl/data/datasets/response_datasets/nemogym_dataset.py",
+  "nemo_rl/data/datasets/response_datasets/nemotron_cascade2_sft.py",
   "nemo_rl/data/datasets/response_datasets/oai_format_dataset.py",
   "nemo_rl/data/datasets/response_datasets/oasst.py",
   "nemo_rl/data/datasets/response_datasets/openmathinstruct2.py",
