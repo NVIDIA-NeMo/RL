@@ -41,7 +41,7 @@ dependencies = [
   "matplotlib",
   "plotly",
   "sympy>=1.14.0",
-  "pillow>=11.3.0",
+  "pillow>=12.1.1",
   "torchvision==0.25.0",
   "transformers==5.3.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
@@ -148,7 +148,7 @@ dev = [
   "pyrefly==0.24.2",
 ]
 test = [
-  "pytest>=7.0.0",
+  "pytest>=8.4.2",
   "pytest-timeout",
   "pytest-cov",
   "pytest-asyncio",
@@ -263,6 +263,8 @@ override-dependencies = [
   # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
   # Override until vllm officially relaxes the constraint (https://github.com/vllm-project/vllm/issues/30466).
   "transformers==5.3.0",
+  #Override till we can upgrade sglang version to address CVE GHSA-7rgv-gqhr-fxg3
+  "xgrammar==0.1.33",
 ]
 # CVE fixes
 constraint-dependencies = [
@@ -274,6 +276,10 @@ constraint-dependencies = [
   "wheel>=0.46.2",            # Address CVE GHSA-8rrh-rw8j-w5fx
   "protobuf>=6.33.5",         # Address CVE GHSA-7gcm-g887-7qv7
   "python-multipart>=0.0.22", # Address CVE GHSA-wp53-j4wj-2cfg
+  "pygments>=2.20.0",         # Address CVE GHSA-5239-wwwm-4pmq
+  "cbor2>=5.9.0",             # Address CVE GHSA-3c37-wwvx-h642
+  "onnx>=1.21.0rc4",          # Address CVE GHSA-hqmj-h5c6-369m
+  "cryptography>=46.0.6",     # Address CVE GHSA-6w46-j5rx-g56g
 ]
 
 conflicts = [
