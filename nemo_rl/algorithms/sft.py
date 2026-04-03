@@ -125,7 +125,7 @@ def setup(
     #      Checkpointing
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
-    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    last_checkpoint_path = checkpointer.resolve_training_start_checkpoint()
     sft_save_state: Optional[SFTSaveState] = cast(
         Optional[SFTSaveState], checkpointer.load_training_info(last_checkpoint_path)
     )

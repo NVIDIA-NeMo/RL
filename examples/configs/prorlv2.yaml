@@ -101,6 +101,7 @@ loss_fn:
 # ============================================================================
 checkpointing:
   checkpoint_dir: "results/prorl"
+  resume_if_exists: true
 
 logger:
   log_dir: "logs/prorl"

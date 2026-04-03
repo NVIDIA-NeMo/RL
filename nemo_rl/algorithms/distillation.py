@@ -227,7 +227,7 @@ def setup(
     #      Checkpointing
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
-    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    last_checkpoint_path = checkpointer.resolve_training_start_checkpoint()
     distillation_save_state: Optional[DistillationSaveState] = cast(
         Optional[DistillationSaveState],
         checkpointer.load_training_info(last_checkpoint_path),

@@ -22,6 +22,7 @@ dpo:
 
 checkpointing:
   enabled: true
+  resume_if_exists: true
   checkpoint_dir: "results/dpo"
   metric_name: "val:validation-default_loss"
   higher_is_better: false

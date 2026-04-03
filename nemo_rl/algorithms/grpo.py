@@ -266,7 +266,7 @@ def setup(
     #      Checkpointing
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
-    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    last_checkpoint_path = checkpointer.resolve_training_start_checkpoint()
     grpo_save_state: Optional[GRPOSaveState] = cast(
         Optional[GRPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
     )

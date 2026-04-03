@@ -10,6 +10,7 @@ grpo:
 
 checkpointing:
   enabled: true
+  resume_if_exists: true
   checkpoint_dir: "results/grpo-sliding-puzzle"
   metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
   higher_is_better: true

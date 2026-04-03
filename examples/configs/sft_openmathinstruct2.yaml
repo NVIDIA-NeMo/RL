@@ -7,6 +7,7 @@ sft:
   val_micro_batch_size: 2
 checkpointing:
   checkpoint_dir: results/sft_openmathinstruct2
+  resume_if_exists: true
   keep_top_k: 100
   save_period: 500
 policy:
