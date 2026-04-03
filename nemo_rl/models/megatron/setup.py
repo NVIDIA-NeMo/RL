@@ -80,7 +80,7 @@ from nemo_rl.models.megatron.draft.utils import (
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
-from nemo_rl.models.megatron.recipe_config import load_recipe
+from nemo_rl.models.megatron.mbridge_recipe_utils import load_recipe
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -394,16 +394,15 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.tensor_model_parallel_size = config["megatron_cfg"][
         "tensor_model_parallel_size"
     ]
-    if getattr(model_cfg, "pipeline_model_parallel_layout", None) is None:
-        model_cfg.pipeline_model_parallel_size = config["megatron_cfg"][
-            "pipeline_model_parallel_size"
-        ]
-        model_cfg.num_layers_in_first_pipeline_stage = config["megatron_cfg"][
-            "num_layers_in_first_pipeline_stage"
-        ]
-        model_cfg.num_layers_in_last_pipeline_stage = config["megatron_cfg"][
-            "num_layers_in_last_pipeline_stage"
-        ]
+    model_cfg.pipeline_model_parallel_size = config["megatron_cfg"][
+        "pipeline_model_parallel_size"
+    ]
+    model_cfg.num_layers_in_first_pipeline_stage = config["megatron_cfg"][
+        "num_layers_in_first_pipeline_stage"
+    ]
+    model_cfg.num_layers_in_last_pipeline_stage = config["megatron_cfg"][
+        "num_layers_in_last_pipeline_stage"
+    ]
     model_cfg.sequence_parallel = config["megatron_cfg"]["sequence_parallel"]
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
 
@@ -521,10 +520,13 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             )
 
     if model_cfg.gradient_accumulation_fusion:
-        try:
-            import fused_weight_gradient_mlp_cuda  # noqa: F401
-        except ImportError:
-            model_cfg.gradient_accumulation_fusion = False
+        from megatron.bridge.utils.fusions import (
+            can_enable_gradient_accumulation_fusion,
+        )
+
+        model_cfg.gradient_accumulation_fusion = (
+            can_enable_gradient_accumulation_fusion()
+        )
 
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)

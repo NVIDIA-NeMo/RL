@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_rl.models.megatron.recipe_config import (
+from nemo_rl.models.megatron.mbridge_recipe_utils import (
     load_recipe,
 )
 
