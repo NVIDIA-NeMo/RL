@@ -11,6 +11,7 @@ The logger is designed to track key training metrics (including distributed metr
    * Tensorboard
    * MLflow
    * Swanlab
+   * Trackio
 
 ## Overall Design
 
@@ -57,6 +58,10 @@ logging_config = {
         "experiment_name": "nemo-rl-experiment",
         "run_name": "grpo-dev-run",
         "tracking_uri": None,  # Use local tracking
+    },
+    "trackio": {
+        "project": "nemo-rl",
+        "name": "trackio-run",
     },
 }
 logger = Logger(
@@ -125,6 +130,37 @@ Then access the UI at `http://127.0.0.1:5000/` to view:
 - Metrics (loss, validation metrics, etc.)
 - Hyperparameters
 - Model artifacts and checkpoints
+
+### Trackio
+
+Trackio is a lightweight experiment tracking backend with strong support for:
+
+- Fast logging with minimal overhead
+- GPU metric tracking (native support)
+- Dataset versioning and push
+- Hugging Face Space integration (for dashboards)
+- Simple API with structured logging
+
+#### Trackio Configuration
+
+```python
+trackio:
+  project: "nemo_rl_project"
+  name: "experiment_run"
+
+  # GPU logging
+  auto_log_gpu: true
+  gpu_log_interval: 10.0
+
+ 
+  dataset_id: null # optional additions
+  space_id: null
+
+  # Alerts
+  webhook_url: null
+  webhook_min_level: "WARN"
+```
+
 
 ## Validation Pretty Logging
 

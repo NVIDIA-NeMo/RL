@@ -25,6 +25,7 @@ from nemo_rl.utils.logger import (
     RayGpuMonitorLogger,
     SwanlabLogger,
     TensorboardLogger,
+    TrackioLogger,
     WandbLogger,
     flatten_dict,
     print_message_log_samples,
@@ -744,6 +745,169 @@ class TestMLflowLogger:
         )
         mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
         mock_mlflow.start_run.assert_called_once_with(run_name=cfg["run_name"])
+
+
+class TestTrackioLogger:
+    """Test the TrackioLogger class."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        temp_dir = tempfile.mkdtemp()
+        yield temp_dir
+        shutil.rmtree(temp_dir)
+
+    @patch("nemo_rl.utils.logger.trackio")
+    def test_init_basic(self, mock_trackio, temp_dir):
+        cfg = {
+            "project": "test-project",
+            "name": "test-run",
+        }
+
+        TrackioLogger(cfg, log_dir=temp_dir)
+
+        mock_trackio.init.assert_called_once_with(
+            project="test-project",
+            name="test-run",
+        )
+
+    @patch("nemo_rl.utils.logger.trackio")
+    def test_init_with_optional_fields(self, mock_trackio, temp_dir):
+        cfg = {
+            "project": "proj",
+            "name": "run",
+            "space_id": "user/space",
+            "dataset_id": "user/dataset",
+        }
+
+        TrackioLogger(cfg, log_dir=temp_dir)
+
+        mock_trackio.init.assert_called_once()
+        mock_trackio.launch.assert_called_once_with("user/space")
+
+    @patch("nemo_rl.utils.logger.trackio")
+    def test_log_metrics(self, mock_trackio):
+        cfg = {"project": "test"}
+        logger = TrackioLogger(cfg)
+
+        metrics = {"loss": 0.5, "accuracy": 0.8}
+        logger.log_metrics(metrics, step=10)
+
+        mock_trackio.log.assert_called_once_with(metrics, step=10)
+
+    @patch("nemo_rl.utils.logger.trackio")
+    def test_log_metrics_with_prefix(self, mock_trackio):
+        cfg = {"project": "test"}
+        logger = TrackioLogger(cfg)
+
+        metrics = {"loss": 0.5, "accuracy": 0.8}
+        logger.log_metrics(metrics, step=5, prefix="train")
+
+        expected = {
+            "train/loss": 0.5,
+            "train/accuracy": 0.8,
+        }
+
+        mock_trackio.log.assert_called_once_with(expected, step=5)
+
+    @patch("nemo_rl.utils.logger.trackio")
+    def test_log_metrics_with_step_metric(self, mock_trackio):
+        cfg = {"project": "test"}
+        logger = TrackioLogger(cfg)
+
+        metrics = {"loss": 0.5, "iteration": 10}
+        logger.log_metrics(metrics, step=1, step_metric="iteration")
+
+        # step should be ignored in this case
+        mock_trackio.log.assert_called_once_with(metrics)
+
+    @patch("nemo_rl.utils.logger.trackio")
+    def test_log_hyperparams(self, mock_trackio):
+        cfg = {"project": "test"}
+        logger = TrackioLogger(cfg)
+
+        params = {
+            "lr": 0.001,
+            "model": {"hidden": 128},
+        }
+
+        logger.log_hyperparams(params)
+
+        expected = {
+            "lr": 0.001,
+            "model.hidden": 128,
+        }
+
+        mock_trackio.config.assert_called_once_with(expected)
+
+    @patch("nemo_rl.utils.logger.trackio")
+    def test_gpu_logging_enabled(self, mock_trackio):
+        cfg = {
+            "project": "test",
+            "auto_log_gpu": True,
+        }
+
+        logger = TrackioLogger(cfg)
+        logger.log_metrics({"loss": 0.1}, step=1)
+
+        assert mock_trackio.log_gpu.called
+
+    @patch("nemo_rl.utils.logger.trackio")
+    def test_gpu_logging_disabled(self, mock_trackio):
+        cfg = {
+            "project": "test",
+            "auto_log_gpu": False,
+        }
+
+        logger = TrackioLogger(cfg)
+        logger.log_metrics({"loss": 0.1}, step=1)
+
+        assert not mock_trackio.log_gpu.called
+
+    @patch("nemo_rl.utils.logger.trackio")
+    def test_dataset_push(self, mock_trackio):
+        cfg = {
+            "project": "test",
+            "dataset_id": "user/test-dataset",
+        }
+
+        logger = TrackioLogger(cfg)
+
+        data = {"samples": [1, 2, 3]}
+
+        if hasattr(logger, "push_dataset"):
+            logger.push_dataset(data)
+            mock_trackio.push_dataset.assert_called_once()
+
+    @patch("nemo_rl.utils.logger.trackio")
+    def test_space_launch(self, mock_trackio):
+        cfg = {
+            "project": "test",
+            "space_id": "user/test-space",
+        }
+
+        TrackioLogger(cfg)
+
+        mock_trackio.launch.assert_called_once_with("user/test-space")
+
+    @patch("nemo_rl.utils.logger.TrackioLogger")
+    def test_logger_with_trackio(mock_trackio_logger, temp_dir):
+        cfg = {
+            "trackio_enabled": True,
+            "wandb_enabled": False,
+            "tensorboard_enabled": False,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "trackio": {
+                "project": "test-project",
+            },
+            "log_dir": temp_dir,
+        }
+
+        logger = Logger(cfg)
+
+        assert len(logger.loggers) == 1
+        mock_trackio_logger.assert_called_once()
 
 
 class TestRayGpuMonitorLogger:
