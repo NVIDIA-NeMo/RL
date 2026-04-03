@@ -17,6 +17,7 @@ import json
 import tempfile
 from copy import deepcopy
 from dataclasses import asdict
+from types import SimpleNamespace
 
 import pytest
 import ray
@@ -30,6 +31,7 @@ from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
 from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleConfig,
     SlidingPuzzleEnv,
@@ -65,6 +67,49 @@ from tests.unit.test_envs import (
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 
 
+class _DummyTokenizer:
+    pad_token_id = 0
+
+    def __call__(
+        self,
+        text: str,
+        return_tensors: str = "pt",
+        add_special_tokens: bool = False,
+    ) -> SimpleNamespace:
+        del return_tensors, add_special_tokens
+        num_tokens = 0 if text == "" else max(1, len(text.split()))
+        input_ids = torch.arange(num_tokens, dtype=torch.long).unsqueeze(0)
+        return SimpleNamespace(input_ids=input_ids)
+
+
+@ray.remote(num_cpus=0)
+class InvalidRewardMaskEnv(EnvironmentInterface):
+    def __init__(self, rewards: list[float], reward_valid_mask: list[bool]):
+        self.rewards = rewards
+        self.reward_valid_mask = reward_valid_mask
+
+    def step(self, message_log_batch, metadata) -> EnvironmentReturn:
+        sample_indices = [sample_metadata["sample_idx"] for sample_metadata in metadata]
+        return EnvironmentReturn(
+            observations=[{"role": "environment", "content": "feedback"}]
+            * len(message_log_batch),
+            metadata=metadata,
+            next_stop_strings=[None] * len(message_log_batch),
+            rewards=torch.tensor(
+                [self.rewards[i] for i in sample_indices], dtype=torch.float32
+            ),
+            terminateds=torch.ones(len(message_log_batch), dtype=torch.bool),
+            answers=[None] * len(message_log_batch),
+            reward_valid_mask=torch.tensor(
+                [self.reward_valid_mask[i] for i in sample_indices],
+                dtype=torch.bool,
+            ),
+        )
+
+    def global_post_process_and_metrics(self, batch: BatchedDataDict) -> tuple:
+        return batch, {}
+
+
 class TestCalculateSingleMetric:
     """Unit tests for _calculate_single_metric function."""
 
@@ -94,11 +139,152 @@ class TestCalculateSingleMetric:
         assert result["test/median"] == 2.0
         assert abs(result["test/stddev"] - 1.0) < 1e-9  # stdev of [1,2,3] is 1.0
 
-    def test_two_identical_values_returns_zero_stddev(self):
-        """Test that stddev is 0 when all values are identical."""
-        result = _calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
 
-        assert result["test/stddev"] == 0.0
+def test_run_multi_turn_rollout_propagates_reward_valid_mask(monkeypatch):
+    """Test sync rollouts preserve reward validity returned by the environment."""
+
+    def fake_generate_responses(
+        policy_generation,
+        generation_input_data,
+        batch,
+        tokenizer,
+        input_lengths,
+        include_logprobs=True,
+        greedy=False,
+    ):
+        del (
+            policy_generation,
+            generation_input_data,
+            tokenizer,
+            input_lengths,
+            include_logprobs,
+            greedy,
+        )
+        generated_ids = []
+        for i in range(len(batch["message_log"])):
+            token_ids = torch.tensor([11, 12], dtype=torch.long)
+            batch["message_log"][i].append(
+                {
+                    "role": "assistant",
+                    "content": "assistant response",
+                    "token_ids": token_ids,
+                }
+            )
+            generated_ids.append(token_ids)
+        return batch, generated_ids, {
+            "mean_generation_length": 2.0,
+            "total_generated_tokens": 2 * len(batch["message_log"]),
+        }
+
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollouts.generate_responses", fake_generate_responses
+    )
+
+    tokenizer = _DummyTokenizer()
+    env = InvalidRewardMaskEnv.remote([0.0, 1.0], [False, True])
+    input_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [{"role": "user", "content": "prompt 1", "token_ids": torch.tensor([1])}],
+                [{"role": "user", "content": "prompt 2", "token_ids": torch.tensor([2])}],
+            ],
+            "extra_env_info": [{"sample_idx": 0}, {"sample_idx": 1}],
+            "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "idx": [0, 1],
+            "task_name": ["invalid_reward_env", "invalid_reward_env"],
+        }
+    )
+
+    try:
+        final_batch, rollout_metrics = run_multi_turn_rollout(
+            policy_generation=object(),
+            input_batch=input_batch,
+            tokenizer=tokenizer,
+            task_to_env={"invalid_reward_env": env},
+            max_seq_len=64,
+            max_rollout_turns=1,
+        )
+    finally:
+        ray.kill(env)
+
+    assert torch.equal(final_batch["reward_valid_mask"], torch.tensor([False, True]))
+    assert torch.allclose(final_batch["total_reward"], torch.tensor([0.0, 1.0]))
+    assert rollout_metrics["invalid_reward_count"] == 1
+    assert rollout_metrics["invalid_reward_rate"] == 0.5
+
+
+def test_run_async_multi_turn_rollout_propagates_reward_valid_mask(monkeypatch):
+    """Test async rollouts preserve reward validity returned by the environment."""
+
+    async def fake_async_generate_response_for_sample_turn(
+        policy_generation,
+        sample_message_log,
+        sample_stop_strings,
+        tokenizer,
+        max_seq_len,
+        greedy=False,
+    ):
+        del (
+            policy_generation,
+            sample_stop_strings,
+            tokenizer,
+            max_seq_len,
+            greedy,
+        )
+        token_ids = torch.tensor([21, 22], dtype=torch.long)
+        updated_message_log = deepcopy(sample_message_log)
+        updated_message_log.append(
+            {
+                "role": "assistant",
+                "content": "assistant response",
+                "token_ids": token_ids,
+            }
+        )
+        return updated_message_log, token_ids, torch.tensor(1), {}
+
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollouts.async_generate_response_for_sample_turn",
+        fake_async_generate_response_for_sample_turn,
+    )
+
+    tokenizer = _DummyTokenizer()
+    env = InvalidRewardMaskEnv.remote([0.0, 1.0], [False, True])
+    input_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [{"role": "user", "content": "prompt 1", "token_ids": torch.tensor([1])}],
+                [{"role": "user", "content": "prompt 2", "token_ids": torch.tensor([2])}],
+            ],
+            "extra_env_info": [{"sample_idx": 0}, {"sample_idx": 1}],
+            "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "idx": [0, 1],
+            "task_name": ["invalid_reward_env", "invalid_reward_env"],
+        }
+    )
+
+    try:
+        final_batch, rollout_metrics = run_async_multi_turn_rollout(
+            policy_generation=object(),
+            input_batch=input_batch,
+            tokenizer=tokenizer,
+            task_to_env={"invalid_reward_env": env},
+            max_seq_len=64,
+            max_rollout_turns=1,
+        )
+    finally:
+        ray.kill(env)
+
+    assert torch.equal(final_batch["reward_valid_mask"], torch.tensor([False, True]))
+    assert torch.allclose(final_batch["total_reward"], torch.tensor([0.0, 1.0]))
+    assert rollout_metrics["invalid_reward_count"] == 1
+    assert rollout_metrics["invalid_reward_rate"] == 0.5
+
+
+def test_two_identical_values_returns_zero_stddev():
+    """Test that stddev is 0 when all values are identical."""
+    result = _calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
+
+    assert result["test/stddev"] == 0.0
 
 
 @pytest.fixture(scope="function")

@@ -39,6 +39,9 @@ class EnvironmentReturn(NamedTuple, Generic[MetadataT]):
     rewards: the rewards for this turn.
     terminateds: whether the episode ended this turn.
     answers: the answers for this turn.
+    reward_valid_mask: optional boolean mask marking whether the reward for
+                       each sample is valid. Invalid rewards should be masked
+                       out of training statistics and loss computation.
     """
 
     observations: list[dict[str, str]]
@@ -47,6 +50,7 @@ class EnvironmentReturn(NamedTuple, Generic[MetadataT]):
     rewards: Tensor  ## Shape [B] for single-reward, [B, num_reward_components] for multi-reward (e.g. GDPO)
     terminateds: Tensor
     answers: list[str | None] | None
+    reward_valid_mask: Tensor | None = None
 
 
 class EnvironmentInterface(abc.ABC, Generic[MetadataT]):

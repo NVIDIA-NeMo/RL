@@ -15,7 +15,9 @@ import time
 
 import pytest
 import ray
+import torch
 
+from nemo_rl.environments.math_environment import HFVerifyWorker
 from nemo_rl.environments.utils import create_env
 
 # ============================================================================
@@ -44,6 +46,28 @@ def math_multi_reward_env():
     env.shutdown.remote()
     ray.kill(env)
     # Give some time for cleanup
+    time.sleep(0.1)
+
+
+@pytest.fixture(scope="module")
+def invalid_math_env():
+    """Create a MathEnvironment actor configured to force verifier failures."""
+    env = create_env("math", {"num_workers": 2, "math_verify_impl": "invalid_impl"})
+    yield env
+    env.shutdown.remote()
+    ray.kill(env)
+    time.sleep(0.1)
+
+
+@pytest.fixture(scope="module")
+def invalid_math_multi_reward_env():
+    """Create a MathMultiRewardEnvironment actor configured to force verifier failures."""
+    env = create_env(
+        "math_multi_reward", {"num_workers": 2, "math_verify_impl": "invalid_impl"}
+    )
+    yield env
+    env.shutdown.remote()
+    ray.kill(env)
     time.sleep(0.1)
 
 
@@ -240,6 +264,7 @@ def test_math_env_step_basic(math_env, basic_test_data):
     # Check rewards and done flags
     assert result.rewards.shape == (3,), "Rewards should be a tensor of shape (3,)"
     assert all(result.rewards == 1.0), "All rewards should be 1.0 for correct answers"
+    assert torch.equal(result.reward_valid_mask, torch.tensor([True, True, True]))
     assert result.terminateds.shape == (3,), (
         "Terminated flags should be a tensor of shape (3,)"
     )
@@ -276,6 +301,7 @@ def test_multi_reward_env_step_basic(math_multi_reward_env, multi_reward_test_da
 
     # Check rewards: shape (batch_size=3, number_of_rewards=3)
     assert result.rewards.shape == (3, 3), "Rewards should be a tensor of shape (3, 3)"
+    assert torch.equal(result.reward_valid_mask, torch.tensor([True, True, True]))
 
     # Check rewards for each data point
     # First reward: correctness reward 1.0, int reward 1.0, format reward 1.0
@@ -339,6 +365,7 @@ def test_multichoice_env_step_basic(multichoice_env, multichoice_test_data):
         "The first two rewards should be 1.0 for correct answers"
     )
     assert result.rewards[2] == 0.0, "The third reward should be 0.0 for wrong answer"
+    assert torch.equal(result.reward_valid_mask, torch.tensor([True, True, True]))
     assert result.terminateds.shape == (3,), (
         "Terminated flags should be a tensor of shape (3,)"
     )
@@ -450,6 +477,7 @@ def test_math_exception_handling(math_env):
     # Program should not crash
     assert result.rewards.shape == (1,), "Rewards should be a tensor of shape (1,)"
     assert result.rewards[0] == 0.0, "Reward should be 0.0"
+    assert result.reward_valid_mask[0] == False, "Reward should be marked invalid"
 
 
 def test_math_timeout_handling(math_env):
@@ -499,3 +527,49 @@ Now, let's consider \(f = x - n = (2 + \sqrt{3})^{1000} - \lfloor (2 + \sqrt{3})
         "Terminated flags should be a tensor of shape (1,)"
     )
     assert result.terminateds[0] == 1.0, "Terminated flag should be 1.0"
+    assert result.reward_valid_mask[0] == False, "Reward should be marked invalid"
+
+
+def test_math_invalid_verifier_marks_rewards_invalid(invalid_math_env, basic_test_data):
+    """Test forced verifier failures propagate an invalid reward mask."""
+    result = ray.get(
+        invalid_math_env.step.remote(
+            basic_test_data["message_log_batch"], basic_test_data["metadata"]
+        )
+    )
+
+    assert torch.all(result.rewards == 0.0)
+    assert torch.equal(result.reward_valid_mask, torch.tensor([False, False, False]))
+
+
+def test_hf_verify_worker_defaults_to_hf_math_verify():
+    """Test direct worker calls use hf_math_verify when the kwarg is omitted."""
+    worker = HFVerifyWorker.remote()
+    try:
+        result = ray.get(
+            worker.verify.remote(
+                ["2 + 2 = \\boxed{4}"],
+                ["4"],
+            )
+        )
+    finally:
+        ray.kill(worker)
+
+    assert result["scores"] == [1.0]
+    assert result["reward_valid_mask"] == [True]
+
+
+def test_math_multi_reward_invalid_verifier_marks_rewards_invalid(
+    invalid_math_multi_reward_env, multi_reward_test_data
+):
+    """Test forced verifier failures propagate invalid masks for multi-reward math."""
+    result = ray.get(
+        invalid_math_multi_reward_env.step.remote(
+            multi_reward_test_data["message_log_batch"],
+            multi_reward_test_data["metadata"],
+        )
+    )
+
+    assert result.rewards.shape == (3, 3)
+    assert torch.all(result.rewards == 0.0)
+    assert torch.equal(result.reward_valid_mask, torch.tensor([False, False, False]))
