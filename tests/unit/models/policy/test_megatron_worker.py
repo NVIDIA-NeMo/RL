@@ -68,6 +68,7 @@ def create_megatron_test_config(
     converter_type: str = "LlamaForCausalLM",
     logprob_chunk_size: Optional[int] = None,
     defer_fp32_logits: Optional[bool] = None,
+    attention_backend: Optional[str] = None,
 ) -> PolicyConfig:
     """Create a test config for Megatron policy worker."""
     return {
@@ -182,6 +183,14 @@ def create_megatron_test_config(
                 "fp8_recipe": "tensorwise",
                 "fp8_param": True,
             },
+            "attention_backend": attention_backend,
+        },
+        "draft": {
+            "enabled": False,
+            "model_name": None,
+            "loss_weight": 0.1,
+            "num_layers": None,
+            "aux_layer_indices": None,
         },
         "make_sequence_length_divisible_by": tp,
         "optimizer": None,  # Remove default FSDP optimizer
@@ -319,6 +328,10 @@ def training_setup(request):
                 config["megatron_cfg"]["sequence_parallel"] = config_updates[
                     "sequence_parallel"
                 ]
+            if "attention_backend" in config_updates:
+                config["megatron_cfg"]["attention_backend"] = config_updates[
+                    "attention_backend"
+                ]
 
         tokenizer = get_tokenizer(config["tokenizer"])
         config["generation"] = configure_generation_config(
@@ -379,15 +392,16 @@ def training_setup(request):
         (2, 1, 1, "tiny_qwen2_model_path", {}),
         (2, 2, 1, "tiny_qwen2_model_path", {}),
         (2, 1, 1, "tiny_llama_model_path", {"precision": "bfloat16"}),
+        (2, 1, 1, "tiny_llama_model_path", {"activation_checkpointing": True}),
+        (2, 2, 1, "tiny_llama_model_path", {"sequence_parallel": True}),
+        (2, 2, 1, "tiny_llama_model_path", {"precision": "bfloat16", "fp8": "hybrid"}),
         (
             2,
             1,
             1,
             "tiny_llama_model_path",
-            {"activation_checkpointing": True},
+            {"attention_backend": "flash", "precision": "bfloat16"},
         ),
-        (2, 2, 1, "tiny_llama_model_path", {"sequence_parallel": True}),
-        (2, 2, 1, "tiny_llama_model_path", {"precision": "bfloat16", "fp8": "hybrid"}),
     ],
     indirect=True,
     ids=[
@@ -399,6 +413,7 @@ def training_setup(request):
         "2gpu_dp2_llama_ac",
         "2gpu_tp2_llama_sp",
         "2gpu_tp2_llama_fp8",
+        "2gpu_dp2_llama_attention_backend_flash",
     ],
 )
 def test_megatron_policy_training(training_setup):
