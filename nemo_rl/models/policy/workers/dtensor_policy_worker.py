@@ -421,14 +421,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
             getattr(self.model, "config", {}), "tie_word_embeddings", False
         )
         if is_tied_lm_head:
-            embed_tokens_weight = None
-            for name, param in self.model.named_parameters():
-                if "embed_tokens" in name and name.endswith(".weight"):
-                    embed_tokens_weight = param
-                    break
-
-            if embed_tokens_weight is not None:
-                self.model.lm_head.weight = embed_tokens_weight
+            self.model.tie_weights()
 
         # Manually broadcast buffers
         for _, buf in self.model.named_buffers():
