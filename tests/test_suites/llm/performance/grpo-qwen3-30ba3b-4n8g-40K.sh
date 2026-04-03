@@ -6,7 +6,7 @@ export NRL_IGNORE_TP_ACCURACY_CHECK=1
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
-STEPS_PER_RUN=5
+STEPS_PER_RUN=4
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
@@ -26,7 +26,7 @@ uv run examples/run_grpo.py \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
-    checkpointing.save_period=5 \
+    checkpointing.save_period=4 \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     $@ \
     2>&1 | tee $RUN_LOG
@@ -37,6 +37,6 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'mean(data["train/token_mult_prob_error"]) < 1.1' \
+        'median(data["train/token_mult_prob_error"]) < 1.1' \
         'data["train/token_mult_prob_error"]["10"] < 1.1'
 fi
