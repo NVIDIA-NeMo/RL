@@ -22,10 +22,17 @@ rsync -ahP $CKPT_DIR/policy/tokenizer ${CKPT_DIR}-hf/
 
 ## Converting Megatron Checkpoints to Hugging Face Format
 
-For models that were originally trained using the Megatron-LM backend, a separate converter is available to convert Megatron checkpoints to Hugging Face format. This script requires Megatron-Core, so make sure to launch the conversion with the `mcore` extra. For example,
+For models that were originally trained using the Megatron-LM backend, a separate converter is available to convert Megatron checkpoints to Hugging Face format. This script requires Megatron-Core, so make sure to launch the conversion with the `mcore` extra. 
 
+Use `--hf-model-name` argument to override the model name mentioned in `config.yaml`. This is useful for models like GPT-OSS whose base checkpoint precision(mxfp4) is different from supported export precision(bfloat16) in Megatron-Bridge, [Ref](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/models/gpt_oss).
+
+For example,
 ```sh
 CKPT_DIR=results/sft/step_10
 
-uv run --extra mcore examples/converters/convert_megatron_to_hf.py --config=$CKPT_DIR/config.yaml --megatron-ckpt-path=$CKPT_DIR/policy/weights/iter_0000000/ --hf-ckpt-path=<path_to_save_hf_ckpt>
+uv run --extra mcore examples/converters/convert_megatron_to_hf.py \
+  --config=$CKPT_DIR/config.yaml \
+  --hf-model-name <repo>/model_name \
+  --megatron-ckpt-path=$CKPT_DIR/policy/weights/iter_0000000/ \
+  --hf-ckpt-path=<path_to_save_hf_ckpt>
 ```
