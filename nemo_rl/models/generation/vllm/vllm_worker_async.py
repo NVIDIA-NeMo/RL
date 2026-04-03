@@ -711,12 +711,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         input_lengths_batch = data["input_lengths"]
         batch_size = input_ids_batch.shape[0]
 
-        # Ensure generate_async only receives single samples (batch_size = 1)
-        assert batch_size == 1, (
-            f"generate_async is restricted to handle only single samples, "
-            f"but received batch_size={batch_size}. Please handle batching outside this method."
-        )
-
         batch_specific_stop_strings_list = data.get(
             "stop_strings", [[] for _ in range(batch_size)]
         )
