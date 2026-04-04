@@ -283,6 +283,12 @@ def validate_and_prepare_config(
     # Get HF config overrides
     hf_config_overrides = config.get("hf_config_overrides", {}) or {}
 
+    rope_scaling = hf_config_overrides.get("rope_scaling") or {}
+    assert rope_scaling.get("rope_type") != "yarn", (
+        "YaRN RoPE scaling is not supported with the automodel (DTensor) backend. "
+        "Please use the Megatron backend (policy.megatron_cfg.enabled=True) for YaRN."
+    )
+
     # NeMoAutoModelForCausalLM uses flash_attention_2 by default
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
