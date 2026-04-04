@@ -381,22 +381,32 @@ class LossPostProcessor:
             # AllGatherCPTensor.backward all_reduces over that local group (size = local_cp_size),
             # so we must divide by local_cp_size here to cancel it out.
             # For non-HCP, fall back to the global CP world size (same behaviour as before).
-            _is_hcp_group = getattr(packed_seq_params, "cp_group", None) is not None
+            _cp_group = getattr(packed_seq_params, "cp_group", None)
             _local_cp_size = (
-                torch.distributed.get_world_size(packed_seq_params.cp_group)
-                if _is_hcp_group
+                torch.distributed.get_world_size(_cp_group)
+                if _cp_group is not None
                 else get_context_parallel_world_size()
             )
             prev_loss_fn = loss_fn_wrapped
 
             def _div_by_cp_size(*args, **kwargs):
                 loss, metrics = prev_loss_fn(*args, **kwargs)
-                # For HCP with local_cp_size > 1, also scale metrics["loss"] by
-                # 1/_local_cp_size to cancel overcounting in the DP×CP all_reduce.
-                # In HCP each sample lives on _local_cp_size CP ranks, so the
-                # DP×CP reduce sums its contribution _local_cp_size times.
-                if _is_hcp_group and _local_cp_size > 1:
-                    metrics = {**metrics, "loss": metrics["loss"] / _local_cp_size}
+                if _cp_group is not None and _local_cp_size > 1:
+                    # from_parallel_logits_to_logprobs does allgather_cp_sharded_tensor
+                    # across the local CP group, so ALL lcp CP ranks end up with the
+                    # same full-sequence prev_logprobs (and identical generation_logprobs
+                    # / token_mask from data_dict).  Every CP rank therefore computes the
+                    # exact same scalar metrics (gen_kl_error, actor_loss, etc.).
+                    # After lm_policy.py collects all_mb_metrics from all HDP-rank
+                    # batch_results and grpo.py sums them, each metric is overcounted by
+                    # lcp.  Dividing here by lcp cancels that overcounting so that the
+                    # final sum across lcp CP ranks yields the correct global value.
+                    # Min/max extrema metrics are exempt: min/max of lcp identical values
+                    # equals the original value, so no correction is needed.
+                    metrics = {
+                        k: v if ("_min" in k or "_max" in k) else v / _local_cp_size
+                        for k, v in metrics.items()
+                    }
                 return loss / _local_cp_size, metrics
 
             loss_fn_wrapped = _div_by_cp_size

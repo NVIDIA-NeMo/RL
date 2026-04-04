@@ -521,6 +521,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         logprobs: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(worker_results)
 
+        # HCP schedules samples sorted by sequence length; reorder logprobs back to original
+        # data order so that logprobs[i] corresponds to the i-th sample in the input batch.
+        if hcp_enabled and self.use_sequence_packing and "_hcp_sample_ids" in logprobs:
+            hcp_sample_ids = logprobs["_hcp_sample_ids"]
+            del logprobs["_hcp_sample_ids"]
+            logprobs.reorder_data(hcp_sample_ids)
+
         # dynamic batching sorts the inputs by sequence length to improve load balancing,
         # so change it back here
         # Note: When HCP is enabled, unsorted_data_indices is None because HCP handles ordering internally
@@ -611,6 +618,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         logprobs: BatchedDataDict[ReferenceLogprobOutputSpec] = (
             BatchedDataDict.from_batches(worker_results)
         )
+
+        # HCP schedules samples sorted by sequence length; reorder logprobs back to original
+        # data order so that logprobs[i] corresponds to the i-th sample in the input batch.
+        if hcp_enabled and self.use_sequence_packing and "_hcp_sample_ids" in logprobs:
+            hcp_sample_ids = logprobs["_hcp_sample_ids"]
+            del logprobs["_hcp_sample_ids"]
+            logprobs.reorder_data(hcp_sample_ids)
 
         # dynamic batching sorts the inputs by sequence length to improve load balancing,
         # so change it back here
@@ -771,7 +785,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     )
 
                 batch_results = self.worker_group.get_all_worker_results(futures)
-                all_batch_results.append(batch_results[0])
+                # global_loss/grad_norm/moe_metrics: use rank 0 (global_loss is
+                # already all-reduced across all CP×DP ranks inside the worker).
+                # all_mb_metrics: aggregate from ALL HDP-rank results because each
+                # CP rank holds only a token shard; its metrics are partial sums
+                # divided by global_valid_toks, so we need all shards to reconstruct
+                # the correct global value.  Rank 0's shard is mostly prompt tokens
+                # (token_mask=0), so using only rank 0 gives near-zero gen_kl_error
+                # and actor_loss regardless of what the model is doing.
+                primary_result = dict(batch_results[0])
+                merged_mb_metrics: dict = defaultdict(list)
+                for worker_result in batch_results:
+                    for k, v in worker_result.get("all_mb_metrics", {}).items():
+                        merged_mb_metrics[k].extend(v)
+                primary_result["all_mb_metrics"] = dict(merged_mb_metrics)
+                all_batch_results.append(primary_result)
 
             # Combine results across all global batches.
             combined_result = dict(all_batch_results[-1])

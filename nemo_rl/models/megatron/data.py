@@ -326,7 +326,7 @@ def process_global_batch(
         # ranks that hold any portion of the global batch.
         # Pop here so the field never reaches Megatron-LM's data iterators,
         # which may try to CP-shard or otherwise transform every key in the dict.
-        lcp = batch.pop("local_cp_sizes").float().cuda()
+        lcp = batch.pop("local_cp_sizes").float()
         smask = batch["sample_mask"].float()
         local_valid_seqs = (smask / lcp).sum()
         if "token_mask" not in batch:
