@@ -423,8 +423,11 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
         if is_tied_lm_head:
             self.model.tie_weights()
 
-        # Manually broadcast buffers
-        for _, buf in self.model.named_buffers():
+        # Manually broadcast buffers in a deterministic order
+        buf_dict = dict(self.model.named_buffers())
+        ordered_names = sorted(buf_dict.keys())
+        for name in ordered_names:
+            buf = buf_dict[name]
             torch.distributed.broadcast(to_local_if_dtensor(buf), src=0)
 
         if self.cpu_offload:
