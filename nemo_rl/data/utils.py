@@ -14,7 +14,7 @@
 
 from typing import Any, Optional, Union
 
-from datasets import concatenate_datasets
+from datasets import Dataset, concatenate_datasets
 from transformers import AutoProcessor, AutoTokenizer
 
 from nemo_rl.data import DataConfig
@@ -25,9 +25,25 @@ from nemo_rl.data.datasets import (
     load_response_dataset,
     update_single_dataset_config,
 )
+from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
+    PreservingDataset,
+)
 from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
+
+
+def merge_datasets(datasets: list) -> Union[Dataset, "PreservingDataset"]:
+    """Merge a list of datasets, handling both HuggingFace Dataset and PreservingDataset.
+
+    HuggingFace's ``concatenate_datasets`` does not accept ``PreservingDataset`` objects.
+    This helper detects the dataset types and merges them appropriately.
+    """
+    if all(isinstance(d, PreservingDataset) for d in datasets):
+        merged_data = [item for d in datasets for item in d.data]
+        return PreservingDataset(merged_data)
+
+    return concatenate_datasets(datasets)
 
 
 # TODO: @yukih: unify to setup_data after dataset refactored
@@ -134,7 +150,7 @@ def setup_response_data(
         }
     else:
         # merge datasets into a single dataset
-        merged_data = concatenate_datasets([data.dataset for data in data_list])
+        merged_data = merge_datasets([data.dataset for data in data_list])
         dataset = AllTaskProcessedDataset(
             merged_data,
             tokenizer,
@@ -199,7 +215,7 @@ def setup_response_data(
     # merge datasets
     val_dataset = None
     if len(val_data_list) > 0:
-        merged_val_data = concatenate_datasets(val_data_list)
+        merged_val_data = merge_datasets(val_data_list)
         val_dataset = AllTaskProcessedDataset(
             merged_val_data,
             tokenizer,
