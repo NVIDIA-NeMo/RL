@@ -13,7 +13,6 @@ policy:
   megatron_cfg:
     enabled: true
     context_parallel_size: 8
-    force_reconvert_from_hf: true
     distributed_data_parallel_config:
       grad_reduce_in_fp32: true
     optimizer:

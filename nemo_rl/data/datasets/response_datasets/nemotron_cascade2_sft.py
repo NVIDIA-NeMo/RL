@@ -31,8 +31,8 @@ class NemotronCascade2SFTMathDataset(RawDataset):
         split: HuggingFace dataset split to load, default is "train"
         split_validation_size: Fraction of data held out for validation when
             no dedicated validation split exists, default is 0.05
-        seed: Random seed used when creating the train/validation split,
-            default is 42
+        seed: Random seed used when shuffling before selecting max_samples and
+            when creating the train/validation split, default is 42
         max_samples: If set, randomly sample this many examples from the
             dataset before any train/validation split, default is None (use all)
     """

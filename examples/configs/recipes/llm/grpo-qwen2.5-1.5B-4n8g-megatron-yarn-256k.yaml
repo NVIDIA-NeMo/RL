@@ -12,7 +12,6 @@ policy:
   make_sequence_length_divisible_by: 64
   megatron_cfg:
     context_parallel_size: 32
-    force_reconvert_from_hf: true
   hf_config_overrides:
     rope_scaling:
       rope_type: yarn
