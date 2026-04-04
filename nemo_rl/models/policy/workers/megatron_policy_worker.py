@@ -311,6 +311,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     self.cfg,
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
+                    model_cfg=self.megatron_cfg.model,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -494,6 +495,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             self.cfg,
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
+            model_cfg=self.megatron_cfg.model,
         )
 
         logprobs_post_processor = LogprobsPostProcessor(
@@ -642,6 +644,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             self.cfg,
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
+            model_cfg=self.megatron_cfg.model,
         )
 
         list_of_outputs = megatron_forward_backward(

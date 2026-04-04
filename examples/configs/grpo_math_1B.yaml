@@ -126,6 +126,7 @@ policy:
       lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
       use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
   
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen25_1p5b_pretrain_config
   megatron_cfg:
     enabled: false
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
