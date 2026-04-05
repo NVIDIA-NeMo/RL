@@ -17,7 +17,6 @@ import os
 import pprint
 from functools import partial
 
-from datasets import concatenate_datasets
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 
@@ -29,6 +28,7 @@ from nemo_rl.data.datasets import (
     load_response_dataset,
     update_single_dataset_config,
 )
+from nemo_rl.data.utils import merge_datasets
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.utils.config import (
     load_config,
@@ -89,7 +89,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         if hasattr(data, "preprocessor") and data.preprocessor is not None:
             task_data_preprocessors[data.task_name] = data.preprocessor
 
-    merged_data = concatenate_datasets([data.dataset for data in data_list])
+    merged_data = merge_datasets([data.dataset for data in data_list])
     dataset = AllTaskProcessedDataset(
         merged_data,
         tokenizer,
@@ -144,7 +144,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
 
     val_dataset = None
     if len(val_data_list) > 0:
-        merged_val_data = concatenate_datasets(val_data_list)
+        merged_val_data = merge_datasets(val_data_list)
         val_dataset = AllTaskProcessedDataset(
             merged_val_data,
             tokenizer,

@@ -313,3 +313,59 @@ class TestOpenAIFormatDatasetWithHeterogeneousTools:
         preserving_dataset = PreservingDataset(data)
         assert preserving_dataset[0]["tool_id"] == "123"
         assert "tool_id" not in preserving_dataset[1]  # Key doesn't exist
+
+
+class TestMergeDatasets:
+    """Test merge_datasets helper that handles both HF Dataset and PreservingDataset."""
+
+    def test_merge_preserving_datasets(self):
+        """Test merging multiple PreservingDatasets."""
+        from nemo_rl.data.utils import merge_datasets
+
+        ds1 = PreservingDataset([{"a": 1}, {"b": 2}])
+        ds2 = PreservingDataset([{"c": 3}])
+
+        merged = merge_datasets([ds1, ds2])
+
+        assert isinstance(merged, PreservingDataset)
+        assert len(merged) == 3
+        assert merged[0] == {"a": 1}
+        assert merged[1] == {"b": 2}
+        assert merged[2] == {"c": 3}
+
+    def test_merge_hf_datasets(self):
+        """Test merging standard HuggingFace Datasets still works."""
+        from nemo_rl.data.utils import merge_datasets
+
+        ds1 = Dataset.from_list([{"x": 1}, {"x": 2}])
+        ds2 = Dataset.from_list([{"x": 3}])
+
+        merged = merge_datasets([ds1, ds2])
+
+        assert isinstance(merged, Dataset)
+        assert len(merged) == 3
+        assert merged[0]["x"] == 1
+        assert merged[2]["x"] == 3
+
+    def test_merge_single_preserving_dataset(self):
+        """Test merging a single PreservingDataset."""
+        from nemo_rl.data.utils import merge_datasets
+
+        ds = PreservingDataset([{"a": 1, "b": 2}, {"c": 3}])
+
+        merged = merge_datasets([ds])
+
+        assert isinstance(merged, PreservingDataset)
+        assert len(merged) == 2
+
+    def test_merge_preserving_datasets_preserves_heterogeneous_structure(self):
+        """Test that merging PreservingDatasets doesn't introduce None-filling."""
+        from nemo_rl.data.utils import merge_datasets
+
+        ds1 = PreservingDataset([{"role": "user", "content": "hi", "tool_id": "1"}])
+        ds2 = PreservingDataset([{"role": "assistant", "content": "hello"}])
+
+        merged = merge_datasets([ds1, ds2])
+
+        assert "tool_id" in merged[0]
+        assert "tool_id" not in merged[1]  # No None-filling
