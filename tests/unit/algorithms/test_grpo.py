@@ -260,21 +260,31 @@ def mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
 
 @ray.remote(num_cpus=0)
 class MockEnvironment(EnvironmentInterface):
-    def __init__(self, rewards: list[float]):
+    def __init__(
+        self,
+        rewards: list[float],
+        reward_valid_mask: list[bool] | None = None,
+    ):
         self.rewards = rewards
+        self.reward_valid_mask = reward_valid_mask or [True] * len(rewards)
         self._calls = 0
 
     def step(
         self, messages: list[LLMMessageLogType], env_info: list[dict]
     ) -> EnvironmentReturn:
         self._calls += 1
-        return (
-            [{"role": "environment", "content": "observation"}] * len(messages),
-            [{}] * len(messages),
-            [[]] * len(messages),
-            self.rewards,
-            [True] * len(messages),
-            [None] * len(messages),
+        batch_size = len(messages)
+        return EnvironmentReturn(
+            observations=[{"role": "environment", "content": "observation"}]
+            * batch_size,
+            metadata=[{}] * batch_size,
+            next_stop_strings=[[]] * batch_size,
+            rewards=torch.tensor(self.rewards[:batch_size], dtype=torch.float32),
+            terminateds=torch.ones(batch_size, dtype=torch.bool),
+            answers=[None] * batch_size,
+            reward_valid_mask=torch.tensor(
+                self.reward_valid_mask[:batch_size], dtype=torch.bool
+            ),
         )
 
     def get_calls(self):
@@ -330,18 +340,17 @@ def test_calculate_rewards_single_task(mock_env):
     batch = create_mock_batch(2, task_names, message_logs)
 
     # Calculate rewards
-    env_observations, metadata, next_stop_strings, rewards, terminateds, answers = (
-        calculate_rewards(batch, task_to_env)
-    )
+    result = calculate_rewards(batch, task_to_env)
 
     # Verify results
-    assert torch.allclose(rewards, torch.tensor([1.0, 2.0]))
-    assert len(env_observations) == 2
-    assert len(terminateds) == 2
-    assert len(next_stop_strings) == 2
-    assert len(metadata) == 2
-    assert len(answers) == 2
-    assert torch.allclose(rewards, torch.tensor([1.0, 2.0]))
+    assert torch.allclose(result.rewards, torch.tensor([1.0, 2.0]))
+    assert torch.equal(result.reward_valid_mask, torch.tensor([True, True]))
+    assert len(result.observations) == 2
+    assert len(result.terminateds) == 2
+    assert len(result.next_stop_strings) == 2
+    assert len(result.metadata) == 2
+    assert len(result.answers) == 2
+    assert torch.allclose(result.rewards, torch.tensor([1.0, 2.0]))
     assert (
         ray.get(mock_env.get_calls.remote()) == 1
     )  # Should only call once for all samples of same task
@@ -366,18 +375,19 @@ def test_calculate_rewards_multiple_tasks(mock_envs):
     batch = create_mock_batch(4, task_names, message_logs)
 
     # Calculate rewards
-    env_observations, metadata, next_stop_strings, rewards, terminateds, answers = (
-        calculate_rewards(batch, mock_envs)
-    )
+    result = calculate_rewards(batch, mock_envs)
 
     # Verify results
-    assert torch.allclose(rewards, torch.tensor([1.0, 2.0, 3.0, 4.0]))
-    assert len(env_observations) == 4
-    assert len(terminateds) == 4
-    assert len(next_stop_strings) == 4
-    assert len(metadata) == 4
-    assert len(answers) == 4
-    assert torch.allclose(rewards, torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    assert torch.allclose(result.rewards, torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    assert torch.equal(
+        result.reward_valid_mask, torch.tensor([True, True, True, True])
+    )
+    assert len(result.observations) == 4
+    assert len(result.terminateds) == 4
+    assert len(result.next_stop_strings) == 4
+    assert len(result.metadata) == 4
+    assert len(result.answers) == 4
+    assert torch.allclose(result.rewards, torch.tensor([1.0, 2.0, 3.0, 4.0]))
     assert (
         ray.get(mock_envs["math"].get_calls.remote()) == 1
     )  # One call for all math samples
@@ -394,17 +404,16 @@ def test_calculate_rewards_empty_batch(mock_env):
     batch = create_mock_batch(0, [], [])
 
     # Calculate rewards
-    env_observations, metadata, next_stop_strings, rewards, terminateds, answers = (
-        calculate_rewards(batch, task_to_env)
-    )
+    result = calculate_rewards(batch, task_to_env)
 
     # Verify results
-    assert len(rewards) == 0
-    assert len(env_observations) == 0
-    assert len(terminateds) == 0
-    assert len(next_stop_strings) == 0
-    assert len(metadata) == 0
-    assert len(answers) == 0
+    assert len(result.rewards) == 0
+    assert len(result.reward_valid_mask) == 0
+    assert len(result.observations) == 0
+    assert len(result.terminateds) == 0
+    assert len(result.next_stop_strings) == 0
+    assert len(result.metadata) == 0
+    assert len(result.answers) == 0
     assert (
         ray.get(mock_env.get_calls.remote()) == 0
     )  # Should not call environment for empty batch
@@ -423,6 +432,49 @@ def test_calculate_rewards_missing_environment():
         ValueError, match="No environment found for task type: unknown_task"
     ):
         calculate_rewards(batch, task_to_env)
+
+
+def test_calculate_rewards_preserves_reward_valid_mask_order():
+    """Test reward validity masks are preserved after task grouping and sorting."""
+    math_env = MockEnvironment.remote(
+        rewards=[1.0, 2.0], reward_valid_mask=[True, False]
+    )
+    code_env = MockEnvironment.remote(
+        rewards=[3.0, 4.0], reward_valid_mask=[False, True]
+    )
+    try:
+        batch = create_mock_batch(
+            4,
+            ["math", "math", "code", "code"],
+            [
+                [
+                    {"role": "user", "content": "1+1"},
+                    {"role": "assistant", "content": "2"},
+                ],
+                [
+                    {"role": "user", "content": "2+2"},
+                    {"role": "assistant", "content": "4"},
+                ],
+                [
+                    {"role": "user", "content": "print('hello')"},
+                    {"role": "assistant", "content": "hello"},
+                ],
+                [
+                    {"role": "user", "content": "print('world')"},
+                    {"role": "assistant", "content": "world"},
+                ],
+            ],
+        )
+
+        result = calculate_rewards(batch, {"math": math_env, "code": code_env})
+
+        assert torch.allclose(result.rewards, torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        assert torch.equal(
+            result.reward_valid_mask, torch.tensor([True, False, False, True])
+        )
+    finally:
+        ray.kill(math_env)
+        ray.kill(code_env)
 
 
 def test_dapo_dynamic_sampling_filters_nonzero_std():
@@ -1675,6 +1727,32 @@ def test_grpo_advantage_estimator_zero_std():
     assert torch.allclose(result[2:], expected_prompt_1, rtol=1e-4)
 
 
+def test_grpo_advantage_estimator_masks_invalid_samples():
+    """Test GRPOAdvantageEstimator ignores invalid samples in baseline computation."""
+    estimator = GRPOAdvantageEstimator(
+        {
+            "use_leave_one_out_baseline": False,
+            "normalize_rewards": False,
+        },
+        {},
+    )
+
+    prompt_ids = torch.tensor([[0], [0], [0]])
+    rewards = torch.tensor([1.0, 999.0, 3.0])
+    mask = torch.ones(3, 2)
+    sample_valid_mask = torch.tensor([True, False, True])
+
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+        sample_valid_mask=sample_valid_mask,
+    )
+
+    expected = torch.tensor([[-1.0], [0.0], [1.0]]).expand(3, 2)
+    assert torch.allclose(result, expected)
+
+
 def test_grpo_advantage_estimator_tensor_shapes():
     """Test GRPOAdvantageEstimator with different tensor shapes.
 
@@ -1866,6 +1944,35 @@ def test_gdpo_advantage_estimator_single_reward():
         estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
 
 
+def test_gdpo_advantage_estimator_masks_invalid_samples():
+    """Test GDPOAdvantageEstimator ignores invalid samples in each reward head."""
+    estimator_config = {
+        "use_leave_one_out_baseline": False,
+        "normalize_rewards": False,
+    }
+    loss_config = {}
+    estimator = GDPOAdvantageEstimator(estimator_config, loss_config)
+
+    prompt_ids = torch.tensor([[0], [0], [0]])
+    mask = torch.ones(3, 1)
+    repeated_batch = {
+        "reward1": torch.tensor([1.0, 999.0, 3.0]),
+        "reward2": torch.tensor([0.0, 999.0, 2.0]),
+    }
+    sample_valid_mask = torch.tensor([True, False, True])
+
+    result = estimator.compute_advantage(
+        prompt_ids,
+        None,
+        mask,
+        repeated_batch,
+        sample_valid_mask=sample_valid_mask,
+    )
+
+    expected = torch.tensor([[-0.7071], [0.0], [0.7071]])
+    assert torch.allclose(result, expected, rtol=1e-3, atol=1e-4)
+
+
 # ============================================================================
 # Tests for ReinforcePlusPlusAdvantageEstimator class
 # ============================================================================
@@ -1907,6 +2014,78 @@ def test_reinforce_plus_plus_global_normalization():
     # Check the normalized advantages have correct relative ordering
     # Lower rewards should have negative advantages, higher should have positive
     assert result[0, 0] < result[1, 0] < result[2, 0] < result[3, 0]
+
+
+def test_reinforce_plus_plus_masks_invalid_samples():
+    """Test Reinforce++ excludes invalid samples from baseline and normalization."""
+    estimator_config = {
+        "minus_baseline": True,
+    }
+    loss_config = {
+        "use_kl_in_reward": False,
+        "reference_policy_kl_penalty": 0.0001,
+        "reference_policy_kl_type": "k2",
+    }
+    estimator = ReinforcePlusPlusAdvantageEstimator(estimator_config, loss_config)
+
+    prompt_ids = torch.tensor([[0], [0], [0]])
+    rewards = torch.tensor([1.0, 999.0, 3.0])
+    sample_valid_mask = torch.tensor([True, False, True])
+    mask = sample_valid_mask.unsqueeze(-1).repeat(1, 2).float()
+
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+        sample_valid_mask=sample_valid_mask,
+    )
+
+    expected = torch.tensor([[-1.0, -1.0], [0.0, 0.0], [1.0, 1.0]])
+    assert torch.allclose(result, expected)
+
+
+def test_reinforce_plus_plus_masks_invalid_samples_after_kl_penalty():
+    """Test Reinforce++ keeps invalid samples masked even when KL reward is enabled."""
+    estimator_config = {
+        "minus_baseline": True,
+    }
+    loss_config = {
+        "use_kl_in_reward": True,
+        "reference_policy_kl_penalty": 1.0,
+        "reference_policy_kl_type": "k1",
+    }
+    estimator = ReinforcePlusPlusAdvantageEstimator(estimator_config, loss_config)
+
+    prompt_ids = torch.tensor([[0], [0], [0]])
+    rewards = torch.tensor([1.0, 999.0, 3.0])
+    sample_valid_mask = torch.tensor([True, False, True])
+    mask = torch.ones(3, 2)
+    logprobs_policy = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+        ]
+    )
+    logprobs_reference = torch.tensor(
+        [
+            [0.0, 0.0],
+            [2.0, 2.0],
+            [0.0, 0.0],
+        ]
+    )
+
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+        sample_valid_mask=sample_valid_mask,
+        logprobs_policy=logprobs_policy,
+        logprobs_reference=logprobs_reference,
+    )
+
+    expected = torch.tensor([[-1.0, -1.0], [0.0, 0.0], [1.0, 1.0]])
+    assert torch.allclose(result, expected)
 
 
 # ============================================================================

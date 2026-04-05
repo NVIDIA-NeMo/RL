@@ -16,8 +16,12 @@ import time
 
 import pytest
 import ray
+import torch
 
-from nemo_rl.environments.code_jaccard_environment import CodeJaccardEnvConfig
+from nemo_rl.environments.code_jaccard_environment import (
+    CodeJaccardEnvConfig,
+    CodeJaccardVerifyWorker,
+)
 from nemo_rl.environments.utils import create_env
 
 
@@ -66,6 +70,7 @@ def test_code_jaccard_basic_alignment(code_jaccard_env):
     assert result.rewards.shape == (2,)
     assert float(result.rewards[0]) == pytest.approx(1.0, rel=0, abs=1e-6)
     assert float(result.rewards[1]) == pytest.approx(1.0, rel=0, abs=1e-6)
+    assert torch.equal(result.reward_valid_mask, torch.tensor([True, True]))
     # Terminated flags set
     assert result.terminateds.shape == (2,)
     assert all(result.terminateds == 1.0)
@@ -90,6 +95,7 @@ def test_code_jaccard_misalignment(code_jaccard_env):
     # Reward should be between 0 and 1, and reasonably low for disjoint tokens
     score = float(result.rewards[0])
     assert 0.0 <= score <= 0.5
+    assert torch.equal(result.reward_valid_mask, torch.tensor([True]))
     assert result.terminateds.shape == (1,)
     assert result.terminateds[0] == 1.0
 
@@ -116,6 +122,7 @@ def test_code_jaccard_answers_return(code_jaccard_env):
 
     assert result.answers is not None
     assert result.answers == ["x = a + b", "def add(a, b): return a + b"]
+    assert torch.equal(result.reward_valid_mask, torch.tensor([True, True]))
 
 
 def test_code_jaccard_empty_input(code_jaccard_env):
@@ -125,3 +132,23 @@ def test_code_jaccard_empty_input(code_jaccard_env):
     assert len(result.metadata) == 0
     assert result.rewards.shape == (0,)
     assert result.terminateds.shape == (0,)
+    assert result.reward_valid_mask.shape == (0,)
+
+
+def test_code_jaccard_worker_marks_invalid_rewards_on_exception():
+    """Invalid worker inputs should produce zero reward and an invalid mask."""
+    worker = CodeJaccardVerifyWorker.remote()
+    try:
+        result = ray.get(
+            worker.verify.remote(
+                [None],  # type: ignore[list-item]
+                ["print('hello')"],
+                True,
+            )
+        )
+    finally:
+        ray.kill(worker)
+
+    assert result["scores"] == [0.0]
+    assert result["reward_valid_mask"] == [False]
+    assert result["extracted_answers"] == [None]

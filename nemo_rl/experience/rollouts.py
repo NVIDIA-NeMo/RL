@@ -237,6 +237,25 @@ async def generate_responses_async(
     return batch, generated_ids, gen_metrics
 
 
+def _normalize_reward_valid_mask(
+    reward_valid_mask: torch.Tensor | list[bool] | None, batch_size: int
+) -> torch.Tensor:
+    """Normalize optional reward validity info to a boolean tensor."""
+    if reward_valid_mask is None:
+        return torch.ones(batch_size, dtype=torch.bool)
+    mask: torch.Tensor
+    if isinstance(reward_valid_mask, torch.Tensor):
+        mask = reward_valid_mask.to(dtype=torch.bool).cpu().reshape(-1)
+    else:
+        mask = torch.tensor(reward_valid_mask, dtype=torch.bool).reshape(-1)
+    if mask.numel() != batch_size:
+        raise ValueError(
+            "reward_valid_mask must have one element per sample; "
+            f"got {mask.numel()} values for batch size {batch_size}"
+        )
+    return mask
+
+
 def calculate_rewards(
     batch: BatchedDataDict[DatumSpec],
     task_to_env: dict[str, EnvironmentInterface],
@@ -254,6 +273,7 @@ def calculate_rewards(
             - next_stop_strings: List of stop strings for the next generation step.
             - rewards: Tensor of rewards for the last turn.
             - terminateds: Tensor of booleans indicating if an episode ended naturally.
+            - reward_valid_mask: Tensor of booleans marking whether each reward is valid.
     """
     # Extract message logs for environment (most recent interaction)
     to_env = [
@@ -296,18 +316,20 @@ def calculate_rewards(
     all_metadata = []  # Store extracted metadata
     all_indices_order = []
     all_answers = []
+    all_reward_valid_masks = []
 
     for future, result in zip(futures, results):
         indices = future_to_indices[future]
-        # Environment step returns: EnvironmentReturn
-        (
-            env_observations,
-            metadata,
-            next_stop_strings,
-            task_rewards,
-            terminateds,
-            answers,
-        ) = result
+        env_observations = result.observations
+        metadata = result.metadata
+        next_stop_strings = result.next_stop_strings
+        task_rewards = result.rewards
+        terminateds = result.terminateds
+        answers = result.answers
+        task_reward_valid_mask = _normalize_reward_valid_mask(
+            result.reward_valid_mask,
+            len(task_rewards),
+        )
         if next_stop_strings is None:
             next_stop_strings = [None] * len(task_rewards)
         if answers is None:
@@ -322,6 +344,7 @@ def calculate_rewards(
             all_next_stop_strings.append(next_stop_strings[i])
             all_metadata.append(metadata[i])
             all_answers.append(answers[i])
+            all_reward_valid_masks.append(bool(task_reward_valid_mask[i].item()))
 
     # Sort results by original index to maintain order
     sorted_indices = sorted(
@@ -339,6 +362,9 @@ def calculate_rewards(
     next_stop_strings = [all_next_stop_strings[i] for i in sorted_indices]
     metadata = [all_metadata[i] for i in sorted_indices]  # Sort metadata
     answers = [all_answers[i] for i in sorted_indices]
+    reward_valid_mask = torch.tensor(
+        [all_reward_valid_masks[i] for i in sorted_indices], dtype=torch.bool
+    )
 
     return EnvironmentReturn(
         observations=env_observations,
@@ -347,6 +373,7 @@ def calculate_rewards(
         rewards=rewards,
         terminateds=terminateds,
         answers=answers,
+        reward_valid_mask=reward_valid_mask,
     )
 
 
@@ -379,6 +406,7 @@ def run_multi_turn_rollout(
     batch_size = len(current_batch["message_log"])
     active_indices = torch.arange(batch_size)
     total_rewards = torch.zeros(batch_size, dtype=torch.float32)
+    sample_reward_valid_mask = torch.ones(batch_size, dtype=torch.bool)
 
     # Multi_rewards: number of components inferred from first env_output (1 for single-reward envs)
     number_of_rewards: int | None = None
@@ -468,6 +496,11 @@ def run_multi_turn_rollout(
 
         # Calculate rewards and get environment feedback
         env_output: EnvironmentReturn = calculate_rewards(active_batch, task_to_env)
+        turn_reward_valid_mask = _normalize_reward_valid_mask(
+            env_output.reward_valid_mask,
+            len(active_indices),
+        )
+        sample_reward_valid_mask[active_indices] &= turn_reward_valid_mask
 
         # Infer number of reward components on first turn (supports single- and multi-reward envs)
         if number_of_rewards is None:
@@ -564,6 +597,7 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
     current_batch["truncated"] = sample_truncated
+    current_batch["reward_valid_mask"] = sample_reward_valid_mask
     # Expose per-component rewards (reward1, reward2, ...) for multi-reward envs only; GRPO uses total_reward
     if multi_rewards is not None:
         num_reward_components = multi_rewards.shape[1]
@@ -579,6 +613,8 @@ def run_multi_turn_rollout(
         "natural_termination_rate": float(sample_terminated.float().mean().item()),
         "truncation_rate": float(sample_truncated.float().mean().item()),
         "max_turns_reached_rate": float(sample_max_turns_reached.float().mean().item()),
+        "invalid_reward_count": int((~sample_reward_valid_mask).sum().item()),
+        "invalid_reward_rate": float((~sample_reward_valid_mask).float().mean().item()),
         # Token usage metrics
         "mean_total_tokens_per_sample": float(
             sample_token_counts.float().mean().item()
@@ -710,6 +746,7 @@ async def run_sample_multi_turn_rollout(
     terminated = False
     truncated = False
     max_turns_reached = False
+    reward_valid = True
 
     # Track per-turn metrics
     turn_gen_tokens = []
@@ -775,6 +812,9 @@ async def run_sample_multi_turn_rollout(
 
         # Get environment feedback
         env_output = calculate_rewards(sample_batch, task_to_env)
+        reward_valid = reward_valid and bool(
+            _normalize_reward_valid_mask(env_output.reward_valid_mask, 1)[0].item()
+        )
         # Update total reward and optional per-reward signals (reward1, reward2, ... rewardN)
         if env_output.rewards.ndim == 2 and env_output.rewards.shape[1] >= 1:
             multi_reward_seen = True
@@ -832,6 +872,7 @@ async def run_sample_multi_turn_rollout(
         "extra_env_info": current_extra_env_info,
         "task_name": task_name,
         "total_reward": torch.tensor(total_reward),
+        "reward_valid_mask": torch.tensor(reward_valid, dtype=torch.bool),
         "stop_strings": current_stop_strings,
         "idx": sample_idx,
     }
@@ -849,6 +890,7 @@ async def run_sample_multi_turn_rollout(
         "truncated": truncated,
         "max_turns_reached": max_turns_reached,
         "total_reward": total_reward,
+        "reward_valid": reward_valid,
         "turn_gen_tokens": turn_gen_tokens,
         "turn_input_tokens": turn_input_tokens,
         "turn_total_tokens": turn_total_tokens,
@@ -951,6 +993,9 @@ def run_async_multi_turn_rollout(
                 "total_reward": torch.stack(
                     [state["total_reward"] for state in final_sample_states]
                 ),
+                "reward_valid_mask": torch.stack(
+                    [state["reward_valid_mask"] for state in final_sample_states]
+                ).bool(),
                 "idx": [
                     state.get("idx", i) for i, state in enumerate(final_sample_states)
                 ],
@@ -1004,6 +1049,13 @@ def run_async_multi_turn_rollout(
             / batch_size,
             "max_turns_reached_rate": sum(
                 m["max_turns_reached"] for m in all_sample_metrics
+            )
+            / batch_size,
+            "invalid_reward_count": sum(
+                not m["reward_valid"] for m in all_sample_metrics
+            ),
+            "invalid_reward_rate": sum(
+                not m["reward_valid"] for m in all_sample_metrics
             )
             / batch_size,
             # Token usage metrics

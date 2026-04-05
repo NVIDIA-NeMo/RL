@@ -975,6 +975,95 @@ def scale_rewards(
     return repeated_batch
 
 
+def _get_batch_loss_multiplier(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    batch_size: int,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Normalize batch loss multipliers to a float tensor."""
+    loss_multiplier = repeated_batch["loss_multiplier"]
+    if isinstance(loss_multiplier, torch.Tensor):
+        loss_multiplier_tensor = loss_multiplier.to(device=device, dtype=torch.float32)
+    else:
+        loss_multiplier_tensor = torch.tensor(
+            loss_multiplier,
+            dtype=torch.float32,
+            device=device,
+        )
+    loss_multiplier_tensor = loss_multiplier_tensor.reshape(-1)
+    if loss_multiplier_tensor.shape[0] != batch_size:
+        raise ValueError(
+            "loss_multiplier must have one element per sample; "
+            f"got {loss_multiplier_tensor.shape[0]} values for batch size {batch_size}"
+        )
+    return loss_multiplier_tensor
+
+
+def _get_reward_valid_mask(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    rewards: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize optional reward-validity info to a boolean tensor."""
+    reward_valid_mask = repeated_batch.get("reward_valid_mask")
+    if reward_valid_mask is None:
+        return torch.ones(rewards.shape[0], dtype=torch.bool, device=rewards.device)
+    if isinstance(reward_valid_mask, torch.Tensor):
+        reward_valid_mask_tensor = reward_valid_mask.to(
+            device=rewards.device,
+            dtype=torch.bool,
+        )
+    else:
+        reward_valid_mask_tensor = torch.tensor(
+            reward_valid_mask,
+            dtype=torch.bool,
+            device=rewards.device,
+        )
+    reward_valid_mask_tensor = reward_valid_mask_tensor.reshape(-1)
+    if reward_valid_mask_tensor.shape[0] != rewards.shape[0]:
+        raise ValueError(
+            "reward_valid_mask must have one element per reward; "
+            f"got {reward_valid_mask_tensor.shape[0]} values for "
+            f"{rewards.shape[0]} rewards"
+        )
+    return reward_valid_mask_tensor
+
+
+def _get_stats_valid_mask(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    rewards: torch.Tensor,
+) -> torch.Tensor:
+    """Get the sample-level validity mask used for reward statistics."""
+    loss_multiplier = _get_batch_loss_multiplier(
+        repeated_batch,
+        rewards.shape[0],
+        device=rewards.device,
+    )
+    reward_valid_mask = _get_reward_valid_mask(repeated_batch, rewards)
+    return (loss_multiplier > 0) & reward_valid_mask
+
+
+def _get_reward_validity_metrics(
+    rewards: torch.Tensor,
+    reward_valid_mask: torch.Tensor,
+) -> dict[str, float | int]:
+    """Compute basic invalid-reward metrics for logging."""
+    if reward_valid_mask.numel() == 0:
+        return {
+            "invalid_reward_count": 0,
+            "invalid_reward_rate": 0.0,
+            "valid_reward_mean": 0.0,
+        }
+
+    valid_rewards = rewards[reward_valid_mask]
+    return {
+        "invalid_reward_count": int((~reward_valid_mask).sum().item()),
+        "invalid_reward_rate": float((~reward_valid_mask).float().mean().item()),
+        "valid_reward_mean": float(valid_rewards.mean().item())
+        if valid_rewards.numel() > 0
+        else 0.0,
+    }
+
+
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
@@ -1593,6 +1682,7 @@ def grpo_train(
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
+                    stats_valid_mask = _get_stats_valid_mask(repeated_batch, rewards)
 
                     print("▶ Computing advantages...", flush=True)
                     if master_config["grpo"].get("calculate_advantages_on_gpu"):
@@ -1602,7 +1692,7 @@ def grpo_train(
                         baseline, std = calculate_baseline_and_std_per_prompt(
                             input_ids.cuda(device_id),
                             rewards.cuda(device_id),
-                            torch.ones_like(rewards).cuda(device_id),
+                            stats_valid_mask.cuda(device_id),
                             leave_one_out_baseline=master_config["grpo"][
                                 "use_leave_one_out_baseline"
                             ],
@@ -1613,7 +1703,7 @@ def grpo_train(
                         baseline, std = calculate_baseline_and_std_per_prompt(
                             input_ids,
                             rewards,
-                            torch.ones_like(rewards),
+                            stats_valid_mask,
                             leave_one_out_baseline=master_config["grpo"][
                                 "use_leave_one_out_baseline"
                             ],
@@ -1640,6 +1730,11 @@ def grpo_train(
                         repeated_batch["total_reward"]
                         if not master_config["grpo"]["use_dynamic_sampling"]
                         else repeated_batch["filtered_reward"]
+                    )
+                    reward_valid_mask = _get_reward_valid_mask(repeated_batch, rewards)
+                    stats_valid_mask = _get_stats_valid_mask(repeated_batch, rewards)
+                    reward_validity_metrics = _get_reward_validity_metrics(
+                        rewards, reward_valid_mask
                     )
                     baseline = repeated_batch["baseline"]
                     std = repeated_batch["std"]
@@ -1671,16 +1766,20 @@ def grpo_train(
                     del std
 
                 with timer.time("data_processing"):
+                    loss_multiplier = _get_batch_loss_multiplier(
+                        repeated_batch,
+                        len(repeated_batch["message_log"]),
+                    )
+                    loss_multiplier = loss_multiplier * reward_valid_mask.float()
                     use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
                     if use_overlong_filtering:
-                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
                         truncated = repeated_batch["truncated"]
 
                         if isinstance(truncated, list):
                             truncated = torch.tensor(truncated, dtype=torch.bool)
 
                         loss_multiplier[truncated] = 0
-                        repeated_batch["loss_multiplier"] = loss_multiplier
+                    repeated_batch["loss_multiplier"] = loss_multiplier
                     # Add loss mask to each message in LLMMessageLogType
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -1740,7 +1839,7 @@ def grpo_train(
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
                             "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": repeated_batch["loss_multiplier"],
+                            "sample_mask": train_data["sample_mask"],
                             **extra_multimodal_data,
                         }
                     )
@@ -1785,6 +1884,7 @@ def grpo_train(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
                         mask=mask,
+                        sample_valid_mask=stats_valid_mask,
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
@@ -1896,6 +1996,7 @@ def grpo_train(
                     "advantages/min": torch.min(response_advantages).detach().item()
                     if response_advantages.numel() > 0
                     else 0.0,
+                    **reward_validity_metrics,
                     **ds_metrics,
                 }
                 if "moe_metrics" in train_results:
@@ -1929,6 +2030,8 @@ def grpo_train(
                         "mean_prompt_length",
                     }:
                         metrics[k] = np.mean(v).item()
+                    elif isinstance(v, (float, int, np.floating, np.integer)):
+                        metrics[k] = float(v)
                     elif isinstance(v, (np.ndarray, list)):
                         metrics[k] = np.sum(v).item()
                     else:
@@ -2059,6 +2162,7 @@ def grpo_train(
                 log_data["token_ids"] = train_data["input_ids"].tolist()
                 log_data["token_loss_mask"] = train_data["token_mask"].tolist()
                 log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+                log_data["reward_valid_mask"] = reward_valid_mask.tolist()
                 log_data["advantages"] = train_data["advantages"].tolist()
                 log_data["generation_logprobs"] = train_data[
                     "generation_logprobs"
@@ -2128,6 +2232,10 @@ def grpo_train(
                 )
             else:
                 print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
+            print(
+                f"  • Invalid Reward Rate: {metrics['invalid_reward_rate']:.4f} ({int(metrics['invalid_reward_count'])} samples)"
+            )
+            print(f"  • Avg Valid Reward: {metrics['valid_reward_mean']:.4f}")
             print(
                 f"  • Mean Generation Length: {metrics_logging_data['mean_gen_tokens_per_sample']:.4f}",
                 flush=True,
@@ -2232,6 +2340,7 @@ def validate(
         print(f"▶ Starting validation at step {step}...", flush=True)
 
         total_rewards = []
+        total_reward_valid_masks = []
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
@@ -2284,6 +2393,11 @@ def validate(
                 )
 
             total_rewards.extend(val_batch["total_reward"].tolist())
+            total_reward_valid_masks.extend(
+                _get_reward_valid_mask(val_batch, val_batch["total_reward"])
+                .cpu()
+                .tolist()
+            )
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
@@ -2300,9 +2414,25 @@ def validate(
         num_samples = len(total_rewards)
         if num_samples > 0:
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
+            reward_valid_mask_t = torch.tensor(
+                total_reward_valid_masks, dtype=torch.bool
+            )
             accuracy = rewards_t.mean().item()
+            invalid_reward_count = int((~reward_valid_mask_t).sum().item())
+            invalid_reward_rate = float(
+                (~reward_valid_mask_t).float().mean().item()
+            )
+            if reward_valid_mask_t.any().item():
+                reward_valid_only_mean = float(
+                    rewards_t[reward_valid_mask_t].mean().item()
+                )
+            else:
+                reward_valid_only_mean = 0.0
         else:
             accuracy = 0.0
+            invalid_reward_count = 0
+            invalid_reward_rate = 0.0
+            reward_valid_only_mean = 0.0
 
         avg_length = (
             sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
@@ -2311,6 +2441,9 @@ def validate(
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
+            "invalid_reward_count": invalid_reward_count,
+            "invalid_reward_rate": invalid_reward_rate,
+            "reward_valid_only_mean": reward_valid_only_mean,
             **additional_metrics_to_report,
         }
 
@@ -2336,6 +2469,10 @@ def validate(
     # Print summary of validation results
     print("\n📊 Validation Results:")
     print(f"    • Accuracy: {accuracy:.4f}")
+    print(
+        f"    • Invalid Reward Rate: {invalid_reward_rate:.4f} ({invalid_reward_count} samples)"
+    )
+    print(f"    • Avg Valid Reward: {reward_valid_only_mean:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 
@@ -2349,6 +2486,7 @@ def validate(
         val_log_data = {
             "content": all_message_logs,
             "rewards": total_rewards,
+            "reward_valid_mask": total_reward_valid_masks,
         }
         logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
 
@@ -2735,6 +2873,13 @@ def async_grpo_train(
                     del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
+                    reward_valid_mask = _get_reward_valid_mask(
+                        repeated_batch, rewards
+                    )
+                    stats_valid_mask = _get_stats_valid_mask(repeated_batch, rewards)
+                    reward_validity_metrics = _get_reward_validity_metrics(
+                        repeated_batch["total_reward"], reward_valid_mask
+                    )
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
@@ -2742,6 +2887,13 @@ def async_grpo_train(
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
+                    loss_multiplier = _get_batch_loss_multiplier(
+                        repeated_batch,
+                        len(repeated_batch["message_log"]),
+                    )
+                    repeated_batch["loss_multiplier"] = (
+                        loss_multiplier * reward_valid_mask.float()
+                    )
                     # Add loss mask to each message
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -2822,6 +2974,7 @@ def async_grpo_train(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
                         mask=mask,
+                        sample_valid_mask=stats_valid_mask,
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
@@ -2952,6 +3105,7 @@ def async_grpo_train(
                     "advantages/min": torch.min(response_advantages).detach().item()
                     if response_advantages.numel() > 0
                     else 0.0,
+                    **reward_validity_metrics,
                 }
                 if "moe_metrics" in train_results:
                     metrics.update(
@@ -2978,6 +3132,8 @@ def async_grpo_train(
                         "mean_prompt_length",
                     }:
                         metrics[k] = np.mean(v).item()
+                    elif isinstance(v, (float, int, np.floating, np.integer)):
+                        metrics[k] = float(v)
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
@@ -3086,6 +3242,7 @@ def async_grpo_train(
             log_data["token_ids"] = train_data["input_ids"].tolist()
             log_data["token_loss_mask"] = train_data["token_mask"].tolist()
             log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+            log_data["reward_valid_mask"] = reward_valid_mask.tolist()
             log_data["advantages"] = train_data["advantages"].tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
@@ -3136,6 +3293,10 @@ def async_grpo_train(
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
             print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
+            print(
+                f"  • Invalid Reward Rate: {metrics['invalid_reward_rate']:.4f} ({int(metrics['invalid_reward_count'])} samples)"
+            )
+            print(f"  • Avg Valid Reward: {metrics['valid_reward_mean']:.4f}")
             print(f"  • Buffer Size: {buffer_size_current}")
             print(f"  • Avg Trajectory Age: {avg_trajectory_age:.2f} steps")
 

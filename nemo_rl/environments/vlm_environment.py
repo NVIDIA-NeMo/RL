@@ -45,6 +45,11 @@ class VLMEnvConfig(TypedDict):
     reward_functions: List[dict[str, Any]]  # list of reward functions and their weights
 
 
+class VLMVerifyResult(TypedDict):
+    scores: list[float]
+    reward_valid_mask: list[bool]
+
+
 @contextlib.contextmanager
 def _mute_output():
     devnull_out, devnull_err = io.StringIO(), io.StringIO()
@@ -93,7 +98,7 @@ class VLMVerifyWorker:
 
     def verify(
         self, pred_responses: list[str], ground_truths: list[str]
-    ) -> list[float]:
+    ) -> VLMVerifyResult:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -103,20 +108,20 @@ class VLMVerifyWorker:
         Returns:
             list[float]. The rewards for each predicted response.
         """
-        results = []
+        results: list[float] = []
+        reward_valid_mask: list[bool] = []
         for response, ground_truth in zip(pred_responses, ground_truths):
+            ret_score = 0.0
+            is_valid = True
             try:
                 with _mute_output():
-                    try:
-                        ret_score, _ = self.verify_func(ground_truth, response)
-                    except Exception as e:
-                        ret_score = 0.0
-                        print(f"Error in verify_func: {e}")
-                results.append(float(ret_score))
-            except Exception as e:
-                print(f"Error in verify: {e}")
-                results.append(0.0)
-        return results
+                    ret_score, _ = self.verify_func(ground_truth, response)
+            except Exception:
+                is_valid = False
+
+            results.append(float(ret_score))
+            reward_valid_mask.append(is_valid)
+        return {"scores": results, "reward_valid_mask": reward_valid_mask}
 
 
 class VLMEnvironmentMetadata(TypedDict):
@@ -185,10 +190,15 @@ class VLMEnvironment(EnvironmentInterface):
             )
         ]
 
-        results = ray.get(futures)
+        worker_results = ray.get(futures)
 
         # flatten the results
-        results = [item for sublist in results for item in sublist]
+        results = [item for worker_result in worker_results for item in worker_result["scores"]]
+        reward_valid_mask = [
+            is_valid
+            for worker_result in worker_results
+            for is_valid in worker_result["reward_valid_mask"]
+        ]
         observations = [
             {
                 "role": "environment",
@@ -202,6 +212,9 @@ class VLMEnvironment(EnvironmentInterface):
         # create a tensor of rewards and done flags
         rewards = torch.tensor(results).cpu()
         done = torch.ones_like(rewards).cpu()
+        reward_valid_mask_tensor = torch.tensor(
+            reward_valid_mask, dtype=torch.bool
+        ).cpu()
 
         next_stop_strings = [None] * len(message_log_batch)
 
@@ -212,6 +225,7 @@ class VLMEnvironment(EnvironmentInterface):
             rewards=rewards,
             terminateds=done,
             answers=None,
+            reward_valid_mask=reward_valid_mask_tensor,
         )
 
     def global_post_process_and_metrics(
