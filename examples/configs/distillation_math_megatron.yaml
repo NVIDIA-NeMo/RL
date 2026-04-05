@@ -2,6 +2,7 @@ defaults: distillation_math.yaml
 
 checkpointing:
     checkpoint_dir: "checkpoints/distillation-megatron-${policy.model_name}"
+    resume_if_exists: true
 
 policy: &POLICY_BASE
     model_name: "Qwen/Qwen3-1.7B-Base"

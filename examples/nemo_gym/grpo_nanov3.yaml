@@ -46,6 +46,7 @@ loss_fn:
 
 checkpointing:
   enabled: true
+  resume_if_exists: true
   checkpoint_dir: "results/grpo"
   metric_name: "val:total_reward/mean"
   higher_is_better: true
