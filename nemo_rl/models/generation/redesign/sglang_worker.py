@@ -495,7 +495,7 @@ def _compute_server_args(
         "trust_remote_code": True,
         "random_seed": args.seed + rank,
         # memory
-        "enable_memfory_saver": args.offload_rollout,
+        "enable_memory_saver": args.offload_rollout,
         # distributed
         "host": host,
         "port": port,
