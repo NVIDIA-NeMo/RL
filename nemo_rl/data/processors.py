@@ -456,27 +456,34 @@ def math_hf_data_processor(
     extra_env_info = {"ground_truth": user_message[1]["content"]}
 
     message_log: LLMMessageLogType = []
+
+    # merge system prompt and user prompt
+    message_list = []
+    if task_data_spec.system_prompt:
+        message_list.append(
+            {
+                "role": "system",
+                "content": task_data_spec.system_prompt,
+            }
+        )
     formatted_content = (
         task_data_spec.prompt.format(problem) if task_data_spec.prompt else problem
     )
-    user_message = {
-        "role": "user",
-        "content": formatted_content,
-    }
+    message_list.append({"role": "user", "content": formatted_content})
+
     message: list[str] = tokenizer.apply_chat_template(  # type: ignore
-        [user_message],
+        message_list,
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
     )
 
-    user_message["token_ids"] = tokenizer(
+    token_ids = tokenizer(
         message,
         return_tensors="pt",
         add_special_tokens=False,
     )["input_ids"][0]
-    user_message["content"] = message
-    message_log.append(user_message)
+    message_log.append({"role": "user", "content": message, "token_ids": token_ids})
 
     length = sum(len(m["token_ids"]) for m in message_log)
 
