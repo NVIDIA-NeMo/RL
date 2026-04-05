@@ -44,6 +44,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
+    run_multi_turn_rollout_async_generation,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
 )
@@ -984,7 +985,7 @@ def validate(
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts if vLLM async engine is enabled
             if _should_use_async_rollouts(master_config):
-                val_batch, gen_metrics = run_async_multi_turn_rollout(
+                val_batch, gen_metrics = run_multi_turn_rollout_async_generation(
                     policy_generation,
                     val_batch,
                     tokenizer,

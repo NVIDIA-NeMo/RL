@@ -63,6 +63,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
+    run_multi_turn_rollout_async_generation,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -2263,7 +2264,7 @@ def validate(
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
                 additional_metrics_to_report = gen_metrics
             elif _should_use_async_rollouts(master_config):
-                val_batch, gen_metrics = run_async_multi_turn_rollout(
+                val_batch, gen_metrics = run_multi_turn_rollout_async_generation(
                     policy_generation,
                     val_batch,
                     tokenizer,
