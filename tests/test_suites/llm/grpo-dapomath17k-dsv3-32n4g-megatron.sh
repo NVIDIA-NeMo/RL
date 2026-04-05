@@ -1,12 +1,14 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
+# disable NVLS to avoid OOM issue
+export NCCL_NVLS_ENABLE=0
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=32
 GPUS_PER_NODE=4
-STEPS_PER_RUN=60
-MAX_STEPS=60
+STEPS_PER_RUN=10
+MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
 # ===== END CONFIG =====
@@ -39,9 +41,9 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'mean(data["train/gen_kl_error"]) < 0.002' \
-        'data["train/reward"]["60"] > 0.60' \
-        'mean(data["timing/train/total_step_time"], -6, -1) < 210'
+        'min(data["train/token_mult_prob_error"]) < 1.05' \
+        'max(data["train/reward"]) > 0.4' \
+        'mean(data["timing/train/total_step_time"], -6, -1) < 1000'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

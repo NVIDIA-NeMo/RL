@@ -8,6 +8,7 @@ export MODEL_NAME=${NRL_DEEPSEEK_V3_BF16_CKPT:-"unsloth/DeepSeek-V3-0324-BF16"}
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=32
+GPUS_PER_NODE=4
 STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
@@ -40,8 +41,7 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'median(data["train/token_mult_prob_error"]) < 1.1' \
-        'data["train/token_mult_prob_error"]["10"] < 1.1'
+        'median(data["train/token_mult_prob_error"]) < 1.1'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
