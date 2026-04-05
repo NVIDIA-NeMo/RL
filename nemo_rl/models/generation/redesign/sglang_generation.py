@@ -50,6 +50,21 @@ logger = logging.getLogger(__name__)
 # ServerGroup / RolloutServer abstractions
 # ---------------------------------------------------------------------------
 
+# # use_unified_pg = True for Nemo
+#         if use_unified_pg:
+#             # Create a single unified placement group for cross-node model parallelism
+#             all_bundles = []
+#             for bundle_count in self._bundle_ct_per_node_list:
+#                 for _ in range(bundle_count):
+#                     all_bundles.append(
+#                         {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
+#                     )
+
+#             placement_groups = [
+#                 placement_group(
+#                     bundles=all_bundles, strategy=strategy, name=f"{self.name}-unified"
+#                 )
+#             ]
 
 @dataclasses.dataclass
 class ServerGroup:
@@ -799,24 +814,29 @@ def _compute_megatron_num_gpus(args) -> int:
     return num
 
 
-def start_rollout_servers(args, pg) -> ServerGroup:
+def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     """Start rollout servers: one per model, each with its own router.
 
     Returns a dict mapping model name -> ``RolloutServer``.
     """
     config = _resolve_sglang_config(args)
 
-    server_group: ServerGroup = None
+    servers: dict[str, RolloutServer] = {}
     gpu_offset = 0
     engine_offset = 0
 
     rollout_pg_offset = _compute_rollout_offset(args)
     megatron_num_gpus = _compute_megatron_num_gpus(args)
 
-    model_cfg.resolve(args)
-    router_ip, router_port = _start_router(args, force_new=False)
-    args.sglang_router_ip = router_ip
-    args.sglang_router_port = router_port
+    for model_idx, model_cfg in enumerate(config.models):
+        model_cfg.resolve(args)
+
+        has_pd = model_cfg.has_pd_disaggregation
+        router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
+
+        if model_idx == 0:
+            args.sglang_router_ip = router_ip
+            args.sglang_router_port = router_port
 
         server_groups: list[ServerGroup] = []
         all_init_handles: list = []
@@ -873,7 +893,6 @@ def start_rollout_servers(args, pg) -> ServerGroup:
     args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
 
     return servers
-
 
 def _resolve_sglang_config(args) -> SglangConfig:
     """Build a SglangConfig from args, choosing the right source."""
