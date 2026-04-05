@@ -586,6 +586,16 @@ uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
     --hf-ckpt-path results/grpo/hf
 ```
 
+If you trained with **LoRA on the Megatron backend**, use the LoRA merger to fold the adapter weights into the base model and export a standalone Hugging Face checkpoint:
+
+```sh
+uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
+    --base-ckpt <path_to_base_megatron_checkpoint>/iter_0000000 \
+    --adapter-ckpt <path_to_lora_adapter_checkpoint>/iter_0000000 \
+    --hf-model-name <huggingface_model_name> \
+    --hf-ckpt-path results/lora_merged_hf
+```
+
 > **Note:** Adjust the paths according to your training output directory structure.
 
 For an in-depth explanation of checkpointing, refer to the [Checkpointing documentation](docs/design-docs/checkpointing.md).
