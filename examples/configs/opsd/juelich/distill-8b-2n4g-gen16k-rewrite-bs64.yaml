@@ -26,6 +26,8 @@ distillation:
     max_val_samples: 2560
     topk_logits_k: 512
     teacher_student_prefix_fraction: 0.0
+    teacher_student_prefix_fraction_start: null
+    teacher_student_prefix_fraction_warmup_steps: null
     val_max_total_sequence_length: 33280
     val_max_new_tokens: 32768
     val_temperature: 0.6
@@ -240,6 +242,7 @@ data:
         prompt_file: "examples/prompts/cot.txt"
         system_prompt_file: null
         teacher_prompt_file: "examples/prompts/teacher_rewrite_v14_independent_check_improved.txt"
+        teacher_prefix_prompt_file: null
         env_name: "math"
         column_mapping:
             qwen3_8b_answer: trace

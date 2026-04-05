@@ -23,6 +23,7 @@ import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
     _apply_teacher_student_prefix_mix,
     _default_distillation_save_state,
+    _get_scheduled_teacher_student_prefix_fraction,
     _get_teacher_student_prefix_indices,
     _inject_student_rollout_into_teacher_message_logs,
     check_vocab_equality,
@@ -814,3 +815,47 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
         # Configure mocks to skip checkpoint loading
         mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)
+
+
+# ---------------------------------------------------------------------------
+# Tests for _get_scheduled_teacher_student_prefix_fraction
+# ---------------------------------------------------------------------------
+
+
+def test_scheduled_fraction_linear_interpolation():
+    """Fraction linearly interpolates from start to end over warmup_steps."""
+    # Step 0 -> start value
+    assert _get_scheduled_teacher_student_prefix_fraction(0.0, 0.95, 200, 0) == 0.95
+    # Midpoint
+    result = _get_scheduled_teacher_student_prefix_fraction(0.0, 0.95, 200, 100)
+    assert result == pytest.approx(0.475)
+    # Exactly at warmup_steps -> end value
+    assert _get_scheduled_teacher_student_prefix_fraction(0.0, 0.95, 200, 200) == 0.0
+    # Beyond warmup -> stays at end
+    assert _get_scheduled_teacher_student_prefix_fraction(0.0, 0.95, 200, 500) == 0.0
+
+
+def test_scheduled_fraction_no_warmup():
+    """Without warmup config, returns the constant end fraction (backwards compat)."""
+    assert _get_scheduled_teacher_student_prefix_fraction(0.5, None, None, 0) == 0.5
+    assert _get_scheduled_teacher_student_prefix_fraction(0.5, None, None, 100) == 0.5
+    # Only start set, warmup_steps missing -> constant
+    assert _get_scheduled_teacher_student_prefix_fraction(0.5, 0.95, None, 0) == 0.5
+    # Only warmup_steps set, start missing -> constant
+    assert _get_scheduled_teacher_student_prefix_fraction(0.5, None, 200, 0) == 0.5
+
+
+def test_scheduled_fraction_ascending():
+    """Also works when start < end (fraction increases over warmup)."""
+    assert _get_scheduled_teacher_student_prefix_fraction(0.95, 0.0, 100, 0) == 0.0
+    result = _get_scheduled_teacher_student_prefix_fraction(0.95, 0.0, 100, 50)
+    assert result == pytest.approx(0.475)
+    assert _get_scheduled_teacher_student_prefix_fraction(0.95, 0.0, 100, 100) == 0.95
+
+
+def test_scheduled_fraction_checkpoint_resume():
+    """Resuming at step 150 with warmup_steps=200 computes correctly."""
+    # progress = 150/200 = 0.75
+    # fraction = 0.95 + (0.0 - 0.95) * 0.75 = 0.2375
+    result = _get_scheduled_teacher_student_prefix_fraction(0.0, 0.95, 200, 150)
+    assert result == pytest.approx(0.2375)

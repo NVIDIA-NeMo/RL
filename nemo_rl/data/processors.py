@@ -517,10 +517,10 @@ def math_hf_data_processor(
     user_message["content"] = message
     message_log.append(user_message)
 
-    # Build teacher message_log if teacher_prompt is configured
+    # Build template fields shared by teacher prompts
     teacher_message_log = None
-    if task_data_spec.teacher_prompt is not None:
-        # Collect template fields: standard fields + any extra string columns from dataset
+    teacher_prefix_message_log = None
+    if task_data_spec.teacher_prompt is not None or task_data_spec.teacher_prefix_prompt is not None:
         format_kwargs = {"problem": problem, "answer": original_messages[1]["content"]}
         for key, value in datum_dict.items():
             if key not in ("messages", "task_name") and isinstance(value, str):
@@ -533,21 +533,28 @@ def math_hf_data_processor(
                 format_kwargs["trace"], task_data_spec
             )
 
-        teacher_content = task_data_spec.teacher_prompt.format_map(format_kwargs)
-        teacher_user_msg: dict[str, Any] = {"role": "user", "content": teacher_content}
-        teacher_msg_str: list[str] = tokenizer.apply_chat_template(  # type: ignore
-            [teacher_user_msg],
-            tokenize=False,
-            add_generation_prompt=True,
-            add_special_tokens=False,
-        )
-        teacher_user_msg["token_ids"] = tokenizer(
-            teacher_msg_str,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )["input_ids"][0]
-        teacher_user_msg["content"] = teacher_msg_str
-        teacher_message_log = [teacher_user_msg]
+        def _build_teacher_ml(prompt_text: str) -> list[dict[str, Any]]:
+            content = prompt_text.format_map(format_kwargs)
+            msg: dict[str, Any] = {"role": "user", "content": content}
+            msg_str: list[str] = tokenizer.apply_chat_template(  # type: ignore
+                [msg],
+                tokenize=False,
+                add_generation_prompt=True,
+                add_special_tokens=False,
+            )
+            msg["token_ids"] = tokenizer(
+                msg_str,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )["input_ids"][0]
+            msg["content"] = msg_str
+            return [msg]
+
+        if task_data_spec.teacher_prompt is not None:
+            teacher_message_log = _build_teacher_ml(task_data_spec.teacher_prompt)
+
+        if task_data_spec.teacher_prefix_prompt is not None:
+            teacher_prefix_message_log = _build_teacher_ml(task_data_spec.teacher_prefix_prompt)
 
     length = sum(len(m["token_ids"]) for m in message_log)
 
@@ -570,6 +577,8 @@ def math_hf_data_processor(
     }
     if teacher_message_log is not None:
         output["teacher_message_log"] = teacher_message_log
+    if teacher_prefix_message_log is not None:
+        output["teacher_prefix_message_log"] = teacher_prefix_message_log
     return output
 
 

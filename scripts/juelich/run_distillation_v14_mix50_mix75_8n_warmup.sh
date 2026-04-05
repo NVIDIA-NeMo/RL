@@ -1,6 +1,9 @@
 #!/bin/bash
 # Submit 2 Qwen3-8B self-distill runs on 8 nodes (Jülich Booster):
-#   v14 teacher prompt, mix 50 and mix 75
+#   v14 teacher prompt, with rewrite warmup over 50 steps
+#
+#   Run 1: fraction 1.0 → 0.75 (rewrite warms from 0% to 25%)
+#   Run 2: fraction 1.0 → 0.50 (rewrite warms from 0% to 50%)
 #
 # Config from Jupiter prompt sweep (no LR/scheduler overrides — config defaults).
 # Cluster/paths adapted for Jülich.
@@ -47,24 +50,30 @@ BASE_8B=(
   cluster.num_nodes="${NODES}"
   policy.generation.vllm_cfg.gpu_memory_utilization="${VLLM_UTIL}"
   policy.dynamic_batching.train_mb_tokens=20480
+  distillation.val_at_start=false
 )
 
 V14_PROMPT="examples/prompts/teacher_rewrite_v14_independent_check_improved.txt"
+WARMUP_STEPS=50
 
-submit_job "d-8b-v14-mix50-8n" "${NODES}" \
-  "${BASE_8B[@]}" \
-  data.default.teacher_prompt_file="${V14_PROMPT}" \
-  distillation.teacher_student_prefix_fraction=0.50 \
-  checkpointing.checkpoint_dir="${CKPT}/distill-8b-v14-mix50-8n-bs64" \
-  logger.log_dir=logs/distill-8b-v14-mix50-8n-bs64 \
-  logger.wandb.name=distill-8b-v14-mix50-8n-bs64
-
-submit_job "d-8b-v14-mix75-8n" "${NODES}" \
+submit_job "d-8b-v14-mix75-8n-wu50" "${NODES}" \
   "${BASE_8B[@]}" \
   data.default.teacher_prompt_file="${V14_PROMPT}" \
   distillation.teacher_student_prefix_fraction=0.75 \
-  checkpointing.checkpoint_dir="${CKPT}/distill-8b-v14-mix75-8n-bs64" \
-  logger.log_dir=logs/distill-8b-v14-mix75-8n-bs64 \
-  logger.wandb.name=distill-8b-v14-mix75-8n-bs64
+  distillation.teacher_student_prefix_fraction_start=1.0 \
+  distillation.teacher_student_prefix_fraction_warmup_steps="${WARMUP_STEPS}" \
+  checkpointing.checkpoint_dir="${CKPT}/distill-8b-v14-mix75-8n-wu50" \
+  logger.log_dir=logs/distill-8b-v14-mix75-8n-wu50 \
+  logger.wandb.name=distill-8b-v14-mix75-8n-wu50
 
-echo "Both v14 runs (mix50 + mix75, 8 nodes) submitted."
+submit_job "d-8b-v14-mix50-8n-wu50" "${NODES}" \
+  "${BASE_8B[@]}" \
+  data.default.teacher_prompt_file="${V14_PROMPT}" \
+  distillation.teacher_student_prefix_fraction=0.50 \
+  distillation.teacher_student_prefix_fraction_start=1.0 \
+  distillation.teacher_student_prefix_fraction_warmup_steps="${WARMUP_STEPS}" \
+  checkpointing.checkpoint_dir="${CKPT}/distill-8b-v14-mix50-8n-wu50" \
+  logger.log_dir=logs/distill-8b-v14-mix50-8n-wu50 \
+  logger.wandb.name=distill-8b-v14-mix50-8n-wu50
+
+echo "Both v14 warmup runs (mix75 + mix50, 8 nodes, warmup 50 steps) submitted."

@@ -59,6 +59,7 @@ class RawDataset:
         system_prompt_file = self.data_config.get("system_prompt_file", None)
         prompt_file = self.data_config.get("prompt_file", None)
         teacher_prompt_file = self.data_config.get("teacher_prompt_file", None)
+        teacher_prefix_prompt_file = self.data_config.get("teacher_prefix_prompt_file", None)
         column_mapping = self.data_config.get("column_mapping", {})
         trace_mode = self.data_config.get("trace_mode", "full")
         trace_truncate_fraction = self.data_config.get("trace_truncate_fraction", 1.0)
@@ -68,6 +69,7 @@ class RawDataset:
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
             teacher_prompt_file=teacher_prompt_file,
+            teacher_prefix_prompt_file=teacher_prefix_prompt_file,
             column_mapping=column_mapping or {},
             trace_mode=trace_mode,
             trace_truncate_fraction=trace_truncate_fraction,

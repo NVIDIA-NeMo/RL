@@ -89,6 +89,8 @@ class DistillationConfig(TypedDict):
     topk_logits_k: int
     seed: int
     teacher_student_prefix_fraction: NotRequired[float]
+    teacher_student_prefix_fraction_start: NotRequired[float]
+    teacher_student_prefix_fraction_warmup_steps: NotRequired[int]
     # Optional overrides for validation rollouts (see validate()).
     val_max_total_sequence_length: NotRequired[Optional[int]]
     val_max_new_tokens: NotRequired[Optional[int]]
@@ -220,6 +222,26 @@ def setup(
             raise AssertionError(
                 f"Distillation does not support DTensor sequence parallel + sequence packing ({who} policy). "
                 "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details."
+            )
+
+    # Validate teacher_student_prefix_fraction warmup config
+    frac_start = distillation_config.get("teacher_student_prefix_fraction_start")
+    warmup_steps = distillation_config.get("teacher_student_prefix_fraction_warmup_steps")
+    has_start = frac_start is not None
+    has_warmup = warmup_steps is not None
+    if has_start != has_warmup:
+        raise ValueError(
+            "teacher_student_prefix_fraction_start and "
+            "teacher_student_prefix_fraction_warmup_steps must both be set or both be absent."
+        )
+    if has_start:
+        if not 0.0 <= frac_start <= 1.0:
+            raise ValueError(
+                f"teacher_student_prefix_fraction_start must be in [0, 1], got {frac_start}"
+            )
+        if warmup_steps <= 0:
+            raise ValueError(
+                f"teacher_student_prefix_fraction_warmup_steps must be > 0, got {warmup_steps}"
             )
 
     # Set random seed
@@ -552,6 +574,27 @@ def _align_teacher_topk_to_student(
     return aligned_logits, aligned_indices
 
 
+def _get_scheduled_teacher_student_prefix_fraction(
+    fraction_end: float,
+    fraction_start: float | None,
+    warmup_steps: int | None,
+    total_steps: int,
+) -> float:
+    """Compute the effective prefix fraction for the current step.
+
+    Linearly interpolates from *fraction_start* to *fraction_end* over
+    *warmup_steps* training steps.  If warmup is not configured (either
+    value is ``None``), returns *fraction_end* unchanged (backwards
+    compatible).
+    """
+    if fraction_start is None or warmup_steps is None:
+        return fraction_end
+    if total_steps >= warmup_steps:
+        return fraction_end
+    progress = total_steps / warmup_steps
+    return fraction_start + (fraction_end - fraction_start) * progress
+
+
 def _get_teacher_student_prefix_indices(
     batch_size: int,
     fraction: float,
@@ -584,9 +627,15 @@ def _apply_teacher_student_prefix_mix(
     seed: int,
     total_steps: int,
 ) -> dict[str, float]:
-    """Swap a deterministic subset of teacher prompts to the student prefix."""
+    """Swap a deterministic subset of teacher prompts to the prefix prompt.
+
+    For selected samples the teacher_message_log is replaced with either:
+      - teacher_prefix_message_log (if present in batch), or
+      - the student's message_log (legacy fallback).
+    Non-selected samples keep their original teacher_message_log.
+    """
     metrics = {
-        "teacher_student_prefix_fraction_configured": float(fraction),
+        "teacher_student_prefix_fraction_scheduled": float(fraction),
         "teacher_student_prefix_selected_count": 0.0,
         "teacher_student_prefix_realized_fraction": 0.0,
         "teacher_prompt_count": 0.0,
@@ -603,13 +652,17 @@ def _apply_teacher_student_prefix_mix(
     if "teacher_message_log" not in repeated_batch or repeated_batch.size == 0:
         return metrics
 
+    has_prefix_prompt = "teacher_prefix_message_log" in repeated_batch
     selected_index_set = {int(idx) for idx in selected_indices.tolist()}
     selected_prefix_lengths: list[int] = []
     teacher_prompt_lengths: list[int] = []
 
     for i in range(repeated_batch.size):
         if i in selected_index_set:
-            repeated_batch["teacher_message_log"][i] = repeated_batch["message_log"][i]
+            if has_prefix_prompt:
+                repeated_batch["teacher_message_log"][i] = repeated_batch["teacher_prefix_message_log"][i]
+            else:
+                repeated_batch["teacher_message_log"][i] = repeated_batch["message_log"][i]
             selected_prefix_lengths.append(
                 len(repeated_batch["teacher_message_log"][i][0]["token_ids"])
             )
@@ -932,11 +985,21 @@ def distillation_train(
 
                 with timer.time("data_processing"):
                     has_teacher_ml = "teacher_message_log" in repeated_batch
-                    teacher_context_metrics = _apply_teacher_student_prefix_mix(
-                        repeated_batch,
-                        fraction=master_config["distillation"].get(
+                    scheduled_fraction = _get_scheduled_teacher_student_prefix_fraction(
+                        fraction_end=master_config["distillation"].get(
                             "teacher_student_prefix_fraction", 0.0
                         ),
+                        fraction_start=master_config["distillation"].get(
+                            "teacher_student_prefix_fraction_start", None
+                        ),
+                        warmup_steps=master_config["distillation"].get(
+                            "teacher_student_prefix_fraction_warmup_steps", None
+                        ),
+                        total_steps=total_steps,
+                    )
+                    teacher_context_metrics = _apply_teacher_student_prefix_mix(
+                        repeated_batch,
+                        fraction=scheduled_fraction,
                         seed=master_config["distillation"]["seed"],
                         total_steps=total_steps,
                     )
@@ -1097,6 +1160,11 @@ def distillation_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(teacher_context_metrics)
+                metrics["teacher_student_prefix_fraction_end"] = float(
+                    master_config["distillation"].get(
+                        "teacher_student_prefix_fraction", 0.0
+                    )
+                )
                 metrics.update(rollout_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
 

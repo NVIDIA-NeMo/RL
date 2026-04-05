@@ -12,6 +12,8 @@ distillation:
     max_val_samples: 512
     topk_logits_k: 64
     teacher_student_prefix_fraction: 0.0
+    # teacher_student_prefix_fraction_start: 0.95  # linearly interpolate from _start to teacher_student_prefix_fraction
+    # teacher_student_prefix_fraction_warmup_steps: 200  # over this many steps
     val_max_total_sequence_length: null # when set, validation generation uses this instead of policy.max_total_sequence_length
     val_max_new_tokens: null # when set, validation generation uses this instead of policy.generation.max_new_tokens
     seed: 42

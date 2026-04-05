@@ -1,4 +1,4 @@
-Solve the following math problem concisely and correctly. Be direct -- avoid unnecessary elaboration, redundant steps, or restating the problem. Focus only on the key reasoning steps needed to reach the answer. The last line of your response should be of the form "Final Answer: \\boxed{{Answer}}" where Answer is the answer to the problem.
+Solv- the following math problem concisely and correctly. Be direct -- avoid unnecessary elaboration, redundant steps, or restating the problem. Focus only on the key reasoning steps needed to reach the answer. The last line of your response should be of the form "Final Answer: \\boxed{{Answer}}" where Answer is the answer to the problem.
 
 {problem}
 

@@ -15,6 +15,8 @@ distillation:
     max_val_samples: 512
     topk_logits_k: 64
     teacher_student_prefix_fraction: 0.0
+    # teacher_student_prefix_fraction_start: 0.95  # linearly interpolate from _start to teacher_student_prefix_fraction
+    # teacher_student_prefix_fraction_warmup_steps: 200  # over this many steps
     seed: 42
 
 loss_fn:

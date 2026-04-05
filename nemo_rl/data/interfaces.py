@@ -61,6 +61,7 @@ class TaskDataSpec:
     system_prompt_file: Optional[PathLike] = None
 
     teacher_prompt_file: Optional[PathLike] = None
+    teacher_prefix_prompt_file: Optional[PathLike] = None
     column_mapping: dict = field(default_factory=dict)
 
     # Trace conditioning mode: "full", "truncate", "mask", or "none"
@@ -87,6 +88,7 @@ class TaskDataSpec:
         self.system_prompt = load_prompt_file(self.system_prompt_file)
         self.prompt = load_prompt_file(self.prompt_file)
         self.teacher_prompt = load_prompt_file(self.teacher_prompt_file)
+        self.teacher_prefix_prompt = load_prompt_file(self.teacher_prefix_prompt_file)
 
     def copy_defaults(self, from_spec: "TaskDataSpec") -> None:
         """Apply default values from another Task instance for any None attributes."""
@@ -94,6 +96,7 @@ class TaskDataSpec:
             "system_prompt": from_spec.system_prompt,
             "prompt": from_spec.prompt,
             "teacher_prompt": from_spec.teacher_prompt,
+            "teacher_prefix_prompt": from_spec.teacher_prefix_prompt,
             "column_mapping": from_spec.column_mapping,
             "trace_mode": from_spec.trace_mode,
             "trace_truncate_fraction": from_spec.trace_truncate_fraction,
