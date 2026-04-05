@@ -587,37 +587,22 @@ class VllmGeneration(GenerationInterface):
         if not data_validation_fn(data):
             return
 
-        # Determine the leader worker for the current data parallel shard
-        leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
-            self.current_generate_dp_shard_idx
-        )
+        total_batch_size = len(next(iter(data.values())))
 
-        # Run the async method on the selected leader worker
-        worker_gen_proxy = self.worker_group.run_single_worker_single_data(
-            method_name=method_name,
-            worker_idx=leader_worker_idx,
-            data=data,
-            greedy=greedy,
-        )
-
-        # Increment the round-robin worker group index
-        self.current_generate_dp_shard_idx += 1
-        self.current_generate_dp_shard_idx %= self.worker_group.dp_size
-
-        # Create a queue to collect sample results from the worker as they complete
+        # Create a queue to collect sample results from workers as they complete.
         result_queue = asyncio.Queue()
-        finished = False
+        finished_workers = 0
 
-        async def consume_worker_generator(worker_idx, worker_gen):
-            """Consume a single worker generator and put sample results in the queue."""
-            nonlocal finished
+        async def consume_worker_generator(worker_idx, worker_gen, original_idx_offset):
+            """Consume a worker generator and put sample results in the queue."""
             worker_name = f"Worker-{worker_idx}"
             try:
                 async for sample_result_ref in worker_gen:
                     sample_result = await sample_result_ref
                     # sample_result is a tuple: (original_idx, BatchedDataDict)
                     # Tag the result with worker index for downstream attribution
-                    original_idx, result_batch = sample_result
+                    local_original_idx, result_batch = sample_result
+                    original_idx = original_idx_offset + int(local_original_idx)
                     # Use a length-one list so BatchedDataDict.from_batches can merge without shape errors
                     result_batch["gen_leader_worker_idx"] = [int(worker_idx)]
                     sample_result = (original_idx, result_batch)
@@ -630,20 +615,64 @@ class VllmGeneration(GenerationInterface):
                 traceback.print_exc()
                 await result_queue.put(("error", e))
             finally:
-                finished = True
-                await result_queue.put(("worker_done", None))
+                await result_queue.put(("worker_done", worker_idx))
 
-        # Start the task to consume the worker generator
-        worker_task = asyncio.create_task(
-            consume_worker_generator(leader_worker_idx, worker_gen_proxy)
-        )
+        worker_tasks: list[asyncio.Task] = []
+
+        if total_batch_size == 1:
+            # For single-sample requests, keep round-robin dispatch across DP leaders so
+            # concurrent callers naturally spread work across all inference engines.
+            leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
+                self.current_generate_dp_shard_idx
+            )
+            worker_gen_proxy = self.worker_group.run_single_worker_single_data(
+                method_name=method_name,
+                worker_idx=leader_worker_idx,
+                data=data,
+                greedy=greedy,
+            )
+            self.current_generate_dp_shard_idx += 1
+            self.current_generate_dp_shard_idx %= self.worker_group.dp_size
+            worker_tasks.append(
+                asyncio.create_task(
+                    consume_worker_generator(leader_worker_idx, worker_gen_proxy, 0)
+                )
+            )
+        else:
+            # Shard the batch across all DP leaders, matching the sync generate path.
+            dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+            sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
+                dp_size, allow_uneven_shards=True
+            )
+            shard_offset = 0
+            for dp_shard_idx, shard in enumerate(sharded_data):
+                shard_batch_size = len(next(iter(shard.values()))) if len(shard) > 0 else 0
+                if shard_batch_size == 0:
+                    continue
+                leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
+                    dp_shard_idx
+                )
+                worker_gen_proxy = self.worker_group.run_single_worker_single_data(
+                    method_name=method_name,
+                    worker_idx=leader_worker_idx,
+                    data=shard,
+                    greedy=greedy,
+                )
+                worker_tasks.append(
+                    asyncio.create_task(
+                        consume_worker_generator(
+                            leader_worker_idx, worker_gen_proxy, shard_offset
+                        )
+                    )
+                )
+                shard_offset += shard_batch_size
 
         # Yield sample results as they become available from the worker
         timeout_seconds = float(
             os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "600")
         )  # Default 10 minutes
 
-        while not finished:
+        while finished_workers < len(worker_tasks):
             try:
                 msg_type, item = await asyncio.wait_for(
                     result_queue.get(), timeout=timeout_seconds
@@ -655,10 +684,10 @@ class VllmGeneration(GenerationInterface):
                 print(
                     f"For longer sequences, increase the timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
                 )
-                # Cancel the task
-                if not worker_task.done():
-                    worker_task.cancel()
-                await asyncio.gather(worker_task, return_exceptions=True)
+                for worker_task in worker_tasks:
+                    if not worker_task.done():
+                        worker_task.cancel()
+                await asyncio.gather(*worker_tasks, return_exceptions=True)
                 raise RuntimeError(
                     f"Timeout waiting for worker results after {timeout_seconds}s. "
                     f"For longer sequences, increase timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
@@ -669,20 +698,18 @@ class VllmGeneration(GenerationInterface):
                 yield item
             elif msg_type == "error":
                 # Cancel the task and propagate error
-                if not worker_task.done():
-                    worker_task.cancel()
-                await asyncio.gather(worker_task, return_exceptions=True)
+                for worker_task in worker_tasks:
+                    if not worker_task.done():
+                        worker_task.cancel()
+                await asyncio.gather(*worker_tasks, return_exceptions=True)
                 raise item
             elif msg_type == "worker_done":
-                # Worker finished, just continue the loop
-                pass
+                finished_workers += 1
             else:
                 raise RuntimeError(f"Unexpected message type: {msg_type}")
 
-        # Verify the task is actually done
-        assert worker_task.done(), (
-            f"Worker task {leader_worker_idx} should be done but isn't"
-        )
+        for worker_task in worker_tasks:
+            assert worker_task.done(), "A worker task should be done but isn't"
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
