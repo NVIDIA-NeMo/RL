@@ -112,6 +112,8 @@ class ClippedPGLossConfig(TypedDict):
     force_on_policy_ratio: NotRequired[bool]
     # If True, add KL penalty to reward instead of loss (used by Reinforce++)
     use_kl_in_reward: NotRequired[bool]
+    # If True, use CISPO (Clipped IS-weight Policy Optimization) from MiniMax-M1.
+    use_cispo: NotRequired[bool]
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -136,6 +138,7 @@ class ClippedPGLossFn(LossFunction):
     - GRPO - https://arxiv.org/abs/2402.03300
     - REINFORCE/RLOO (set disable_ppo_ratio = True and ignores ratio_clip_min/ratio_clip_max) - https://arxiv.org/abs/2402.14740
     - GSPO (set sequence_level_importance_ratios = True and token_level_loss = False) - https://arxiv.org/abs/2507.18071
+    - CISPO (set use_cispo = True) - https://arxiv.org/abs/2506.13585
     - Truly on-policy (set force_on_policy_ratio = True to force ratio = 1.0, requires one update per rollout)
 
     Formula:
@@ -154,6 +157,10 @@ class ClippedPGLossFn(LossFunction):
 
     For REINFORCE/RLOO (when disable_ppo_ratio=True), the formula simplifies to:
     L(θ) = E_t [ π_θ(a_t|s_t) * A_t ] - β * KL(π_θ || π_ref)
+
+    Formula (CISPO):
+    L(θ) = E_t [ sg(clip(r_t(θ), 1-ε_low, 1+ε_high)) * A_t * log π_θ(a_t|s_t) ]
+
 
     Also supports "Dual-Clipping" from https://arxiv.org/pdf/1912.09729, which
     imposes an additional upper bound on the probability ratio when advantages are negative.
@@ -208,6 +215,11 @@ class ClippedPGLossFn(LossFunction):
         if self.sequence_level_importance_ratios:
             assert self.loss_type == LossType.SEQUENCE_LEVEL, (
                 "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
+            )
+        self.use_cispo = cfg.get("use_cispo", False)
+        if self.use_cispo:
+            assert not self.disable_ppo_ratio, (
+                "use_cispo is incompatible with disable_ppo_ratio; "
             )
         if self.truncated_importance_sampling_ratio is not None:
             assert self.use_importance_sampling_correction, (
@@ -409,7 +421,11 @@ class ClippedPGLossFn(LossFunction):
 
         # Determine which value to use for clipping (max for pessimistic estimate)
         clip_loss = torch.max(loss1, loss2)
-
+        if self.use_cispo:
+            ratios_clamped = ratios.clamp(
+                1.0 - self.ratio_clip_min, 1.0 + self.ratio_clip_max
+            )
+            clip_loss = -advantages * ratios_clamped.detach() * curr_logprobs
         # Dual-clipping see https://arxiv.org/pdf/1912.09729
         if self.ratio_clip_c is not None:
             assert self.ratio_clip_c > 1, (

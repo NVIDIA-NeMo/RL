@@ -1,0 +1,25 @@
+defaults: "grpo_math_1B.yaml"
+
+  # ============================================================================
+  # CISPO: Clipped Importance Sampling Policy Optimization
+  # CISPO clips the IS weight itself and applies stop-gradient, then multiplies by
+  # advantage and log-probability. 
+  # ratio_clip_min / ratio_clip_max control the IS weight clipping bounds (ε_IS_low / ε_IS_high).
+  # The original paper sets ratio_clip_min to a large value (effectively no lower bound) and
+  # only tunes ratio_clip_max. Dual-clipping (ratio_clip_c) is ignored when use_cispo=True.
+  # See: https://arxiv.org/abs/2506.13585
+
+loss_fn:
+  use_cispo: true
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_min: 1.0 # set to very high
+  ratio_clip_max: 0.8 #tune as per experiments
+  token_level_loss: true
+  force_on_policy_ratio: false
+  ratio_clip_c: null
+  
+checkpointing:
+  checkpoint_dir: "results/cispo"
+
+logger:
+  log_dir: "logs/cispo"

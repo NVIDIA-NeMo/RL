@@ -637,6 +637,58 @@ def test_clipped_pg_loss_force_on_policy_ratio():
     assert metrics["probs_ratio_clamped_max"] == 1.0
 
 
+def test_clipped_pg_loss_cispo():
+    """Tests CISPO (Clipped IS-weight Policy Optimization) path in ClippedPGLossFn.
+
+    Uses the same data pattern as test_clipped_pg_loss_ppo_clipping (same advantages,
+    prev/curr logprobs, and ratio clip bounds) so ratios are [0.5, 1.0, 1.5] and
+    clamped to [0.8, 1.0, 1.2]. CISPO formula:
+    L = -advantages * clip(ratio, 1-ε, 1+ε).detach() * curr_logprobs
+    (IS weight is clipped and stop-gradiented; gradients flow only through curr_logprobs).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
+
+    cfg = deepcopy(basic_pg_loss_test_config)
+    cfg["use_cispo"] = True
+    loss_fn = ClippedPGLossFn(cfg)
+
+    adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
+    prev_lp_masked = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    # Target ratios: 0.5, 1.0, 1.5 -> after clip(0.2, 0.2): 0.8, 1.0, 1.2
+    curr_lp_masked = torch.tensor(
+        [[-1.69315, -1.0, -0.59453]], device=device
+    )  # approx log(0.5)-1, log(1)-1, log(1.5)-1
+
+    data["advantages"][0, 1:] = adv_masked
+    data["prev_logprobs"][0, 1:] = prev_lp_masked
+
+    # --- Hand calculation: CISPO loss = -A * clip(r, 1-ε, 1+ε) * curr_lp (ratio stop-grad) ---
+    ratios = torch.exp(curr_lp_masked - prev_lp_masked)  # [0.5, 1.0, 1.5]
+    ratios_clamped = torch.clamp(
+        ratios, 1.0 - cfg["ratio_clip_min"], 1.0 + cfg["ratio_clip_max"]
+    )  # [0.8, 1.0, 1.2]
+    cispo_loss_per_token = -adv_masked * ratios_clamped * curr_lp_masked
+    expected_loss = torch.mean(cispo_loss_per_token)
+
+    input_ids = data["input_ids"]
+    dummy_logits = _create_exact_logits(
+        curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
+    )
+    loss_input = prepare_loss_input(dummy_logits, data, loss_fn)
+
+    actual_loss, _ = loss_fn(
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+        **loss_input,
+    )
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("kl_type", ["k1", "k2", "k3"])
 def test_calculate_kl(kl_type):
     """Tests KL calculations."""
