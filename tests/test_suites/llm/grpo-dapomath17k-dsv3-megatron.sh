@@ -1,6 +1,8 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
+# disable NVLS to avoid OOM issue
+export NCCL_NVLS_ENABLE=0
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=32
@@ -42,7 +44,8 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'min(data["train/token_mult_prob_error"]) < 1.05' \
-        'max(data["train/reward"]) > 0.4'
+        'max(data["train/reward"]) > 0.4' \
+        'mean(data["timing/train/total_step_time"], -6, -1) < 1000'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
