@@ -117,7 +117,7 @@ This command will:
 ## Python Version
 
 > [!NOTE]
-> This project uses Python 3.12 as specified in `.python-version`.  
+> This project uses Python 3.13 as specified in `.python-version`.
 > This Python version should always be kept in sync with the `.python-version` file at the root of the `nemo-rl` repository to ensure compatibility.
 
 
