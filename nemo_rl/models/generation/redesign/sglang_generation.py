@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # ServerGroup / RolloutServer abstractions
 # ---------------------------------------------------------------------------
 
-# # use_unified_pg = True for Nemo
+# use_unified_pg = True for Nemo
 #         if use_unified_pg:
 #             # Create a single unified placement group for cross-node model parallelism
 #             all_bundles = []
@@ -65,6 +65,11 @@ logger = logging.getLogger(__name__)
 #                     bundles=all_bundles, strategy=strategy, name=f"{self.name}-unified"
 #                 )
 #             ]
+
+#         pg = cluster._init_placement_groups(strategy="PACK", use_unified_pg=True)[0]
+#         pg_reordered_bundle_indices   = cluster._get_sorted_bundle_indices()
+#         
+
 
 @dataclasses.dataclass
 class ServerGroup:
@@ -335,7 +340,6 @@ class RolloutManager:
     def generate(self, rollout_id):
         start_time = time.time()
         self.rollout_id = rollout_id
-        self.health_monitoring_resume()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
@@ -346,7 +350,6 @@ class RolloutManager:
         if self.args.debug_train_only:
             # if debug train only, we don't generate evaluation data
             return
-        self.health_monitoring_resume()
 
         if self.use_experimental_refactor:
             result = call_rollout_function(self.eval_generate_rollout, RolloutFnEvalInput(rollout_id=rollout_id))
@@ -814,7 +817,7 @@ def _compute_megatron_num_gpus(args) -> int:
     return num
 
 
-def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
+def start_rollout_servers(args, pg) -> ServerGroup:
     """Start rollout servers: one per model, each with its own router.
 
     Returns a dict mapping model name -> ``RolloutServer``.

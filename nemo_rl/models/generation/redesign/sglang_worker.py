@@ -17,16 +17,9 @@ import ray
 
 logger = logging.getLogger(__name__)
 
-def get_base_gpu_id(args, rank):
-    num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
-    if args.colocate:
-        start_index = (rank * num_gpus) % args.num_gpus_per_node
-    else:
-        num_actor_gpus = 0 if args.debug_rollout_only else args.actor_num_gpus_per_node * args.actor_num_nodes
-        start_index = (num_actor_gpus + rank * num_gpus) % args.num_gpus_per_node
-        if args.use_critic:
-            num_critic_gpus = args.critic_num_gpus_per_node * args.critic_num_nodes
-            start_index = (num_actor_gpus + num_critic_gpus + rank * num_gpus) % args.num_gpus_per_node
+def get_base_gpu_id(cluster_cfg, sgl_cfg, rank):
+    num_gpus = min(cluster_cfg["gpus_per_node"], sgl_cfg["num_gpus_per_engine"])
+    start_index = (rank * num_gpus) % cluster_cfg["gpus_per_node"]
     return start_index
 
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
@@ -104,14 +97,16 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
 class SGLangEngine:
     def __init__(
         self,
-        args,
+        cluster_cfg,
+        sgl_cfg,
         rank: int,
         worker_type: str = "regular",
         base_gpu_id: int | None = None,
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
-    ):
-        self.args = args
+    ):  
+        self.cluster_cfg = cluster_cfg
+        self.sgl_cfg = sgl_cfg
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
@@ -127,15 +122,9 @@ class SGLangEngine:
         router_ip=None,
         router_port=None,
     ):
-        if env_report := self.args.env_report:
-            collect_and_print_node_env_report(
-                role="rollout",
-                rank=self.rank,
-                partial_env_report=env_report,
-            )
 
-        self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
-        self.router_port = router_port if router_port is not None else self.args.sglang_router_port
+        self.router_ip = router_ip if router_ip is not None else self.sgl_cfg["sglang_router_ip"]
+        self.router_port = router_port if router_port is not None else self.sgl_cfg["sglang_router_port"]
 
         host = host or get_host_info()[1]
 
@@ -153,8 +142,9 @@ class SGLangEngine:
         ip_part, port_part = dist_init_addr.rsplit(":", 1)
         dist_init_addr = f"{_format_v6_uri(ip_part)}:{port_part}"
 
-        server_args_dict, _ = _compute_server_args(
-            self.args,
+        server_args_dict = _compute_server_args(
+            self.cluster_cfg,
+            self.sgl_cfg,
             self.rank,
             dist_init_addr,
             nccl_port,
@@ -177,7 +167,7 @@ class SGLangEngine:
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
-            if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_miles_router:
+            if parse(sglang_router.__version__) <= parse("0.2.1"):
                 assert (
                     self.worker_type == "regular"
                 ), "pd disaggregation is not supported in old router or miles router."
@@ -296,7 +286,7 @@ class SGLangEngine:
         if self.node_rank == 0:
             worker_url = f"http://{self.server_host}:{self.server_port}"
             response = None
-            if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_miles_router:
+            if parse(sglang_router.__version__) <= parse("0.2.1"):
                 response = requests.post(
                     f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}"
                 )
@@ -475,7 +465,8 @@ class SGLangEngine:
 
 
 def _compute_server_args(
-    args,
+    cluster_cfg,
+    sgl_cfg,
     rank,
     dist_init_addr,
     nccl_port,
@@ -485,17 +476,17 @@ def _compute_server_args(
     sglang_overrides: dict | None = None,
     num_gpus_per_engine: int | None = None,
 ):
-    _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
-    nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
+    _gpus_per_engine = num_gpus_per_engine or sgl_cfg["num_gpus_per_engine"]
+    nnodes = max(1, _gpus_per_engine // cluster_cfg["gpus_per_node"])
     node_rank = rank % nnodes
-    base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(args, rank)
+    base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(cluster_cfg, sgl_cfg, rank)
     base = _to_local_gpu_id(base)
     kwargs = {
-        "model_path": args.hf_checkpoint,
+        "model_path": sgl_cfg["model_path"],
         "trust_remote_code": True,
-        "random_seed": args.seed + rank,
+        "random_seed": sgl_cfg["random_seed"] + rank,
         # memory
-        "enable_memory_saver": args.offload_rollout,
+        "enable_memory_saver": sgl_cfg["enable_memory_saver"],
         # distributed
         "host": host,
         "port": port,
@@ -507,29 +498,39 @@ def _compute_server_args(
         "base_gpu_id": base,
         # parallel
         "tp_size": _gpus_per_engine,
-        "dp_size": args.sglang_dp_size,
-        "pp_size": args.sglang_pp_size,
-        "ep_size": args.sglang_ep_size,
+        "dp_size": sgl_cfg["dp_size"],
+        "pp_size": sgl_cfg["pp_size"],
+        "ep_size": sgl_cfg["ep_size"],
         # always skip warmup to prevent warmup timeout.
         "skip_server_warmup": True,
         # always enable draft weights cpu backup so that we run training without mtp weights.
         "enable_draft_weights_cpu_backup": True,
     }
 
-    if sglang_overrides:
-        kwargs.update(sglang_overrides)
-
-    if args.use_rollout_routing_replay:
-        kwargs["enable_return_routed_experts"] = True
-    if args.fp16:
-        kwargs["dtype"] = "float16"
-    external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
-
+    for key in [
+        "dtype",
+        "kv_cache_dtype",
+        "context_length",
+        "max_running_requests",
+        "chunked_prefill_size",
+        "max_prefill_tokens",
+        "schedule_policy",
+        "schedule_conservativeness",
+        "cpu_offload_gb",
+        "log_level",
+        "mem_fraction_static",
+        "allow_auto_truncate",
+        "disable_piecewise_cuda_graph",
+    ]:
+        if key in sgl_cfg:
+            kwargs[key] = sgl_cfg[key]
 
     unused_keys = set(kwargs.keys())
+
     for attr in dataclasses.fields(ServerArgs):
-        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
-            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
+        sgl_key = f"sglang_{attr.name}"
+        if sgl_key in sgl_cfg and attr.name not in kwargs:
+            kwargs[attr.name] = sgl_cfg[sgl_key]
         unused_keys.discard(attr.name)
 
     # for compatibility with old args
@@ -538,16 +539,5 @@ def _compute_server_args(
         for key in unused_keys:
             kwargs.pop(key)
 
-    return kwargs, external_engine_need_check_fields
+    return kwargs
 
-
-_EXTERNAL_ENGINE_SKIP_CHECK_FIELDS = [
-    "model_path",
-    "trust_remote_code",
-    "random_seed",
-    "nccl_port",
-    "dist_init_addr",
-    "skip_server_warmup",
-    "enable_draft_weights_cpu_backup",
-    "mem_fraction_static",
-]
