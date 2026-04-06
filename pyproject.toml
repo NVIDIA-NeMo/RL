@@ -269,6 +269,8 @@ override-dependencies = [
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs
   "mlflow>=3.9.0rc0",
+  # Override outlines for Python 3.13 support
+  "outlines>=0.2.0",
 ]
 # CVE fixes
 constraint-dependencies = [
