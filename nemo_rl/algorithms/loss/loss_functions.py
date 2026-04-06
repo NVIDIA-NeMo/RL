@@ -1113,8 +1113,12 @@ class SDPOLossFn(LossFunction):
         Returns:
             (loss, metrics)
         """
-        # Shift by 1 to align token logprobs with their positions in token_mask/advantages
-        student_lp = next_token_logprobs[:, 1:]           # [B, S-1]
+        # next_token_logprobs from the training forward has shape [B, S-1]
+        # (convention: logprobs[t] = log P(token[t+1] | context[0:t+1])).
+        # teacher_logprobs / prev_logprobs come from get_logprobs() which uses the
+        # full-sequence convention [B, S] with a dummy 0 at position 0, so we shift
+        # those by 1 to align with next_token_logprobs.
+        student_lp = next_token_logprobs                   # [B, S-1]
         teacher_lp = data["teacher_logprobs"][:, 1:]      # [B, S-1]
         token_mask = data["token_mask"][:, 1:]             # [B, S-1]
         sdpo_mask = data["sdpo_mask"]                      # [B]
@@ -1146,6 +1150,7 @@ class SDPOLossFn(LossFunction):
 
         frac_with_demo = sdpo_mask.float().mean().item()
         metrics = {
+            "num_valid_samples": sample_mask.sum().item(),
             "sdpo/mean_log_ratio": masked_mean(log_ratio, effective_mask).item(),
             "sdpo/frac_with_demo": frac_with_demo,
         }

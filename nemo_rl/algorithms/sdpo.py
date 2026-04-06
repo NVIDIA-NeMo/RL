@@ -15,6 +15,7 @@ This module implements SDPO in NeMo-RL.  The key idea is:
    clipped policy-gradient loss.
 """
 
+import os
 import re
 import time
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
@@ -598,15 +599,21 @@ def sdpo_train(
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
+        # grpo.validate() reads master_config["grpo"] for these keys; provide a shim.
+        _validate_cfg = {**master_config, "grpo": {
+            "max_val_samples": sdpo_cfg["max_val_samples"],
+            "val_batch_size": sdpo_cfg["val_batch_size"],
+            "max_rollout_turns": sdpo_cfg["max_rollout_turns"],
+        }}
         val_metrics, _ = validate(
             policy_generation,
             val_dataloader,
             tokenizer,
             val_task_to_env,
-            master_config,
+            total_steps,
+            _validate_cfg,
         )
         logger.log_metrics(val_metrics, step=total_steps)
-        print(f"  Validation metrics: {val_metrics}", flush=True)
 
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         print(
@@ -848,12 +855,19 @@ def sdpo_train(
                             policy, policy_generation, colocated_inference
                         )
                         POLICY_GENERATION_STALE = False
+                    # grpo.validate() reads master_config["grpo"] for these keys; provide a shim.
+                    _validate_cfg = {**master_config, "grpo": {
+                        "max_val_samples": sdpo_cfg["max_val_samples"],
+                        "val_batch_size": sdpo_cfg["val_batch_size"],
+                        "max_rollout_turns": sdpo_cfg["max_rollout_turns"],
+                    }}
                     val_metrics, _ = validate(
                         policy_generation,
                         val_dataloader,
                         tokenizer,
                         val_task_to_env,
-                        master_config,
+                        total_steps,
+                        _validate_cfg,
                     )
                     metrics.update(val_metrics)
 
@@ -881,28 +895,55 @@ def sdpo_train(
                     }
                 )
 
-                checkpointer.maybe_save_checkpoint(
-                    policy,
-                    training_info=sdpo_save_state,
-                    metrics=metrics,
-                    step=total_steps,
+                timeout.mark_iteration()
+                should_save_by_step = (
+                    is_last_step
+                    or total_steps % master_config["checkpointing"]["save_period"] == 0
                 )
+                should_save_by_timeout = timeout.check_save()
 
-                timeout.update()
+                if master_config["checkpointing"]["enabled"] and (
+                    should_save_by_step or should_save_by_timeout
+                ):
+                    # Track metric for top-k checkpointing
+                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    if ":" in full_metric_name:
+                        prefix, metric_name = full_metric_name.split(":", 1)
+                        metrics_source = metrics if prefix == "train" else val_metrics
+                        if metrics_source and metric_name in metrics_source:
+                            sdpo_save_state[full_metric_name] = metrics_source[
+                                metric_name
+                            ]
 
-            if total_steps >= max_num_steps:
-                break
+                    print(
+                        f"Saving checkpoint for step {total_steps}...", flush=True
+                    )
+                    checkpoint_path = checkpointer.init_tmp_checkpoint(
+                        total_steps, sdpo_save_state, master_config
+                    )
+                    policy.save_checkpoint(
+                        weights_path=os.path.join(
+                            checkpoint_path, "policy", "weights"
+                        ),
+                        optimizer_path=os.path.join(
+                            checkpoint_path, "policy", "optimizer"
+                        )
+                        if checkpointer.save_optimizer
+                        else None,
+                        tokenizer_path=os.path.join(
+                            checkpoint_path, "policy", "tokenizer"
+                        ),
+                        checkpointing_cfg=master_config["checkpointing"],
+                    )
+                    torch.save(
+                        dataloader.state_dict(),
+                        os.path.join(checkpoint_path, "train_dataloader.pt"),
+                    )
+                    checkpointer.finalize_checkpoint(checkpoint_path)
 
-            if timeout.timed_out:
-                print("Training timeout reached, saving checkpoint...")
-                checkpointer.save_checkpoint(
-                    policy,
-                    training_info=sdpo_save_state,
-                    metrics=metrics,
-                    step=total_steps,
-                    force=True,
-                )
-                return
+                if should_save_by_timeout:
+                    print("Timeout reached, stopping training early.", flush=True)
+                    return
 
         current_epoch += 1
         current_step = 0
