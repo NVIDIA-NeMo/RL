@@ -70,7 +70,7 @@ RUN GITHUB_ARTIFACTORY=github.com \
 
 # Install uv and python
 ARG UV_VERSION=0.9.7
-ARG PYTHON_VERSION=3.13
+ARG PYTHON_VERSION=3.13.11
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
     uv python install ${PYTHON_VERSION}
