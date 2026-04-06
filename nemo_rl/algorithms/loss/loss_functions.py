@@ -1035,3 +1035,124 @@ class DistillationLossFn(LossFunction):
         }
 
         return kl_loss, metrics
+
+
+# ============================================================================
+# SDPO Loss
+# ============================================================================
+
+
+class SDPOLossConfig(TypedDict):
+    """Configuration for the SDPO (Self-Distilled Policy Optimization) loss.
+
+    Defaults:
+        success_reward_threshold: 1.0  - minimum reward to count as "successful"
+        is_clip: 2.0                   - clip value for token-level IS ratio (None to disable)
+    """
+
+    success_reward_threshold: float
+    is_clip: Optional[float]
+
+
+class SDPOLossDataDict(TypedDict):
+    """Required keys in the data BatchedDataDict for SDPOLossFn."""
+
+    input_ids: torch.Tensor           # [B, seq_len]
+    token_mask: torch.Tensor          # [B, seq_len]  1 = response token
+    sample_mask: torch.Tensor         # [B]           1 = valid sample
+    prev_logprobs: torch.Tensor       # [B, seq_len]  old policy logprobs (for IS correction)
+    teacher_logprobs: torch.Tensor    # [B, seq_len]  teacher logprobs at student positions
+    sdpo_mask: torch.Tensor           # [B]           1 = sample has a demonstration
+
+
+class SDPOLossFn(LossFunction):
+    """Self-Distilled Policy Optimization loss.
+
+    Trains the student (current policy on original prompt) to match the teacher
+    (current policy conditioned on a successful demonstration) via a token-level
+    reverse-KL distillation objective:
+
+        L(θ) = E_{t ∈ response, i has demo}
+                  [ (log π_θ(t|s) - log π_teacher(t|s, demo)).detach()
+                    * log π_θ(t|s)
+                    * IS_clip(π_θ / π_old, c) ]
+
+    where:
+        - π_θ(t|s)       is the current student policy (being optimised)
+        - π_teacher(t|s,demo) is the current model conditioned on the demonstration
+          (pre-computed and stored in data["teacher_logprobs"])
+        - IS_clip clips the importance-sampling ratio to [0, is_clip] to stabilise
+          off-policy multi-step updates
+
+    References:
+        Hübotter et al. (2026) "Reinforcement Learning via Self-Distillation"
+        arXiv:2601.20802
+    """
+
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.LOGPROB
+
+    def __init__(self, cfg: SDPOLossConfig):
+        self.is_clip = cfg.get("is_clip", 2.0)
+
+    def __call__(
+        self,
+        next_token_logprobs: Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute the SDPO self-distillation loss.
+
+        Args:
+            next_token_logprobs: current-policy log-probs, shape [B, seq_len].
+            data: must contain keys defined in SDPOLossDataDict.
+            global_valid_seqs: number of valid sequences in this microbatch.
+            global_valid_toks: number of valid tokens in this microbatch.
+
+        Returns:
+            (loss, metrics)
+        """
+        # next_token_logprobs from the training forward has shape [B, S-1]
+        # (convention: logprobs[t] = log P(token[t+1] | context[0:t+1])).
+        # teacher_logprobs / prev_logprobs come from get_logprobs() which uses the
+        # full-sequence convention [B, S] with a dummy 0 at position 0, so we shift
+        # those by 1 to align with next_token_logprobs.
+        student_lp = next_token_logprobs                   # [B, S-1]
+        teacher_lp = data["teacher_logprobs"][:, 1:]      # [B, S-1]
+        token_mask = data["token_mask"][:, 1:]             # [B, S-1]
+        sdpo_mask = data["sdpo_mask"]                      # [B]
+        sample_mask = data["sample_mask"]                  # [B]
+
+        # Effective mask: response token AND sample has demo AND sample is valid
+        effective_mask = (
+            token_mask
+            * sdpo_mask.unsqueeze(-1).float()
+            * sample_mask.unsqueeze(-1)
+        )
+
+        # Token-level reverse-KL gradient (REINFORCE approximation):
+        #   ∇_θ KL(π_θ || π_teacher) ≈ (log_ratio).detach() * ∇_θ log π_θ
+        log_ratio = (student_lp - teacher_lp).detach()
+        per_token_loss = log_ratio * student_lp
+
+        # Optional importance-sampling correction for off-policy updates
+        if self.is_clip is not None:
+            prev_lp = data["prev_logprobs"][:, 1:]        # [B, S-1]
+            is_ratio = (student_lp - prev_lp).detach().exp().clamp(max=self.is_clip)
+            per_token_loss = per_token_loss * is_ratio
+
+        loss = masked_mean(
+            per_token_loss,
+            effective_mask,
+            global_normalization_factor=global_valid_toks,
+        )
+
+        frac_with_demo = sdpo_mask.float().mean().item()
+        metrics = {
+            "num_valid_samples": sample_mask.sum().item(),
+            "sdpo/mean_log_ratio": masked_mean(log_ratio, effective_mask).item(),
+            "sdpo/frac_with_demo": frac_with_demo,
+        }
+
+        return loss, metrics
