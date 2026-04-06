@@ -20,7 +20,9 @@ mkdir -p $EXP_DIR $LOG_DIR
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo.py \
-    policy.model_name=Qwen/Qwen3-0.6B \
+    policy.model_name=google/gemma-3-4b-it \
+    policy.dtensor_cfg._v2=false \
+    policy.dtensor_cfg.tensor_parallel_size=2 \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
     policy.train_global_batch_size=4 \
@@ -38,7 +40,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-    'max(data["train/gen_kl_error"]) < 0.002' \
+    'max(data["train/gen_kl_error"]) < 0.001' \
     'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
     'max(data["train/probs_ratio_clamped_min"]) < 1.21' \
     'min(data["train/probs_ratio_clamped_max"]) > 0.79' \

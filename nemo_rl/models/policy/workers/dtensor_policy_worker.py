@@ -45,7 +45,10 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
-from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
+from transformers.models.gemma3.modeling_gemma3 import (
+    Gemma3ForCausalLM,
+    Gemma3ForConditionalGeneration,
+)
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -334,9 +337,12 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                 "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
             )
 
+        self.is_gemma3 = isinstance(self.model, Gemma3ForCausalLM) or isinstance(
+            self.model, Gemma3ForConditionalGeneration
+        )
         if cp_size > 1:
-            assert not isinstance(self.model, Gemma3ForCausalLM), (
-                "Context parallel is not supported for Gemma3ForCausalLM. Torch context parallel has many limitations. "
+            assert not self.is_gemma3, (
+                "Context parallel is not supported for Gemma3 models. Torch context parallel has many limitations. "
                 "Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
             )
 
@@ -415,17 +421,13 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
             getattr(self.model, "config", {}), "tie_word_embeddings", False
         )
         if is_tied_lm_head:
-            embed_tokens_weight = None
-            for name, param in self.model.named_parameters():
-                if "embed_tokens" in name and name.endswith(".weight"):
-                    embed_tokens_weight = param
-                    break
+            self.model.tie_weights()
 
-            if embed_tokens_weight is not None:
-                self.model.lm_head.weight = embed_tokens_weight
-
-        # Manually broadcast buffers
-        for _, buf in self.model.named_buffers():
+        # Manually broadcast buffers in a deterministic order
+        buf_dict = dict(self.model.named_buffers())
+        ordered_names = sorted(buf_dict.keys())
+        for name in ordered_names:
+            buf = buf_dict[name]
             torch.distributed.broadcast(to_local_if_dtensor(buf), src=0)
 
         if self.cpu_offload:
@@ -767,6 +769,13 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 flash_attn_kwargs=flash_attn_kwargs,
                                 **vlm_kwargs,
                             )
+
+                            # Gemma3 requires token_type_ids when model.training=True.
+                            # For text-only inputs, default to zeros (text tokens).
+                            if self.is_gemma3 and "token_type_ids" not in model_args:
+                                model_args["token_type_ids"] = torch.zeros_like(
+                                    input_ids
+                                )
 
                             if self._is_reward_model:
                                 # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.
