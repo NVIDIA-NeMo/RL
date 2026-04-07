@@ -42,6 +42,7 @@ class DynamoCfg(TypedDict, total=False):
     etcd_peer_port: int  # 0 = auto-assign
     namespace: str
     enable_planner: bool  # Launch planner + VirtualConnectorClient for autoscaling
+    initial_dp_size: int  # Workers at startup (must be <= cluster.world_size() // tp_size)
 
 
 class DynamoVllmConfig(GenerationConfig):

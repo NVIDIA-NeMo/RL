@@ -18,6 +18,7 @@ Manages the lifecycle of:
 - An etcd subprocess for service discovery
 - N ``python -m dynamo.vllm`` worker subprocesses (one per DP shard)
 - A single ``python -m dynamo.frontend`` subprocess for HTTP routing
+- (optional) A planner subprocess + VirtualConnectorClient for autoscaling
 
 All generation requests go through the frontend.  Weight updates are
 not supported — calling any weight-update method will ``assert False``.
@@ -36,21 +37,19 @@ import threading
 import time
 from typing import Any, Optional, Union
 
-import numpy as np
 import ray
 import requests
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import (
     PY_EXECUTABLES,
     RayVirtualCluster,
     _get_free_port_local,
     _get_node_ip_local,
 )
-from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 from nemo_rl.models.generation.dynamo.config import DynamoVllmConfig
+from nemo_rl.models.generation.dynamo.worker_pool import DynamoWorkerPool
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -58,7 +57,6 @@ from nemo_rl.models.generation.interfaces import (
 )
 
 # (attr_name, display_name, stop_timeout_seconds)
-# Order determines shutdown sequence.
 _SUBPROCESS_REGISTRY: list[tuple[str, str, int]] = [
     ("_planner_process", "planner", 15),
     ("_frontend_process", "frontend", 15),
@@ -92,7 +90,6 @@ class DynamoVllmGeneration(GenerationInterface):
             f"World size {cluster.world_size()} must be divisible by "
             f"tensor_parallel_size {self.tp_size}"
         )
-        self.dp_size = cluster.world_size() // self.tp_size
 
         # Dynamo namespace — unique per run to avoid collisions on shared etcd.
         self._namespace = dynamo_cfg.get("namespace", "nemo_rl")
@@ -106,8 +103,6 @@ class DynamoVllmGeneration(GenerationInterface):
         self._frontend_port = frontend_port if frontend_port else _get_free_port_local()
 
         # Resolve the vllm venv python for subprocesses.
-        # If PY_EXECUTABLES.VLLM starts with "uv", create a local venv first.
-        # Otherwise (container builds), it's already a usable python path.
         vllm_exec = PY_EXECUTABLES.VLLM
         if vllm_exec.startswith("uv"):
             self._vllm_python = create_local_venv_on_each_node(
@@ -143,50 +138,40 @@ class DynamoVllmGeneration(GenerationInterface):
             self._start_planner()
             self._start_virtual_connector_client()
 
+        # ------------------------------------------------------------------
+        # Worker pool
+        # ------------------------------------------------------------------
         needs_cross_node_parallelism = self.tp_size > cluster.num_gpus_per_node
         strategy = None if config["colocated"]["enabled"] else "PACK"
-
         cluster._init_placement_groups(
             strategy=strategy,
             use_unified_pg=needs_cross_node_parallelism,
         )
 
-        self.sharding_annotations = NamedSharding(
-            layout=np.arange(cluster.world_size()).reshape(self.dp_size, self.tp_size),
-            names=["data_parallel", "tensor_parallel"],
-        )
-
-        worker_cls = "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker"
-        worker_builder = RayWorkerBuilder(worker_cls, config)
-
-        env_vars = {
+        base_env_vars = {
             **self._dynamo_env_vars(),
             "ALLOW_NONE_AUTHENTICATION": "yes",
             "DYNAMO_VLLM_PYTHON": self._vllm_python,
         }
+        self._pool = DynamoWorkerPool(
+            cluster=cluster,
+            config=config,
+            tp_size=self.tp_size,
+            base_env_vars=base_env_vars,
+            name_prefix=name_prefix,
+        )
 
-        if self.tp_size > 1:
-            node_bundle_indices = self._get_tied_worker_bundle_indices(cluster)
-            self.worker_group = RayWorkerGroup(
-                cluster,
-                worker_builder,
-                name_prefix=name_prefix,
-                bundle_indices_list=node_bundle_indices,
-                sharding_annotations=self.sharding_annotations,
-                env_vars=env_vars,
-            )
-        else:
-            self.worker_group = RayWorkerGroup(
-                cluster,
-                worker_builder,
-                name_prefix=name_prefix,
-                workers_per_node=workers_per_node,
-                sharding_annotations=self.sharding_annotations,
-                env_vars=env_vars,
-            )
+        max_dp_size = self._pool.max_size
+        initial_dp_size = dynamo_cfg.get("initial_dp_size", max_dp_size)
+        assert initial_dp_size <= max_dp_size, (
+            f"initial_dp_size ({initial_dp_size}) exceeds cluster capacity "
+            f"({max_dp_size} = {cluster.world_size()} GPUs / TP {self.tp_size})"
+        )
+        self._pool.add_workers(initial_dp_size)
 
+        # Start frontend (blocks until initial workers register).
         self._start_frontend()
-        self._healthcheck_frontend()
+        self._healthcheck_frontend(expected_workers=initial_dp_size)
 
         self.dp_openai_server_base_urls: list[Optional[str]] = [
             f"http://{self._host}:{self._frontend_port}/v1"
@@ -198,67 +183,6 @@ class DynamoVllmGeneration(GenerationInterface):
 
         # Ensure subprocesses are cleaned up on normal exit.
         atexit.register(self.shutdown)
-
-    # ------------------------------------------------------------------
-    # Placement group helpers (mirrors VllmGeneration)
-    # ------------------------------------------------------------------
-
-    def _get_tied_worker_bundle_indices(
-        self, cluster: RayVirtualCluster
-    ) -> list[tuple[int, list[int]]]:
-        from ray.util.placement_group import PlacementGroup
-
-        placement_groups = cluster.get_placement_groups()
-        if not placement_groups:
-            raise ValueError("No placement groups available in the cluster")
-
-        tp_size = self.tp_size
-
-        if len(placement_groups) == 1:
-            pg = placement_groups[0]
-            num_groups = pg.bundle_count // tp_size
-
-            def get_node_bundles(pg: PlacementGroup) -> dict[str, list[int]]:
-                table = ray.util.placement_group_table(pg)
-                node_to_bundles: dict[str, list[int]] = {}
-                for idx, bundle in enumerate(table.get("bundles_to_node_id", [])):
-                    node_to_bundles.setdefault(bundle, []).append(idx)
-                return node_to_bundles
-
-            node_bundles = get_node_bundles(pg)
-            bundle_to_node = {}
-            for node, bundles in node_bundles.items():
-                for b in bundles:
-                    bundle_to_node[b] = node
-
-            sorted_nodes = sorted(node_bundles)
-            node_idx = {nid: idx for idx, nid in enumerate(sorted_nodes)}
-            flat: list[int] = []
-            for nid in sorted_nodes:
-                flat.extend(node_bundles[nid])
-
-            groups: list[tuple[int, list[int]]] = []
-            for i in range(num_groups):
-                slice_ = flat[i * tp_size : (i + 1) * tp_size]
-                first_node = bundle_to_node[slice_[0]]
-                groups.append((node_idx[first_node], slice_))
-
-            return groups
-        else:
-            tied_groups: list[tuple[int, list[int]]] = []
-            for pg_idx, pg in enumerate(placement_groups):
-                if pg.bundle_count == 0:
-                    continue
-                num_groups_in_pg = pg.bundle_count // tp_size
-                for group_idx in range(num_groups_in_pg):
-                    start_idx = group_idx * tp_size
-                    bundle_indices = list(range(start_idx, start_idx + tp_size))
-                    tied_groups.append((pg_idx, bundle_indices))
-            if not tied_groups:
-                raise ValueError(
-                    "Unable to allocate any worker groups with the available resources."
-                )
-            return tied_groups
 
     # ------------------------------------------------------------------
     # Utilities
@@ -338,9 +262,6 @@ class DynamoVllmGeneration(GenerationInterface):
                 "--initial-advertise-peer-urls", peer_url,
                 "--initial-cluster", f"default={peer_url}",
                 "--data-dir", self._etcd_data_dir,
-                # Increase timeouts so etcd survives CPU contention during
-                # vLLM model loading on the same node.  Keep election timeout
-                # moderate so initial leader election completes quickly.
                 "--heartbeat-interval", "500",
                 "--election-timeout", "5000",
             ],
@@ -428,8 +349,13 @@ class DynamoVllmGeneration(GenerationInterface):
             flush=True,
         )
 
-    def _healthcheck_frontend(self, timeout: float = 300) -> None:
-        """Poll ``/health`` until all workers have registered."""
+    def _healthcheck_frontend(
+        self, timeout: float = 300, expected_workers: Optional[int] = None
+    ) -> None:
+        """Poll ``/health`` until expected workers have registered."""
+        if expected_workers is None:
+            expected_workers = self._pool.size
+
         url = f"http://localhost:{self._frontend_port}/health"
         deadline = time.monotonic() + timeout
         last_error = None
@@ -450,7 +376,7 @@ class DynamoVllmGeneration(GenerationInterface):
                         1 for i in data.get("instances", [])
                         if i.get("endpoint") == "generate"
                     )
-                    if num_instances >= self.dp_size:
+                    if num_instances >= expected_workers:
                         print(
                             f"  [Dynamo] Frontend healthy — "
                             f"{num_instances} worker(s) registered",
@@ -463,7 +389,7 @@ class DynamoVllmGeneration(GenerationInterface):
 
         raise RuntimeError(
             f"Dynamo frontend did not become healthy within {timeout}s. "
-            f"Expected {self.dp_size} workers, last error: {last_error}"
+            f"Expected {expected_workers} workers, last error: {last_error}"
         )
 
     # ------------------------------------------------------------------
@@ -513,7 +439,6 @@ class DynamoVllmGeneration(GenerationInterface):
                     print(f"  [Dynamo] VirtualConnectorClient error: {e}", flush=True)
                 break
 
-            # Check planner health after an event is signaled, not during idle wait.
             if self._planner_process is not None:
                 retcode = self._planner_process.poll()
                 if retcode is not None:
@@ -533,12 +458,17 @@ class DynamoVllmGeneration(GenerationInterface):
                 break
 
     def _handle_scaling_event(self, event: Any) -> None:
-        """Mock handler — logs the scaling decision without actually scaling."""
+        """Scale workers to match the planner's desired replica count."""
+        desired = event.num_decode_workers
+        current = self._pool.size
+
         print(
             f"  [Dynamo] Scaling event (decision_id={event.decision_id}): "
-            f"prefill={event.num_prefill_workers}, decode={event.num_decode_workers}",
+            f"decode={desired} (current={current})",
             flush=True,
         )
+
+        self._pool.scale_to(desired)
 
     # ------------------------------------------------------------------
     # GenerationInterface
@@ -578,11 +508,7 @@ class DynamoVllmGeneration(GenerationInterface):
             shutil.rmtree(self._etcd_data_dir, ignore_errors=True)
             self._etcd_data_dir = None
 
-        try:
-            self.worker_group.shutdown(cleanup_method="shutdown")
-        except Exception as e:
-            print(f"  [Dynamo] Warning: worker shutdown failed: {e}", flush=True)
-
+        self._pool.shutdown()
         return True
 
     # ------------------------------------------------------------------
