@@ -483,7 +483,9 @@ def math_hf_data_processor(
         return_tensors="pt",
         add_special_tokens=False,
     )["input_ids"][0]
-    message_log.append({"role": "user", "content": message, "token_ids": token_ids})
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
 
     length = sum(len(m["token_ids"]) for m in message_log)
 
