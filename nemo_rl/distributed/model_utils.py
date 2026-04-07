@@ -649,7 +649,8 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
 
             gi = global_indices[:, s0:s1, :]
             in_range = (gi >= int(vocab_start_index)) & (gi < int(vocab_end_index))
-            li = (gi - int(vocab_start_index)).clamp(min=0, max=V_local - 1)
+            # .long() ensures gather works when indices are stored as int32
+            li = (gi - int(vocab_start_index)).clamp(min=0, max=V_local - 1).long()
 
             local_vals = torch.gather(log_probs, dim=-1, index=li)
             local_vals = local_vals * in_range.to(dtype=local_vals.dtype)
@@ -699,7 +700,8 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
 
             gi = global_indices[:, s0:s1, :]
             in_range = (gi >= int(vocab_start_index)) & (gi < int(vocab_end_index))
-            li = (gi - int(vocab_start_index)).clamp(min=0, max=V_local - 1)
+            # .long() ensures scatter_add_ works when indices are stored as int32
+            li = (gi - int(vocab_start_index)).clamp(min=0, max=V_local - 1).long()
 
             # Sum over K for the softmax term
             go_chunk = grad_output[:, s0:s1, :]  # [B, Sc, K]
@@ -1457,7 +1459,8 @@ def gather_logits_at_global_indices(
         in_range = (gi >= int(vocab_start_index)) & (gi < int(vocab_end_index))
         # Map global ids to local shard ids and clamp to valid range to avoid OOB gather
         V_local = logits.shape[-1]
-        li = (gi - int(vocab_start_index)).clamp(min=0, max=V_local - 1)
+        # .long() ensures gather works when indices are stored as int32
+        li = (gi - int(vocab_start_index)).clamp(min=0, max=V_local - 1).long()
 
         local_vals = torch.gather(logits[:, s0:s1, :], dim=-1, index=li)
         local_vals = local_vals * in_range.to(dtype=local_vals.dtype)
@@ -1604,7 +1607,7 @@ def get_distillation_topk_logprobs_from_logits(
         else:
             student_logprobs = torch.nn.functional.log_softmax(student_logits, dim=-1)
             student_topk_logprobs = student_logprobs.gather(
-                dim=-1, index=teacher_topk_indices
+                dim=-1, index=teacher_topk_indices.long()
             )
 
             if calculate_entropy:
@@ -1629,7 +1632,7 @@ def get_distillation_topk_logprobs_from_logits(
         # Non-distributed processing
         else:
             student_topk_logits = student_logits.gather(
-                dim=-1, index=teacher_topk_indices
+                dim=-1, index=teacher_topk_indices.long()
             )
 
         student_topk_logprobs = torch.nn.functional.log_softmax(

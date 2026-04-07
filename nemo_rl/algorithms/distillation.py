@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations.
 # limitations under the License.
+import gc
 import os
 import warnings
 from copy import deepcopy
@@ -1077,6 +1078,12 @@ def distillation_train(
                         timer=timer,
                     )
 
+                    # Downcast indices from int64 to int32 to halve CPU memory
+                    # (safe for any vocab_size < 2^31 ≈ 2.1B).
+                    teacher_topk["topk_indices"] = teacher_topk["topk_indices"].to(
+                        torch.int32
+                    )
+
                     if has_teacher_ml:
                         # Align teacher topk logits to student sequence positions
                         aligned_logits, aligned_indices = _align_teacher_topk_to_student(
@@ -1093,6 +1100,22 @@ def distillation_train(
                         train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
                     if total_steps == 0:
                         _debug_print_first_sample(train_data, teacher_data, tokenizer)
+
+                # Free large intermediate tensors before training to reduce
+                # peak CPU memory.  train_data already holds the (aligned)
+                # logits/indices it needs; everything else is dead weight.
+                del teacher_topk
+                if has_teacher_ml:
+                    del teacher_data
+                # Keep only the lightweight "content" field needed for logging;
+                # the heavy tensor fields (token_ids, token_loss_mask) are
+                # already referenced by train_data and stay alive through it.
+                flat_messages = {"content": flat_messages.get("content")}
+                # Keep lightweight fields (e.g. "length") used for metrics;
+                # drop the heavy message-log lists.
+                for _key in ("message_log", "teacher_message_log", "teacher_prefix_message_log"):
+                    repeated_batch.pop(_key, None)
+                gc.collect()
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
