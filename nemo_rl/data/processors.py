@@ -469,7 +469,7 @@ def math_hf_data_processor(
     )
     message_list.append({"role": "user", "content": formatted_content})
 
-    message: list[str] = tokenizer.apply_chat_template(  # type: ignore
+    message: str = tokenizer.apply_chat_template(  # type: ignore
         message_list,
         tokenize=False,
         add_generation_prompt=True,
