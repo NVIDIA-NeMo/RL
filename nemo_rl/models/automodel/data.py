@@ -55,6 +55,11 @@ class ProcessedInputs:
     cp_buffers: list[torch.Tensor] = field(default_factory=list)
     seq_index: Optional[torch.Tensor] = None
 
+    # THD packing support (seq_packing + CP with TE attention)
+    packed_seq_params: Any = None  # PackedSeqParams from megatron packing
+    cu_seqlens: Optional[torch.Tensor] = None
+    cu_seqlens_padded: Optional[torch.Tensor] = None
+
     @property
     def has_context_parallel(self) -> bool:
         """Check if context parallel is enabled."""
@@ -100,6 +105,7 @@ def make_processed_microbatch_iterator(
     tokenizer: AutoTokenizer,
     cfg: dict[str, Any],
     cp_size: int,
+    cp_mesh: Any = None,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -112,6 +118,7 @@ def make_processed_microbatch_iterator(
         tokenizer: Tokenizer for processing
         cfg: Configuration dictionary (enable_seq_packing is inferred from cfg["sequence_packing"]["enabled"])
         cp_size: Context parallel size
+        cp_mesh: Optional CP device mesh (needed for seq_packing + CP)
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
@@ -131,6 +138,7 @@ def make_processed_microbatch_iterator(
             enable_seq_packing,
             cfg,
             cp_size,
+            cp_mesh=cp_mesh,
         )
 
         yield ProcessedMicrobatch(
@@ -148,6 +156,7 @@ def get_microbatch_iterator(
     dp_mesh: Any,  # noqa: ARG001
     tokenizer: AutoTokenizer,
     cp_size: int = 1,
+    cp_mesh: Any = None,
 ) -> tuple[Iterator[ProcessedMicrobatch], int]:
     """Create processed microbatch iterator based on batching strategy.
 
@@ -193,6 +202,7 @@ def get_microbatch_iterator(
         tokenizer,
         cfg,
         cp_size,
+        cp_mesh=cp_mesh,
     )
     return processed_iterator, iterator_len
 
@@ -203,6 +213,7 @@ def process_microbatch(
     enable_seq_packing: bool,
     cfg: dict[str, Any],
     cp_size: int,
+    cp_mesh: Any = None,
 ) -> ProcessedInputs:
     """Process a microbatch and prepare inputs for model forward.
 
@@ -217,6 +228,44 @@ def process_microbatch(
         ProcessedInputs containing all tensors and metadata for forward pass
     """
     input_ids = mb.get("input_ids").cuda()
+
+    if enable_seq_packing and cp_size > 1:
+        # Seq packing + CP: reuse megatron packing utility which handles CP sharding
+        from nemo_rl.models.megatron.data import _pack_sequences_for_megatron
+
+        # Determine CP rank from mesh
+        cp_rank = (
+            torch.distributed.get_rank(cp_mesh.get_group())
+            if cp_mesh is not None
+            else 0
+        )
+
+        (
+            all_input_ids,
+            input_ids_cp_sharded,
+            packed_seq_params,
+            cu_seqlens,
+            cu_seqlens_padded,
+        ) = _pack_sequences_for_megatron(
+            input_ids=input_ids,
+            seq_lengths=mb["input_lengths"],
+            pad_individual_seqs_to_multiple_of=cp_size * 2,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+        )
+
+        return ProcessedInputs(
+            input_ids=input_ids_cp_sharded,
+            seq_len=input_ids_cp_sharded.shape[1],
+            attention_mask=None,
+            position_ids=None,
+            flash_attn_kwargs={},
+            cp_buffers=[],
+            seq_index=None,
+            packed_seq_params=packed_seq_params,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_padded=cu_seqlens_padded,
+        )
 
     if enable_seq_packing:
         input_ids, position_ids, _ = pack_sequences(

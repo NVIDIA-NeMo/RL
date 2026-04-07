@@ -36,6 +36,8 @@ class DistributedContext(NamedTuple):
     dp_size: int
     tp_size: int
     cp_size: int
+    pp_size: int
+    pp_mesh: Any  # Optional[DeviceMesh], None when pp_size==1
 
 
 class RuntimeConfig(NamedTuple):
