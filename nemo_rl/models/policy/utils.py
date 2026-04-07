@@ -50,6 +50,15 @@ from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_
 # an automodel factory for loading the huggingface models from correct class
 
 AUTOMODEL_FACTORY: Dict[str, Any] = {
+    # Add an entry here when a model (1) uses HF's standard loading path
+    # (no custom NeMo automodel impl) AND (2) its architecture isn't
+    # loadable via AutoModelForCausalLM (e.g. VLMs using
+    # ForConditionalGeneration / ForImageTextToText). Models with a
+    # custom NeMo automodel impl (e.g. qwen3_5_moe) don't need an entry
+    # — the custom impl intercepts from_pretrained regardless of the
+    # parent AutoModel class. Check MODEL_ARCH_MAPPING in the NeMo
+    # automodel registry to see which architectures have custom impls:
+    # https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
     "qwen2_5_vl": AutoModelForImageTextToText,
     "qwen2_vl": AutoModelForImageTextToText,
     "qwen2_5_omni": AutoModelForTextToWaveform,
