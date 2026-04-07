@@ -1,0 +1,15 @@
+defaults: ./grpo-moonlight-16b-automodel-1n8g-ep8.yaml
+policy:
+  train_micro_batch_size: 4
+  dtensor_cfg:
+    pipeline_parallel_size: 2
+    expert_parallel_size: 4
+    automodel_kwargs:
+      pipeline_config:
+        _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
+        pp_schedule: Interleaved1F1B
+        pp_microbatch_size: 2
+  dynamic_batching:
+    enabled: false
+checkpointing:
+  checkpoint_dir: results/grpo-moonlight-16b-automodel-1n8g-pp2ep4

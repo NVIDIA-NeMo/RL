@@ -54,6 +54,7 @@ class AutomodelCheckpointManager:
         dp_mesh: DeviceMesh,
         tp_mesh: DeviceMesh,
         moe_mesh: Optional[DeviceMesh] = None,
+        pp_mesh: Optional[DeviceMesh] = None,
     ):
         """Initialize the AutomodelCheckpointManager.
 
@@ -61,12 +62,14 @@ class AutomodelCheckpointManager:
             dp_mesh: The data parallel device mesh.
             tp_mesh: The tensor parallel device mesh.
             moe_mesh: Optional MoE device mesh.
+            pp_mesh: Optional pipeline parallel device mesh.
         """
         self.checkpointer: Optional[Checkpointer] = None
         self.checkpoint_config: Optional[AutomodelCheckpointingConfig] = None
         self.dp_mesh = dp_mesh
         self.tp_mesh = tp_mesh
         self.moe_mesh = moe_mesh
+        self.pp_mesh = pp_mesh
 
     def _get_dp_rank(self) -> int:
         """Get the data parallel rank."""
@@ -98,7 +101,11 @@ class AutomodelCheckpointManager:
 
         dp_rank = self._get_dp_rank()
         tp_rank = self._get_tp_rank()
-        pp_rank = 0
+        pp_rank = (
+            torch.distributed.get_rank(self.pp_mesh.get_group())
+            if self.pp_mesh is not None
+            else 0
+        )
 
         # Initialize a base config with sensible defaults
         base_cfg = AutomodelCheckpointingConfig(
