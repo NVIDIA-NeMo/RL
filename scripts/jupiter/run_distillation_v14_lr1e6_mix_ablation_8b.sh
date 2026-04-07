@@ -1,11 +1,13 @@
 #!/bin/bash
-# Submit 3 Qwen3-8B self-distill runs on Jupiter (2 nodes × 4 GPUs).
+# Submit 5 Qwen3-8B self-distill runs on Jupiter (2 nodes × 4 GPUs).
 #
 # TP=2, CP=1, DP=4 — GBS=128, MBS=2, train_mb_tokens=20480
 #
 #   Run 1: LR 1e-6, warmup 50,  mix10
 #   Run 2: LR 1e-6, warmup 50,  mix25
 #   Run 3: LR 5e-7, warmup 100, mix10
+#   Run 4: LR 5e-7, warmup 100, mix10, teacher update every 50 steps
+#   Run 5: LR 5e-7, warmup 100, be-concise prompts (student-concise + teacher-concise, no mix)
 #
 # Student/eval prompt: cot.txt (config default)
 # Teacher prompt: teacher_rewrite_v14_independent_check_improved.txt (config default)
@@ -67,7 +69,7 @@ BASE_8B=(
   distillation.num_prompts_per_step=128
   distillation.val_at_start=true
   data.default.column_mapping.qwen3_8b_answer=trace
-  'data.validation=[{dataset_name: MATH500, repeat: 1, teacher_prompt_file: null}, {dataset_name: AIME2024, repeat: 4, teacher_prompt_file: null}, {dataset_name: AIME2025, repeat: 4, teacher_prompt_file: null}, {dataset_name: AIME2026, repeat: 4, teacher_prompt_file: null}]'
+  'data.validation=[{dataset_name: MATH500, repeat: 1, prompt_file: examples/prompts/cot.txt, teacher_prompt_file: null}, {dataset_name: AIME2024, repeat: 4, prompt_file: examples/prompts/cot.txt, teacher_prompt_file: null}, {dataset_name: AIME2025, repeat: 4, prompt_file: examples/prompts/cot.txt, teacher_prompt_file: null}, {dataset_name: AIME2026, repeat: 4, prompt_file: examples/prompts/cot.txt, teacher_prompt_file: null}]'
 )
 
 # --- Run 1: LR 1e-6, warmup 50, mix10 ---
@@ -106,4 +108,31 @@ submit_job "d-8b-v14-mix10-lr5e7" "${NODES}" \
   logger.log_dir="${LOG_ROOT}/distill-8b-v14-mix10-lr5e7" \
   logger.wandb.name=distill-8b-v14-mix10-lr5e7
 
-echo "All 3 runs submitted through ${RAY_SUB}."
+# --- Run 4: LR 5e-7, warmup 100, mix10, teacher update every 50 steps ---
+
+submit_job "d-8b-v14-mix10-lr5e7-tu50" "${NODES}" \
+  "${BASE_8B[@]}" \
+  distillation.teacher_student_prefix_fraction=0.10 \
+  policy.optimizer.kwargs.lr=5e-7 \
+  policy.scheduler.0.kwargs.total_iters=100 \
+  'policy.scheduler.2.milestones=[100]' \
+  distillation.teacher_update_period=50 \
+  checkpointing.checkpoint_dir="${CKPT}/distill-8b-v14-mix10-lr5e7-tu50" \
+  logger.log_dir="${LOG_ROOT}/distill-8b-v14-mix10-lr5e7-tu50" \
+  logger.wandb.name=distill-8b-v14-mix10-lr5e7-tu50
+
+# --- Run 5: LR 5e-7, warmup 100, be-concise prompts (no mix) ---
+
+submit_job "d-8b-bc-lr5e7" "${NODES}" \
+  "${BASE_8B[@]}" \
+  distillation.teacher_student_prefix_fraction=0.00 \
+  policy.optimizer.kwargs.lr=5e-7 \
+  policy.scheduler.0.kwargs.total_iters=100 \
+  'policy.scheduler.2.milestones=[100]' \
+  data.default.prompt_file=examples/prompts/student-concise.txt \
+  data.default.teacher_prompt_file=examples/prompts/teacher-concise.txt \
+  checkpointing.checkpoint_dir="${CKPT}/distill-8b-bc-lr5e7" \
+  logger.log_dir="${LOG_ROOT}/distill-8b-bc-lr5e7" \
+  logger.wandb.name=distill-8b-bc-lr5e7
+
+echo "All 5 runs submitted through ${RAY_SUB}."

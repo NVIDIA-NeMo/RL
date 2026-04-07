@@ -940,6 +940,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         ray.get(futures)
 
+    def load_checkpoint(self, weights_path: str) -> None:
+        """Load weights into the model (no optimizer/scheduler)."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "load_checkpoint", weights_path=weights_path
+        )
+        ray.get(futures)
+
     def shutdown(self) -> bool:
         """Shut down all HF workers and clean up resources."""
         try:

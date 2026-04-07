@@ -96,6 +96,9 @@ class DistillationConfig(TypedDict):
     val_max_total_sequence_length: NotRequired[Optional[int]]
     val_max_new_tokens: NotRequired[Optional[int]]
     val_temperature: NotRequired[Optional[float]]
+    # If set, copy student weights to the teacher every N steps (online self-distillation).
+    # None (default) keeps the teacher frozen for the entire run.
+    teacher_update_period: NotRequired[Optional[int]]
 
 
 class DistillationSaveState(TypedDict):
@@ -488,6 +491,15 @@ def setup(
         init_reference_model=False,
     )
 
+    # When resuming with online teacher updates, sync student weights to teacher
+    # so the teacher matches the state it would have had before the interruption.
+    if last_checkpoint_path and distillation_config.get("teacher_update_period"):
+        print("▶ Syncing student weights to teacher (resume with teacher updates)...", flush=True)
+        student_weights_path = str(Path(last_checkpoint_path) / "policy" / "weights")
+        teacher_policy.prepare_for_lp_inference()
+        teacher_policy.load_checkpoint(weights_path=student_weights_path)
+        teacher_policy.offload_after_refit()
+
     if student_generation is not None:
         state_dict_info = student_policy.prepare_refit_info()
         student_generation.prepare_refit_info(state_dict_info)
@@ -878,6 +890,9 @@ def distillation_train(
     max_steps = master_config["distillation"][
         "max_num_steps"
     ]  # max number of steps to train for
+    teacher_update_period: Optional[int] = master_config["distillation"].get(
+        "teacher_update_period", None
+    )
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -1130,6 +1145,25 @@ def distillation_train(
                         loss_fn,
                         timer=timer,
                     )
+
+                # Update teacher weights from student if configured
+                if (
+                    teacher_update_period
+                    and (total_steps + 1) % teacher_update_period == 0
+                ):
+                    print(
+                        f"▶ Updating teacher weights from student (step {total_steps + 1})...",
+                        flush=True,
+                    )
+                    with timer.time("teacher_weight_update"):
+                        sync_dir = os.path.join(
+                            master_config["checkpointing"]["checkpoint_dir"],
+                            "_teacher_sync",
+                        )
+                        student_policy.save_checkpoint(weights_path=sync_dir)
+                        teacher_policy.prepare_for_lp_inference()
+                        teacher_policy.load_checkpoint(weights_path=sync_dir)
+                        teacher_policy.offload_after_refit()
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
