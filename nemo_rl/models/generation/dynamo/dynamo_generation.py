@@ -23,12 +23,16 @@ All generation requests go through the frontend.  Weight updates are
 not supported — calling any weight-update method will ``assert False``.
 """
 
+import asyncio
+import atexit
+import json
 import os
 import shutil
 import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any, Optional, Union
 
@@ -52,6 +56,15 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+
+# (attr_name, display_name, stop_timeout_seconds)
+# Order determines shutdown sequence.
+_SUBPROCESS_REGISTRY: list[tuple[str, str, int]] = [
+    ("_planner_process", "planner", 15),
+    ("_frontend_process", "frontend", 15),
+    ("_nats_process", "NATS", 10),
+    ("_etcd_process", "etcd", 10),
+]
 
 
 class DynamoVllmGeneration(GenerationInterface):
@@ -111,21 +124,25 @@ class DynamoVllmGeneration(GenerationInterface):
         # NATS port for the event plane.
         self._nats_port = _get_free_port_local()
 
-        # Subprocess handles.
+        # Subprocess handles (see _SUBPROCESS_REGISTRY for ordering/timeouts).
         self._etcd_process: Optional[subprocess.Popen] = None
         self._etcd_data_dir: Optional[str] = None
         self._nats_process: Optional[subprocess.Popen] = None
         self._frontend_process: Optional[subprocess.Popen] = None
+        self._planner_process: Optional[subprocess.Popen] = None
+        self._planner_config_file: Optional[str] = None
 
-        # ------------------------------------------------------------------
-        # 1. Start etcd and NATS
-        # ------------------------------------------------------------------
+        # VirtualConnectorClient state.
+        self._vc_stop = threading.Event()
+        self._vc_thread: Optional[threading.Thread] = None
+
         self._start_etcd()
         self._start_nats()
 
-        # ------------------------------------------------------------------
-        # 2. Placement groups & worker group
-        # ------------------------------------------------------------------
+        if dynamo_cfg.get("enable_planner", False):
+            self._start_planner()
+            self._start_virtual_connector_client()
+
         needs_cross_node_parallelism = self.tp_size > cluster.num_gpus_per_node
         strategy = None if config["colocated"]["enabled"] else "PACK"
 
@@ -143,10 +160,7 @@ class DynamoVllmGeneration(GenerationInterface):
         worker_builder = RayWorkerBuilder(worker_cls, config)
 
         env_vars = {
-            "ETCD_ENDPOINTS": f"http://{self._host}:{self._etcd_port}",
-            "NATS_SERVER": f"nats://{self._host}:{self._nats_port}",
-            "DYN_DISCOVERY_BACKEND": "etcd",
-            "DYN_NAMESPACE": self._namespace,
+            **self._dynamo_env_vars(),
             "ALLOW_NONE_AUTHENTICATION": "yes",
             "DYNAMO_VLLM_PYTHON": self._vllm_python,
         }
@@ -171,15 +185,9 @@ class DynamoVllmGeneration(GenerationInterface):
                 env_vars=env_vars,
             )
 
-        # ------------------------------------------------------------------
-        # 3. Start frontend (blocks until workers register)
-        # ------------------------------------------------------------------
         self._start_frontend()
         self._healthcheck_frontend()
 
-        # ------------------------------------------------------------------
-        # 4. Expose URL for NeMo-Gym
-        # ------------------------------------------------------------------
         self.dp_openai_server_base_urls: list[Optional[str]] = [
             f"http://{self._host}:{self._frontend_port}/v1"
         ]
@@ -187,6 +195,9 @@ class DynamoVllmGeneration(GenerationInterface):
             f"  [Dynamo] Ready at {self.dp_openai_server_base_urls[0]}",
             flush=True,
         )
+
+        # Ensure subprocesses are cleaned up on normal exit.
+        atexit.register(self.shutdown)
 
     # ------------------------------------------------------------------
     # Placement group helpers (mirrors VllmGeneration)
@@ -250,187 +261,26 @@ class DynamoVllmGeneration(GenerationInterface):
             return tied_groups
 
     # ------------------------------------------------------------------
-    # etcd lifecycle
-    # ------------------------------------------------------------------
-
-    def _start_etcd(self) -> None:
-        if self._etcd_process is not None:
-            return
-
-        self._etcd_data_dir = tempfile.mkdtemp(prefix="nemorl_etcd_")
-
-        cmd = [
-            "etcd",
-            "--listen-client-urls",
-            f"http://0.0.0.0:{self._etcd_port}",
-            "--advertise-client-urls",
-            f"http://{self._host}:{self._etcd_port}",
-            "--listen-peer-urls",
-            f"http://0.0.0.0:{self._etcd_peer_port}",
-            "--data-dir",
-            self._etcd_data_dir,
-            # Increase timeouts so etcd survives CPU contention during
-            # vLLM model loading on the same node.  Keep election timeout
-            # moderate so initial leader election completes quickly.
-            "--heartbeat-interval",
-            "500",
-            "--election-timeout",
-            "5000",
-        ]
-
-        env = os.environ.copy()
-        env["ALLOW_NONE_AUTHENTICATION"] = "yes"
-
-        self._etcd_process = subprocess.Popen(
-            cmd,
-            env=env,
-        )
-
-        # Wait for etcd to be fully ready (not just TCP-open, but serving).
-        self._wait_for_etcd(timeout=30)
-        print(
-            f"  [Dynamo] etcd started on port {self._etcd_port} "
-            f"(pid={self._etcd_process.pid})",
-            flush=True,
-        )
-
-    def _stop_etcd(self) -> None:
-        if self._etcd_process is not None:
-            self._etcd_process.send_signal(signal.SIGTERM)
-            try:
-                self._etcd_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self._etcd_process.kill()
-            self._etcd_process = None
-            print("  [Dynamo] etcd stopped", flush=True)
-
-        if self._etcd_data_dir is not None:
-            shutil.rmtree(self._etcd_data_dir, ignore_errors=True)
-            self._etcd_data_dir = None
-
-    # ------------------------------------------------------------------
-    # NATS lifecycle
-    # ------------------------------------------------------------------
-
-    def _start_nats(self) -> None:
-        if self._nats_process is not None:
-            return
-
-        cmd = [
-            "nats-server",
-            "-p",
-            str(self._nats_port),
-        ]
-
-        self._nats_process = subprocess.Popen(
-            cmd,
-        )
-
-        self._wait_for_port(self._nats_port, timeout=30, label="NATS")
-        print(
-            f"  [Dynamo] NATS started on port {self._nats_port} "
-            f"(pid={self._nats_process.pid})",
-            flush=True,
-        )
-
-    def _stop_nats(self) -> None:
-        if self._nats_process is not None:
-            self._nats_process.send_signal(signal.SIGTERM)
-            try:
-                self._nats_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self._nats_process.kill()
-            self._nats_process = None
-            print("  [Dynamo] NATS stopped", flush=True)
-
-    # ------------------------------------------------------------------
-    # Frontend lifecycle
-    # ------------------------------------------------------------------
-
-    def _start_frontend(self) -> None:
-        if self._frontend_process is not None:
-            return
-
-        cmd = [
-            self._vllm_python,
-            "-m",
-            "dynamo.frontend",
-            "--http-port",
-            str(self._frontend_port),
-            "--http-host",
-            "0.0.0.0",
-            "--router-mode",
-            self._router_mode,
-            "--discovery-backend",
-            "etcd",
-            "--namespace-prefix",
-            self._namespace,
-        ]
-
-        env = os.environ.copy()
-        env["ETCD_ENDPOINTS"] = f"http://{self._host}:{self._etcd_port}"
-        env["NATS_SERVER"] = f"nats://{self._host}:{self._nats_port}"
-        env["ALLOW_NONE_AUTHENTICATION"] = "yes"
-
-        self._frontend_process = subprocess.Popen(
-            cmd,
-            env=env,
-        )
-
-        print(
-            f"  [Dynamo] Frontend starting on http://{self._host}:{self._frontend_port} "
-            f"(pid={self._frontend_process.pid}, router={self._router_mode})",
-            flush=True,
-        )
-
-    def _stop_frontend(self) -> None:
-        if self._frontend_process is not None:
-            self._frontend_process.send_signal(signal.SIGTERM)
-            try:
-                self._frontend_process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                self._frontend_process.kill()
-            self._frontend_process = None
-            print("  [Dynamo] Frontend stopped", flush=True)
-
-    def _healthcheck_frontend(self, timeout: float = 300) -> None:
-        """Poll ``/health`` until all workers have registered."""
-        url = f"http://localhost:{self._frontend_port}/health"
-        deadline = time.monotonic() + timeout
-        last_error = None
-
-        while time.monotonic() < deadline:
-            if self._frontend_process is not None:
-                retcode = self._frontend_process.poll()
-                if retcode is not None:
-                    raise RuntimeError(
-                        f"Dynamo frontend exited with code {retcode}. "
-                        f"Check console output above for details."
-                    )
-            try:
-                resp = requests.get(url, timeout=5)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    instances = data.get("instances", [])
-                    if len(instances) >= self.dp_size:
-                        print(
-                            f"  [Dynamo] Frontend healthy — "
-                            f"{len(instances)} worker(s) registered",
-                            flush=True,
-                        )
-                        return
-            except requests.RequestException as e:
-                last_error = e
-            time.sleep(2)
-
-        raise RuntimeError(
-            f"Dynamo frontend did not become healthy within {timeout}s. "
-            f"Expected {self.dp_size} workers, last error: {last_error}"
-        )
-
-    # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
+
+    def _dynamo_env_vars(self) -> dict[str, str]:
+        """Env vars required by all dynamo components."""
+        return {
+            "ETCD_ENDPOINTS": f"http://{self._host}:{self._etcd_port}",
+            "NATS_SERVER": f"nats://{self._host}:{self._nats_port}",
+            "DYN_NAMESPACE": self._namespace,
+            "DYN_DISCOVERY_BACKEND": "etcd",
+        }
+
+    @staticmethod
+    def _stop_subprocess(proc: subprocess.Popen, name: str, timeout: int) -> None:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        print(f"  [Dynamo] {name} stopped", flush=True)
 
     @staticmethod
     def _wait_for_port(port: int, timeout: float = 30, label: str = "service") -> None:
@@ -467,30 +317,276 @@ class DynamoVllmGeneration(GenerationInterface):
         )
 
     # ------------------------------------------------------------------
-    # GenerationInterface — supported methods
+    # Subprocess lifecycle
     # ------------------------------------------------------------------
 
+    def _start_etcd(self) -> None:
+        if self._etcd_process is not None:
+            return
+
+        self._etcd_data_dir = tempfile.mkdtemp(prefix="nemorl_etcd_")
+
+        peer_url = f"http://{self._host}:{self._etcd_peer_port}"
+        env = os.environ.copy()
+        env["ALLOW_NONE_AUTHENTICATION"] = "yes"
+        self._etcd_process = subprocess.Popen(
+            [
+                "etcd",
+                "--listen-client-urls", f"http://0.0.0.0:{self._etcd_port}",
+                "--advertise-client-urls", f"http://{self._host}:{self._etcd_port}",
+                "--listen-peer-urls", f"http://0.0.0.0:{self._etcd_peer_port}",
+                "--initial-advertise-peer-urls", peer_url,
+                "--initial-cluster", f"default={peer_url}",
+                "--data-dir", self._etcd_data_dir,
+                # Increase timeouts so etcd survives CPU contention during
+                # vLLM model loading on the same node.  Keep election timeout
+                # moderate so initial leader election completes quickly.
+                "--heartbeat-interval", "500",
+                "--election-timeout", "5000",
+            ],
+            env=env,
+        )
+        self._wait_for_etcd(timeout=30)
+        print(
+            f"  [Dynamo] etcd started on port {self._etcd_port} "
+            f"(pid={self._etcd_process.pid})",
+            flush=True,
+        )
+
+    def _start_nats(self) -> None:
+        if self._nats_process is not None:
+            return
+
+        self._nats_process = subprocess.Popen(
+            ["nats-server", "-p", str(self._nats_port)],
+        )
+        self._wait_for_port(self._nats_port, timeout=30, label="NATS")
+        print(
+            f"  [Dynamo] NATS started on port {self._nats_port} "
+            f"(pid={self._nats_process.pid})",
+            flush=True,
+        )
+
+    def _start_planner(self) -> None:
+        if self._planner_process is not None:
+            return
+
+        planner_config = {
+            "environment": "virtual",
+            "mode": "decode",
+            "backend": "vllm",
+            "namespace": self._namespace,
+            "model_name": self.cfg.get("model", "unknown"),
+            "enable_throughput_scaling": False,
+            "enable_load_scaling": True,
+            "pre_deployment_sweeping_mode": "none",
+            "decode_engine_num_gpu": self.tp_size,
+            "ttft": 500.0,
+            "itl": 50.0,
+            "max_gpu_budget": 2,
+            "min_endpoint": 1,
+            "load_adjustment_interval": 5,
+            "load_scaling_down_sensitivity": 80,
+        }
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+            json.dump(planner_config, tf)
+            self._planner_config_file = tf.name
+
+        env = os.environ.copy()
+        env.update(self._dynamo_env_vars())
+        self._planner_process = subprocess.Popen(
+            [self._vllm_python, "-m", "dynamo.planner", "--config", self._planner_config_file],
+            env=env,
+        )
+        print(
+            f"  [Dynamo] Planner starting (pid={self._planner_process.pid})",
+            flush=True,
+        )
+
+    def _start_frontend(self) -> None:
+        if self._frontend_process is not None:
+            return
+
+        env = os.environ.copy()
+        env.update(self._dynamo_env_vars())
+        env["ALLOW_NONE_AUTHENTICATION"] = "yes"
+        self._frontend_process = subprocess.Popen(
+            [
+                self._vllm_python, "-m", "dynamo.frontend",
+                "--http-port", str(self._frontend_port),
+                "--http-host", "0.0.0.0",
+                "--router-mode", self._router_mode,
+                "--discovery-backend", "etcd",
+                "--namespace-prefix", self._namespace,
+            ],
+            env=env,
+        )
+        print(
+            f"  [Dynamo] Frontend starting on http://{self._host}:{self._frontend_port} "
+            f"(pid={self._frontend_process.pid}, router={self._router_mode})",
+            flush=True,
+        )
+
+    def _healthcheck_frontend(self, timeout: float = 300) -> None:
+        """Poll ``/health`` until all workers have registered."""
+        url = f"http://localhost:{self._frontend_port}/health"
+        deadline = time.monotonic() + timeout
+        last_error = None
+
+        while time.monotonic() < deadline:
+            if self._frontend_process is not None:
+                retcode = self._frontend_process.poll()
+                if retcode is not None:
+                    raise RuntimeError(
+                        f"Dynamo frontend exited with code {retcode}. "
+                        f"Check console output above for details."
+                    )
+            try:
+                resp = requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    num_instances = sum(
+                        1 for i in data.get("instances", [])
+                        if i.get("endpoint") == "generate"
+                    )
+                    if num_instances >= self.dp_size:
+                        print(
+                            f"  [Dynamo] Frontend healthy — "
+                            f"{num_instances} worker(s) registered",
+                            flush=True,
+                        )
+                        return
+            except requests.RequestException as e:
+                last_error = e
+            time.sleep(2)
+
+        raise RuntimeError(
+            f"Dynamo frontend did not become healthy within {timeout}s. "
+            f"Expected {self.dp_size} workers, last error: {last_error}"
+        )
+
+    # ------------------------------------------------------------------
+    # VirtualConnectorClient lifecycle
+    # ------------------------------------------------------------------
+
+    def _start_virtual_connector_client(self) -> None:
+        # DistributedRuntime (Rust) reads these from the process environment.
+        os.environ.update(self._dynamo_env_vars())
+
+        self._vc_thread = threading.Thread(
+            target=self._vc_listener_thread,
+            daemon=True,
+            name="dynamo-vc-listener",
+        )
+        self._vc_thread.start()
+
+    def _stop_virtual_connector_client(self) -> None:
+        self._vc_stop.set()
+        if self._vc_thread is not None and self._vc_thread.is_alive():
+            self._vc_thread.join(timeout=10)
+            self._vc_thread = None
+
+    def _vc_listener_thread(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._vc_listener_loop(loop))
+        except Exception as e:
+            if not self._vc_stop.is_set():
+                print(f"  [Dynamo] VirtualConnectorClient listener error: {e}", flush=True)
+        finally:
+            loop.close()
+
+    async def _vc_listener_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        from dynamo._core import DistributedRuntime, VirtualConnectorClient
+
+        runtime = DistributedRuntime(loop, "etcd", "tcp", True)
+        client = VirtualConnectorClient(runtime, self._namespace)
+        print("  [Dynamo] VirtualConnectorClient listening for scaling events", flush=True)
+
+        while not self._vc_stop.is_set():
+            try:
+                await client.wait()
+            except Exception as e:
+                if not self._vc_stop.is_set():
+                    print(f"  [Dynamo] VirtualConnectorClient error: {e}", flush=True)
+                break
+
+            # Check planner health after an event is signaled, not during idle wait.
+            if self._planner_process is not None:
+                retcode = self._planner_process.poll()
+                if retcode is not None:
+                    raise RuntimeError(
+                        f"Dynamo planner exited with code {retcode}. "
+                        f"Check console output above for details."
+                    )
+
+            try:
+                event = await client.get()
+                if event.decision_id != -1:
+                    self._handle_scaling_event(event)
+                    await client.complete(event)
+            except Exception as e:
+                if not self._vc_stop.is_set():
+                    print(f"  [Dynamo] VirtualConnectorClient error: {e}", flush=True)
+                break
+
+    def _handle_scaling_event(self, event: Any) -> None:
+        """Mock handler — logs the scaling decision without actually scaling."""
+        print(
+            f"  [Dynamo] Scaling event (decision_id={event.decision_id}): "
+            f"prefill={event.num_prefill_workers}, decode={event.num_decode_workers}",
+            flush=True,
+        )
+
+    # ------------------------------------------------------------------
+    # GenerationInterface
+    # ------------------------------------------------------------------
+
+    def _check_subprocesses(self) -> None:
+        """Raise if any managed subprocess has exited unexpectedly."""
+        for attr, name, _ in _SUBPROCESS_REGISTRY:
+            proc: Optional[subprocess.Popen] = getattr(self, attr)
+            if proc is not None:
+                retcode = proc.poll()
+                if retcode is not None:
+                    raise RuntimeError(
+                        f"Dynamo {name} exited unexpectedly with code {retcode}."
+                    )
+
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
+        self._check_subprocesses()
         return True
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         return True
 
     def shutdown(self) -> bool:
+        self._stop_virtual_connector_client()
+
+        for attr, name, timeout in _SUBPROCESS_REGISTRY:
+            proc: Optional[subprocess.Popen] = getattr(self, attr)
+            if proc is not None:
+                self._stop_subprocess(proc, name, timeout)
+                setattr(self, attr, None)
+
+        if self._planner_config_file is not None:
+            os.unlink(self._planner_config_file)
+            self._planner_config_file = None
+        if self._etcd_data_dir is not None:
+            shutil.rmtree(self._etcd_data_dir, ignore_errors=True)
+            self._etcd_data_dir = None
+
         try:
             self.worker_group.shutdown(cleanup_method="shutdown")
         except Exception as e:
             print(f"  [Dynamo] Warning: worker shutdown failed: {e}", flush=True)
-        self._stop_frontend()
-        self._stop_nats()
-        self._stop_etcd()
+
         return True
 
-    def __del__(self) -> None:
-        self.shutdown()
-
     # ------------------------------------------------------------------
-    # GenerationInterface — unsupported methods
+    # Unsupported weight-update methods
     # ------------------------------------------------------------------
 
     def generate(

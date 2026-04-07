@@ -34,6 +34,7 @@ class DynamoCfg(TypedDict, total=False):
     etcd_port: int  # 0 = auto-assign
     etcd_peer_port: int  # 0 = auto-assign
     namespace: str
+    enable_planner: bool  # Launch planner + VirtualConnectorClient for autoscaling
 
 
 class DynamoVllmConfig(GenerationConfig):

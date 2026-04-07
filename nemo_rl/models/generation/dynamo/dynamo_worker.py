@@ -27,6 +27,8 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.distributed.virtual_cluster import _get_free_port_local
+
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.dynamo.config import DynamoVllmConfig
 
@@ -103,6 +105,8 @@ class DynamoVllmWorker:
         # passed via the DYNAMO_VLLM_PYTHON env var.
         vllm_python = os.environ.get("DYNAMO_VLLM_PYTHON", "python")
 
+        kv_event_port = _get_free_port_local()
+
         cmd = [
             vllm_python,
             "-m",
@@ -115,6 +119,8 @@ class DynamoVllmWorker:
             str(vllm_cfg["gpu_memory_utilization"]),
             "--max-model-len",
             str(vllm_cfg["max_model_len"]),
+            "--kv-events-config",
+            f'{{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:{kv_event_port}","enable_kv_cache_events":true}}'
         ]
 
         # Pass through extra vllm args
@@ -123,6 +129,7 @@ class DynamoVllmWorker:
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = cuda_visible
+        env["DYN_FORWARDPASS_METRIC_PORT"] = str(_get_free_port_local())
         # etcd_endpoint and namespace are set by DynamoVllmGeneration via
         # the worker group env_vars mechanism.
 
