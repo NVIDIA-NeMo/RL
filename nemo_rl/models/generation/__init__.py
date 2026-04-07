@@ -16,6 +16,7 @@ from typing import cast
 
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.models.generation.dynamo import DynamoVllmConfig
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm import VllmConfig
 
@@ -68,5 +69,10 @@ def configure_generation_config(
                 config["vllm_cfg"]["skip_tokenizer_init"] = False
             else:
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
+
+    # dynamo setting — always loads real weights (no refit support)
+    elif config["backend"] == "dynamo":
+        config = cast(DynamoVllmConfig, config)
+        config["vllm_cfg"]["load_format"] = "auto"
 
     return config

@@ -153,25 +153,83 @@ def apply_fp8_patches(self, fp8_config):
     fp8_patches_applied = True
 
 
-def init_fp8(vllm_cfg, model_name, model_parallel_size):
+def compute_fp8_engine_kwargs(vllm_cfg, model_name, model_parallel_size):
+    """Compute vLLM engine kwargs for FP8 without applying monkey patches.
+
+    Used by DynamoVllmWorker which passes these as CLI args to a subprocess
+    rather than calling vllm.LLM() directly.
+    """
     config = AutoConfig.from_pretrained(model_name)
-    global global_fp8_config
-    # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
-    # Validate configuration: kv_cache_dtype
     if kv_cache_dtype not in ["auto", "fp8", "fp8_e4m3"]:
         raise ValueError(
             f"kv_cache_dtype must be one of ['auto', 'fp8', 'fp8_e4m3'], but got {kv_cache_dtype}"
         )
 
-    # Validate configuration: kv_cache_dtype=fp8 requires precision=fp8
     if kv_cache_dtype.startswith("fp8") and not use_fp8_weights:
         raise ValueError(
             f"kv_cache_dtype='{kv_cache_dtype}' requires precision='fp8'. "
             "FP8 KV cache can only be used together with FP8 model weights."
         )
+
+    num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
+    num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
+    fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+
+    if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
+        with init_empty_weights():
+            model = AutoModel.from_config(config)
+        param_names = [name for name, _ in model.named_parameters()]
+
+        bf16_params = []
+        if num_first_layers_in_bf16 > 0:
+            layers = [l for l in range(num_first_layers_in_bf16)]
+            bf16_params.append(_get_params_in_layers(param_names, layers))
+
+        if num_last_layers_in_bf16 > 0:
+            layers = [
+                l
+                for l in range(
+                    config.num_hidden_layers - num_last_layers_in_bf16,
+                    config.num_hidden_layers,
+                )
+            ]
+            bf16_params.append(_get_params_in_layers(param_names, layers))
+
+        fp8_block_quant_kwargs["ignored_layers"] = bf16_params
+
+    quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws", [])
+    if len(quantization_ignored_layer_kws):
+        with init_empty_weights():
+            model = AutoModel.from_config(config)
+        param_names = [
+            f"model.{name}".removesuffix(".weight")
+            for name, _ in model.named_parameters()
+        ]
+        ignored_layers = [
+            n
+            for n in param_names
+            if any(p in n for p in quantization_ignored_layer_kws)
+        ]
+        if "ignored_layers" not in fp8_block_quant_kwargs:
+            fp8_block_quant_kwargs["ignored_layers"] = ignored_layers
+        else:
+            fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
+        print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
+
+    return {
+        "quantization": "fp8",
+        "kv_cache_dtype": kv_cache_dtype,
+        "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
+    }
+
+
+def init_fp8(vllm_cfg, model_name, model_parallel_size):
+    global global_fp8_config
+    use_fp8_weights = vllm_cfg.get("precision") == "fp8"
+    kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
     global_fp8_config = FP8Config(
         use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
@@ -198,59 +256,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         # if not async, just directly monkey patch the ray executor
         monkey_patch_vllm_ray_executor(global_fp8_config)
 
-    # create fp8 kwargs for vllm's LLM(...)
-    num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
-    num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
-    fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
-
-    if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
-        with init_empty_weights():
-            model = AutoModel.from_config(config)
-        param_names = [name for name, _ in model.named_parameters()]
-
-        bf16_params = []
-        if num_first_layers_in_bf16 > 0:
-            layers = [l for l in range(num_first_layers_in_bf16)]
-            bf16_params.append(_get_params_in_layers(param_names, layers))
-
-        if num_last_layers_in_bf16 > 0:
-            layers = [
-                l
-                for l in range(
-                    config.num_hidden_layers - num_last_layers_in_bf16,
-                    config.num_hidden_layers,
-                )
-            ]
-            bf16_params.append(_get_params_in_layers(param_names, layers))
-
-        fp8_block_quant_kwargs["ignored_layers"] = bf16_params
-    quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws", [])
-    if len(quantization_ignored_layer_kws):
-        with init_empty_weights():
-            model = AutoModel.from_config(config)
-        param_names = [
-            f"model.{name}".removesuffix(".weight")
-            for name, _ in model.named_parameters()
-        ]
-        ignored_layers = [
-            n
-            for n in param_names
-            if any(p in n for p in quantization_ignored_layer_kws)
-        ]
-        if "ignored_layers" not in fp8_block_quant_kwargs:
-            fp8_block_quant_kwargs["ignored_layers"] = ignored_layers
-        else:
-            fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
-        print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
-
-    # Return FP8 kwargs (precision=fp8 is required at this point)
-    vllm_kwargs = {
-        "quantization": "fp8",
-        "kv_cache_dtype": kv_cache_dtype,
-        "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
-    }
-
-    return vllm_kwargs
+    return compute_fp8_engine_kwargs(vllm_cfg, model_name, model_parallel_size)
 
 
 def is_fp8_model(vllm_config):

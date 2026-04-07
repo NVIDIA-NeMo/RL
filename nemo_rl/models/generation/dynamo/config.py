@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
@@ -21,8 +21,15 @@ class DynamoSpecificArgs(TypedDict):
     """vLLM engine arguments passed through to dynamo.vllm."""
 
     tensor_parallel_size: int
+    pipeline_parallel_size: int
+    expert_parallel_size: int
     gpu_memory_utilization: float
     max_model_len: int
+    kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
+    precision: NotRequired[str]  # maps to vLLM --dtype
+    load_format: NotRequired[str]
+    enforce_eager: NotRequired[bool]
+    hf_overrides: NotRequired[dict[str, Any]]
     extra_vllm_args: NotRequired[dict[str, Any]]
 
 
@@ -46,3 +53,4 @@ class DynamoVllmConfig(GenerationConfig):
 
     vllm_cfg: DynamoSpecificArgs
     dynamo_cfg: NotRequired[DynamoCfg]
+    vllm_kwargs: NotRequired[dict[str, Any]]
