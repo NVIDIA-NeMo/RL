@@ -43,7 +43,7 @@ dependencies = [
   "sympy>=1.14.0",
   "pillow>=12.1.1",
   "torchvision==0.25.0",
-  "transformers==5.3.0",
+  "transformers==5.5.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
   "mlflow>=3.11.1",
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
@@ -64,7 +64,7 @@ automodel = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
-  "transformers>=5.3.0",
+  "transformers>=5.5.0",
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
@@ -78,7 +78,7 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  "vllm==0.17.1",
+  "vllm==0.19.0",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.4",
   "flashinfer-cubin==0.6.4",
@@ -261,9 +261,8 @@ override-dependencies = [
   "nvidia-cutlass-dsl>=4.4.1",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
-  # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
-  # Override until vllm officially relaxes the constraint (https://github.com/vllm-project/vllm/issues/30466).
-  "transformers==5.3.0",
+  # Gemma 4 requires transformers>=5.5.0. vLLM 0.19.0 is compatible.
+  "transformers==5.5.0",
   #Override till we can upgrade sglang version to address CVE GHSA-7rgv-gqhr-fxg3
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs
