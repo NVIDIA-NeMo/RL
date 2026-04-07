@@ -143,6 +143,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
+            pp_size = config["dtensor_cfg"].get("pipeline_parallel_size", 1)
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
 
