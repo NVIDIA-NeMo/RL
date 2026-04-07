@@ -73,6 +73,8 @@ AUTOMODEL_FACTORY: Dict[str, Any] = {
 
 if NEMO_AUTOMODEL_AVAILABLE:
     AUTOMODEL_FACTORY = {
+        # NeMo wrappers — keep in sync with the vanilla HF dict above.
+        # See comment above for when to add entries.
         "qwen2_5_vl": NeMoAutoModelForImageTextToText,
         "qwen2_vl": NeMoAutoModelForImageTextToText,
         "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
