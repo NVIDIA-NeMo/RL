@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 from typing import Any, Optional
 
@@ -107,7 +108,14 @@ def import_model_from_hf_name(
     config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
     config.pipeline_dtype = orig_pipeline_dtype
 
-    bridge.save_megatron_model(megatron_model, output_path)
+    # fully_parallel_save=False avoids deadlock when world includes non-training ranks
+    # (e.g., non-colocated vLLM). FullyParallelSaveStrategyWrapper would call
+    # all_gather_object on DP sub-groups that include ranks that never enter save.
+    # Conditional for backward compat with older Megatron-Bridge versions.
+    save_kwargs = {}
+    if "fully_parallel_save" in inspect.signature(bridge.save_megatron_model).parameters:
+        save_kwargs["fully_parallel_save"] = False
+    bridge.save_megatron_model(megatron_model, output_path, **save_kwargs)
 
     # resetting mcore state
     import megatron.core.rerun_state_machine
