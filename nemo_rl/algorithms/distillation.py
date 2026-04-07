@@ -412,7 +412,7 @@ def setup(
         generation_config = cast(VllmConfig, generation_config)
         if "vllm_cfg" in generation_config:
             ## make vllm hf overrides match the training policy
-            generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
+            generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
                 "hf_config_overrides", {}
             )
         student_generation = VllmGeneration(

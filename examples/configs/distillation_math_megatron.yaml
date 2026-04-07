@@ -145,6 +145,7 @@ policy: &POLICY_BASE
             num_last_layers_in_bf16: 0
             num_first_layers_in_bf16: 0
             distributed_executor_backend: null
+        vllm_kwargs: {}
 
         colocated:
             # true: generation shares training GPUs

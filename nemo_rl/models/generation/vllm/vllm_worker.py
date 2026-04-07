@@ -238,6 +238,60 @@ class BaseVllmGenerationWorker:
             with open(file_to_patch, "w") as f:
                 f.write(content)
 
+        def _patch_vllm_llama_eagle3_own_lm_head():
+            """Patch LlamaEagle3 to keep truncated draft lm_head ownership."""
+            try:
+                file_to_patch = _get_vllm_file("model_executor/models/llama_eagle3.py")
+            except RuntimeError:
+                logger.warning(
+                    "Could not locate llama_eagle3.py for lm_head ownership patch."
+                )
+                return
+
+            with open(file_to_patch, "r") as f:
+                content = f.read()
+
+            if "self.has_own_lm_head = (" in content:
+                logger.info("llama_eagle3 lm_head ownership patch already applied.")
+                return
+
+            old_snippet = (
+                "        self.lm_head = ParallelLMHead(\n"
+                "            self.config.draft_vocab_size,\n"
+                "            self.config.hidden_size,\n"
+                '            prefix=maybe_prefix(prefix, "lm_head"),\n'
+                "        )\n"
+                "        self.logits_processor = LogitsProcessor(\n"
+            )
+
+            new_snippet = (
+                "        self.lm_head = ParallelLMHead(\n"
+                "            self.config.draft_vocab_size,\n"
+                "            self.config.hidden_size,\n"
+                '            prefix=maybe_prefix(prefix, "lm_head"),\n'
+                "        )\n"
+                "        self.has_own_lm_head = (\n"
+                "            self.config.draft_vocab_size != self.config.vocab_size\n"
+                "        )\n"
+                "        self.logits_processor = LogitsProcessor(\n"
+            )
+
+            if old_snippet not in content:
+                logger.warning(
+                    "Could not apply llama_eagle3 lm_head ownership patch: "
+                    "expected code snippet not found in %s. "
+                    "The vLLM version may have changed.",
+                    file_to_patch,
+                )
+                return
+
+            content = content.replace(old_snippet, new_snippet, 1)
+
+            with open(file_to_patch, "w") as f:
+                f.write(content)
+
+            logger.info("Successfully patched llama_eagle3 lm_head ownership.")
+
         def _patch_vllm_hermes_tool_parser_thread_safety():
             """Patch Hermes2ProToolParser.__init__ to cache tokenizer calls.
 
@@ -361,6 +415,7 @@ class BaseVllmGenerationWorker:
         _patch_vllm_init_workers_ray()
         logger.info("Successfully patched vllm _init_workers_ray.")
 
+        _patch_vllm_llama_eagle3_own_lm_head()
         _patch_vllm_hermes_tool_parser_thread_safety()
 
         try:
@@ -450,9 +505,6 @@ class BaseVllmGenerationWorker:
 
         if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}
-        vllm_kwargs["hf_overrides"].update(
-            self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
-        )
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization

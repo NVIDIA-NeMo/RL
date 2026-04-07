@@ -23,7 +23,7 @@ dependencies = [
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]==2.54.0",
-  "wandb>=0.25.0",
+  "wandb>=0.25.1",
   "numpy",
   "datasets>=4.0.0",
   "rich",
@@ -41,11 +41,11 @@ dependencies = [
   "matplotlib",
   "plotly",
   "sympy>=1.14.0",
-  "pillow>=11.3.0",
+  "pillow>=12.1.1",
   "torchvision==0.25.0",
   "transformers==5.3.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
-  "mlflow>=3.5.0,<3.6.0",
+  "mlflow>=3.9.0rc0",
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
@@ -79,7 +79,7 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  "vllm==0.17.0",
+  "vllm==0.17.1",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.4",
   "nvidia-cutlass-dsl>=4.4.0.dev1",
@@ -149,7 +149,7 @@ dev = [
   "pyrefly==0.24.2",
 ]
 test = [
-  "pytest>=7.0.0",
+  "pytest>=8.4.2",
   "pytest-timeout",
   "pytest-cov",
   "pytest-asyncio",
@@ -162,12 +162,16 @@ nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = t
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace", editable = true }
 nemo_gym = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
-# torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
+# torch/torchaudio/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
   { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 torchvision = [
+  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
+  { index = "pypi", marker = "sys_platform == 'darwin'" },
+]
+torchaudio = [
   { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
@@ -261,6 +265,10 @@ override-dependencies = [
   # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
   # Override until vllm officially relaxes the constraint (https://github.com/vllm-project/vllm/issues/30466).
   "transformers==5.3.0",
+  #Override till we can upgrade sglang version to address CVE GHSA-7rgv-gqhr-fxg3
+  "xgrammar==0.1.33",
+  # Override dependencies to address CVEs
+  "mlflow>=3.9.0rc0",
 ]
 
 # CVE fixes
@@ -269,10 +277,15 @@ constraint-dependencies = [
   "starlette>=0.49.1",        # Address CVE GHSA-7f5h-v6xp-fcq8
   "urllib3>=2.6.3",           # Address CVE GHSA-38jv-5279-wg99
   "aiohttp>=3.13.3",          # Address CVE GHSA-mqqc-3gqh-h2x8
-  "pyasn1>=0.6.2",            # Address CVE GHSA-63vm-454h-vhhq
+  "pyasn1>=0.6.3",            # Address CVE GHSA-jr27-m4p2-rc6r
   "wheel>=0.46.2",            # Address CVE GHSA-8rrh-rw8j-w5fx
   "protobuf>=6.33.5",         # Address CVE GHSA-7gcm-g887-7qv7
   "python-multipart>=0.0.22", # Address CVE GHSA-wp53-j4wj-2cfg
+  "pygments>=2.20.0",         # Address CVE GHSA-5239-wwwm-4pmq
+  "cbor2>=5.9.0",             # Address CVE GHSA-3c37-wwvx-h642
+  "onnx>=1.21.0rc4",          # Address CVE GHSA-hqmj-h5c6-369m
+  "cryptography>=46.0.6",     # Address CVE GHSA-6w46-j5rx-g56g
+  "orjson>=3.11.6",           # Address CVE GHSA-hx9q-6w63-j58v
 ]
 
 conflicts = [

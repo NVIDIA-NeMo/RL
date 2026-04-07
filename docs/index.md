@@ -107,6 +107,13 @@ Step-by-step guide for supervised fine-tuning on the OpenMathInstruct2 dataset.
 Create custom reward environments and integrate them with NeMo RL training pipelines.
 :::
 
+:::{grid-item-card} {octicon}`rocket` Eagle3 Speculative Decoding
+:link: guides/eagle3-speculative-decoding
+:link-type: doc
+
+Configure offline and online Eagle3 draft-model workflows to accelerate rollout generation with vLLM.
+:::
+
 :::{grid-item-card} {octicon}`plus-circle` Adding New Models
 :link: adding-new-models
 :link-type: doc
@@ -227,6 +234,7 @@ guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
 guides/quantization-aware-rl.md
+guides/eagle3-speculative-decoding.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
 guides/ft-launcher-guide.md

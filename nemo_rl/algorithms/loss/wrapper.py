@@ -19,6 +19,7 @@ import torch
 import torch.distributed
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
@@ -225,6 +226,67 @@ class SequencePackingFusionLossWrapper:
             global_valid_toks=global_valid_toks,
             **loss_input,
         )
+
+
+class DraftLossWrapper:
+    """Combine policy loss with draft soft cross-entropy loss."""
+
+    def __init__(
+        self,
+        loss_fn: Callable[..., tuple[torch.Tensor, dict[str, Any]]],
+        prepare_fn: Callable[Any, Any],
+        data_dict: BatchedDataDict[Any],
+        loss_weight: float = 1.0,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        self.loss_fn = loss_fn
+        self.prepare_fn = prepare_fn
+        self.data_dict = data_dict
+        self.loss_weight = loss_weight
+        self.vocab_parallel_rank = vocab_parallel_rank
+        self.vocab_parallel_group = vocab_parallel_group
+        self.context_parallel_group = context_parallel_group
+        self.draft_loss_fn = DraftCrossEntropyLossFn(
+            vocab_parallel_group=vocab_parallel_group,
+        )
+
+    def __call__(
+        self,
+        next_token_logits: torch.Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: torch.Tensor | None,
+        global_valid_toks: torch.Tensor | None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if global_valid_toks is None:
+            raise ValueError("global_valid_toks is required for DraftLossWrapper.")
+        policy_loss, metrics = self.loss_fn(
+            next_token_logits,
+            data,
+            global_valid_seqs,
+            global_valid_toks,
+            **kwargs,
+        )
+
+        loss_input, data = self.prepare_fn(
+            logits=next_token_logits,
+            data=data,
+            loss_fn=self.draft_loss_fn,
+            vocab_parallel_rank=self.vocab_parallel_rank,
+            vocab_parallel_group=self.vocab_parallel_group,
+            context_parallel_group=self.context_parallel_group,
+        )
+        draft_loss = self.draft_loss_fn(
+            data=data,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            **loss_input,
+        )
+        combined_loss = policy_loss + self.loss_weight * draft_loss
+        metrics["draft_loss"] = float(draft_loss.detach().item())
+        return combined_loss, metrics
 
 
 def wrap_loss_fn_with_input_preparation(
