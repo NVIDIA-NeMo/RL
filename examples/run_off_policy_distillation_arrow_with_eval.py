@@ -140,6 +140,56 @@ def _sft_preprocessor(
     }
 
 
+def _kd_preprocessor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Knowledge-distillation preprocessor: raw text, no chat template, loss on all tokens.
+
+    Both student and teacher tokenize the same raw text, matching the
+    train_distillation_ddp.py pipeline. The raw text is stored in
+    extra_env_info so the teacher can tokenize it directly.
+    """
+    raw_text = "\n".join(
+        msg["content"]
+        for msg in datum_dict["messages"]
+        if isinstance(msg.get("content"), str)
+    )
+
+    token_ids = tokenizer(
+        raw_text,
+        return_tensors="pt",
+        add_special_tokens=True,
+        max_length=max_seq_length,
+        truncation=True,
+    )["input_ids"][0]
+
+    length = len(token_ids)
+    loss_multiplier = 1.0
+    if length > max_seq_length:
+        loss_multiplier = 0.0
+
+    message_log = [
+        {
+            "role": "assistant",
+            "content": raw_text,
+            "token_ids": token_ids,
+            "token_loss_mask": torch.ones_like(token_ids),
+        }
+    ]
+
+    return {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": {"raw_text": raw_text},
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+    }
+
+
 def setup_train_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     from nemo_rl.data.datasets import load_response_dataset
 
@@ -152,12 +202,7 @@ def setup_train_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: in
         train_dataset_raw,
         tokenizer,
         task_spec,
-        partial(
-            _sft_preprocessor,
-            add_bos=data_config.get("add_bos", True),
-            add_eos=data_config.get("add_eos", True),
-            add_generation_prompt=data_config.get("add_generation_prompt", False),
-        ),
+        _kd_preprocessor,
         max_seq_length=data_config["max_input_seq_length"],
     )
     print(f"  ✓ Training dataset loaded with {len(train_dataset)} samples")
@@ -487,6 +532,8 @@ def main():
         )
         if token_aligner_cfg.get("project_teacher_to_student", False):
             token_aligner.create_reverse_projection_matrix(device="cpu")
+
+        token_aligner.precompute_canonical_maps()
 
         print(f"  ✓ TokenAligner initialized ({policy_config['model_name']} → {teacher_config['model_name']})")
     else:

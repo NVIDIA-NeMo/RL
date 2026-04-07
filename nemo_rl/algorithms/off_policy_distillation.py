@@ -174,19 +174,116 @@ def _init_align_worker(token_aligner):
 def _align_chunk(args):
     """Align a chunk of (student, teacher) token-ID pairs.
 
-    Called by ProcessPoolExecutor.  Only the alignment (the expensive DP step)
-    runs in the worker; fast batch decode/encode stays on the driver.
+    Called by ProcessPoolExecutor.  Uses align_fast (precomputed canonical maps)
+    when available, falling back to regular align otherwise.
 
     Args:
         args: (student_ids_chunk, teacher_ids_chunk) — both list[list[int]].
 
     Returns:
-        aligned_pairs from ``TokenAligner.align``.
+        aligned_pairs from ``TokenAligner.align_fast`` or ``TokenAligner.align``.
     """
     student_ids_chunk, teacher_ids_chunk = args
     student_t = torch.tensor(student_ids_chunk)
     teacher_t = torch.tensor(teacher_ids_chunk)
+    if _ct_token_aligner._student_canon_map is not None:
+        return _ct_token_aligner.align_fast(student_t, teacher_t)
     return _ct_token_aligner.align(student_t, teacher_t)
+
+
+def _align_by_char_offsets(
+    s_content: list[tuple[int, int, int]],
+    t_content: list[tuple[int, int, int]],
+) -> list[tuple]:
+    """Align tokens via character offsets in O(n+m).
+
+    Both sequences are tokenizations of the same text, so their character
+    spans partition the same string.  A two-pointer walk groups tokens
+    whose character boundaries converge.
+
+    Args:
+        s_content: [(char_start, char_end, token_position), ...] for student,
+                   sorted by char_start, excluding special/pad tokens.
+        t_content: same for teacher.
+
+    Returns:
+        aligned_pairs in the standard 7-tuple format:
+        (s1_tokens, s2_tokens, s_pos_start, s_pos_end, t_pos_start, t_pos_end, is_correct)
+    """
+    pairs: list[tuple] = []
+    si, ti = 0, 0
+    n_s, n_t = len(s_content), len(t_content)
+
+    while si < n_s and ti < n_t:
+        s_group_start = si
+        t_group_start = ti
+        s_char_end = s_content[si][1]
+        t_char_end = t_content[ti][1]
+
+        while s_char_end != t_char_end:
+            if s_char_end < t_char_end:
+                si += 1
+                if si >= n_s:
+                    break
+                s_char_end = s_content[si][1]
+            else:
+                ti += 1
+                if ti >= n_t:
+                    break
+                t_char_end = t_content[ti][1]
+
+        if s_char_end != t_char_end:
+            break
+
+        pairs.append((
+            [], [],
+            s_content[s_group_start][2], s_content[si][2] + 1,
+            t_content[t_group_start][2], t_content[ti][2] + 1,
+            True,
+        ))
+        si += 1
+        ti += 1
+
+    for i in range(si, n_s):
+        pos = s_content[i][2]
+        pairs.append(([], [], pos, pos + 1, -1, -1, False))
+    for i in range(ti, n_t):
+        pos = t_content[i][2]
+        pairs.append(([], [], -1, -1, pos, pos + 1, False))
+
+    return pairs
+
+
+def _try_char_offset_align(args):
+    """Try char-offset alignment for one sample. Pool-friendly (no shared state).
+
+    Args:
+        args: (s_off_np, t_off_np) — numpy arrays of shape [T, 2].
+
+    Returns:
+        (aligned_pairs, success): pairs list if char-offset worked, else (None, False).
+    """
+    s_off, t_off = args
+    s_content = [
+        (int(s), int(e), pos)
+        for pos, (s, e) in enumerate(s_off)
+        if s != 0 or e != 0
+    ]
+    t_content = [
+        (int(s), int(e), pos)
+        for pos, (s, e) in enumerate(t_off)
+        if s != 0 or e != 0
+    ]
+
+    if not s_content or not t_content or s_content[-1][1] != t_content[-1][1]:
+        return (None, False)
+
+    pairs = _align_by_char_offsets(s_content, t_content)
+    n_correct = sum(1 for p in pairs if p[6])
+    if n_correct == 0 or n_correct / len(pairs) < 0.5:
+        return (None, False)
+
+    return (pairs, True)
 
 
 # ===============================================================================
@@ -391,6 +488,8 @@ def setup(
             token_aligner.create_reverse_projection_matrix(device="cpu")
 
         print(f"  ✓ TokenAligner initialized ({policy_config['model_name']} → {teacher_config['model_name']})", flush=True)
+
+        token_aligner.precompute_canonical_maps()
 
     # ==========================
     #      Teacher Policy
@@ -845,6 +944,8 @@ def off_policy_distillation_train(
 
                 if cross_tokenizer_enabled:
                     with timer.time("cross_tokenizer_processing"):
+                        import time as _time
+                        from nemo_rl.algorithms.x_token.tokenalign import _NUMBA_AVAILABLE
                         student_ids = train_data["input_ids"]
                         batch_size_ct = student_ids.shape[0]
 
@@ -853,37 +954,132 @@ def off_policy_distillation_train(
                             master_config["policy"]["max_total_sequence_length"],
                         )
 
-                        texts = tokenizer.batch_decode(
-                            student_ids.tolist(), skip_special_tokens=True
-                        )
+                        _t0 = _time.time()
+                        extra_env = batch.get("extra_env_info")
+                        if (
+                            extra_env
+                            and extra_env[0] is not None
+                            and isinstance(extra_env[0], dict)
+                            and "raw_text" in extra_env[0]
+                        ):
+                            texts = [info["raw_text"] for info in extra_env]
+                        else:
+                            texts = tokenizer.batch_decode(
+                                student_ids.tolist(), skip_special_tokens=True
+                            )
+                        _t1 = _time.time()
                         teacher_encoded = teacher_tokenizer(
                             texts,
                             max_length=max_teacher_len_rt,
                             padding="max_length",
                             truncation=True,
                             return_tensors="pt",
+                            return_offsets_mapping=True,
                         )
                         teacher_input_ids = teacher_encoded["input_ids"]
                         teacher_attention_mask = teacher_encoded["attention_mask"]
+                        teacher_offsets = teacher_encoded["offset_mapping"]
 
-                        if ct_pool is not None and batch_size_ct > 1:
-                            n_chunks = min(batch_size_ct, ct_num_workers)
-                            chunk_size = math.ceil(batch_size_ct / n_chunks)
-                            student_ids_list = student_ids.tolist()
-                            teacher_ids_list = teacher_input_ids.tolist()
-                            chunk_args = [
-                                (student_ids_list[i : i + chunk_size],
-                                 teacher_ids_list[i : i + chunk_size])
-                                for i in range(0, batch_size_ct, chunk_size)
-                            ]
-                            results = list(ct_pool.map(_align_chunk, chunk_args))
-                            aligned_pairs = []
-                            for r in results:
-                                aligned_pairs.extend(r)
-                        else:
-                            aligned_pairs = token_aligner.align(
-                                student_ids, teacher_input_ids
+                        student_re = tokenizer(
+                            texts,
+                            max_length=student_ids.shape[1],
+                            padding="max_length",
+                            truncation=True,
+                            return_tensors="pt",
+                            return_offsets_mapping=True,
+                        )
+                        student_offsets = student_re["offset_mapping"]
+                        _t2 = _time.time()
+
+                        # --- Vectorized pre-check: which samples can try char-offset? ---
+                        s_off_np = student_offsets.numpy()
+                        t_off_np = teacher_offsets.numpy()
+
+                        s_nonzero = (s_off_np[:, :, 0] != 0) | (s_off_np[:, :, 1] != 0)
+                        t_nonzero = (t_off_np[:, :, 0] != 0) | (t_off_np[:, :, 1] != 0)
+
+                        s_has = s_nonzero.any(axis=1)
+                        t_has = t_nonzero.any(axis=1)
+
+                        s_last = s_nonzero.shape[1] - 1 - np.flip(s_nonzero, axis=1).argmax(axis=1)
+                        t_last = t_nonzero.shape[1] - 1 - np.flip(t_nonzero, axis=1).argmax(axis=1)
+                        s_last_end = s_off_np[np.arange(batch_size_ct), s_last, 1]
+                        t_last_end = t_off_np[np.arange(batch_size_ct), t_last, 1]
+
+                        can_try_offset = s_has & t_has & (s_last_end == t_last_end)
+
+                        # --- Vectorized offset filtering (avoid per-sample .tolist()) ---
+                        # Pre-extract content indices per sample using numpy
+                        s_content_per_sample = []
+                        t_content_per_sample = []
+                        for idx in range(batch_size_ct):
+                            if can_try_offset[idx]:
+                                s_mask = s_nonzero[idx]
+                                t_mask = t_nonzero[idx]
+                                s_positions = np.where(s_mask)[0]
+                                t_positions = np.where(t_mask)[0]
+                                s_content_per_sample.append([
+                                    (int(s_off_np[idx, p, 0]), int(s_off_np[idx, p, 1]), int(p))
+                                    for p in s_positions
+                                ])
+                                t_content_per_sample.append([
+                                    (int(t_off_np[idx, p, 0]), int(t_off_np[idx, p, 1]), int(p))
+                                    for p in t_positions
+                                ])
+                            else:
+                                s_content_per_sample.append(None)
+                                t_content_per_sample.append(None)
+
+                        # --- Char-offset alignment (sequential, fast O(n+m) per sample) ---
+                        aligned_pairs = [None] * batch_size_ct
+                        dp_samples_s = []
+                        dp_samples_t = []
+                        dp_slot_indices = []
+
+                        for idx in range(batch_size_ct):
+                            if not can_try_offset[idx]:
+                                dp_samples_s.append(student_ids[idx:idx+1].tolist())
+                                dp_samples_t.append(teacher_input_ids[idx:idx+1].tolist())
+                                dp_slot_indices.append(idx)
+                                continue
+
+                            pairs = _align_by_char_offsets(
+                                s_content_per_sample[idx], t_content_per_sample[idx]
                             )
+                            n_correct = sum(1 for p in pairs if p[6])
+                            if n_correct == 0 or n_correct / len(pairs) < 0.5:
+                                dp_samples_s.append(student_ids[idx:idx+1].tolist())
+                                dp_samples_t.append(teacher_input_ids[idx:idx+1].tolist())
+                                dp_slot_indices.append(idx)
+                            else:
+                                aligned_pairs[idx] = pairs
+
+                        dp_fallback = len(dp_slot_indices)
+                        n_offsets = batch_size_ct - dp_fallback
+
+                        # --- DP alignment for fallbacks (parallelized) ---
+                        if dp_fallback > 0:
+                            if ct_pool is not None and dp_fallback > 1:
+                                chunks = list(zip(dp_samples_s, dp_samples_t))
+                                dp_results = list(ct_pool.map(_align_chunk, chunks))
+                                for i, slot in enumerate(dp_slot_indices):
+                                    aligned_pairs[slot] = dp_results[i][0]
+                            else:
+                                for i, slot in enumerate(dp_slot_indices):
+                                    s_t = torch.tensor(dp_samples_s[i])
+                                    t_t = torch.tensor(dp_samples_t[i])
+                                    if token_aligner._student_canon_map is not None:
+                                        dp_result = token_aligner.align_fast(s_t, t_t)
+                                    else:
+                                        dp_result = token_aligner.align(s_t, t_t)
+                                    aligned_pairs[slot] = dp_result[0]
+
+                        _t3 = _time.time()
+                        print(f"  [CT timing] decode={_t1-_t0:.2f}s, "
+                              f"encode={_t2-_t1:.2f}s, "
+                              f"align={_t3-_t2:.2f}s "
+                              f"(offsets: {n_offsets}, "
+                              f"dp_fallback: {dp_fallback})", flush=True)
 
                         teacher_input_lengths_ct = teacher_attention_mask.sum(dim=1)
 

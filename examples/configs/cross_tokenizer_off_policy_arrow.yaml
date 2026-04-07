@@ -30,7 +30,7 @@ distillation:
   num_prompts_per_step: 768
   num_generations_per_prompt: 1
   max_num_steps: 80000
-  max_num_epochs: 20
+  max_num_epochs: 1
   val_period: 1000
   val_at_start: false
   max_val_samples: 128
@@ -188,7 +188,8 @@ teacher:
 
 data:
   dataset_name: "arrow_text"
-  arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-000[0-5][0-9]-of-02476.arrow"
+  arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-00[0-4][0-9][0-9]-of-02476.arrow"
+  # arrow_files="/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-000[0-5][0-9]-of-02476.arrow"
   prompt_file: null
   max_input_seq_length: 4096
   shuffle: true

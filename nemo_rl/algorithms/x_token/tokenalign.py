@@ -15,6 +15,12 @@ import os
 
 import torch
 
+try:
+    from numba import njit
+    _NUMBA_AVAILABLE = True
+except ImportError:
+    _NUMBA_AVAILABLE = False
+
 ##### define the format of projection matrix
 ##### go for dense as it is easier to train, and gradient is only computed for top_k
 ##### we will not have "A_to_B" and "B_to_A" to simplify, no bidirectional projection
@@ -24,6 +30,76 @@ import torch
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = logging.getLogger(__name__)
+
+
+if _NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def _dp_core_numba(ids1, ids2, joined1, joined2, n1, n2,
+                       exact_match_score, gap_penalty, comb_mul, max_comb_len):
+        """Numba-accelerated DP core for token alignment.
+
+        Uses the same algorithm as align_tokens_with_combinations_numpy but
+        with integer ID comparisons instead of Python string operations.
+
+        Trace codes: 0=start, 1=diag, 2=up, 3=left,
+                     10+k = comb_s1_over_s2_k, 20+k = comb_s2_over_s1_k
+        """
+        INVALID = np.int64(-1)
+        dp = np.zeros((n1 + 1, n2 + 1), dtype=np.float32)
+        trace = np.zeros((n1 + 1, n2 + 1), dtype=np.int32)
+
+        for i in range(1, n1 + 1):
+            dp[i, 0] = dp[i - 1, 0] + gap_penalty
+            trace[i, 0] = 2
+        for j in range(1, n2 + 1):
+            dp[0, j] = dp[0, j - 1] + gap_penalty
+            trace[0, j] = 3
+
+        for i in range(1, n1 + 1):
+            id_i = ids1[i - 1]
+            for j in range(1, n2 + 1):
+                id_j = ids2[j - 1]
+
+                if id_i == id_j:
+                    best = dp[i - 1, j - 1] + exact_match_score
+                else:
+                    best = dp[i - 1, j - 1] - exact_match_score
+                best_m = np.int32(1)
+
+                s = dp[i - 1, j] + gap_penalty
+                if s > best:
+                    best = s
+                    best_m = np.int32(2)
+
+                s = dp[i, j - 1] + gap_penalty
+                if s > best:
+                    best = s
+                    best_m = np.int32(3)
+
+                k_max_s2 = min(j, max_comb_len)
+                for k in range(2, k_max_s2 + 1):
+                    jid = joined2[j, k]
+                    if jid != INVALID and id_i == jid:
+                        s = dp[i - 1, j - k] + comb_mul * np.float32(k)
+                        if s > best:
+                            best = s
+                            best_m = np.int32(10 + k)
+
+                k_max_s1 = min(i, max_comb_len)
+                for k in range(2, k_max_s1 + 1):
+                    jid = joined1[i, k]
+                    if jid != INVALID and id_j == jid:
+                        s = dp[i - k, j - 1] + comb_mul * np.float32(k)
+                        if s > best:
+                            best = s
+                            best_m = np.int32(20 + k)
+
+                dp[i, j] = best
+                trace[i, j] = best_m
+
+        return dp, trace
+else:
+    _dp_core_numba = None
 
 
 class TokenAligner(nn.Module):
@@ -53,9 +129,155 @@ class TokenAligner(nn.Module):
         # Cached CSR for dense top-k projection (built from indices/values) to avoid scatter path
         self._dense_proj_csr = None
         self._dense_proj_csr_device = None
-        
 
-        
+        # Precomputed canonical ID maps (built by precompute_canonical_maps)
+        self._student_canon_map = None
+        self._teacher_canon_map = None
+        self._canon_id_to_str = None
+
+    def precompute_canonical_maps(self):
+        """Build token_id → canonical_string lookup tables for both tokenizers.
+
+        Call once at startup. After this, align_fast() can skip
+        convert_ids_to_tokens and _canonicalize_sequence entirely.
+        """
+        import time as _time
+        _t0 = _time.time()
+
+        canon_str_to_id: dict[str, int] = {}
+        next_id = [0]
+
+        def _get_canon_id(s: str) -> int:
+            cid = canon_str_to_id.get(s)
+            if cid is None:
+                cid = next_id[0]
+                canon_str_to_id[s] = cid
+                next_id[0] += 1
+            return cid
+
+        student_vocab_size = len(self.student_tokenizer)
+        teacher_vocab_size = len(self.teacher_tokenizer)
+
+        student_map = np.zeros(student_vocab_size, dtype=np.int64)
+        for tid in range(student_vocab_size):
+            tok = self.student_tokenizer.convert_ids_to_tokens(tid)
+            canon = self._canonical_token(tok)
+            student_map[tid] = _get_canon_id(canon)
+
+        teacher_map = np.zeros(teacher_vocab_size, dtype=np.int64)
+        for tid in range(teacher_vocab_size):
+            tok = self.teacher_tokenizer.convert_ids_to_tokens(tid)
+            canon = self._canonical_token(tok)
+            teacher_map[tid] = _get_canon_id(canon)
+
+        self._student_canon_map = student_map
+        self._teacher_canon_map = teacher_map
+        self._canon_id_to_str = {v: k for k, v in canon_str_to_id.items()}
+
+        _t1 = _time.time()
+        print(f"  [TokenAligner] Precomputed canonical maps in {_t1-_t0:.2f}s "
+              f"(student_vocab={student_vocab_size}, teacher_vocab={teacher_vocab_size}, "
+              f"unique_canonical={len(canon_str_to_id)})", flush=True)
+
+    def align_fast(self, student_ids, teacher_ids,
+                   exact_match_score=3,
+                   combination_score_multiplier=1.5,
+                   gap_penalty=-1.5,
+                   chunk_size=128,
+                   post_process=True,
+                   anchor_lengths=[3,],
+                   ignore_leading_char_diff=False):
+        """Fast alignment using precomputed canonical ID maps.
+
+        Skips convert_ids_to_tokens and _canonicalize_sequence by looking up
+        canonical strings directly from token IDs via precomputed numpy arrays.
+        Falls back to regular align() if precomputed maps are not available.
+        """
+        if self._student_canon_map is None:
+            return self.align(student_ids, teacher_ids,
+                              exact_match_score=exact_match_score,
+                              combination_score_multiplier=combination_score_multiplier,
+                              gap_penalty=gap_penalty,
+                              chunk_size=chunk_size,
+                              post_process=post_process,
+                              anchor_lengths=anchor_lengths,
+                              ignore_leading_char_diff=ignore_leading_char_diff)
+
+        if isinstance(student_ids, torch.Tensor):
+            student_ids = student_ids.cpu().numpy()
+        if isinstance(teacher_ids, torch.Tensor):
+            teacher_ids = teacher_ids.cpu().numpy()
+
+        if student_ids.ndim == 1:
+            student_ids = student_ids[np.newaxis, :]
+            teacher_ids = teacher_ids[np.newaxis, :]
+
+        import time as _time
+        _t_lookup_total = 0.0
+        _t_anchors_dp_total = 0.0
+        _t_postprocess_total = 0.0
+        _t_mask_total = 0.0
+
+        all_aligned_pairs = []
+        for i in range(student_ids.shape[0]):
+            s_ids = student_ids[i]
+            t_ids = teacher_ids[i]
+
+            _tl0 = _time.time()
+            s_canon_strs = [self._canon_id_to_str[self._student_canon_map[tid]] for tid in s_ids]
+            t_canon_strs = [self._canon_id_to_str[self._teacher_canon_map[tid]] for tid in t_ids]
+            _tl1 = _time.time()
+            _t_lookup_total += _tl1 - _tl0
+
+            align_kwargs = {
+                'exact_match_score': exact_match_score,
+                'combination_score_multiplier': combination_score_multiplier,
+                'gap_penalty': gap_penalty,
+                'max_combination_len': self.max_combination_len,
+                'ignore_leading_char_diff': False,
+                'chunk_size': chunk_size,
+                'anchor_lengths': anchor_lengths,
+            }
+
+            aligned_pairs, _ = self._align_with_anchors(s_canon_strs, t_canon_strs, **align_kwargs)
+            _tl2 = _time.time()
+            _t_anchors_dp_total += _tl2 - _tl1
+
+            if post_process:
+                aligned_pairs = self.post_process_alignment_optimized(
+                    aligned_pairs,
+                    ignore_leading_char_diff=ignore_leading_char_diff,
+                    exact_match_score=exact_match_score,
+                    combination_score_multiplier=combination_score_multiplier,
+                    gap_penalty=gap_penalty,
+                    max_combination_len=self.max_combination_len
+                )
+            _tl3 = _time.time()
+            _t_postprocess_total += _tl3 - _tl2
+
+            mask = self.get_alignment_mask(aligned_pairs, use_canonicalization=True,
+                                           ignore_leading_char_diff=ignore_leading_char_diff)
+            aligned_pairs = [
+                (s1_tokens, s2_tokens, s1_start, s1_end, s2_start, s2_end, mask_value)
+                for (s1_tokens, s2_tokens, s1_start, s1_end, s2_start, s2_end), mask_value
+                in zip(aligned_pairs, mask)
+            ]
+            _tl4 = _time.time()
+            _t_mask_total += _tl4 - _tl3
+
+            all_aligned_pairs.append(aligned_pairs)
+
+        n = student_ids.shape[0]
+        _t_total = _t_lookup_total + _t_anchors_dp_total + _t_postprocess_total + _t_mask_total
+        if _t_total > 0.5 or n > 1:
+            print(f"    [align_fast timing] lookup={_t_lookup_total:.3f}s, "
+                  f"anchors+DP={_t_anchors_dp_total:.3f}s, "
+                  f"postprocess={_t_postprocess_total:.3f}s, "
+                  f"mask={_t_mask_total:.3f}s, "
+                  f"total={_t_total:.3f}s (n={n})", flush=True)
+
+        return all_aligned_pairs
+
     def _convert_student_tokens_to_teacher_tokens(self, student_tokens: torch.Tensor) -> torch.Tensor:
         device = student_tokens.device
         dtype = student_tokens.dtype
@@ -889,34 +1111,41 @@ class TokenAligner(nn.Module):
               post_process=True,
               convert_ids_to_tokens=True,
               anchor_lengths=[3,],
-              track_rules=None):
+              track_rules=None,
+              _debug_timing=False):
         """
         Aligns two sequences of tokens (or batches of sequences), identifies
         translation rules, and updates the internal rule set.
         """
-        # Determine whether to track rules
+        import time as _time
+
         should_track_rules = track_rules if track_rules is not None else self.track_rules
         
         seq1 = student_seq
         seq2 = teacher_seq
         
-        # Store original token IDs for rule tracking
         original_seq1_ids = None
         original_seq2_ids = None
         
-        #if seq1 is tensor, convert to list
+        _t_convert = 0.0
         if isinstance(seq1, torch.Tensor):
-            # Store original IDs before conversion
             original_seq1_ids = seq1.cpu().tolist()
             original_seq2_ids = seq2.cpu().tolist()
             
             seq1 = seq1.cpu().tolist()
             seq2 = seq2.cpu().tolist()
             if convert_ids_to_tokens:
+                _tc0 = _time.time()
                 seq1 = [self.student_tokenizer.convert_ids_to_tokens(seq1_single) for seq1_single in seq1]
                 seq2 = [self.teacher_tokenizer.convert_ids_to_tokens(seq2_single) for seq2_single in seq2]
+                _t_convert = _time.time() - _tc0
         
         is_batched = isinstance(seq1, list) and len(seq1) > 0 and isinstance(seq1[0], list)
+
+        _t_canon_total = 0.0
+        _t_anchors_dp_total = 0.0
+        _t_postprocess_total = 0.0
+        _t_mask_total = 0.0
 
         if is_batched:
             if not (isinstance(seq2, list) and len(seq2) == len(seq1) and (len(seq2) == 0 or isinstance(seq2[0], list))):
@@ -924,18 +1153,33 @@ class TokenAligner(nn.Module):
 
             all_aligned_pairs = []
             for i, (s1, s2) in enumerate(zip(seq1, seq2)):
-                # Pass token IDs for this batch item
                 s1_ids = original_seq1_ids[i] if original_seq1_ids else None
                 s2_ids = original_seq2_ids[i] if original_seq2_ids else None
-                aligned_pairs = self._align_single(s1, s2, exact_match_score, combination_score_multiplier, gap_penalty, ignore_leading_char_diff, chunk_size, post_process, anchor_lengths, s1_ids, s2_ids, should_track_rules)
+                aligned_pairs, timings = self._align_single(s1, s2, exact_match_score, combination_score_multiplier, gap_penalty, ignore_leading_char_diff, chunk_size, post_process, anchor_lengths, s1_ids, s2_ids, should_track_rules, _return_timings=True)
                 all_aligned_pairs.append(aligned_pairs)
+                _t_canon_total += timings.get("canon", 0)
+                _t_anchors_dp_total += timings.get("anchors_dp", 0)
+                _t_postprocess_total += timings.get("postprocess", 0)
+                _t_mask_total += timings.get("mask", 0)
         else:
-            # For single sequences, pass the first (and only) sequence's IDs
             s1_ids = original_seq1_ids[0] if original_seq1_ids else None
             s2_ids = original_seq2_ids[0] if original_seq2_ids else None
-            aligned_pairs = self._align_single(seq1, seq2, exact_match_score, combination_score_multiplier, gap_penalty, ignore_leading_char_diff, chunk_size, post_process, anchor_lengths, s1_ids, s2_ids, should_track_rules)
+            aligned_pairs, timings = self._align_single(seq1, seq2, exact_match_score, combination_score_multiplier, gap_penalty, ignore_leading_char_diff, chunk_size, post_process, anchor_lengths, s1_ids, s2_ids, should_track_rules, _return_timings=True)
             all_aligned_pairs = [aligned_pairs]
-            
+            _t_canon_total += timings.get("canon", 0)
+            _t_anchors_dp_total += timings.get("anchors_dp", 0)
+            _t_postprocess_total += timings.get("postprocess", 0)
+            _t_mask_total += timings.get("mask", 0)
+
+        if _debug_timing:
+            n = len(all_aligned_pairs)
+            print(f"    [align timing] convert_ids={_t_convert:.3f}s, "
+                  f"canonicalize={_t_canon_total:.3f}s, "
+                  f"anchors+DP={_t_anchors_dp_total:.3f}s, "
+                  f"postprocess={_t_postprocess_total:.3f}s, "
+                  f"mask={_t_mask_total:.3f}s "
+                  f"(n={n})", flush=True)
+
         return all_aligned_pairs 
 
     def _align_single(self, seq1, seq2,
@@ -948,29 +1192,31 @@ class TokenAligner(nn.Module):
             anchor_lengths=None,
             seq1_token_ids=None,
             seq2_token_ids=None,
-            track_rules=None):
+            track_rules=None,
+            _return_timings=False):
         """
         Aligns two sequences of tokens, identifies translation rules, and updates
         the internal rule set.
         """
-        # ------------------------------------------------------------------
-        # One-time canonicalisation per sequence
-        # ------------------------------------------------------------------
+        import time as _time
+
+        _tc0 = _time.time()
         seq1_canon = TokenAligner._canonicalize_sequence(seq1)
         seq2_canon = TokenAligner._canonicalize_sequence(seq2)
+        _tc1 = _time.time()
 
         align_kwargs = {
             'exact_match_score': exact_match_score,
             'combination_score_multiplier': combination_score_multiplier,
             'gap_penalty': gap_penalty,
             'max_combination_len': self.max_combination_len,
-            'ignore_leading_char_diff': False,  # canonicalisation removed need
+            'ignore_leading_char_diff': False,
             'chunk_size': chunk_size,
             'anchor_lengths': anchor_lengths,
         }
 
-        # Use the anchor-based optimization which falls back to DP if needed.
         aligned_pairs, _ = self._align_with_anchors(seq1_canon, seq2_canon, **align_kwargs)
+        _tc2 = _time.time()
 
         if post_process:
             aligned_pairs = self.post_process_alignment_optimized(
@@ -981,19 +1227,27 @@ class TokenAligner(nn.Module):
                 gap_penalty=gap_penalty,
                 max_combination_len=self.max_combination_len
             )
-        
-        # Compute alignment mask after post-processing but before rule updates
+        _tc3 = _time.time()
+
         mask = self.get_alignment_mask(aligned_pairs, use_canonicalization=True, ignore_leading_char_diff=ignore_leading_char_diff)
-        # Add mask to each alignment pair: (s1_tokens, s2_tokens, s1_start, s1_end, s2_start, s2_end, is_correct)
         aligned_pairs = [
             (s1_tokens, s2_tokens, s1_start, s1_end, s2_start, s2_end, mask_value)
             for (s1_tokens, s2_tokens, s1_start, s1_end, s2_start, s2_end), mask_value in zip(aligned_pairs, mask)
         ]
-        
-        # Update rules with the final aligned pairs (after post-processing and with masks) only if tracking is enabled
+        _tc4 = _time.time()
+
         if track_rules:
             self._update_rules(aligned_pairs, seq1_token_ids, seq2_token_ids, seq1, seq2)
-        
+
+        timings = {
+            "canon": _tc1 - _tc0,
+            "anchors_dp": _tc2 - _tc1,
+            "postprocess": _tc3 - _tc2,
+            "mask": _tc4 - _tc3,
+        }
+
+        if _return_timings:
+            return aligned_pairs, timings
         return aligned_pairs
     
     
@@ -1249,14 +1503,55 @@ class TokenAligner(nn.Module):
         Helper function to run the core DP-based alignment.
         """
         chunk_size = kwargs.get('chunk_size', 0)
-        
-        # Remove the chunk_size from kwargs to avoid passing it down if not needed
         kwargs.pop('chunk_size', None)
+        kwargs.pop('anchor_lengths', None)
 
         if chunk_size > 0:
             return self.align_tokens_combinations_chunked(seq1, seq2, chunk_size=chunk_size, **kwargs)
         else:
-            return self.align_tokens_with_combinations_numpy(seq1, seq2, **kwargs)
+            return self.align_tokens_with_combinations_numpy_jit(seq1, seq2, **kwargs)
+
+    @staticmethod
+    def _align_chunked_fast(
+        seq1, seq2,
+        exact_match_score=3,
+        combination_score_multiplier=1.5,
+        gap_penalty=-1.5,
+        max_combination_len=4,
+        ignore_leading_char_diff=False,
+        chunk_size=256,
+    ):
+        """Chunked processing using the fast DP as the base case."""
+        n1, n2 = len(seq1), len(seq2)
+
+        if n1 <= chunk_size and n2 <= chunk_size:
+            return TokenAligner.align_tokens_with_combinations_numpy_fast(
+                seq1, seq2, exact_match_score, combination_score_multiplier,
+                gap_penalty, max_combination_len, ignore_leading_char_diff,
+            )
+
+        mid1, mid2 = n1 // 2, n2 // 2
+
+        left_aligned, left_score = TokenAligner._align_chunked_fast(
+            seq1[:mid1], seq2[:mid2], exact_match_score, combination_score_multiplier,
+            gap_penalty, max_combination_len, ignore_leading_char_diff, chunk_size,
+        )
+        right_aligned, right_score = TokenAligner._align_chunked_fast(
+            seq1[mid1:], seq2[mid2:], exact_match_score, combination_score_multiplier,
+            gap_penalty, max_combination_len, ignore_leading_char_diff, chunk_size,
+        )
+
+        adjusted_right = []
+        for s1_tokens, s2_tokens, s1_start, s1_end, s2_start, s2_end in right_aligned:
+            adjusted_right.append((
+                s1_tokens, s2_tokens,
+                s1_start + mid1 if s1_start >= 0 else -1,
+                s1_end + mid1 if s1_end >= 0 else -1,
+                s2_start + mid2 if s2_start >= 0 else -1,
+                s2_end + mid2 if s2_end >= 0 else -1,
+            ))
+
+        return left_aligned + adjusted_right, left_score + right_score
 
     @staticmethod
     def _canonical_token(token: str) -> str:
@@ -1545,6 +1840,162 @@ class TokenAligner(nn.Module):
         return s1_canonical == s2_canonical 
 
     @staticmethod
+    def align_tokens_with_combinations_numpy_fast(
+        seq1, seq2,
+        exact_match_score=3,
+        combination_score_multiplier=1.5,
+        gap_penalty=-1.5,
+        max_combination_len=4,
+        ignore_leading_char_diff=False,
+        band_width=None,
+    ):
+        """DP alignment using integer token IDs, int32 trace, and optional band constraint.
+
+        Produces the same result as ``align_tokens_with_combinations_numpy`` but
+        replaces per-cell Python string comparisons with integer comparisons and
+        uses a compact int32 trace array instead of a Python object array.
+
+        When *band_width* is set (recommended for cross-tokenizer alignment where
+        both sequences encode the same text), the DP is restricted to a diagonal
+        band of width ``2 * band_width + 1``, reducing complexity from
+        O(n1 * n2) to O(n1 * band_width).
+
+        Note: ``ignore_leading_char_diff`` must be False.  The caller
+        (``_align_single``) canonicalizes sequences before calling the DP,
+        so flexible comparison is never needed here.
+        """
+        if ignore_leading_char_diff:
+            return TokenAligner.align_tokens_with_combinations_numpy(
+                seq1, seq2, exact_match_score, combination_score_multiplier,
+                gap_penalty, max_combination_len, ignore_leading_char_diff,
+            )
+        n1, n2 = len(seq1), len(seq2)
+        if n1 == 0 and n2 == 0:
+            return [], 0.0
+        if n1 == 0:
+            return [([], [seq2[j]], -1, -1, j, j + 1) for j in range(n2)], n2 * gap_penalty
+        if n2 == 0:
+            return [([seq1[i]], [], i, i + 1, -1, -1) for i in range(n1)], n1 * gap_penalty
+
+        token_to_id: dict[str, int] = {}
+        _next = [0]
+
+        def _id(s: str) -> int:
+            tid = token_to_id.get(s)
+            if tid is None:
+                tid = _next[0]
+                token_to_id[s] = tid
+                _next[0] += 1
+            return tid
+
+        ids1 = [_id(t) for t in seq1]
+        ids2 = [_id(t) for t in seq2]
+
+        joined_ids1: dict[tuple[int, int], int] = {}
+        for i in range(n1 + 1):
+            for k in range(2, min(i, max_combination_len) + 1):
+                joined_ids1[(i - k, i)] = _id(''.join(seq1[i - k:i]))
+
+        joined_ids2: dict[tuple[int, int], int] = {}
+        for j in range(n2 + 1):
+            for k in range(2, min(j, max_combination_len) + 1):
+                joined_ids2[(j - k, j)] = _id(''.join(seq2[j - k:j]))
+
+        use_band = band_width is not None
+        NEG_INF = np.float32(-1e9)
+        dp = np.full((n1 + 1, n2 + 1), NEG_INF, dtype=np.float32)
+        # Trace codes: 0=start, 1=diag, 2=up, 3=left,
+        #   10+k = comb_s1_over_s2_k, 20+k = comb_s2_over_s1_k
+        trace = np.zeros((n1 + 1, n2 + 1), dtype=np.int32)
+
+        dp[0, 0] = 0.0
+        for i in range(1, n1 + 1):
+            dp[i, 0] = dp[i - 1, 0] + gap_penalty
+            trace[i, 0] = 2
+        for j in range(1, n2 + 1):
+            dp[0, j] = dp[0, j - 1] + gap_penalty
+            trace[0, j] = 3
+
+        scale = n2 / max(n1, 1)
+        exact = np.float32(exact_match_score)
+        neg_exact = np.float32(-exact_match_score)
+        gap = np.float32(gap_penalty)
+        comb_mul = np.float32(combination_score_multiplier)
+
+        for i in range(1, n1 + 1):
+            if use_band:
+                ej = int(i * scale)
+                j_lo = max(1, ej - band_width)
+                j_hi = min(n2, ej + band_width)
+            else:
+                j_lo = 1
+                j_hi = n2
+
+            id_i = ids1[i - 1]
+
+            for j in range(j_lo, j_hi + 1):
+                id_j = ids2[j - 1]
+
+                best = dp[i - 1, j - 1] + (exact if id_i == id_j else neg_exact)
+                best_m = 1
+
+                s = dp[i - 1, j] + gap
+                if s > best:
+                    best = s
+                    best_m = 2
+
+                s = dp[i, j - 1] + gap
+                if s > best:
+                    best = s
+                    best_m = 3
+
+                for k in range(2, min(j + 1, max_combination_len + 1)):
+                    key = (j - k, j)
+                    if key in joined_ids2 and id_i == joined_ids2[key]:
+                        s = dp[i - 1, j - k] + comb_mul * k
+                        if s > best:
+                            best = s
+                            best_m = 10 + k
+
+                for k in range(2, min(i + 1, max_combination_len + 1)):
+                    key = (i - k, i)
+                    if key in joined_ids1 and id_j == joined_ids1[key]:
+                        s = dp[i - k, j - 1] + comb_mul * k
+                        if s > best:
+                            best = s
+                            best_m = 20 + k
+
+                dp[i, j] = best
+                trace[i, j] = best_m
+
+        aligned: list = []
+        i, j = n1, n2
+        while i > 0 or j > 0:
+            m = int(trace[i, j])
+            if m == 1:
+                aligned.append(([seq1[i - 1]], [seq2[j - 1]], i - 1, i, j - 1, j))
+                i -= 1; j -= 1
+            elif m == 2:
+                aligned.append(([seq1[i - 1]], [], i - 1, i, -1, -1))
+                i -= 1
+            elif m == 3:
+                aligned.append(([], [seq2[j - 1]], -1, -1, j - 1, j))
+                j -= 1
+            elif 10 <= m < 20:
+                k = m - 10
+                aligned.append(([seq1[i - 1]], seq2[j - k:j], i - 1, i, j - k, j))
+                i -= 1; j -= k
+            elif 20 <= m < 30:
+                k = m - 20
+                aligned.append((seq1[i - k:i], [seq2[j - 1]], i - k, i, j - 1, j))
+                i -= k; j -= 1
+            else:
+                break
+
+        aligned.reverse()
+        return aligned, float(dp[n1, n2])
+
+    @staticmethod
     def align_tokens_with_combinations_numpy(seq1, seq2,
                                             exact_match_score=3,
                                             combination_score_multiplier=1.5,
@@ -1640,6 +2091,99 @@ class TokenAligner(nn.Module):
         return aligned, dp[n1, n2]
 
     @staticmethod
+    def align_tokens_with_combinations_numpy_jit(
+        seq1, seq2,
+        exact_match_score=3,
+        combination_score_multiplier=1.5,
+        gap_penalty=-1.5,
+        max_combination_len=4,
+        ignore_leading_char_diff=False,
+    ):
+        """Numba-accelerated version of align_tokens_with_combinations_numpy.
+
+        Pre-converts string tokens to integer IDs, runs the DP in a Numba
+        @njit kernel, then backtracks using the original string tokens.
+        Falls back to the pure-Python original when Numba is unavailable or
+        when ignore_leading_char_diff is True (requires Python string logic).
+        """
+        if not _NUMBA_AVAILABLE or ignore_leading_char_diff:
+            return TokenAligner.align_tokens_with_combinations_numpy(
+                seq1, seq2, exact_match_score, combination_score_multiplier,
+                gap_penalty, max_combination_len, ignore_leading_char_diff,
+            )
+
+        n1, n2 = len(seq1), len(seq2)
+        if n1 == 0 and n2 == 0:
+            return [], 0.0
+        if n1 == 0:
+            return [([], [seq2[j]], -1, -1, j, j + 1) for j in range(n2)], n2 * gap_penalty
+        if n2 == 0:
+            return [([seq1[i]], [], i, i + 1, -1, -1) for i in range(n1)], n1 * gap_penalty
+
+        token_to_id: dict[str, int] = {}
+        _next_id = [0]
+
+        def _get_id(s: str) -> int:
+            tid = token_to_id.get(s)
+            if tid is None:
+                tid = _next_id[0]
+                token_to_id[s] = tid
+                _next_id[0] += 1
+            return tid
+
+        ids1 = np.array([_get_id(t) for t in seq1], dtype=np.int64)
+        ids2 = np.array([_get_id(t) for t in seq2], dtype=np.int64)
+
+        INVALID = np.int64(-1)
+        joined1 = np.full((n1 + 1, max_combination_len + 1), INVALID, dtype=np.int64)
+        for i in range(n1 + 1):
+            for k in range(2, min(i, max_combination_len) + 1):
+                joined1[i, k] = _get_id(''.join(seq1[i - k:i]))
+
+        joined2 = np.full((n2 + 1, max_combination_len + 1), INVALID, dtype=np.int64)
+        for j in range(n2 + 1):
+            for k in range(2, min(j, max_combination_len) + 1):
+                joined2[j, k] = _get_id(''.join(seq2[j - k:j]))
+
+        dp, trace = _dp_core_numba(
+            ids1, ids2, joined1, joined2, n1, n2,
+            np.float32(exact_match_score),
+            np.float32(gap_penalty),
+            np.float32(combination_score_multiplier),
+            max_combination_len,
+        )
+
+        aligned = []
+        i, j = n1, n2
+        while i > 0 or j > 0:
+            m = trace[i, j]
+            if m == 1:
+                aligned.append(([seq1[i - 1]], [seq2[j - 1]], i - 1, i, j - 1, j))
+                i -= 1
+                j -= 1
+            elif m == 2:
+                aligned.append(([seq1[i - 1]], [], i - 1, i, -1, -1))
+                i -= 1
+            elif m == 3:
+                aligned.append(([], [seq2[j - 1]], -1, -1, j - 1, j))
+                j -= 1
+            elif 10 <= m < 20:
+                k = m - 10
+                aligned.append(([seq1[i - 1]], seq2[j - k:j], i - 1, i, j - k, j))
+                i -= 1
+                j -= k
+            elif 20 <= m < 30:
+                k = m - 20
+                aligned.append((seq1[i - k:i], [seq2[j - 1]], i - k, i, j - 1, j))
+                i -= k
+                j -= 1
+            else:
+                break
+
+        aligned.reverse()
+        return aligned, float(dp[n1, n2])
+
+    @staticmethod
     def align_tokens_combinations_chunked(
         seq1: List[str],
         seq2: List[str],
@@ -1657,7 +2201,7 @@ class TokenAligner(nn.Module):
         
         # If sequences are small enough, use regular algorithm
         if n1 <= chunk_size and n2 <= chunk_size:
-            return TokenAligner.align_tokens_with_combinations_numpy(
+            return TokenAligner.align_tokens_with_combinations_numpy_jit(
                 seq1, seq2, exact_match_score, combination_score_multiplier,
                 gap_penalty, max_combination_len, ignore_leading_char_diff
             )
@@ -1696,7 +2240,7 @@ class TokenAligner(nn.Module):
             return combined_aligned, combined_score
         
         # Fallback to regular algorithm
-        return TokenAligner.align_tokens_with_combinations_numpy(
+        return TokenAligner.align_tokens_with_combinations_numpy_jit(
             seq1, seq2, exact_match_score, combination_score_multiplier,
             gap_penalty, max_combination_len, ignore_leading_char_diff
         )
