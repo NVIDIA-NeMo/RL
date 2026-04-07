@@ -455,8 +455,6 @@ def math_hf_data_processor(
     problem = user_message[0]["content"]
     extra_env_info = {"ground_truth": user_message[1]["content"]}
 
-    message_log: LLMMessageLogType = []
-
     # merge system prompt and user prompt
     message_list = []
     if task_data_spec.system_prompt:
