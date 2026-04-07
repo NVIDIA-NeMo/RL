@@ -11,8 +11,8 @@
 
 ## 📣 News
 * [04/06/2026] New Model Support
-    * Added support for [Qwen3.5](https://huggingface.co/collections/Qwen/qwen3-5-685a7df87897dbed85bfb21a) dense and MoE models (LLM and VLM) for GRPO training.
-    * Added support for [GLM-4.7-Flash](https://huggingface.co/THUDM/GLM-4.7-Flash) for GRPO training.
+    * Added support for [Qwen3.5](https://huggingface.co/collections/Qwen/qwen35) dense and MoE models (LLM and VLM) for GRPO training.
+    * Added support for [GLM-4.7-Flash](https://huggingface.co/zai-org/GLM-4.7-Flash) for GRPO training.
     * Recipes: [grpo-qwen3.5-9b-1n8g-megatron.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron.yaml), [grpo-qwen3.5-35ba3b-2n8g-megatron-ep16.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16.yaml), [grpo-glm47-flash-4n8g-automodel.yaml](/examples/configs/recipes/llm/grpo-glm47-flash-4n8g-automodel.yaml)
 * [03/12/2026] GDPO Support
     * Enabling [Group reward-Decoupled Normalization Policy Optimization](https://arxiv.org/abs/2601.05242) (GDPO) for multi-reward RL training is now supported.
