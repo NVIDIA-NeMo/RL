@@ -220,8 +220,8 @@ class MegatronConfig(TypedDict):
     apply_rope_fusion: bool
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: bool
-    # Force overwrite of the initial checkpoint even if it exists (default: False)
-    force_overwrite_initial_ckpt: NotRequired[bool]
+    # Force reconvert from HF even if the checkpoint already exists (default: False)
+    force_reconvert_from_hf: NotRequired[bool]
     # Attention backend available values:
     # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/enums.py#L60
     attention_backend: NotRequired[str]
@@ -249,6 +249,8 @@ class MegatronConfig(TypedDict):
     # Number of tokens per chunk when computing the fused linear CE loss.
     # Smaller values reduce peak memory further but may decrease throughput.
     linear_ce_fusion_chunk_size: NotRequired[int]
+    # When mtp_num_layers=0, Multi-Token Prediction is disabled.
+    mtp_num_layers: NotRequired[int]
 
 
 class DraftConfigDisabled(TypedDict):

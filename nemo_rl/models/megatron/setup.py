@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
 import os
 import time
 import warnings
@@ -245,6 +247,26 @@ def validate_and_set_config(
             "tracked in https://github.com/NVIDIA-NeMo/RL/issues/720"
         )
 
+    # Validate yarn rope_scaling fields are fully specified
+    rope_scaling = (config.get("hf_config_overrides") or {}).get("rope_scaling") or {}
+    if rope_scaling.get("rope_type") == "yarn":
+        _YARN_REQUIRED_FIELDS = (
+            "factor",
+            "rope_theta",
+            "original_max_position_embeddings",
+            "truncate",
+            "beta_fast",
+            "beta_slow",
+            "mscale",
+            "mscale_all_dim",
+        )
+        missing = [f for f in _YARN_REQUIRED_FIELDS if f not in rope_scaling]
+        assert not missing, (
+            f"rope_scaling.rope_type is 'yarn' but the following required fields are not set: "
+            f"{missing}. Please specify all of {list(_YARN_REQUIRED_FIELDS)} in "
+            f"policy.hf_config_overrides.rope_scaling."
+        )
+
     megatron_cfg, model_cfg = setup_model_config(
         config,
         rank,
@@ -273,21 +295,37 @@ def validate_and_set_config(
     )
 
 
+def _canonicalize_hf_config_overrides(overrides: dict[str, Any]) -> str:
+    """Return a stable JSON string for hf_config_overrides."""
+    return json.dumps(
+        overrides, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+
+
+def _get_hf_config_overrides_hash(overrides: dict[str, Any]) -> str:
+    """Return a short stable hash for hf_config_overrides."""
+    canonical = _canonicalize_hf_config_overrides(overrides)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
 def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     """Validate and setup model paths."""
     # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
     hf_model_name = config["model_name"]
+    hf_config_overrides = config.get("hf_config_overrides", {}) or {}
 
     # Check if the checkpoint already exists
     hf_model_subdir = hf_model_name
     if os.path.exists(hf_model_name):
         hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
 
-    pretrained_path = f"{get_megatron_checkpoint_dir()}/{hf_model_subdir}"
+    if hf_config_overrides:
+        overrides_hash = _get_hf_config_overrides_hash(hf_config_overrides)
+        hf_model_subdir = f"{hf_model_subdir}__hfovr_{overrides_hash}"
+    pretrained_path = os.path.join(get_megatron_checkpoint_dir(), hf_model_subdir)
     pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
         os.path.join(pretrained_path, "iter_0000000")
     )
-
     return hf_model_name, pretrained_path, pt_checkpoint_exists
 
 
@@ -339,6 +377,9 @@ def setup_model_config(
 
     # Apply MoE settings
     _apply_moe_config(model_cfg, config)
+
+    # Apply MTP settings
+    _apply_mtp_config(model_cfg, config)
 
     # Apply precision settings
     _apply_precision_config(model_cfg, config, dtype)
@@ -437,6 +478,11 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     ]
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
+
+
+def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
+    if "mtp_num_layers" in config["megatron_cfg"]:
+        model_cfg.mtp_num_layers = config["megatron_cfg"]["mtp_num_layers"]
 
 
 def _apply_precision_config(
@@ -958,7 +1004,11 @@ def handle_model_import(
     pt_checkpoint_exists: bool,
 ) -> None:
     """Handle HF model import if checkpoint doesn't exist."""
-    if pt_checkpoint_exists:
+    force_reconvert_from_hf = config["megatron_cfg"].get(
+        "force_reconvert_from_hf", False
+    )
+
+    if pt_checkpoint_exists and not force_reconvert_from_hf:
         print(f"Checkpoint already exists at {pretrained_path}. Skipping import.")
     else:
         hf_config_overrides = config.get("hf_config_overrides", {}) or {}

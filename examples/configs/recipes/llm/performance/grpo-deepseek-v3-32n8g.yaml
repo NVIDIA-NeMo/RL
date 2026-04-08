@@ -10,9 +10,7 @@ loss_fn:
 checkpointing:
   checkpoint_dir: results/grpo-deepseek-v3-32n8g
 policy:
-  model_name: unsloth/DeepSeek-V3-0324-BF16
-  tokenizer:
-    name: unsloth/DeepSeek-V3-0324-BF16
+  model_name: "Follow instructions in https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/deepseek.md"
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 1536
@@ -29,8 +27,11 @@ policy:
     num_layers_in_first_pipeline_stage: 3
     num_layers_in_last_pipeline_stage: 2
     apply_rope_fusion: false
+    gradient_accumulation_fusion: false
     moe_permute_fusion: true
     defer_fp32_logits: true
+    # MTP — disabled
+    mtp_num_layers: 0
     optimizer:
       lr: 5.0e-07
       min_lr: 5.0e-08
