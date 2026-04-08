@@ -1,0 +1,14 @@
+defaults: ./dpo-llama3.1-8b-tulu3-1n8g-fsdp2tp1.yaml
+policy:
+  train_micro_batch_size: 2
+  dtensor_cfg:
+    _v2: true
+    pipeline_parallel_size: 2
+    automodel_kwargs:
+      force_hf: true
+      pipeline_config:
+        _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
+        pp_schedule: 1F1B
+        pp_microbatch_size: 1
+checkpointing:
+  checkpoint_dir: results/dpo-llama3.1-8b-tulu3-1n8g-pp2
