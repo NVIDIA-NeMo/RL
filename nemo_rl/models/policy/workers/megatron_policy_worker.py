@@ -41,10 +41,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.optimizer import ChainedOptimizer
-from megatron.core.parallel_state import (
-    get_pipeline_model_parallel_group,
-    is_pipeline_last_stage,
-)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
@@ -379,11 +375,6 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     num_zeros_in_grad, mp_group=pg_collection.mp
                 )
 
-                if update_successful:
-                    skipped_iter = 0
-                else:
-                    skipped_iter = 1
-
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
                     torch.cuda.empty_cache()
@@ -481,8 +472,6 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         self.model.eval()
 
-        pp_grp = get_pipeline_model_parallel_group()
-
         (
             mb_iterator,
             num_microbatches,
@@ -514,7 +503,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
-        if is_pipeline_last_stage(ignore_virtual=True):
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             all_log_probs_padded = []
             all_logprobs = [l["logprobs"] for l in list_of_logprobs]
             for lp in all_logprobs:
@@ -533,6 +522,59 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         no_grad.__exit__(None, None, None)
         return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
+
+    def _apply_state_dict_to_model(
+        self,
+        source_state_dict: dict,
+        *,
+        raise_if_key_missing: bool = False,
+    ) -> None:
+        """Apply a state dict to self.model in-place.
+
+        - Tensors with matching shape: in-place copy (parameters / buffers).
+        - _extra_state keys (e.g. FP8 scale/amax) with shape mismatch or non-Tensor value:
+          resolve the submodule and call set_extra_state(); supports DDP and Float16Module unwrap.
+
+        Args:
+            source_state_dict: State dict to apply (e.g. reference_state_dict or saved model_state_dict).
+            raise_if_key_missing: If True, raise when a key in self.model.state_dict() is missing
+                from source_state_dict; if False, skip such keys.
+        """
+        for state_dict_key, param_or_buf in self.model.state_dict().items():
+            if (
+                not isinstance(param_or_buf, torch.Tensor)
+                or "draft_model." in state_dict_key
+            ):
+                continue
+            if state_dict_key not in source_state_dict:
+                if raise_if_key_missing:
+                    raise ValueError(
+                        f"Key '{state_dict_key}' not in source state_dict."
+                    )
+                continue
+            source_value = source_state_dict[state_dict_key]
+
+            # Case 1: Same shape → in-place copy (parameters / buffers)
+            if (
+                isinstance(source_value, torch.Tensor)
+                and param_or_buf.shape == source_value.shape
+            ):
+                param_or_buf.copy_(source_value)
+                continue
+
+            # Case 2: _extra_state (shape mismatch or non-Tensor) → set_extra_state()
+            assert "extra_state" in state_dict_key, (
+                f"the {state_dict_key} is not an extra_state, but the param_or_buf is mismatched with the reference_state_dict {source_value.shape} != {param_or_buf.shape}."
+            )
+
+            submodule_path = state_dict_key.rsplit("._extra_state", 1)[0]
+            base_module = getattr(self.model, "module", self.model)
+            # Unwrap Float16Module/MoEFloat16Module: state_dict keys are relative to inner .module
+            top_level_name = submodule_path.split(".", 1)[0]
+            if not hasattr(base_module, top_level_name):
+                base_module = getattr(base_module, "module", base_module)
+            target_module = base_module.get_submodule(submodule_path)
+            target_module.set_extra_state(source_value)
 
     @contextmanager
     def use_reference_model(self):
@@ -555,12 +597,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     item = item.detach().to(device="cpu", non_blocking=True, copy=True)
                 model_state_dict[name] = item
 
-            # Swap reference model state_dict to self.model
-            for k, v in self.model.state_dict().items():
-                if isinstance(v, torch.Tensor):
-                    if "draft_model." in k:
-                        continue
-                    v.copy_(self.reference_state_dict[k])
+            # Swap reference model state_dict into self.model (reference weights + optional FP8 extra_state)
+            self._apply_state_dict_to_model(
+                self.reference_state_dict,
+                raise_if_key_missing=True,
+            )
 
             if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                 gc.collect()
@@ -588,10 +629,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             # Restore sampling_params
             self.sampling_params = saved_sampling_params
 
-            # Restore original references and device placement
-            for k, v in self.model.state_dict().items():
-                if isinstance(v, torch.Tensor):
-                    v.copy_(model_state_dict[k])
+            # Restore original policy state (weights + FP8 extra_state) from saved model_state_dict
+            self._apply_state_dict_to_model(
+                model_state_dict,
+                raise_if_key_missing=True,
+            )
 
             if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                 gc.collect()
@@ -629,8 +671,6 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         self.model.eval()
 
-        pp_grp = get_pipeline_model_parallel_group()
-
         (
             mb_iterator,
             num_microbatches,
@@ -657,7 +697,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
-        if is_pipeline_last_stage(ignore_virtual=True):
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             logits_chunks = []
             indices_chunks = []
             for out in list_of_outputs:
@@ -730,7 +770,6 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 f"Input to Megatron Generation worker is not properly right-padded: {error_msg}"
             )
 
-        model_cfg = self.megatron_cfg.model
         mcore_generation_config = cast(
             MegatronGenerationConfig, self.cfg["generation"]["mcore_generation_config"]
         )
