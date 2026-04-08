@@ -25,6 +25,10 @@ token_aligner:
   max_comb_len: 4
   learnable: false
   project_teacher_to_student: false   # Remove this  
+  use_char_offset: false
+  use_align_fast: true
+  use_cuda_dp: false
+  dp_chunk_size: 128
 
 distillation:
   num_prompts_per_step: 768
@@ -40,8 +44,9 @@ distillation:
   loss_on_all_tokens: true
   seed: 42
   # Number of CPU processes for cross-tokenizer decode/encode/align.
-  # null = os.cpu_count() (auto), 1 = sequential (no pool).
-  cross_tokenizer_num_workers: null
+  # Heuristic currently used: total GPUs / 2 (16 nodes * 8 GPUs = 128 -> 64 workers).
+  # Note: this is workload-dependent; tune per batch size and cluster shape.
+  cross_tokenizer_num_workers: 64
 
 loss_fn:
   loss_type: "KL"
