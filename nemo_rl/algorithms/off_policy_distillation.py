@@ -30,7 +30,8 @@ import math
 import multiprocessing
 import os
 import warnings
-from concurrent.futures import ProcessPoolExecutor
+import importlib.util
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 import sys
 if sys.version_info >= (3, 11):
@@ -94,6 +95,11 @@ class TokenAlignerConfig(TypedDict, total=False):
     max_comb_len: int                      # Max combination length for token alignment DP
     learnable: bool                        # If True, projection matrix is trainable
     project_teacher_to_student: bool       # If True, project teacher->student instead of student->teacher
+    use_char_offset: bool                  # If True, try char-offset alignment before DP fallback
+    force_dp_only: bool                    # If True, disable char-offset path and run DP for all samples
+    use_cuda_dp: bool                      # If True, patch TokenAligner chunked DP base case with CUDA kernel
+    dp_chunk_size: int                     # Chunk size used by DP chunked solver
+    use_align_fast: bool                   # If True, use align_fast for DP path; default False for parity
 
 
 class OffPolicyDistillationConfig(TypedDict):
@@ -154,28 +160,48 @@ class OffPolicyMasterConfig(TypedDict):
     token_aligner: NotRequired[TokenAlignerConfig]  # Cross-tokenizer config (optional)
 
 
+class _PrefetchedBatchPack(TypedDict):
+    batch: BatchedDataDict[DatumSpec]
+    flat_messages: BatchedDataDict[DatumSpec]
+    input_lengths: torch.Tensor
+    train_data: BatchedDataDict[DistillationLossDataDict]
+    ct_future: Any
+
+
 # ===============================================================================
 # Cross-Tokenizer Parallel Processing
 # ===============================================================================
 
 # Module-level global set by _init_align_worker for each pool process.
 _ct_token_aligner = None
+_ct_dp_chunk_size = 128
+_ct_use_align_fast = False
 
 
-def _init_align_worker(token_aligner):
+def _init_align_worker(token_aligner, dp_chunk_size: int, use_align_fast: bool):
     """Initializer for ProcessPoolExecutor workers.
 
     Stores the TokenAligner once per process to avoid re-pickling every call.
     """
-    global _ct_token_aligner
+    global _ct_token_aligner, _ct_dp_chunk_size, _ct_use_align_fast
     _ct_token_aligner = token_aligner
+    _ct_dp_chunk_size = int(dp_chunk_size)
+    _ct_use_align_fast = bool(use_align_fast)
+    if getattr(_ct_token_aligner, "_use_cuda_dp", False):
+        cuda_dp_path_str = getattr(_ct_token_aligner, "_cuda_dp_module_path", "")
+        if cuda_dp_path_str:
+            spec = importlib.util.spec_from_file_location("x_token_cuda_dp_worker", cuda_dp_path_str)
+            if spec is not None and spec.loader is not None:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                mod.monkeypatch_tokenaligner_cuda_basecase()
 
 
 def _align_chunk(args):
     """Align a chunk of (student, teacher) token-ID pairs.
 
-    Called by ProcessPoolExecutor.  Uses align_fast (precomputed canonical maps)
-    when available, falling back to regular align otherwise.
+    Called by ProcessPoolExecutor. Uses align_fast only when enabled;
+    otherwise falls back to regular align.
 
     Args:
         args: (student_ids_chunk, teacher_ids_chunk) — both list[list[int]].
@@ -186,9 +212,13 @@ def _align_chunk(args):
     student_ids_chunk, teacher_ids_chunk = args
     student_t = torch.tensor(student_ids_chunk)
     teacher_t = torch.tensor(teacher_ids_chunk)
-    if _ct_token_aligner._student_canon_map is not None:
-        return _ct_token_aligner.align_fast(student_t, teacher_t)
-    return _ct_token_aligner.align(student_t, teacher_t)
+    if _ct_use_align_fast and _ct_token_aligner._student_canon_map is not None:
+        return _ct_token_aligner.align_fast(
+            student_t, teacher_t, chunk_size=_ct_dp_chunk_size
+        )
+    return _ct_token_aligner.align(
+        student_t, teacher_t, chunk_size=_ct_dp_chunk_size
+    )
 
 
 def _align_by_char_offsets(
@@ -254,36 +284,186 @@ def _align_by_char_offsets(
     return pairs
 
 
-def _try_char_offset_align(args):
-    """Try char-offset alignment for one sample. Pool-friendly (no shared state).
+def _process_cross_tokenizer_batch(
+    train_input_ids: torch.Tensor,
+    batch_loss_multiplier: torch.Tensor,
+    extra_env: Any,
+    tokenizer: PreTrainedTokenizerBase,
+    teacher_tokenizer: PreTrainedTokenizerBase,
+    token_aligner: Any,
+    use_char_offset: bool,
+    use_align_fast: bool,
+    dp_chunk_size: int,
+    ct_pool: Optional[ProcessPoolExecutor],
+    max_teacher_len_rt: int,
+) -> tuple[torch.Tensor, list[Any], BatchedDataDict]:
+    """Prepare teacher inputs + aligned pairs for one training batch."""
+    import time as _time
 
-    Args:
-        args: (s_off_np, t_off_np) — numpy arrays of shape [T, 2].
+    student_ids = train_input_ids
+    batch_size_ct = student_ids.shape[0]
 
-    Returns:
-        (aligned_pairs, success): pairs list if char-offset worked, else (None, False).
-    """
-    s_off, t_off = args
-    s_content = [
-        (int(s), int(e), pos)
-        for pos, (s, e) in enumerate(s_off)
-        if s != 0 or e != 0
-    ]
-    t_content = [
-        (int(s), int(e), pos)
-        for pos, (s, e) in enumerate(t_off)
-        if s != 0 or e != 0
-    ]
+    _t0 = _time.time()
+    has_raw_text = (
+        extra_env
+        and len(extra_env) == batch_size_ct
+        and all(
+            info is not None
+            and isinstance(info, dict)
+            and "raw_text" in info
+            for info in extra_env
+        )
+    )
+    if has_raw_text:
+        texts = [info["raw_text"] for info in extra_env]
+    else:
+        # Fallback only when raw text is unavailable for the batch.
+        texts = tokenizer.batch_decode(student_ids.tolist(), skip_special_tokens=True)
+    _t1 = _time.time()
 
-    if not s_content or not t_content or s_content[-1][1] != t_content[-1][1]:
-        return (None, False)
+    teacher_encoded = teacher_tokenizer(
+        texts,
+        max_length=max_teacher_len_rt,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt",
+        return_offsets_mapping=True,
+    )
+    teacher_input_ids = teacher_encoded["input_ids"]
+    teacher_attention_mask = teacher_encoded["attention_mask"]
+    teacher_offsets = teacher_encoded["offset_mapping"]
 
-    pairs = _align_by_char_offsets(s_content, t_content)
-    n_correct = sum(1 for p in pairs if p[6])
-    if n_correct == 0 or n_correct / len(pairs) < 0.5:
-        return (None, False)
+    student_re = tokenizer(
+        texts,
+        max_length=student_ids.shape[1],
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt",
+        return_offsets_mapping=True,
+    )
+    # Align against student/teacher IDs tokenized from the same raw text.
+    # This keeps alignment semantics symmetric across tokenizers.
+    student_align_ids = student_re["input_ids"]
+    student_offsets = student_re["offset_mapping"]
+    _t2 = _time.time()
 
-    return (pairs, True)
+    # --- Vectorized pre-check: which samples can try char-offset? ---
+    s_off_np = student_offsets.numpy()
+    t_off_np = teacher_offsets.numpy()
+
+    s_nonzero = (s_off_np[:, :, 0] != 0) | (s_off_np[:, :, 1] != 0)
+    t_nonzero = (t_off_np[:, :, 0] != 0) | (t_off_np[:, :, 1] != 0)
+
+    s_has = s_nonzero.any(axis=1)
+    t_has = t_nonzero.any(axis=1)
+
+    s_last = s_nonzero.shape[1] - 1 - np.flip(s_nonzero, axis=1).argmax(axis=1)
+    t_last = t_nonzero.shape[1] - 1 - np.flip(t_nonzero, axis=1).argmax(axis=1)
+    s_last_end = s_off_np[np.arange(batch_size_ct), s_last, 1]
+    t_last_end = t_off_np[np.arange(batch_size_ct), t_last, 1]
+
+    if not use_char_offset:
+        can_try_offset = np.zeros(batch_size_ct, dtype=bool)
+    else:
+        can_try_offset = s_has & t_has & (s_last_end == t_last_end)
+
+    # --- Vectorized offset filtering (avoid per-sample .tolist()) ---
+    # Pre-extract content indices per sample using numpy
+    s_content_per_sample = []
+    t_content_per_sample = []
+    for idx in range(batch_size_ct):
+        if can_try_offset[idx]:
+            s_mask = s_nonzero[idx]
+            t_mask = t_nonzero[idx]
+            s_positions = np.where(s_mask)[0]
+            t_positions = np.where(t_mask)[0]
+            s_content_per_sample.append([
+                (int(s_off_np[idx, p, 0]), int(s_off_np[idx, p, 1]), int(p))
+                for p in s_positions
+            ])
+            t_content_per_sample.append([
+                (int(t_off_np[idx, p, 0]), int(t_off_np[idx, p, 1]), int(p))
+                for p in t_positions
+            ])
+        else:
+            s_content_per_sample.append(None)
+            t_content_per_sample.append(None)
+
+    # --- Char-offset alignment (sequential, fast O(n+m) per sample) ---
+    aligned_pairs: list[Any] = [None] * batch_size_ct
+    dp_samples_s = []
+    dp_samples_t = []
+    dp_slot_indices = []
+
+    for idx in range(batch_size_ct):
+        if not can_try_offset[idx]:
+            dp_samples_s.append(student_align_ids[idx : idx + 1].tolist())
+            dp_samples_t.append(teacher_input_ids[idx : idx + 1].tolist())
+            dp_slot_indices.append(idx)
+            continue
+
+        pairs = _align_by_char_offsets(
+            s_content_per_sample[idx], t_content_per_sample[idx]
+        )
+        n_correct = sum(1 for p in pairs if p[6])
+        if n_correct == 0 or n_correct / len(pairs) < 0.5:
+            dp_samples_s.append(student_align_ids[idx : idx + 1].tolist())
+            dp_samples_t.append(teacher_input_ids[idx : idx + 1].tolist())
+            dp_slot_indices.append(idx)
+        else:
+            aligned_pairs[idx] = pairs
+
+    dp_fallback = len(dp_slot_indices)
+    n_offsets = batch_size_ct - dp_fallback
+
+    # --- DP alignment for fallbacks (parallelized) ---
+    if dp_fallback > 0:
+        if ct_pool is not None and dp_fallback > 1:
+            chunks = list(zip(dp_samples_s, dp_samples_t))
+            dp_results = list(ct_pool.map(_align_chunk, chunks))
+            for i, slot in enumerate(dp_slot_indices):
+                aligned_pairs[slot] = dp_results[i][0]
+        else:
+            for i, slot in enumerate(dp_slot_indices):
+                s_t = torch.tensor(dp_samples_s[i])
+                t_t = torch.tensor(dp_samples_t[i])
+                if use_align_fast and token_aligner._student_canon_map is not None:
+                    dp_result = token_aligner.align_fast(
+                        s_t, t_t, chunk_size=dp_chunk_size
+                    )
+                else:
+                    dp_result = token_aligner.align(
+                        s_t, t_t, chunk_size=dp_chunk_size
+                    )
+                aligned_pairs[slot] = dp_result[0]
+
+    _t3 = _time.time()
+    print(
+        f"  [CT timing] decode={_t1-_t0:.2f}s, "
+        f"encode={_t2-_t1:.2f}s, "
+        f"align={_t3-_t2:.2f}s "
+        f"(offsets: {n_offsets}, "
+        f"dp_fallback: {dp_fallback})",
+        flush=True,
+    )
+
+    teacher_input_lengths_ct = teacher_attention_mask.sum(dim=1)
+
+    teacher_token_mask = torch.zeros_like(teacher_input_ids, dtype=torch.float32)
+    for i in range(batch_size_ct):
+        teacher_token_mask[i, : teacher_input_lengths_ct[i]] = 1.0
+
+    teacher_data = BatchedDataDict(
+        {
+            "input_ids": teacher_input_ids,
+            "input_lengths": teacher_input_lengths_ct,
+            "token_mask": teacher_token_mask,
+            "sample_mask": batch_loss_multiplier,
+        }
+    )
+    teacher_data.to("cpu")
+
+    return teacher_input_ids, aligned_pairs, teacher_data
 
 
 # ===============================================================================
@@ -490,6 +670,23 @@ def setup(
         print(f"  ✓ TokenAligner initialized ({policy_config['model_name']} → {teacher_config['model_name']})", flush=True)
 
         token_aligner.precompute_canonical_maps()
+        if token_aligner_cfg.get("use_cuda_dp", False):
+            cuda_dp_path = Path(__file__).resolve().parents[2] / "x_token" / "cuda_tokenalign_dp.py"
+            if not cuda_dp_path.exists():
+                raise FileNotFoundError(
+                    f"Requested token_aligner.use_cuda_dp=true but file not found: {cuda_dp_path}"
+                )
+            spec = importlib.util.spec_from_file_location("x_token_cuda_dp", str(cuda_dp_path))
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Failed to load CUDA DP module from: {cuda_dp_path}")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.monkeypatch_tokenaligner_cuda_basecase()
+            token_aligner._use_cuda_dp = True
+            token_aligner._cuda_dp_module_path = str(cuda_dp_path)
+            print("  ✓ CUDA DP monkeypatch enabled for TokenAligner", flush=True)
+        if token_aligner_cfg.get("force_dp_only", False):
+            print("  ✓ force_dp_only enabled (char-offset disabled)", flush=True)
 
     # ==========================
     #      Teacher Policy
@@ -864,6 +1061,14 @@ def off_policy_distillation_train(
 
     # Create a process pool for cross-tokenizer processing (if enabled).
     cross_tokenizer_enabled = token_aligner is not None and teacher_tokenizer is not None
+    token_aligner_cfg = master_config.get("token_aligner", {})
+    dp_chunk_size = int(token_aligner_cfg.get("dp_chunk_size", 128))
+    # Default to DP-only for parity/stability; char-offset is opt-in.
+    use_char_offset = bool(token_aligner_cfg.get("use_char_offset", False))
+    if bool(token_aligner_cfg.get("force_dp_only", False)):
+        # Backward-compatible override for older configs.
+        use_char_offset = False
+    use_align_fast = bool(token_aligner_cfg.get("use_align_fast", False))
     ct_num_workers = master_config["distillation"].get("cross_tokenizer_num_workers", None)
     if ct_num_workers is None:
         ct_num_workers = os.cpu_count() or 1
@@ -874,12 +1079,129 @@ def off_policy_distillation_train(
             max_workers=ct_num_workers,
             mp_context=mp_ctx,
             initializer=_init_align_worker,
-            initargs=(token_aligner,),
+            initargs=(token_aligner, dp_chunk_size, use_align_fast),
         )
         print(
-            f"  ✓ Cross-tokenizer process pool created with {ct_num_workers} workers",
+            f"  ✓ Cross-tokenizer process pool created with {ct_num_workers} workers "
+            f"(dp_chunk_size={dp_chunk_size})",
             flush=True,
         )
+    if cross_tokenizer_enabled:
+        print(f"  ✓ TokenAligner mode: use_char_offset={use_char_offset}", flush=True)
+        print(f"  ✓ TokenAligner DP mode: use_align_fast={use_align_fast}", flush=True)
+
+    ct_prefetch_pool: Optional[ThreadPoolExecutor] = None
+    if cross_tokenizer_enabled:
+        ct_prefetch_pool = ThreadPoolExecutor(max_workers=1)
+
+    def _shutdown_alignment_pools() -> None:
+        if ct_prefetch_pool is not None:
+            ct_prefetch_pool.shutdown(wait=False, cancel_futures=True)
+        if ct_pool is not None:
+            ct_pool.shutdown(wait=False)
+
+    def _prepare_train_batch_data(batch_obj: BatchedDataDict[DatumSpec]):
+        # Add loss mask for each message (train on assistant tokens only)
+        # Skip if token_loss_mask already exists from data processor
+        for message_log in batch_obj["message_log"]:
+            for message in message_log:
+                if "token_loss_mask" not in message:
+                    if message["role"] == "assistant":
+                        message["token_loss_mask"] = torch.ones_like(
+                            message["token_ids"]
+                        )
+                    else:
+                        message["token_loss_mask"] = torch.zeros_like(
+                            message["token_ids"]
+                        )
+
+        # Convert message_log to flat format for training
+        flat_messages_obj, input_lengths_obj = batched_message_log_to_flat_message(
+            batch_obj["message_log"],
+            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+            make_sequence_length_divisible_by=master_config["policy"].get(
+                "make_sequence_length_divisible_by", 1
+            ),
+        )
+
+        train_data_obj = BatchedDataDict[DistillationLossDataDict](
+            {
+                "input_ids": flat_messages_obj["token_ids"],
+                "input_lengths": input_lengths_obj,
+                "token_mask": flat_messages_obj["token_loss_mask"],
+                "sample_mask": batch_obj["loss_multiplier"],
+            }
+        )
+        train_data_obj.update(
+            flat_messages_obj.get_multimodal_dict(as_tensors=False)
+        )
+        train_data_obj.to("cpu")
+        return flat_messages_obj, input_lengths_obj, train_data_obj
+
+    def _get_max_teacher_len() -> int:
+        return int(
+            master_config["teacher"].get(
+                "max_total_sequence_length",
+                master_config["policy"]["max_total_sequence_length"],
+            )
+        )
+
+    def _resolve_cross_tokenizer_batch_data(
+        train_data_obj: BatchedDataDict[DistillationLossDataDict],
+        batch_obj: BatchedDataDict[DatumSpec],
+        ct_future_obj: Any,
+    ) -> tuple[torch.Tensor, list[Any], BatchedDataDict]:
+        if ct_future_obj is not None:
+            return ct_future_obj.result()
+        return _process_cross_tokenizer_batch(
+            train_input_ids=train_data_obj["input_ids"],
+            batch_loss_multiplier=batch_obj["loss_multiplier"],
+            extra_env=batch_obj.get("extra_env_info"),
+            tokenizer=tokenizer,
+            teacher_tokenizer=teacher_tokenizer,
+            token_aligner=token_aligner,
+            use_char_offset=use_char_offset,
+            use_align_fast=use_align_fast,
+            dp_chunk_size=dp_chunk_size,
+            ct_pool=ct_pool,
+            max_teacher_len_rt=_get_max_teacher_len(),
+        )
+
+    def _maybe_prefetch_next_batch(
+        dataloader_iter_obj: Any,
+    ) -> Optional[_PrefetchedBatchPack]:
+        if not cross_tokenizer_enabled or ct_prefetch_pool is None:
+            return None
+
+        try:
+            next_batch_obj = next(dataloader_iter_obj)
+        except StopIteration:
+            return None
+
+        next_flat_messages, next_input_lengths, next_train_data = _prepare_train_batch_data(
+            next_batch_obj
+        )
+        next_ct_future = ct_prefetch_pool.submit(
+            _process_cross_tokenizer_batch,
+            next_train_data["input_ids"],
+            next_batch_obj["loss_multiplier"],
+            next_batch_obj.get("extra_env_info"),
+            tokenizer,
+            teacher_tokenizer,
+            token_aligner,
+            use_char_offset,
+            use_align_fast,
+            dp_chunk_size,
+            ct_pool,
+            _get_max_teacher_len(),
+        )
+        return {
+            "batch": next_batch_obj,
+            "flat_messages": next_flat_messages,
+            "input_lengths": next_input_lengths,
+            "train_data": next_train_data,
+            "ct_future": next_ct_future,
+        }
 
     while total_steps < max_steps and current_epoch < max_epochs:
         print(
@@ -887,7 +1209,25 @@ def off_policy_distillation_train(
             flush=True,
         )
 
-        for batch in dataloader:
+        dataloader_iter = iter(dataloader)
+        prefetched_batch_pack: Optional[_PrefetchedBatchPack] = None
+        while total_steps < max_steps:
+            if prefetched_batch_pack is not None:
+                batch = prefetched_batch_pack["batch"]
+                flat_messages = prefetched_batch_pack["flat_messages"]
+                input_lengths = prefetched_batch_pack["input_lengths"]
+                train_data = prefetched_batch_pack["train_data"]
+                ct_future = prefetched_batch_pack["ct_future"]
+                prefetched_batch_pack = None
+                loaded_from_prefetch = True
+            else:
+                try:
+                    batch = next(dataloader_iter)
+                except StopIteration:
+                    break
+                loaded_from_prefetch = False
+                ct_future = None
+
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_steps)} {'=' * 25}",
                 flush=True,
@@ -898,211 +1238,40 @@ def off_policy_distillation_train(
             with timer.time("total_step_time"):
                 # ==== Data Processing ====
                 # Off-policy: Use responses from dataset directly (no generation)
-                print("▶ Processing batch data (off-policy - using fixed responses)...", flush=True)
-                
-                with timer.time("data_processing"):
-                    # Add loss mask for each message (train on assistant tokens only)
-                    # Skip if token_loss_mask already exists from data processor
-                    for message_log in batch["message_log"]:
-                        for message in message_log:
-                            if "token_loss_mask" not in message:
-                                if message["role"] == "assistant":
-                                    message["token_loss_mask"] = torch.ones_like(
-                                        message["token_ids"]
-                                    )
-                                else:
-                                    message["token_loss_mask"] = torch.zeros_like(
-                                        message["token_ids"]
-                                    )
-
-                    # Convert message_log to flat format for training
-                    flat_messages, input_lengths = batched_message_log_to_flat_message(
-                        batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=master_config["policy"].get(
-                            "make_sequence_length_divisible_by", 1
-                        ),
-                    )
-
-                    # Create training data from flattened messages
-                    train_data = BatchedDataDict[DistillationLossDataDict](
-                        {
-                            "input_ids": flat_messages["token_ids"],
-                            "input_lengths": input_lengths,
-                            "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": batch["loss_multiplier"],
-                        }
-                    )
-                    # Handle multimodal data if present
-                    train_data.update(
-                        flat_messages.get_multimodal_dict(as_tensors=False)
-                    )
-                    train_data.to("cpu")
+                if not loaded_from_prefetch:
+                    print("▶ Processing batch data (off-policy - using fixed responses)...", flush=True)
+                    with timer.time("data_processing"):
+                        flat_messages, input_lengths, train_data = _prepare_train_batch_data(batch)
+                else:
+                    print("▶ Using prefetched batch data...", flush=True)
+                    # Keep timing key stable in logs when using prefetched data.
+                    with timer.time("data_processing"):
+                        pass
 
                 # ==== Cross-Tokenizer Data Processing ====
                 teacher_data = None
 
                 if cross_tokenizer_enabled:
                     with timer.time("cross_tokenizer_processing"):
-                        import time as _time
-                        from nemo_rl.algorithms.x_token.tokenalign import _NUMBA_AVAILABLE
-                        student_ids = train_data["input_ids"]
-                        batch_size_ct = student_ids.shape[0]
-
-                        max_teacher_len_rt = master_config["teacher"].get(
-                            "max_total_sequence_length",
-                            master_config["policy"]["max_total_sequence_length"],
-                        )
-
-                        _t0 = _time.time()
-                        extra_env = batch.get("extra_env_info")
-                        if (
-                            extra_env
-                            and extra_env[0] is not None
-                            and isinstance(extra_env[0], dict)
-                            and "raw_text" in extra_env[0]
-                        ):
-                            texts = [info["raw_text"] for info in extra_env]
-                        else:
-                            texts = tokenizer.batch_decode(
-                                student_ids.tolist(), skip_special_tokens=True
+                        teacher_input_ids, aligned_pairs, teacher_data = (
+                            _resolve_cross_tokenizer_batch_data(
+                                train_data_obj=train_data,
+                                batch_obj=batch,
+                                ct_future_obj=ct_future,
                             )
-                        _t1 = _time.time()
-                        teacher_encoded = teacher_tokenizer(
-                            texts,
-                            max_length=max_teacher_len_rt,
-                            padding="max_length",
-                            truncation=True,
-                            return_tensors="pt",
-                            return_offsets_mapping=True,
                         )
-                        teacher_input_ids = teacher_encoded["input_ids"]
-                        teacher_attention_mask = teacher_encoded["attention_mask"]
-                        teacher_offsets = teacher_encoded["offset_mapping"]
-
-                        student_re = tokenizer(
-                            texts,
-                            max_length=student_ids.shape[1],
-                            padding="max_length",
-                            truncation=True,
-                            return_tensors="pt",
-                            return_offsets_mapping=True,
-                        )
-                        student_offsets = student_re["offset_mapping"]
-                        _t2 = _time.time()
-
-                        # --- Vectorized pre-check: which samples can try char-offset? ---
-                        s_off_np = student_offsets.numpy()
-                        t_off_np = teacher_offsets.numpy()
-
-                        s_nonzero = (s_off_np[:, :, 0] != 0) | (s_off_np[:, :, 1] != 0)
-                        t_nonzero = (t_off_np[:, :, 0] != 0) | (t_off_np[:, :, 1] != 0)
-
-                        s_has = s_nonzero.any(axis=1)
-                        t_has = t_nonzero.any(axis=1)
-
-                        s_last = s_nonzero.shape[1] - 1 - np.flip(s_nonzero, axis=1).argmax(axis=1)
-                        t_last = t_nonzero.shape[1] - 1 - np.flip(t_nonzero, axis=1).argmax(axis=1)
-                        s_last_end = s_off_np[np.arange(batch_size_ct), s_last, 1]
-                        t_last_end = t_off_np[np.arange(batch_size_ct), t_last, 1]
-
-                        can_try_offset = s_has & t_has & (s_last_end == t_last_end)
-
-                        # --- Vectorized offset filtering (avoid per-sample .tolist()) ---
-                        # Pre-extract content indices per sample using numpy
-                        s_content_per_sample = []
-                        t_content_per_sample = []
-                        for idx in range(batch_size_ct):
-                            if can_try_offset[idx]:
-                                s_mask = s_nonzero[idx]
-                                t_mask = t_nonzero[idx]
-                                s_positions = np.where(s_mask)[0]
-                                t_positions = np.where(t_mask)[0]
-                                s_content_per_sample.append([
-                                    (int(s_off_np[idx, p, 0]), int(s_off_np[idx, p, 1]), int(p))
-                                    for p in s_positions
-                                ])
-                                t_content_per_sample.append([
-                                    (int(t_off_np[idx, p, 0]), int(t_off_np[idx, p, 1]), int(p))
-                                    for p in t_positions
-                                ])
-                            else:
-                                s_content_per_sample.append(None)
-                                t_content_per_sample.append(None)
-
-                        # --- Char-offset alignment (sequential, fast O(n+m) per sample) ---
-                        aligned_pairs = [None] * batch_size_ct
-                        dp_samples_s = []
-                        dp_samples_t = []
-                        dp_slot_indices = []
-
-                        for idx in range(batch_size_ct):
-                            if not can_try_offset[idx]:
-                                dp_samples_s.append(student_ids[idx:idx+1].tolist())
-                                dp_samples_t.append(teacher_input_ids[idx:idx+1].tolist())
-                                dp_slot_indices.append(idx)
-                                continue
-
-                            pairs = _align_by_char_offsets(
-                                s_content_per_sample[idx], t_content_per_sample[idx]
-                            )
-                            n_correct = sum(1 for p in pairs if p[6])
-                            if n_correct == 0 or n_correct / len(pairs) < 0.5:
-                                dp_samples_s.append(student_ids[idx:idx+1].tolist())
-                                dp_samples_t.append(teacher_input_ids[idx:idx+1].tolist())
-                                dp_slot_indices.append(idx)
-                            else:
-                                aligned_pairs[idx] = pairs
-
-                        dp_fallback = len(dp_slot_indices)
-                        n_offsets = batch_size_ct - dp_fallback
-
-                        # --- DP alignment for fallbacks (parallelized) ---
-                        if dp_fallback > 0:
-                            if ct_pool is not None and dp_fallback > 1:
-                                chunks = list(zip(dp_samples_s, dp_samples_t))
-                                dp_results = list(ct_pool.map(_align_chunk, chunks))
-                                for i, slot in enumerate(dp_slot_indices):
-                                    aligned_pairs[slot] = dp_results[i][0]
-                            else:
-                                for i, slot in enumerate(dp_slot_indices):
-                                    s_t = torch.tensor(dp_samples_s[i])
-                                    t_t = torch.tensor(dp_samples_t[i])
-                                    if token_aligner._student_canon_map is not None:
-                                        dp_result = token_aligner.align_fast(s_t, t_t)
-                                    else:
-                                        dp_result = token_aligner.align(s_t, t_t)
-                                    aligned_pairs[slot] = dp_result[0]
-
-                        _t3 = _time.time()
-                        print(f"  [CT timing] decode={_t1-_t0:.2f}s, "
-                              f"encode={_t2-_t1:.2f}s, "
-                              f"align={_t3-_t2:.2f}s "
-                              f"(offsets: {n_offsets}, "
-                              f"dp_fallback: {dp_fallback})", flush=True)
-
-                        teacher_input_lengths_ct = teacher_attention_mask.sum(dim=1)
 
                         loss_fn.set_cross_tokenizer_data(
                             teacher_input_ids=teacher_input_ids,
                             aligned_pairs=aligned_pairs,
                         )
 
-                        teacher_token_mask = torch.zeros_like(
-                            teacher_input_ids, dtype=torch.float32
-                        )
-                        for i in range(batch_size_ct):
-                            teacher_token_mask[i, : teacher_input_lengths_ct[i]] = 1.0
-
-                        teacher_data = BatchedDataDict(
-                            {
-                                "input_ids": teacher_input_ids,
-                                "input_lengths": teacher_input_lengths_ct,
-                                "token_mask": teacher_token_mask,
-                                "sample_mask": batch["loss_multiplier"],
-                            }
-                        )
-                        teacher_data.to("cpu")
+                # Prepare one-step-ahead cross-tokenizer preprocessing in the background.
+                if (
+                    cross_tokenizer_enabled
+                    and prefetched_batch_pack is None
+                ):
+                    prefetched_batch_pack = _maybe_prefetch_next_batch(dataloader_iter)
 
                 # ==== Teacher Logprob Inference ====
                 use_ipc = master_config["distillation"].get("use_ipc", True)
@@ -1392,17 +1561,18 @@ def off_policy_distillation_train(
             total_steps += 1
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
+                _shutdown_alignment_pools()
                 return
             if total_steps >= max_steps:
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
                 )
+                _shutdown_alignment_pools()
                 return
 
         # End of epoch
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
 
-    if ct_pool is not None:
-        ct_pool.shutdown(wait=False)
+    _shutdown_alignment_pools()
