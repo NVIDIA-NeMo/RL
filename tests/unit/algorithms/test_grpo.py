@@ -26,6 +26,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
+    aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
@@ -2474,3 +2475,76 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         # At least sequence 2 should be masked
         assert num_masked >= 1, "At least one sequence should be masked"
         assert train_data["sample_mask"][0] == 1.0, "Sequence 0 should be kept"
+
+
+class TestAggregateRolloutMetrics:
+    """Tests for aggregate_rollout_metrics which aggregates per-group metrics by semantic type."""
+
+    def test_min_metrics_take_minimum(self):
+        metrics = {
+            "gen_tokens/min": [10, 5, 8],
+            "min_reward": [0.3, 0.1, 0.5],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["gen_tokens/min"] == 5
+        assert result["min_reward"] == 0.1
+
+    def test_max_metrics_take_maximum(self):
+        metrics = {
+            "gen_tokens/max": [10, 50, 30],
+            "max_reward": [0.3, 0.9, 0.5],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["gen_tokens/max"] == 50
+        assert result["max_reward"] == 0.9
+
+    def test_rate_suffix_excluded_from_min_max(self):
+        """min_*_rate and max_*_rate should be averaged, not min/maxed."""
+        metrics = {
+            "min_completion_rate": [0.2, 0.8, 0.5],
+            "max_completion_rate": [0.3, 0.9, 0.6],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["min_completion_rate"] == pytest.approx(0.5)
+        assert result["max_completion_rate"] == pytest.approx(0.6)
+
+    def test_total_turns_summed(self):
+        metrics = {"total_turns": [10, 20, 30]}
+        result = aggregate_rollout_metrics(metrics)
+        assert result["total_turns"] == 60
+
+    def test_mean_metrics_averaged(self):
+        metrics = {
+            "mean_gen_tokens_per_sample": [100, 200, 300],
+            "reward/mean": [0.5, 0.7, 0.9],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["mean_gen_tokens_per_sample"] == pytest.approx(200.0)
+        assert result["reward/mean"] == pytest.approx(0.7)
+
+    def test_non_numeric_passed_through(self):
+        metrics = {"some_list_metric": [["a", "b"], ["c", "d"]]}
+        result = aggregate_rollout_metrics(metrics)
+        assert result["some_list_metric"] == [["a", "b"], ["c", "d"]]
+
+    def test_mixed_metrics(self):
+        """Full integration test with a realistic mix of metric types."""
+        metrics = {
+            "gen_tokens/min": [5, 3, 7],
+            "gen_tokens/max": [100, 200, 150],
+            "gen_tokens/mean": [50, 60, 70],
+            "min_reward": [0.1, 0.2, 0.05],
+            "max_reward": [0.9, 0.8, 0.95],
+            "total_turns": [10, 15, 20],
+            "accuracy": [0.8, 0.9, 0.7],
+            "min_accuracy_rate": [0.1, 0.2, 0.3],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["gen_tokens/min"] == 3
+        assert result["gen_tokens/max"] == 200
+        assert result["gen_tokens/mean"] == pytest.approx(60.0)
+        assert result["min_reward"] == 0.05
+        assert result["max_reward"] == 0.95
+        assert result["total_turns"] == 45
+        assert result["accuracy"] == pytest.approx(0.8)
+        assert result["min_accuracy_rate"] == pytest.approx(0.2)
