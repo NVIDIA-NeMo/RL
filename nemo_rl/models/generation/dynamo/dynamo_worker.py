@@ -194,8 +194,18 @@ class DynamoVllmWorker:
         ray_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
         if ray_cuda_devices:
             available = ray_cuda_devices.split(",")
-            selected = [available[i] for i in bundle_indices if i < len(available)]
-            cuda_visible = ",".join(selected)
+            if model_parallel_size == 1:
+                # TP=1: Ray already restricted CUDA_VISIBLE_DEVICES to the
+                # single GPU assigned to this actor — use it as-is.
+                cuda_visible = ray_cuda_devices
+            else:
+                # TP/PP > 1: CUDA_VISIBLE_DEVICES has all node GPUs
+                # (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 was set).
+                # Select the subset for this worker's bundle.
+                selected = [
+                    available[i] for i in bundle_indices if i < len(available)
+                ]
+                cuda_visible = ",".join(selected)
         else:
             cuda_visible = ",".join(str(i) for i in bundle_indices)
 

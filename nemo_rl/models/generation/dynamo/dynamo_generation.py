@@ -131,6 +131,9 @@ class DynamoVllmGeneration(GenerationInterface):
         self._vc_stop = threading.Event()
         self._vc_thread: Optional[threading.Thread] = None
 
+        # Total inference GPUs — used by the planner's max_gpu_budget.
+        self._inference_gpu_count = cluster.world_size()
+
         self._start_etcd()
         self._start_nats()
 
@@ -304,7 +307,7 @@ class DynamoVllmGeneration(GenerationInterface):
             "decode_engine_num_gpu": self.tp_size,
             "ttft": 500.0,
             "itl": 50.0,
-            "max_gpu_budget": 2,
+            "max_gpu_budget": self._inference_gpu_count,
             "min_endpoint": 1,
             "load_adjustment_interval": 5,
             "load_scaling_down_sensitivity": 80,
