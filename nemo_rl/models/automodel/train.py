@@ -71,7 +71,9 @@ def _needs_kv_cache_for_shared_layers(model: nn.Module) -> bool:
     producing incorrect outputs.
     """
     model_config = getattr(model, "config", None)
-    text_config = getattr(model_config, "text_config", model_config) if model_config else None
+    text_config = (
+        getattr(model_config, "text_config", model_config) if model_config else None
+    )
     return getattr(text_config, "num_kv_shared_layers", 0) > 0
 
 
@@ -123,7 +125,9 @@ def model_forward(
     # Gemma 4 requires mm_token_type_ids even for text-only inputs
     if getattr(getattr(model, "config", None), "model_type", None) == "gemma4":
         if "mm_token_type_ids" not in model_args:
-            model_args["mm_token_type_ids"] = torch.zeros_like(processed_inputs.input_ids)
+            model_args["mm_token_type_ids"] = torch.zeros_like(
+                processed_inputs.input_ids
+            )
 
     # Reward models don't support flash_attn_kwargs
     if is_reward_model:

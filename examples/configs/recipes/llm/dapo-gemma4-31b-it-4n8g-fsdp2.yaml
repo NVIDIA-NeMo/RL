@@ -1,6 +1,5 @@
 defaults: ../../grpo_math_1B.yaml
 grpo:
-  num_prompts_per_step: 32
   batch_multiplier: 3
   val_period: 15
   max_val_samples: 960

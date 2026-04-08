@@ -692,7 +692,13 @@ def setup_model_and_optimizer(
     # Note: encoders may be nested under model.model (e.g. model.model.visual for
     # Qwen3_5MoeForConditionalGeneration), not directly on model.
     if not is_vlm:
-        for attr in ("visual", "vision_tower", "audio_tower", "embed_vision", "embed_audio"):
+        for attr in (
+            "visual",
+            "vision_tower",
+            "audio_tower",
+            "embed_vision",
+            "embed_audio",
+        ):
             # Handle both direct attributes and nested under model.model (FSDP wrapping)
             module = getattr(model, attr, None)
             if module is None:

@@ -788,9 +788,18 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 del model_args["flash_attn_kwargs"]
 
                             # Gemma 4 requires mm_token_type_ids even for text-only inputs
-                            if getattr(getattr(self.model, "config", None), "model_type", None) == "gemma4":
+                            if (
+                                getattr(
+                                    getattr(self.model, "config", None),
+                                    "model_type",
+                                    None,
+                                )
+                                == "gemma4"
+                            ):
                                 if "mm_token_type_ids" not in model_args:
-                                    model_args["mm_token_type_ids"] = torch.zeros_like(input_ids)
+                                    model_args["mm_token_type_ids"] = torch.zeros_like(
+                                        input_ids
+                                    )
 
                             outputs = self.model(**model_args)
 
@@ -1124,9 +1133,16 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                             del model_args["flash_attn_kwargs"]
 
                         # Gemma 4 requires mm_token_type_ids even for text-only inputs
-                        if getattr(getattr(self.model, "config", None), "model_type", None) == "gemma4":
+                        if (
+                            getattr(
+                                getattr(self.model, "config", None), "model_type", None
+                            )
+                            == "gemma4"
+                        ):
                             if "mm_token_type_ids" not in model_args:
-                                model_args["mm_token_type_ids"] = torch.zeros_like(input_ids)
+                                model_args["mm_token_type_ids"] = torch.zeros_like(
+                                    input_ids
+                                )
 
                         outputs = self.model(**model_args)
 
@@ -1395,9 +1411,16 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                         )
 
                         # Gemma 4 requires mm_token_type_ids even for text-only inputs
-                        if getattr(getattr(self.model, "config", None), "model_type", None) == "gemma4":
+                        if (
+                            getattr(
+                                getattr(self.model, "config", None), "model_type", None
+                            )
+                            == "gemma4"
+                        ):
                             if "mm_token_type_ids" not in model_args:
-                                model_args["mm_token_type_ids"] = torch.zeros_like(input_ids)
+                                model_args["mm_token_type_ids"] = torch.zeros_like(
+                                    input_ids
+                                )
 
                         outputs = self.model(**model_args)
 
@@ -1570,9 +1593,16 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                             del model_args["flash_attn_kwargs"]
 
                         # Gemma 4 requires mm_token_type_ids even for text-only inputs
-                        if getattr(getattr(self.model, "config", None), "model_type", None) == "gemma4":
+                        if (
+                            getattr(
+                                getattr(self.model, "config", None), "model_type", None
+                            )
+                            == "gemma4"
+                        ):
                             if "mm_token_type_ids" not in model_args:
-                                model_args["mm_token_type_ids"] = torch.zeros_like(input_ids)
+                                model_args["mm_token_type_ids"] = torch.zeros_like(
+                                    input_ids
+                                )
 
                         outputs = self.model(**model_args)
 
