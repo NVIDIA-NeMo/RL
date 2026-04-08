@@ -147,13 +147,14 @@ def destroy_parallel_state():
         old_call_idx = getattr(
             megatron_async_utils._async_calls_queue, "call_idx", None
         )
-        num_unfinalized = (
-            megatron_async_utils._async_calls_queue.get_num_unfinalized_calls()
-        )
-        if num_unfinalized > 0:
-            print(
-                f"[WARNING] Resetting Megatron async calls queue with {num_unfinalized} unfinalized calls"
+        if megatron_async_utils._async_calls_queue is not None:
+            num_unfinalized = (
+                megatron_async_utils._async_calls_queue.get_num_unfinalized_calls()
             )
+            if num_unfinalized > 0:
+                print(
+                    f"[WARNING] Resetting Megatron async calls queue with {num_unfinalized} unfinalized calls"
+                )
         try:
             megatron_async_utils._async_calls_queue.close()
         except:
