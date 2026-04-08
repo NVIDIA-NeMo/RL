@@ -50,20 +50,22 @@ from nemo_rl.models.automodel.setup import (
     setup_reference_model_state,
     validate_and_prepare_config,
 )
+from nemo_rl.models.automodel.pipeline_parallel import (
+    PPLogprobsCapturer,
+    PPLossAdapter,
+    PPTopkCapturer,
+    broadcast_loss_metrics_from_last_pp_stage,
+    broadcast_tensors_from_last_pp_stage,
+    pp_forward_backward,
+)
 from nemo_rl.models.automodel.train import (
     LogprobsPostProcessor,
     LossPostProcessor,
-    PPLossAdapter,
-    PPLogprobsCapturer,
-    PPTopkCapturer,
     ScorePostProcessor,
     TopkLogitsPostProcessor,
     aggregate_training_statistics,
     automodel_forward_backward,
-    broadcast_loss_metrics_from_last_pp_stage,
-    broadcast_tensors_from_last_pp_stage,
     forward_with_post_processing_fn,
-    pp_forward_backward,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -177,8 +179,8 @@ def get_train_context(
     """Create combined context manager for training with context parallel and autocast."""
     with contextlib.ExitStack() as stack:
         context_parallel_ctx = None
-        if cp_size > 1:
-            # Create context parallel context
+        if cp_size > 1 and cp_buffers:
+            # Create DTensor CP context. Skip when cp_buffers is empty.
             context_parallel_ctx = create_context_parallel_ctx(
                 cp_mesh=cp_mesh,
                 cp_buffers=cp_buffers,
@@ -297,34 +299,31 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             optimizer_path=optimizer_path,
         )
 
-        # Set instance attributes from model and optimizer state (tuple unpacking)
+        # Set instance attributes from model and optimizer state
         (
-            self.model,
-            self.optimizer,
-            self.scheduler,
+            self.model_handle,
+            self.optimizers,
+            self.schedulers,
             self.is_hf_model,
             self.is_moe_model,
-            self._is_reward_model,  # Note: using underscore prefix for internal naming
+            self._is_reward_model,
             self.model_class,
             self.model_config,
             self.peft_config,
             self.autocast_enabled,
         ) = model_and_optimizer_state
 
-        # PP model attributes
-        if self.pp_enabled:
-            self.model_parts = self.model.parts
-            self.has_first_stage = self.model.info.has_first_stage
-            self.has_last_stage = self.model.info.has_last_stage
-        else:
-            self.model_parts = [self.model]
-            self.has_first_stage = True
-            self.has_last_stage = True
+        # Convenience aliases
+        self.model = self.model_handle.raw  # raw AutoPipeline or nn.Module
+        self.has_first_stage = self.model_handle.has_first_stage
+        self.has_last_stage = self.model_handle.has_last_stage
 
         # Initialize reference model if requested
         self.reference_model_state_dict = None
         if init_reference_model:
-            self.reference_model_state_dict = setup_reference_model_state(self.model)
+            self.reference_model_state_dict = setup_reference_model_state(
+                self.model_handle
+            )
 
         # Set instance attributes from runtime config (tuple unpacking)
         (
@@ -371,26 +370,10 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
-            if self.pp_enabled:
-                for mp in self.model_parts:
-                    mp.eval()
-            else:
-                self.model.eval()
+            self.model_handle.eval()
         else:
             ctx = nullcontext()
-            if self.pp_enabled:
-                for mp in self.model_parts:
-                    mp.train()
-            else:
-                self.model.train()
-
-        # PP helper references
-        optimizers_list = (
-            self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
-        )
-        schedulers_list = (
-            self.scheduler if isinstance(self.scheduler, list) else [self.scheduler]
-        )
+            self.model_handle.train()
 
         if self.pp_enabled:
             return self._train_pp(
@@ -401,8 +384,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 num_global_batches=num_global_batches,
                 sequence_dim=sequence_dim,
                 ctx=ctx,
-                optimizers_list=optimizers_list,
-                schedulers_list=schedulers_list,
+                optimizers_list=self.optimizers,
+                schedulers_list=self.schedulers,
             )
 
         # --- Non-PP path (existing) ---
@@ -463,7 +446,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
-                self.optimizer.zero_grad()
+                for opt in self.optimizers:
+                    opt.zero_grad()
 
                 # Get microbatch iterator based on batching strategy
                 processed_iterator, iterator_len = get_microbatch_iterator(
@@ -502,7 +486,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     # Only process valid (non-dummy) batches for metrics
                     if mb_idx < iterator_len:
                         num_valid_samples = loss_metrics["num_valid_samples"]
-                        loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                        loss_metrics["lr"] = self.optimizers[0].param_groups[0]["lr"]
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
 
@@ -533,15 +517,18 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     )
 
                     # Update parameters
-                    self.optimizer.step()
+                    for opt in self.optimizers:
+                        opt.step()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
             # release gradient memory before rollouts
-            self.optimizer.zero_grad()
+            for opt in self.optimizers:
+                opt.zero_grad()
             # increment scheduler after all batches in rollout are processed
             if not eval_mode:
-                self.scheduler.step()
+                for sched in self.schedulers:
+                    sched.step()
             # dynamic batch and sequence dims causes alot of fragmentation, so clear
             # the memory allocator before moving on
             torch.cuda.empty_cache()
@@ -612,19 +599,23 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     opt.zero_grad()
 
                 # Gradient accumulation: split local_gbs into pp_batch_size chunks.
-                # Each chunk → one schedule.step() call. Gradients accumulate across calls.
+                # Each chunk -> one schedule.step() call. Gradients accumulate across calls.
                 # Pattern follows automodel's _run_train_optim_step.
                 num_accum_steps = max(1, local_gbs // pp_batch_size)
                 n_microbatches = self.model.info.schedule._n_microbatches
 
                 if not eval_mode:
-                    prepare_for_grad_accumulation(self.model_parts, pp_enabled=True)
+                    prepare_for_grad_accumulation(
+                        self.model_handle.parts, pp_enabled=True
+                    )
 
                 gb_total_loss = torch.tensor(0.0, device="cuda")
 
                 for accum_idx in range(num_accum_steps):
                     if not eval_mode and accum_idx == num_accum_steps - 1:
-                        prepare_for_final_backward(self.model_parts, pp_enabled=True)
+                        prepare_for_final_backward(
+                            self.model_handle.parts, pp_enabled=True
+                        )
 
                     # Slice this accumulation step's data
                     start = accum_idx * pp_batch_size
@@ -651,11 +642,12 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                         loss_adapter.reset()
 
                     input_ids = batch.get("input_ids")[start:end].cuda()
+
                     # Force-reset PP schedule state before each step/eval.
-                    # This is needed because a prior schedule.eval() (e.g., logprobs)
-                    # may have left stale stage initialization that breaks step().
-                    self.model._pp_current_seq_len = None  # force update_seq_len to run
-                    self.model.update_seq_len(input_ids.shape[1])
+                    if hasattr(self.model, "_pp_current_seq_len"):
+                        self.model._pp_current_seq_len = None
+                    if hasattr(self.model, "update_seq_len"):
+                        self.model.update_seq_len(input_ids.shape[1])
 
                     pp_batch = {
                         "input_ids": input_ids,
@@ -701,7 +693,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     dp_group_size = self.dp_size * self.cp_size
                     grad_norm = scale_grads_and_clip_grad_norm(
                         self.max_grad_norm,
-                        self.model_parts,
+                        self.model_handle.parts,
                         norm_type=2.0,
                         pp_enabled=True,
                         device_mesh=self.device_mesh,
@@ -721,6 +713,19 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     for opt in optimizers_list:
                         opt.step()
 
+                # Broadcast loss from last PP stage so all ranks report correct value.
+                # Undo dp*cp scaling from PPLossAdapter (needed for FSDP grad averaging
+                # during training, but not for the reported loss).
+                if self.pp_size > 1:
+                    loss_tensor = gb_total_loss.unsqueeze(0)  # [1] for broadcast helper
+                    broadcasted = broadcast_tensors_from_last_pp_stage(
+                        {"loss": loss_tensor if self.has_last_stage else None},
+                        self.pp_mesh,
+                        self.has_last_stage,
+                    )
+                    gb_total_loss = broadcasted["loss"].squeeze(0) / (
+                        self.dp_size * self.cp_size
+                    )
                 losses.append(gb_total_loss.item())
 
             for opt in optimizers_list:
@@ -849,7 +854,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         ranks, then runs through LogprobsPostProcessor (same as non-PP path).
         Processes data in pp_batch_size chunks to match the schedule's batch size.
         """
-        for mp in self.model_parts:
+        for mp in self.model_handle.parts:
             mp.eval()
 
         capturer = PPLogprobsCapturer()
@@ -885,7 +890,11 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 labels = input_ids.clone()
 
                 capturer.reset()
-                self.model.update_seq_len(input_ids.shape[1])
+
+                if hasattr(self.model, "_pp_current_seq_len"):
+                    self.model._pp_current_seq_len = None
+                if hasattr(self.model, "update_seq_len"):
+                    self.model.update_seq_len(input_ids.shape[-1])
 
                 targets = labels if self.has_last_stage else None
                 losses = [] if self.has_last_stage else None
@@ -904,7 +913,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 )
                 logits = broadcasted["logits"]
 
-                # Run through same LogprobsPostProcessor as non-PP path
+                # Run through same LogprobsPostProcessor as non-PP path.
                 from nemo_rl.models.automodel.data import ProcessedInputs
 
                 processed_inputs = ProcessedInputs(
@@ -1121,7 +1130,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         seq_dim_size: int,
     ) -> BatchedDataDict[Any]:
         """PP path for top-k logits. Processes in pp_batch_size chunks."""
-        for mp in self.model_parts:
+        for mp in self.model_handle.parts:
             mp.eval()
 
         capturer = PPTopkCapturer()
@@ -1199,7 +1208,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         # Phase 1: build a lazy local param lookup (name → part index).
         # We don't materialise all tensors yet to save memory.
         local_names: set[str] = set()
-        for part in self.model_parts:
+        for part in self.model_handle.parts:
             for name in part.state_dict().keys():
                 if not (
                     name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight")
@@ -1239,7 +1248,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 )
                 # Adapt FQN for HF format
                 for adapted_name, adapted_tensor in _maybe_adapt_tensor_to_hf(
-                    self.model_parts[0], name, tensor
+                    self.model_handle.parts[0], name, tensor
                 ):
                     yield (
                         adapted_name,
@@ -1255,7 +1264,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 buf = torch.empty(shape, dtype=dtype, device="cuda")
                 torch.distributed.broadcast(buf, src=owner_global_rank, group=pp_group)
                 for adapted_name, adapted_tensor in _maybe_adapt_tensor_to_hf(
-                    self.model_parts[0], name, buf
+                    self.model_handle.parts[0], name, buf
                 ):
                     yield (
                         adapted_name,
@@ -1264,7 +1273,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
     def _get_local_param_tensor(self, name: str) -> torch.Tensor:
         """Get a single param tensor by name from local model parts, gathering DTensor."""
-        for part in self.model_parts:
+        for part in self.model_handle.parts:
             sd = part.state_dict()
             if name in sd:
                 tensor = sd[name]
@@ -1272,12 +1281,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         raise KeyError(f"Param {name} not found in any local model part")
 
     def _model_state_dict_items(self):
-        """Iterate state_dict items, handling both regular models and PP AutoPipeline."""
-        if self.pp_enabled:
-            for part in self.model_parts:
-                yield from part.state_dict().items()
-        else:
-            yield from self.model.state_dict().items()
+        """Iterate state_dict items (unified for PP and non-PP via ModelHandle)."""
+        return self.model_handle.state_dict_items()
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:
@@ -1330,22 +1335,11 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         torch.cuda.synchronize()
 
     def return_state_dict(self):
-        if self.pp_enabled:
-            state = {}
-            for part in self.model_parts:
-                state.update(part.state_dict())
-            return state
-        return self.model.state_dict()
+        return self.model_handle.state_dict()
 
     def return_model_config(self) -> dict[str, Any]:
-        """Return the model configuration as a dictionary.
-
-        Returns:
-            dict: Model configuration dictionary
-        """
-        if self.pp_enabled:
-            return self.model_parts[0].config
-        return self.model.config
+        """Return the model configuration as a dictionary."""
+        return self.model_handle.config
 
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
@@ -1355,7 +1349,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         across PP ranks so every rank returns the full model's metadata.
         """
         local_info = {}
-        for part in self.model_parts:
+        for part in self.model_handle.parts:
             for name, tensor in part.state_dict().items():
                 if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
                     continue
@@ -1503,23 +1497,15 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:
         # onload model to cuda
-        if self.pp_enabled:
-            for mp in self.model_parts:
-                if not self.cpu_offload:
-                    self.move_to_cuda(mp)
-                else:
-                    self.move_buffer_to_device(mp, "cuda")
-                mp.eval()
+        if not self.cpu_offload:
+            self.move_to_cuda(self.model)
         else:
-            if not self.cpu_offload:
-                self.move_to_cuda(self.model)
-            else:
-                self.model = self.move_buffer_to_device(self.model, "cuda")
-            self.model.eval()
+            self.model_handle.move_buffers_to("cuda")
+        self.model_handle.eval()
 
         # offload optimizer to cpu
         torch.randn(1).cuda()  # wake up torch allocator
-        if self.optimizer is not None and self.offload_optimizer_for_logprob:
+        if self.optimizers is not None and self.offload_optimizer_for_logprob:
             self.move_optimizer_to_device("cpu")
 
         gc.collect()
@@ -1527,24 +1513,15 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
-        # onload models and optimizer state to cuda
-        if self.pp_enabled:
-            for mp in self.model_parts:
-                if not self.cpu_offload:
-                    self.move_to_cuda(mp)
-                else:
-                    self.move_buffer_to_device(mp, "cuda")
-                mp.train()
+        if not self.cpu_offload:
+            self.move_to_cuda(self.model)
         else:
-            if not self.cpu_offload:
-                self.move_to_cuda(self.model)
-            else:
-                self.model = self.move_buffer_to_device(self.model, "cuda")
-            self.model.train()
+            self.model_handle.move_buffers_to("cuda")
+        self.model_handle.train()
         # Move optimizer state to CUDA if it exists
         # colocated generation will always offload optimizer to cuda before refit
         if (
-            self.optimizer is not None
+            self.optimizers is not None
             and not self.cpu_offload
             and (self.offload_optimizer_for_logprob or self.is_generation_colocated)
         ):
@@ -1557,7 +1534,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
         torch.randn(1).cuda()  # wake up torch allocator
-        if self.optimizer is not None:
+        if self.optimizers is not None:
             self.move_optimizer_to_device("cpu")
 
         gc.collect()
@@ -1568,8 +1545,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     def offload_after_refit(self) -> None:
         """Offload as much as possible on the CPU."""
         self.model = self.move_to_cpu(self.model)
-        for m in self._get_modules(self.model):
-            m.eval()
+        self.model_handle.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
 
@@ -1581,32 +1557,22 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         )
 
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
-        opts = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
+        opts = self.optimizers
         for opt in opts:
             for state in opt.state.values():
                 for k, v in state.items():
                     if isinstance(v, (DTensor, torch.Tensor)):
                         state[k] = v.to(device)
 
-    def _get_modules(self, model: nn.Module) -> list[nn.Module]:
-        """Get the list of nn.Module instances for device moves (handles PP AutoPipeline)."""
-        if hasattr(model, "parts"):
-            return list(model.parts)
-        return [model]
-
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
-        model = self.move_buffer_to_device(model, device)
-        for m in self._get_modules(model):
-            m.to(device)
+        self.model_handle.move_buffers_to(device)
+        self.model_handle.to(device)
         return model
 
     def move_buffer_to_device(
         self, model: nn.Module, device: str | torch.device
     ) -> nn.Module:
-        # FSDP modules do not move buffers to the device automatically
-        for m in self._get_modules(model):
-            for v in m.buffers():
-                torch.utils.swap_tensors(v, v.to(device))
+        self.model_handle.move_buffers_to(device)
         return model
 
     def move_to_cuda(self, model: torch.nn.Module) -> torch.nn.Module:
@@ -1631,13 +1597,29 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         """Save a checkpoint of the model.
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
+        For PP, passes model parts list and optimizer/scheduler lists so the
+        automodel Checkpointer can save per-stage state.
         """
+        # For PP, pass model parts list; for non-PP, pass single model.
+        # The automodel Checkpointer's ModelState/OptimizerState wrappers
+        # handle both single nn.Module and lists transparently.
+        model_for_ckpt = self.model_handle.parts if self.pp_enabled else self.model
+        optimizer_for_ckpt = (
+            self.optimizers
+            if self.pp_enabled
+            else (self.optimizers[0] if self.optimizers else None)
+        )
+        scheduler_for_ckpt = (
+            self.schedulers
+            if self.pp_enabled
+            else (self.schedulers[0] if self.schedulers else None)
+        )
         self.checkpoint_manager.save_checkpoint(
-            model=self.model,
+            model=model_for_ckpt,
             weights_path=weights_path,
-            optimizer=self.optimizer,
+            optimizer=optimizer_for_ckpt,
             optimizer_path=optimizer_path,
-            scheduler=self.scheduler,
+            scheduler=scheduler_for_ckpt,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
             checkpointing_cfg=checkpointing_cfg,
@@ -1651,12 +1633,23 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         optimizer_path: Optional[str] = None,
     ) -> None:
         """Load a checkpoint into the model using Automodel Checkpointer."""
+        model_for_ckpt = self.model_handle.parts if self.pp_enabled else self.model
+        optimizer_for_ckpt = (
+            self.optimizers
+            if self.pp_enabled
+            else (self.optimizers[0] if self.optimizers else None)
+        )
+        scheduler_for_ckpt = (
+            self.schedulers
+            if self.pp_enabled
+            else (self.schedulers[0] if self.schedulers else None)
+        )
         self.checkpoint_manager.load_checkpoint(
-            model=self.model,
+            model=model_for_ckpt,
             weights_path=weights_path,
-            optimizer=self.optimizer,
+            optimizer=optimizer_for_ckpt,
             optimizer_path=optimizer_path,
-            scheduler=self.scheduler,
+            scheduler=scheduler_for_ckpt,
         )
 
     def _init_checkpoint_manager(

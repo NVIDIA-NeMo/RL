@@ -86,21 +86,8 @@ def model_forward(
         use_cache=False,
     )
 
-    # THD packing (seq_packing + CP with TE): pass cu_seqlens directly.
-    # Automodel models accept cu_seqlens via **attn_kwargs — the attention
-    # utils (preprocess_args_and_kwargs_for_attn) detect "cu_seqlens" in kwargs
-    # and route to TE's THD path with qkv_format="thd".
-    if processed_inputs.packed_seq_params is not None:
-        cu_padded = processed_inputs.cu_seqlens_padded
-        model_args["cu_seqlens"] = cu_padded
-        if processed_inputs.cu_seqlens_padded is not None:
-            model_args["cu_seqlens_padded"] = cu_padded
-        max_seqlen = int((cu_padded[1:] - cu_padded[:-1]).max().item())
-        model_args["max_seqlen"] = max_seqlen
-        model_args.pop("attention_mask", None)
-
     # Add flash attention kwargs if applicable
-    elif processed_inputs.has_flash_attention:
+    if processed_inputs.has_flash_attention:
         model_args["flash_attn_kwargs"] = processed_inputs.flash_attn_kwargs
 
     # Add VLM kwargs if applicable
@@ -547,21 +534,15 @@ class LossPostProcessor:
         global_valid_toks: torch.Tensor,
         sequence_dim: int = 1,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute loss from logits.
+        """Compute loss from logits."""
+        # Determine cu_seqlens source for seq packing (FA2 path)
+        if self.enable_seq_packing and processed_inputs.has_flash_attention:
+            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+        else:
+            cu_seqlens = None
 
-        Args:
-            logits: Model output logits
-            data_dict: Microbatch data
-            processed_inputs: Processed inputs
-            global_valid_seqs: Global valid sequence count
-            global_valid_toks: Global valid token count
-            sequence_dim: Sequence dimension
-
-        Returns:
-            Tuple of (loss, metrics)
-        """
         # Handle CP redistribution
-        if self.cp_size > 1:
+        if self.cp_size > 1 and cu_seqlens is None:
             _, data_dict = prepare_data_for_cp(
                 data_dict, processed_inputs, self.cp_mesh, sequence_dim
             )
@@ -569,17 +550,17 @@ class LossPostProcessor:
                 logits, self.device_mesh, self.cp_mesh, sequence_dim
             )
 
-        # Wrap prepare_loss_input with sampling_params
         prepare_loss_input_wrapped = partial(
             prepare_loss_input, sampling_params=self.sampling_params
         )
-        # Wrap loss function for sequence packing if needed
-        if self.enable_seq_packing:
+
+        if cu_seqlens is not None:
+            # FA2 seq packing loss path.
             loss_fn = SequencePackingLossWrapper(
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_loss_input_wrapped,
-                cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
-                cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens,
             )
             loss, loss_metrics = loss_fn(
                 logits,
@@ -660,6 +641,7 @@ class LogprobsPostProcessor:
         input_lengths = data_dict["input_lengths"]
 
         if self.cp_size > 1:
+            # Standard DTensor CP path
             seq_index_tensor = (
                 DTensor.from_local(
                     processed_inputs.seq_index,
@@ -685,7 +667,7 @@ class LogprobsPostProcessor:
                 input_ids_dtensor,
                 seq_index_tensor,
                 chunk_size=self.logprob_chunk_size,
-                sampling_params=self.sampling_params,  # top-k and top-p filtering
+                sampling_params=self.sampling_params,
             )
 
             assert token_logprobs.shape[1] == seq_len - 1
@@ -709,14 +691,18 @@ class LogprobsPostProcessor:
             [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
         )
 
-        # Handle sequence packing unpacking or mask application
-        if self.enable_seq_packing:
+        # Handle sequence packing unpacking or mask application (FA2 path).
+        if self.enable_seq_packing and processed_inputs.has_flash_attention:
+            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+        else:
+            cu_seqlens = None
+
+        if cu_seqlens is not None:
             unpacked_logprobs = torch.zeros(
                 (original_batch_size, original_seq_len),
                 dtype=token_logprobs.dtype,
                 device=token_logprobs.device,
             )
-            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
             for i in range(original_batch_size):
                 start = cu_seqlens[i].item() + 1
                 end = cu_seqlens[i + 1].item()
@@ -908,8 +894,13 @@ class TopkLogitsPostProcessor:
                 full_logits = logits.to(torch.float32)
                 vals, idx = torch.topk(full_logits, k=self.k, dim=-1)
 
-        # Handle sequence packing unpacking
-        if self.enable_seq_packing:
+        # Handle sequence packing unpacking (FA2 path).
+        if self.enable_seq_packing and processed_inputs.has_flash_attention:
+            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+        else:
+            cu_seqlens = None
+
+        if cu_seqlens is not None:
             # Unpack top-k results from packed format back to original batch format
             # vals: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
             # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
@@ -923,8 +914,6 @@ class TopkLogitsPostProcessor:
                 dtype=idx.dtype,
                 device=idx.device,
             )
-
-            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
 
             for i in range(original_batch_size):
                 start = cu_seqlens[i].item()
@@ -1015,294 +1004,3 @@ def aggregate_training_statistics(
     }
 
     return metrics
-
-
-# ---------------------------------------------------------------------------
-# Pipeline Parallelism (PP) utilities
-# ---------------------------------------------------------------------------
-
-
-def broadcast_tensors_from_last_pp_stage(
-    tensors: dict[str, Optional[torch.Tensor]],
-    pp_mesh: Any,
-    has_last_stage: bool,
-) -> dict[str, torch.Tensor]:
-    """Broadcast tensors from last PP stage to all stages.
-
-    Adapted from nemo_rl/models/megatron/pipeline_parallel.py for device-mesh
-    based PP (no Megatron parallel state).
-
-    Args:
-        tensors: Dict mapping names to tensors. On last stage, tensors are
-            populated; on other stages they may be None.
-        pp_mesh: Pipeline parallel DeviceMesh.
-        has_last_stage: Whether this rank owns the last pipeline stage.
-
-    Returns:
-        Dict with the same keys, all tensors populated on every rank.
-    """
-    pp_group = pp_mesh.get_group()
-    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
-    last_global_rank = pp_ranks[-1]
-
-    result = {}
-    for name, tensor in tensors.items():
-        # Broadcast metadata (shape, dtype)
-        if has_last_stage:
-            assert tensor is not None, f"Last stage must provide tensor '{name}'"
-            meta = [list(tensor.shape), str(tensor.dtype)]
-        else:
-            meta = [None, None]
-        meta_list = [meta]
-        torch.distributed.broadcast_object_list(
-            meta_list, src=last_global_rank, group=pp_group
-        )
-        shape, dtype_str = meta_list[0]
-
-        if not has_last_stage:
-            dtype = getattr(torch, dtype_str.replace("torch.", ""))
-            tensor = torch.empty(shape, dtype=dtype, device="cuda")
-
-        torch.distributed.broadcast(tensor, src=last_global_rank, group=pp_group)
-        result[name] = tensor
-
-    return result
-
-
-def broadcast_loss_metrics_from_last_pp_stage(
-    metrics: Optional[list[dict[str, Any]]],
-    pp_mesh: Any,
-    has_last_stage: bool,
-) -> list[dict[str, Any]]:
-    """Broadcast loss metrics from last PP stage to all stages.
-
-    Args:
-        metrics: List of metric dicts (populated on last stage, None elsewhere).
-        pp_mesh: Pipeline parallel DeviceMesh.
-        has_last_stage: Whether this rank owns the last pipeline stage.
-
-    Returns:
-        List of metric dicts on all ranks.
-    """
-    pp_group = pp_mesh.get_group()
-    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
-    last_global_rank = pp_ranks[-1]
-
-    obj = [metrics]
-    torch.distributed.broadcast_object_list(obj, src=last_global_rank, group=pp_group)
-    return obj[0]
-
-
-class PPLossAdapter:
-    """Stateful loss adapter for pipeline parallel schedules.
-
-    Bridges NeMo RL's LossFunction interface with the PP schedule's
-    ``loss_fn(output, target)`` contract by pre-chunking RL data across
-    microbatches.
-
-    The PP schedule calls ``__call__(output, target)`` once per microbatch.
-    This adapter indexes into pre-chunked RL tensors to compute the loss for
-    each microbatch.
-
-    **Critical**: PP schedules sum loss across microbatches, so the loss
-    returned here must use ``reduction="sum"`` (not mean).
-    """
-
-    def __init__(
-        self,
-        loss_fn: "LossFunction",
-        cfg: Any,
-        device_mesh: Any,
-        cp_mesh: Any,
-        tp_mesh: Any,
-        cp_size: int,
-        dp_size: int,
-        enable_seq_packing: bool = False,
-        sampling_params: Optional[TrainingSamplingParams] = None,
-    ):
-        self._loss_fn = loss_fn
-        self._cfg = cfg
-        self._device_mesh = device_mesh
-        self._cp_mesh = cp_mesh
-        self._tp_mesh = tp_mesh
-        self._cp_size = cp_size
-        self._dp_size = dp_size
-        self._enable_seq_packing = enable_seq_packing
-        self._sampling_params = sampling_params
-
-        self._microbatches: list[dict[str, Any]] = []
-        self._call_idx: int = 0
-        self._all_metrics: list[dict[str, Any]] = []
-        self._global_valid_seqs: Optional[torch.Tensor] = None
-        self._global_valid_toks: Optional[torch.Tensor] = None
-        self._num_global_batches: int = 1
-
-    def set_microbatches(
-        self,
-        data_dict: "BatchedDataDict[Any]",
-        n_microbatches: int,
-        global_valid_seqs: torch.Tensor,
-        global_valid_toks: torch.Tensor,
-        num_global_batches: int = 1,
-    ) -> None:
-        """Pre-chunk RL tensors along batch dim into n_microbatches."""
-        self._call_idx = 0
-        self._all_metrics = []
-        self._global_valid_seqs = global_valid_seqs
-        self._global_valid_toks = global_valid_toks
-        self._num_global_batches = num_global_batches
-
-        self._microbatches = []
-        for i in range(n_microbatches):
-            mb = {}
-            for key in data_dict:
-                val = data_dict[key]
-                if torch.is_tensor(val) and val.shape[0] > 0:
-                    chunks = torch.tensor_split(val, n_microbatches, dim=0)
-                    mb[key] = chunks[i]
-                else:
-                    mb[key] = val
-            self._microbatches.append(mb)
-
-    def __call__(self, output: Any, target: torch.Tensor) -> torch.Tensor:
-        """Called by PP schedule per microbatch.
-
-        Following the validated pattern from automodel-engine/test_rl_pp.py:
-        compute logprobs directly from the schedule's output and target tensors,
-        then use pre-chunked RL data for advantages/prev_logprobs.
-
-        Args:
-            output: Model output (has .logits attribute or is a tensor).
-            target: Labels tensor for this microbatch (schedule-chunked).
-
-        Returns:
-            Scalar loss tensor with reduction="sum".
-        """
-        logits = getattr(output, "logits", output)
-        mb_data = self._microbatches[self._call_idx]
-        self._call_idx += 1
-
-        # Compute next-token logprobs directly from schedule's logits and target.
-        # Following test_rl_pp.py: use target (schedule-chunked labels) for gather.
-        # Returns [B, S-1] matching the non-PP path's get_next_token_logprobs_from_logits.
-        log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
-        curr_logprobs = (
-            log_probs[:, :-1]
-            .gather(dim=-1, index=target[:, 1:].unsqueeze(-1).clamp(min=0))
-            .squeeze(-1)
-        )
-
-        # Build loss input with computed logprobs
-        from nemo_rl.algorithms.loss.interfaces import LossInputType
-
-        if self._loss_fn.input_type == LossInputType.LOGPROB:
-            loss_input = {"next_token_logprobs": curr_logprobs}
-        else:
-            loss_input = {"logits": logits}
-
-        loss, loss_metrics = self._loss_fn(
-            data=mb_data,
-            global_valid_seqs=self._global_valid_seqs,
-            global_valid_toks=self._global_valid_toks,
-            **loss_input,
-        )
-
-        # Scale metrics for aggregation
-        for k in loss_metrics:
-            if "_min" not in k and "_max" not in k:
-                loss_metrics[k] /= self._num_global_batches
-
-        self._all_metrics.append(loss_metrics)
-
-        # Scale loss to cancel FSDP's automatic gradient averaging across DP ranks,
-        # matching the non-PP path which does `loss * dp_size * cp_size` before backward.
-        return loss * self._dp_size * self._cp_size
-
-    def reset(self) -> None:
-        """Reset state for the next forward-backward call."""
-        self._call_idx = 0
-        self._all_metrics = []
-
-
-class PPLogprobsCapturer:
-    """Pseudo-loss that captures logits from each PP microbatch.
-
-    Used with ``schedule.eval()`` to collect logits on the last pipeline
-    stage for logprob computation.
-    """
-
-    def __init__(self):
-        self.captured_logits: list[torch.Tensor] = []
-
-    def __call__(self, output: Any, target: torch.Tensor) -> torch.Tensor:
-        """Capture logits and return a dummy zero loss."""
-        logits = getattr(output, "logits", output)
-        self.captured_logits.append(logits.detach())
-        return torch.tensor(0.0, device="cuda")
-
-    def reset(self) -> None:
-        self.captured_logits = []
-
-
-class PPTopkCapturer:
-    """Pseudo-loss that captures logits for top-k computation on last stage."""
-
-    def __init__(self):
-        self.captured_logits: list[torch.Tensor] = []
-
-    def __call__(self, output: Any, target: torch.Tensor) -> torch.Tensor:
-        logits = getattr(output, "logits", output)
-        self.captured_logits.append(logits.detach())
-        return torch.tensor(0.0, device="cuda")
-
-    def reset(self) -> None:
-        self.captured_logits = []
-
-
-def pp_forward_backward(
-    model: nn.Module,
-    batch: dict[str, torch.Tensor],
-    loss_adapter: PPLossAdapter,
-    *,
-    forward_only: bool = False,
-) -> tuple[torch.Tensor, list[dict[str, Any]]]:
-    """Execute forward (and optionally backward) using the PP schedule.
-
-    The PP schedule internally handles microbatch splitting, stage-to-stage
-    communication, and gradient accumulation.
-
-    Args:
-        model: AutoPipeline model with .info and .parts attributes.
-        batch: Dict with at least ``input_ids`` and ``labels``.
-        loss_adapter: PPLossAdapter (already configured via set_microbatches).
-        forward_only: If True, use schedule.eval() instead of schedule.step().
-
-    Returns:
-        Tuple of (total_loss, list_of_metric_dicts).
-        total_loss is the summed loss on last stage, 0.0 on other stages.
-    """
-    schedule = model.info.schedule
-    has_first = model.info.has_first_stage
-    has_last = model.info.has_last_stage
-
-    input_ids = batch.pop("input_ids")
-    targets = batch.pop("labels", None) if has_last else None
-    losses: Optional[list[torch.Tensor]] = [] if has_last else None
-
-    # Inject the loss adapter into the schedule
-    schedule._loss_fn = loss_adapter
-
-    # Build args: first stage receives input_ids, others don't
-    args = (input_ids,) if has_first else ()
-
-    if forward_only:
-        schedule.eval(*args, target=targets, losses=losses)
-    else:
-        schedule.step(*args, target=targets, losses=losses)
-
-    if has_last and losses:
-        total_loss = torch.sum(torch.stack(losses))
-    else:
-        total_loss = torch.tensor(0.0, device="cuda")
-
-    return total_loss, loss_adapter._all_metrics

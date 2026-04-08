@@ -82,9 +82,9 @@ class ModelAndOptimizerState(NamedTuple):
     optimizer, scheduler, and metadata about the model type and configuration.
     """
 
-    model: torch.nn.Module
-    optimizer: Optional[torch.optim.Optimizer]
-    scheduler: Optional[Any]
+    model: Any  # nn.Module or ModelHandle for PP
+    optimizers: Optional[list[torch.optim.Optimizer]]
+    schedulers: Optional[list[Any]]
     is_hf_model: bool
     is_moe_model: bool
     is_reward_model: bool
