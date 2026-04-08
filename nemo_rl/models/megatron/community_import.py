@@ -108,13 +108,19 @@ def import_model_from_hf_name(
     config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
     config.pipeline_dtype = orig_pipeline_dtype
 
-    # fully_parallel_save=False avoids deadlock when world includes non-training ranks
-    # (e.g., non-colocated vLLM). FullyParallelSaveStrategyWrapper would call
-    # all_gather_object on DP sub-groups that include ranks that never enter save.
+    # Disable save optimizations that deadlock when the distributed world includes
+    # non-training ranks (e.g., non-colocated vLLM workers):
+    # - fully_parallel_save=False: bypasses FullyParallelSaveStrategyWrapper which
+    #   calls all_gather_object on DP sub-groups containing non-participating ranks
+    # - validate_access_integrity=False: skips determine_global_metadata which calls
+    #   all_gather_object on the default PG where some ranks may not participate
     # Conditional for backward compat with older Megatron-Bridge versions.
     save_kwargs = {}
-    if "fully_parallel_save" in inspect.signature(bridge.save_megatron_model).parameters:
+    sig = inspect.signature(bridge.save_megatron_model)
+    if "fully_parallel_save" in sig.parameters:
         save_kwargs["fully_parallel_save"] = False
+    if "validate_access_integrity" in sig.parameters:
+        save_kwargs["validate_access_integrity"] = False
     bridge.save_megatron_model(megatron_model, output_path, **save_kwargs)
 
     # resetting mcore state
