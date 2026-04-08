@@ -55,6 +55,7 @@ dependencies = [
   "cuda-bindings",                # for non-colocated refit
   "pybase64",                     # for sglang refit
   "nvidia-cudnn-cu12==9.19.0.56", # for transformer-engine no build isolation
+  "nvidia-resiliency-ext",        # for ft_launcher (fault-tolerant training launcher)
 ]
 
 [project.optional-dependencies]
