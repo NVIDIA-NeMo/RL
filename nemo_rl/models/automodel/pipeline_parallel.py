@@ -436,6 +436,41 @@ def reset_pp_stage_shapes_for_thd(model: Any, tokens_per_chunk: int) -> None:
         )
 
 
+def _reset_pp_schedule_state(
+    model: Any,
+    seq_len: int,
+    *,
+    seqpack: bool = False,
+    is_hf_model: bool = False,
+    force: bool = False,
+) -> None:
+    """Reset PP schedule state for the upcoming batch.
+
+    For THD format (seqpack with custom models), delegates to
+    ``reset_pp_stage_shapes_for_thd``. Otherwise delegates to
+    ``model.update_seq_len()`` which skips when seq_len is unchanged.
+
+    Args:
+        force: If True, clear cached seq_len to force re-initialization.
+            Required when switching between schedule.eval() and
+            schedule.step() since the schedule needs fresh state.
+    """
+    if not hasattr(model, "update_seq_len"):
+        raise RuntimeError(
+            "AutoPipeline.update_seq_len() not found. "
+            "Pipeline parallelism requires nemo_automodel >= 0.4.0 "
+            "(PR #1689: dynamic sequence length support). "
+            "Please update the automodel submodule to latest main."
+        )
+    if force:
+        model._pp_current_seq_len = None
+    if seqpack and not is_hf_model:
+        model._pp_current_seq_len = None
+        reset_pp_stage_shapes_for_thd(model, seq_len)
+    else:
+        model.update_seq_len(seq_len)
+
+
 # ---------------------------------------------------------------------------
 # PP seqpack batch preparation
 # ---------------------------------------------------------------------------
@@ -611,9 +646,7 @@ def pp_forward_with_post_processing(
     input_ids, actual_seqs = pad_batch_for_pp(input_ids, pp_batch_size)
     labels = input_ids.clone()
 
-    model._pp_current_seq_len = None
-    if hasattr(model, "update_seq_len"):
-        model.update_seq_len(input_ids.shape[-1])
+    _reset_pp_schedule_state(model, input_ids.shape[-1])
 
     # 2. Run schedule.eval()
     targets = labels if has_last_stage else None
@@ -762,3 +795,172 @@ def pp_forward_loop(
 
     # Concatenate across chunks
     return {key: torch.cat(tensors, dim=0) for key, tensors in all_results.items()}
+
+
+# ---------------------------------------------------------------------------
+# PP training forward/backward loop
+# ---------------------------------------------------------------------------
+
+
+def pp_train_forward_backward_loop(
+    *,
+    model: nn.Module,
+    model_parts: list[nn.Module],
+    batch: BatchedDataDict,
+    loss_adapter: PPLossAdapter,
+    pp_batch_size: int,
+    n_microbatches: int,
+    has_last_stage: bool,
+    pp_mesh: Any,
+    enable_seq_packing: bool,
+    is_hf_model: bool,
+    tokenizer_eos_id: int,
+    train_mb_tokens: int,
+    cp_size: int,
+    cp_mesh: Any,
+    device_mesh: Any,
+    global_valid_seqs: torch.Tensor,
+    global_valid_toks: torch.Tensor,
+    num_global_batches: int,
+    forward_only: bool = False,
+) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+    """Run the PP gradient-accumulation loop for one global batch.
+
+    Encapsulates the inner accumulation loop of PP training, analogous to
+    ``automodel_forward_backward()`` in ``train.py`` for the non-PP path.
+
+    Handles:
+    - Syncing actual batch size across ranks for uniform ``num_accum_steps``
+    - ``prepare_for_grad_accumulation`` / ``prepare_for_final_backward`` /
+      ``prepare_after_first_microbatch`` lifecycle calls
+    - Slicing the batch into accumulation-step-sized chunks
+    - Building PP batches (seqpack via ``prepare_pp_seqpack_batch`` or simple)
+    - Configuring the loss adapter per accumulation step
+    - Resetting PP schedule state (seq len / THD shapes)
+    - Calling ``pp_forward_backward`` per accumulation step
+    - Broadcasting and collecting metrics from last stage
+
+    Gradient clipping, optimizer step, and loss broadcasting for reporting
+    are NOT included -- those remain in the caller (policy-level concerns).
+
+    Returns:
+        Tuple of (total_loss, all_mb_metrics).
+        total_loss: accumulated loss across accum steps (on last stage; 0 elsewhere).
+        all_mb_metrics: list of metric dicts collected from all accum steps.
+    """
+    from nemo_automodel.components.training.utils import (
+        prepare_after_first_microbatch,
+        prepare_for_final_backward,
+        prepare_for_grad_accumulation,
+    )
+
+    # Sync actual batch size across all ranks so everyone has the same
+    # num_accum_steps (required for PP collectives).
+    actual_total = batch.get("input_ids").shape[0]
+    max_batch = torch.tensor([actual_total], device="cuda")
+    torch.distributed.all_reduce(max_batch, op=torch.distributed.ReduceOp.MAX)
+    num_accum_steps = max(
+        1, (int(max_batch.item()) + pp_batch_size - 1) // pp_batch_size
+    )
+
+    if not forward_only:
+        prepare_for_grad_accumulation(model_parts, pp_enabled=True)
+
+    total_loss = torch.tensor(0.0, device="cuda")
+    all_metrics: list[dict[str, Any]] = []
+
+    for accum_idx in range(num_accum_steps):
+        if not forward_only and accum_idx == num_accum_steps - 1:
+            prepare_for_final_backward(model_parts, pp_enabled=True)
+
+        # Clamp to actual batch size so empty/partial accum steps on ranks
+        # with fewer samples still participate in collectives.
+        start = accum_idx * pp_batch_size
+        cstart = min(start, actual_total)
+        cend = min(start + pp_batch_size, actual_total)
+        accum_data = {}
+        for key in batch:
+            val = batch[key]
+            if torch.is_tensor(val) and val.shape[0] >= actual_total:
+                accum_data[key] = val[cstart:cend]
+            else:
+                accum_data[key] = val
+
+        input_ids = batch.get("input_ids")[cstart:cend].cuda()
+
+        thd_batch = None
+        if enable_seq_packing:
+            input_lengths = batch["input_lengths"][cstart:cend]
+            token_mask = accum_data.get("token_mask", None)
+            pp_batch, accum_data, thd_batch = prepare_pp_seqpack_batch(
+                input_ids=input_ids,
+                input_lengths=input_lengths,
+                accum_data=accum_data,
+                pp_batch_size=pp_batch_size,
+                n_microbatches=n_microbatches,
+                tokenizer_eos_id=tokenizer_eos_id,
+                train_mb_tokens=train_mb_tokens,
+                cp_size=cp_size,
+                cp_mesh=cp_mesh,
+                device_mesh=device_mesh,
+                token_mask=token_mask,
+            )
+        else:
+            pp_batch = {
+                "input_ids": input_ids,
+                "labels": input_ids.clone(),
+            }
+
+        if has_last_stage:
+            cu_seqlens_per_row = (
+                thd_batch.cu_seqlens_per_row if enable_seq_packing else None
+            )
+            cu_padded = (
+                thd_batch.cu_seqlens_padded_per_row
+                if enable_seq_packing and cp_size > 1
+                else None
+            )
+            cp_group = cp_mesh.get_group() if cp_size > 1 else None
+            loss_adapter.set_microbatches(
+                accum_data,
+                n_microbatches,
+                global_valid_seqs,
+                global_valid_toks,
+                num_global_batches=num_global_batches,
+                cu_seqlens=cu_seqlens_per_row,
+                cu_seqlens_padded=cu_padded,
+                context_parallel_group=cp_group,
+            )
+        else:
+            loss_adapter.reset()
+
+        _reset_pp_schedule_state(
+            model,
+            pp_batch["input_ids"].shape[-1],
+            seqpack=enable_seq_packing,
+            is_hf_model=is_hf_model,
+            force=True,
+        )
+
+        step_loss, mb_metrics_list = pp_forward_backward(
+            model=model,
+            batch=pp_batch,
+            loss_adapter=loss_adapter,
+            forward_only=forward_only,
+        )
+        total_loss += step_loss.detach()
+
+        if not forward_only and accum_idx == 0:
+            prepare_after_first_microbatch()
+
+        if has_last_stage:
+            gb_loss_metrics = mb_metrics_list
+        else:
+            gb_loss_metrics = None
+        gb_loss_metrics = broadcast_loss_metrics_from_last_pp_stage(
+            gb_loss_metrics, pp_mesh, has_last_stage
+        )
+        if gb_loss_metrics:
+            all_metrics.extend(gb_loss_metrics)
+
+    return total_loss, all_metrics
