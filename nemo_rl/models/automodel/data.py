@@ -55,6 +55,9 @@ class ProcessedInputs:
     cp_buffers: list[torch.Tensor] = field(default_factory=list)
     seq_index: Optional[torch.Tensor] = None
 
+    # THD batch for CP+seqpack path (bypasses FA2 and DTensor CP)
+    thd_batch: Optional["THDBatch"] = None
+
     @property
     def has_context_parallel(self) -> bool:
         """Check if context parallel is enabled."""
@@ -101,6 +104,7 @@ def make_processed_microbatch_iterator(
     cfg: dict[str, Any],
     cp_size: int,
     cp_mesh: Any = None,
+    device_mesh: Any = None,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -114,6 +118,7 @@ def make_processed_microbatch_iterator(
         cfg: Configuration dictionary (enable_seq_packing is inferred from cfg["sequence_packing"]["enabled"])
         cp_size: Context parallel size
         cp_mesh: Optional CP device mesh (needed for seq_packing + CP)
+        device_mesh: Full device mesh with "cp" dim (needed for CP+seqpack THD path)
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
@@ -134,6 +139,7 @@ def make_processed_microbatch_iterator(
             cfg,
             cp_size,
             cp_mesh=cp_mesh,
+            device_mesh=device_mesh,
         )
 
         yield ProcessedMicrobatch(
@@ -152,6 +158,7 @@ def get_microbatch_iterator(
     tokenizer: AutoTokenizer,
     cp_size: int = 1,
     cp_mesh: Any = None,
+    device_mesh: Any = None,
 ) -> tuple[Iterator[ProcessedMicrobatch], int]:
     """Create processed microbatch iterator based on batching strategy.
 
@@ -198,6 +205,7 @@ def get_microbatch_iterator(
         cfg,
         cp_size,
         cp_mesh=cp_mesh,
+        device_mesh=device_mesh,
     )
     return processed_iterator, iterator_len
 
@@ -209,6 +217,7 @@ def process_microbatch(
     cfg: dict[str, Any],
     cp_size: int,
     cp_mesh: Any = None,
+    device_mesh: Any = None,
 ) -> ProcessedInputs:
     """Process a microbatch and prepare inputs for model forward.
 
@@ -218,13 +227,39 @@ def process_microbatch(
         enable_seq_packing: Whether sequence packing is enabled
         cfg: Configuration dictionary
         cp_size: Context parallel size
+        cp_mesh: CP device mesh (for CP+seqpack THD path)
+        device_mesh: Full device mesh with "cp" dim (for CP+seqpack THD path)
 
     Returns:
         ProcessedInputs containing all tensors and metadata for forward pass
     """
     input_ids = mb.get("input_ids").cuda()
 
-    if enable_seq_packing:
+    if enable_seq_packing and cp_size > 1:
+        # CP+seqpack: use THD path with TE CP sharding.
+        # pack_for_thd handles CP-padding, THD conversion, and CP sharding.
+        # Pass token_mask so prompt tokens get labels=-100 in packed format.
+        token_mask = mb.get("token_mask", None)
+        thd_result = pack_for_thd(
+            input_ids=input_ids,
+            input_lengths=mb["input_lengths"],
+            packed_sequence_size=[len(mb["input_lengths"])],
+            padding_value=tokenizer.eos_token_id,
+            min_seq_len=cfg["sequence_packing"]["train_mb_tokens"],
+            cp_size=cp_size,
+            cp_mesh=cp_mesh,
+            device_mesh=device_mesh,
+            token_mask=token_mask,
+        )
+        return ProcessedInputs(
+            input_ids=thd_result.input_ids,
+            position_ids=thd_result.position_ids,
+            attention_mask=None,
+            flash_attn_kwargs={},
+            seq_len=thd_result.input_ids.shape[0],
+            thd_batch=thd_result,
+        )
+    elif enable_seq_packing:
         input_ids, position_ids, _ = pack_sequences(
             input_ids=input_ids,
             input_lengths=mb["input_lengths"],
@@ -352,6 +387,270 @@ def process_global_batch(
         "global_valid_seqs": global_valid_seqs,
         "global_valid_toks": global_valid_toks,
     }
+
+
+@dataclass
+class THDBatch:
+    """Packed sequence batch in THD-ready format for custom automodel models.
+
+    Custom models (gpt-oss, qwen3-moe) with TE backend expect individual kwargs
+    (cu_seqlens, qkv_format) instead of HF's bundled flash_attn_kwargs.
+    """
+
+    input_ids: torch.Tensor  # [packed_len] (1D THD) or [n_rows, packed_len] (2D for PP)
+    position_ids: torch.Tensor  # same shape as input_ids
+    labels: torch.Tensor  # same shape as input_ids
+    cu_seqlens: torch.Tensor  # [num_seqs+1] or [n_rows, max_seqs+1] for PP
+    cu_seqlens_per_row: list  # per-row clean cu_seqlens from actual lengths
+    cu_seqlens_padded_per_row: list  # per-row clean cu_seqlens from CP-padded lengths
+    n_packed_rows: int  # number of packed rows (= n_microbatches for PP)
+
+    # CP-specific fields (set by pack_for_thd when cp_size > 1)
+    cp_size: int = 1
+    cp_rank: int = 0
+    max_seqlen: Optional[torch.Tensor] = None
+
+    def to_model_kwargs(self, device: torch.device) -> dict[str, Any]:
+        """Build kwargs dict to pass to schedule.step() or model forward.
+
+        For a single row (non-PP or PP with n_microbatches=1), tensors are 1D
+        (THD format). For multiple rows (PP with n_microbatches > 1), tensors
+        are 2D [n_rows, packed_len] so the PP schedule can split along dim 0.
+        The _thd_squeeze_hook on model parts squeezes dim 0 after splitting.
+        """
+        result = {
+            "input_ids": self.input_ids.to(device),
+            "labels": self.labels.to(device),
+            "position_ids": self.position_ids.to(device),
+            "cu_seqlens": self.cu_seqlens.to(dtype=torch.int32, device=device),
+            "qkv_format": "thd",
+        }
+        # CP size/rank are already configured on the model's attention modules
+        # via apply_cp(). Don't pass them as kwargs — it can confuse TE backends.
+        if self.max_seqlen is not None:
+            result["max_seqlen"] = self.max_seqlen.to(device)
+        return result
+
+
+def install_thd_squeeze_hook(model_parts: list) -> list:
+    """Install forward pre-hooks that squeeze cu_seqlens for PP microbatches.
+
+    When the PP schedule splits [n_rows, packed_len] along dim 0, cu_seqlens
+    becomes [1, max_seqs+1]. Custom models expect 1D cu_seqlens, so the hook
+    squeezes dim 0. Input_ids stays [1, packed_len] — all custom models handle
+    this via their internal THD unsqueeze logic.
+
+    Returns list of hook handles for removal.
+    """
+    handles = []
+    for part in model_parts:
+        def _squeeze_hook(module, args, kwargs):
+            if "cu_seqlens" not in kwargs:
+                return args, kwargs
+            kwargs = dict(kwargs)
+            if kwargs["cu_seqlens"].ndim == 2 and kwargs["cu_seqlens"].shape[0] == 1:
+                kwargs["cu_seqlens"] = kwargs["cu_seqlens"].squeeze(0)
+            return args, kwargs
+
+        h = part.register_forward_pre_hook(_squeeze_hook, with_kwargs=True)
+        handles.append(h)
+    return handles
+
+
+def _cp_pad_length(length: int, cp_size: int) -> int:
+    """Pad a sequence length to the nearest multiple of 2*cp_size."""
+    divisor = 2 * cp_size
+    return ((length + divisor - 1) // divisor) * divisor
+
+
+def pack_for_thd(
+    input_ids: torch.Tensor,
+    input_lengths: torch.Tensor,
+    packed_sequence_size: list[int],
+    padding_value: int,
+    min_seq_len: int = 0,
+    num_chunks: int = 1,
+    cp_size: int = 1,
+    cp_mesh: Any = None,
+    device_mesh: Any = None,
+    token_mask: Optional[torch.Tensor] = None,
+) -> THDBatch:
+    """Pack sequences into THD-format batch, optionally with CP sharding.
+
+    For CP > 1, individual sequences are padded to multiples of ``2*cp_size``
+    before packing, and ``make_cp_batch_and_ctx`` shards tokens across CP ranks.
+    For PP, ``num_chunks`` controls how many microbatch rows are produced.
+
+    Args:
+        input_ids: [num_sequences, max_seq_len] raw input
+        input_lengths: [num_sequences] actual lengths
+        packed_sequence_size: How many sequences per packed row, e.g. [4, 4]
+        padding_value: Pad token id
+        min_seq_len: Minimum packed row length
+        num_chunks: Number of THD chunks (= n_microbatches for PP). Default 1.
+        cp_size: Context parallel size. Default 1.
+        cp_mesh: CP device mesh (required when cp_size > 1).
+        device_mesh: Full device mesh with "cp" dim (required when cp_size > 1).
+
+    Returns:
+        THDBatch with THD-format data, optionally CP-sharded.
+    """
+    from nemo_automodel.components.distributed.thd_utils import (
+        split_batch_into_thd_chunks,
+    )
+
+    # When CP > 1, pad each individual sequence to 2*cp_size multiple.
+    # This is done by adjusting input_lengths; pack_sequences will trim
+    # each sequence to input_lengths[i] tokens, so we use the CP-padded
+    # lengths as the actual lengths for packing.
+    if cp_size > 1:
+        cp_padded_lengths = torch.tensor(
+            [_cp_pad_length(l.item(), cp_size) for l in input_lengths],
+            dtype=input_lengths.dtype,
+            device=input_lengths.device,
+        )
+    else:
+        cp_padded_lengths = input_lengths
+
+    packed_ids, packed_pos_ids, _ = pack_sequences(
+        input_ids=input_ids,
+        input_lengths=cp_padded_lengths,
+        packed_sequence_size=packed_sequence_size,
+        padding_value=padding_value,
+        return_attention_mask=False,
+        min_seq_len=min_seq_len,
+    )
+    n_rows = len(packed_sequence_size)
+    row_len = packed_ids.shape[1]
+
+    # Build seq_lens (actual) and seq_lens_padded (CP-padded per seq, last
+    # seq absorbs remaining space to fill row_len — matching automodel's
+    # packed_sequence_thd_collater convention).
+    seq_lens_list = []
+    seq_lens_padded_list = []
+    cu_seqlens_per_row = []
+    cu_seqlens_padded_per_row = []
+    seq_idx = 0
+    for row_size in packed_sequence_size:
+        row_actual = input_lengths[seq_idx : seq_idx + row_size].clone()
+        row_cp_padded = cp_padded_lengths[seq_idx : seq_idx + row_size].clone()
+
+        # Last sequence absorbs remaining space to fill the row
+        row_padded_for_thd = row_cp_padded.clone()
+        total_cp_padded = int(row_cp_padded.sum().item())
+        remaining = row_len - total_cp_padded
+        if remaining > 0:
+            row_padded_for_thd[-1] = row_padded_for_thd[-1] + remaining
+
+        seq_lens_list.append(row_actual)
+        seq_lens_padded_list.append(row_padded_for_thd)
+
+        # Clean cu_seqlens from actual lengths (for data slicing in loss wrapper)
+        cu = torch.nn.functional.pad(
+            row_actual.to(torch.int32).cumsum(dim=0), (1, 0)
+        )
+        cu_seqlens_per_row.append(cu)
+
+        # Clean cu_seqlens from CP-padded lengths (for CP logit slicing)
+        cu_padded = torch.nn.functional.pad(
+            row_padded_for_thd.to(torch.int32).cumsum(dim=0), (1, 0)
+        )
+        cu_seqlens_padded_per_row.append(cu_padded)
+        seq_idx += row_size
+
+    # Pad to uniform number of sequences per row
+    max_seqs = max(len(s) for s in seq_lens_list)
+    seq_lens = torch.stack([
+        torch.nn.functional.pad(s, (0, max_seqs - len(s)), value=-1000)
+        for s in seq_lens_list
+    ])
+    seq_lens_padded = torch.stack([
+        torch.nn.functional.pad(s, (0, max_seqs - len(s)), value=-1000)
+        for s in seq_lens_padded_list
+    ])
+
+    # Build labels with -100 for non-trainable positions:
+    # (a) CP padding between sequences (beyond actual but within CP-padded)
+    # (b) End-of-row padding (beyond total valid tokens)
+    # (c) Prompt tokens (where token_mask == 0, if provided)
+    # This is critical for the CP loss path which uses cross_entropy directly
+    # on all tokens (not bounded by cu_seqlens like SequencePackingLossWrapper).
+    #
+    # Also pack token_mask using the same CP-padded lengths so we can
+    # mask prompt tokens in the packed format.
+    if token_mask is not None:
+        # token_mask: [batch_size, seq_len] with 0=prompt, 1=response.
+        # Pack using the same CP-padded lengths to align with packed_ids.
+        packed_mask, _, _ = pack_sequences(
+            input_ids=token_mask.float(),
+            input_lengths=cp_padded_lengths,
+            packed_sequence_size=packed_sequence_size,
+            padding_value=0,
+            return_attention_mask=False,
+            min_seq_len=min_seq_len,
+        )
+
+    labels = packed_ids.clone()
+    for row_idx in range(n_rows):
+        row_actual = seq_lens_list[row_idx]
+        row_cp_padded = cp_padded_lengths[
+            sum(packed_sequence_size[:row_idx]) : sum(packed_sequence_size[:row_idx + 1])
+        ]
+        # Mark padding between each sequence's actual and CP-padded boundary
+        pos = 0
+        for seq_i in range(len(row_actual)):
+            actual = int(row_actual[seq_i].item())
+            padded = int(row_cp_padded[seq_i].item())
+            if actual < padded:
+                labels[row_idx, pos + actual : pos + padded] = -100
+            pos += padded
+        # Mark end-of-row padding
+        if pos < row_len:
+            labels[row_idx, pos:] = -100
+
+    # Mask prompt tokens using token_mask
+    if token_mask is not None:
+        labels[packed_mask < 0.5] = -100
+
+    thd_input = {
+        "input_ids": packed_ids,
+        "labels": labels,
+        "position_ids": packed_pos_ids,
+        "seq_lens": seq_lens,
+        "seq_lens_padded": seq_lens_padded,
+    }
+
+    if cp_size > 1:
+        # Use automodel's make_cp_batch_and_ctx for combined THD + CP sharding.
+        from nemo_automodel.components.distributed.cp_utils import (
+            make_cp_batch_and_ctx,
+        )
+        _, thd_batch = make_cp_batch_and_ctx(
+            device_mesh,
+            thd_input,
+            use_te=True,
+            padding_token_id=padding_value,
+            num_chunks=num_chunks,
+        )
+    else:
+        thd_batch = split_batch_into_thd_chunks(
+            thd_input,
+            num_chunks=num_chunks,
+            padding_token_id=padding_value,
+        )
+
+    return THDBatch(
+        input_ids=thd_batch["input_ids"],
+        position_ids=thd_batch["position_ids"],
+        labels=thd_batch["labels"],
+        cu_seqlens=thd_batch["cu_seqlens"],
+        cu_seqlens_per_row=cu_seqlens_per_row,
+        cu_seqlens_padded_per_row=cu_seqlens_padded_per_row,
+        n_packed_rows=n_rows,
+        cp_size=thd_batch.get("cp_size", 1),
+        cp_rank=thd_batch.get("cp_rank", 0),
+        max_seqlen=thd_batch.get("max_seqlen"),
+    )
 
 
 def check_sequence_dim(data: BatchedDataDict[Any]) -> Tuple[int, int]:
