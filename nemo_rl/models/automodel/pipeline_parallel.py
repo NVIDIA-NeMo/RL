@@ -17,8 +17,9 @@
 Contains PP-specific classes and functions:
 - Broadcast helpers for PP stage communication
 - PPLossAdapter: stateful loss wrapper for PP schedules
-- PPLogprobsCapturer / PPTopkCapturer: logit capture for eval
+- PPLogitsCapturer: logit capture for eval
 - pp_forward_backward: PP schedule step/eval wrapper
+- pp_forward_with_post_processing / pp_forward_loop: PP eval with post-processing
 - reset_pp_stage_shapes_for_thd: THD stage shape management
 - prepare_pp_seqpack_batch: pack sequences for PP training step
 - pad_batch_for_pp: pad batch to pp_batch_size for PP schedule
@@ -27,10 +28,14 @@ Contains PP-specific classes and functions:
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 if TYPE_CHECKING:
     from nemo_rl.models.automodel.data import THDBatch
+    from nemo_rl.models.automodel.train import (
+        LogprobsPostProcessor,
+        TopkLogitsPostProcessor,
+    )
 
 import torch
 from torch import nn
@@ -39,7 +44,6 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-
 
 # ---------------------------------------------------------------------------
 # Broadcast helpers
@@ -221,8 +225,14 @@ class PPLossAdapter:
         if logits.ndim == 2:
             logits = logits.unsqueeze(0)
         mb_data = self._microbatches[self._call_idx]
-        cu_seqlens = self._cu_seqlens_list[self._call_idx] if self._cu_seqlens_list else None
-        cu_seqlens_padded = self._cu_seqlens_padded_list[self._call_idx] if self._cu_seqlens_padded_list else cu_seqlens
+        cu_seqlens = (
+            self._cu_seqlens_list[self._call_idx] if self._cu_seqlens_list else None
+        )
+        cu_seqlens_padded = (
+            self._cu_seqlens_padded_list[self._call_idx]
+            if self._cu_seqlens_padded_list
+            else cu_seqlens
+        )
         self._call_idx += 1
 
         if cu_seqlens is not None:
@@ -236,7 +246,9 @@ class PPLossAdapter:
                 loss_fn=self._loss_fn,
                 prepare_fn=prepare_loss_input_wrapped,
                 cu_seqlens_q=cu_seqlens,
-                cu_seqlens_q_padded=cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens_padded
+                if cu_seqlens_padded is not None
+                else cu_seqlens,
                 context_parallel_group=self._context_parallel_group,
             )
             loss, loss_metrics = loss_fn_wrapped(
@@ -289,27 +301,12 @@ class PPLossAdapter:
 # ---------------------------------------------------------------------------
 
 
-class PPLogprobsCapturer:
-    """Pseudo-loss that captures logits from each PP microbatch.
+class PPLogitsCapturer:
+    """Pseudo-loss that captures logits from each PP microbatch during eval.
 
     Used with ``schedule.eval()`` to collect logits on the last pipeline
-    stage for logprob computation.
+    stage for downstream post-processing (logprobs, top-k, etc.).
     """
-
-    def __init__(self):
-        self.captured_logits: list[torch.Tensor] = []
-
-    def __call__(self, output: Any, target: torch.Tensor) -> torch.Tensor:
-        logits = getattr(output, "logits", output)
-        self.captured_logits.append(logits.detach())
-        return torch.tensor(0.0, device="cuda")
-
-    def reset(self) -> None:
-        self.captured_logits = []
-
-
-class PPTopkCapturer:
-    """Pseudo-loss that captures logits for top-k computation on last stage."""
 
     def __init__(self):
         self.captured_logits: list[torch.Tensor] = []
@@ -425,10 +422,14 @@ def reset_pp_stage_shapes_for_thd(model: Any, tokens_per_chunk: int) -> None:
             )
         else:
             stage.inputs_meta = (
-                torch.empty(1, tokens_per_chunk, hidden_size, device="meta", dtype=model_dtype),
+                torch.empty(
+                    1, tokens_per_chunk, hidden_size, device="meta", dtype=model_dtype
+                ),
             )
 
-        has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
+        has_lm_head = (
+            hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
+        )
         out_dim = vocab_size if has_lm_head else hidden_size
         stage._outputs_meta = (
             torch.empty(1, tokens_per_chunk, out_dim, device="meta", dtype=model_dtype),
@@ -466,16 +467,26 @@ def prepare_pp_seqpack_batch(
 
     if actual_seqs < pp_batch_size:
         pad_count = pp_batch_size - actual_seqs
-        input_ids = torch.cat([
-            input_ids,
-            torch.zeros(pad_count, input_ids.shape[1],
-                        dtype=input_ids.dtype, device=input_ids.device),
-        ], dim=0)
-        input_lengths = torch.cat([
-            input_lengths,
-            torch.ones(pad_count, dtype=input_lengths.dtype,
-                       device=input_lengths.device),
-        ])
+        input_ids = torch.cat(
+            [
+                input_ids,
+                torch.zeros(
+                    pad_count,
+                    input_ids.shape[1],
+                    dtype=input_ids.dtype,
+                    device=input_ids.device,
+                ),
+            ],
+            dim=0,
+        )
+        input_lengths = torch.cat(
+            [
+                input_lengths,
+                torch.ones(
+                    pad_count, dtype=input_lengths.dtype, device=input_lengths.device
+                ),
+            ]
+        )
         for key in accum_data:
             val = accum_data[key]
             if torch.is_tensor(val) and val.ndim >= 1 and val.shape[0] == actual_seqs:
@@ -489,12 +500,19 @@ def prepare_pp_seqpack_batch(
     if token_mask is not None:
         if token_mask.shape[0] < len(input_lengths):
             pad_rows = len(input_lengths) - token_mask.shape[0]
-            token_mask = torch.cat([
-                token_mask,
-                torch.zeros(pad_rows, token_mask.shape[1],
-                            dtype=token_mask.dtype, device=token_mask.device),
-            ], dim=0)
-        token_mask = token_mask[:len(input_lengths)]
+            token_mask = torch.cat(
+                [
+                    token_mask,
+                    torch.zeros(
+                        pad_rows,
+                        token_mask.shape[1],
+                        dtype=token_mask.dtype,
+                        device=token_mask.device,
+                    ),
+                ],
+                dim=0,
+            )
+        token_mask = token_mask[: len(input_lengths)]
 
     thd_batch = pack_for_thd(
         input_ids=input_ids,
@@ -520,9 +538,227 @@ def pad_batch_for_pp(
     actual_seqs = input_ids.shape[0]
     if actual_seqs < pp_batch_size:
         pad_count = pp_batch_size - actual_seqs
-        input_ids = torch.cat([
-            input_ids,
-            torch.zeros(pad_count, input_ids.shape[1],
-                        dtype=input_ids.dtype, device=input_ids.device),
-        ], dim=0)
+        input_ids = torch.cat(
+            [
+                input_ids,
+                torch.zeros(
+                    pad_count,
+                    input_ids.shape[1],
+                    dtype=input_ids.dtype,
+                    device=input_ids.device,
+                ),
+            ],
+            dim=0,
+        )
     return input_ids, actual_seqs
+
+
+# ---------------------------------------------------------------------------
+# PP forward with post-processing (eval path)
+# ---------------------------------------------------------------------------
+
+
+def pp_forward_with_post_processing(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    chunk_data: BatchedDataDict,
+    post_processor: Union["LogprobsPostProcessor", "TopkLogitsPostProcessor"],
+    pp_batch_size: int,
+    seq_dim_size: int,
+    pp_mesh: Any,
+    has_first_stage: bool,
+    has_last_stage: bool,
+    capturer: PPLogitsCapturer,
+) -> dict[str, torch.Tensor]:
+    """Run PP schedule.eval() on one chunk and apply post-processing.
+
+    Analogous to ``forward_with_post_processing_fn()`` in ``train.py`` but
+    for the PP eval path. Handles batch padding, schedule execution, logit
+    capture, broadcasting, and post-processor dispatch.
+
+    Broadcast timing differs by post-processor type:
+    - LogprobsPostProcessor: broadcasts full logits first (post-processor
+      needs full vocab for log_softmax + gather), then post-processes.
+    - TopkLogitsPostProcessor: applies top-k on last stage first (reduces
+      [B,S,V] → [B,S,k]), then broadcasts the smaller tensors.
+
+    Args:
+        model: AutoPipeline model with .info attribute.
+        input_ids: Token IDs for this chunk [actual_seqs, seq_len].
+        chunk_data: Sliced BatchedDataDict for this chunk.
+        post_processor: LogprobsPostProcessor or TopkLogitsPostProcessor.
+        pp_batch_size: Required batch size for the PP schedule.
+        seq_dim_size: Global max sequence length (for output padding).
+        pp_mesh: Pipeline parallel DeviceMesh.
+        has_first_stage: Whether this rank owns the first pipeline stage.
+        has_last_stage: Whether this rank owns the last pipeline stage.
+        capturer: PPLogitsCapturer instance (shared across chunks).
+
+    Returns:
+        Dict of result tensors, e.g. ``{"logprobs": tensor}`` or
+        ``{"topk_logits": tensor, "topk_indices": tensor}``.
+    """
+    from nemo_rl.models.automodel.data import ProcessedInputs
+    from nemo_rl.models.automodel.train import (
+        LogprobsPostProcessor,
+        TopkLogitsPostProcessor,
+    )
+
+    schedule = model.info.schedule
+
+    # 1. Pad batch and reset schedule state
+    capturer.reset()
+    input_ids, actual_seqs = pad_batch_for_pp(input_ids, pp_batch_size)
+    labels = input_ids.clone()
+
+    model._pp_current_seq_len = None
+    if hasattr(model, "update_seq_len"):
+        model.update_seq_len(input_ids.shape[-1])
+
+    # 2. Run schedule.eval()
+    targets = labels if has_last_stage else None
+    losses = [] if has_last_stage else None
+    args = (input_ids,) if has_first_stage else ()
+    schedule.eval(*args, target=targets, losses=losses)
+
+    # 3. Dispatch based on post-processor type
+    if isinstance(post_processor, LogprobsPostProcessor):
+        # Broadcast full logits, then post-process on all ranks
+        if has_last_stage:
+            all_logits = torch.cat(capturer.captured_logits, dim=0)
+            tensors = {"logits": all_logits}
+        else:
+            tensors = {"logits": None}
+
+        broadcasted = broadcast_tensors_from_last_pp_stage(
+            tensors, pp_mesh, has_last_stage
+        )
+        logits = broadcasted["logits"]
+
+        processed_inputs = ProcessedInputs(
+            input_ids=input_ids,
+            seq_len=input_ids.shape[1],
+        )
+        token_logprobs = post_processor(
+            logits=logits,
+            data_dict=chunk_data,
+            processed_inputs=processed_inputs,
+            original_batch_size=actual_seqs,
+            original_seq_len=seq_dim_size,
+            sequence_dim=1,
+        )
+
+        # Trim dummy-padded rows and pad to global seq dim
+        token_logprobs = token_logprobs[:actual_seqs]
+        padding_needed = seq_dim_size - token_logprobs.shape[1]
+        if padding_needed > 0:
+            token_logprobs = torch.nn.functional.pad(
+                token_logprobs, (0, padding_needed), mode="constant", value=0.0
+            )
+        return {"logprobs": token_logprobs}
+
+    elif isinstance(post_processor, TopkLogitsPostProcessor):
+        # Post-process on last stage first (reduces vocab dim), then broadcast
+        k = post_processor.k
+        if has_last_stage:
+            mb_vals, mb_idx = [], []
+            for logits in capturer.captured_logits:
+                vals, idx = torch.topk(logits.float(), k=k, dim=-1)
+                mb_vals.append(vals)
+                mb_idx.append(idx)
+            topk_vals = torch.cat(mb_vals, dim=0)
+            topk_indices = torch.cat(mb_idx, dim=0)
+            tensors = {"topk_logits": topk_vals, "topk_indices": topk_indices}
+        else:
+            tensors = {"topk_logits": None, "topk_indices": None}
+
+        broadcasted = broadcast_tensors_from_last_pp_stage(
+            tensors, pp_mesh, has_last_stage
+        )
+        vals = broadcasted["topk_logits"]
+        idx = broadcasted["topk_indices"]
+
+        # Pad to global seq dim
+        pad_needed = seq_dim_size - vals.shape[1]
+        if pad_needed > 0:
+            vals = torch.nn.functional.pad(vals, (0, 0, 0, pad_needed), value=0.0)
+            idx = torch.nn.functional.pad(idx, (0, 0, 0, pad_needed), value=0)
+        return {"topk_logits": vals, "topk_indices": idx}
+
+    else:
+        raise TypeError(
+            f"Unsupported post-processor type for PP eval: {type(post_processor)}"
+        )
+
+
+def pp_forward_loop(
+    model: nn.Module,
+    data: BatchedDataDict,
+    post_processor: Union["LogprobsPostProcessor", "TopkLogitsPostProcessor"],
+    pp_batch_size: int,
+    seq_dim_size: int,
+    pp_mesh: Any,
+    has_first_stage: bool,
+    has_last_stage: bool,
+) -> dict[str, torch.Tensor]:
+    """Run PP eval over all data in pp_batch_size chunks with post-processing.
+
+    Analogous to how the non-PP path loops over microbatches calling
+    ``forward_with_post_processing_fn()`` per microbatch.
+
+    Handles syncing total_samples across ranks (to prevent collective hangs
+    with uneven data), iterating chunks, and concatenating results.
+
+    Args:
+        model: AutoPipeline model.
+        data: Full dataset (will be moved to CUDA).
+        post_processor: LogprobsPostProcessor or TopkLogitsPostProcessor.
+        pp_batch_size: Batch size per PP schedule eval call.
+        seq_dim_size: Global max sequence length.
+        pp_mesh: Pipeline parallel DeviceMesh.
+        has_first_stage: Whether this rank owns the first pipeline stage.
+        has_last_stage: Whether this rank owns the last pipeline stage.
+
+    Returns:
+        Dict of concatenated result tensors across all chunks.
+    """
+    capturer = PPLogitsCapturer()
+    schedule = model.info.schedule
+    schedule._loss_fn = capturer
+
+    data.to("cuda")
+    all_input_ids = data.get("input_ids").cuda()
+    total_samples = all_input_ids.shape[0]
+
+    # Sync across ranks to prevent collective hangs when data is uneven
+    max_samples = torch.tensor([total_samples], device="cuda")
+    torch.distributed.all_reduce(max_samples, op=torch.distributed.ReduceOp.MAX)
+    num_chunks = max(1, (int(max_samples.item()) + pp_batch_size - 1) // pp_batch_size)
+
+    all_results: dict[str, list[torch.Tensor]] = {}
+    for chunk_idx in range(num_chunks):
+        start = chunk_idx * pp_batch_size
+        actual_chunk_size = min(pp_batch_size, total_samples - start)
+        chunk_data = data.slice(start, start + actual_chunk_size)
+        input_ids = chunk_data.get("input_ids").cuda()
+
+        chunk_result = pp_forward_with_post_processing(
+            model=model,
+            input_ids=input_ids,
+            chunk_data=chunk_data,
+            post_processor=post_processor,
+            pp_batch_size=pp_batch_size,
+            seq_dim_size=seq_dim_size,
+            pp_mesh=pp_mesh,
+            has_first_stage=has_first_stage,
+            has_last_stage=has_last_stage,
+            capturer=capturer,
+        )
+
+        for key, tensor in chunk_result.items():
+            if key not in all_results:
+                all_results[key] = []
+            all_results[key].append(tensor)
+
+    # Concatenate across chunks
+    return {key: torch.cat(tensors, dim=0) for key, tensors in all_results.items()}
