@@ -21,7 +21,6 @@ policy:
   make_sequence_length_divisible_by: 4
 sft:
   val_at_start: false
-  val_at_end: false
 checkpointing:
   enabled: false
 cluster:
