@@ -27,6 +27,7 @@ from megatron.bridge.training.post_training.checkpointing import (
 )
 from megatron.core import parallel_state
 from megatron.core.utils import unwrap_model
+from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
 import nemo_rl.models.megatron.setup as megatron_setup
@@ -361,6 +362,30 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
         return refit_param_info_hf
 
+    @staticmethod
+    def _find_weight_quantizer(module, param_weight):
+        """Find the enabled weight quantizer that corresponds to ``param_weight``.
+
+        Uses ModelOpt's ``QuantModule.iter_weights_for_calibration`` to discover
+        ``(weight, weight_quantizer)`` pairs, then matches by identity.
+        This handles standard ``weight`` / ``weight_quantizer`` as well as
+        custom names like ``gate_up_proj`` / ``gate_up_proj_weight_quantizer``.
+
+        Returns the matching ``TensorQuantizer`` or ``None``.
+        """
+        if module is None or param_weight is None:
+            return None
+        if not isinstance(module, QuantModule):
+            return None
+        for weight, wq in module.iter_weights_for_calibration():
+            if (
+                param_weight is weight
+                and isinstance(wq, TensorQuantizer)
+                and wq.is_enabled
+            ):
+                return wq
+        return None
+
     def _iter_params_with_optional_kv_scales(self, kv_scales=None):
         """Pre-fold weights on-the-fly via lazy proxy tasks.
 
@@ -388,16 +413,30 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 return getattr(self._task, name)
 
         folded_tasks = []
+        skipped_fold = []
         for task in self.refit_conversion_tasks:
-            wq = getattr(task.megatron_module, "weight_quantizer", None)
-            if (
-                isinstance(wq, TensorQuantizer)
-                and wq.is_enabled
-                and task.param_weight is not None
-            ):
-                folded_tasks.append(_FoldedTask(task, wq))
+            matched_wq = self._find_weight_quantizer(
+                task.megatron_module, task.param_weight
+            )
+            if matched_wq is not None:
+                folded_tasks.append(_FoldedTask(task, matched_wq))
             else:
+                if (
+                    task.param_weight is not None
+                    and isinstance(task.megatron_module, QuantModule)
+                    and any(
+                        True
+                        for _ in task.megatron_module.iter_weights_for_calibration()
+                    )
+                ):
+                    skipped_fold.append(task.param_name)
                 folded_tasks.append(task)
+
+        if skipped_fold and self.rank == 0:
+            print(
+                f"[QuantFold] Skipped folding {len(skipped_fold)} non-GEMM params "
+                f"that share a module with weight_quantizer: {skipped_fold[:5]}"
+            )
 
         original_tasks = self.refit_conversion_tasks
         self.refit_conversion_tasks = folded_tasks

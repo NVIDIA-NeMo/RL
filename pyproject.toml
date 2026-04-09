@@ -186,7 +186,7 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 # From JustinTong0323/sglang branch update-transformers-v5 (sgl-project/sglang#17784)
 sglang = { git = "https://github.com/JustinTong0323/sglang.git", rev = "70aa688742dd2b75bf9e8e980249303f39295b0d", subdirectory = "python" }
 sgl-kernel = { git = "https://github.com/JustinTong0323/sglang.git", rev = "70aa688742dd2b75bf9e8e980249303f39295b0d", subdirectory = "sgl-kernel" }
-nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "f1beaba36f2df02304eceea2293c99c595f73711" }
+nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "9aab38ce76f91c28555c141e3913a591e6fab28c" }
 
 [tool.uv.workspace]
 members = [
