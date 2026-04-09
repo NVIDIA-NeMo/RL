@@ -144,6 +144,7 @@ def create_megatron_test_config(
             "defer_fp32_logits": defer_fp32_logits,
             "use_linear_ce_fusion_loss": False,
             "linear_ce_fusion_chunk_size": 256,
+            "gradient_accumulation_fusion": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
