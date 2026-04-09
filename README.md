@@ -243,8 +243,8 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 > [!IMPORTANT]
 > **Bare metal only (skip if using the NeMo RL container):** If you use the Megatron backend (`--extra mcore`), set these environment variables so Transformer Engine uses the pip-installed cuDNN instead of a potentially mismatched system version:
 > ```sh
-> export CUDNN_HOME=.venv/lib/python3.12/site-packages/nvidia/cudnn
-> export LD_LIBRARY_PATH=".venv/lib/python3.12/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
+> export CUDNN_HOME=.venv/lib/python3.13/site-packages/nvidia/cudnn
+> export LD_LIBRARY_PATH=".venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
 > # Verify (should match nvidia-cudnn-cu12 version in pyproject.toml, currently 9.19.0):
 > # uv run --extra mcore python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 > ```
