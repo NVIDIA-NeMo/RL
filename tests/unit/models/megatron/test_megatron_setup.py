@@ -226,7 +226,6 @@ class TestApplyMoeConfig:
                 "moe_enable_deepep": False,
                 "moe_token_dispatcher_type": "alltoall",
                 "moe_shared_expert_overlap": True,
-                "gradient_accumulation_fusion": False,
             }
         }
 
