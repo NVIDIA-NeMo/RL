@@ -286,6 +286,12 @@ def validate_and_prepare_config(
     # Get HF config overrides
     hf_config_overrides = config.get("hf_config_overrides", {}) or {}
 
+    rope_scaling = hf_config_overrides.get("rope_scaling") or {}
+    assert rope_scaling.get("rope_type") != "yarn", (
+        "YaRN RoPE scaling is not supported with the automodel (DTensor) backend. "
+        "Please use the Megatron backend (policy.megatron_cfg.enabled=True) for YaRN."
+    )
+
     # NeMoAutoModelForCausalLM uses flash_attention_2 by default
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
@@ -563,6 +569,21 @@ def setup_model_and_optimizer(
                 "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
             )
 
+        if model_config.model_type == "qwen3_5":
+            raise AssertionError(
+                "Context parallel is not supported for Qwen3.5 dense models (only torch attention backend is available). "
+                "Please set cp_size = 1. For Qwen3.5 MoE models, CP is supported with the TE backend."
+            )
+
+        if model_config.model_type == "qwen3_5_moe":
+            try:
+                import fla  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "Qwen3.5 MoE requires flash-linear-attention for context parallel. "
+                    "Please install it in your Automodel venv: pip install flash-linear-attention"
+                )
+
     # LoRA configuration
     lora_cfg = config["dtensor_cfg"].get("lora_cfg", None)
     peft_config = None
@@ -676,14 +697,21 @@ def setup_model_and_optimizer(
         getattr(model, "config", {}), "tie_word_embeddings", False
     )
     if is_tied_lm_head:
-        embed_tokens_weight = None
-        for name, param in model.named_parameters():
-            if "embed_tokens" in name and name.endswith(".weight"):
-                embed_tokens_weight = param
-                break
+        model.tie_weights()
 
-        if embed_tokens_weight is not None:
-            model.lm_head.weight = embed_tokens_weight
+    # Freeze visual encoder when not doing VLM training.
+    # Without this, the optimizer creates state entries for visual params that never
+    # receive gradients, causing a key mismatch when resuming from checkpoint.
+    # Note: visual encoder is nested under model.model (e.g. model.model.visual for
+    # Qwen3_5MoeForConditionalGeneration), not directly on model.
+    visual_module = getattr(getattr(model, "model", None), "visual", None) or getattr(
+        model, "visual", None
+    )
+    if not is_vlm and visual_module is not None:
+        for param in visual_module.parameters():
+            param.requires_grad_(False)
+        if rank == 0:
+            print("Froze visual encoder parameters for text-only training")
 
     # CPU offload if needed
     if cpu_offload:

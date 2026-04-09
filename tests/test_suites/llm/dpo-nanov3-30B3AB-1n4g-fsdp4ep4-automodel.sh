@@ -4,6 +4,7 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
+GPUS_PER_NODE=4
 STEPS_PER_RUN=15
 MAX_STEPS=15
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up

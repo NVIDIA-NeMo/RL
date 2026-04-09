@@ -10,6 +10,10 @@
 </div>
 
 ## 📣 News
+* [04/06/2026] New Model Support
+    * Added support for [Qwen3.5](https://huggingface.co/collections/Qwen/qwen35) dense and MoE models (LLM and VLM) for GRPO training.
+    * Added support for [GLM-4.7-Flash](https://huggingface.co/zai-org/GLM-4.7-Flash) for GRPO training.
+    * Recipes: [grpo-qwen3.5-9b-1n8g-megatron.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron.yaml), [grpo-qwen3.5-35ba3b-2n8g-megatron-ep16.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16.yaml), [grpo-glm47-flash-4n8g-automodel.yaml](/examples/configs/recipes/llm/grpo-glm47-flash-4n8g-automodel.yaml)
 * [03/12/2026] GDPO Support
     * Enabling [Group reward-Decoupled Normalization Policy Optimization](https://arxiv.org/abs/2601.05242) (GDPO) for multi-reward RL training is now supported.
     * Example: [gdpo_math_1B.yaml](/examples/configs/gdpo_math_1B.yaml)
@@ -239,8 +243,8 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 > [!IMPORTANT]
 > **Bare metal only (skip if using the NeMo RL container):** If you use the Megatron backend (`--extra mcore`), set these environment variables so Transformer Engine uses the pip-installed cuDNN instead of a potentially mismatched system version:
 > ```sh
-> export CUDNN_HOME=.venv/lib/python3.12/site-packages/nvidia/cudnn
-> export LD_LIBRARY_PATH=".venv/lib/python3.12/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
+> export CUDNN_HOME=.venv/lib/python3.13/site-packages/nvidia/cudnn
+> export LD_LIBRARY_PATH=".venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
 > # Verify (should match nvidia-cudnn-cu12 version in pyproject.toml, currently 9.19.0):
 > # uv run --extra mcore python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 > ```
@@ -584,6 +588,16 @@ uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
     --config results/grpo/step_170/config.yaml \
     --megatron-ckpt-path results/grpo/step_170/policy/weights/iter_0000000 \
     --hf-ckpt-path results/grpo/hf
+```
+
+If you trained with **LoRA on the Megatron backend**, use the LoRA merger to fold the adapter weights into the base model and export a standalone Hugging Face checkpoint:
+
+```sh
+uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
+    --base-ckpt <path_to_base_megatron_checkpoint>/iter_0000000 \
+    --adapter-ckpt <path_to_lora_adapter_checkpoint>/iter_0000000 \
+    --hf-model-name <huggingface_model_name> \
+    --hf-ckpt-path results/lora_merged_hf
 ```
 
 > **Note:** Adjust the paths according to your training output directory structure.
