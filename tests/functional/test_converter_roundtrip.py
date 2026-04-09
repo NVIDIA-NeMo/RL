@@ -645,7 +645,7 @@ def main():
         with torch.no_grad():
             lora_output = lora_merged_model(test_input_lora)
         print("✓ LoRA merged model can perform forward pass")
-        # del lora_merged_model
+        del lora_merged_model
         gc.collect()
 
         # Adapter-only (PEFT) export assertions
@@ -666,12 +666,6 @@ def main():
         print(
             "✓ PEFT adapter directory has expected files (adapter_config.json + weights)"
         )
-
-        # Forward pass using the already-merged model from Step 7c.
-        test_input_peft = torch.randint(0, 1000, (1, 10))
-        with torch.no_grad():
-            lora_merged_model(test_input_peft)
-        print("✓ LoRA merged model can perform a forward pass")
 
         # Verify the adapter-only export produces the same merged weights as Step 7c
         # by calling merge_lora_to_hf again with the same Megatron adapter. This
@@ -697,7 +691,7 @@ def main():
         )
         print("✓ adapter-only merge via merge_lora_to_hf matches Step 7c")
 
-        del adapter_only_merged_model, lora_merged_model
+        del adapter_only_merged_model
         gc.collect()
 
         # Verify that both converted models have the expected structure
@@ -728,7 +722,7 @@ def main():
             megatron_output = megatron_converted_model(test_input)
 
         print(
-            "✓ Dtensor V1 and Dtensor V2 DCP, Megatron, and LoRA models can perform forward passes"
+            "✓ Dtensor V1 and Dtensor V2 DCP, Megatron, and LoRA merged models can perform forward passes"
         )
 
         print("\n" + "=" * 80)
