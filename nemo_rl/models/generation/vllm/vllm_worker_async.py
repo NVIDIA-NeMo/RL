@@ -1142,6 +1142,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
         await self.llm.reset_prefix_cache()
+        # Reset the multimodal processor cache (sender side) so it stays in
+        # sync with the receiver cache that vLLM clears internally during
+        # sleep.  Without this, the sender thinks images are already cached on
+        # the receiver and sends data=None, causing an assertion error.
+        if hasattr(self.llm, "reset_mm_cache"):
+            await self.llm.reset_mm_cache()
         await self.llm.sleep(level=1)
 
         gc.collect()

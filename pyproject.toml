@@ -13,7 +13,7 @@ readme = { file = "README.md", content-type = "text/markdown" }
 name = "nemo-rl"
 dynamic = ["version", "readme"]
 description = "NeMo RL: A Scalable and Efficient Post-Training Library for Models Ranging from 1 GPU to 1000s, and from Tiny to >100B Parameters"
-requires-python = ">=3.12"
+requires-python = ">=3.13.11"
 license = { text = "Apache 2.0" }
 dependencies = [
   "setuptools",
@@ -55,6 +55,7 @@ dependencies = [
   "cuda-bindings",                # for non-colocated refit
   "pybase64",                     # for sglang refit
   "nvidia-cudnn-cu12==9.19.0.56", # for transformer-engine no build isolation
+  # nvidia-resiliency-ext removed: no Python 3.13 wheels available (v0.5.0 only has cp310-cp312)
 ]
 
 [project.optional-dependencies]
@@ -269,6 +270,8 @@ override-dependencies = [
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs
   "mlflow>=3.9.0rc0",
+  # Override outlines for Python 3.13 support
+  "outlines>=0.2.0",
 ]
 
 # CVE fixes

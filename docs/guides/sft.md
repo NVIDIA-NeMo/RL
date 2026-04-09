@@ -337,6 +337,10 @@ uv run examples/run_sft.py \
 
 For more details on LoRA, see [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685).
 
+### Exporting a LoRA Checkpoint to Hugging Face Format
+
+After training with LoRA on the Megatron backend, use the LoRA merger script to fold the adapter weights into the base model and produce a standalone Hugging Face checkpoint for inference or evaluation. See the [Checkpointing documentation](../design-docs/checkpointing.md#merging-megatron-lora-adapter-checkpoints-to-hugging-face-format) for full usage details.
+
 ## Optimizations
 
 ### Chunked Linear Cross-Entropy Fusion Loss
