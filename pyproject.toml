@@ -270,6 +270,8 @@ override-dependencies = [
   "mlflow>=3.9.0rc0",
   # Override outlines for Python 3.13 support
   "outlines>=0.2.0",
+  # Upgrade pytest to 9.0.3
+  "pytest>=9.0.3",
 ]
 # CVE fixes
 constraint-dependencies = [
