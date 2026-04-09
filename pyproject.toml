@@ -82,11 +82,12 @@ vllm = [
   "vllm==0.17.1",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.4",
+  "flashinfer-cubin==0.6.4",
   "nvidia-cutlass-dsl>=4.4.0.dev1",
 ]
 sglang = [
   "sglang",
-  "sgl-kernel", # Must be a direct dep so [tool.uv.sources] VCS override applies (transitive deps don't use sources)
+  "sglang-kernel", # Must be a direct dep so [tool.uv.sources] VCS override applies (transitive deps don't use sources)
 ]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -181,10 +182,10 @@ triton = [
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
-# From JustinTong0323/sglang branch update-transformers-v5 (sgl-project/sglang#17784)
-sglang = { git = "https://github.com/JustinTong0323/sglang.git", rev = "70aa688742dd2b75bf9e8e980249303f39295b0d", subdirectory = "python" }
-sgl-kernel = { git = "https://github.com/JustinTong0323/sglang.git", rev = "70aa688742dd2b75bf9e8e980249303f39295b0d", subdirectory = "sgl-kernel" }
 emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
+# Official sglang v0.5.10 with transformers v5 support
+sglang = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "python" }
+sglang-kernel = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "sgl-kernel" }
 
 [tool.uv.workspace]
 members = [
@@ -210,7 +211,7 @@ explicit = true
 
 [tool.uv]
 preview = true # Enable preview features like extra-build-dependencies
-extra-build-variables = { sgl-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "24", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a", CMAKE_ARGS = "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" } }
+extra-build-variables = { sglang-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "24", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a", CMAKE_ARGS = "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" } }
 no-build-isolation-package = [
   "transformer-engine-torch",
   "transformer-engine",
@@ -220,7 +221,7 @@ no-build-isolation-package = [
   "deep_gemm",
   "deep_ep",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
-  "sgl-kernel",
+  "sglang-kernel",
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
@@ -248,17 +249,14 @@ override-dependencies = [
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  # Pin flashinfer globally — flashinfer-python must match flashinfer-cubin at runtime, and
-  # they're resolved independently by uv so ranges risk version mismatch.
-  # When changing this version, check what each backend expects:
-  #   vllm extra (this file, [project.optional-dependencies].vllm): flashinfer-python==0.6.4
-  #   sglang dependency-metadata (this file, [[tool.uv.dependency-metadata]] name="sglang"): flashinfer_python==0.6.4, flashinfer_cubin==0.6.4
-  #   megatron-core (3rdparty/Megatron-LM-workspace/Megatron-LM/pyproject.toml): flashinfer-python~=0.5.0
-  "flashinfer-python==0.6.4",
-  "flashinfer-cubin==0.6.4",
-  # sglang pins nvidia-cutlass-dsl==4.2.1, conflicting with flashinfer 0.6.4 (>=4.3.4) and vllm (>=4.4.0.dev1).
-  # Override to >=4.2.1 so uv can resolve to a version satisfying all three.
-  "nvidia-cutlass-dsl>=4.2.1",
+  # Note: flashinfer versions are pinned per-extra (vllm uses 0.6.4, sglang uses 0.6.7.post2)
+  # since vllm and sglang extras are mutually exclusive and have different requirements.
+  # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm (0.6.4) and sglang (0.6.7.post2)
+  "flashinfer-python>=0.5.0",
+  "flashinfer-cubin>=0.5.0",
+  # sglang 0.5.10 requires nvidia-cutlass-dsl>=4.4.1 (via flashinfer 0.6.7.post2 which uses CUTLASS 4.4.2).
+  # Override to >=4.4.1 so uv can resolve to a version satisfying both vllm and sglang.
+  "nvidia-cutlass-dsl>=4.4.1",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
   # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
@@ -336,7 +334,7 @@ transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
-sgl-kernel = [{ requirement = "torch", match-runtime = true }]
+sglang-kernel = [{ requirement = "torch", match-runtime = true }]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
@@ -384,18 +382,18 @@ version = "v1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
 
 [[tool.uv.dependency-metadata]]
-name = "sgl-kernel"
+name = "sglang-kernel"
 # This version has to match the version in the commit/rev/tag used
-version = "0.3.21"
+version = "0.4.1"
 requires-dist = ["torch", "scikit-build-core", "wheel"]
 
 [[tool.uv.dependency-metadata]]
 name = "sglang"
-# VCS install from JustinTong0323/sglang@update-transformers-v5
+# VCS install from official sgl-project/sglang v0.5.10
 # Version is dynamic (setuptools-scm), so uv cannot resolve deps from the VCS source automatically.
-# This requires-dist list must be kept in sync with the fork's python/pyproject.toml [project].dependencies.
-# Source: https://github.com/JustinTong0323/sglang/blob/70aa688742dd2b75bf9e8e980249303f39295b0d/python/pyproject.toml
-version = "0.5.7.dev0"
+# This requires-dist list must be kept in sync with the official python/pyproject.toml [project].dependencies.
+# Source: https://github.com/sgl-project/sglang/blob/v0.5.10/python/pyproject.toml
+version = "0.5.10"
 requires-dist = [
   "IPython",
   "aiohttp",
@@ -409,8 +407,8 @@ requires-dist = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.4",
-  "flashinfer_cubin==0.6.4",
+  "flashinfer_python==0.6.7.post2",
+  "flashinfer_cubin==0.6.7.post2",
   "gguf",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
@@ -418,7 +416,7 @@ requires-dist = [
   "msgspec",
   "ninja",
   "numpy",
-  "nvidia-cutlass-dsl>=4.3.4",
+  "nvidia-cutlass-dsl>=4.4.1",
   "nvidia-ml-py",
   "openai-harmony==0.0.4",
   "openai==2.6.1",
@@ -434,12 +432,13 @@ requires-dist = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
-  "quack-kernels==0.2.4",
+  "quack-kernels>=0.3.0",
   "requests",
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel==0.3.21",
+  "flash-attn-4>=4.0.0b4",
+  "sglang-kernel==0.4.1",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
@@ -447,17 +446,16 @@ requires-dist = [
   "torch==2.9.1",
   "torchao==0.9.0",
   "torchaudio==2.9.1",
-  "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')",
+  "torchcodec==0.9.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')",
   "torchvision",
   "tqdm",
+  "mistral_common>=1.9.0",
   "transformers==5.3.0",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.1.27",
-  "smg-grpc-proto>=0.3.3",
-  "grpcio>=1.78.0",
-  "grpcio-reflection>=1.78.0",
-  "grpcio-health-checking>=1.78.0",
+  "watchfiles",
+  "xgrammar==0.1.32",
+  "smg-grpc-servicer>=0.5.0",
 ]
 
 [[tool.uv.dependency-metadata]]
