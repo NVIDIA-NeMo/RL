@@ -37,8 +37,7 @@ uv run examples/run_sft.py \
 # Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Only run metrics if the target step is reached
-# Slightly relaxed thresholds vs non-PP baseline (PP=2 vs PP=1 gives ~1% variance)
+# Slightly relaxed thresholds vs non-PP baseline (PP=2 gives ~1% variance)
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'data["train/loss"]["1"] < 7.5' \
