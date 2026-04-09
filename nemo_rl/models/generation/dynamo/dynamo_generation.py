@@ -198,6 +198,7 @@ class DynamoVllmGeneration(GenerationInterface):
             "NATS_SERVER": f"nats://{self._host}:{self._nats_port}",
             "DYN_NAMESPACE": self._namespace,
             "DYN_DISCOVERY_BACKEND": "etcd",
+            "DYN_LOG": "dynamo_llm::http::service::metrics=warn,dynamo_runtime::pipeline::network::ingress::push_handler=warn,dynamo_llm::http::service::service_v2=warn,info"
         }
 
     @staticmethod
@@ -343,6 +344,10 @@ class DynamoVllmGeneration(GenerationInterface):
                 "--router-mode", self._router_mode,
                 "--discovery-backend", "etcd",
                 "--namespace-prefix", self._namespace,
+                "--router-mode", "kv",
+                "--active-decode-blocks-threshold", "1000.0",
+                "--active-prefill-tokens-threshold", "1000000000000",
+                "--active-prefill-tokens-threshold-frac", "1000.0"
             ],
             env=env,
         )
