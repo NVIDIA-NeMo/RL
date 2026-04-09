@@ -286,6 +286,7 @@ constraint-dependencies = [
   "onnx>=1.21.0rc4",          # Address CVE GHSA-hqmj-h5c6-369m
   "cryptography>=46.0.6",     # Address CVE GHSA-6w46-j5rx-g56g
   "orjson>=3.11.6",           # Address CVE GHSA-hx9q-6w63-j58v
+  "pyjwt>=2.12.0",            # Address CVE GHSA-752w-5fwx-jx9f
 ]
 
 conflicts = [
