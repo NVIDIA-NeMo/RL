@@ -49,6 +49,7 @@ from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
+    get_next_token_logprobs_from_logits,
 )
 from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
 from nemo_rl.models.policy import PolicyConfig
@@ -60,6 +61,22 @@ PostProcessingFunction = Union[
     "TopkLogitsPostProcessor",
     "ScorePostProcessor",
 ]
+
+
+
+def _is_custom_automodel(model: nn.Module) -> bool:
+    """Check if model is a custom nemo_automodel model (not standard HF).
+
+    Custom models (gpt-oss, qwen3-moe, etc.) use **attn_kwargs and expect
+    individual keys like cu_seqlens, not a bundled flash_attn_kwargs object.
+    """
+    try:
+        from nemo_automodel._transformers.registry import ModelRegistry
+
+        arch = getattr(getattr(model, "config", None), "architectures", [None])[0]
+        return arch is not None and arch in ModelRegistry.model_arch_name_to_cls
+    except (ImportError, IndexError, AttributeError):
+        return False
 
 
 def model_forward(
@@ -79,6 +96,14 @@ def model_forward(
     Returns:
         torch.Tensor: Output tensor from the model (logits)
     """
+    if processed_inputs.thd_batch is not None:
+        thd = processed_inputs.thd_batch
+        model_args = thd.to_model_kwargs(device=processed_inputs.input_ids.device)
+        model_args.pop("labels", None)  # labels are for loss, not model forward
+        model_args["use_cache"] = False
+        outputs = model(**model_args)
+        return outputs
+
     model_args = dict(
         input_ids=processed_inputs.input_ids,
         attention_mask=processed_inputs.attention_mask,
@@ -86,9 +111,22 @@ def model_forward(
         use_cache=False,
     )
 
-    # Add flash attention kwargs if applicable
+    # Custom automodel models use **attn_kwargs and need cu_seqlens + qkv_format
+    # directly. HF models expect a bundled flash_attn_kwargs object.
     if processed_inputs.has_flash_attention:
-        model_args["flash_attn_kwargs"] = processed_inputs.flash_attn_kwargs
+        fa_kwargs = processed_inputs.flash_attn_kwargs
+        if _is_custom_automodel(model):
+            # Flatten batch dim: [1, packed_len] -> [packed_len] so the model
+            # produces 2D hidden states that TE auto-detects as THD format.
+            model_args["input_ids"] = model_args["input_ids"].squeeze(0)
+            if model_args["position_ids"] is not None:
+                model_args["position_ids"] = model_args["position_ids"].squeeze(0)
+            model_args["cu_seqlens"] = fa_kwargs.cu_seqlens_q.to(
+                dtype=torch.int32, device=model_args["input_ids"].device
+            )
+            model_args["qkv_format"] = "thd"
+        else:
+            model_args["flash_attn_kwargs"] = fa_kwargs
 
     # Add VLM kwargs if applicable
     if processed_inputs.is_multimodal:
@@ -127,15 +165,21 @@ def extract_logits(
         outputs: Model outputs (can be tensor, DTensor, or object with logits attribute)
 
     Returns:
-        torch.Tensor: Logits tensor
+        torch.Tensor: Logits tensor with shape [batch, seq, vocab]
     """
     if isinstance(outputs, (torch.Tensor, DTensor)):
-        # Custom models can output logits directly
-        return outputs
+        # Custom models can output logits directly.
+        # THD format: GPT-OSS returns [T, V], DeepseekV3 returns [1, T, V].
+        # Normalize to [1, T, V] for downstream post-processors.
+        logits = outputs
     elif not hasattr(outputs, "logits"):
-        return model.lm_head(outputs.last_hidden_state)
+        logits = model.lm_head(outputs.last_hidden_state)
     else:
-        return outputs.logits
+        logits = outputs.logits
+
+    if logits.ndim == 2:
+        logits = logits.unsqueeze(0)
+    return logits
 
 
 def apply_temperature_scaling(
@@ -535,13 +579,38 @@ class LossPostProcessor:
         sequence_dim: int = 1,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute loss from logits."""
+        if processed_inputs.thd_batch is not None:
+            thd = processed_inputs.thd_batch
+            cu_seqlens_actual = thd.cu_seqlens_per_row[0]
+            # CP uses padded cu_seqlens for logit slicing (positions // cp_size).
+            # TE's THD partitioning matches Megatron's dual-chunk-swap.
+            cu_seqlens_padded = (
+                thd.cu_seqlens_padded_per_row[0].to(dtype=torch.int32, device=logits.device)
+                if self.cp_size > 1 else cu_seqlens_actual
+            )
+            cp_group = self.cp_mesh.get_group() if self.cp_size > 1 else None
+            prepare_fn = partial(
+                prepare_loss_input, sampling_params=self.sampling_params
+            )
+            loss_fn = SequencePackingLossWrapper(
+                loss_fn=self.loss_fn,
+                prepare_fn=prepare_fn,
+                cu_seqlens_q=cu_seqlens_actual,
+                cu_seqlens_q_padded=cu_seqlens_padded,
+                context_parallel_group=cp_group,
+            )
+            loss, loss_metrics = loss_fn(
+                logits, data_dict, global_valid_seqs, global_valid_toks,
+            )
+            return loss, loss_metrics
+
         # Determine cu_seqlens source for seq packing (FA2 path)
         if self.enable_seq_packing and processed_inputs.has_flash_attention:
             cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
         else:
             cu_seqlens = None
 
-        # Handle CP redistribution
+        # Handle CP redistribution (non-seqpack CP path)
         if self.cp_size > 1 and cu_seqlens is None:
             _, data_dict = prepare_data_for_cp(
                 data_dict, processed_inputs, self.cp_mesh, sequence_dim
@@ -640,8 +709,58 @@ class LogprobsPostProcessor:
         seq_len = processed_inputs.seq_len
         input_lengths = data_dict["input_lengths"]
 
+        if processed_inputs.thd_batch is not None:
+            thd = processed_inputs.thd_batch
+            cu_actual = thd.cu_seqlens_per_row[0]
+            cu_padded = (
+                thd.cu_seqlens_padded_per_row[0]
+                if self.cp_size > 1
+                else cu_actual
+            )
+            cp_group = self.cp_mesh.get_group() if self.cp_size > 1 else None
+            cp_size_val = self.cp_size
+
+            if logits.ndim == 2:
+                logits = logits.unsqueeze(0)
+
+            # Only iterate over real sequences (not dummy-padded ones from PP)
+            n_seqs = min(len(cu_actual) - 1, original_batch_size)
+            unpacked_logprobs = torch.zeros(
+                (original_batch_size, original_seq_len),
+                dtype=logits.dtype, device=logits.device,
+            )
+            for seq_idx in range(n_seqs):
+                actual_len = (cu_actual[seq_idx + 1] - cu_actual[seq_idx]).item()
+                padded_start = cu_padded[seq_idx].item()
+                padded_len = (cu_padded[seq_idx + 1] - cu_padded[seq_idx]).item()
+
+                logit_start = padded_start // cp_size_val
+                logit_length = padded_len // cp_size_val
+                logit_slice = logits.narrow(1, logit_start, logit_length)
+
+                seq_input_ids = data_dict["input_ids"][seq_idx : seq_idx + 1, :actual_len]
+                seq_logprobs = get_next_token_logprobs_from_logits(
+                    input_ids=seq_input_ids,
+                    next_token_logits=logit_slice,
+                    context_parallel_group=cp_group,
+                    sampling_params=self.sampling_params,
+                )
+                unpacked_logprobs[seq_idx, 1 : 1 + seq_logprobs.shape[1]] = seq_logprobs[0]
+
+            # Apply post-attention mask
+            for i, length in enumerate(input_lengths):
+                unpacked_logprobs[i, int(length):] = 0
+
+            if need_top_k_or_top_p_filtering(self.sampling_params):
+                mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
+                unpacked_logprobs = mask_out_neg_inf_logprobs(
+                    unpacked_logprobs, mask, "prev_logprobs"
+                )
+
+            return unpacked_logprobs
+
         if self.cp_size > 1:
-            # Standard DTensor CP path
+            # Standard DTensor CP path (non-seqpack)
             seq_index_tensor = (
                 DTensor.from_local(
                     processed_inputs.seq_index,

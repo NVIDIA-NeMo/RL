@@ -19,17 +19,26 @@ Contains PP-specific classes and functions:
 - PPLossAdapter: stateful loss wrapper for PP schedules
 - PPLogprobsCapturer / PPTopkCapturer: logit capture for eval
 - pp_forward_backward: PP schedule step/eval wrapper
+- reset_pp_stage_shapes_for_thd: THD stage shape management
+- prepare_pp_seqpack_batch: pack sequences for PP training step
+- pad_batch_for_pp: pad batch to pp_batch_size for PP schedule
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from functools import partial
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from nemo_rl.models.automodel.data import THDBatch
 
 import torch
 from torch import nn
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 # ---------------------------------------------------------------------------
@@ -151,11 +160,14 @@ class PPLossAdapter:
         self._sampling_params = sampling_params
 
         self._microbatches: list[dict[str, Any]] = []
+        self._cu_seqlens_list: list[Optional[torch.Tensor]] = []
+        self._cu_seqlens_padded_list: list[Optional[torch.Tensor]] = []
         self._call_idx: int = 0
         self._all_metrics: list[dict[str, Any]] = []
         self._global_valid_seqs: Optional[torch.Tensor] = None
         self._global_valid_toks: Optional[torch.Tensor] = None
         self._num_global_batches: int = 1
+        self._context_parallel_group: Any = None
 
     def set_microbatches(
         self,
@@ -164,6 +176,9 @@ class PPLossAdapter:
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
         num_global_batches: int = 1,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        cu_seqlens_padded: Optional[torch.Tensor] = None,
+        context_parallel_group: Any = None,
     ) -> None:
         """Pre-chunk RL tensors along batch dim into n_microbatches."""
         self._call_idx = 0
@@ -184,30 +199,72 @@ class PPLossAdapter:
                     mb[key] = val
             self._microbatches.append(mb)
 
+        # Set per-microbatch cu_seqlens for sequence packing loss.
+        self._context_parallel_group = context_parallel_group
+
+        def _split_cu_seqlens(cu):
+            if cu is None:
+                return [None] * n_microbatches
+            if isinstance(cu, list):
+                return cu
+            if cu.ndim == 1:
+                return [cu] * n_microbatches
+            return [cu[i] for i in range(n_microbatches)]
+
+        self._cu_seqlens_list = _split_cu_seqlens(cu_seqlens)
+        self._cu_seqlens_padded_list = _split_cu_seqlens(cu_seqlens_padded)
+
     def __call__(self, output: Any, target: torch.Tensor) -> torch.Tensor:
         """Called by PP schedule per microbatch."""
         logits = getattr(output, "logits", output)
+        # THD format: [total_tokens, vocab] → [1, total_tokens, vocab]
+        if logits.ndim == 2:
+            logits = logits.unsqueeze(0)
         mb_data = self._microbatches[self._call_idx]
+        cu_seqlens = self._cu_seqlens_list[self._call_idx] if self._cu_seqlens_list else None
+        cu_seqlens_padded = self._cu_seqlens_padded_list[self._call_idx] if self._cu_seqlens_padded_list else cu_seqlens
         self._call_idx += 1
 
-        log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
-        curr_logprobs = (
-            log_probs[:, :-1]
-            .gather(dim=-1, index=target[:, 1:].unsqueeze(-1).clamp(min=0))
-            .squeeze(-1)
-        )
+        if cu_seqlens is not None:
+            if not isinstance(mb_data, BatchedDataDict):
+                mb_data = BatchedDataDict(mb_data)
 
-        if self._loss_fn.input_type == LossInputType.LOGPROB:
-            loss_input = {"next_token_logprobs": curr_logprobs}
+            prepare_loss_input_wrapped = partial(
+                prepare_loss_input, sampling_params=self._sampling_params
+            )
+            loss_fn_wrapped = SequencePackingLossWrapper(
+                loss_fn=self._loss_fn,
+                prepare_fn=prepare_loss_input_wrapped,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens,
+                context_parallel_group=self._context_parallel_group,
+            )
+            loss, loss_metrics = loss_fn_wrapped(
+                logits,
+                mb_data,
+                self._global_valid_seqs,
+                self._global_valid_toks,
+            )
         else:
-            loss_input = {"logits": logits}
+            # Standard (non-packed) loss path
+            log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+            curr_logprobs = (
+                log_probs[:, :-1]
+                .gather(dim=-1, index=target[:, 1:].unsqueeze(-1).clamp(min=0))
+                .squeeze(-1)
+            )
 
-        loss, loss_metrics = self._loss_fn(
-            data=mb_data,
-            global_valid_seqs=self._global_valid_seqs,
-            global_valid_toks=self._global_valid_toks,
-            **loss_input,
-        )
+            if self._loss_fn.input_type == LossInputType.LOGPROB:
+                loss_input = {"next_token_logprobs": curr_logprobs}
+            else:
+                loss_input = {"logits": logits}
+
+            loss, loss_metrics = self._loss_fn(
+                data=mb_data,
+                global_valid_seqs=self._global_valid_seqs,
+                global_valid_toks=self._global_valid_toks,
+                **loss_input,
+            )
 
         # Scale metrics for aggregation
         for k in loss_metrics:
@@ -223,6 +280,8 @@ class PPLossAdapter:
         """Reset state for the next forward-backward call."""
         self._call_idx = 0
         self._all_metrics = []
+        self._cu_seqlens_list = []
+        self._cu_seqlens_padded_list = []
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +343,9 @@ def pp_forward_backward(
     Args:
         model: AutoPipeline model with .info and .parts attributes.
         batch: Dict with at least ``input_ids`` and ``labels``.
+            May also contain ``flash_attn_kwargs``, ``position_ids``, etc.
+            for sequence packing support. Extra keys are passed as kwargs
+            to schedule.step/eval following automodel's train_ft.py pattern.
         loss_adapter: PPLossAdapter (already configured via set_microbatches).
         forward_only: If True, use schedule.eval() instead of schedule.step().
 
@@ -305,10 +367,19 @@ def pp_forward_backward(
     # Build args: first stage receives input_ids, others don't
     args = (input_ids,) if has_first else ()
 
+    # Pass remaining batch keys (flash_attn_kwargs, position_ids, etc.)
+    # as kwargs to the schedule, following automodel's train_ft.py pattern.
+    # Filter out None values and empty dicts to avoid PP chunking errors.
+    batch_kwargs = {
+        k: v
+        for k, v in batch.items()
+        if v is not None and not (isinstance(v, dict) and len(v) == 0)
+    }
+
     if forward_only:
-        schedule.eval(*args, target=targets, losses=losses)
+        schedule.eval(*args, target=targets, losses=losses, **batch_kwargs)
     else:
-        schedule.step(*args, target=targets, losses=losses)
+        schedule.step(*args, target=targets, losses=losses, **batch_kwargs)
 
     if has_last and losses:
         total_loss = torch.sum(torch.stack(losses))
@@ -316,3 +387,142 @@ def pp_forward_backward(
         total_loss = torch.tensor(0.0, device="cuda")
 
     return total_loss, loss_adapter._all_metrics
+
+
+# ---------------------------------------------------------------------------
+# THD stage shape management
+# ---------------------------------------------------------------------------
+
+
+def reset_pp_stage_shapes_for_thd(model: Any, tokens_per_chunk: int) -> None:
+    """Reset PP stage shapes for THD format (packed sequences).
+
+    THD format produces [1, T, dim] outputs instead of [batch, seq, dim].
+    Must be called before each schedule.step() when sequence lengths change.
+    """
+    from nemo_automodel.components.distributed.pipelining.functional import (
+        _get_hidden_and_vocab_size,
+    )
+
+    schedule = model.info.schedule
+    stages = model.info.stages
+    model_config = model.parts[0].config
+    hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)
+
+    schedule._stages_forward_initialized = False
+    if hasattr(schedule, "_stages_backward_initialized"):
+        schedule._stages_backward_initialized = False
+
+    for stage in stages:
+        try:
+            model_dtype = next(stage.submod.parameters()).dtype
+        except StopIteration:
+            model_dtype = torch.bfloat16
+
+        if stage.is_first:
+            stage.inputs_meta = (
+                torch.empty(1, tokens_per_chunk, device="meta", dtype=torch.long),
+            )
+        else:
+            stage.inputs_meta = (
+                torch.empty(1, tokens_per_chunk, hidden_size, device="meta", dtype=model_dtype),
+            )
+
+        has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
+        out_dim = vocab_size if has_lm_head else hidden_size
+        stage._outputs_meta = (
+            torch.empty(1, tokens_per_chunk, out_dim, device="meta", dtype=model_dtype),
+        )
+
+
+# ---------------------------------------------------------------------------
+# PP seqpack batch preparation
+# ---------------------------------------------------------------------------
+
+
+def prepare_pp_seqpack_batch(
+    input_ids: torch.Tensor,
+    input_lengths: torch.Tensor,
+    accum_data: dict[str, Any],
+    pp_batch_size: int,
+    n_microbatches: int,
+    tokenizer_eos_id: int,
+    train_mb_tokens: int,
+    cp_size: int = 1,
+    cp_mesh: Any = None,
+    device_mesh: Any = None,
+    token_mask: Optional[torch.Tensor] = None,
+) -> tuple[dict[str, Any], dict[str, Any], "THDBatch"]:
+    """Pack sequences into THD format for a PP training step.
+
+    Handles dummy-padding when the batch has fewer than pp_batch_size sequences.
+    Returns the PP batch dict (for schedule.step), the updated accum_data
+    (with dummy sample_mask=0), and the THDBatch for loss metadata.
+    """
+    from nemo_rl.models.automodel.data import pack_for_thd
+
+    actual_seqs = input_ids.shape[0]
+    pp_mbs = pp_batch_size // n_microbatches
+
+    if actual_seqs < pp_batch_size:
+        pad_count = pp_batch_size - actual_seqs
+        input_ids = torch.cat([
+            input_ids,
+            torch.zeros(pad_count, input_ids.shape[1],
+                        dtype=input_ids.dtype, device=input_ids.device),
+        ], dim=0)
+        input_lengths = torch.cat([
+            input_lengths,
+            torch.ones(pad_count, dtype=input_lengths.dtype,
+                       device=input_lengths.device),
+        ])
+        for key in accum_data:
+            val = accum_data[key]
+            if torch.is_tensor(val) and val.ndim >= 1 and val.shape[0] == actual_seqs:
+                pad_shape = (pad_count,) + val.shape[1:]
+                accum_data[key] = torch.cat(
+                    [val, torch.zeros(pad_shape, dtype=val.dtype, device=val.device)]
+                )
+        if "sample_mask" in accum_data:
+            accum_data["sample_mask"][actual_seqs:] = 0
+
+    if token_mask is not None:
+        if token_mask.shape[0] < len(input_lengths):
+            pad_rows = len(input_lengths) - token_mask.shape[0]
+            token_mask = torch.cat([
+                token_mask,
+                torch.zeros(pad_rows, token_mask.shape[1],
+                            dtype=token_mask.dtype, device=token_mask.device),
+            ], dim=0)
+        token_mask = token_mask[:len(input_lengths)]
+
+    thd_batch = pack_for_thd(
+        input_ids=input_ids,
+        input_lengths=input_lengths,
+        packed_sequence_size=[pp_mbs] * n_microbatches,
+        padding_value=tokenizer_eos_id,
+        min_seq_len=train_mb_tokens,
+        num_chunks=n_microbatches,
+        cp_size=cp_size,
+        cp_mesh=cp_mesh,
+        device_mesh=device_mesh,
+        token_mask=token_mask,
+    )
+    pp_batch = thd_batch.to_model_kwargs(device=input_ids.device)
+    return pp_batch, accum_data, thd_batch
+
+
+def pad_batch_for_pp(
+    input_ids: torch.Tensor,
+    pp_batch_size: int,
+) -> tuple[torch.Tensor, int]:
+    """Pad input_ids to pp_batch_size with zero rows. Returns (padded_ids, actual_seqs)."""
+    actual_seqs = input_ids.shape[0]
+    if actual_seqs < pp_batch_size:
+        pad_count = pp_batch_size - actual_seqs
+        input_ids = torch.cat([
+            input_ids,
+            torch.zeros(pad_count, input_ids.shape[1],
+                        dtype=input_ids.dtype, device=input_ids.device),
+        ], dim=0)
+    return input_ids, actual_seqs

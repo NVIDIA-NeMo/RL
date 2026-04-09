@@ -1,0 +1,5 @@
+defaults: ./sft-moonlight-16b-1n8g-fsdp8ep8-seqpack-automodel.yaml
+policy:
+  dtensor_cfg:
+    context_parallel_size: 2
+    expert_parallel_size: 4

@@ -30,6 +30,17 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 
 
+_SELF_TP_GROUP: Optional[torch.distributed.ProcessGroup] = None
+
+
+def _get_self_tp_group() -> torch.distributed.ProcessGroup:
+    """Cached single-rank TP group for CP-only logprob computation."""
+    global _SELF_TP_GROUP
+    if _SELF_TP_GROUP is None:
+        _SELF_TP_GROUP = torch.distributed.new_group([torch.distributed.get_rank()])
+    return _SELF_TP_GROUP
+
+
 @torch.no_grad()
 def _compute_distributed_log_softmax(
     vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
@@ -1392,6 +1403,26 @@ def get_next_token_logprobs_from_logits(
             sampling_params=sampling_params,
         )
         # slice off to the correct length to remove potential CP padding
+        logprobs = logprobs[:, : input_ids.shape[1] - 1]
+
+    elif context_parallel_group is not None and not isinstance(
+        next_token_logits, torch.distributed.tensor.DTensor
+    ):
+        # CP-only path (no TP): automodel backend with full vocab per rank.
+        # TE's thd_get_partitioned_indices uses dual-chunk-swap (same as
+        # _get_tokens_on_this_cp_rank), so from_parallel_logits_to_logprobs works.
+        tp_group = _get_self_tp_group()
+        vocab_size = next_token_logits.shape[-1]
+        logprobs = from_parallel_logits_to_logprobs(
+            next_token_logits,
+            input_ids,
+            vocab_start_index=0,
+            vocab_end_index=vocab_size,
+            tp_group=tp_group,
+            inference_only=False,
+            cp_group=context_parallel_group,
+            sampling_params=sampling_params,
+        )
         logprobs = logprobs[:, : input_ids.shape[1] - 1]
 
     elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):

@@ -42,6 +42,7 @@ from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
     get_microbatch_iterator,
+    install_thd_squeeze_hook,
     process_global_batch,
 )
 from nemo_rl.models.automodel.setup import (
@@ -56,7 +57,10 @@ from nemo_rl.models.automodel.pipeline_parallel import (
     PPTopkCapturer,
     broadcast_loss_metrics_from_last_pp_stage,
     broadcast_tensors_from_last_pp_stage,
+    pad_batch_for_pp,
     pp_forward_backward,
+    prepare_pp_seqpack_batch,
+    reset_pp_stage_shapes_for_thd,
 )
 from nemo_rl.models.automodel.train import (
     LogprobsPostProcessor,
@@ -458,6 +462,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     tokenizer=self.tokenizer,
                     cp_size=self.cp_size,
                     cp_mesh=self.cp_mesh,
+                    device_mesh=self.device_mesh,
                 )
 
                 # Use automodel_forward_backward for the training loop
@@ -577,6 +582,13 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         pp_batch_size = self.model.pp_batch_size  # = train_micro_batch_size
 
+        # Install hook to squeeze batch dim for THD format in PP microbatches.
+        # The PP schedule splits [n_chunks, tokens_per_chunk] → [1, tokens_per_chunk]
+        # per microbatch, but custom models need [tokens_per_chunk] (1D) for THD.
+        thd_hooks: list = []
+        if self.enable_seq_packing and not self.is_hf_model:
+            thd_hooks = install_thd_squeeze_hook(self.model_handle.parts)
+
         with ctx:
             data = data.to("cuda")
             losses = []
@@ -598,10 +610,17 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 for opt in optimizers_list:
                     opt.zero_grad()
 
-                # Gradient accumulation: split local_gbs into pp_batch_size chunks.
-                # Each chunk -> one schedule.step() call. Gradients accumulate across calls.
-                # Pattern follows automodel's _run_train_optim_step.
-                num_accum_steps = max(1, local_gbs // pp_batch_size)
+                # Gradient accumulation: split into pp_batch_size chunks.
+                # Sync actual batch size across all ranks so everyone has the same
+                # num_accum_steps (required for PP collectives).
+                actual_batch_size = batch.get("input_ids").shape[0]
+                max_batch = torch.tensor([actual_batch_size], device="cuda")
+                torch.distributed.all_reduce(
+                    max_batch, op=torch.distributed.ReduceOp.MAX
+                )
+                num_accum_steps = max(
+                    1, (int(max_batch.item()) + pp_batch_size - 1) // pp_batch_size
+                )
                 n_microbatches = self.model.info.schedule._n_microbatches
 
                 if not eval_mode:
@@ -621,38 +640,82 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     start = accum_idx * pp_batch_size
                     end = start + pp_batch_size
 
-                    # Build the RL data slice for the loss adapter
+                    # Build the RL data slice for the loss adapter.
+                    # Clamp to actual batch size to handle partial/empty steps.
+                    actual_total = batch.get("input_ids").shape[0]
+                    cstart = min(start, actual_total)
+                    cend = min(end, actual_total)
                     accum_data = {}
                     for key in batch:
                         val = batch[key]
-                        if torch.is_tensor(val) and val.shape[0] >= end:
-                            accum_data[key] = val[start:end]
+                        if torch.is_tensor(val) and val.shape[0] >= actual_total:
+                            accum_data[key] = val[cstart:cend]
                         else:
                             accum_data[key] = val
 
+                    input_ids = batch.get("input_ids")[cstart:cend].cuda()
+
+                    seqpack_active = self.enable_seq_packing
+                    if seqpack_active:
+                        input_lengths = batch["input_lengths"][start:end]
+                        token_mask = accum_data.get("token_mask", None)
+                        pp_batch, accum_data, thd_batch = prepare_pp_seqpack_batch(
+                            input_ids=input_ids,
+                            input_lengths=input_lengths,
+                            accum_data=accum_data,
+                            pp_batch_size=pp_batch_size,
+                            n_microbatches=n_microbatches,
+                            tokenizer_eos_id=self.tokenizer.eos_token_id,
+                            train_mb_tokens=self.cfg["sequence_packing"]["train_mb_tokens"],
+                            cp_size=self.cp_size,
+                            cp_mesh=self.cp_mesh,
+                            device_mesh=self.device_mesh,
+                            token_mask=token_mask,
+                        )
+                    else:
+                        pp_batch = {
+                            "input_ids": input_ids,
+                            "labels": input_ids.clone(),
+                        }
+
                     if self.has_last_stage:
+                        cu_seqlens_per_row = (
+                            thd_batch.cu_seqlens_per_row if seqpack_active else None
+                        )
+                        cu_padded = thd_batch.cu_seqlens_padded_per_row if seqpack_active and self.cp_size > 1 else None
+                        cp_group = self.cp_mesh.get_group() if self.cp_size > 1 else None
                         loss_adapter.set_microbatches(
                             accum_data,
                             n_microbatches,
                             global_valid_seqs,
                             global_valid_toks,
                             num_global_batches=num_global_batches,
+                            cu_seqlens=cu_seqlens_per_row,
+                            cu_seqlens_padded=cu_padded,
+                            context_parallel_group=cp_group,
                         )
                     else:
                         loss_adapter.reset()
 
-                    input_ids = batch.get("input_ids")[start:end].cuda()
-
                     # Force-reset PP schedule state before each step/eval.
-                    if hasattr(self.model, "_pp_current_seq_len"):
-                        self.model._pp_current_seq_len = None
-                    if hasattr(self.model, "update_seq_len"):
-                        self.model.update_seq_len(input_ids.shape[1])
-
-                    pp_batch = {
-                        "input_ids": input_ids,
-                        "labels": input_ids.clone(),
-                    }
+                    if not hasattr(self.model, "update_seq_len"):
+                        raise RuntimeError(
+                            "AutoPipeline.update_seq_len() not found. "
+                            "Pipeline parallelism requires nemo_automodel >= 0.4.0 "
+                            "(PR #1689: dynamic sequence length support). "
+                            "Please update the automodel submodule to latest main."
+                        )
+                    self.model._pp_current_seq_len = None
+                    if seqpack_active and not self.is_hf_model:
+                        # THD format: override stage shapes to [total_tokens, hidden].
+                        # split_batch_into_thd_chunks produces per-chunk token counts.
+                        tokens_per_chunk = pp_batch["input_ids"].shape[-1]
+                        reset_pp_stage_shapes_for_thd(
+                            self.model, tokens_per_chunk
+                        )
+                    else:
+                        seq_len = pp_batch["input_ids"].shape[-1]
+                        self.model.update_seq_len(seq_len)
 
                     step_loss, mb_metrics_list = pp_forward_backward(
                         model=self.model,
@@ -735,6 +798,10 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     sched.step()
             torch.cuda.empty_cache()
 
+            # Remove THD squeeze hooks
+            for h in thd_hooks:
+                h.remove()
+
             metrics = aggregate_training_statistics(
                 losses=losses,
                 all_mb_metrics=all_mb_metrics,
@@ -766,10 +833,13 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             else self.cfg["logprob_batch_size"]
         )
 
-        # Validate sequence dimension
+        # Validate sequence dimension. Sync across ranks for PP (different ranks
+        # may have different max sequence lengths from GRPO generation).
         sequence_dim, seq_dim_size = check_sequence_dim(data)
-
         if self.pp_enabled:
+            max_seq = torch.tensor([seq_dim_size], device="cuda")
+            torch.distributed.all_reduce(max_seq, op=torch.distributed.ReduceOp.MAX)
+            seq_dim_size = int(max_seq.item())
             return self._get_logprobs_pp(data, logprob_batch_size, seq_dim_size)
 
         all_log_probs = []
@@ -797,6 +867,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 tokenizer=self.tokenizer,
                 cp_size=self.cp_size,
                 cp_mesh=self.cp_mesh,
+                device_mesh=self.device_mesh,
             )
 
             for batch_idx, processed_mb in enumerate(processed_iterator):
@@ -879,23 +950,28 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             data.to("cuda")
             all_input_ids = data.get("input_ids").cuda()
             total_samples = all_input_ids.shape[0]
-            num_chunks = max(1, total_samples // pp_bs)
+            # Sync across ranks to prevent collective hangs when data is uneven
+            _max_samples = torch.tensor([total_samples], device="cuda")
+            torch.distributed.all_reduce(_max_samples, op=torch.distributed.ReduceOp.MAX)
+            num_chunks = max(1, (int(_max_samples.item()) + pp_bs - 1) // pp_bs)
+            n_microbatches = schedule._n_microbatches
 
             all_logprobs = []
             for chunk_idx in range(num_chunks):
                 start = chunk_idx * pp_bs
                 end = start + pp_bs
-                chunk_data = data.get_batch(batch_idx=chunk_idx, batch_size=pp_bs)
+                actual_chunk_size = min(pp_bs, total_samples - start)
+                chunk_data = data.slice(start, start + actual_chunk_size)
                 input_ids = chunk_data.get("input_ids").cuda()
-                labels = input_ids.clone()
 
                 capturer.reset()
 
-                if hasattr(self.model, "_pp_current_seq_len"):
-                    self.model._pp_current_seq_len = None
+                # Pad to pp_bs — PP schedule requires full batches.
+                input_ids, actual_seqs = pad_batch_for_pp(input_ids, pp_bs)
+                labels = input_ids.clone()
+                self.model._pp_current_seq_len = None
                 if hasattr(self.model, "update_seq_len"):
                     self.model.update_seq_len(input_ids.shape[-1])
-
                 targets = labels if self.has_last_stage else None
                 losses = [] if self.has_last_stage else None
                 args = (input_ids,) if self.has_first_stage else ()
@@ -913,7 +989,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 )
                 logits = broadcasted["logits"]
 
-                # Run through same LogprobsPostProcessor as non-PP path.
+                # Run through LogprobsPostProcessor
                 from nemo_rl.models.automodel.data import ProcessedInputs
 
                 processed_inputs = ProcessedInputs(
@@ -924,10 +1000,13 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     logits=logits,
                     data_dict=chunk_data,
                     processed_inputs=processed_inputs,
-                    original_batch_size=input_ids.shape[0],
-                    original_seq_len=input_ids.shape[1],
+                    original_batch_size=actual_seqs,
+                    original_seq_len=seq_dim_size,
                     sequence_dim=sequence_dim,
                 )
+
+                # Trim to actual sequences (exclude dummy-padded rows)
+                token_logprobs = token_logprobs[:actual_seqs]
 
                 padding_needed = seq_dim_size - token_logprobs.shape[1]
                 if padding_needed > 0:
@@ -964,6 +1043,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 tokenizer=self.tokenizer,
                 cp_size=self.cp_size,
                 cp_mesh=self.cp_mesh,
+                device_mesh=self.device_mesh,
             )
 
             all_rm_scores = []
@@ -1059,6 +1139,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 tokenizer=self.tokenizer,
                 cp_size=self.cp_size,
                 cp_mesh=self.cp_mesh,
+                device_mesh=self.device_mesh,
             )
 
             for batch_idx, processed_mb in enumerate(processed_iterator):
@@ -1142,7 +1223,10 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             data.to("cuda")
             all_input_ids = data.get("input_ids").cuda()
             total_samples = all_input_ids.shape[0]
-            num_chunks = max(1, total_samples // pp_bs)
+            # Sync across ranks to prevent collective hangs when data is uneven
+            _max_samples = torch.tensor([total_samples], device="cuda")
+            torch.distributed.all_reduce(_max_samples, op=torch.distributed.ReduceOp.MAX)
+            num_chunks = max(1, (int(_max_samples.item()) + pp_bs - 1) // pp_bs)
 
             all_vals, all_idx = [], []
             for chunk_idx in range(num_chunks):

@@ -1,0 +1,9 @@
+defaults: ./sft-moonlight-16b-1n8g-fsdp8ep8-seqpack-automodel.yaml
+policy:
+  sequence_packing:
+    enabled: false
+sft:
+  val_at_start: false
+  val_at_end: false
+checkpointing:
+  enabled: false

@@ -1,0 +1,13 @@
+defaults: ./sft-gpt-oss-20b-1n8g-pp2ep4-automodel.yaml
+sft:
+  val_at_start: false
+  val_at_end: false
+policy:
+  sequence_packing:
+    enabled: true
+  dtensor_cfg:
+    context_parallel_size: 2
+    expert_parallel_size: 2
+  # PP config inherits pp_schedule: 1f1b, pp_microbatch_size: 4 from parent.
+checkpointing:
+  checkpoint_dir: results/sft-gpt-oss-20b-1n8g-pp2cp2ep2-seqpack-automodel

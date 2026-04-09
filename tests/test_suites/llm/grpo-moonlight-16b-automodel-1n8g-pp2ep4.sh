@@ -12,6 +12,12 @@ NUM_MINUTES=180
 
 exit_if_max_steps_reached
 
+# PP requires automodel with update_seq_len (PR #1689).
+# Install from submodule into the DTensor v2 worker venv if the container's version is older.
+WORKER_VENV=/opt/ray_venvs/nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2
+$WORKER_VENV/bin/python3 -c "from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline; assert hasattr(AutoPipeline, 'update_seq_len')" 2>/dev/null \
+  || $WORKER_VENV/bin/pip install -e $PROJECT_ROOT/3rdparty/Automodel-workspace/Automodel --no-deps -q
+
 # Run the experiment
 cd $PROJECT_ROOT
 uv run examples/run_grpo.py \
