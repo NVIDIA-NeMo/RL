@@ -16,7 +16,6 @@ from typing import Any, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
-
 class SglangSpecificArgs(TypedDict):
     """SGLang-specific configuration arguments.
 
@@ -25,9 +24,7 @@ class SglangSpecificArgs(TypedDict):
     """
 
     model_path: NotRequired[str]
-    # total number of gpus for rollout
-    num_gpus: NotRequired[int]
-    num_gpus_per_engine: NotRequired[int]
+    # Total number of gpus for rollout
     random_seed: NotRequired[int]
     skip_tokenizer_init: NotRequired[bool]
     disable_cuda_graph: NotRequired[bool]
@@ -96,13 +93,20 @@ class SglangSpecificArgs(TypedDict):
     enable_fast_load: NotRequired[bool]
     # Server warmup
     skip_server_warmup: NotRequired[bool]
-    # Router Arg
+
+class SGLangServer(TypedDict):
+    sglang_server_concurrency: int
+    num_gpus: NotRequired[int]
+    num_gpus_per_engine: NotRequired[int]
+
+class SGLangRouter(TypedDict):
     sglang_router_ip: NotRequired[str]
     sglang_router_port: NotRequired[int]
-
+    router_policy: NotRequired[str]
 
 class SGLangConfig(GenerationConfig):
     """Configuration for SGLang runtime."""
-
     sglang_cfg: SglangSpecificArgs
+    sglang_server: SGLangServer
+    sglang_router: SGLangRouter
     sglang_kwargs: NotRequired[dict[str, Any]]

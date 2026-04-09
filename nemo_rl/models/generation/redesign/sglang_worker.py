@@ -17,8 +17,8 @@ import ray
 
 logger = logging.getLogger(__name__)
 
-def get_base_gpu_id(cluster_cfg, sgl_cfg, rank):
-    num_gpus = min(cluster_cfg["gpus_per_node"], sgl_cfg["num_gpus_per_engine"])
+def get_base_gpu_id(cluster_cfg, sglang_cfg, rank):
+    num_gpus = min(cluster_cfg["gpus_per_node"], sglang_cfg["sglang_server"]["num_gpus_per_engine"])
     start_index = (rank * num_gpus) % cluster_cfg["gpus_per_node"]
     return start_index
 
@@ -98,19 +98,15 @@ class SGLangEngine:
     def __init__(
         self,
         cluster_cfg,
-        sgl_cfg,
+        sglang_cfg,
         rank: int,
-        worker_type: str = "regular",
         base_gpu_id: int | None = None,
-        sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
     ):  
         self.cluster_cfg = cluster_cfg
-        self.sgl_cfg = sgl_cfg
+        self.sglang_cfg = sglang_cfg
         self.rank = rank
-        self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
-        self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
 
     def init(
@@ -123,8 +119,8 @@ class SGLangEngine:
         router_port=None,
     ):
 
-        self.router_ip = router_ip if router_ip is not None else self.sgl_cfg["sglang_router_ip"]
-        self.router_port = router_port if router_port is not None else self.sgl_cfg["sglang_router_port"]
+        self.router_ip = router_ip if router_ip is not None else self.sglang_cfg["sglang_cfg"]["sglang_router_ip"]
+        self.router_port = router_port if router_port is not None else self.sglang_cfg["sglang_cfg"]["sglang_router_port"]
 
         host = host or get_host_info()[1]
 
@@ -144,14 +140,13 @@ class SGLangEngine:
 
         server_args_dict = _compute_server_args(
             self.cluster_cfg,
-            self.sgl_cfg,
+            self.sglang_cfg,
             self.rank,
             dist_init_addr,
             nccl_port,
             host,
             port,
             base_gpu_id=self.base_gpu_id,
-            sglang_overrides=self.sglang_overrides,
             num_gpus_per_engine=self.num_gpus_per_engine,
         )
 
@@ -168,16 +163,13 @@ class SGLangEngine:
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
             if parse(sglang_router.__version__) <= parse("0.2.1"):
-                assert (
-                    self.worker_type == "regular"
-                ), "pd disaggregation is not supported in old router or miles router."
                 response = requests.post(
                     f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
                 )
             else:
                 payload = {
                     "url": f"http://{self.server_host}:{self.server_port}",
-                    "worker_type": self.worker_type,
+                    "worker_type": "regular",
                 }
                 response = requests.post(
                     f"http://{self.router_ip}:{self.router_port}/workers",
@@ -463,30 +455,28 @@ class SGLangEngine:
         logger.info(f"Simulating crash on engine {self.server_host}:{self.server_port}...")
         self.shutdown()
 
-
 def _compute_server_args(
     cluster_cfg,
-    sgl_cfg,
+    sglang_cfg,
     rank,
     dist_init_addr,
     nccl_port,
     host,
     port,
     base_gpu_id: int | None = None,
-    sglang_overrides: dict | None = None,
     num_gpus_per_engine: int | None = None,
 ):
-    _gpus_per_engine = num_gpus_per_engine or sgl_cfg["num_gpus_per_engine"]
+    _gpus_per_engine = num_gpus_per_engine or sglang_cfg["sglang_server"]["num_gpus_per_engine"]
     nnodes = max(1, _gpus_per_engine // cluster_cfg["gpus_per_node"])
     node_rank = rank % nnodes
-    base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(cluster_cfg, sgl_cfg, rank)
+    base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(cluster_cfg, sglang_cfg, rank)
     base = _to_local_gpu_id(base)
     kwargs = {
-        "model_path": sgl_cfg["model_path"],
+        "model_path": sglang_cfg["sglang_cfg"]["model_path"],
         "trust_remote_code": True,
-        "random_seed": sgl_cfg["random_seed"] + rank,
+        "random_seed": sglang_cfg["sglang_cfg"]["random_seed"] + rank,
         # memory
-        "enable_memory_saver": sgl_cfg["enable_memory_saver"],
+        "enable_memory_saver": sglang_cfg["sglang_cfg"]["enable_memory_saver"],
         # distributed
         "host": host,
         "port": port,
@@ -498,9 +488,9 @@ def _compute_server_args(
         "base_gpu_id": base,
         # parallel
         "tp_size": _gpus_per_engine,
-        "dp_size": sgl_cfg["dp_size"],
-        "pp_size": sgl_cfg["pp_size"],
-        "ep_size": sgl_cfg["ep_size"],
+        "dp_size": sglang_cfg["sglang_cfg"]["dp_size"],
+        "pp_size": sglang_cfg["sglang_cfg"]["pp_size"],
+        "ep_size": sglang_cfg["sglang_cfg"]["ep_size"],
         # always skip warmup to prevent warmup timeout.
         "skip_server_warmup": True,
         # always enable draft weights cpu backup so that we run training without mtp weights.
@@ -522,22 +512,8 @@ def _compute_server_args(
         "allow_auto_truncate",
         "disable_piecewise_cuda_graph",
     ]:
-        if key in sgl_cfg:
-            kwargs[key] = sgl_cfg[key]
-
-    unused_keys = set(kwargs.keys())
-
-    for attr in dataclasses.fields(ServerArgs):
-        sgl_key = f"sglang_{attr.name}"
-        if sgl_key in sgl_cfg and attr.name not in kwargs:
-            kwargs[attr.name] = sgl_cfg[sgl_key]
-        unused_keys.discard(attr.name)
-
-    # for compatibility with old args
-    if len(unused_keys) > 0:
-        logger.info(f"Warning: The following arguments is not supported in the current sglang: {unused_keys}.")
-        for key in unused_keys:
-            kwargs.pop(key)
+        if key in sglang_cfg["sglang_cfg"]:
+            kwargs[key] = sglang_cfg["sglang_cfg"][key]
 
     return kwargs
 

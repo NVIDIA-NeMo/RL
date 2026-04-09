@@ -68,7 +68,6 @@ logger = logging.getLogger(__name__)
 
 #         pg = cluster._init_placement_groups(strategy="PACK", use_unified_pg=True)[0]
 #         pg_reordered_bundle_indices   = cluster._get_sorted_bundle_indices()
-#         
 
 
 @dataclasses.dataclass
@@ -80,15 +79,13 @@ class ServerGroup:
     in PD disaggregation).
     """
 
-    args: Any
     pg: Any  # (placement_group, reordered_bundle_indices, reordered_gpu_ids)
     all_engines: list
     num_gpus_per_engine: int
+    num_gpus_per_node: int
     num_new_engines: int
-    worker_type: str = "regular"  # "regular", "prefill", or "decode"
     rank_offset: int = 0
     gpu_offset: int = 0
-    sglang_overrides: dict = dataclasses.field(default_factory=dict)
     needs_offload: bool = False
     model_path: str | None = None
     router_ip: str | None = None
@@ -96,7 +93,7 @@ class ServerGroup:
 
     @property
     def nodes_per_engine(self):
-        return max(1, self.num_gpus_per_engine // self.args.num_gpus_per_node)
+        return max(1, self.num_gpus_per_engine // self.num_gpus_per_node)
 
     @property
     def engines(self):
@@ -127,14 +124,9 @@ class ServerGroup:
         """
         if port_cursors is None:
             port_cursors = {}
-        if self.args.debug_train_only or self.worker_type == "placeholder":
-            self.num_new_engines = 0
-            return [], port_cursors
 
-        num_gpu_per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
-
+        num_gpu_per_engine = min(self.num_gpus_per_engine, self.num_gpus_per_node)
         pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
-
         RolloutRayActor = ray.remote(SGLangEngine)
 
         rollout_engines = []
@@ -178,9 +170,7 @@ class ServerGroup:
             ).remote(
                 self.args,
                 rank=global_rank,
-                worker_type=self.worker_type,
                 base_gpu_id=base_gpu_id,
-                sglang_overrides=self.sglang_overrides,
                 num_gpus_per_engine=self.num_gpus_per_engine,
             )
 
@@ -194,9 +184,7 @@ class ServerGroup:
 
         base_port = max(port_cursors.values()) if port_cursors else 15000
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
-            args=self.args,
             rollout_engines=rollout_engines,
-            worker_type=self.worker_type,
             num_gpus_per_engine=self.num_gpus_per_engine,
             rank_offset=self.rank_offset,
             base_port=base_port,
@@ -228,7 +216,6 @@ class ServerGroup:
         updatable_new_engines = []
         non_updatable_groups_engines: list[tuple[str, list]] = []
         for g, dead_indices in zip(self.server_groups, dead_per_group, strict=True):
-            logger.info(f"Recovered {g.num_new_engines} dead rollout engines (worker_type={g.worker_type})")
             assert g.num_new_engines == len(dead_indices), "num_new_engines does not match dead_indices length"
             if g.needs_offload and dead_indices:
                 new_engines = [g.all_engines[i] for i in dead_indices]
@@ -280,21 +267,25 @@ class ServerGroup:
         ]
 
 # ---------------------------------------------------------------------------
-# RolloutManager
+# SGLangGeneration
 # ---------------------------------------------------------------------------
 
-@ray.remote
-class RolloutManager:
+class SGLangGeneration(GenerationInterface):
     """The class to run rollout and convert rollout data to training data."""
 
-    def __init__(self, args, pg):
+    def __init__(self, cluster: RayVirtualCluster, cluster_cfg: ClusterConfig, sglang_cfg: SGLangConfig):
         configure_logger()
 
-        self.pg = pg
-        self.args = args
-        # TODO make args immutable
-        init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
+        self.cluster = cluster
+        self.cluster_cfg = cluster_cfg
+        self.sglang_cfg = sglang_cfg
+        self.pg = cluster._init_placement_groups(
+            strategy="PACK",
+            use_unified_pg=True,
+        )
+        self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids = get_reordered_bundle_and_gpu_ids(self.pg)
 
+        # TODO: change to each implementation
         self.generate_rollout = load_function(self.args.rollout_function_path)
         self.eval_generate_rollout = load_function(self.args.eval_function_path)
         self.custom_reward_post_process_func = None
@@ -308,11 +299,8 @@ class RolloutManager:
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
         logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
 
-        if self.args.debug_train_only:
-            self.server_group = None
-        else:
-            init_http_client(args)
-            self.server_group = start_rollout_servers(args, pg)
+        init_http_client(args)
+        self.server_group = start_rollout_servers(args, (self.pg, self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids))
 
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
@@ -347,10 +335,6 @@ class RolloutManager:
         return self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
 
     def eval(self, rollout_id):
-        if self.args.debug_train_only:
-            # if debug train only, we don't generate evaluation data
-            return
-
         if self.use_experimental_refactor:
             result = call_rollout_function(self.eval_generate_rollout, RolloutFnEvalInput(rollout_id=rollout_id))
         else:
@@ -371,11 +355,13 @@ class RolloutManager:
                 if engine is not None
             ]
             return ray.get(handles) if handles else []
-        self.server_group.offload()
-
+        else:
+            handles = self.server_group.offload()
+            return ray.get(handles) if handles else []
 
     def onload(self, tags: list[str] | None = None):
-        self.server_group.onload(tags)
+        handles = self.server_group.onload(tags)
+        return ray.get(handles) if handles else []
 
     def onload_weights(self):
         self.server_group.onload_weights()
@@ -663,10 +649,9 @@ class RolloutManager:
 
 def _allocate_rollout_engine_addr_and_ports_normal(
     *,
-    args,
+    cluster_cfg,
+    sglang_cfg,
     rollout_engines,
-    worker_type="regular",
-    num_gpus_per_engine=None,
     rank_offset=0,
     base_port=15000,
 ):
@@ -676,8 +661,13 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     # 2. nccl port
     # 3. dist_init_addr port
     # 4. other ports for dp_attention, which is of size 4 + dp_size
-    _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
-    num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
+
+    sglang_dp_size = sglang_cfg["sglang_cfg"]["dp_size"]
+    num_gpus_per_engine = sglang_cfg["sglang_server"]["num_gpus_per_engine"]
+    num_gpus_per_node = cluster_cfg["gpus_per_node"]
+
+    _gpus_per_engine = num_gpus_per_engine 
+    num_engines_per_node = max(1, num_gpus_per_node // _gpus_per_engine)
     addr_and_ports: dict[int, dict] = {}
 
     # Track per-node port cursors so that different server groups (called
@@ -727,19 +717,16 @@ def _allocate_rollout_engine_addr_and_ports_normal(
             addr_and_ports[current_rank]["port"] = get_port()
             addr_and_ports[current_rank]["nccl_port"] = get_port()
 
-            if worker_type == "prefill":
-                addr_and_ports[current_rank]["disaggregation_bootstrap_port"] = get_port()
-
-        if _gpus_per_engine > args.num_gpus_per_node:
-            num_node_per_engine = _gpus_per_engine // args.num_gpus_per_node
+        if _gpus_per_engine > num_gpus_per_node:
+            num_node_per_engine = _gpus_per_engine // num_gpus_per_node
             if local_rank % num_node_per_engine == 0:
-                dist_init_addr = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
+                dist_init_addr = f"{get_addr()}:{get_port(30 + sglang_dp_size)}"
                 for i in range(num_node_per_engine):
                     addr_and_ports.setdefault(rank + i, {})
                     addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
         else:
             for i in range(num_engines_on_this_node):
-                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
+                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + sglang_dp_size)}"
 
     for i, _ in rollout_engines:
         for key in ["port", "nccl_port", "dist_init_addr"]:
@@ -752,7 +739,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 # Router + server bootstrap
 # ---------------------------------------------------------------------------
 
-def _start_router(args, *, force_new: bool = False) -> tuple[str, int]:
+def _start_router(args: SGLangConfig, *, force_new: bool = False) -> tuple[str, int]:
     """Start sgl router or miles router and return (router_ip, router_port).
 
     If ``args.sglang_router_ip`` is already set and ``force_new`` is False,
@@ -771,11 +758,12 @@ def _start_router(args, *, force_new: bool = False) -> tuple[str, int]:
 
     from sglang_router.launch_router import RouterArgs
 
-    from miles.utils.http_utils import run_router
-
-    router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
+    # pass from 
+    router_args = RouterArgs()
     router_args.host = router_ip
     router_args.port = router_port
+    if args["sglang_router"]["router_policy"] is not None:
+        router_args.router_policy = args["sglang_router"]["router_policy"]
     router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
     router_args.log_level = "warn"
     router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
@@ -793,30 +781,6 @@ def _start_router(args, *, force_new: bool = False) -> tuple[str, int]:
     logger.info(f"Router launched at {router_ip}:{router_port}")
     return router_ip, router_port
 
-def _compute_rollout_offset(args) -> int:
-    """Offset (in PG bundle slots) where rollout GPUs start."""
-    if args.debug_train_only or args.debug_rollout_only or args.colocate:
-        return 0
-    if getattr(args, "critic_train_only", False):
-        return args.critic_num_nodes * args.critic_num_gpus_per_node
-    offset = args.actor_num_nodes * args.actor_num_gpus_per_node
-    if getattr(args, "use_critic", False):
-        offset += args.critic_num_nodes * args.critic_num_gpus_per_node
-    return offset
-
-
-def _compute_megatron_num_gpus(args) -> int:
-    """Total number of megatron (actor + critic) GPU slots in the placement group."""
-    if getattr(args, "debug_rollout_only", False):
-        return 0
-    if getattr(args, "critic_train_only", False):
-        return args.critic_num_nodes * args.critic_num_gpus_per_node
-    num = args.actor_num_nodes * args.actor_num_gpus_per_node
-    if getattr(args, "use_critic", False):
-        num += args.critic_num_nodes * args.critic_num_gpus_per_node
-    return num
-
-
 def start_rollout_servers(args, pg) -> ServerGroup:
     """Start rollout servers: one per model, each with its own router.
 
@@ -824,12 +788,9 @@ def start_rollout_servers(args, pg) -> ServerGroup:
     """
     config = _resolve_sglang_config(args)
 
-    servers: dict[str, RolloutServer] = {}
     gpu_offset = 0
     engine_offset = 0
-
-    rollout_pg_offset = _compute_rollout_offset(args)
-    megatron_num_gpus = _compute_megatron_num_gpus(args)
+    rollout_pg_offset = 0
 
     for model_idx, model_cfg in enumerate(config.models):
         model_cfg.resolve(args)
@@ -850,28 +811,18 @@ def start_rollout_servers(args, pg) -> ServerGroup:
             num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
             num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
 
-            group_abs_start = rollout_pg_offset + gpu_offset
-            needs_offload = args.offload_rollout and group_abs_start < megatron_num_gpus
-            overrides = dict(group_cfg.overrides)
-            if args.offload_rollout and not needs_offload:
-                overrides.setdefault("enable_memory_saver", False)
-            logger.info(
-                f"Engine group '{group_cfg.worker_type}' gpu_offset={gpu_offset} "
-                f"(abs={group_abs_start}): needs_offload={needs_offload}"
-            )
+            needs_offload = args.offload_rollout
 
             group = ServerGroup(
                 args=args,
                 pg=pg,
-                all_engines=[None] * num_engines if group_cfg.worker_type != "placeholder" else [],
+                all_engines=[None] * num_engines,
                 num_gpus_per_engine=gpus_per_engine,
                 num_new_engines=0,
-                worker_type=group_cfg.worker_type,
                 rank_offset=engine_offset,
                 gpu_offset=gpu_offset,
-                sglang_overrides=overrides,
                 needs_offload=needs_offload,
-                model_path=overrides.get("model_path", args.hf_checkpoint),
+                model_path= sglang_cfg["sglang_cfg"]["model_path"],
                 router_ip=router_ip,
                 router_port=router_port,
             )
@@ -896,28 +847,6 @@ def start_rollout_servers(args, pg) -> ServerGroup:
     args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
 
     return servers
-
-def _resolve_sglang_config(args) -> SglangConfig:
-    """Build a SglangConfig from args, choosing the right source."""
-    if getattr(args, "sglang_config", None) is not None:
-        config = SglangConfig.from_yaml(args.sglang_config)
-        expected = args.rollout_num_gpus
-        actual = config.total_num_gpus
-        assert actual == expected, f"sglang_config total GPUs ({actual}) != rollout_num_gpus ({expected})"
-        return config
-
-    if args.prefill_num_servers is not None:
-        return SglangConfig.from_prefill_num_servers(args)
-
-    return SglangConfig(
-        models=[
-            ModelConfig(
-                name="default",
-                server_groups=[ServerGroupConfig(worker_type="regular", num_gpus=args.rollout_num_gpus)],
-            )
-        ]
-    )
-
 
 # ---------------------------------------------------------------------------
 # Logging / metrics helpers (unchanged)
