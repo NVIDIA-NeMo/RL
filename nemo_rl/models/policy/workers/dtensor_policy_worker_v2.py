@@ -47,12 +47,9 @@ from nemo_rl.models.automodel.data import (
 )
 from nemo_rl.models.automodel.pipeline_parallel import (
     PPLossAdapter,
-    broadcast_loss_metrics_from_last_pp_stage,
     broadcast_tensors_from_last_pp_stage,
-    pp_forward_backward,
     pp_forward_loop,
-    prepare_pp_seqpack_batch,
-    reset_pp_stage_shapes_for_thd,
+    pp_train_forward_backward_loop,
 )
 from nemo_rl.models.automodel.setup import (
     setup_distributed,
@@ -559,7 +556,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         optimizers_list: list,
         schedulers_list: list,
     ) -> dict[str, Any]:
-        """PP training path using the pipeline schedule."""
+        """PP training path using pp_train_forward_backward_loop."""
         loss_adapter = PPLossAdapter(
             loss_fn=loss_fn,
             cfg=self.cfg,
@@ -572,13 +569,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             sampling_params=self.sampling_params,
         )
 
-        from nemo_automodel.components.training.utils import (
-            prepare_after_first_microbatch,
-            prepare_for_final_backward,
-            prepare_for_grad_accumulation,
-        )
-
-        pp_batch_size = self.model.pp_batch_size  # = train_micro_batch_size
+        pp_batch_size = self.model.pp_batch_size
+        n_microbatches = self.model.info.schedule._n_microbatches
 
         # Install hook to squeeze batch dim for THD format in PP microbatches.
         # The PP schedule splits [n_chunks, tokens_per_chunk] → [1, tokens_per_chunk]
@@ -601,153 +593,43 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     batch_idx=gb_idx,
                     batch_size=local_gbs,
                 )
-                batch = gb_result["batch"]
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
                 for opt in optimizers_list:
                     opt.zero_grad()
 
-                # Gradient accumulation: split into pp_batch_size chunks.
-                # Sync actual batch size across all ranks so everyone has the same
-                # num_accum_steps (required for PP collectives).
-                actual_batch_size = batch.get("input_ids").shape[0]
-                max_batch = torch.tensor([actual_batch_size], device="cuda")
-                torch.distributed.all_reduce(
-                    max_batch, op=torch.distributed.ReduceOp.MAX
+                gb_total_loss, gb_metrics = pp_train_forward_backward_loop(
+                    model=self.model,
+                    model_parts=self.model_handle.parts,
+                    batch=gb_result["batch"],
+                    loss_adapter=loss_adapter,
+                    pp_batch_size=pp_batch_size,
+                    n_microbatches=n_microbatches,
+                    has_last_stage=self.has_last_stage,
+                    pp_mesh=self.pp_mesh,
+                    enable_seq_packing=self.enable_seq_packing,
+                    is_hf_model=self.is_hf_model,
+                    tokenizer_eos_id=self.tokenizer.eos_token_id,
+                    train_mb_tokens=self.cfg["sequence_packing"]["train_mb_tokens"],
+                    cp_size=self.cp_size,
+                    cp_mesh=self.cp_mesh,
+                    device_mesh=self.device_mesh,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    num_global_batches=num_global_batches,
+                    forward_only=eval_mode,
                 )
-                num_accum_steps = max(
-                    1, (int(max_batch.item()) + pp_batch_size - 1) // pp_batch_size
-                )
-                n_microbatches = self.model.info.schedule._n_microbatches
 
-                if not eval_mode:
-                    prepare_for_grad_accumulation(
-                        self.model_handle.parts, pp_enabled=True
-                    )
-
-                gb_total_loss = torch.tensor(0.0, device="cuda")
-
-                for accum_idx in range(num_accum_steps):
-                    if not eval_mode and accum_idx == num_accum_steps - 1:
-                        prepare_for_final_backward(
-                            self.model_handle.parts, pp_enabled=True
-                        )
-
-                    # Slice this accumulation step's data
-                    start = accum_idx * pp_batch_size
-                    end = start + pp_batch_size
-
-                    # Build the RL data slice for the loss adapter.
-                    # Clamp to actual batch size to handle partial/empty steps.
-                    actual_total = batch.get("input_ids").shape[0]
-                    cstart = min(start, actual_total)
-                    cend = min(end, actual_total)
-                    accum_data = {}
-                    for key in batch:
-                        val = batch[key]
-                        if torch.is_tensor(val) and val.shape[0] >= actual_total:
-                            accum_data[key] = val[cstart:cend]
-                        else:
-                            accum_data[key] = val
-
-                    input_ids = batch.get("input_ids")[cstart:cend].cuda()
-
-                    seqpack_active = self.enable_seq_packing
-                    if seqpack_active:
-                        input_lengths = batch["input_lengths"][start:end]
-                        token_mask = accum_data.get("token_mask", None)
-                        pp_batch, accum_data, thd_batch = prepare_pp_seqpack_batch(
-                            input_ids=input_ids,
-                            input_lengths=input_lengths,
-                            accum_data=accum_data,
-                            pp_batch_size=pp_batch_size,
-                            n_microbatches=n_microbatches,
-                            tokenizer_eos_id=self.tokenizer.eos_token_id,
-                            train_mb_tokens=self.cfg["sequence_packing"][
-                                "train_mb_tokens"
-                            ],
-                            cp_size=self.cp_size,
-                            cp_mesh=self.cp_mesh,
-                            device_mesh=self.device_mesh,
-                            token_mask=token_mask,
-                        )
-                    else:
-                        pp_batch = {
-                            "input_ids": input_ids,
-                            "labels": input_ids.clone(),
-                        }
-
-                    if self.has_last_stage:
-                        cu_seqlens_per_row = (
-                            thd_batch.cu_seqlens_per_row if seqpack_active else None
-                        )
-                        cu_padded = (
-                            thd_batch.cu_seqlens_padded_per_row
-                            if seqpack_active and self.cp_size > 1
-                            else None
-                        )
-                        cp_group = (
-                            self.cp_mesh.get_group() if self.cp_size > 1 else None
-                        )
-                        loss_adapter.set_microbatches(
-                            accum_data,
-                            n_microbatches,
-                            global_valid_seqs,
-                            global_valid_toks,
-                            num_global_batches=num_global_batches,
-                            cu_seqlens=cu_seqlens_per_row,
-                            cu_seqlens_padded=cu_padded,
-                            context_parallel_group=cp_group,
-                        )
-                    else:
-                        loss_adapter.reset()
-
-                    # Force-reset PP schedule state before each step/eval.
-                    if not hasattr(self.model, "update_seq_len"):
-                        raise RuntimeError(
-                            "AutoPipeline.update_seq_len() not found. "
-                            "Pipeline parallelism requires nemo_automodel >= 0.4.0 "
-                            "(PR #1689: dynamic sequence length support). "
-                            "Please update the automodel submodule to latest main."
-                        )
-                    self.model._pp_current_seq_len = None
-                    if seqpack_active and not self.is_hf_model:
-                        # THD format: override stage shapes to [total_tokens, hidden].
-                        # split_batch_into_thd_chunks produces per-chunk token counts.
-                        tokens_per_chunk = pp_batch["input_ids"].shape[-1]
-                        reset_pp_stage_shapes_for_thd(self.model, tokens_per_chunk)
-                    else:
-                        seq_len = pp_batch["input_ids"].shape[-1]
-                        self.model.update_seq_len(seq_len)
-
-                    step_loss, mb_metrics_list = pp_forward_backward(
-                        model=self.model,
-                        batch=pp_batch,
-                        loss_adapter=loss_adapter,
-                        forward_only=eval_mode,
-                    )
-                    gb_total_loss += step_loss.detach()
-
-                    if not eval_mode and accum_idx == 0:
-                        prepare_after_first_microbatch()
-
-                    # Broadcast and collect metrics from last stage
-                    if self.has_last_stage:
-                        gb_loss_metrics = mb_metrics_list
-                    else:
-                        gb_loss_metrics = None
-                    gb_loss_metrics = broadcast_loss_metrics_from_last_pp_stage(
-                        gb_loss_metrics, self.pp_mesh, self.has_last_stage
-                    )
-                    if gb_loss_metrics:
-                        for m in gb_loss_metrics:
-                            lr = optimizers_list[0].param_groups[0]["lr"]
-                            m["lr"] = lr
-                            m["global_valid_seqs"] = global_valid_seqs.item()
-                            m["global_valid_toks"] = global_valid_toks.item()
-                            if m.get("num_valid_samples", 0) > 0:
-                                all_mb_metrics.append(m)
+                # Enrich metrics with lr and global counts
+                if gb_metrics:
+                    for m in gb_metrics:
+                        lr = optimizers_list[0].param_groups[0]["lr"]
+                        m["lr"] = lr
+                        m["global_valid_seqs"] = global_valid_seqs.item()
+                        m["global_valid_toks"] = global_valid_toks.item()
+                        if m.get("num_valid_samples", 0) > 0:
+                            all_mb_metrics.append(m)
 
                 if not eval_mode:
                     # PP gradient scaling: each schedule.step() scales loss by
@@ -784,7 +666,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 # Undo dp*cp scaling from PPLossAdapter (needed for FSDP grad averaging
                 # during training, but not for the reported loss).
                 if self.pp_size > 1:
-                    loss_tensor = gb_total_loss.unsqueeze(0)  # [1] for broadcast helper
+                    loss_tensor = gb_total_loss.unsqueeze(0)
                     broadcasted = broadcast_tensors_from_last_pp_stage(
                         {"loss": loss_tensor if self.has_last_stage else None},
                         self.pp_mesh,
