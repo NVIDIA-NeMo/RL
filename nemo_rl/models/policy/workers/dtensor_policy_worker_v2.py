@@ -1103,7 +1103,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
             if my_pp_rank == owner_pp_rank:
                 # Materialise and adapt the tensor (TP gather + HF name adapt)
-                tensor = self._get_local_param_tensor(name).cuda()
+                tensor, owning_part = self._get_local_param_tensor(name)
+                tensor = tensor.cuda()
                 meta = [list(tensor.shape), str(tensor.dtype)]
                 torch.distributed.broadcast_object_list(
                     [meta], src=owner_global_rank, group=pp_group
@@ -1111,9 +1112,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 torch.distributed.broadcast(
                     tensor, src=owner_global_rank, group=pp_group
                 )
-                # Adapt FQN for HF format
                 for adapted_name, adapted_tensor in _maybe_adapt_tensor_to_hf(
-                    self.model_handle.parts[0], name, tensor
+                    owning_part, name, tensor
                 ):
                     yield (
                         adapted_name,
@@ -1136,13 +1136,21 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                         adapted_tensor.to(self.dtype, non_blocking=True).contiguous(),
                     )
 
-    def _get_local_param_tensor(self, name: str) -> torch.Tensor:
-        """Get a single param tensor by name from local model parts, gathering DTensor."""
+    def _get_local_param_tensor(self, name: str) -> tuple[torch.Tensor, nn.Module]:
+        """Get a single param tensor by name from local model parts, gathering DTensor.
+
+        Returns:
+            Tuple of (tensor, owning_part) so callers can pass the correct
+            model part to state_dict adapters.
+        """
         for part in self.model_handle.parts:
             sd = part.state_dict()
             if name in sd:
                 tensor = sd[name]
-                return tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+                gathered = (
+                    tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+                )
+                return gathered, part
         raise KeyError(f"Param {name} not found in any local model part")
 
     def _model_state_dict_items(self):
