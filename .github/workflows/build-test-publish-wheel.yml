@@ -26,7 +26,7 @@ defaults:
 
 jobs:
   build-test-publish-wheel:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_publish_wheel.yml@7a6fd6d27f422af24f853346bc738d31af0338c0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_publish_wheel.yml@v0.88.1
     if: ${{ vars.BUILD_TEST_PUBLISH_WHEEL == 'true' }}
     with:
       dry-run: true
