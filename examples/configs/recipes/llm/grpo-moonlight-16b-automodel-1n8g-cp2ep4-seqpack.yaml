@@ -6,6 +6,5 @@ policy:
     enabled: false
   dtensor_cfg:
     context_parallel_size: 2
-    expert_parallel_size: 4
 checkpointing:
   checkpoint_dir: results/grpo-moonlight-16b-automodel-1n8g-cp2ep4-seqpack

@@ -4,9 +4,3 @@ policy:
     enabled: false
   dtensor_cfg:
     context_parallel_size: 2
-    expert_parallel_size: 4
-sft:
-  val_at_start: false
-  val_at_end: false
-checkpointing:
-  enabled: false

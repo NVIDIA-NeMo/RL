@@ -4,8 +4,6 @@ policy:
   sequence_packing:
     enabled: true
     train_mb_tokens: 2048
-  dynamic_batching:
-    enabled: false
 data:
   max_input_seq_length: 2048
 checkpointing:
