@@ -45,7 +45,7 @@ dependencies = [
   "torchvision==0.25.0",
   "transformers==5.3.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
-  "mlflow>=3.9.0rc0",
+  "mlflow>=3.11.1",
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
@@ -265,7 +265,7 @@ override-dependencies = [
   #Override till we can upgrade sglang version to address CVE GHSA-7rgv-gqhr-fxg3
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs
-  "mlflow>=3.9.0rc0",
+  "mlflow>=3.11.1",
   # Override outlines for Python 3.13 support
   "outlines>=0.2.0",
 ]
