@@ -95,6 +95,7 @@ class SglangSpecificArgs(TypedDict):
     skip_server_warmup: NotRequired[bool]
 
 class SGLangServer(TypedDict):
+    needs_offload: bool
     sglang_server_concurrency: int
     num_gpus: NotRequired[int]
     num_gpus_per_engine: NotRequired[int]
