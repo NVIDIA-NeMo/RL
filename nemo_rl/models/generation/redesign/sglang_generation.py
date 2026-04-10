@@ -451,28 +451,26 @@ class SGLangGeneration(GenerationInterface):
         *,
         greedy: bool,
         max_new_tokens: int,
-        stop_strings: Optinoal[list[str]] = None,
-        input_len: Optional[int] = None,
+        stop_strings: list[str] | None = None,
     ) -> dict[str, Any]:
         """Build sampling parameters dictionary for SGLang API.
 
         Args:
             greedy: Whether to use greedy decoding (temperature=0.0)
-            stop_strings: Merged stop strings (not used here, handled per sample)
-            max_new_tokens: Override max_new_tokens from config if provided
-            input_len: Input length for this sample (used for context_length adjustment)
+            max_new_tokens: Max new tokens for this sample (already clamped by caller
+                against ``context_length - input_length``).
+            stop_strings: Merged stop strings for this sample.
 
         Returns:
-            Dictionary of sampling parameters compatible with SGLang API
+            Dictionary of sampling parameters compatible with SGLang API.
         """
+        temperature = 0.0 if greedy else self.sglang_cfg["temperature"]
         top_k_cfg = self.sglang_cfg.get("top_k")
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
-        if top_k_val != -1:
-            sampling_params["top_k"] = top_k_val
-        temperature = 0.0 if greedy else self.sglang_cfg["temperature"]
 
-        # Build sampling params dict
-        sampling_params = {
+        # Build sampling params dict first, then patch in optional fields so we
+        # never reference ``sampling_params`` before it's bound.
+        sampling_params: dict[str, Any] = {
             "temperature": temperature,
             "top_p": self.sglang_cfg.get("top_p", 1.0),
             "max_new_tokens": max_new_tokens,
@@ -480,10 +478,13 @@ class SGLangGeneration(GenerationInterface):
             "spaces_between_special_tokens": False,
         }
 
+        if top_k_val != -1:
+            sampling_params["top_k"] = top_k_val
+
         stop_token_ids = self.sglang_cfg.get("stop_token_ids")
         if stop_token_ids is not None:
             sampling_params["stop_token_ids"] = stop_token_ids
-        
+
         if stop_strings is not None and len(stop_strings) > 0:
             sampling_params["stop"] = stop_strings
 
@@ -534,28 +535,31 @@ class SGLangGeneration(GenerationInterface):
         # Build per-sample requests (each sample gets its own sampling params because
         # max_new_tokens is adjusted against the per-sample input length).
         sample_requests: list[tuple[int, dict[str, Any], list[int]]] = []
-        skip_results = []
+        skip_results: set[int] = set()
+        skip_max_length = 0
         for i in range(batch_size):
-            input_len = input_lengths[i].item()
-            valid_input_ids = input_ids[i, :input_len].tolist()
+            input_length = input_lengths[i].item()
+            valid_input_ids = input_ids[i, :input_length].tolist()
 
             if context_length is not None:
-                max_new_tokens = min(self.sglang_cfg["max_new_tokens"], context_length - input_len)
+                max_new_tokens = min(
+                    self.sglang_cfg["max_new_tokens"], context_length - input_length
+                )
             else:
                 max_new_tokens = self.sglang_cfg["max_new_tokens"]
             max_new_tokens = max(0, max_new_tokens)
 
             if max_new_tokens == 0:
-                skip_results.append(i)
-            else: 
-                sample_sampling_params = self._build_sampling_params(
-                    greedy=greedy,
-                    max_new_tokens=max_new_tokens,
-                    stop_strings=stop_strings[i] if i < len(stop_strings) else None,
-                    input_len=input_len,
-                )
+                skip_results.add(i)
+                skip_max_length = max(skip_max_length, input_length)
+                continue
 
-                sample_requests.append((i, sample_sampling_params, valid_input_ids))
+            sample_sampling_params = self._build_sampling_params(
+                greedy=greedy,
+                max_new_tokens=max_new_tokens,
+                stop_strings=stop_strings[i] if i < len(stop_strings) else None,
+            )
+            sample_requests.append((i, sample_sampling_params, valid_input_ids))
 
         # Dispatch concurrently to the SGLang router with bounded concurrency.
         # Max concurrency = per-engine concurrency * number of engines.
@@ -579,16 +583,25 @@ class SGLangGeneration(GenerationInterface):
                     router_ip, router_port, sp, ids, idx
                 )
 
-        async def _dispatch_all():
-            return await asyncio.gather(
+        async def _dispatch_all() -> dict[int, tuple[list[int], list[float], bool]]:
+            gathered = await asyncio.gather(
                 *(
                     _bounded_generate_one_sample(idx, sp, ids)
                     for idx, sp, ids in sample_requests
                 )
             )
-            
-        router_results = run(_dispatch_all())
-        
+            # generate_one_sample returns (index, tokens, logprobs, truncated).
+            # Re-key by the original sample index so downstream code can look up
+            # results directly without sorting.
+            return {
+                returned_idx: (new_tokens, new_logprobs, is_truncated)
+                for returned_idx, new_tokens, new_logprobs, is_truncated in gathered
+            }
+
+        router_results: dict[int, tuple[list[int], list[float], bool]] = (
+            run(_dispatch_all()) if sample_requests else {}
+        )
+
         # Process the outputs - preserve the original input padding structure.
         pad_token_id = self.sglang_cfg["_pad_token_id"]
         output_ids_list: list[torch.Tensor] = []
@@ -597,48 +610,42 @@ class SGLangGeneration(GenerationInterface):
         unpadded_sequence_lengths_list: list[int] = []
         truncated_list: list[bool] = []
 
-        # First pass: compute max unpadded (input + generation) length across the batch
-        # so every sample can be right-padded to the same width.
-        max_length = 0
-        for i, (_, new_tokens, _, _) in enumerate(router_results):
-            input_len = input_lengths[i].item()
-            max_length = max(max_length, input_len + len(new_tokens))
+        # First pass: compute total_length as the max over all samples of
+        # (input_length + generation_length). Skipped samples contribute only
+        # their input_length (already tracked in ``skip_max_length``).
+        max_length = skip_max_length
+        for returned_idx, (returned_tokens, _, _) in router_results.items():
+            sample_input_length = input_lengths[returned_idx].item()
+            max_length = max(max_length, sample_input_length + len(returned_tokens))
         total_length = max(max_length, padded_input_length)
-        if len(skip_results):
-            total_length = max(total_length, context_length)
 
+        # Second pass: materialize the output tensors, using a single set of
+        # local variable names (``generation_length`` / ``unpadded_length`` are
+        # always Python ints; tensor promotion happens only at the final stack).
         for i in range(batch_size):
-            input_len = input_lengths[i].item()
+            input_length = input_lengths[i].item()
             full_output = torch.full(
                 (total_length,), pad_token_id, dtype=input_ids.dtype
             )
             full_logprobs = torch.zeros(total_length, dtype=torch.float32)
+            full_output[:input_length] = input_ids[i][:input_length]
+
             if i in skip_results:
-
+                generation_length = 0
+                is_truncated = False
             else:
+                new_tokens, new_logprobs, is_truncated = router_results[i]
+                generation_length = len(new_tokens)
+                if new_tokens:
+                    full_output[input_length : input_length + generation_length] = (
+                        torch.tensor(new_tokens, dtype=input_ids.dtype)
+                    )
+                if new_logprobs:
+                    full_logprobs[input_length : input_length + len(new_logprobs)] = (
+                        torch.tensor(new_logprobs, dtype=torch.float32)
+                    )
 
-
-        for i, (_, new_tokens, new_logprobs, is_truncated) in enumerate(router_results):
-            input_len = input_lengths[i].item()
-            generation_length = len(new_tokens)
-            unpadded_length = input_len + generation_length
-
-            # Build full output: [input tokens | generated tokens | pad]
-            full_output = torch.full(
-                (total_length,), pad_token_id, dtype=input_ids.dtype
-            )
-            full_output[:input_len] = input_ids[i][:input_len]
-            if new_tokens:
-                full_output[input_len : input_len + generation_length] = torch.tensor(
-                    new_tokens, dtype=input_ids.dtype
-                )
-
-            # Logprobs: zeros for input tokens, actual logprobs at generated positions.
-            full_logprobs = torch.zeros(total_length, dtype=torch.float32)
-            if new_logprobs:
-                for idx, logprob in enumerate(new_logprobs):
-                    full_logprobs[input_len + idx] = logprob
-
+            unpadded_length = input_length + generation_length
             output_ids_list.append(full_output)
             logprobs_list.append(full_logprobs)
             generation_lengths_list.append(generation_length)
@@ -667,13 +674,6 @@ class SGLangGeneration(GenerationInterface):
         greedy: bool = False,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate a single sample using SGLang, yielding the result when ready.
-
-        This mirrors ``VllmGenerationWorker.generate_async``: it is restricted to
-        single-sample batches (``batch_size == 1``), so the surrounding
-        ``asyncio.create_task(...) / asyncio.as_completed(...)`` fan-out used in
-        the vLLM version is unnecessary here — we simply ``await`` the single
-        ``generate_one_sample`` call directly and yield its output.
-
         Args:
             data: BatchedDataDict with input_ids and input_lengths (batch_size must be 1)
             greedy: Whether to use greedy decoding instead of sampling
@@ -698,29 +698,32 @@ class SGLangGeneration(GenerationInterface):
         )
 
         sample_idx = 0
-        input_len = input_lengths_batch[sample_idx].item()
-        valid_input_ids = input_ids_batch[sample_idx, :input_len].tolist()
+        input_length = input_lengths_batch[sample_idx].item()
+        original_input_ids_single_row = input_ids_batch[sample_idx]
+        device = original_input_ids_single_row.device
+        dtype = original_input_ids_single_row.dtype
+        pad_token_id = self.sglang_cfg["_pad_token_id"]
 
-        # Merge stop strings for this single sample.
-        batch_stop_strings: list[list[str]] = data.get("stop_strings", [])
-        stop_strings = self._merge_stop_strings(batch_stop_strings)
-        per_sample_stop_strings = (
-            stop_strings[sample_idx] if sample_idx < len(stop_strings) else None
-        )
-
+        # Clamp max_new_tokens against the per-sample remaining context window,
+        # mirroring the logic in ``generate``.
         context_length = self.sglang_cfg["sglang_cfg"].get("context_length")
-        remaining_ctx = (
-            (context_length - input_len) if context_length is not None else None
-        )
+        if context_length is not None:
+            max_new_tokens = min(
+                self.sglang_cfg["max_new_tokens"], context_length - input_length
+            )
+        else:
+            max_new_tokens = self.sglang_cfg["max_new_tokens"]
+        max_new_tokens = max(0, max_new_tokens)
 
-        # Short-circuit when the prompt already fills the context window.
-        if remaining_ctx is not None and remaining_ctx <= 0:
-            device = input_ids_batch.device
-            output_ids_single_item_batched = input_ids_batch[
-                sample_idx, :input_len
+        # Short-circuit when there is no room left in the context window. Yield
+        # a pure-input row (generation_length=0, truncated=False) without
+        # touching the SGLang router.
+        if max_new_tokens == 0:
+            output_ids_single_item_batched = original_input_ids_single_row[
+                :input_length
             ].unsqueeze(0)
             logprobs_single_item = torch.zeros(
-                (1, input_len), dtype=torch.float32, device=device
+                (1, input_length), dtype=torch.float32, device=device
             )
             empty_result = BatchedDataDict[GenerationOutputSpec](
                 {
@@ -730,7 +733,7 @@ class SGLangGeneration(GenerationInterface):
                         [0], dtype=torch.long, device=device
                     ),
                     "unpadded_sequence_lengths": torch.tensor(
-                        [input_len], dtype=torch.long, device=device
+                        [input_length], dtype=torch.long, device=device
                     ),
                     "truncated": torch.tensor(
                         [False], dtype=torch.bool, device=device
@@ -740,14 +743,22 @@ class SGLangGeneration(GenerationInterface):
             yield (sample_idx, empty_result)
             return
 
+        # Merge stop strings for this single sample.
+        batch_stop_strings: list[list[str]] = data.get("stop_strings", [])
+        stop_strings = self._merge_stop_strings(batch_stop_strings)
+        per_sample_stop_strings = (
+            stop_strings[sample_idx] if sample_idx < len(stop_strings) else None
+        )
+
         sampling_params = self._build_sampling_params(
             greedy=greedy,
+            max_new_tokens=max_new_tokens,
             stop_strings=per_sample_stop_strings,
-            input_len=input_len,
         )
 
         router_ip = self.sglang_cfg["sglang_router"]["sglang_router_ip"]
         router_port = self.sglang_cfg["sglang_router"]["sglang_router_port"]
+        valid_input_ids = original_input_ids_single_row[:input_length].tolist()
 
         # batch_size == 1, so no task fan-out / as_completed is needed. Just
         # await the single coroutine directly.
@@ -760,49 +771,42 @@ class SGLangGeneration(GenerationInterface):
         )
 
         # Build the single-sample output tensor: [input | generated].
-        pad_token_id = self.sglang_cfg["_pad_token_id"]
-        original_input_ids_single_row = input_ids_batch[sample_idx]
-        device = original_input_ids_single_row.device
-        dtype = original_input_ids_single_row.dtype
-
-        num_generated_tokens = len(new_tokens)
-        final_output_tensor_len = input_len + num_generated_tokens
+        generation_length = len(new_tokens)
+        unpadded_length = input_length + generation_length
 
         output_ids_single_item = torch.full(
-            (final_output_tensor_len,), pad_token_id, dtype=dtype, device=device
+            (unpadded_length,), pad_token_id, dtype=dtype, device=device
         )
-        output_ids_single_item[:input_len] = original_input_ids_single_row[:input_len]
+        output_ids_single_item[:input_length] = original_input_ids_single_row[
+            :input_length
+        ]
         if new_tokens:
-            output_ids_single_item[input_len:final_output_tensor_len] = torch.tensor(
+            output_ids_single_item[input_length:unpadded_length] = torch.tensor(
                 new_tokens, dtype=dtype, device=device
             )
-        output_ids_single_item_batched = output_ids_single_item.unsqueeze(0)
 
         # Logprobs: zeros for input tokens, raw floats at generated positions.
         logprobs_single_item = torch.zeros(
-            (1, final_output_tensor_len), dtype=torch.float32, device=device
+            (1, unpadded_length), dtype=torch.float32, device=device
         )
         if new_logprobs:
-            for idx, logprob in enumerate(new_logprobs):
-                logprobs_single_item[0, input_len + idx] = logprob
-
-        generation_lengths_tensor = torch.tensor(
-            [num_generated_tokens], dtype=torch.long, device=device
-        )
-        unpadded_sequence_lengths_tensor = torch.tensor(
-            [final_output_tensor_len], dtype=torch.long, device=device
-        )
-        truncated_tensor = torch.tensor(
-            [bool(is_truncated)], dtype=torch.bool, device=device
-        )
+            logprobs_single_item[
+                0, input_length : input_length + len(new_logprobs)
+            ] = torch.tensor(new_logprobs, dtype=torch.float32, device=device)
 
         result_batch = BatchedDataDict[GenerationOutputSpec](
             {
-                "output_ids": output_ids_single_item_batched,
+                "output_ids": output_ids_single_item.unsqueeze(0),
                 "logprobs": logprobs_single_item,
-                "generation_lengths": generation_lengths_tensor,
-                "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
-                "truncated": truncated_tensor,
+                "generation_lengths": torch.tensor(
+                    [generation_length], dtype=torch.long, device=device
+                ),
+                "unpadded_sequence_lengths": torch.tensor(
+                    [unpadded_length], dtype=torch.long, device=device
+                ),
+                "truncated": torch.tensor(
+                    [bool(is_truncated)], dtype=torch.bool, device=device
+                ),
             }
         )
 
