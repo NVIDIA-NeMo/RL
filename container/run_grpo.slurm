@@ -133,7 +133,7 @@ COMMON_SRUN_ARGS+=" --no-container-mount-home"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
-COMMON_SRUN_ARGS+=" --container-workdir=$(pwd)"
+COMMON_SRUN_ARGS+=" --container-workdir=/opt/nemo-rl"
 
 num_retries=3
 
@@ -323,7 +323,7 @@ echo "All Ray workers connected!"
 # ==============================================================================
 # Run training (or idle)
 # ==============================================================================
-CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
+CONTAINER_CWD=/opt/nemo-rl
 
 if [[ -n "$COMMAND" ]]; then
   echo "Running: $COMMAND"
