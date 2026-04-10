@@ -1685,14 +1685,11 @@ class TestSetupModelAndOptimizer:
 
             mock_torch_cuda.enable_cudnn_sdp.assert_called_with(False)
 
-    @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
+    @pytest.mark.hf_gated
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
-    @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_with_tied_word_embeddings(
         self,
-        mock_get_class,
         mock_get_rank,
-        mock_lambda_lr,
         mock_config,
         mock_runtime_config,
         mock_distributed_context,
@@ -1700,28 +1697,19 @@ class TestSetupModelAndOptimizer:
         mock_tokenizer,
     ):
         """Test model setup with tied word embeddings."""
+        from transformers import AutoModelForCausalLM
+
+        # Mock the rank to be 0
         mock_get_rank.return_value = 0
-        mock_lambda_lr.return_value = MagicMock()
 
-        mock_embed_weight = torch.nn.Parameter(torch.zeros(100, 768))
-        mock_model = MagicMock()
-        mock_model.state_dict.return_value = {}
-        mock_model.config = MagicMock()
-        mock_model.config.pad_token_id = 0
-        mock_model.config.tie_word_embeddings = True
-        mock_model.lm_head = MagicMock()
-
-        # Setup named_parameters to return embed_tokens
-        mock_model.named_parameters.return_value = [
-            ("model.embed_tokens.weight", mock_embed_weight),
-            ("lm_head.weight", torch.nn.Parameter(torch.zeros(100, 768))),
-        ]
-
-        mock_runtime_config.model_class.from_pretrained.return_value = mock_model
-        mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
-
-        mock_optimizer = MagicMock()
-        mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
+        # Load the model
+        model = AutoModelForCausalLM.from_pretrained(
+            "google/gemma-3-1b-it",
+            torch_dtype=torch.bfloat16,
+            device_map="cpu",
+            trust_remote_code=True,
+        )
+        mock_runtime_config.model_class.from_pretrained.return_value = model
 
         setup_model_and_optimizer(
             config=mock_config,
@@ -1732,7 +1720,10 @@ class TestSetupModelAndOptimizer:
         )
 
         # Verify lm_head.weight was set to embed_tokens weight
-        assert mock_model.lm_head.weight is mock_embed_weight
+        assert (
+            model.lm_head.weight.data_ptr()
+            == model.get_input_embeddings().weight.data_ptr()
+        )
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")

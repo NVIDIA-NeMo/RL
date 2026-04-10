@@ -53,7 +53,6 @@ policy:
     sequence_parallel: true
     moe_permute_fusion: true
     apply_rope_fusion: false
-    gradient_accumulation_fusion: false
     # MTP — disabled
     mtp_num_layers: 0
     optimizer:
