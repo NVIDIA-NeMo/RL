@@ -41,6 +41,7 @@ from nemo_rl.models.generation.redesign.http_utils import (
 from nemo_rl.models.generation.redesign.misc import (
     NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
     run_router,
+    terminate_process,
 )
 from nemo_rl.models.generation.redesign.ray_utils import (
     Lock,
@@ -49,6 +50,8 @@ from nemo_rl.models.generation.redesign.ray_utils import (
     get_host_info,
 )
 from nemo_rl.models.generation.redesign.sglang_worker import SGLangEngine
+
+from nemo_rl.models.generation.redesign.fault_tolerance import RolloutHealthMonitor
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -77,6 +80,10 @@ class ServerGroup:
     router_port: int | None = None
     cluster_cfg: Any = None
     sglang_cfg: Any = None
+    # Router subprocess handle. Only set when _start_router actually spawned
+    # the router (i.e. sglang_router_ip was not already configured). Kept so
+    # SGLangGeneration.shutdown() can terminate it cleanly.
+    router_process: multiprocessing.Process | None = None
 
     @property
     def nodes_per_engine(self):
@@ -192,6 +199,7 @@ class ServerGroup:
         ]
         return init_handles, port_cursors
     
+    
     def recover(self):
         """Recover dead engines across all active groups, overlapping init."""
         dead_indices = [i for i, engine in enumerate(self.all_engines) if engine is None]
@@ -264,6 +272,13 @@ class SGLangGeneration(GenerationInterface):
 
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
 
+        monitor = None
+        if sglang_cfg["sglang_cfg"].get("use_fault_tolerance"):
+            monitor = RolloutHealthMonitor(self.server_group, sglang_cfg)
+            monitor.start()
+        self._health_monitor = monitor
+
+
     @property
     def rollout_engines(self):
         """All node-0 engines across all servers / models."""
@@ -309,10 +324,7 @@ class SGLangGeneration(GenerationInterface):
         server_group = self.server_group
 
         if server_group is None:
-            engines = server_group.engines if server_group else []
-            gpu_counts = server_group.engine_gpu_counts if server_group else []
-            gpu_offsets = server_group.engine_gpu_offsets if server_group else []
-            return engines, self.rollout_engine_lock, (server_group.num_new_engines if server_group else 0), gpu_counts, gpu_offsets
+            return [], self.rollout_engine_lock, 0, [], []
 
         server_group.recover()
         return (
@@ -329,7 +341,48 @@ class SGLangGeneration(GenerationInterface):
             self.server_group.num_new_engines = 0
 
     def check_weights(self, action: str):
-        return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
+        return ray.get(
+            [
+                engine.check_weights.remote(action=action)
+                for engine in self.rollout_engines
+                if engine is not None
+            ]
+        )
+
+    def health_monitoring_pause(self) -> None:
+        if self._health_monitor:
+            self._health_monitor.pause()
+
+    def health_monitoring_resume(self) -> None:
+        if self._health_monitor:
+            self._health_monitor.resume()
+
+    def shutdown(self) -> bool:
+        if self._health_monitor:
+            self._health_monitor.stop()
+
+        ok = True
+        engines = [e for e in self.server_group.all_engines if e is not None]
+        if engines:
+            try:
+                ray.get([e.shutdown.remote() for e in engines])
+            except Exception as e:
+                logger.warning(f"Engine shutdown failed: {e}")
+                ok = False
+
+        router_process = self.server_group.router_process
+        if router_process is not None:
+            try:
+                terminate_process(router_process, timeout=3.0)
+            except Exception as e:
+                logger.warning(f"Router terminate failed: {e}")
+                ok = False
+            self.server_group.router_process = None
+
+        return ok
+
+    def __del__(self) -> None:
+        self.shutdown()
 
     def _merge_stop_strings(self, batch_stop_strings) -> list[list[str]]:
         """Merge stop strings from config and batch.
@@ -749,9 +802,10 @@ async def generate_one_sample(sglang_router_ip, sglang_router_port, sampling_par
     else:
         response_tokens, response_log_probs = [], []
 
-    response_truncated = False
-    if output["meta_info"]["output_token_logprobs"] is not None and output["meta_info"]["output_token_logprobs"] == "length":
-        response_truncated = True
+    # SGLang reports the termination reason under meta_info.finish_reason.type;
+    # "length" means the decoder hit max_new_tokens before EOS.
+    finish_reason = output["meta_info"].get("finish_reason") or {}
+    response_truncated = finish_reason.get("type") == "length"
 
     return index, response_tokens, response_log_probs, response_truncated
 
@@ -852,31 +906,37 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 # Router + server bootstrap
 # ---------------------------------------------------------------------------
 
-def _start_router(args: SGLangConfig) -> tuple[str, int]:
-    """Start sgl router return (router_ip, router_port).
+def _start_router(
+    sglang_cfg: SGLangConfig,
+) -> tuple[str, int, multiprocessing.Process | None]:
+    """Start sgl router, returning ``(router_ip, router_port, process)``.
 
-    If ``args.sglang_router_ip`` is already set and ``force_new`` is False,
-    skip launching and return the existing values.
+    If ``sglang_router.sglang_router_ip`` is already set, reuse it and return
+    ``process=None`` (we do not own that router and must not terminate it).
+    Otherwise spawn a new router process and return its handle so the caller
+    can shut it down explicitly.
     """
-    if args.sglang_router_ip is not None:
-        return args.sglang_router_ip, args.sglang_router_port
+    router_cfg = sglang_cfg["sglang_router"]
+    if router_cfg["sglang_router_ip"] is not None:
+        return router_cfg["sglang_router_ip"], router_cfg["sglang_router_port"], None
 
     router_ip = _wrap_ipv6(get_host_info()[1])
-    router_port = args.sglang_router_port
+    router_port = router_cfg["sglang_router_port"]
     if router_port is None:
         router_port = find_available_port(random.randint(3000, 4000))
 
     from sglang_router.launch_router import RouterArgs
 
-    # pass from 
     router_args = RouterArgs()
     router_args.host = router_ip
     router_args.port = router_port
-    if args["sglang_router"]["router_policy"] is not None:
-        router_args.router_policy = args["sglang_router"]["router_policy"]
+    if router_cfg.get("router_policy") is not None:
+        router_args.router_policy = router_cfg["router_policy"]
     router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
     router_args.log_level = "warn"
-    router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
+    request_timeout_secs = router_cfg.get("sglang_router_request_timeout_secs")
+    if request_timeout_secs is not None:
+        router_args.request_timeout_secs = request_timeout_secs
 
     logger.info(f"Launch router with args: {router_args}")
 
@@ -889,7 +949,7 @@ def _start_router(args: SGLangConfig) -> tuple[str, int]:
     time.sleep(3)
     assert process.is_alive()
     logger.info(f"Router launched at {router_ip}:{router_port}")
-    return router_ip, router_port
+    return router_ip, router_port, process
 
 def start_rollout_servers(sglang_cfg, cluster_cfg, pg) -> ServerGroup:
     """Start rollout servers: one per model, each with its own router.
@@ -900,7 +960,7 @@ def start_rollout_servers(sglang_cfg, cluster_cfg, pg) -> ServerGroup:
     engine_offset = 0
     gpu_offset = 0
 
-    router_ip, router_port = _start_router(sglang_cfg)
+    router_ip, router_port, router_process = _start_router(sglang_cfg)
 
     sglang_cfg["sglang_router"]["sglang_router_ip"] = router_ip
     sglang_cfg["sglang_router"]["sglang_router_port"] = router_port
@@ -929,6 +989,7 @@ def start_rollout_servers(sglang_cfg, cluster_cfg, pg) -> ServerGroup:
         router_port=router_port,
         cluster_cfg=cluster_cfg,
         sglang_cfg=sglang_cfg,
+        router_process=router_process,
     )
 
     handles, port_cursors = server_group.start_engines(port_cursors)

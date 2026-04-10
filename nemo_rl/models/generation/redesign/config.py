@@ -93,12 +93,17 @@ class SglangSpecificArgs(TypedDict):
     enable_fast_load: NotRequired[bool]
     # Server warmup
     skip_server_warmup: NotRequired[bool]
+    # Fault tolerance
+    use_fault_tolerance: NotRequired[bool]
+    rollout_health_check_interval: NotRequired[int]
+    rollout_health_check_timeout: NotRequired[int]
+    rollout_health_check_first_wait: NotRequired[int]
 
 class SGLangServer(TypedDict):
     needs_offload: bool
     sglang_server_concurrency: int
     num_gpus: NotRequired[int]
-    num_gpus_per_engine: NotRequired[int]
+    num_gpus_per_engine: NotRequired[int] 
 
 class SGLangRouter(TypedDict):
     sglang_router_ip: NotRequired[str]

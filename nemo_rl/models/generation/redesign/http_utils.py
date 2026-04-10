@@ -65,13 +65,14 @@ async def _post(client, url, payload, max_retries=60, action="post"):
 def init_http_client(args: SGLangConfig):
     """Initialize HTTP client and optionally enable distributed POST via Ray."""
     global _http_client, _client_concurrency, _distributed_post_enabled
-    if not args.get("sglang_server").get("num_gpus"):
+    server_cfg = args.get("sglang_server") or {}
+    if not server_cfg.get("num_gpus"):
         return
 
     _client_concurrency = (
-        args["sglang_server"]["sglang_server_concurrency"]
-        * args["sglang_server"]["num_gpus"]
-        // args["sglang_server"]["num_gpus_per_engine"]
+        server_cfg["sglang_server_concurrency"]
+        * server_cfg["num_gpus"]
+        // server_cfg["num_gpus_per_engine"]
     )
     if _http_client is None:
         _http_client = httpx.AsyncClient(
@@ -80,7 +81,8 @@ def init_http_client(args: SGLangConfig):
         )
 
     # Optionally initialize distributed POST via Ray without changing interfaces
-    if args.get("sglang_router").get("use_distributed_post"):
+    router_cfg = args.get("sglang_router") or {}
+    if router_cfg.get("use_distributed_post"):
         _init_ray_distributed_post(args)
         _distributed_post_enabled = True
 

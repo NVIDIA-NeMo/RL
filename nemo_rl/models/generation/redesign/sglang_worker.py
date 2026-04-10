@@ -53,7 +53,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     p.start()
 
     if server_args.node_rank != 0:
-        return
+        return p
 
     _wait_server_healthy(
         base_url=server_args.url(),
@@ -124,8 +124,8 @@ class SGLangEngine:
         router_port=None,
     ):
 
-        self.router_ip = router_ip if router_ip is not None else self.sglang_cfg["sglang_cfg"]["sglang_router_ip"]
-        self.router_port = router_port if router_port is not None else self.sglang_cfg["sglang_cfg"]["sglang_router_port"]
+        self.router_ip = router_ip if router_ip is not None else self.sglang_cfg["sglang_router"]["sglang_router_ip"]
+        self.router_port = router_port if router_port is not None else self.sglang_cfg["sglang_router"]["sglang_router_port"]
 
         host = host or get_host_info()[1]
 
@@ -278,7 +278,6 @@ class SGLangEngine:
             raise TimeoutError("Timeout while flushing cache.")
 
     def shutdown(self):
-
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         if self.node_rank == 0:
             worker_url = f"http://{self.server_host}:{self.server_port}"
