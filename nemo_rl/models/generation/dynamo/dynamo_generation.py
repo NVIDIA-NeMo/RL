@@ -198,6 +198,7 @@ class DynamoVllmGeneration(GenerationInterface):
             "NATS_SERVER": f"nats://{self._host}:{self._nats_port}",
             "DYN_NAMESPACE": self._namespace,
             "DYN_DISCOVERY_BACKEND": "etcd",
+            "DYN_SDK_DISABLE_ANSI_LOGGING": "1",
             "DYN_LOG": "dynamo_llm::http::service::metrics=warn,dynamo_runtime::pipeline::network::ingress::push_handler=warn,dynamo_llm::http::service::service_v2=warn,info"
         }
 
@@ -298,7 +299,7 @@ class DynamoVllmGeneration(GenerationInterface):
 
         planner_config = {
             "environment": "virtual",
-            "mode": "decode",
+            "mode": "agg",
             "backend": "vllm",
             "namespace": self._namespace,
             "model_name": self.cfg.get("model", "unknown"),

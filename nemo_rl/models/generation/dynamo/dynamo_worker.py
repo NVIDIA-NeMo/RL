@@ -276,6 +276,8 @@ class DynamoVllmWorker:
                 kv_events_config_json=kv_events_json,
                 seed=seed,
             ),
+            "--dyn-tool-call-parser", "hermes",
+            "--dyn-reasoning-parser", "qwen3"
         ]
 
         # --- Subprocess environment ---
