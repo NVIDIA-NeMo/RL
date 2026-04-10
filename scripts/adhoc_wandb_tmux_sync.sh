@@ -6,11 +6,11 @@ INTERVAL_SECONDS="${INTERVAL_SECONDS:-900}"  # 15 minutes
 RUN_DIRS_CSV="${RUN_DIRS_CSV:-}"
 
 DEFAULT_RUN_DIRS=(
-  "/e/project1/scifi/kryeziu1/RL/scripts/logs/324524-ray"
-  "/e/project1/scifi/kryeziu1/RL/scripts/logs/324525-ray"
-  "/e/project1/scifi/kryeziu1/RL/scripts/logs/324526-ray"
-  "/e/project1/scifi/kryeziu1/RL/scripts/logs/324527-ray"
-  "/e/project1/scifi/kryeziu1/RL/scripts/logs/324528-ray"
+  "/e/project1/scifi/kryeziu1/RL/scripts/logs/348038-ray"
+  "/e/project1/scifi/kryeziu1/RL/scripts/logs/348039-ray"
+  "/e/project1/scifi/kryeziu1/RL/scripts/logs/348040-ray"
+  "/e/project1/scifi/kryeziu1/RL/scripts/logs/348441-ray"
+  "/e/project1/scifi/kryeziu1/RL/scripts/logs/348442-ray"
 )
 
 if [[ -n "$RUN_DIRS_CSV" ]]; then

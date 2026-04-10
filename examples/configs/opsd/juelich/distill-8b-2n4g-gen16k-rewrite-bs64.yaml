@@ -227,7 +227,7 @@ data:
         dataset_name: OpenThoughtsMath
     validation:
         - dataset_name: math500
-          repeat: 4
+          repeat: 1
           teacher_prompt_file: null
         - dataset_name: AIME2024
           repeat: 4
