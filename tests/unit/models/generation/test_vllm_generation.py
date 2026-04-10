@@ -245,6 +245,7 @@ def get_basic_megatron_test_config(
             "apply_rope_fusion": True,
             "bias_activation_fusion": True,
             "moe_per_layer_logging": False,
+            "gradient_accumulation_fusion": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
