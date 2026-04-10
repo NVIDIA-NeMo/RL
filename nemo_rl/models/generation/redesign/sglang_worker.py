@@ -14,7 +14,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
 
-from nemo_rl.models.generation.redesign.ray_http_utils import (
+from nemo_rl.models.generation.redesign.ray_utils import (
     get_current_node_ip,
     get_free_port,
     get_host_info,

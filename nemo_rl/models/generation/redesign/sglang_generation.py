@@ -34,15 +34,19 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.redesign.async_utils import run
 from nemo_rl.models.generation.redesign.config import SGLangConfig
-from nemo_rl.models.generation.redesign.ray_http_utils import (
+from nemo_rl.models.generation.redesign.http_utils import (
+    init_http_client,
+    post,
+)
+from nemo_rl.models.generation.redesign.misc import (
     NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
+    run_router,
+)
+from nemo_rl.models.generation.redesign.ray_utils import (
     Lock,
     _wrap_ipv6,
     find_available_port,
     get_host_info,
-    init_http_client,
-    post,
-    run_router,
 )
 from nemo_rl.models.generation.redesign.sglang_worker import SGLangEngine
 
@@ -850,7 +854,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 # ---------------------------------------------------------------------------
 
 def _start_router(args: SGLangConfig) -> tuple[str, int]:
-    """Start sgl router or miles router and return (router_ip, router_port).
+    """Start sgl router return (router_ip, router_port).
 
     If ``args.sglang_router_ip`` is already set and ``force_new`` is False,
     skip launching and return the existing values.
