@@ -39,6 +39,12 @@ class VllmSpecificArgs(TypedDict):
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
+    # Controls how the P*R batch is distributed across DP workers in the sync generate() path.
+    # "contiguous": each DP rank gets a contiguous slice (default). Rank 0 gets all R responses
+    #   of prompt 0, rank 1 gets all R responses of prompt 1, etc.
+    # "interleaved": round-robin / strided distribution. Rank 0 gets response 0 of every prompt,
+    #   rank 1 gets response 1 of every prompt, etc. Matches the async engine's distribution.
+    sync_dp_load_balancing: NotRequired[Literal["contiguous", "interleaved"]]
 
 
 class VllmConfig(GenerationConfig):

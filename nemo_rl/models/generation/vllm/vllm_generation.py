@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import math
 import os
 import warnings
 from collections import defaultdict
@@ -475,6 +476,28 @@ class VllmGeneration(GenerationInterface):
 
         # Shard the data across the tied worker groups
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+
+        # Reorder the batch for interleaved (round-robin) DP distribution.
+        # "contiguous" (default): rank r gets a contiguous slice of size total/dp_size.
+        # "interleaved": rank r gets every dp_size-th sample starting at r
+        # This can be useful to spread long sequences across different workers to 
+        # avoid long tail latency.
+        interleaved = (
+            self.cfg.get("vllm_cfg", {}).get("sync_dp_load_balancing", "contiguous")
+            == "interleaved"
+        )
+        perm: list[int] | None = None
+        if interleaved:
+            total = len(data["input_ids"])
+            shard_size = math.ceil(total / dp_size)
+            perm = [
+                r + s * dp_size
+                for r in range(dp_size)
+                for s in range(shard_size)
+                if r + s * dp_size < total
+            ]
+            data = data.select_indices(perm)
+
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
         )
@@ -494,6 +517,10 @@ class VllmGeneration(GenerationInterface):
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
             results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]}
         )
+
+        # Restore original sample order if we applied an interleaved permutation.
+        if perm is not None:
+            combined.reorder_data(perm)
 
         # Verify the output has all required fields
         required_keys = [
