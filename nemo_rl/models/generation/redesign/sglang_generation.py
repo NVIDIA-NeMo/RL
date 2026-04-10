@@ -240,15 +240,7 @@ class ServerGroup:
     def onload_kv(self):
         handles = self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
         return ray.get(handles) if handles else []
-    
-    def onload_weights_from_disk(self):
-        """Reload weights from ``model_path`` for non-updatable groups."""
-        if not self.needs_offload or not self.model_path:
-            return []
-        return [
-            engine.update_weights_from_disk.remote(self.model_path) for engine in self.engines if engine is not None
-        ]
-    
+
 
 class SGLangGeneration(GenerationInterface):
     """The class to run rollout and convert rollout data to training data."""
