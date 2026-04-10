@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import re
 from math import gcd
 from typing import Any
 
 import numpy as np
-from datasets import Dataset, load_dataset
+import soundfile as sf
+from datasets import Audio, Dataset, load_dataset
 from scipy.signal import resample_poly
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
@@ -89,9 +91,11 @@ class AVQADataset(RawDataset):
 
         if max_samples is not None:
             ds = load_dataset("gijs/avqa-processed", split=split, streaming=True)
+            ds = ds.cast_column("audio", Audio(decode=False))
             self.dataset = Dataset.from_list(list(ds.take(max_samples)))
         else:
             self.dataset = load_dataset("gijs/avqa-processed", split=split)
+            self.dataset = self.dataset.cast_column("audio", Audio(decode=False))
 
         self.dataset = self.dataset.add_column(
             "task_name", [self.task_name] * len(self.dataset)
@@ -104,14 +108,12 @@ class AVQADataset(RawDataset):
         self.split_train_validation(split_validation_size, seed)
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
-        audio_data = data["audio"]
-        audio_array = audio_data["array"]
+        audio_raw = data["audio"]
+        audio_array, orig_sr = sf.read(io.BytesIO(audio_raw["bytes"]))
 
         # Resample to 16kHz if needed
-        if audio_data["sampling_rate"] != 16000:
-            audio_array = _resample_audio(
-                audio_array, audio_data["sampling_rate"], 16000
-            )
+        if orig_sr != 16000:
+            audio_array = _resample_audio(audio_array, orig_sr, 16000)
 
         # Parse question and build prompt
         question, choices = _parse_question(data["question"])
