@@ -37,6 +37,12 @@ except ImportError:
     )
 
 
+def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor:
+    if key.endswith("mlp.experts.down_proj"):
+        weight = weight.transpose(-2, -1).contiguous()
+    return weight
+
+
 class VllmInternalWorkerExtension:
     def init_collective(
         self,
@@ -199,20 +205,30 @@ class VllmInternalWorkerExtension:
                     shape, dtype = self.state_dict_info[key]  # pyrefly
                     if isinstance(shape, list):
                         shape = torch.Size(shape)
+
+                    # Get the weight from the buffer
                     size_in_bytes = dtype.itemsize * shape.numel()
-                    weights.append(
-                        (
-                            key,
-                            buffer[offset : offset + size_in_bytes]
-                            .view(dtype=dtype)
-                            .view(shape),
-                        )
+                    weight = (
+                        buffer[offset : offset + size_in_bytes]
+                        .view(dtype=dtype)
+                        .view(shape)
                     )
+                    # apply gpt-oss transpose fix
+                    if (
+                        "GptOssForCausalLM"
+                        in self.model_runner.vllm_config.model_config.architectures
+                    ):
+                        weight = fix_gpt_oss_export_transpose(key, weight)
+                    weights.append((key, weight))
+
+                    # Move offset to the next weight
                     aligned_size = calculate_aligned_size(size_in_bytes)
                     offset += aligned_size
+
                 assert offset == used_bytes, (
                     "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
+
                 # Load weights into the model
                 from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -275,6 +291,15 @@ class VllmInternalWorkerExtension:
                 None
             """
             from nemo_rl.models.generation.vllm.quantization import fp8
+
+            # apply gpt-oss transpose fix
+            if (
+                "GptOssForCausalLM"
+                in self.model_runner.vllm_config.model_config.architectures
+            ):
+                for idx, (key, weight) in enumerate(weights):
+                    weight = fix_gpt_oss_export_transpose(key, weight)
+                    weights[idx] = (key, weight)
 
             policy_weights, draft_weights = self._split_policy_and_draft_weights(
                 weights
