@@ -14,117 +14,42 @@ import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
-
-from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
-from miles.backends.sglang_utils.sglang_engine import SGLangEngine
-from miles.rollout.base_types import (
-    RolloutFnConstructorInput,
-    RolloutFnEvalInput,
-    RolloutFnTrainInput,
-    call_rollout_fn,
+from sglang.srt.constants import (
+    GPU_MEMORY_TYPE_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
 )
-from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
-from miles.utils import tracking_utils
-from miles.utils.environ import enable_experimental_rollout_refactor
-from miles.utils.health_monitor import RolloutHealthMonitor
-from miles.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
-from miles.utils.iter_utils import group_by
-from miles.utils.logging_utils import configure_logger
-from miles.utils.metric_checker import MetricChecker
-from miles.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
-from miles.utils.misc import load_function
-from miles.utils.ray_utils import Box
-from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
-from miles.utils.tracking_utils import init_tracking
-from miles.utils.types import Sample
 
-from ..utils.metric_utils import has_repetition
-from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import (
+    ClusterConfig,
+    RayVirtualCluster,
+    get_reordered_bundle_and_gpu_ids,
+)
+from nemo_rl.models.generation.interfaces import (
+    GenerationDatumSpec,
+    GenerationInterface,
+    GenerationOutputSpec,
+    verify_right_padding,
+)
+from nemo_rl.models.generation.redesign.async_utils import run
+from nemo_rl.models.generation.redesign.config import SGLangConfig
+from nemo_rl.models.generation.redesign.ray_http_utils import (
+    NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
+    Lock,
+    _wrap_ipv6,
+    find_available_port,
+    get_host_info,
+    init_http_client,
+    post,
+    run_router,
+)
+from nemo_rl.models.generation.redesign.sglang_worker import SGLangEngine
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# ServerGroup / RolloutServer abstractions
-# ---------------------------------------------------------------------------
-
-# use_unified_pg = True for Nemo
-#         if use_unified_pg:
-#             # Create a single unified placement group for cross-node model parallelism
-#             all_bundles = []
-#             for bundle_count in self._bundle_ct_per_node_list:
-#                 for _ in range(bundle_count):
-#                     all_bundles.append(
-#                         {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
-#                     )
-
-#             placement_groups = [
-#                 placement_group(
-#                     bundles=all_bundles, strategy=strategy, name=f"{self.name}-unified"
-#                 )
-#             ]
-
-#         pg = cluster._init_placement_groups(strategy="PACK", use_unified_pg=True)[0]
-#         pg_reordered_bundle_indices   = cluster._get_sorted_bundle_indices()
-
-
-class AsyncLoopThread:
-    def __init__(self):
-        self.loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._start_loop, daemon=True)
-        self._thread.start()
-
-    def _start_loop(self):
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
-
-    def run(self, coro):
-        # Schedule a coroutine onto the loop and block until it's done
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
-
-# Create one global instance
-async_loop = None
-
-def get_async_loop():
-    global async_loop
-    if async_loop is None:
-        async_loop = AsyncLoopThread()
-    return async_loop
-
-def run(coro):
-    """Run a coroutine in the background event loop."""
-    return get_async_loop().run(coro)
-
-
-async def generate_one_sample(sglang_router_ip, sglang_router_port, sampling_params, input_ids, index: int):
-    """Generate using traditional SGLang router with token-based workflow"""
-    url = f"http://{sglang_router_ip}:{sglang_router_port}/generate"
-
-    # Prepare payload for sglang server
-    payload = {
-        "sampling_params": sampling_params,
-        "return_logprob": True,
-        "input_ids": input_ids,
-    }
-
-    output = await post(url, payload)
-
-    if "output_token_logprobs" in output["meta_info"]:
-        response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-        response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-    else:
-        response_tokens, response_log_probs = [], []
-
-    response_truncated = False
-    if response_truncated["meta_info"]["output_token_logprobs"] is not None and output["meta_info"]["output_token_logprobs"] == "length":
-        response_truncated = True
-
-    return index, response_tokens, response_log_probs, response_truncated
-
 
 @dataclasses.dataclass
 class ServerGroup:
@@ -146,6 +71,8 @@ class ServerGroup:
     model_path: str | None = None
     router_ip: str | None = None
     router_port: int | None = None
+    cluster_cfg: Any = None
+    sglang_cfg: Any = None
 
     @property
     def nodes_per_engine(self):
@@ -155,10 +82,6 @@ class ServerGroup:
     def engines(self):
         """Node-0 engines only (for multi-node serving)."""
         return self.all_engines[:: self.nodes_per_engine]
-    
-    @num_new_engines.setter
-    def num_new_engines(self, value):
-        self.num_new_engines = value
 
     @property
     def engine_gpu_counts(self) -> list[int]:
@@ -224,7 +147,8 @@ class ServerGroup:
                     "env_vars": env_vars,
                 },
             ).remote(
-                self.args,
+                self.cluster_cfg,
+                self.sglang_cfg,
                 rank=global_rank,
                 base_gpu_id=base_gpu_id,
                 num_gpus_per_engine=self.num_gpus_per_engine,
@@ -240,8 +164,9 @@ class ServerGroup:
 
         base_port = max(port_cursors.values()) if port_cursors else 15000
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
+            cluster_cfg=self.cluster_cfg,
+            sglang_cfg=self.sglang_cfg,
             rollout_engines=rollout_engines,
-            num_gpus_per_engine=self.num_gpus_per_engine,
             rank_offset=self.rank_offset,
             base_port=base_port,
         )
@@ -258,34 +183,25 @@ class ServerGroup:
     
     def recover(self):
         """Recover dead engines across all active groups, overlapping init."""
-        dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in self.server_groups]
+        dead_indices = [i for i, engine in enumerate(self.all_engines) if engine is None]
 
-        all_handles = []
         port_cursors: dict[int, int] = {}
-        for g in self.server_groups:
-            handles, port_cursors = g.start_engines(port_cursors)
-            all_handles.extend(handles)
-        if all_handles:
-            ray.get(all_handles)
+        handles = self.start_engines(port_cursors)
+        if handles:
+            ray.get(handles)
 
         release_handles = []
         updatable_new_engines = []
-        non_updatable_groups_engines: list[tuple[str, list]] = []
-        for g, dead_indices in zip(self.server_groups, dead_per_group, strict=True):
-            assert g.num_new_engines == len(dead_indices), "num_new_engines does not match dead_indices length"
-            if g.needs_offload and dead_indices:
-                new_engines = [g.all_engines[i] for i in dead_indices]
-                release_handles.extend(engine.release_memory_occupation.remote() for engine in new_engines)
-                if self.update_weights:
-                    updatable_new_engines.extend(new_engines)
-                elif g.model_path:
-                    non_updatable_groups_engines.append((g.model_path, new_engines))
+
+        assert self.num_new_engines == len(dead_indices), "num_new_engines does not match dead_indices length"
+        if self.needs_offload and dead_indices:
+            new_engines = [self.all_engines[i] for i in dead_indices]
+            release_handles.extend(engine.release_memory_occupation.remote() for engine in new_engines)
+            updatable_new_engines.extend(new_engines)
 
         if release_handles:
             ray.get(release_handles)
             all_resume_engines = updatable_new_engines[:]
-            for _model_path, engines in non_updatable_groups_engines:
-                all_resume_engines.extend(engines)
             if all_resume_engines:
                 ray.get(
                     [
@@ -321,17 +237,12 @@ class ServerGroup:
         return [
             engine.update_weights_from_disk.remote(self.model_path) for engine in self.engines if engine is not None
         ]
-
-# ---------------------------------------------------------------------------
-# SGLangGeneration
-# ---------------------------------------------------------------------------
+    
 
 class SGLangGeneration(GenerationInterface):
     """The class to run rollout and convert rollout data to training data."""
 
     def __init__(self, cluster: RayVirtualCluster, cluster_cfg: ClusterConfig, sglang_cfg: SGLangConfig):
-        configure_logger()
-
         self.cluster = cluster
         self.cluster_cfg = cluster_cfg
         self.sglang_cfg = sglang_cfg
@@ -341,15 +252,14 @@ class SGLangGeneration(GenerationInterface):
         )
         self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids = get_reordered_bundle_and_gpu_ids(self.pg)
 
-        init_http_client(args)
-        self.server_group = start_rollout_servers(args, (self.pg, self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids))
+        init_http_client(sglang_cfg)
+        self.server_group = start_rollout_servers(
+            sglang_cfg,
+            cluster_cfg,
+            (self.pg, self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids),
+        )
 
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
-
-        
-    def dispose(self):
-        if self._metric_checker is not None:
-            self._metric_checker.dispose()
 
     @property
     def rollout_engines(self):
@@ -394,7 +304,8 @@ class SGLangGeneration(GenerationInterface):
         updates from training).
         """
         server_group = self.server_group
-        if self.rollout_id == -1 or server_group is None:
+
+        if server_group is None:
             engines = server_group.engines if server_group else []
             gpu_counts = server_group.engine_gpu_counts if server_group else []
             gpu_offsets = server_group.engine_gpu_offsets if server_group else []
@@ -812,10 +723,40 @@ class SGLangGeneration(GenerationInterface):
 
         yield (sample_idx, result_batch)
 
+
+# ---------------------------------------------------------------------------
+# Generate one sample helper
+# ---------------------------------------------------------------------------
+async def generate_one_sample(sglang_router_ip, sglang_router_port, sampling_params, input_ids, index: int):
+    """Generate using traditional SGLang router with token-based workflow"""
+    url = f"http://{sglang_router_ip}:{sglang_router_port}/generate"
+
+    # Prepare payload for sglang server
+    payload = {
+        "sampling_params": sampling_params,
+        "return_logprob": True,
+        "input_ids": input_ids,
+    }
+
+    output = await post(url, payload)
+
+    if "output_token_logprobs" in output["meta_info"]:
+        response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+        response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+    else:
+        response_tokens, response_log_probs = [], []
+
+    response_truncated = False
+    if output["meta_info"]["output_token_logprobs"] is not None and output["meta_info"]["output_token_logprobs"] == "length":
+        response_truncated = True
+
+    return index, response_tokens, response_log_probs, response_truncated
+
+
+
 # ---------------------------------------------------------------------------
 # Port allocation helpers
 # ---------------------------------------------------------------------------
-
 def _allocate_rollout_engine_addr_and_ports_normal(
     *,
     cluster_cfg,
@@ -980,9 +921,11 @@ def start_rollout_servers(sglang_cfg, cluster_cfg, pg) -> ServerGroup:
         rank_offset=engine_offset,
         gpu_offset=gpu_offset,
         needs_offload=needs_offload,
-        model_path= model_path,
+        model_path=model_path,
         router_ip=router_ip,
         router_port=router_port,
+        cluster_cfg=cluster_cfg,
+        sglang_cfg=sglang_cfg,
     )
 
     handles, port_cursors = server_group.start_engines(port_cursors)

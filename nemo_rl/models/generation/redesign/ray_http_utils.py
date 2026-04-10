@@ -1,3 +1,119 @@
+import asyncio
+import io
+import ipaddress
+import json
+import logging
+import multiprocessing
+import os
+import random
+import socket
+from multiprocessing.reduction import ForkingPickler
+from typing import Callable, Union
+
+import httpx
+import pybase64
+import ray
+import torch
+from torch.multiprocessing import reductions
+
+from nemo_rl.models.generation.redesign.config import SGLangConfig
+
+logger = logging.getLogger(__name__)
+
+
+class RayActor:
+    """Base class for Ray actors providing node IP / free port helpers."""
+
+    @staticmethod
+    def _get_current_node_ip_and_free_port(start_port=10000, consecutive=1):
+        return get_current_node_ip(), get_free_port(
+            start_port=start_port, consecutive=consecutive
+        )
+
+    def get_master_addr_and_port(self):
+        return self.master_addr, self.master_port
+
+
+class MultiprocessingSerializer:  # pragma: no cover
+    """Serialize/deserialize Python objects using ForkingPickler for IPC.
+
+    This class enables serialization of objects (including CUDA tensors with IPC
+    handles) for transfer between processes via HTTP or other mechanisms.
+
+    Original source (sglang v0.5.2):
+    https://github.com/sgl-project/sglang/blob/v0.5.2/python/sglang/srt/utils.py#L589-L623
+    """
+
+    @staticmethod
+    def serialize(obj, output_str: bool = False):
+        """Serialize a Python object using ForkingPickler.
+
+        Args:
+            obj: The object to serialize.
+            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
+
+        Returns:
+            bytes or str: The serialized object.
+        """
+        buf = io.BytesIO()
+        ForkingPickler(buf).dump(obj)
+        buf.seek(0)
+        output = buf.read()
+
+        if output_str:
+            # Convert bytes to base64-encoded string
+            output = pybase64.b64encode(output).decode("utf-8")
+
+        return output
+
+    @staticmethod
+    def deserialize(data):
+        """Deserialize a previously serialized object.
+
+        Args:
+            data (bytes or str): The serialized data, optionally base64-encoded.
+
+        Returns:
+            The deserialized Python object.
+        """
+        if isinstance(data, str):
+            # Decode base64 string to bytes
+            data = pybase64.b64decode(data, validate=True)
+
+        return ForkingPickler.loads(data)
+
+
+
+NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
+    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+    "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
+    "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES",
+    "RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES",
+    "RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES",
+    "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
+    "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR",
+]
+
+
+@ray.remote
+class Lock(RayActor):
+    def __init__(self):
+        self._locked = False  # False: unlocked, True: locked
+
+    def acquire(self):
+        """
+        Try to acquire the lock. Returns True if acquired, False otherwise.
+        Caller should retry until it returns True.
+        """
+        if not self._locked:
+            self._locked = True
+            return True
+        return False
+
+    def release(self):
+        """Release the lock, allowing others to acquire."""
+        assert self._locked, "Lock is not acquired, cannot release."
+        self._locked = False
 
 
 
@@ -26,9 +142,6 @@ def is_port_available(port):
 
 def get_host_info():
     hostname = socket.gethostname()
-
-    if env_overwrite_local_ip := os.getenv(MILES_HOST_IP_ENV, None):
-        return hostname, env_overwrite_local_ip
 
     def _is_loopback(ip):
         return ip.startswith("127.") or ip == "::1"
@@ -194,13 +307,17 @@ async def _post(client, url, payload, max_retries=60, action="post"):
     return output
 
 
-def init_http_client(args: SglangSpecificArgs):
+def init_http_client(args: SGLangConfig):
     """Initialize HTTP client and optionally enable distributed POST via Ray."""
     global _http_client, _client_concurrency, _distributed_post_enabled
-    if not args.rollout_num_gpus:
+    if not args.get("sglang_server").get("num_gpus"):
         return
 
-    _client_concurrency = args["sglang_server"]["sglang_server_concurrency"] * args["sglang_server"]["num_gpus"] // args["sglang_server"]["num_gpus_per_engine"]
+    _client_concurrency = (
+        args["sglang_server"]["sglang_server_concurrency"]
+        * args["sglang_server"]["num_gpus"]
+        // args["sglang_server"]["num_gpus_per_engine"]
+    )
     if _http_client is None:
         _http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=_client_concurrency),
@@ -208,12 +325,12 @@ def init_http_client(args: SglangSpecificArgs):
         )
 
     # Optionally initialize distributed POST via Ray without changing interfaces
-    if args.use_distributed_post:
+    if args.get("sglang_router").get("use_distributed_post"):
         _init_ray_distributed_post(args)
         _distributed_post_enabled = True
 
 
-def _init_ray_distributed_post(args: SglangSpecificArgs):
+def _init_ray_distributed_post(args: SGLangConfig):
     """Initialize one or more Ray async actors per node for HTTP POST.
 
     Uses NodeAffinitySchedulingStrategy to place actors on distinct nodes.

@@ -6,14 +6,19 @@ import os
 import time
 from urllib.parse import quote
 
+import ray
 import requests
 import sglang_router
 from packaging.version import parse
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
-from miles.utils.env_report import collect_and_print_node_env_report
-import ray
+
+from nemo_rl.models.generation.redesign.ray_http_utils import (
+    get_current_node_ip,
+    get_free_port,
+    get_host_info,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -492,7 +497,7 @@ def _compute_server_args(
         "pp_size": sglang_cfg["sglang_cfg"]["pp_size"],
         "ep_size": sglang_cfg["sglang_cfg"]["ep_size"],
         # always skip warmup to prevent warmup timeout.
-        "skip_server_warmup": True,
+        "skip_server_warmup": sglang_cfg["sglang_cfg"]["skip_server_warmup"],
         # always enable draft weights cpu backup so that we run training without mtp weights.
         "enable_draft_weights_cpu_backup": True,
     }
@@ -500,7 +505,7 @@ def _compute_server_args(
     for key in [
         "dtype",
         "kv_cache_dtype",
-        " ",
+        "context_length",
         "max_running_requests",
         "chunked_prefill_size",
         "max_prefill_tokens",
@@ -516,4 +521,3 @@ def _compute_server_args(
             kwargs[key] = sglang_cfg["sglang_cfg"][key]
 
     return kwargs
-

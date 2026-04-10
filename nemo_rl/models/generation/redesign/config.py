@@ -104,6 +104,7 @@ class SGLangRouter(TypedDict):
     sglang_router_ip: NotRequired[str]
     sglang_router_port: NotRequired[int]
     router_policy: NotRequired[str]
+    use_distributed_post: NotRequired[bool]
 
 class SGLangConfig(GenerationConfig):
     """Configuration for SGLang runtime."""
