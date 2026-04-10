@@ -1,0 +1,192 @@
+# NeMo-RL GRPO Config - FAST VERSION FOR TESTING
+# Model: Qwen/Qwen3-4B-Thinking-2507
+# Optimized for quick iterations and frequent logging
+defaults: /fsx/edward/work/scale-rl/nemo-rl/examples/configs/grpo_math_1B.yaml
+
+cluster:
+  num_nodes: 2
+  gpus_per_node: 8
+
+data:
+  dataset_name: "OpenMathInstruct-2"
+  max_input_seq_length: 256  # Reduced from 512 for faster processing
+  num_workers: 1
+  prompt_file: "examples/prompts/cot.txt"
+  shuffle: true
+  system_prompt_file: null
+
+grpo:
+  seed: 42
+  max_num_steps: 5  # Reduced from 10 for quick testing
+  max_num_epochs: 10
+  num_generations_per_prompt: 4  # Reduced from 16 (4x speedup)
+  num_prompts_per_step: 16  # Reduced from 64 (4x speedup)
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  max_rollout_turns: 1
+  batch_multiplier: 1
+  overlong_filtering: false
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  val_at_start: false
+  val_period: 1  # Validate every single step for maximum logging
+  val_batch_size: 64  # Smaller validation batches (was 256)
+  max_val_samples: 64  # Fewer validation samples (was 256)
+
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  reward_shaping:
+    enabled: false
+    max_response_length: 256  # Reduced from 1024
+    overlong_buffer_length: 64  # Reduced from 128
+    overlong_buffer_penalty: 1
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0  # TRL: beta = 0.0 (No KL term)
+  reference_policy_kl_type: "k3"
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  token_level_loss: true
+  sequence_level_importance_ratios: false
+  use_importance_sampling_correction: false
+  use_on_policy_kl_approximation: false
+  truncated_importance_sampling_ratio: null
+
+policy:
+  model_name: "Qwen/Qwen3-4B-Thinking-2507"
+  max_total_sequence_length: 512  # Reduced from 1536 (256 prompt + 256 completion)
+  max_grad_norm: 1.0
+  generation_batch_size: 16
+  logprob_batch_size: 4  # Increased from 2 for faster logprob computation
+  logprob_chunk_size: null
+  make_sequence_length_divisible_by: 1
+  hf_config_overrides: {}
+  precision: "bfloat16"
+
+  # Tokenizer
+  tokenizer:
+    name: "Qwen/Qwen3-4B-Thinking-2507"
+    chat_template_kwargs: null
+
+  # Batch sizes - reduced for faster iterations
+  train_global_batch_size: 64  # Reduced from 512 (8x speedup)
+  train_micro_batch_size: 1
+
+  # Optimizer (for DTensor path)
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-06  # TRL: learning_rate
+      betas: [0.9, 0.999]
+      eps: 1.0e-08
+      weight_decay: 0.01
+      foreach: false
+      fused: false
+
+  # Scheduler - simple constant LR
+  scheduler:
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: []
+
+  # Offload optimizer during logprob computation
+  offload_optimizer_for_logprob: false
+
+  # Dynamic batching disabled for simplicity
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 8192
+    sequence_length_round: 64
+
+  # Sequence packing disabled
+  sequence_packing:
+    enabled: false
+    algorithm: "modified_first_fit_decreasing"
+    max_diff_pct: 0.1
+
+  # Generation settings - OPTIMIZED FOR SPEED
+  generation:
+    backend: "vllm"  # TRL: use_vllm = true
+    max_new_tokens: 256  # Reduced from 1024 (4x speedup per generation)
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_strings: null
+    stop_token_ids: null
+
+    vllm_cfg:
+      precision: "bfloat16"
+      max_model_len: 512  # Reduced from 1536
+      gpu_memory_utilization: 0.4  # Lower = faster KV cache allocation during init
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      enforce_eager: true # Disable slow Capturing CUDA graph for faster init
+      use_deep_gemm: false
+      num_first_layers_in_bf16: 0
+      num_last_layers_in_bf16: 0
+      async_engine: true
+
+    vllm_kwargs:
+      compilation_config:
+        use_inductor: false  # Disable torch compilation for faster init
+
+  # DTensor (FSDP2 with TP1) - simplified
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: false
+    cpu_offload: false
+    custom_parallel_plan: null
+
+  # Megatron disabled - using DTensor instead
+  megatron_cfg:
+    enabled: false
+
+env:
+  math:
+    math_verify_impl: "hf_math_verify"
+    num_workers: 8
+
+logger:
+  log_dir: "logs/grpo-qwen3-4b-thinking-fast"
+  monitor_gpus: true
+  num_val_samples_to_print: 2  # Print 2 validation samples for visibility
+  tensorboard_enabled: true
+  wandb_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+
+  tensorboard: {}
+  wandb:
+    project: "nemo-rl"
+    name: "grpo-qwen3-4b-thinking-fast"
+
+  gpu_monitoring:
+    collection_interval: 5  # Log GPU stats every 5 seconds
+    flush_interval: 5  # Flush logs every 5 seconds
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "/fsx/edward/checkpoints/nemo-rl/grpo_test_fast"
+  save_period: 10000
+  keep_top_k: 3
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  save_consolidated: false
+  model_save_format: "safetensors"
+  checkpoint_must_save_by: null
