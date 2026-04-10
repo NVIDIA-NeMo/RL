@@ -221,6 +221,7 @@ def setup_configs(args, tokenizer):
             "moe_per_layer_logging": False,
             "freeze_moe_router": False,
             "apply_rope_fusion": False,
+            "gradient_accumulation_fusion": False,
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,

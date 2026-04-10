@@ -108,6 +108,7 @@ policy:
     track_moe_metrics: True
     moe_per_layer_logging: True
     moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
 
     optimizer:
       optimizer: "adam"

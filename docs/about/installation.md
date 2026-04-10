@@ -82,8 +82,8 @@ uv venv
 >
 > ```sh
 > # Point TE at the pip-installed cuDNN (adjust path if UV_PROJECT_ENVIRONMENT is set)
-> export CUDNN_HOME=.venv/lib/python3.12/site-packages/nvidia/cudnn
-> export LD_LIBRARY_PATH=".venv/lib/python3.12/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
+> export CUDNN_HOME=.venv/lib/python3.13/site-packages/nvidia/cudnn
+> export LD_LIBRARY_PATH=".venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
 >
 > # Verify TE picks up the correct cuDNN version (TE is in the mcore extra).
 > # The version should match nvidia-cudnn-cu12 pinned in pyproject.toml (currently 9.19.0).

@@ -1,4 +1,4 @@
-python-version = "3.12.0"
+python-version = "3.13.11"
 replace-imports-with-any = [
   "nemo_automodel.*",
   "pynvml.*",
@@ -33,6 +33,7 @@ project-includes = [
   "docs/conf.py",
   "docs/helpers.py",
   "examples/converters/convert_dcp_to_hf.py",
+  "examples/converters/convert_lora_to_hf.py",
   "examples/converters/convert_megatron_to_hf.py",
   "examples/custom_dataloader/custom_dataloader.py",
   "examples/custom_parallel/custom_parallel.py",

@@ -510,12 +510,29 @@ class BaseVllmGenerationWorker:
                 )
                 # disable quantization
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
-        elif "Gemma3ForConditionalGeneration" in getattr(
-            hf_config, "architectures", []
+        elif any(
+            arch in getattr(hf_config, "architectures", [])
+            for arch in (
+                "Gemma3ForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            )
         ):
+            detected_arch = [
+                arch
+                for arch in getattr(hf_config, "architectures", [])
+                if arch
+                in (
+                    "Gemma3ForConditionalGeneration",
+                    "Qwen3_5ForConditionalGeneration",
+                    "Qwen3_5MoeForConditionalGeneration",
+                )
+            ]
             if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
                 print(
-                    "Gemma3ForConditionalGeneration models may crash when skip_tokenizer_init is True. NeMo-RL is forcing it to False for this architecture. See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
+                    f"Detected {detected_arch} which may crash when skip_tokenizer_init is True. "
+                    "NeMo-RL is forcing it to False for this architecture. "
+                    "See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
 
@@ -529,7 +546,9 @@ class BaseVllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
+            enable_prefix_caching=self.cfg["vllm_cfg"].get(
+                "enable_prefix_caching", torch.cuda.get_device_capability()[0] >= 8
+            ),
             dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
@@ -977,6 +996,16 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
         self.llm.llm_engine.reset_prefix_cache()
+        # Clear the renderer's multimodal processor cache (sender side) so it
+        # stays in sync with the receiver cache that vLLM clears internally
+        # during sleep.  Without this, the sender thinks images are already
+        # cached on the receiver and sends data=None, causing an assertion
+        # error.  We only clear the renderer (sender) cache here — the
+        # receiver and worker-level caches are reset by sleep() internally.
+        if hasattr(self.llm, "renderer") and hasattr(
+            self.llm.renderer, "clear_mm_cache"
+        ):
+            self.llm.renderer.clear_mm_cache()
         self.llm.sleep(level=1)
 
         gc.collect()
