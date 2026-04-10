@@ -160,7 +160,7 @@ requires-dist = ["torch", "scikit-build-core", "wheel"]
 [[manifest.dependency-metadata]]
 name = "sglang"
 version = "0.5.7.dev0"
-requires-dist = ["ipython", "aiohttp", "apache-tvm-ffi>=0.1.5,<0.2", "anthropic>=0.20.0", "blobfile==3.0.0", "build", "compressed-tensors", "cuda-python==12.9", "decord2", "datasets", "einops", "fastapi", "flashinfer-python==0.6.4", "flashinfer-cubin==0.6.4", "gguf", "interegular", "llguidance>=0.7.11,<0.8.0", "modelscope", "msgspec", "ninja", "numpy", "nvidia-cutlass-dsl>=4.3.4", "nvidia-ml-py", "openai-harmony==0.0.4", "openai==2.6.1", "orjson", "outlines==0.1.11", "packaging", "partial-json-parser", "pillow", "prometheus-client>=0.20.0", "psutil", "py-spy", "pybase64", "pydantic", "python-multipart", "pyzmq>=25.1.2", "quack-kernels==0.2.4", "requests", "scipy", "sentencepiece", "setproctitle", "sgl-kernel==0.3.21", "soundfile==0.13.1", "tiktoken", "timm==1.0.16", "torch-memory-saver==0.0.9", "torch==2.9.1", "torchao==0.9.0", "torchaudio==2.9.1", "torchcodec==0.8.0 ; (platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l') or sys_platform != 'linux'", "torchvision", "tqdm", "transformers==5.3.0", "uvicorn", "uvloop", "xgrammar==0.1.27", "smg-grpc-proto>=0.3.3", "grpcio>=1.78.0", "grpcio-reflection>=1.78.0", "grpcio-health-checking>=1.78.0"]
+requires-dist = ["ipython", "aiohttp", "apache-tvm-ffi>=0.1.5,<0.2", "anthropic>=0.20.0", "blobfile==3.0.0", "build", "compressed-tensors", "cuda-python==12.9", "decord2", "datasets", "einops", "fastapi", "flashinfer-python==0.6.4", "flashinfer-cubin==0.6.4", "gguf", "interegular", "llguidance>=0.7.11,<0.8.0", "modelscope", "msgspec", "ninja", "numpy", "nvidia-cutlass-dsl>=4.3.4", "nvidia-ml-py", "openai-harmony==0.0.4", "openai==2.6.1", "orjson", "outlines==0.1.11", "packaging", "partial-json-parser", "pillow", "prometheus-client>=0.20.0", "psutil", "py-spy", "pybase64", "pydantic", "python-multipart", "pyzmq>=25.1.2", "quack-kernels==0.2.4", "requests", "scipy", "sentencepiece", "setproctitle", "sgl-kernel==0.3.21", "soundfile==0.13.1", "tiktoken", "timm==1.0.16", "torch-memory-saver==0.0.9", "torch==2.9.1", "torchao==0.9.0", "torchaudio==2.9.1", "torchcodec==0.8.0 ; (platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l') or sys_platform != 'linux'", "torchvision", "tqdm", "transformers==5.2.0", "uvicorn", "uvloop", "xgrammar==0.1.27", "smg-grpc-proto>=0.3.3", "grpcio>=1.78.0", "grpcio-reflection>=1.78.0", "grpcio-health-checking>=1.78.0"]
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
@@ -4289,8 +4289,8 @@ requires-dist = [
     { name = "ray", extras = ["default"], specifier = "==2.54.0" },
     { name = "rich" },
     { name = "setuptools" },
-    { name = "sgl-kernel", marker = "extra == 'sglang'", git = "https://github.com/JustinTong0323/sglang.git?subdirectory=sgl-kernel&rev=70aa688742dd2b75bf9e8e980249303f39295b0d" },
-    { name = "sglang", marker = "extra == 'sglang'", git = "https://github.com/JustinTong0323/sglang.git?subdirectory=python&rev=70aa688742dd2b75bf9e8e980249303f39295b0d" },
+    { name = "sgl-kernel", marker = "extra == 'sglang'", git = "https://github.com/chtruong814/sglang.git?subdirectory=sgl-kernel&rev=78135940075cd87307f6a764d4402188d00ef7c3" },
+    { name = "sglang", marker = "extra == 'sglang'", git = "https://github.com/chtruong814/sglang.git?subdirectory=python&rev=78135940075cd87307f6a764d4402188d00ef7c3" },
     { name = "swanlab" },
     { name = "sympy", specifier = ">=1.14.0" },
     { name = "tensorboard" },
@@ -6933,7 +6933,7 @@ wheels = [
 [[package]]
 name = "sgl-kernel"
 version = "0.3.21"
-source = { git = "https://github.com/JustinTong0323/sglang.git?subdirectory=sgl-kernel&rev=70aa688742dd2b75bf9e8e980249303f39295b0d#70aa688742dd2b75bf9e8e980249303f39295b0d" }
+source = { git = "https://github.com/chtruong814/sglang.git?subdirectory=sgl-kernel&rev=78135940075cd87307f6a764d4402188d00ef7c3#78135940075cd87307f6a764d4402188d00ef7c3" }
 dependencies = [
     { name = "scikit-build-core" },
     { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -6944,7 +6944,7 @@ dependencies = [
 [[package]]
 name = "sglang"
 version = "0.5.7.dev0"
-source = { git = "https://github.com/JustinTong0323/sglang.git?subdirectory=python&rev=70aa688742dd2b75bf9e8e980249303f39295b0d#70aa688742dd2b75bf9e8e980249303f39295b0d" }
+source = { git = "https://github.com/chtruong814/sglang.git?subdirectory=python&rev=78135940075cd87307f6a764d4402188d00ef7c3#78135940075cd87307f6a764d4402188d00ef7c3" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
