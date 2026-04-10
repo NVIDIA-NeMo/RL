@@ -458,7 +458,17 @@ def setup(
     )
 
     if student_generation is not None:
+        # First pass — bf16, to get HF-style param names
         state_dict_info = student_policy.prepare_refit_info()
+
+        # Sync FP8 param names from generation to training (one-time).
+        fp8_param_names = student_generation.get_fp8_param_names(
+            list(state_dict_info.keys())
+        )
+        if fp8_param_names:
+            student_policy.set_fp8_param_names(fp8_param_names)
+            state_dict_info = student_policy.prepare_refit_info()
+
         student_generation.prepare_refit_info(state_dict_info)
 
     # if it is not colocated inference, initialize collective communication for update weights

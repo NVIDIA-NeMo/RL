@@ -997,6 +997,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         return cast(list[str], list_of_worker_results)
 
+    async def get_fp8_param_names_async(self, param_names: list[str]) -> set[str]:
+        """Async version of get_fp8_param_names."""
+        results = await self.llm.collective_rpc("get_fp8_param_names", args=(param_names,))
+        return results[0]
+
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))

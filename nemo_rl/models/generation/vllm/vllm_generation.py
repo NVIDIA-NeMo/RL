@@ -810,6 +810,21 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy shutdown: {e}")
             return False
 
+    def get_fp8_param_names(self, param_names: list[str]) -> set[str]:
+        """Classify which HF param names are FP8-quantized using vLLM's model."""
+        method_name = (
+            "get_fp8_param_names_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "get_fp8_param_names"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            param_names=param_names,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        results = ray.get(futures)
+        return results[0]
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
         # Choose the appropriate method based on async_engine setting

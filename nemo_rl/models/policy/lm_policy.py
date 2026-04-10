@@ -728,6 +728,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
+    def set_fp8_param_names(self, fp8_param_names: set[str]) -> None:
+        """Broadcast the FP8 param name set to all workers."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "set_fp8_param_names", fp8_param_names=fp8_param_names
+        )
+        ray.get(futures)
+
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare the info for refit.
 

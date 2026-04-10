@@ -798,6 +798,11 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         )
         return cast(list[str], list_of_worker_results)
 
+    def get_fp8_param_names(self, param_names: list[str]) -> set[str]:
+        """Classify which HF param names are FP8-quantized using vLLM's model."""
+        results = self.llm.collective_rpc("get_fp8_param_names", args=(param_names,))
+        return results[0]
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))

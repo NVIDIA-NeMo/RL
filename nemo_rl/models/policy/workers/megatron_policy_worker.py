@@ -900,11 +900,16 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
 
+    def set_fp8_param_names(self, fp8_param_names: set[str]) -> None:
+        """Cache the set of FP8-quantized param names obtained from vLLM."""
+        self._fp8_param_names = fp8_param_names
+
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
-        self.refit_param_info_mcore = self._calculate_refit_param_info()
+        if not hasattr(self, "refit_param_info_mcore") or self.refit_param_info_mcore is None:
+            self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
@@ -965,26 +970,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
         return param_info
 
-    def _is_fp8_weights_enabled(self) -> bool:
-        """Check if the generation side uses FP8 weight quantization."""
-        if (
-            "generation" in self.cfg
-            and self.cfg["generation"] is not None
-            and self.cfg["generation"]["backend"] == "vllm"
-        ):
-            vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
-            return vllm_cfg.get("precision") == "fp8"
-        return False
-
     def _iter_params_with_optional_kv_scales(
         self,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
-        When FP8 weight quantization is enabled for generation, eligible weights
-        are quantized to FP8 on the training worker and yielded as
-        (name, fp8_data) + (name + "_scale_inv", scale) pairs.  This reduces
+        When ``_fp8_param_names`` is populated (synced once from vLLM at init),
+        eligible weights are quantized to FP8 on the training worker and yielded
+        as (name, fp8_data) + (name + "_scale_inv", scale) pairs.  This reduces
         the broadcast payload from bf16 to fp8.
 
         This helper is used by both IPC-based streaming and collective broadcast
@@ -994,12 +988,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             FP8_WEIGHT_BLOCK_SIZE,
             cast_tensor_to_fp8_blockwise,
             get_vllm_qkv_scale_names,
-            should_quantize_to_fp8,
         )
 
-        use_fp8_weights = self._is_fp8_weights_enabled()
+        fp8_param_names = getattr(self, "_fp8_param_names", set())
         use_pow2_scale = False
-        if use_fp8_weights:
+        if fp8_param_names:
             vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
             use_pow2_scale = vllm_cfg.get("pow2_weight_scaling_factors", False)
 
@@ -1010,7 +1003,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
 
         for name, tensor in base_iter:
-            if use_fp8_weights and should_quantize_to_fp8(name, tensor):
+            if name in fp8_param_names:
                 fp8_data, scale = cast_tensor_to_fp8_blockwise(
                     tensor.to(torch.float),
                     weight_block_size=FP8_WEIGHT_BLOCK_SIZE,

@@ -700,9 +700,22 @@ def setup(
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
-    # prepare refit info
+    # prepare refit info (first pass — bf16, no FP8 quantization yet)
     state_dict_info = policy.prepare_refit_info()
+
+    # Sync FP8 param names from generation (vLLM) to training (Megatron).
+    # vLLM's model structure is the single source of truth for which weights
+    # are FP8-quantized.  state_dict_info keys are HF-style names produced by
+    # export_hf_weights — these are the names vLLM's _is_fp8_weight() expects.
     if policy_generation is not None:
+        fp8_param_names = policy_generation.get_fp8_param_names(
+            list(state_dict_info.keys())
+        )
+        if fp8_param_names:
+            policy.set_fp8_param_names(fp8_param_names)
+            # Re-generate with FP8 quantization applied to eligible weights
+            state_dict_info = policy.prepare_refit_info()
+
         policy_generation.prepare_refit_info(state_dict_info)
 
     # Calculate total setup time

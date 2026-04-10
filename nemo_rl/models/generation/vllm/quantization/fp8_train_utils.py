@@ -17,22 +17,6 @@ import torch
 FP8_WEIGHT_BLOCK_SIZE = [128, 128]
 
 
-def should_quantize_to_fp8(name: str, tensor: torch.Tensor) -> bool:
-    """Check whether a HuggingFace-named weight should be block-quantized to FP8.
-
-    Matches the same set of parameters that vLLM quantizes (linear-layer
-    weights only).  Embeddings, layernorms, biases, and lm_head are excluded.
-    """
-    if tensor.dim() != 2:
-        return False
-    if not name.endswith(".weight"):
-        return False
-    lower = name.lower()
-    if any(kw in lower for kw in ("norm", "embed", "lm_head")):
-        return False
-    return True
-
-
 def cast_tensor_to_fp8_blockwise(
     data_hp: torch.Tensor,
     weight_block_size: list[int],
