@@ -21,6 +21,7 @@ from nemo_rl.models.megatron.community_import import export_model_from_megatron
 """ NOTE: this script requires mcore. Make sure to launch with the mcore extra:
 uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
   --config <path_to_ckpt>/config.yaml \
+  --hf-model-name <repo>/model_name \
   --megatron-ckpt-path <path_to_ckpt>/policy/weights/iter_xxxxx \
   --hf-ckpt-path <path_to_save_hf_ckpt>
 """
@@ -36,6 +37,12 @@ def parse_args():
         type=str,
         default=None,
         help="Path to config.yaml file in the checkpoint directory",
+    )
+    parser.add_argument(
+        "--hf-model-name",
+        type=str,
+        default=None,
+        help="HuggingFace model name override",
     )
     parser.add_argument(
         "--megatron-ckpt-path",
@@ -59,7 +66,10 @@ def main():
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
 
-    model_name = config["policy"]["model_name"]
+    # Use hf_model_name override, if available.
+    model_name = (
+        args.hf_model_name if args.hf_model_name else config["policy"]["model_name"]
+    )
     tokenizer_name = config["policy"]["tokenizer"]["name"]
     hf_overrides = config["policy"].get("hf_overrides", {}) or {}
 

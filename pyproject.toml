@@ -13,7 +13,7 @@ readme = { file = "README.md", content-type = "text/markdown" }
 name = "nemo-rl"
 dynamic = ["version", "readme"]
 description = "NeMo RL: A Scalable and Efficient Post-Training Library for Models Ranging from 1 GPU to 1000s, and from Tiny to >100B Parameters"
-requires-python = ">=3.12"
+requires-python = ">=3.13.11"
 license = { text = "Apache 2.0" }
 dependencies = [
   "setuptools",
@@ -23,7 +23,7 @@ dependencies = [
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]==2.54.0",
-  "wandb>=0.25.0",
+  "wandb>=0.25.1",
   "numpy",
   "datasets>=4.0.0",
   "rich",
@@ -41,20 +41,20 @@ dependencies = [
   "matplotlib",
   "plotly",
   "sympy>=1.14.0",
-  "pillow>=11.3.0",
+  "pillow>=12.1.1",
   "torchvision==0.25.0",
   "transformers==5.3.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
-  "mlflow>=3.5.0,<3.6.0",
+  "mlflow>=3.9.0rc0",
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
   "decord2",
-
-  "nccl4py",                      # for non-colocated refit
-  "cuda-bindings",                # for non-colocated refit
-  "pybase64",                     # for sglang refit
-  "nvidia-cudnn-cu12==9.19.0.56", # for transformer-engine no build isolation
+  "nccl4py",                                                                                                          # for non-colocated refit
+  "cuda-bindings",                                                                                                    # for non-colocated refit
+  "pybase64",                                                                                                         # for sglang refit
+  "nvidia-cudnn-cu12==9.19.0.56",                                                                                     # for transformer-engine no build isolation
+  # nvidia-resiliency-ext removed: no Python 3.13 wheels available (v0.5.0 only has cp310-cp312)
 ]
 
 [project.optional-dependencies]
@@ -98,14 +98,14 @@ mcore = [
   # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
   # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
   # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
-  "transformer-engine[pytorch]==2.12.0",
+  "transformer-engine[pytorch,core_cu12] @ git+https://github.com/NVIDIA/TransformerEngine.git@71bbefbf153418f943640df0f7373625dc93fa46",
   "megatron-core",
   "megatron-bridge",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
-  "emerging-optimizers==0.1.0",
+  "emerging-optimizers==0.2.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
 ]
 nemo_gym = ["nemo_gym"]
@@ -148,7 +148,7 @@ dev = [
   "pyrefly==0.24.2",
 ]
 test = [
-  "pytest>=7.0.0",
+  "pytest>=8.4.2",
   "pytest-timeout",
   "pytest-cov",
   "pytest-asyncio",
@@ -184,6 +184,7 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 # From JustinTong0323/sglang branch update-transformers-v5 (sgl-project/sglang#17784)
 sglang = { git = "https://github.com/JustinTong0323/sglang.git", rev = "70aa688742dd2b75bf9e8e980249303f39295b0d", subdirectory = "python" }
 sgl-kernel = { git = "https://github.com/JustinTong0323/sglang.git", rev = "70aa688742dd2b75bf9e8e980249303f39295b0d", subdirectory = "sgl-kernel" }
+emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
 
 [tool.uv.workspace]
 members = [
@@ -235,7 +236,7 @@ link-mode = "copy"
 # The timm override is needed because current automodel pins to 1.0.16. This can be removed once we move ToT automodel
 # The nvidia-modelopt override is needed because mcore is still on 0.33
 override-dependencies = [
-  "transformer-engine[pytorch]==2.12.0",
+  "transformer-engine[pytorch,core_cu12] @ git+https://github.com/NVIDIA/TransformerEngine.git@71bbefbf153418f943640df0f7373625dc93fa46",
   "nvidia-cudnn-cu12==9.19.0.56",
   "opencv-python-headless>=4.11.0",
   "timm<=1.0.22",
@@ -263,6 +264,12 @@ override-dependencies = [
   # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
   # Override until vllm officially relaxes the constraint (https://github.com/vllm-project/vllm/issues/30466).
   "transformers==5.3.0",
+  #Override till we can upgrade sglang version to address CVE GHSA-7rgv-gqhr-fxg3
+  "xgrammar==0.1.33",
+  # Override dependencies to address CVEs
+  "mlflow>=3.9.0rc0",
+  # Override outlines for Python 3.13 support
+  "outlines>=0.2.0",
 ]
 # CVE fixes
 constraint-dependencies = [
@@ -270,10 +277,16 @@ constraint-dependencies = [
   "starlette>=0.49.1",        # Address CVE GHSA-7f5h-v6xp-fcq8
   "urllib3>=2.6.3",           # Address CVE GHSA-38jv-5279-wg99
   "aiohttp>=3.13.3",          # Address CVE GHSA-mqqc-3gqh-h2x8
-  "pyasn1>=0.6.2",            # Address CVE GHSA-63vm-454h-vhhq
+  "pyasn1>=0.6.3",            # Address CVE GHSA-jr27-m4p2-rc6r
   "wheel>=0.46.2",            # Address CVE GHSA-8rrh-rw8j-w5fx
   "protobuf>=6.33.5",         # Address CVE GHSA-7gcm-g887-7qv7
   "python-multipart>=0.0.22", # Address CVE GHSA-wp53-j4wj-2cfg
+  "pygments>=2.20.0",         # Address CVE GHSA-5239-wwwm-4pmq
+  "cbor2>=5.9.0",             # Address CVE GHSA-3c37-wwvx-h642
+  "onnx>=1.21.0rc4",          # Address CVE GHSA-hqmj-h5c6-369m
+  "cryptography>=46.0.6",     # Address CVE GHSA-6w46-j5rx-g56g
+  "orjson>=3.11.6",           # Address CVE GHSA-hx9q-6w63-j58v
+  "pyjwt>=2.12.0",            # Address CVE GHSA-752w-5fwx-jx9f
 ]
 
 conflicts = [
@@ -355,11 +368,20 @@ version = "v2.0.0+7b6b556"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
+name = "transformer-engine"
+version = "2.14.0+71bbefb"
+requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
+
+[[tool.uv.dependency-metadata]]
+name = "transformer-engine-torch"
+version = "2.14.0+71bbefb"
+requires-dist = ["torch", "transformer-engine"]
+
+[[tool.uv.dependency-metadata]]
 name = "nv-grouped-gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "v1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
-
 
 [[tool.uv.dependency-metadata]]
 name = "sgl-kernel"
@@ -470,7 +492,7 @@ requires-dist = [
   # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13
   "transformer-engine[pytorch,core_cu12]",
   "mamba-ssm",
-  "nvidia-resiliency-ext~=0.5.0",
+  "nvidia-resiliency-ext",
   "causal-conv1d",
   "flash-linear-attention",
   "timm",
@@ -479,6 +501,12 @@ requires-dist = [
   "comet-ml>=3.50.0",
   "torch>=2.6.0",
 ]
+
+# remove numpy upper-bound to resolve conflict of nvidia-resiliency-ext==0.6.0 and onnx>=1.21.0rc4
+[[tool.uv.dependency-metadata]]
+name = "logsage"
+version = "0.1.5"
+requires-dist = []
 
 [tool.black]
 line-length = 120

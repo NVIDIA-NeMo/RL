@@ -31,6 +31,10 @@ import torch
 from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtensor
 from torch import nn
 from torch.distributed.tensor import DTensor, Shard
+from transformers.models.gemma3.modeling_gemma3 import (
+    Gemma3ForCausalLM,
+    Gemma3ForConditionalGeneration,
+)
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -92,6 +96,12 @@ def model_forward(
         # flash_attn_kwargs is not supported for multimodal
         if "flash_attn_kwargs" in model_args:
             del model_args["flash_attn_kwargs"]
+
+    is_gemma3 = isinstance(model, Gemma3ForCausalLM) or isinstance(
+        model, Gemma3ForConditionalGeneration
+    )
+    if is_gemma3 and "token_type_ids" not in model_args:
+        model_args["token_type_ids"] = torch.zeros_like(processed_inputs.input_ids)
 
     # Reward models don't support flash_attn_kwargs
     if is_reward_model:
