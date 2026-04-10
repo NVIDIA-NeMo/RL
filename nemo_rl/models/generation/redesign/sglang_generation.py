@@ -70,6 +70,60 @@ logger = logging.getLogger(__name__)
 #         pg_reordered_bundle_indices   = cluster._get_sorted_bundle_indices()
 
 
+class AsyncLoopThread:
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._start_loop, daemon=True)
+        self._thread.start()
+
+    def _start_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def run(self, coro):
+        # Schedule a coroutine onto the loop and block until it's done
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
+
+# Create one global instance
+async_loop = None
+
+def get_async_loop():
+    global async_loop
+    if async_loop is None:
+        async_loop = AsyncLoopThread()
+    return async_loop
+
+def run(coro):
+    """Run a coroutine in the background event loop."""
+    return get_async_loop().run(coro)
+
+
+async def generate_one_sample(sglang_router_ip, sglang_router_port, sampling_params, input_ids):
+    """Generate using traditional SGLang router with token-based workflow"""
+    url = f"http://{sglang_router_ip}:{sglang_router_port}/generate"
+
+    # Prepare payload for sglang server
+    payload = {
+        "sampling_params": sampling_params,
+        "return_logprob": True,
+        "input_ids": input_ids,
+    }
+
+    output = await post(url, payload)
+
+    if "output_token_logprobs" in output["meta_info"]:
+        response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+        response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+    else:
+        response_tokens, response_log_probs = [], []
+
+    response_truncated = False
+    if response_truncated["meta_info"]["output_token_logprobs"] is not None and output["meta_info"]["output_token_logprobs"] == "length":
+        response_truncated = True
+
+    return response_tokens, response_log_probs, response_truncated
+
+
 @dataclasses.dataclass
 class ServerGroup:
     """A group of homogeneous SGLang engines with the same configuration.
@@ -361,9 +415,222 @@ class SGLangGeneration(GenerationInterface):
     def check_weights(self, action: str):
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
 
-    def generate():
-        pass
+    def _merge_stop_strings(self, batch_stop_strings) -> list[list[str]]:
+        """Merge stop strings from config and batch.
 
+        Args:
+            batch_stop_strings: List of stop strings from batch (one per sample)
+
+        Returns:
+            List of merged stop strings (one per sample)
+        """
+        stop_set: set[str] = set()
+
+        # Add stop strings from config
+        if self.sglang_cfg.get("stop_strings"):
+            stop_set.update(self.sglang_cfg["stop_strings"])
+
+        # Merge stop strings from batch
+        merged_stop_strings = []
+        for sample_ss in batch_stop_strings:
+            sample_stop_set = stop_set.copy()
+            if sample_ss:
+                if isinstance(sample_ss, str):
+                    sample_stop_set.add(sample_ss)
+                elif isinstance(sample_ss, list):
+                    sample_stop_set.update(sample_ss)
+
+            merged_stop_strings.append(list(sample_stop_set))
+
+        return merged_stop_strings
+    
+    def _build_sampling_params(
+        self,
+        *,
+        greedy: bool,
+        stop_strings: Optinoal[list[str]] = None,
+        input_len: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Build sampling parameters dictionary for SGLang API.
+
+        Args:
+            greedy: Whether to use greedy decoding (temperature=0.0)
+            stop_strings: Merged stop strings (not used here, handled per sample)
+            max_new_tokens: Override max_new_tokens from config if provided
+            input_len: Input length for this sample (used for context_length adjustment)
+
+        Returns:
+            Dictionary of sampling parameters compatible with SGLang API
+        """
+        top_k_cfg = self.sglang_cfg.get("top_k")
+        top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
+        if top_k_val != -1:
+            sampling_params["top_k"] = top_k_val
+        temperature = 0.0 if greedy else self.sglang_cfg["temperature"]
+
+        context_length = self.sglang_cfg["sglang_cfg"]["context_length"]
+        if context_length is not None:
+            max_new_tokens = min(self.sglang_cfg["max_new_tokens"], context_length - input_len)
+        else:
+            max_new_tokens = self.sglang_cfg["max_new_tokens"]
+
+        if max_new_tokens < 0:
+            raise("context len is smaller than input len")
+
+        # Build sampling params dict
+        sampling_params = {
+            "temperature": temperature,
+            "top_p": self.sglang_cfg.get("top_p", 1.0),
+            "max_new_tokens": max_new_tokens,
+            "no_stop_trim": True,
+            "spaces_between_special_tokens": False,
+        }
+
+        stop_token_ids = self.sglang_cfg.get("stop_token_ids")
+        if stop_token_ids is not None:
+            sampling_params["stop_token_ids"] = stop_token_ids
+        
+        if stop_strings is not None and len(stop_strings) > 0:
+            sampling_params["stop"] = stop_strings
+
+        return sampling_params
+
+
+    def generate(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+        """Generate a batch of data using vLLM generation.
+
+        Args:
+            data: BatchedDataDict containing input_ids and input_lengths tensors
+            greedy: Whether to use greedy decoding instead of sampling
+
+        Returns:
+            BatchedDataDict conforming to GenerationOutputSpec:
+                - output_ids: input + generated token IDs with proper padding
+                - logprobs: Log probabilities for tokens
+                - generation_lengths: Lengths of each response
+                - unpadded_sequence_lengths: Lengths of each input + generated sequence
+        """
+        # Handle empty input case
+        if len(data["input_ids"]) == 0:
+            # Return empty BatchedDataDict with all required fields
+            return BatchedDataDict[GenerationOutputSpec](
+                {
+                    "output_ids": torch.zeros((0, 0), dtype=torch.long),
+                    "logprobs": torch.zeros((0, 0), dtype=torch.float),
+                    "generation_lengths": torch.zeros(0, dtype=torch.long),
+                    "unpadded_sequence_lengths": torch.zeros(0, dtype=torch.long),
+                    "truncated": torch.zeros(0, dtype=torch.bool),
+                }
+            )
+
+        input_ids = data["input_ids"]
+        input_lengths = data["input_lengths"]
+        batch_stop_strings: list[list[str]] = data.get("stop_strings", [])
+        stop_strings = self._merge_stop_strings(batch_stop_strings)
+
+        batch_size = len(input_lengths)
+        padded_input_length = input_ids.size(1)
+
+        # verify inputs have correct padding
+        verify_right_padding(data, pad_value=self.sglang_cfg["_pad_token_id"])
+
+        # Original input length with padding
+        for i in range(batch_size):
+            input_len = input_lengths[i].item()
+
+            valid_input_ids = input_ids[i, :input_len].tolist()
+
+            # Build sampling params for this sample (with context_length adjustment)
+            sample_sampling_params = self._build_sampling_params(
+                greedy=greedy,
+                stop_strings=stop_strings,
+                input_len=input_len,
+            )
+
+        
+        # TODO: 
+        # Process the outputs - but preserve the original input padding structure
+        output_ids_list = []
+        logprobs_list = []
+        generation_lengths = []
+        unpadded_sequence_lengths = []
+        truncated_list = []  # Track if response was truncated (hit max_tokens)
+        max_length = 0
+        for output in outputs:
+            max_length = max(max_length, len(output.outputs[0].token_ids))
+
+        for i, output in enumerate(outputs):
+            # Extract generated tokens
+            sequence_length = input_lengths[i]
+            generation = output.outputs[0]
+            generated_tokens = list(generation.token_ids)
+
+            # Calculate total sequence length (original input length + generated tokens)
+            total_length = padded_input_length + max_length
+
+            # Create a new tensor with the right size and fill with padding token
+            full_output = torch.full(
+                (total_length,), self.cfg["_pad_token_id"], dtype=input_ids.dtype
+            )
+
+            # Copy original input (with padding) into the beginning
+            full_output[:sequence_length] = input_ids[i][:sequence_length]
+
+            # Add generated tokens after the original input
+            full_output[sequence_length : sequence_length + len(generated_tokens)] = (
+                torch.tensor(generated_tokens)
+            )
+
+            output_ids_list.append(full_output)
+            full_logprobs = torch.zeros(total_length, dtype=torch.float32)
+            if hasattr(generation, "logprobs") and generation.logprobs:
+                try:
+                    for idx, logprob_dict in enumerate(generation.logprobs):
+                        if logprob_dict:
+                            position = sequence_length + idx
+                            full_logprobs[position] = next(iter(logprob_dict.items()))[
+                                1
+                            ].logprob
+                except Exception:
+                    import traceback
+
+                    traceback.print_exc()
+
+            logprobs_list.append(full_logprobs)
+
+            response_length = sequence_length + len(generated_tokens)
+            generation_lengths.append(len(generated_tokens))
+            unpadded_sequence_lengths.append(response_length)
+
+            # Check if response was truncated (hit max_tokens length limit)
+            is_truncated = generation.finish_reason == "length"
+            truncated_list.append(is_truncated)
+
+            assert response_length <= self.llm.llm_engine.model_config.max_model_len, (
+                f"response_length={response_length} > max_model_len={self.llm.llm_engine.model_config.max_model_len}, which should not happen. Please check this behavior in isolation by running `uv run --extra vllm tools/model_diagnostics/1.max_model_len_respected.py {self.llm.llm_engine.model_config.model}` and raise this issue with the vllm team."
+            )
+
+        # Create return data conforming to GenerationOutputSpec
+        output_ids = torch.stack(output_ids_list)
+        logprobs = torch.stack(logprobs_list)
+
+        return_data = BatchedDataDict[GenerationOutputSpec](
+            {
+                "output_ids": output_ids,
+                "logprobs": logprobs,
+                "generation_lengths": torch.tensor(
+                    generation_lengths, dtype=torch.long
+                ),
+                "unpadded_sequence_lengths": torch.tensor(
+                    unpadded_sequence_lengths, dtype=torch.long
+                ),
+                "truncated": torch.tensor(truncated_list, dtype=torch.bool),
+            }
+        )
+
+        return return_data
 # ---------------------------------------------------------------------------
 # Port allocation helpers
 # ---------------------------------------------------------------------------
@@ -537,7 +804,7 @@ def start_rollout_servers(sglang_cfg, cluster_cfg, pg) -> ServerGroup:
         router_port=router_port,
     )
 
-    handles, port_cursors = group.start_engines(port_cursors)
+    handles, port_cursors = server_group.start_engines(port_cursors)
     all_init_handles.extend(handles)
 
     if all_init_handles:

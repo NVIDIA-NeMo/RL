@@ -1,4 +1,6 @@
 
+
+
 def find_available_port(base_port: int):
     port = base_port + random.randint(100, 1000)
     while True:
@@ -211,7 +213,7 @@ def init_http_client(args: SglangSpecificArgs):
         _distributed_post_enabled = True
 
 
-def _init_ray_distributed_post(args):
+def _init_ray_distributed_post(args: SglangSpecificArgs):
     """Initialize one or more Ray async actors per node for HTTP POST.
 
     Uses NodeAffinitySchedulingStrategy to place actors on distinct nodes.
