@@ -1,7 +1,6 @@
 defaults: ./grpo-gptoss-20b-8n8g-megatron.yaml
 policy:
   megatron_cfg:
-    expert_model_parallel_size: 8
     tensor_model_parallel_size: 1
     sequence_parallel: false
   make_sequence_length_divisible_by: 1
@@ -15,4 +14,3 @@ policy:
       attention_backend: TRITON_ATTN
 cluster:
   gpus_per_node: 4
-

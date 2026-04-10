@@ -8,16 +8,9 @@ policy:
     pipeline_model_parallel_size: 8
     num_layers_in_first_pipeline_stage: 7
     num_layers_in_last_pipeline_stage: 6
-    # DeepEP is supported for Ampere, Hopper, and Blackwell (B200/B300) GPUs
-    moe_enable_deepep: false
-    moe_token_dispatcher_type: "alltoall"
-  generation:
-    vllm_cfg:
-      tensor_parallel_size: 32
 logger:
   log_dir: logs/grpo-deepseek-v3-32n4g
   wandb:
     name: grpo-deepseek-v3-32n4g
 cluster:
   gpus_per_node: 4
-  num_nodes: 32
