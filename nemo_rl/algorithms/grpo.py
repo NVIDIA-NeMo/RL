@@ -975,6 +975,39 @@ def scale_rewards(
     return repeated_batch
 
 
+def extract_initial_prompt_messages(
+    message_logs: list,
+    original_prompt_lengths: torch.Tensor,
+) -> list:
+    """Extract the original prompt messages from message logs using token length.
+
+    This function correctly identifies original prompt messages even when the prompt
+    contains assistant messages (e.g., multi-turn conversation history).
+
+    Args:
+        message_logs: List of message logs, where each log is a list of messages.
+        original_prompt_lengths: Tensor of original prompt token lengths per sample.
+
+    Returns:
+        List of message logs containing only the original prompt messages.
+    """
+    initial_prompt_message_logs = []
+    for i, message_log in enumerate(message_logs):
+        initial_prompt_log = []
+        cumulative_length = 0
+        target_length = original_prompt_lengths[i].item()
+
+        for message in message_log:
+            if cumulative_length >= target_length:
+                break
+            initial_prompt_log.append(message)
+            cumulative_length += len(message["token_ids"])
+
+        initial_prompt_message_logs.append(initial_prompt_log)
+
+    return initial_prompt_message_logs
+
+
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
@@ -1070,28 +1103,6 @@ def _create_advantage_estimator(master_config: MasterConfig):
         raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
 
     return adv_estimator
-
-
-def _extract_prompt_only_messages(message_logs: list) -> list:
-    """Extract only prompt messages (user/system) from message logs.
-
-    This is used to get prompt IDs for advantage estimation, excluding
-    any assistant responses.
-
-    Args:
-        message_logs: List of message logs, where each log is a list of messages.
-
-    Returns:
-        List of message logs containing only user and system messages.
-    """
-    prompt_only_message_logs = []
-    for message_log in message_logs:
-        prompt_only_log = []
-        for message in message_log:
-            if message["role"] == "user" or message["role"] == "system":
-                prompt_only_log.append(message)
-        prompt_only_message_logs.append(prompt_only_log)
-    return prompt_only_message_logs
 
 
 def refit_policy_generation(
@@ -1655,16 +1666,20 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
+                    # Extract original prompt messages using the length field
+                    # This correctly handles multi-turn prompts that contain assistant messages
+                    initial_prompt_message_logs = extract_initial_prompt_messages(
+                        repeated_batch["message_log"],
+                        repeated_batch["length"],
                     )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    prompt_batched_flat, prompt_input_lengths = (
+                        batched_message_log_to_flat_message(
+                            initial_prompt_message_logs,
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
                     )
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
+                    del initial_prompt_message_logs
                     del prompt_batched_flat
                     del input_ids
                     del baseline
@@ -2722,16 +2737,21 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
+                    # Extract original prompt messages using the length field
+                    # This correctly handles multi-turn prompts that contain assistant messages
+                    initial_prompt_message_logs = extract_initial_prompt_messages(
+                        repeated_batch["message_log"],
+                        repeated_batch["length"],
                     )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+
+                    prompt_batched_flat, prompt_input_lengths = (
+                        batched_message_log_to_flat_message(
+                            initial_prompt_message_logs,
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
                     )
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
+                    del initial_prompt_message_logs
                     del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
