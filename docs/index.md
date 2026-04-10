@@ -153,7 +153,7 @@ Optimize large language models with FP8 quantization for faster training and inf
 :link: guides/quantization-aware-rl
 :link-type: doc
 
-Run GRPO and distillation with quantized models using NVIDIA ModelOpt (NVFP4, FP8).
+Run quantization aware GRPO and distillation using NVIDIA ModelOpt (NVFP4, FP8).
 :::
 
 :::{grid-item-card} {octicon}`container` Docker Containers

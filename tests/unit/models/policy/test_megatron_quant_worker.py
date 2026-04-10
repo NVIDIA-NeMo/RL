@@ -19,6 +19,7 @@ from copy import deepcopy
 import pytest
 import ray
 import torch
+import torch.nn as nn
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -36,11 +37,32 @@ try:
 except ImportError:
     pass
 
+_WORKER_IMPORTABLE = False
+if _MODELOPT_AVAILABLE:
+    try:
+        from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
+        from modelopt.torch.quantization.nn.modules.tensor_quantizer import (
+            TensorQuantizer,
+        )
+
+        from nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker import (
+            MegatronQuantPolicyWorker,
+        )
+
+        _WORKER_IMPORTABLE = True
+    except ImportError:
+        pass
+
 _CUDA_AVAILABLE = torch.cuda.is_available()
 
 requires_quant = pytest.mark.skipif(
     not (_CUDA_AVAILABLE and _MODELOPT_AVAILABLE),
     reason="Requires CUDA + modelopt for FP8 quantization",
+)
+
+requires_weight_folding = pytest.mark.skipif(
+    not _WORKER_IMPORTABLE,
+    reason="Requires modelopt + megatron deps for weight folding tests",
 )
 
 _VOCAB_SIZE = 32000
@@ -352,3 +374,96 @@ def test_quant_megatron_checkpoint_save_restore(tiny_llama_model_path):
             if policy2:
                 policy2.shutdown()
             cluster2.shutdown()
+
+
+_find_wq = (
+    MegatronQuantPolicyWorker._find_weight_quantizer if _WORKER_IMPORTABLE else None
+)
+
+if _WORKER_IMPORTABLE:
+
+    class _SingleWeightQuantModule(QuantModule):
+        """Minimal QuantModule with one GEMM weight and its quantizer."""
+
+        def __init__(self, enable_quantizer=True):
+            nn.Module.__init__(self)
+            self.weight = nn.Parameter(torch.randn(4, 4))
+            self.weight_quantizer = TensorQuantizer()
+            if not enable_quantizer:
+                self.weight_quantizer.disable()
+
+        def iter_weights_for_calibration(self):
+            yield self.weight, self.weight_quantizer
+
+    class _MultiWeightQuantModule(QuantModule):
+        """QuantModule with multiple GEMM weights (e.g. MoE grouped GEMM)."""
+
+        def __init__(self, num_weights=3):
+            nn.Module.__init__(self)
+            for i in range(num_weights):
+                setattr(self, f"weight{i}", nn.Parameter(torch.randn(4, 4)))
+            self.weight_quantizer = TensorQuantizer()
+            self._num_weights = num_weights
+
+        def iter_weights_for_calibration(self):
+            for i in range(self._num_weights):
+                yield getattr(self, f"weight{i}"), self.weight_quantizer
+
+
+@requires_weight_folding
+class TestFindWeightQuantizer:
+    """Tests for MegatronQuantPolicyWorker._find_weight_quantizer."""
+
+    def test_matches_gemm_weight(self):
+        """GEMM weight should be matched to its enabled quantizer."""
+        module = _SingleWeightQuantModule(enable_quantizer=True)
+        result = _find_wq(module, module.weight)
+        assert result is module.weight_quantizer
+
+    def test_skips_non_weight_param(self):
+        """A tensor that is NOT the module's weight must not be matched."""
+        module = _SingleWeightQuantModule(enable_quantizer=True)
+        bias = nn.Parameter(torch.randn(4))
+        assert _find_wq(module, bias) is None
+
+    def test_skips_different_tensor_same_shape(self):
+        """A tensor with the same shape/values but different identity must not match."""
+        module = _SingleWeightQuantModule(enable_quantizer=True)
+        clone = module.weight.clone()
+        assert _find_wq(module, clone) is None
+
+    def test_skips_disabled_quantizer(self):
+        """Disabled quantizer should not be returned even for the correct weight."""
+        module = _SingleWeightQuantModule(enable_quantizer=False)
+        assert _find_wq(module, module.weight) is None
+
+    def test_non_quant_module(self):
+        """Plain nn.Module (not a QuantModule) should always return None."""
+        linear = nn.Linear(4, 4)
+        assert _find_wq(linear, linear.weight) is None
+
+    def test_none_module(self):
+        """None module should return None."""
+        tensor = torch.randn(4, 4)
+        assert _find_wq(None, tensor) is None
+
+    def test_none_param_weight(self):
+        """None param_weight should return None."""
+        module = _SingleWeightQuantModule(enable_quantizer=True)
+        assert _find_wq(module, None) is None
+
+    def test_multi_weight_matches_each(self):
+        """Each weight in a multi-weight module should match the shared quantizer."""
+        module = _MultiWeightQuantModule(num_weights=3)
+        for i in range(3):
+            w = getattr(module, f"weight{i}")
+            result = _find_wq(module, w)
+            assert result is module.weight_quantizer, (
+                f"weight{i} should match the quantizer"
+            )
+
+    def test_multi_weight_rejects_unknown(self):
+        """A tensor not in the multi-weight module should not match."""
+        module = _MultiWeightQuantModule(num_weights=3)
+        unknown = nn.Parameter(torch.randn(4, 4))
+        assert _find_wq(module, unknown) is None
