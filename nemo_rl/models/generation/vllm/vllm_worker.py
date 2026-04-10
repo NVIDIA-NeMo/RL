@@ -16,6 +16,8 @@ import copy
 import gc
 import os
 import sys
+import threading
+import time
 from importlib.util import find_spec
 from typing import Any, Optional, cast
 
@@ -668,6 +670,92 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
+        self._vllm_metrics_lock = threading.Lock()
+        if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            self._start_vllm_metrics_logger()
+
+    def _start_vllm_metrics_logger(self) -> None:
+        """Start a background thread that periodically collects vLLM engine metrics.
+
+        Polls the Prometheus registry for inflight batch sizes, pending samples,
+        KV cache usage, and generation token counts while llm.generate() runs on
+        the main thread.  Runs only on the model-owner actor.
+
+        Controlled by vllm_metrics_logger_interval in vllm_cfg.
+        """
+        from vllm.v1.metrics.reader import Gauge, get_metrics_snapshot
+
+        if not self.is_model_owner:
+            return
+
+        assert "vllm_metrics_logger_interval" in self.cfg["vllm_cfg"], (
+            "vllm_metrics_logger_interval must be set in vllm_cfg when "
+            "enable_vllm_metrics_logger is True"
+        )
+        interval_s = self.cfg["vllm_cfg"]["vllm_metrics_logger_interval"]
+        assert interval_s > 0, (
+            f"vllm_metrics_logger_interval must be a positive float, got {interval_s}"
+        )
+
+        self.inflight_batch_sizes: list[int] = []
+        self.num_pending_samples: list[int] = []
+        self.kv_cache_usage_perc: list[float] = []
+        self.generation_tokens: list[int] = []
+
+        def _logger_loop():
+            # Brief delay so the engine can finish initialising before first poll.
+            time.sleep(min(2.0, interval_s))
+            while True:
+                try:
+                    for m in get_metrics_snapshot():
+                        if isinstance(m, Gauge):
+                            if m.name == "vllm:num_requests_running":
+                                with self._vllm_metrics_lock:
+                                    self.inflight_batch_sizes.append(int(m.value))
+                            elif m.name == "vllm:num_requests_waiting":
+                                with self._vllm_metrics_lock:
+                                    self.num_pending_samples.append(int(m.value))
+                            elif m.name == "vllm:kv_cache_usage_perc":
+                                with self._vllm_metrics_lock:
+                                    self.kv_cache_usage_perc.append(float(m.value))
+                            if m.name == "vllm:generation_tokens":
+                                with self._vllm_metrics_lock:
+                                    self.generation_tokens.append(int(m.value))
+                except Exception:
+                    print(
+                        "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
+                        flush=True,
+                    )
+                time.sleep(interval_s)
+
+        t = threading.Thread(
+            target=_logger_loop, name="vllm-metrics-logger", daemon=True
+        )
+        t.start()
+        self._vllm_metrics_logger_thread = t
+        print("📋[vLLM Metric Logger] vLLM metrics logger thread started", flush=True)
+
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return {}
+
+        with self._vllm_metrics_lock:
+            return {
+                "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
+                "num_pending_samples": copy.deepcopy(self.num_pending_samples),
+                "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
+                "generation_tokens": copy.deepcopy(self.generation_tokens),
+            }
+
+    def clear_vllm_logger_metrics(self) -> None:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return
+
+        with self._vllm_metrics_lock:
+            self.inflight_batch_sizes = []
+            self.num_pending_samples = []
+            self.kv_cache_usage_perc = []
+            self.generation_tokens = []
 
     def init_collective(
         self,

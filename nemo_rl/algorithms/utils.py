@@ -596,9 +596,7 @@ def print_performance_metrics(
 
     is_vllm_metrics_logger_enabled = master_config["policy"]["generation"].get(
         "vllm_cfg", {}
-    ).get("enable_vllm_metrics_logger", False) and master_config["policy"][
-        "generation"
-    ].get("vllm_cfg", {}).get("async_engine", False)
+    ).get("enable_vllm_metrics_logger", False)
     generation_logger_metrics = metrics.get("generation_logger_metrics", {})
     if is_vllm_metrics_logger_enabled and generation_logger_metrics:
         vllm_logger_metrics = generation_logger_metrics
