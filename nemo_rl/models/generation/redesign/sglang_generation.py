@@ -143,6 +143,13 @@ class ServerGroup:
                 }.items()
             }
 
+            # Explicitly pass CUDA_VISIBLE_DEVICES through to the engine actor so
+            # all engines see the same global value (Ray would otherwise remap it
+            # because we set the NOSET_* flags above).
+            global_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+            if global_cvd:
+                env_vars["CUDA_VISIBLE_DEVICES"] = global_cvd
+
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
                 num_gpus=num_gpus,
