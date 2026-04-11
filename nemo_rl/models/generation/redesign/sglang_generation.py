@@ -121,7 +121,7 @@ class ServerGroup:
         num_gpu_per_engine = min(self.num_gpus_per_engine, self.num_gpus_per_node)
         pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
 
-        rollout_engines = []
+        local_all_engines = []
         for i in range(len(self.all_engines)):
             if self.all_engines[i] is not None:
                 continue
@@ -175,10 +175,10 @@ class ServerGroup:
                 num_gpus_per_engine=self.num_gpus_per_engine,
             )
 
-            rollout_engines.append((global_rank, rollout_engine))
+            local_all_engines.append((global_rank, rollout_engine))
             self.all_engines[i] = rollout_engine
 
-        self.num_new_engines = len(rollout_engines)
+        self.num_new_engines = len(local_all_engines)
 
         if self.num_new_engines == 0:
             return [], port_cursors
@@ -187,7 +187,7 @@ class ServerGroup:
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
             cluster_cfg=self.cluster_cfg,
             sglang_cfg=self.sglang_cfg,
-            rollout_engines=rollout_engines,
+            local_all_engines=local_all_engines,
             rank_offset=self.rank_offset,
             base_port=base_port,
         )
@@ -198,7 +198,7 @@ class ServerGroup:
                 router_ip=self.router_ip,
                 router_port=self.router_port,
             )
-            for rank, engine in rollout_engines
+            for rank, engine in local_all_engines
         ]
         return init_handles, port_cursors
     
@@ -281,7 +281,6 @@ class SGLangGeneration(GenerationInterface):
             monitor.start()
         self._health_monitor = monitor
 
-
     @property
     def rollout_engines(self):
         """All node-0 engines across all servers / models."""
@@ -297,10 +296,11 @@ class SGLangGeneration(GenerationInterface):
         return engines, self.rollout_engine_lock, num_new, gpu_counts, gpu_offsets
 
     def offload(self, tags: list[str] | None = None):
+        """All node-0 engines across all servers / models."""
         if tags is not None:
             handles = [
                 engine.release_memory_occupation.remote(tags=tags)
-                for engine in self.rollout_engines
+                for engine in self.rollout_engines 
                 if engine is not None
             ]
             return ray.get(handles) if handles else []
@@ -344,6 +344,7 @@ class SGLangGeneration(GenerationInterface):
             self.server_group.num_new_engines = 0
 
     def check_weights(self, action: str):
+        """All node-0 engines across all servers / models."""
         return ray.get(
             [
                 engine.check_weights.remote(action=action)
@@ -751,15 +752,15 @@ class SGLangGeneration(GenerationInterface):
         output_ids_single_item[:input_length] = original_input_ids_single_row[
             :input_length
         ]
-        if new_tokens:
-            output_ids_single_item[input_length:unpadded_length] = torch.tensor(
-                new_tokens, dtype=dtype, device=device
-            )
-
         # Logprobs: zeros for input tokens, raw floats at generated positions.
         logprobs_single_item = torch.zeros(
             (1, unpadded_length), dtype=torch.float32, device=device
         )
+        
+        if new_tokens:
+            output_ids_single_item[input_length:unpadded_length] = torch.tensor(
+                new_tokens, dtype=dtype, device=device
+            )
         if new_logprobs:
             logprobs_single_item[
                 0, input_length : input_length + len(new_logprobs)
@@ -822,7 +823,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     *,
     cluster_cfg,
     sglang_cfg,
-    rollout_engines,
+    local_all_engines,
     rank_offset=0,
     base_port=15000,
 ):
@@ -846,7 +847,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     node_port_cursor: dict[int, int] = {}
 
     visited_nodes = set()
-    for rank, engine in rollout_engines:
+    for rank, engine in local_all_engines:
         local_rank = rank - rank_offset
         node_index = local_rank // num_engines_per_node
         if node_index in visited_nodes:
@@ -899,7 +900,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
             for i in range(num_engines_on_this_node):
                 addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + sglang_dp_size)}"
 
-    for i, _ in rollout_engines:
+    for i, _ in local_all_engines:
         for key in ["port", "nccl_port", "dist_init_addr"]:
             assert key in addr_and_ports[i], f"Engine {i} {key} is not set."
         logger.info(f"Ports for engine {i}: {addr_and_ports[i]}")
