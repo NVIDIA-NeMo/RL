@@ -102,6 +102,14 @@ These parameters are added under the `policy` section:
 
 The `policy.generation.quant_cfg` should match `policy.quant_cfg` to ensure consistent quantization between training and generation.
 
+## Megatron Checkpoint Directory
+
+On first run, the HF model is automatically converted to a Megatron checkpoint. By default, this checkpoint is saved under `$HF_HOME/nemo_rl` (or `~/.cache/huggingface/nemo_rl` if `HF_HOME` is not set). To control where the converted checkpoint is stored — for example, to keep it alongside your experiment outputs — set the `NRL_MEGATRON_CHECKPOINT_DIR` environment variable:
+
+```bash
+export NRL_MEGATRON_CHECKPOINT_DIR="/path/to/your/megatron/checkpoints"
+```
+
 ## Differences from FP8 Training
 
 QARL (via ModelOpt) and NeMo RL's built-in [FP8 training](../fp8.md) (via TransformerEngine) serve different purposes:

@@ -20,9 +20,9 @@ referenced from a YAML config file by providing a file path and variable name:
     policy:
       quant_cfg: "examples/modelopt/quant_configs/example_w8a8.py:W8A8_CUSTOM_CFG"
 
-This example defines a W8A8 config (8-bit weights, 8-bit activations) using
-block-wise weight quantization and dynamic per-tensor activation quantization.
-Sensitive layers (lm_head, MoE gate layers, etc.) are disabled by default.
+This example defines a W8A8 config (FP8 weights, FP8 activations) using
+per-tensor quantization. Sensitive layers (lm_head, MoE gate layers, etc.)
+are disabled by default.
 
 See https://github.com/NVIDIA/TensorRT-Model-Optimizer for more quantization
 config examples and supported options.
@@ -31,11 +31,17 @@ config examples and supported options.
 import modelopt.torch.quantization as mtq
 
 W8A8_CUSTOM_CFG = {
-    "quant_cfg": {
-        "*weight_quantizer": {"num_bits": (4, 3), "axis": None},
-        "*input_quantizer": {"num_bits": (4, 3), "axis": None},
-        # Disable quantization for sensitive layers (lm_head, MoE gates, etc.)
-        **mtq.config._default_disabled_quantizer_cfg,
-    },
+    "quant_cfg": [
+        *mtq.config._base_disable_all,
+        {
+            "quantizer_name": "*weight_quantizer",
+            "cfg": {"num_bits": (4, 3), "axis": None},
+        },
+        {
+            "quantizer_name": "*input_quantizer",
+            "cfg": {"num_bits": (4, 3), "axis": None},
+        },
+        *mtq.config._default_disabled_quantizer_cfg,
+    ],
     "algorithm": "max",
 }
