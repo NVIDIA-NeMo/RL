@@ -1,5 +1,4 @@
 import asyncio
-import dataclasses
 import itertools
 import logging
 import multiprocessing
@@ -61,55 +60,107 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-@dataclasses.dataclass
-class ServerGroup:
-    """A group of homogeneous SGLang engines with the same configuration.
+class SGLangGeneration(GenerationInterface):
+    """The class to run rollout and convert rollout data to training data.
 
-    All engines in a group share the same tp_size / nodes_per_engine / pg.
-    A RolloutServer may contain multiple ServerGroups (e.g. prefill vs decode
-    in PD disaggregation).
+    This class owns the full rollout server topology: the placement group,
+    the router subprocess, and every ``SGLangGenerationWorker`` Ray actor.
+    The former ``ServerGroup`` dataclass has been folded in so there is a
+    single source of truth for engine state.
     """
 
-    pg: Any  # (placement_group, reordered_bundle_indices, reordered_gpu_ids)
-    all_engines: list
-    num_gpus_per_engine: int
-    num_gpus_per_node: int
-    num_new_engines: int
-    rank_offset: int = 0
-    gpu_offset: int = 0
-    needs_offload: bool = False
-    model_path: str | None = None
-    router_ip: str | None = None
-    router_port: int | None = None
-    cluster_cfg: Any = None
-    sglang_cfg: Any = None
-    # Router subprocess handle. Only set when _start_router actually spawned
-    # the router (i.e. sglang_router_ip was not already configured). Kept so
-    # SGLangGeneration.shutdown() can terminate it cleanly.
-    router_process: multiprocessing.Process | None = None
+    def __init__(self, cluster: RayVirtualCluster, cluster_cfg: ClusterConfig, sglang_cfg: SGLangConfig):
+        self.cluster = cluster
+        self.cluster_cfg = cluster_cfg
+        self.sglang_cfg = sglang_cfg
 
+        self.pg = cluster._init_placement_groups(
+            strategy="PACK",
+            use_unified_pg=True,
+        )
+        self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids = get_reordered_bundle_and_gpu_ids(self.pg)
+
+        init_http_client(sglang_cfg)
+
+        # --- Engine topology (formerly ``ServerGroup``) ------------------
+        gpus_per_engine = sglang_cfg["sglang_server"]["num_gpus_per_engine"]
+        num_gpus_per_node = cluster_cfg["gpus_per_node"]
+        num_gpu_per_engine_local = min(gpus_per_engine, num_gpus_per_node)
+        num_engines = sglang_cfg["sglang_server"]["num_gpus"] // num_gpu_per_engine_local
+
+        self.num_gpus_per_engine: int = gpus_per_engine
+        self.num_gpus_per_node: int = num_gpus_per_node
+        self.all_engines: list = [None] * num_engines
+        self.num_new_engines: int = 0
+        self.rank_offset: int = 0
+        self.gpu_offset: int = 0
+        self.needs_offload: bool = sglang_cfg["sglang_server"]["needs_offload"]
+        self.model_path: str | None = sglang_cfg["sglang_cfg"]["model_path"]
+
+        # --- Router bootstrap --------------------------------------------
+        router_ip, router_port, router_process = _start_router(sglang_cfg)
+        sglang_cfg["sglang_router"]["sglang_router_ip"] = router_ip
+        sglang_cfg["sglang_router"]["sglang_router_port"] = router_port
+        self.router_ip: str = router_ip
+        self.router_port: int = router_port
+        # Only set when ``_start_router`` actually spawned the router (i.e.
+        # sglang_router_ip was not already configured). Kept so ``shutdown``
+        # can terminate it cleanly.
+        self.router_process: multiprocessing.Process | None = router_process
+
+        # --- Start engines -----------------------------------------------
+        init_handles, _ = self._start_engines({})
+        if init_handles:
+            ray.get(init_handles)
+
+        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+
+        monitor = None
+        if sglang_cfg["sglang_cfg"].get("use_fault_tolerance"):
+            monitor = RolloutHealthMonitor(self, sglang_cfg)
+            monitor.start()
+        self._health_monitor = monitor
+
+    # ------------------------------------------------------------------
+    # Engine topology properties (formerly ``ServerGroup``)
+    # ------------------------------------------------------------------
     @property
-    def nodes_per_engine(self):
+    def nodes_per_engine(self) -> int:
         return max(1, self.num_gpus_per_engine // self.num_gpus_per_node)
 
     @property
-    def engines(self):
-        """Node-0 engines only (for multi-node serving)."""
+    def engines(self) -> list:
+        """Node-0 engines only (one entry per logical engine).
+
+        For multi-node TP, ``all_engines`` contains ``nodes_per_engine``
+        consecutive actors per logical engine; this slice returns just the
+        node-0 representative for each.
+        """
         return self.all_engines[:: self.nodes_per_engine]
 
     @property
+    def rollout_engines(self) -> list:
+        """Alias for ``engines`` — node-0 engines across all servers / models."""
+        return self.engines
+
+    @property
     def engine_gpu_counts(self) -> list[int]:
-        """Per-engine GPU count for all node-0 engines, parallel to ``engines``."""
+        """Per-engine GPU count, parallel to ``engines``."""
         return [self.num_gpus_per_engine for _ in self.engines]
 
     @property
     def engine_gpu_offsets(self) -> list[int]:
-        offsets = []
-        for j in range(len(self.engines)):
-            offsets.append(self.gpu_offset + j * self.num_gpus_per_engine)
-        return offsets
+        return [
+            self.gpu_offset + j * self.num_gpus_per_engine
+            for j in range(len(self.engines))
+        ]
 
-    def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[list, dict[int, int]]:
+    # ------------------------------------------------------------------
+    # Engine lifecycle (formerly ``ServerGroup.start_engines`` / ``recover``)
+    # ------------------------------------------------------------------
+    def _start_engines(
+        self, port_cursors: dict[int, int] | None = None
+    ) -> tuple[list, dict[int, int]]:
         """Create Ray actors, allocate ports, and fire ``engine.init()`` without waiting.
 
         Returns ``(init_handles, port_cursors)`` where *init_handles* is a list
@@ -119,7 +170,9 @@ class ServerGroup:
             port_cursors = {}
 
         num_gpu_per_engine = min(self.num_gpus_per_engine, self.num_gpus_per_node)
-        pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
+        pg = self.pg
+        reordered_bundle_indices = self.pg_reordered_bundle_indices
+        reordered_gpu_ids = self.pg_reordered_gpu_ids
 
         local_all_engines = []
         for i in range(len(self.all_engines)):
@@ -201,154 +254,105 @@ class ServerGroup:
             for rank, engine in local_all_engines
         ]
         return init_handles, port_cursors
-    
-    
-    def recover(self):
-        """Recover dead engines across all active groups, overlapping init."""
+
+    def _recover(self) -> None:
+        """Recover dead engines, overlapping init."""
         dead_indices = [i for i, engine in enumerate(self.all_engines) if engine is None]
 
         port_cursors: dict[int, int] = {}
-        handles = self.start_engines(port_cursors)
+        handles, _ = self._start_engines(port_cursors)
         if handles:
             ray.get(handles)
 
-        release_handles = []
-        updatable_new_engines = []
+        assert self.num_new_engines == len(dead_indices), (
+            "num_new_engines does not match dead_indices length"
+        )
 
-        assert self.num_new_engines == len(dead_indices), "num_new_engines does not match dead_indices length"
         if self.needs_offload and dead_indices:
             new_engines = [self.all_engines[i] for i in dead_indices]
-            release_handles.extend(engine.release_memory_occupation.remote() for engine in new_engines)
-            updatable_new_engines.extend(new_engines)
-
-        if release_handles:
+            release_handles = [
+                engine.release_memory_occupation.remote() for engine in new_engines
+            ]
             ray.get(release_handles)
-            all_resume_engines = updatable_new_engines[:]
-            if all_resume_engines:
-                ray.get(
-                    [
-                        engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS])
-                        for engine in all_resume_engines
-                    ]
-                )
+            ray.get(
+                [
+                    engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+                    for engine in new_engines
+                ]
+            )
 
-    def offload(self):
-        if not self.needs_offload:
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def get_updatable_engines_and_lock(self):
+        """Return engines eligible for weight updates."""
+        return (
+            self.engines,
+            self.rollout_engine_lock,
+            self.num_new_engines,
+            self.engine_gpu_counts,
+            self.engine_gpu_offsets,
+        )
+
+    def offload(self, tags: list[str] | None = None):
+        """Release memory on all node-0 engines across all servers / models."""
+        if tags is None and not self.needs_offload:
             return []
-        return [engine.release_memory_occupation.remote() for engine in self.engines if engine is not None]
+        if tags is None:
+            handles = [
+                engine.release_memory_occupation.remote()
+                for engine in self.engines
+                if engine is not None
+            ]
+        else:
+            handles = [
+                engine.release_memory_occupation.remote(tags=tags)
+                for engine in self.engines
+                if engine is not None
+            ]
+        return ray.get(handles) if handles else []
 
     def onload(self, tags: list[str] | None = None):
         if not self.needs_offload:
             return []
-        return [engine.resume_memory_occupation.remote(tags=tags) for engine in self.engines if engine is not None]
+        handles = [
+            engine.resume_memory_occupation.remote(tags=tags)
+            for engine in self.engines
+            if engine is not None
+        ]
+        return ray.get(handles) if handles else []
 
     def onload_weights(self):
         if not self.needs_offload:
             return
-        handles = self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
-        return ray.get(handles) if handles else []
+        self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     def onload_kv(self):
-        handles = self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
-        return ray.get(handles) if handles else []
-
-
-class SGLangGeneration(GenerationInterface):
-    """The class to run rollout and convert rollout data to training data."""
-
-    def __init__(self, cluster: RayVirtualCluster, cluster_cfg: ClusterConfig, sglang_cfg: SGLangConfig):
-        self.cluster = cluster
-        self.cluster_cfg = cluster_cfg
-        self.sglang_cfg = sglang_cfg
-        self.pg = cluster._init_placement_groups(
-            strategy="PACK",
-            use_unified_pg=True,
-        )
-        self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids = get_reordered_bundle_and_gpu_ids(self.pg)
-
-        init_http_client(sglang_cfg)
-        self.server_group = start_rollout_servers(
-            sglang_cfg,
-            cluster_cfg,
-            (self.pg, self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids),
-        )
-
-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
-
-        monitor = None
-        if sglang_cfg["sglang_cfg"].get("use_fault_tolerance"):
-            monitor = RolloutHealthMonitor(self.server_group, sglang_cfg)
-            monitor.start()
-        self._health_monitor = monitor
-
-    @property
-    def rollout_engines(self):
-        """All node-0 engines across all servers / models."""
-        return [e for e in self.server_group.engines]
-
-    def get_updatable_engines_and_lock(self):
-        """Return engines eligible for weight updates."""
-        server_group = self.server_group
-        engines = server_group.engines if server_group else []
-        gpu_counts = server_group.engine_gpu_counts if server_group else []
-        gpu_offsets = server_group.engine_gpu_offsets if server_group else []
-        num_new = server_group.num_new_engines if server_group else 0
-        return engines, self.rollout_engine_lock, num_new, gpu_counts, gpu_offsets
-
-    def offload(self, tags: list[str] | None = None):
-        """All node-0 engines across all servers / models."""
-        if tags is not None:
-            handles = [
-                engine.release_memory_occupation.remote(tags=tags)
-                for engine in self.rollout_engines 
-                if engine is not None
-            ]
-            return ray.get(handles) if handles else []
-        else:
-            handles = self.server_group.offload()
-            return ray.get(handles) if handles else []
-
-    def onload(self, tags: list[str] | None = None):
-        handles = self.server_group.onload(tags)
-        return ray.get(handles) if handles else []
-
-    def onload_weights(self):
-        self.server_group.onload_weights()
-
-    def onload_kv(self):
-        self.server_group.onload_kv()
+        self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
 
     def recover_updatable_engines(self):
-        """Restart any dead rollout engines and update num_new_engines for update_weights detection.
-
-        Recovers the updatable model (the one that receives weight
-        updates from training).
+        """Restart any dead rollout engines and update ``num_new_engines``
+        for weight-update detection.
         """
-        server_group = self.server_group
-
-        if server_group is None:
-            return [], self.rollout_engine_lock, 0, [], []
-
-        server_group.recover()
+        self._recover()
         return (
-            server_group.engines,
+            self.engines,
             self.rollout_engine_lock,
-            server_group.num_new_engines,
-            server_group.engine_gpu_counts,
-            server_group.engine_gpu_offsets,
+            self.num_new_engines,
+            self.engine_gpu_counts,
+            self.engine_gpu_offsets,
         )
 
     def clear_updatable_num_new_engines(self):
         # when fault tolerance is not enabled, we need to manually clear num_new_engines after update_weights
-        if self.server_group:
-            self.server_group.num_new_engines = 0
+        self.num_new_engines = 0
 
     def check_weights(self, action: str):
         """All node-0 engines across all servers / models."""
         return ray.get(
             [
                 engine.check_weights.remote(action=action)
-                for engine in self.rollout_engines
+                for engine in self.engines
                 if engine is not None
             ]
         )
@@ -366,7 +370,7 @@ class SGLangGeneration(GenerationInterface):
             self._health_monitor.stop()
 
         ok = True
-        engines = [e for e in self.server_group.all_engines if e is not None]
+        engines = [e for e in self.all_engines if e is not None]
         if engines:
             try:
                 ray.get([e.shutdown.remote() for e in engines])
@@ -374,14 +378,13 @@ class SGLangGeneration(GenerationInterface):
                 logger.warning(f"Engine shutdown failed: {e}")
                 ok = False
 
-        router_process = self.server_group.router_process
-        if router_process is not None:
+        if self.router_process is not None:
             try:
-                terminate_process(router_process, timeout=3.0)
+                terminate_process(self.router_process, timeout=3.0)
             except Exception as e:
                 logger.warning(f"Router terminate failed: {e}")
                 ok = False
-            self.server_group.router_process = None
+            self.router_process = None
 
         return ok
 
@@ -955,52 +958,3 @@ def _start_router(
     assert process.is_alive()
     logger.info(f"Router launched at {router_ip}:{router_port}")
     return router_ip, router_port, process
-
-def start_rollout_servers(sglang_cfg, cluster_cfg, pg) -> ServerGroup:
-    """Start rollout servers: one per model, each with its own router.
-
-    Returns a dict mapping model name -> ``RolloutServer``.
-    """
-
-    engine_offset = 0
-    gpu_offset = 0
-
-    router_ip, router_port, router_process = _start_router(sglang_cfg)
-
-    sglang_cfg["sglang_router"]["sglang_router_ip"] = router_ip
-    sglang_cfg["sglang_router"]["sglang_router_port"] = router_port
-
-    all_init_handles: list = []
-    port_cursors: dict[int, int] = {}
-
-    gpus_per_engine = sglang_cfg["sglang_server"]["num_gpus_per_engine"]
-    num_gpu_per_engine_local = min(gpus_per_engine, cluster_cfg["gpus_per_node"])
-    num_engines = sglang_cfg["sglang_server"]["num_gpus"] // num_gpu_per_engine_local
-    needs_offload = sglang_cfg["sglang_server"]["needs_offload"]
-    num_gpus_per_node = cluster_cfg["gpus_per_node"]
-    model_path= sglang_cfg["sglang_cfg"]["model_path"]
-
-    server_group = ServerGroup(
-        pg=pg,
-        all_engines=[None] * num_engines,
-        num_gpus_per_engine=gpus_per_engine,
-        num_gpus_per_node=num_gpus_per_node,
-        num_new_engines=0,
-        rank_offset=engine_offset,
-        gpu_offset=gpu_offset,
-        needs_offload=needs_offload,
-        model_path=model_path,
-        router_ip=router_ip,
-        router_port=router_port,
-        cluster_cfg=cluster_cfg,
-        sglang_cfg=sglang_cfg,
-        router_process=router_process,
-    )
-
-    handles, port_cursors = server_group.start_engines(port_cursors)
-    all_init_handles.extend(handles)
-
-    if all_init_handles:
-        ray.get(all_init_handles)
-
-    return server_group
