@@ -108,6 +108,7 @@ class VllmInternalWorkerExtension:
             return
 
         # FP8 KV cache: process KV scales after weight loading
+        from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.utils import (
             process_weights_after_loading,
         )
@@ -116,11 +117,12 @@ class VllmInternalWorkerExtension:
         target_device = next(self.model_runner.model.parameters()).device
 
         # Call process_weights_after_loading to handle KV scales
-        process_weights_after_loading(
-            self.model_runner.model,
-            self.model_runner.model_config,
-            target_device,
-        )
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            process_weights_after_loading(
+                self.model_runner.model,
+                self.model_runner.model_config,
+                target_device,
+            )
 
     @staticmethod
     def _split_policy_and_draft_weights(
@@ -180,13 +182,15 @@ class VllmInternalWorkerExtension:
 
                 if payload == IPCProtocol.COMPLETE:
                     # means the update is done
+                    from vllm.config import set_current_vllm_config
                     from vllm.model_executor.model_loader.utils import (
                         process_weights_after_loading,
                     )
 
-                    process_weights_after_loading(
-                        self.model_runner.model, self.model_config, self.device
-                    )
+                    with set_current_vllm_config(self.model_runner.vllm_config):
+                        process_weights_after_loading(
+                            self.model_runner.model, self.model_config, self.device
+                        )
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
