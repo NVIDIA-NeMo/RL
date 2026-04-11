@@ -99,7 +99,8 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
 
             time.sleep(2)
 
-class SGLangEngine:
+@ray.remote  # pragma: no cover
+class SGLangGenerationWorker:
     def __init__(
         self,
         cluster_cfg,
@@ -107,7 +108,7 @@ class SGLangEngine:
         rank: int,
         base_gpu_id: int | None = None,
         num_gpus_per_engine: int | None = None,
-    ):  
+    ):
         self.cluster_cfg = cluster_cfg
         self.sglang_cfg = sglang_cfg
         self.rank = rank

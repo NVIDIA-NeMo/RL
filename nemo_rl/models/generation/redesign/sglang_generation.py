@@ -26,6 +26,7 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     get_reordered_bundle_and_gpu_ids,
 )
+from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -49,9 +50,11 @@ from nemo_rl.models.generation.redesign.ray_utils import (
     find_available_port,
     get_host_info,
 )
-from nemo_rl.models.generation.redesign.sglang_worker import SGLangEngine
+from nemo_rl.models.generation.redesign.sglang_worker import SGLangGenerationWorker
 
 from nemo_rl.models.generation.redesign.fault_tolerance import RolloutHealthMonitor
+
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -117,7 +120,6 @@ class ServerGroup:
 
         num_gpu_per_engine = min(self.num_gpus_per_engine, self.num_gpus_per_node)
         pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
-        RolloutRayActor = ray.remote(SGLangEngine)
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -157,12 +159,13 @@ class ServerGroup:
             if global_cvd:
                 env_vars["CUDA_VISIBLE_DEVICES"] = global_cvd
 
-            rollout_engine = RolloutRayActor.options(
+            rollout_engine = SGLangGenerationWorker.options(
                 num_cpus=num_cpus,
                 num_gpus=num_gpus,
                 scheduling_strategy=scheduling_strategy,
                 runtime_env={
                     "env_vars": env_vars,
+                    **get_nsight_config_if_pattern_matches("sglang_generation_worker"),
                 },
             ).remote(
                 self.cluster_cfg,
@@ -458,6 +461,7 @@ class SGLangGeneration(GenerationInterface):
         return sampling_params
 
 
+    @wrap_with_nvtx_name("sglang_genertion/generate")
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
