@@ -123,6 +123,26 @@ QARL (via ModelOpt) and NeMo RL's built-in [FP8 training](../fp8.md) (via Transf
 - **Weight quantization**: per-tensor, per-channel, and block-wise formats are all supported. Weights are pre-folded on the policy (Megatron) side before transfer to vLLM.
 - **Input (activation) quantization**: only per-tensor is supported. The input quantizer amax is synced to vLLM as a per-tensor scalar.
 
+## Exporting Checkpoints
+
+After quantization-aware training, the Megatron checkpoint contains BF16 weights alongside quantization metadata (amax values, scales). To export a trained checkpoint to a fully quantized HuggingFace format (with real low-precision weights), use the Megatron-Bridge export tool. The exported checkpoint is ready for deployment with inference engines like vLLM or TensorRT-LLM.
+
+From within the NeMo RL container:
+
+```bash
+cd /opt/nemo-rl
+
+uv run --extra mcore --extra modelopt \
+  torchrun --nproc_per_node <NUM_GPUS> \
+  3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/examples/quantization/export.py \
+  --hf-model-id <hf-model-name-or-path> \
+  --megatron-load-path <path-to-megatron-checkpoint>/policy/weights \
+  --export-dir <output-hf-directory> \
+  --tp <tensor-parallel-size> --pp <pipeline-parallel-size>
+```
+
+- `--hf-model-id` should point to the original (pre-training) HuggingFace model so that the exporter knows the model architecture and tokenizer.
+
 ## Limitations
 
 - **Generation**: Currently only vLLM is supported for generation.
