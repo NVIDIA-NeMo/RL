@@ -38,6 +38,14 @@ except ImportError:
 
 
 def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor:
+    """Apply GPT-OSS down_proj transpose fix to the weight.
+
+    This is a workaround for the issue that the down_proj layout is not the same across different frameworks.
+        - HF needs [in, out] layout.
+        - Megatron needs [in, out] layout.
+        - vLLM needs [out, in] layout.
+    See https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/3271 for more details.
+    """
     if key.endswith("mlp.experts.down_proj"):
         weight = weight.transpose(-2, -1).contiguous()
     return weight
