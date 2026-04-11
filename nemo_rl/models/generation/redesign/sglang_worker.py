@@ -460,6 +460,21 @@ class SGLangGenerationWorker:
         logger.info(f"Simulating crash on engine {self.server_host}:{self.server_port}...")
         self.shutdown()
 
+# ---------------------------------------------------------------------------
+# Compatible with parent class or old interfaces 
+# ---------------------------------------------------------------------------
+    def get_base_url(self) -> str | None:
+        pass
+
+    def get_gpu_uuids(self) -> list[str]:
+        pass
+
+    def invalidate_kv_cache(self) -> bool:
+        pass
+
+# ----------------------------------------------------------------------------
+# Compute Server args
+# ----------------------------------------------------------------------------
 def _compute_server_args(
     cluster_cfg,
     sglang_cfg,

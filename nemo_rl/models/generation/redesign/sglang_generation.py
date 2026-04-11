@@ -789,6 +789,40 @@ class SGLangGeneration(GenerationInterface):
 
 
 # ---------------------------------------------------------------------------
+# Compatible with parent class or old interfaces 
+# ---------------------------------------------------------------------------
+    def init_collective(
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
+    ) -> list[ray.ObjectRef]:
+        return []
+    
+    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        pass
+
+    def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
+        return []
+
+    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+        return []
+    
+    def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
+        """Wake workers up for colocated inference."""
+        pass
+
+    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+        """Sleep workers and reset prefix cache."""
+        pass
+    
+    def invalidate_kv_cache(self) -> bool:
+        pass
+
+    def get_sglang_server_urls(self) -> list[str]:
+        pass
+
+    def get_sglang_url_to_gpu_uuids(self) -> dict[str, list[str]]:
+        pass
+    
+# ---------------------------------------------------------------------------
 # Generate one sample helper
 # ---------------------------------------------------------------------------
 async def generate_one_sample(sglang_router_ip, sglang_router_port, sampling_params, input_ids, index: int):
