@@ -357,6 +357,22 @@ class SGLangGenerationWorker:
             tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
         )
 
+    def get_weights_by_name(self, name: str, truncate_size: int = 0):
+        """Get a model parameter by name from the SGLang server.
+
+        Args:
+            name: Fully qualified parameter name (e.g. "model.layers.0.self_attn.q_proj.weight").
+            truncate_size: Maximum number of elements to return per tensor.
+                0 means return the full tensor.
+
+        Returns:
+            Server response JSON containing the parameter values.
+        """
+        return self._make_request(
+            "get_weights_by_name",
+            {"name": name, "truncate_size": truncate_size},
+        )
+
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
 
