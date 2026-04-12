@@ -35,7 +35,7 @@ checkpointing:
   keep_top_k: 5
   save_period: 5
 policy:
-  model_name: MiniMaxAI/MiniMax-M2.5
+  model_name: MiniMaxAI/MiniMax-M2.7
   hf_config_overrides:
     router_aux_loss_coef: 0
   train_global_batch_size: 64
