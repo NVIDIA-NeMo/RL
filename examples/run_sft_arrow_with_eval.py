@@ -40,7 +40,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
-from nemo_rl.algorithms.loss_functions import NLLLoss
+from nemo_rl.algorithms.loss.loss_functions import NLLLoss
 from nemo_rl.algorithms.sft import SFTSaveState, _default_sft_save_state
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig

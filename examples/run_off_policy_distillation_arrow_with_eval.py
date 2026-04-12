@@ -44,7 +44,7 @@ from omegaconf import OmegaConf
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.loss_functions import (
+from nemo_rl.algorithms.loss.loss_functions import (
     CrossTokenizerDistillationLossFn,
     DistillationLossFn,
 )

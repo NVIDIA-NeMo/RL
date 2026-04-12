@@ -14,7 +14,7 @@
 
 token_aligner:
   enabled: true
-  projection_matrix_path: "cross_tokenizer_data/projection_map_Llama-3.2_to_Phi-4-mini-instruct_multitoken_top_32_double_special.pt"
+  projection_matrix_path: "cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special.pt"
   use_sparse_format: false
   loss_type: "KL"
   exact_token_match_only: false
@@ -67,6 +67,7 @@ checkpointing:
   higher_is_better: false
   keep_top_k: 3
   save_period: 10
+  save_optimizer: true
   model_save_format: "safetensors"
   save_consolidated: false
 
@@ -142,10 +143,17 @@ policy:
         gpus_per_node: null
         num_nodes: null
 
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 4096
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
 teacher:
-  model_name: "microsoft/Phi-4-mini-instruct"
+  model_name: "Qwen/Qwen3-8B-Base"
   tokenizer:
-    name: "microsoft/Phi-4-mini-instruct"
+    name: "Qwen/Qwen3-8B-Base"
     chat_template: null
   precision: "bfloat16"
   train_global_batch_size: 768

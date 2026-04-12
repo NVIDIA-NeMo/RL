@@ -22,10 +22,9 @@ from nemo_rl.algorithms.loss.loss_functions import (
     DPOLossConfig,
     DPOLossDataDict,
     DPOLossFn,
-    DraftCrossEntropyLossFn,
-    NLLLossFn,
+    NLLLoss as NLLLossFn,
     PreferenceLossDataDict,
-    PreferenceLossFn,
+    PreferenceLoss as PreferenceLossFn,
 )
 from nemo_rl.algorithms.loss.utils import (
     prepare_loss_input,

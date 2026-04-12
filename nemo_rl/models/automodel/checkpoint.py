@@ -326,7 +326,6 @@ class AutomodelCheckpointManager:
                 scheduler=scheduler,
             )
 
-
 def detect_checkpoint_format(weights_path: str) -> tuple[str, bool]:
     """Detect model save format and PEFT status from checkpoint directory.
 

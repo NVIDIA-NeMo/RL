@@ -342,7 +342,7 @@ def main():
 
     # --- Step 3: Loss via CrossTokenizerDistillationLossFn ---
     # off_policy_distillation.py lines 812-815 + 878-881
-    from nemo_rl.algorithms.loss_functions import CrossTokenizerDistillationLossFn
+    from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 
     cfg = {
         "loss_type": "KL",

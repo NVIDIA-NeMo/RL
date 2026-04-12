@@ -106,7 +106,7 @@ def main():
     print("  Path B: CrossTokenizerDistillationLossFn (loss_functions.py)")
     print("=" * 60)
 
-    from nemo_rl.algorithms.loss_functions import CrossTokenizerDistillationLossFn
+    from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 
     loss_fn = CrossTokenizerDistillationLossFn(cfg, aligner)
     loss_fn._debug_dumped = True  # skip re-dumping
