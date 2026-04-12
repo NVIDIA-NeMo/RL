@@ -8,15 +8,7 @@ from urllib.parse import quote
 
 import ray
 import requests
-import sglang_router
 from packaging.version import parse
-from sglang.srt.constants import (
-    GPU_MEMORY_TYPE_CUDA_GRAPH,
-    GPU_MEMORY_TYPE_KV_CACHE,
-    GPU_MEMORY_TYPE_WEIGHTS,
-)
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
 
 from nemo_rl.models.generation.redesign.ray_utils import (
@@ -49,7 +41,7 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
         f"Expected one of {visible} (physical) or 0..{len(visible)-1} (local)."
     )
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def launch_server_process(server_args) -> multiprocessing.Process:
     from sglang.srt.entrypoints.http_server import launch_server
 
     multiprocessing.set_start_method("spawn", force=True)
@@ -169,6 +161,9 @@ class SGLangGenerationWorker:
 
 
     def _init_normal(self, server_args_dict):
+        import sglang_router
+        from sglang.srt.server_args import ServerArgs
+
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 
@@ -281,6 +276,9 @@ class SGLangGenerationWorker:
             raise TimeoutError("Timeout while flushing cache.")
 
     def shutdown(self):
+        import sglang_router
+        from sglang.srt.utils import kill_process_tree
+
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         if self.node_rank == 0:
             worker_url = f"http://{self.server_host}:{self.server_port}"
@@ -340,17 +338,21 @@ class SGLangGenerationWorker:
         )
 
     def release_memory_weights(self):
+        from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
         return self.release_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     def release_memory_kv_cache_and_cuda_graph(self):
+        from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE
         return self.release_memory_occupation(
             tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
         )
 
     def resume_memory_weights(self):
+        from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
         return self.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     def resume_memory_kv_cache_and_cuda_graph(self):
+        from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE
         return self.resume_memory_occupation(
             tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
         )

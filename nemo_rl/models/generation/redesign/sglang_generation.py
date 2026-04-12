@@ -32,11 +32,8 @@ from nemo_rl.models.generation.redesign.http_utils import (
 from nemo_rl.distributed.ray_actor_environment_registry import SGLANG_EXECUTABLE
 from nemo_rl.models.generation.redesign.misc import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from nemo_rl.models.generation.redesign.ray_utils import Lock
-from nemo_rl.models.generation.redesign.sglang_actors import (
-    SGLANG_WORKER_FQN,
-    RouterActor,
-    SGLangWorkerInitializer,
-)
+from nemo_rl.models.generation.redesign.sglang_actors import RouterActor
+from nemo_rl.models.generation.redesign.sglang_worker import SGLangGenerationWorker
 from nemo_rl.models.generation.redesign.fault_tolerance import RolloutHealthMonitor
 
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -160,11 +157,6 @@ class SGLangGeneration(GenerationInterface):
         reordered_bundle_indices = self.pg_reordered_bundle_indices
         reordered_gpu_ids = self.pg_reordered_gpu_ids
 
-        # One initializer per _start_engines() call (not per engine).
-        initializer = SGLangWorkerInitializer.options(
-            runtime_env={"py_executable": SGLANG_EXECUTABLE},
-        ).remote(SGLANG_WORKER_FQN)
-
         engine_refs: list[tuple[int, int, ray.ObjectRef]] = []  # (index, rank, ref)
         for i in range(len(self.all_engines)):
             if self.all_engines[i] is not None:
@@ -220,9 +212,12 @@ class SGLangGeneration(GenerationInterface):
                 "num_gpus_per_engine": self.num_gpus_per_engine,
             }
 
-            # Collect refs — do NOT ray.get inside the loop (preserve parallel creation).
-            rollout_engine_ref = initializer.create.remote(actor_options, init_args, init_kwargs)
-            engine_refs.append((i, global_rank, rollout_engine_ref))
+            # Create worker actor directly — sglang_worker.py uses lazy imports
+            # so it's importable in SYSTEM env; the actor runs in sglang env.
+            engine = SGLangGenerationWorker.options(**actor_options).remote(
+                *init_args, **init_kwargs
+            )
+            engine_refs.append((i, global_rank, engine))
 
         # Resolve all engine actor handles in parallel.
         if not engine_refs:
