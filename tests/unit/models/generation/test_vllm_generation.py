@@ -2640,3 +2640,158 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
             megatron_policy.shutdown()
         if vllm_generation:
             vllm_generation.shutdown()
+
+
+@pytest.mark.timeout(600)
+def test_vllm_direct_zmq_weight_update_cpu_serialize(
+    cluster, tokenizer, test_input_data
+):
+    """Test direct ZMQ weight update using cpu_serialize transport.
+
+    This exercises the lm_policy.stream_weights_via_ipc_zmq() → vllm_backend
+    path with explicit model_update_transport="cpu_serialize", bypassing the
+    env-var reading in refit_policy_generation.
+    """
+    from nemo_rl.models.policy.lm_policy import Policy
+
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
+    dtensor_config = basic_dtensor_test_config
+
+    vllm_policy = None
+    lm_policy = None
+    try:
+        lm_policy = Policy(cluster, dtensor_config, tokenizer)
+        vllm_policy = VllmGeneration(cluster, vllm_config)
+
+        state_dict_info = lm_policy.prepare_refit_info()
+        vllm_policy.prepare_refit_info(state_dict_info)
+
+        print("Running Generation 1 (Initial)...")
+        vllm_policy.prepare_for_generation()
+        outputs1 = vllm_policy.generate(test_input_data, greedy=True)
+        input_lengths = test_input_data["input_lengths"]
+        logprob1 = outputs1["logprobs"][0, input_lengths[0]].item()
+
+        print("Adding noise to weights in HF policy...")
+        ray.get(
+            [
+                worker._add_noise_to_weights.remote()
+                for worker in lm_policy.worker_group.workers
+            ]
+        )
+
+        # Direct ZMQ weight update with cpu_serialize transport
+        buffer_size_bytes = int(lm_policy.get_free_memory_bytes() * 0.3)
+        futures_train = lm_policy.stream_weights_via_ipc_zmq(
+            buffer_size_bytes=buffer_size_bytes,
+            model_update_transport="cpu_serialize",
+        )
+        futures_inference = vllm_policy.update_weights_via_ipc_zmq()
+        ray.get(futures_train)
+        results = ray.get(futures_inference)
+        assert all(
+            result for result in results if result is not None
+        ), "cpu_serialize weight update should succeed"
+
+        print("Running Generation 2 (Weights Updated)...")
+        outputs2 = vllm_policy.generate(test_input_data, greedy=True)
+        logprob2 = outputs2["logprobs"][0, input_lengths[0]].item()
+        assert logprob2 != logprob1, (
+            "Logprobs should change after cpu_serialize direct weight update."
+        )
+
+    finally:
+        if vllm_policy:
+            vllm_policy.shutdown()
+        if lm_policy:
+            lm_policy.shutdown()
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.asyncio
+async def test_vllm_async_refit_cpu_serialize(
+    cluster, test_input_data, tokenizer, monkeypatch
+):
+    """Test async refit path using cpu_serialize transport via env var.
+
+    This exercises the refit_policy_generation() → env-var → sender →
+    receiver path with NRL_MODEL_UPDATE_TRANSPORT=cpu_serialize.
+    """
+    from nemo_rl.models.policy.lm_policy import Policy
+
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config = configure_generation_config(vllm_config, tokenizer)
+    vllm_config["vllm_cfg"]["async_engine"] = True
+    dtensor_config = basic_dtensor_test_config
+
+    lm_policy = None
+    async_policy = None
+    try:
+        async_policy = VllmGeneration(cluster, vllm_config)
+        async_policy.finish_generation()
+
+        lm_policy = Policy(cluster, dtensor_config, tokenizer)
+
+        state_dict_info = lm_policy.prepare_refit_info()
+        async_policy.prepare_refit_info(state_dict_info)
+
+        monkeypatch.setenv("NRL_MODEL_UPDATE_TRANSPORT", "cpu_serialize")
+
+        print("Running initial cpu_serialize refit...")
+        refit_policy_generation(
+            lm_policy,
+            async_policy,
+            vllm_config["colocated"]["enabled"],
+        )
+
+        print("Running Generation 1 (Initial)...")
+        outputs1 = await _generate_async(
+            async_policy, tokenizer, test_input_data, greedy=True
+        )
+        input_lengths = test_input_data["input_lengths"]
+        logprob1 = outputs1["logprobs"][0, input_lengths[0]].item()
+
+        print("Adding noise to weights in HF policy...")
+        ray.get(
+            [
+                worker._add_noise_to_weights.remote()
+                for worker in lm_policy.worker_group.workers
+            ]
+        )
+
+        print("Running cpu_serialize refit after weight change...")
+        refit_policy_generation(
+            lm_policy,
+            async_policy,
+            vllm_config["colocated"]["enabled"],
+        )
+
+        print("Running Generation 2 (Weights Updated)...")
+        outputs2 = await _generate_async(
+            async_policy, tokenizer, test_input_data, greedy=True
+        )
+        logprob2 = outputs2["logprobs"][0, input_lengths[0]].item()
+        assert logprob2 != logprob1, (
+            "Logprobs should change after cpu_serialize async refit."
+        )
+
+    finally:
+        if async_policy:
+            try:
+                async_policy.shutdown()
+            except Exception:
+                pass
+        if lm_policy:
+            try:
+                lm_policy.shutdown()
+            except Exception:
+                pass
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()

@@ -1078,7 +1078,10 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(
-        self, buffer_size_bytes: int = 0, kv_scales: Optional[dict[str, float]] = None
+        self,
+        buffer_size_bytes: int = 0,
+        kv_scales: Optional[dict[str, float]] = None,
+        model_update_transport: str = "cuda_ipc",
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
         self.maybe_init_zmq()
@@ -1094,6 +1097,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
+            model_update_transport=model_update_transport,
         )
 
     @torch.no_grad()

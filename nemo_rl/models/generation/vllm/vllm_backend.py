@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import io
 import traceback
 from typing import Any
 
@@ -190,8 +191,24 @@ class VllmInternalWorkerExtension:
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
-                ipc_handle, list_keys, used_bytes = payload
-                buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
+                ipc_handle_or_bytes, list_keys, used_bytes = payload
+                if isinstance(ipc_handle_or_bytes, bytes):
+                    # cpu_serialize path: deserialize CPU tensor, DMA to GPU
+                    bucket_data = torch.load(
+                        io.BytesIO(ipc_handle_or_bytes), weights_only=True
+                    )
+                    buffer = bucket_data["bucket"]
+                    if not buffer.is_pinned():
+                        buffer = buffer.pin_memory()
+                    buffer = buffer.to(
+                        device=self.device, non_blocking=True
+                    )
+                    torch.cuda.current_stream().synchronize()
+                else:
+                    # cuda_ipc path (existing)
+                    buffer = rebuild_cuda_tensor_from_ipc(
+                        ipc_handle_or_bytes, self.device.index
+                    )
 
                 weights = []
                 offset = 0
