@@ -68,7 +68,8 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
-from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
+from nemo_rl.models.generation.redesign.config import SGLangConfig
+from nemo_rl.models.generation.redesign.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -438,6 +439,10 @@ def setup(
         )
         train_cluster = cluster
         inference_cluster = cluster
+        inference_cluster_cfg: ClusterConfig = {
+            "gpus_per_node": policy_gpus_per_node,
+            "num_nodes": policy_nodes,
+        }
         print(
             f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
             flush=True,
@@ -526,6 +531,10 @@ def setup(
             num_gpus_per_node=inference_gpus_per_node,
             max_colocated_worker_groups=1,
         )
+        inference_cluster_cfg: ClusterConfig = {
+            "gpus_per_node": inference_gpus_per_node,
+            "num_nodes": inference_nodes,
+        }
         print(
             f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
             flush=True,
@@ -578,7 +587,11 @@ def setup(
     def init_sglang():
         """Initialize SGLang generation workers."""
         t0 = time.perf_counter()
-        pg = SGLangGeneration(cluster=inference_cluster, config=generation_config)
+        pg = SGLangGeneration(
+            cluster=inference_cluster,
+            cluster_cfg=inference_cluster_cfg,
+            sglang_cfg=generation_config,
+        )
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 

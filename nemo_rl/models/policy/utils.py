@@ -405,7 +405,7 @@ def stream_weights_via_http_impl(
         worker_name: Name of the worker for logging
         current_device_uuid: UUID of the current training worker's GPU
     """
-    from nemo_rl.models.generation.sglang.sglang_copied_utils import (
+    from nemo_rl.models.generation.redesign.misc import (
         MultiprocessingSerializer,
     )
 
