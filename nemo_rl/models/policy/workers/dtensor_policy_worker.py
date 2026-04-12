@@ -1804,6 +1804,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
         self,
         buffer_size_bytes: int = 0,
         kv_scales: Optional[dict[str, float]] = None,
+        model_update_transport: str = "cuda_ipc",
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
         if kv_scales is not None:
@@ -1840,6 +1841,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
+            model_update_transport=model_update_transport,
         )
 
     @torch.no_grad()

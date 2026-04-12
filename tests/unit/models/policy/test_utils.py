@@ -125,6 +125,7 @@ def server_process(
     known_tensors: list[tuple[str, torch.Tensor]],
     buffer_size_bytes: int,
     ready_queue: multiprocessing.Queue,
+    model_update_transport: str = "cuda_ipc",
 ) -> None:
     """Server process that streams tensors via IPC ZMQ."""
     try:
@@ -144,6 +145,7 @@ def server_process(
             socket,
             rank=0,
             worker_name="test_server",
+            model_update_transport=model_update_transport,
         )
     except Exception as e:
         import sys
@@ -189,8 +191,19 @@ def client_process(
                 socket.send(IPCProtocol.ACK.value.encode())
                 break
 
-            ipc_handle, list_keys, used_bytes = payload
-            buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, device.index)
+            ipc_handle_or_bytes, list_keys, used_bytes = payload
+
+            if isinstance(ipc_handle_or_bytes, bytes):
+                import io
+
+                bucket_data = torch.load(
+                    io.BytesIO(ipc_handle_or_bytes), weights_only=True
+                )
+                buffer = bucket_data["bucket"].contiguous().pin_memory()
+                buffer = buffer.to(device=device, non_blocking=True)
+                torch.cuda.current_stream().synchronize()
+            else:
+                buffer = rebuild_cuda_tensor_from_ipc(ipc_handle_or_bytes, device.index)
 
             offset = 0
             for key in list_keys:
@@ -343,3 +356,73 @@ class TestStreamWeightsViaIPC:
 
             if os.path.exists(socket_path):
                 os.unlink(socket_path)
+
+    def test_stream_weights_cpu_serialize(self):
+        """Test cpu_serialize round-trip: sender serializes via torch.save, receiver auto-detects bytes payload."""
+        tensor_specs = [
+            ("weight_a", (32, 64), torch.float32),
+            ("weight_b", (16, 16), torch.bfloat16),
+            ("weight_c", (128,), torch.float16),
+        ]
+        known_tensors = [
+            (name, torch.randn(*shape, dtype=dtype))
+            for name, shape, dtype in tensor_specs
+        ]
+        known_tensors_data = [
+            (name, list(t.shape), t.dtype, t) for name, t in known_tensors
+        ]
+
+        socket_path = f"/tmp/test_ipc_zmq_cpu_serialize_{os.getpid()}_{time.time()}"
+        zmq_addr = f"ipc://{socket_path}"
+        buffer_size_bytes = 100 * 1024  # 100 KB
+
+        mp_context = multiprocessing.get_context("spawn")
+        ready_queue = mp_context.Queue()
+        result_queue = mp_context.Queue()
+
+        server_proc = mp_context.Process(
+            target=server_process,
+            args=(zmq_addr, known_tensors, buffer_size_bytes, ready_queue, "cpu_serialize"),
+        )
+        server_proc.start()
+
+        status, msg = ready_queue.get(timeout=self.TIMEOUT)
+        assert status == "ready", f"Server failed: {msg}"
+
+        client_proc = mp_context.Process(
+            target=client_process,
+            args=(zmq_addr, known_tensors_data, result_queue),
+        )
+        client_proc.start()
+
+        try:
+            server_proc.join(timeout=self.TIMEOUT)
+            client_proc.join(timeout=self.TIMEOUT)
+
+            check_process_error(client_proc, result_queue, "Client")
+            check_process_error(server_proc, ready_queue, "Server")
+
+            status, msg = result_queue.get(timeout=self.TIMEOUT)
+            assert status == "success", f"Validation failed: {msg}"
+        finally:
+            for proc in [server_proc, client_proc]:
+                if proc and proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=self.TIMEOUT)
+                    if proc.is_alive():
+                        proc.kill()
+
+            if os.path.exists(socket_path):
+                os.unlink(socket_path)
+
+    def test_stream_weights_invalid_transport(self):
+        """Validation fires before any ZMQ I/O for an unrecognised transport name."""
+        with pytest.raises(ValueError, match="Unsupported model_update_transport"):
+            stream_weights_via_ipc_zmq_impl(
+                params_generator=iter([]),
+                buffer_size_bytes=1024,
+                zmq_socket=None,
+                rank=0,
+                worker_name="test",
+                model_update_transport="typo",
+            )

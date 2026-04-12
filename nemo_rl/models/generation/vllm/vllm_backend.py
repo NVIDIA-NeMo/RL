@@ -190,8 +190,23 @@ class VllmInternalWorkerExtension:
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
-                ipc_handle, list_keys, used_bytes = payload
-                buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
+                ipc_handle_or_bytes, list_keys, used_bytes = payload
+
+                if isinstance(ipc_handle_or_bytes, bytes):
+                    # cpu_serialize path: deserialize CPU tensor, DMA to GPU
+                    import io
+
+                    bucket_data = torch.load(
+                        io.BytesIO(ipc_handle_or_bytes), weights_only=True
+                    )
+                    buffer = bucket_data["bucket"].contiguous().pin_memory()
+                    buffer = buffer.to(device=self.device, non_blocking=True)
+                    torch.cuda.current_stream().synchronize()
+                else:
+                    # Existing CUDA IPC path
+                    buffer = rebuild_cuda_tensor_from_ipc(
+                        ipc_handle_or_bytes, self.device.index
+                    )
 
                 weights = []
                 offset = 0
