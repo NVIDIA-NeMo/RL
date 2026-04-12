@@ -33,7 +33,7 @@ The first node is always the head node, so we need to port forward the dashboard
 #   on the login node is likely taken by someone else.
 ssh -L $LOCAL_PORT:localhost:$DASHBOARD_PORT -N node-12
 
-# Example chosing a port other than 8265 for the LOCAL_PORT
+# Example choosing a port other than 8265 for the LOCAL_PORT
 ssh -L 52640:localhost:8265 -N node-12
 ```
 
