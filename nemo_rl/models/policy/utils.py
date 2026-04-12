@@ -15,6 +15,7 @@
 import gc
 import io
 import os
+import pickle
 import traceback
 from enum import Enum
 from typing import Any, Dict, Optional, cast
@@ -302,10 +303,16 @@ def stream_weights_via_ipc_zmq_impl(
         if await_recv:
             zmq_socket.recv()
 
-        # Payload tuple: (serialized, param_names, used_bytes)
-        # Receiver auto-detects format by isinstance(serialized, bytes)
-        payload = (serialized, param_names, used_bytes)
-        zmq_socket.send_pyobj(payload)
+        if model_update_transport == "cpu_serialize":
+            metadata = pickle.dumps(
+                (param_names, used_bytes), protocol=pickle.HIGHEST_PROTOCOL
+            )
+            zmq_socket.send_multipart(
+                [b"cpu_serialize", metadata, memoryview(serialized)], copy=False
+            )
+        else:
+            payload = (serialized, param_names, used_bytes)
+            zmq_socket.send_pyobj(payload)
         return True  # pending_recv = True
 
     def allocate_buffer(device):

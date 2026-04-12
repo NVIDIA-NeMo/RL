@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import multiprocessing
 import os
+import pickle
 import sys
 import time
 import traceback
@@ -186,18 +188,21 @@ def client_process(
 
         # Receive and validate loop
         while True:
-            payload = socket.recv_pyobj()
-            if payload == IPCProtocol.COMPLETE:
-                socket.send(IPCProtocol.ACK.value.encode())
-                break
+            frames = socket.recv_multipart(copy=False)
+            if len(frames) == 1:
+                payload = pickle.loads(frames[0].buffer)
+                if payload == IPCProtocol.COMPLETE:
+                    socket.send(IPCProtocol.ACK.value.encode())
+                    break
 
-            ipc_handle_or_bytes, list_keys, used_bytes = payload
-            if isinstance(ipc_handle_or_bytes, bytes):
-                # cpu_serialize path: deserialize CPU tensor, DMA to GPU
-                import io
-
+                ipc_handle_or_bytes, list_keys, used_bytes = payload
+                buffer = rebuild_cuda_tensor_from_ipc(
+                    ipc_handle_or_bytes, device.index
+                )
+            elif len(frames) == 3 and bytes(frames[0].buffer) == b"cpu_serialize":
+                list_keys, used_bytes = pickle.loads(frames[1].buffer)
                 bucket_data = torch.load(
-                    io.BytesIO(ipc_handle_or_bytes), weights_only=True
+                    io.BytesIO(frames[2].buffer), weights_only=True
                 )
                 buffer = bucket_data["bucket"]
                 if not buffer.is_pinned():
@@ -205,9 +210,8 @@ def client_process(
                 buffer = buffer.to(device=device, non_blocking=True)
                 torch.cuda.current_stream().synchronize()
             else:
-                # cuda_ipc path (existing)
-                buffer = rebuild_cuda_tensor_from_ipc(
-                    ipc_handle_or_bytes, device.index
+                raise RuntimeError(
+                    f"Unexpected ZMQ frame format in client_process: {len(frames)} frame(s)"
                 )
 
             offset = 0

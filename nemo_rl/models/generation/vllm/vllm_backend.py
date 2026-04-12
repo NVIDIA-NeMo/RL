@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import io
+import pickle
 import traceback
 from typing import Any
 
@@ -177,37 +178,39 @@ class VllmInternalWorkerExtension:
             self.maybe_init_zmq()
             while True:
                 # Blocking receive with timeout (this is the main operation)
-                payload = self.zmq_socket.recv_pyobj()
+                frames = self.zmq_socket.recv_multipart(copy=False)
 
-                if payload == IPCProtocol.COMPLETE:
-                    # means the update is done
-                    from vllm.model_executor.model_loader.utils import (
-                        process_weights_after_loading,
+                if len(frames) == 1:
+                    payload = pickle.loads(frames[0].buffer)
+                    if payload == IPCProtocol.COMPLETE:
+                        # means the update is done
+                        from vllm.model_executor.model_loader.utils import (
+                            process_weights_after_loading,
+                        )
+
+                        process_weights_after_loading(
+                            self.model_runner.model, self.model_config, self.device
+                        )
+                        self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+                        break
+
+                    ipc_handle_or_bytes, list_keys, used_bytes = payload
+                    buffer = rebuild_cuda_tensor_from_ipc(
+                        ipc_handle_or_bytes, self.device.index
                     )
-
-                    process_weights_after_loading(
-                        self.model_runner.model, self.model_config, self.device
-                    )
-                    self.zmq_socket.send(IPCProtocol.ACK.value.encode())
-                    break
-
-                ipc_handle_or_bytes, list_keys, used_bytes = payload
-                if isinstance(ipc_handle_or_bytes, bytes):
-                    # cpu_serialize path: deserialize CPU tensor, DMA to GPU
+                elif len(frames) == 3 and bytes(frames[0].buffer) == b"cpu_serialize":
+                    list_keys, used_bytes = pickle.loads(frames[1].buffer)
                     bucket_data = torch.load(
-                        io.BytesIO(ipc_handle_or_bytes), weights_only=True
+                        io.BytesIO(frames[2].buffer), weights_only=True
                     )
                     buffer = bucket_data["bucket"]
                     if not buffer.is_pinned():
                         buffer = buffer.pin_memory()
-                    buffer = buffer.to(
-                        device=self.device, non_blocking=True
-                    )
+                    buffer = buffer.to(device=self.device, non_blocking=True)
                     torch.cuda.current_stream().synchronize()
                 else:
-                    # cuda_ipc path (existing)
-                    buffer = rebuild_cuda_tensor_from_ipc(
-                        ipc_handle_or_bytes, self.device.index
+                    raise RuntimeError(
+                        f"Unexpected ZMQ frame format in update_weights_via_ipc_zmq: {len(frames)} frame(s)"
                     )
 
                 weights = []
