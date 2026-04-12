@@ -32,7 +32,7 @@ from nemo_rl.models.generation.redesign.http_utils import (
 from nemo_rl.distributed.ray_actor_environment_registry import SGLANG_EXECUTABLE
 from nemo_rl.models.generation.redesign.misc import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from nemo_rl.models.generation.redesign.ray_utils import Lock
-from nemo_rl.models.generation.redesign.sglang_actors import RouterActor
+from nemo_rl.models.generation.redesign.sglang_router import RouterActor
 from nemo_rl.models.generation.redesign.sglang_worker import SGLangGenerationWorker
 from nemo_rl.models.generation.redesign.fault_tolerance import RolloutHealthMonitor
 

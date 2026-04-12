@@ -7,28 +7,6 @@ logger = logging.getLogger(__name__)
 
 SGLANG_WORKER_FQN = "nemo_rl.models.generation.redesign.sglang_worker.SGLangGenerationWorker"
 
-
-@ray.remote
-class SGLangWorkerInitializer:
-    """Loads and constructs SGLangGenerationWorker inside the sglang env.
-
-    Mirrors the role of RayWorkerBuilder.IsolatedWorkerInitializer.
-    We spawn this actor with runtime_env={"py_executable": SGLANG_EXECUTABLE},
-    then call importlib.import_module on the worker module from *inside* this
-    actor — which means the worker module's top-level sglang imports execute in
-    a process that actually has sglang installed.
-    """
-
-    def __init__(self, fqn: str):
-        self._fqn = fqn
-
-    def create(self, actor_options: dict, init_args: tuple, init_kwargs: dict):
-        module_name, class_name = self._fqn.rsplit(".", 1)
-        module = importlib.import_module(module_name)
-        worker_class = getattr(module, class_name)
-        return worker_class.options(**actor_options).remote(*init_args, **init_kwargs)
-
-
 @ray.remote(num_cpus=1, num_gpus=0)
 class RouterActor:
     """Starts and owns the sglang router subprocess.
