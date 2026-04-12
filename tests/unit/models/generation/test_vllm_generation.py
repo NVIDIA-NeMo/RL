@@ -2681,8 +2681,11 @@ def test_vllm_direct_zmq_weight_update_cpu_serialize(
             ]
         )
 
-        # Direct ZMQ weight update with cpu_serialize transport
-        buffer_size_bytes = int(lm_policy.get_free_memory_bytes() * 0.3)
+        vllm_policy.finish_generation()
+        lm_policy.offload_before_refit()
+        vllm_policy.prepare_for_generation(tags=["weights"])
+
+        buffer_size_bytes = int(1.5 * (1024**3))
         futures_train = lm_policy.stream_weights_via_ipc_zmq(
             buffer_size_bytes=buffer_size_bytes,
             model_update_transport="cpu_serialize",
@@ -2695,6 +2698,7 @@ def test_vllm_direct_zmq_weight_update_cpu_serialize(
         ), "cpu_serialize weight update should succeed"
 
         print("Running Generation 2 (Weights Updated)...")
+        vllm_policy.prepare_for_generation()
         outputs2 = vllm_policy.generate(test_input_data, greedy=True)
         logprob2 = outputs2["logprobs"][0, input_lengths[0]].item()
         assert logprob2 != logprob1, (
@@ -2730,6 +2734,7 @@ async def test_vllm_async_refit_cpu_serialize(
     dtensor_config = basic_dtensor_test_config
 
     lm_policy = None
+    updated_policy = None
     async_policy = None
     try:
         async_policy = VllmGeneration(cluster, vllm_config)
@@ -2756,17 +2761,26 @@ async def test_vllm_async_refit_cpu_serialize(
         input_lengths = test_input_data["input_lengths"]
         logprob1 = outputs1["logprobs"][0, input_lengths[0]].item()
 
+        async_policy.finish_generation()
+
+        lm_policy.shutdown()
+        lm_policy = None
+
+        updated_policy = Policy(cluster, dtensor_config, tokenizer)
+        state_dict_info = updated_policy.prepare_refit_info()
+        async_policy.prepare_refit_info(state_dict_info)
+
         print("Adding noise to weights in HF policy...")
         ray.get(
             [
                 worker._add_noise_to_weights.remote()
-                for worker in lm_policy.worker_group.workers
+                for worker in updated_policy.worker_group.workers
             ]
         )
 
         print("Running cpu_serialize refit after weight change...")
         refit_policy_generation(
-            lm_policy,
+            updated_policy,
             async_policy,
             vllm_config["colocated"]["enabled"],
         )
@@ -2789,6 +2803,11 @@ async def test_vllm_async_refit_cpu_serialize(
         if lm_policy:
             try:
                 lm_policy.shutdown()
+            except Exception:
+                pass
+        if updated_policy:
+            try:
+                updated_policy.shutdown()
             except Exception:
                 pass
         import gc
