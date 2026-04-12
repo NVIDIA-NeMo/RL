@@ -10,6 +10,11 @@ import ray
 import requests
 import sglang_router
 from packaging.version import parse
+from sglang.srt.constants import (
+    GPU_MEMORY_TYPE_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
@@ -209,9 +214,6 @@ class SGLangGenerationWorker:
     def _get_current_node_ip_and_free_port(start_port=10000, consecutive=1):
         return get_current_node_ip(), get_free_port(start_port=start_port, consecutive=consecutive)
 
-    def get_master_addr_and_port(self):
-        return self.master_addr, self.master_port
-    
     def health_generate(self, timeout: float = 5.0) -> bool:
         """Run /health_generate on the underlying SGLang HTTP server.
 
@@ -337,19 +339,25 @@ class SGLangGenerationWorker:
             {"tags": tags},
         )
 
+    def release_memory_weights(self):
+        return self.release_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+
+    def release_memory_kv_cache_and_cuda_graph(self):
+        return self.release_memory_occupation(
+            tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
+        )
+
+    def resume_memory_weights(self):
+        return self.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+
+    def resume_memory_kv_cache_and_cuda_graph(self):
+        return self.resume_memory_occupation(
+            tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
+        )
+
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
 
-    def update_weights_from_disk(self, model_path: str, load_format: str | None = None):
-        """Reload weights from *model_path* without restarting the engine.
-
-        Used for non-updatable (frozen) models that overlap with megatron:
-        after offload, weights are restored from disk instead of CPU cache.
-        """
-        payload = {"model_path": model_path}
-        if load_format is not None:
-            payload["load_format"] = load_format
-        return self._make_request("update_weights_from_disk", payload)
 
     def init_weights_update_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
         return self._make_request(
@@ -464,13 +472,62 @@ class SGLangGenerationWorker:
 # Compatible with parent class or old interfaces 
 # ---------------------------------------------------------------------------
     def get_base_url(self) -> str | None:
-        pass
+        """Return the ``http://host:port`` base URL of this SGLang server.
+
+        Only node-rank 0 owns the HTTP server; peer ranks return ``None`` so
+        callers can filter them out when collecting per-engine URLs.
+        """
+        if self.node_rank != 0:
+            return None
+        return f"http://{self.server_host}:{self.server_port}"
 
     def get_gpu_uuids(self) -> list[str]:
-        pass
+        """Return the GPU UUIDs this actor owns on its local node.
+
+        SGLang lays out GPUs contiguously starting at ``base_gpu_id``. Every
+        rank (including peer nodes in multi-node TP) reports its own
+        local-node slice of ``min(num_gpus_per_engine, gpus_per_node)`` GPUs;
+        the orchestrator concatenates the slices across peers to rebuild the
+        full UUID list for a logical engine.
+        """
+        from nemo_rl.utils.nvml import get_device_uuid
+
+        num_local_gpus = min(
+            self.num_gpus_per_engine,
+            self.cluster_cfg["gpus_per_node"],
+        )
+        # ``self.base_gpu_id`` stores the *physical* GPU id handed down by
+        # the orchestrator, but ``get_device_uuid`` indexes into
+        # ``CUDA_VISIBLE_DEVICES`` and therefore expects a *local* id — so
+        # remap before calling it.
+        local_base = _to_local_gpu_id(self.base_gpu_id)
+        return [get_device_uuid(local_base + i) for i in range(num_local_gpus)]
 
     def invalidate_kv_cache(self) -> bool:
-        pass
+        """Flush the cache of the server.
+
+        Returns:
+            True on a successful flush, False on timeout / error. Peer
+            (non-node-0) ranks return True since they do not own the HTTP
+            server.
+        """
+        if self.node_rank != 0:
+            return True
+        # flush cache will not return status_code 200 when there are pending requests
+        for _ in range(60):
+            try:
+                response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
+                if response.status_code == 200:
+                    return True
+            except NewConnectionError as e:
+                logger.error(f"Connection error flushing cache: {e}")
+                return False
+            except Exception as e:
+                logger.info(f"Error flushing cache: {e}")
+                time.sleep(1)
+                continue
+        logger.error("Timeout while flushing cache.")
+        return False
 
 # ----------------------------------------------------------------------------
 # Compute Server args

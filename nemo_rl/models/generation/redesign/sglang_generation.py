@@ -1,11 +1,7 @@
 import asyncio
-import itertools
 import logging
-import multiprocessing
 import os
-import random
 import threading
-import time
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
@@ -13,11 +9,6 @@ import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import (
-    GPU_MEMORY_TYPE_CUDA_GRAPH,
-    GPU_MEMORY_TYPE_KV_CACHE,
-    GPU_MEMORY_TYPE_WEIGHTS,
-)
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -38,19 +29,14 @@ from nemo_rl.models.generation.redesign.http_utils import (
     init_http_client,
     post,
 )
-from nemo_rl.models.generation.redesign.misc import (
-    NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
-    run_router,
-    terminate_process,
+from nemo_rl.distributed.ray_actor_environment_registry import SGLANG_EXECUTABLE
+from nemo_rl.models.generation.redesign.misc import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+from nemo_rl.models.generation.redesign.ray_utils import Lock
+from nemo_rl.models.generation.redesign.sglang_actors import (
+    SGLANG_WORKER_FQN,
+    RouterActor,
+    SGLangWorkerInitializer,
 )
-from nemo_rl.models.generation.redesign.ray_utils import (
-    Lock,
-    _wrap_ipv6,
-    find_available_port,
-    get_host_info,
-)
-from nemo_rl.models.generation.redesign.sglang_worker import SGLangGenerationWorker
-
 from nemo_rl.models.generation.redesign.fault_tolerance import RolloutHealthMonitor
 
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -98,7 +84,7 @@ class SGLangGeneration(GenerationInterface):
         self.model_path: str | None = sglang_cfg["sglang_cfg"]["model_path"]
 
         # --- Router bootstrap --------------------------------------------
-        router_ip, router_port, router_process = _start_router(sglang_cfg)
+        router_ip, router_port, router_actor = _start_router(sglang_cfg)
         sglang_cfg["sglang_router"]["sglang_router_ip"] = router_ip
         sglang_cfg["sglang_router"]["sglang_router_port"] = router_port
         self.router_ip: str = router_ip
@@ -106,7 +92,7 @@ class SGLangGeneration(GenerationInterface):
         # Only set when ``_start_router`` actually spawned the router (i.e.
         # sglang_router_ip was not already configured). Kept so ``shutdown``
         # can terminate it cleanly.
-        self.router_process: multiprocessing.Process | None = router_process
+        self._router_actor: ray.actor.ActorHandle | None = router_actor
 
         # --- Start engines -----------------------------------------------
         init_handles, _ = self._start_engines({})
@@ -174,7 +160,12 @@ class SGLangGeneration(GenerationInterface):
         reordered_bundle_indices = self.pg_reordered_bundle_indices
         reordered_gpu_ids = self.pg_reordered_gpu_ids
 
-        local_all_engines = []
+        # One initializer per _start_engines() call (not per engine).
+        initializer = SGLangWorkerInitializer.options(
+            runtime_env={"py_executable": SGLANG_EXECUTABLE},
+        ).remote(SGLANG_WORKER_FQN)
+
+        engine_refs: list[tuple[int, int, ray.ObjectRef]] = []  # (index, rank, ref)
         for i in range(len(self.all_engines)):
             if self.all_engines[i] is not None:
                 continue
@@ -212,29 +203,39 @@ class SGLangGeneration(GenerationInterface):
             if global_cvd:
                 env_vars["CUDA_VISIBLE_DEVICES"] = global_cvd
 
-            rollout_engine = SGLangGenerationWorker.options(
-                num_cpus=num_cpus,
-                num_gpus=num_gpus,
-                scheduling_strategy=scheduling_strategy,
-                runtime_env={
+            actor_options = {
+                "num_cpus": num_cpus,
+                "num_gpus": num_gpus,
+                "scheduling_strategy": scheduling_strategy,
+                "runtime_env": {
+                    "py_executable": SGLANG_EXECUTABLE,
                     "env_vars": env_vars,
                     **get_nsight_config_if_pattern_matches("sglang_generation_worker"),
                 },
-            ).remote(
-                self.cluster_cfg,
-                self.sglang_cfg,
-                rank=global_rank,
-                base_gpu_id=base_gpu_id,
-                num_gpus_per_engine=self.num_gpus_per_engine,
-            )
+            }
+            init_args = (self.cluster_cfg, self.sglang_cfg)
+            init_kwargs = {
+                "rank": global_rank,
+                "base_gpu_id": base_gpu_id,
+                "num_gpus_per_engine": self.num_gpus_per_engine,
+            }
 
-            local_all_engines.append((global_rank, rollout_engine))
-            self.all_engines[i] = rollout_engine
+            # Collect refs — do NOT ray.get inside the loop (preserve parallel creation).
+            rollout_engine_ref = initializer.create.remote(actor_options, init_args, init_kwargs)
+            engine_refs.append((i, global_rank, rollout_engine_ref))
+
+        # Resolve all engine actor handles in parallel.
+        if not engine_refs:
+            self.num_new_engines = 0
+            return [], port_cursors
+
+        resolved_engines = ray.get([ref for _, _, ref in engine_refs])
+        local_all_engines = []
+        for (i, global_rank, _), engine in zip(engine_refs, resolved_engines):
+            self.all_engines[i] = engine
+            local_all_engines.append((global_rank, engine))
 
         self.num_new_engines = len(local_all_engines)
-
-        if self.num_new_engines == 0:
-            return [], port_cursors
 
         base_port = max(port_cursors.values()) if port_cursors else 15000
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
@@ -270,16 +271,8 @@ class SGLangGeneration(GenerationInterface):
 
         if self.needs_offload and dead_indices:
             new_engines = [self.all_engines[i] for i in dead_indices]
-            release_handles = [
-                engine.release_memory_occupation.remote() for engine in new_engines
-            ]
-            ray.get(release_handles)
-            ray.get(
-                [
-                    engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS])
-                    for engine in new_engines
-                ]
-            )
+            ray.get([engine.release_memory_weights.remote() for engine in new_engines])
+            ray.get([engine.resume_memory_weights.remote() for engine in new_engines])
 
     # ------------------------------------------------------------------
     # Public API
@@ -294,41 +287,45 @@ class SGLangGeneration(GenerationInterface):
             self.engine_gpu_offsets,
         )
 
-    def offload(self, tags: list[str] | None = None):
-        """Release memory on all node-0 engines across all servers / models."""
-        if tags is None and not self.needs_offload:
-            return []
-        if tags is None:
-            handles = [
-                engine.release_memory_occupation.remote()
-                for engine in self.engines
-                if engine is not None
-            ]
-        else:
-            handles = [
-                engine.release_memory_occupation.remote(tags=tags)
-                for engine in self.engines
-                if engine is not None
-            ]
-        return ray.get(handles) if handles else []
-
-    def onload(self, tags: list[str] | None = None):
+    def offload_weights(self):
         if not self.needs_offload:
-            return []
+            return
         handles = [
-            engine.resume_memory_occupation.remote(tags=tags)
+            engine.release_memory_weights.remote()
             for engine in self.engines
             if engine is not None
         ]
-        return ray.get(handles) if handles else []
+        if handles:
+            ray.get(handles)
+
+    def offload_kv(self):
+        handles = [
+            engine.release_memory_kv_cache_and_cuda_graph.remote()
+            for engine in self.engines
+            if engine is not None
+        ]
+        if handles:
+            ray.get(handles)
 
     def onload_weights(self):
         if not self.needs_offload:
             return
-        self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        handles = [
+            engine.resume_memory_weights.remote()
+            for engine in self.engines
+            if engine is not None
+        ]
+        if handles:
+            ray.get(handles)
 
     def onload_kv(self):
-        self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
+        handles = [
+            engine.resume_memory_kv_cache_and_cuda_graph.remote()
+            for engine in self.engines
+            if engine is not None
+        ]
+        if handles:
+            ray.get(handles)
 
     def recover_updatable_engines(self):
         """Restart any dead rollout engines and update ``num_new_engines``
@@ -378,13 +375,14 @@ class SGLangGeneration(GenerationInterface):
                 logger.warning(f"Engine shutdown failed: {e}")
                 ok = False
 
-        if self.router_process is not None:
+        if self._router_actor is not None:
             try:
-                terminate_process(self.router_process, timeout=3.0)
+                ray.get(self._router_actor.stop.remote())
+                ray.kill(self._router_actor)
             except Exception as e:
                 logger.warning(f"Router terminate failed: {e}")
                 ok = False
-            self.router_process = None
+            self._router_actor = None
 
         return ok
 
@@ -814,13 +812,100 @@ class SGLangGeneration(GenerationInterface):
         pass
     
     def invalidate_kv_cache(self) -> bool:
-        pass
+        """Invalidate KV cache before weight updates (Megatron-style).
+
+        Flushes the cache on every node-0 engine so stale KV entries are
+        discarded before new weights land. Returns ``True`` iff every engine
+        reports success.
+        """
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return True
+        try:
+            results = ray.get([e.invalidate_kv_cache.remote() for e in engines])
+        except Exception as e:
+            logger.error(f"[sglang refit] Error flushing SGLang caches: {e}")
+            return False
+
+        success = all(results)
+        if success:
+            logger.info("[sglang refit] All SGLang server caches flushed successfully")
+        else:
+            logger.warning(
+                "[sglang refit] WARNING - Some SGLang server caches failed to flush"
+            )
+        return success
 
     def get_sglang_server_urls(self) -> list[str]:
-        pass
+        """Return the base URLs of all SGLang servers (one per logical engine).
+
+        Returns:
+            List of base URLs, e.g. ``["http://host-a:30000", "http://host-b:30001"]``.
+        """
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            raise RuntimeError("No rollout engines initialized")
+
+        urls = ray.get([e.get_base_url.remote() for e in engines])
+        return list({u for u in urls if u is not None})
 
     def get_sglang_url_to_gpu_uuids(self) -> dict[str, list[str]]:
-        pass
+        """Return a mapping of SGLang server URL to the GPU UUIDs it owns.
+
+        For multi-node TP, a single logical engine spans ``nodes_per_engine``
+        consecutive actors in ``all_engines``; we key by the node-0 URL and
+        concatenate the local-node UUID slices from every peer in the group.
+
+        Returns:
+            Dict mapping base URL to list of GPU UUIDs,
+            e.g. ``{"http://host-a:30000": ["GPU-aaa", "GPU-bbb"], ...}``.
+        """
+        if not any(e is not None for e in self.all_engines):
+            raise RuntimeError("No rollout engines initialized")
+
+        nodes_per_engine = self.nodes_per_engine
+
+        # Fan out to every actor (not just node-0) so peer ranks can report
+        # their own GPU slice. ``None`` slots mean the engine was killed by
+        # the health monitor and not yet recovered; skip them.
+        url_refs = [
+            e.get_base_url.remote() if e is not None else None
+            for e in self.all_engines
+        ]
+        uuid_refs = [
+            e.get_gpu_uuids.remote() if e is not None else None
+            for e in self.all_engines
+        ]
+        urls_live = ray.get([r for r in url_refs if r is not None])
+        uuids_live = ray.get([r for r in uuid_refs if r is not None])
+
+        # Re-key results back to their original slot index so gaps (None
+        # engines) stay aligned with ``all_engines``.
+        urls_by_slot: list[str | None] = []
+        uuids_by_slot: list[list[str] | None] = []
+        u_iter = iter(urls_live)
+        g_iter = iter(uuids_live)
+        for engine in self.all_engines:
+            if engine is None:
+                urls_by_slot.append(None)
+                uuids_by_slot.append(None)
+            else:
+                urls_by_slot.append(next(u_iter))
+                uuids_by_slot.append(next(g_iter))
+
+        url_to_uuids: dict[str, list[str]] = {}
+        for group_start in range(0, len(self.all_engines), nodes_per_engine):
+            node0_url = urls_by_slot[group_start]
+            if node0_url is None:
+                continue
+            aggregated: list[str] = []
+            for i in range(group_start, group_start + nodes_per_engine):
+                slot_uuids = uuids_by_slot[i]
+                if slot_uuids:
+                    aggregated.extend(slot_uuids)
+            if aggregated:
+                url_to_uuids[node0_url] = aggregated
+        return url_to_uuids
     
 # ---------------------------------------------------------------------------
 # Generate one sample helper
@@ -944,51 +1029,22 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 
     return addr_and_ports, node_port_cursor
 
-# ---------------------------------------------------------------------------
-# Router + server bootstrap
-# ---------------------------------------------------------------------------
-
 def _start_router(
     sglang_cfg: SGLangConfig,
-) -> tuple[str, int, multiprocessing.Process | None]:
-    """Start sgl router, returning ``(router_ip, router_port, process)``.
+) -> tuple[str, int, ray.actor.ActorHandle | None]:
+    """Start sgl router, returning ``(router_ip, router_port, actor_handle)``.
 
     If ``sglang_router.sglang_router_ip`` is already set, reuse it and return
-    ``process=None`` (we do not own that router and must not terminate it).
-    Otherwise spawn a new router process and return its handle so the caller
-    can shut it down explicitly.
+    ``actor_handle=None`` (we do not own that router and must not terminate it).
+    Otherwise spawn a ``RouterActor`` in sglang env to own the router process.
     """
     router_cfg = sglang_cfg["sglang_router"]
     if router_cfg["sglang_router_ip"] is not None:
         return router_cfg["sglang_router_ip"], router_cfg["sglang_router_port"], None
 
-    router_ip = _wrap_ipv6(get_host_info()[1])
-    router_port = router_cfg["sglang_router_port"]
-    if router_port is None:
-        router_port = find_available_port(random.randint(3000, 4000))
-
-    from sglang_router.launch_router import RouterArgs
-
-    router_args = RouterArgs()
-    router_args.host = router_ip
-    router_args.port = router_port
-    if router_cfg.get("router_policy") is not None:
-        router_args.router_policy = router_cfg["router_policy"]
-    router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
-    router_args.log_level = "warn"
-    request_timeout_secs = router_cfg.get("sglang_router_request_timeout_secs")
-    if request_timeout_secs is not None:
-        router_args.request_timeout_secs = request_timeout_secs
-
-    logger.info(f"Launch router with args: {router_args}")
-
-    process = multiprocessing.Process(
-        target=run_router,
-        args=(router_args,),
-    )
-    process.daemon = True
-    process.start()
-    time.sleep(3)
-    assert process.is_alive()
+    router_actor = RouterActor.options(
+        runtime_env={"py_executable": SGLANG_EXECUTABLE},
+    ).remote()
+    router_ip, router_port = ray.get(router_actor.start.remote(dict(router_cfg)))
     logger.info(f"Router launched at {router_ip}:{router_port}")
-    return router_ip, router_port, process
+    return router_ip, router_port, router_actor
