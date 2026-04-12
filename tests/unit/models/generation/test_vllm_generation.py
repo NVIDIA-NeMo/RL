@@ -2697,8 +2697,9 @@ def test_vllm_direct_zmq_weight_update_cpu_serialize(
             result for result in results if result is not None
         ), "cpu_serialize weight update should succeed"
 
+        lm_policy.offload_after_refit()
+        vllm_policy.prepare_for_generation(tags=["kv_cache"])
         print("Running Generation 2 (Weights Updated)...")
-        vllm_policy.prepare_for_generation()
         outputs2 = vllm_policy.generate(test_input_data, greedy=True)
         logprob2 = outputs2["logprobs"][0, input_lengths[0]].item()
         assert logprob2 != logprob1, (
