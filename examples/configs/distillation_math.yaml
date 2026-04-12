@@ -87,6 +87,7 @@ policy: &POLICY_BASE
 
     megatron_cfg: &MEGATRON_BASE
         enabled: false
+        force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
         empty_unused_memory_level: 0
         activation_checkpointing: false
         converter_type: "Qwen3ForCausalLM"
@@ -112,6 +113,7 @@ policy: &POLICY_BASE
         moe_enable_deepep: false
         moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
+        gradient_accumulation_fusion: false
         
         optimizer:
             optimizer: "adam"
@@ -196,6 +198,7 @@ policy: &POLICY_BASE
             num_last_layers_in_bf16: 0
             num_first_layers_in_bf16: 0
             distributed_executor_backend: null
+        vllm_kwargs: {}
 
         colocated:
             # true: generation shares training GPUs

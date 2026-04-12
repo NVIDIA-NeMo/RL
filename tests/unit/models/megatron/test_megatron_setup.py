@@ -97,6 +97,42 @@ class TestValidateModelPaths:
         assert hf_model_name == "test-model"
         assert pt_checkpoint_exists is True
 
+    def test_hf_config_overrides_change_hashed_pretrained_path(self, tmp_path):
+        """Test that different hf_config_overrides map to different hashed paths."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        base_config = {"model_name": "test-model"}
+        yarn_config = {
+            "model_name": "test-model",
+            "hf_config_overrides": {
+                "rope_scaling": {
+                    "rope_type": "yarn",
+                    "factor": 4.0,
+                    "original_max_position_embeddings": 32768,
+                }
+            },
+        }
+
+        with patch(
+            "nemo_rl.models.megatron.setup.get_megatron_checkpoint_dir",
+            return_value=str(tmp_path / "checkpoints"),
+        ):
+            _, base_pretrained_path, base_checkpoint_exists = validate_model_paths(
+                base_config
+            )
+            _, yarn_pretrained_path, yarn_checkpoint_exists = validate_model_paths(
+                yarn_config
+            )
+
+        assert base_pretrained_path == f"{tmp_path}/checkpoints/test-model"
+        assert "__hfovr_" not in base_pretrained_path
+        assert yarn_pretrained_path.startswith(
+            f"{tmp_path}/checkpoints/test-model__hfovr_"
+        )
+        assert yarn_pretrained_path != base_pretrained_path
+        assert base_checkpoint_exists is False
+        assert yarn_checkpoint_exists is False
+
 
 @pytest.mark.mcore
 class TestApplyParallelismConfig:
@@ -924,6 +960,47 @@ class TestHandleModelImport:
 
         captured = capsys.readouterr()
         assert "Reinitializing model parallel" in captured.out
+
+    @patch("nemo_rl.models.megatron.setup.import_model_from_hf_name")
+    @patch("nemo_rl.models.megatron.setup.parallel_state")
+    def test_force_reconvert_from_hf_when_checkpoint_exists(
+        self, mock_ps, mock_import, tmp_path
+    ):
+        """Test that force_reconvert_from_hf forces reimport even when checkpoint exists."""
+        from nemo_rl.models.megatron.setup import handle_model_import
+
+        mock_ps.model_parallel_is_initialized.return_value = False
+
+        pretrained_path = str(tmp_path / "model")
+        print(f"pretrained_path: {pretrained_path}")
+        yarn_overrides = {
+            "rope_scaling": {
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            }
+        }
+        config = {
+            "model_name": "test-model",
+            "megatron_cfg": {"force_reconvert_from_hf": True},
+            "hf_config_overrides": yarn_overrides,
+        }
+
+        handle_model_import(
+            config, "test-model", pretrained_path, pt_checkpoint_exists=True
+        )
+
+        mock_import.assert_called_once_with(
+            "test-model",
+            pretrained_path,
+            {"force_reconvert_from_hf": True},
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            },
+        )
+        mock_ps.destroy_model_parallel.assert_not_called()
 
 
 @pytest.mark.mcore

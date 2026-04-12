@@ -1,0 +1,77 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  val_period: 15
+  max_val_samples: 960
+  val_batch_size: 960
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 2
+checkpointing:
+  checkpoint_dir: results/grpo-glm47-flash-4n8g-automodel
+policy:
+  model_name: zai-org/GLM-4.7-Flash
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 10240
+  logprob_chunk_size: 4096
+  offload_optimizer_for_logprob: true
+  optimizer:
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  dtensor_cfg:
+    expert_parallel_size: 32
+    activation_checkpointing: true
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: te
+        enable_deepep: true
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      tensor_parallel_size: 4
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-glm47-flash-4n8g-automodel
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

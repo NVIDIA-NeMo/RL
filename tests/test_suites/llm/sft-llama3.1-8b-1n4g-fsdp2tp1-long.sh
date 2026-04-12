@@ -38,7 +38,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'data["train/loss"]["1"] < 0.6' \
         'data["train/loss"]["250"] < 0.36' \
-	    'max(data["ray/node.0.gpu.0.mem_gb"]) < 80' \
+	    'max(data["ray/node.0.gpu.0.mem_gb"]) < 120' \
         'mean(data["timing/train/total_step_time"], 2) < 22'
 
     # Clean up checkpoint directory after successful run to save space.

@@ -31,7 +31,7 @@ Exception: `Dockerfile.ngc_pytorch` is exempt from this rule.
 
 ## Python Standard
 
-Code must conform to Python 3.12+.
+Code must conform to Python 3.13.13+.
 
 ## Indentation
 
