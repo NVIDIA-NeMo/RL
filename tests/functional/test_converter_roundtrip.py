@@ -543,6 +543,7 @@ def main():
         print("=" * 60)
         lora_adapter_hf_path = os.path.join(temp_dir, "lora_adapter_hf")
         export_lora_adapter_to_hf(
+            base_ckpt=megatron_checkpoint_path,
             adapter_ckpt=lora_adapter_path,
             hf_model_name=model_name,
             hf_ckpt_path=lora_adapter_hf_path,
