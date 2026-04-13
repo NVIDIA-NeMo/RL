@@ -57,10 +57,11 @@ class SGLangGeneration(GenerationInterface):
         self.cluster_cfg = cluster_cfg
         self.sglang_cfg = sglang_cfg
 
-        self.pg = cluster._init_placement_groups(
+        pgs = cluster._init_placement_groups(
             strategy="PACK",
             use_unified_pg=True,
         )
+        self.pg = pgs[0]
         self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids = get_reordered_bundle_and_gpu_ids(self.pg)
 
         init_http_client(sglang_cfg)
@@ -157,7 +158,7 @@ class SGLangGeneration(GenerationInterface):
         reordered_bundle_indices = self.pg_reordered_bundle_indices
         reordered_gpu_ids = self.pg_reordered_gpu_ids
 
-        engine_refs: list[tuple[int, int, ray.ObjectRef]] = []  # (index, rank, ref)
+        local_all_engines = []
         for i in range(len(self.all_engines)):
             if self.all_engines[i] is not None:
                 continue
@@ -217,20 +218,14 @@ class SGLangGeneration(GenerationInterface):
             engine = SGLangGenerationWorker.options(**actor_options).remote(
                 *init_args, **init_kwargs
             )
-            engine_refs.append((i, global_rank, engine))
 
-        # Resolve all engine actor handles in parallel.
-        if not engine_refs:
-            self.num_new_engines = 0
-            return [], port_cursors
-
-        resolved_engines = ray.get([ref for _, _, ref in engine_refs])
-        local_all_engines = []
-        for (i, global_rank, _), engine in zip(engine_refs, resolved_engines):
-            self.all_engines[i] = engine
             local_all_engines.append((global_rank, engine))
+            self.all_engines[i] = engine
 
         self.num_new_engines = len(local_all_engines)
+
+        if self.num_new_engines == 0:
+            return [], port_cursors
 
         base_port = max(port_cursors.values()) if port_cursors else 15000
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
