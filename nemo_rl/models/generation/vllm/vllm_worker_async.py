@@ -1132,7 +1132,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
-    async def sleep_async(self):
+    async def sleep_async(self, level: int | None = None, mode: str = "abort"):
         """Async version of sleep."""
         assert self.llm is not None, (
             "Attempting to sleep with either an uninitialized vLLM or non-model-owner"
@@ -1143,6 +1143,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 "sleep_async can only be used with async_engine=True. Use sleep instead."
             )
 
+        resolved_level = self.cfg["vllm_cfg"].get("sleep_level", 1)
+        if level is not None:
+            resolved_level = level
+
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
         await self.llm.reset_prefix_cache()
         # Reset the multimodal processor cache (sender side) so it stays in
@@ -1151,7 +1155,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         # the receiver and sends data=None, causing an assertion error.
         if hasattr(self.llm, "reset_mm_cache"):
             await self.llm.reset_mm_cache()
-        await self.llm.sleep(level=1)
+        await self.llm.sleep(level=resolved_level, mode=mode)
 
         gc.collect()
         torch.cuda.empty_cache()

@@ -14,9 +14,10 @@
 
 import json
 import os
+import threading
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 import ray
@@ -33,7 +34,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorker
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    VllmAsyncGenerationWorker,
     _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
@@ -187,6 +190,121 @@ def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refi
     )
 
     assert configured["vllm_cfg"]["load_format"] == "dummy"
+
+
+def _make_partial_overlap_policy(async_engine: bool = True, dp_size: int = 4):
+    policy = object.__new__(VllmGeneration)
+    policy.cfg = {"vllm_cfg": {"async_engine": async_engine}, "colocated": {"enabled": False}}
+    policy.worker_group = MagicMock()
+    policy.worker_group.dp_size = dp_size
+    policy.worker_group.get_dp_leader_worker_idx.side_effect = (
+        lambda dp_rank: dp_rank + 100
+    )
+    policy.current_generate_dp_shard_idx = 0
+    policy._active_dp_ranks = set(range(dp_size))
+    policy._active_dp_ranks_lock = threading.Lock()
+    return policy
+
+
+def test_vllm_generation_worker_sleep_passes_configured_level_and_mode():
+    worker = object.__new__(VllmGenerationWorker)
+    worker.cfg = {"vllm_cfg": {"async_engine": False, "sleep_level": 2}}
+    worker.llm = MagicMock()
+    worker.llm.renderer = MagicMock()
+
+    worker.sleep(mode="wait")
+
+    worker.llm.llm_engine.reset_prefix_cache.assert_called_once_with()
+    worker.llm.renderer.clear_mm_cache.assert_called_once_with()
+    worker.llm.sleep.assert_called_once_with(level=2, mode="wait")
+
+
+def test_vllm_generation_worker_sleep_explicit_level_overrides_config():
+    worker = object.__new__(VllmGenerationWorker)
+    worker.cfg = {"vllm_cfg": {"async_engine": False, "sleep_level": 2}}
+    worker.llm = MagicMock()
+    worker.llm.renderer = MagicMock()
+
+    worker.sleep(level=1, mode="wait")
+
+    worker.llm.sleep.assert_called_once_with(level=1, mode="wait")
+
+
+@pytest.mark.asyncio
+async def test_vllm_async_generation_worker_sleep_passes_configured_level_and_mode():
+    worker = object.__new__(VllmAsyncGenerationWorker)
+    worker.cfg = {"vllm_cfg": {"async_engine": True, "sleep_level": 2}}
+    worker.llm = MagicMock()
+    worker.llm.reset_prefix_cache = AsyncMock()
+    worker.llm.reset_mm_cache = AsyncMock()
+    worker.llm.sleep = AsyncMock()
+
+    await worker.sleep_async(mode="wait")
+
+    worker.llm.reset_prefix_cache.assert_awaited_once_with()
+    worker.llm.reset_mm_cache.assert_awaited_once_with()
+    worker.llm.sleep.assert_awaited_once_with(level=2, mode="wait")
+
+
+def test_vllm_generation_partial_overlap_helpers_update_active_ranks(monkeypatch):
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=4)
+    monkeypatch.setattr(ray, "get", lambda _future: True)
+
+    assert policy.sleep_partial([1, 3], level=2)
+    assert policy._active_dp_ranks == {0, 2}
+    assert policy.worker_group.run_single_worker_single_data.call_args_list == [
+        call(method_name="sleep_async", worker_idx=101, level=2, mode="wait"),
+        call(method_name="sleep_async", worker_idx=103, level=2, mode="wait"),
+    ]
+
+    policy.worker_group.run_single_worker_single_data.reset_mock()
+
+    assert policy.wake_up_partial([3], tags=["weights"])
+    assert policy._active_dp_ranks == {0, 2, 3}
+    policy.worker_group.run_single_worker_single_data.assert_called_once_with(
+        method_name="wake_up_async", worker_idx=103, tags=["weights"]
+    )
+
+
+def test_vllm_generation_selects_only_active_dp_ranks():
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=4)
+    policy._active_dp_ranks = {1, 3}
+
+    assert policy._select_next_active_dp_rank() == 1
+    assert policy._select_next_active_dp_rank() == 3
+    assert policy._select_next_active_dp_rank() == 1
+
+
+def test_vllm_generation_sleep_partial_restores_failed_shards(monkeypatch):
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=4)
+    policy.worker_group.run_single_worker_single_data.side_effect = ["sleep-1", "sleep-3"]
+
+    def fake_ray_get(future):
+        if future == "sleep-1":
+            return True
+        raise RuntimeError("sleep failed")
+
+    monkeypatch.setattr(ray, "get", fake_ray_get)
+
+    assert not policy.sleep_partial([1, 3], level=2)
+    assert policy._active_dp_ranks == {0, 2, 3}
+
+
+
+def test_vllm_generation_wake_partial_only_restores_successful_shards(monkeypatch):
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=4)
+    policy._active_dp_ranks = {0, 2}
+    policy.worker_group.run_single_worker_single_data.side_effect = ["wake-1", "wake-3"]
+
+    def fake_ray_get(future):
+        if future == "wake-1":
+            return True
+        raise RuntimeError("wake failed")
+
+    monkeypatch.setattr(ray, "get", fake_ray_get)
+
+    assert not policy.wake_up_partial([1, 3], tags=["weights"])
+    assert policy._active_dp_ranks == {0, 1, 2}
 
 
 def get_basic_megatron_test_config(

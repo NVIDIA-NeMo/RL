@@ -14,6 +14,7 @@
 
 import asyncio
 import os
+import threading
 import warnings
 from collections import defaultdict
 from typing import (
@@ -204,6 +205,8 @@ class VllmGeneration(GenerationInterface):
 
         # Used to track the round-robin selection of worker groups for generate_async
         self.current_generate_dp_shard_idx = 0
+        self._active_dp_ranks = set(range(self.worker_group.dp_size))
+        self._active_dp_ranks_lock = threading.Lock()
 
         # Save the device uuids for the workers
         self.device_uuids = self._report_device_id()
@@ -587,9 +590,13 @@ class VllmGeneration(GenerationInterface):
         if not data_validation_fn(data):
             return
 
-        # Determine the leader worker for the current data parallel shard
+        selected_dp_shard_idx = self._select_next_active_dp_rank()
+        while selected_dp_shard_idx is None:
+            await self._wait_for_active_dp_ranks()
+            selected_dp_shard_idx = self._select_next_active_dp_rank()
+
         leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
-            self.current_generate_dp_shard_idx
+            selected_dp_shard_idx
         )
 
         # Run the async method on the selected leader worker
@@ -599,10 +606,6 @@ class VllmGeneration(GenerationInterface):
             data=data,
             greedy=greedy,
         )
-
-        # Increment the round-robin worker group index
-        self.current_generate_dp_shard_idx += 1
-        self.current_generate_dp_shard_idx %= self.worker_group.dp_size
 
         # Create a queue to collect sample results from the worker as they complete
         result_queue = asyncio.Queue()
@@ -683,6 +686,176 @@ class VllmGeneration(GenerationInterface):
         assert worker_task.done(), (
             f"Worker task {leader_worker_idx} should be done but isn't"
         )
+
+    def _normalize_dp_ranks(self, dp_ranks: list[int]) -> list[int]:
+        """Validate and normalize data parallel shard indices."""
+        normalized_dp_ranks = sorted(set(dp_ranks))
+        invalid_dp_ranks = [
+            dp_rank
+            for dp_rank in normalized_dp_ranks
+            if dp_rank < 0 or dp_rank >= self.worker_group.dp_size
+        ]
+        if invalid_dp_ranks:
+            raise ValueError(
+                f"Invalid data parallel shard indices: {invalid_dp_ranks}. "
+                f"Valid range is [0, {self.worker_group.dp_size})."
+            )
+        return normalized_dp_ranks
+
+    def _run_on_dp_shard_leaders(
+        self, method_name: str, dp_ranks: list[int], **kwargs: Any
+    ) -> list[ray.ObjectRef]:
+        """Run a method on the leader worker of each requested DP shard."""
+        futures: list[ray.ObjectRef] = []
+        for dp_rank in self._normalize_dp_ranks(dp_ranks):
+            worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_rank)
+            futures.append(
+                self.worker_group.run_single_worker_single_data(
+                    method_name=method_name,
+                    worker_idx=worker_idx,
+                    **kwargs,
+                )
+            )
+        return futures
+
+    def _select_next_active_dp_rank(self) -> int | None:
+        """Return the next routable DP shard using round-robin selection."""
+        with self._active_dp_ranks_lock:
+            if not self._active_dp_ranks:
+                return None
+
+            for _ in range(self.worker_group.dp_size):
+                candidate_dp_rank = self.current_generate_dp_shard_idx
+                self.current_generate_dp_shard_idx = (
+                    self.current_generate_dp_shard_idx + 1
+                ) % self.worker_group.dp_size
+                if candidate_dp_rank in self._active_dp_ranks:
+                    return candidate_dp_rank
+
+        return None
+
+    async def _wait_for_active_dp_ranks(self) -> None:
+        """Block until at least one DP shard is active again."""
+        while True:
+            with self._active_dp_ranks_lock:
+                if self._active_dp_ranks:
+                    return
+            await asyncio.sleep(0.05)
+
+    def sleep_partial(self, dp_ranks: list[int], level: int | None = None) -> bool:
+        """Drain and sleep a subset of DP shards without stopping all inference."""
+        if self.cfg["colocated"]["enabled"]:
+            raise RuntimeError(
+                "Partial shard sleep is only supported for non-colocated inference."
+            )
+
+        target_dp_ranks = self._normalize_dp_ranks(dp_ranks)
+        if not target_dp_ranks:
+            return True
+
+        with self._active_dp_ranks_lock:
+            inactive_dp_ranks = sorted(
+                set(target_dp_ranks).difference(self._active_dp_ranks)
+            )
+            if inactive_dp_ranks:
+                raise ValueError(
+                    f"Cannot sleep inactive DP shards: {inactive_dp_ranks}"
+                )
+            self._active_dp_ranks.difference_update(target_dp_ranks)
+
+        method_name = (
+            "sleep_async" if self.cfg["vllm_cfg"]["async_engine"] else "sleep"
+        )
+
+        try:
+            futures = self._run_on_dp_shard_leaders(
+                method_name,
+                target_dp_ranks,
+                level=level,
+                mode="wait",
+            )
+        except Exception as e:
+            print(f"Error dispatching partial sleep: {e}")
+            with self._active_dp_ranks_lock:
+                self._active_dp_ranks.update(target_dp_ranks)
+            return False
+
+        all_success = True
+        failed_dp_ranks: list[int] = []
+        for dp_rank, future in zip(target_dp_ranks, futures):
+            try:
+                result = ray.get(future)
+            except Exception as e:
+                print(f"Error during partial sleep for DP shard {dp_rank}: {e}")
+                failed_dp_ranks.append(dp_rank)
+                all_success = False
+                continue
+
+            if result is not None and not result:
+                failed_dp_ranks.append(dp_rank)
+                all_success = False
+
+        if failed_dp_ranks:
+            with self._active_dp_ranks_lock:
+                self._active_dp_ranks.update(failed_dp_ranks)
+
+        return all_success
+
+    def wake_up_partial(
+        self, dp_ranks: list[int], tags: list[str] | None = None
+    ) -> bool:
+        """Wake a subset of previously slept DP shards and restore routing."""
+        if self.cfg["colocated"]["enabled"]:
+            raise RuntimeError(
+                "Partial shard wake-up is only supported for non-colocated inference."
+            )
+
+        target_dp_ranks = self._normalize_dp_ranks(dp_ranks)
+        if not target_dp_ranks:
+            return True
+
+        with self._active_dp_ranks_lock:
+            already_active_dp_ranks = sorted(
+                self._active_dp_ranks.intersection(target_dp_ranks)
+            )
+            if already_active_dp_ranks:
+                raise ValueError(
+                    f"Cannot wake already-active DP shards: {already_active_dp_ranks}"
+                )
+
+        method_name = (
+            "wake_up_async" if self.cfg["vllm_cfg"]["async_engine"] else "wake_up"
+        )
+        wake_up_kwargs: dict[str, Any] = {}
+        if tags is not None:
+            wake_up_kwargs["tags"] = tags
+
+        futures = self._run_on_dp_shard_leaders(
+            method_name,
+            target_dp_ranks,
+            **wake_up_kwargs,
+        )
+
+        all_success = True
+        successful_dp_ranks: list[int] = []
+        for dp_rank, future in zip(target_dp_ranks, futures):
+            try:
+                result = ray.get(future)
+            except Exception as e:
+                print(f"Error during partial wake-up for DP shard {dp_rank}: {e}")
+                all_success = False
+                continue
+
+            if result is None or result:
+                successful_dp_ranks.append(dp_rank)
+            else:
+                all_success = False
+
+        if successful_dp_ranks:
+            with self._active_dp_ranks_lock:
+                self._active_dp_ranks.update(successful_dp_ranks)
+
+        return all_success
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

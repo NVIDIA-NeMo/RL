@@ -983,7 +983,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
-    def sleep(self):
+    def sleep(self, level: int | None = None, mode: str = "abort"):
         """Put the vLLM engine to sleep."""
         assert self.llm is not None, (
             "Attempting to sleep with either an uninitialized vLLM or non-model-owner"
@@ -993,6 +993,10 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             raise RuntimeError(
                 "sleep cannot be used with async_engine=True. Use sleep_async instead."
             )
+
+        resolved_level = self.cfg["vllm_cfg"].get("sleep_level", 1)
+        if level is not None:
+            resolved_level = level
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
         self.llm.llm_engine.reset_prefix_cache()
@@ -1006,7 +1010,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             self.llm.renderer, "clear_mm_cache"
         ):
             self.llm.renderer.clear_mm_cache()
-        self.llm.sleep(level=1)
+        self.llm.sleep(level=resolved_level, mode=mode)
 
         gc.collect()
         torch.cuda.empty_cache()
