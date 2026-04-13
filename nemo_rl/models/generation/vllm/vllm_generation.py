@@ -44,6 +44,12 @@ from nemo_rl.models.generation.vllm.utils import (
 )
 
 
+class ShardPreemptedError(RuntimeError):
+    def __init__(self, dp_rank: int):
+        super().__init__(f"Generation shard {dp_rank} was preempted")
+        self.dp_rank = dp_rank
+
+
 class VllmGeneration(GenerationInterface):
     def __init__(
         self,
@@ -207,6 +213,8 @@ class VllmGeneration(GenerationInterface):
         self.current_generate_dp_shard_idx = 0
         self._active_dp_ranks = set(range(self.worker_group.dp_size))
         self._active_dp_ranks_lock = threading.Lock()
+        self._preempted_dp_ranks: set[int] = set()
+        self._preempted_dp_ranks_lock = threading.Lock()
 
         # Save the device uuids for the workers
         self.device_uuids = self._report_device_id()
@@ -590,102 +598,121 @@ class VllmGeneration(GenerationInterface):
         if not data_validation_fn(data):
             return
 
-        selected_dp_shard_idx = self._select_next_active_dp_rank()
-        while selected_dp_shard_idx is None:
-            await self._wait_for_active_dp_ranks()
+        max_shard_redispatch_attempts = max(1, min(3, self.worker_group.dp_size))
+
+        for attempt in range(max_shard_redispatch_attempts):
             selected_dp_shard_idx = self._select_next_active_dp_rank()
+            while selected_dp_shard_idx is None:
+                await self._wait_for_active_dp_ranks()
+                selected_dp_shard_idx = self._select_next_active_dp_rank()
 
-        leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
-            selected_dp_shard_idx
-        )
+            leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
+                selected_dp_shard_idx
+            )
 
-        # Run the async method on the selected leader worker
-        worker_gen_proxy = self.worker_group.run_single_worker_single_data(
-            method_name=method_name,
-            worker_idx=leader_worker_idx,
-            data=data,
-            greedy=greedy,
-        )
+            # Run the async method on the selected leader worker
+            worker_gen_proxy = self.worker_group.run_single_worker_single_data(
+                method_name=method_name,
+                worker_idx=leader_worker_idx,
+                data=data,
+                greedy=greedy,
+            )
 
-        # Create a queue to collect sample results from the worker as they complete
-        result_queue = asyncio.Queue()
-        finished = False
+            # Create a queue to collect sample results from the worker as they complete
+            result_queue = asyncio.Queue()
+            finished = False
+            yielded_sample = False
+            preempted_error: ShardPreemptedError | None = None
 
-        async def consume_worker_generator(worker_idx, worker_gen):
-            """Consume a single worker generator and put sample results in the queue."""
-            nonlocal finished
-            worker_name = f"Worker-{worker_idx}"
-            try:
-                async for sample_result_ref in worker_gen:
-                    sample_result = await sample_result_ref
-                    # sample_result is a tuple: (original_idx, BatchedDataDict)
-                    # Tag the result with worker index for downstream attribution
-                    original_idx, result_batch = sample_result
-                    # Use a length-one list so BatchedDataDict.from_batches can merge without shape errors
-                    result_batch["gen_leader_worker_idx"] = [int(worker_idx)]
-                    sample_result = (original_idx, result_batch)
-                    await result_queue.put(("sample", sample_result))
-            except Exception as e:
-                # Log the error before putting it in the queue for better debugging
-                import traceback
+            async def consume_worker_generator(worker_idx, worker_gen):
+                """Consume a single worker generator and put sample results in the queue."""
+                nonlocal finished
+                worker_name = f"Worker-{worker_idx}"
+                try:
+                    async for sample_result_ref in worker_gen:
+                        sample_result = await sample_result_ref
+                        # sample_result is a tuple: (original_idx, BatchedDataDict)
+                        # Tag the result with worker index for downstream attribution
+                        original_idx, result_batch = sample_result
+                        # Use a length-one list so BatchedDataDict.from_batches can merge without shape errors
+                        result_batch["gen_leader_worker_idx"] = [int(worker_idx)]
+                        sample_result = (original_idx, result_batch)
+                        await result_queue.put(("sample", sample_result))
+                except Exception as e:
+                    # Log the error before putting it in the queue for better debugging
+                    import traceback
 
-                print(f"Exception in worker {worker_name}")
-                traceback.print_exc()
-                await result_queue.put(("error", e))
-            finally:
-                finished = True
-                await result_queue.put(("worker_done", None))
+                    print(f"Exception in worker {worker_name}")
+                    traceback.print_exc()
+                    await result_queue.put(("error", e))
+                finally:
+                    finished = True
+                    await result_queue.put(("worker_done", None))
 
-        # Start the task to consume the worker generator
-        worker_task = asyncio.create_task(
-            consume_worker_generator(leader_worker_idx, worker_gen_proxy)
-        )
+            # Start the task to consume the worker generator
+            worker_task = asyncio.create_task(
+                consume_worker_generator(leader_worker_idx, worker_gen_proxy)
+            )
 
-        # Yield sample results as they become available from the worker
-        timeout_seconds = float(
-            os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "600")
-        )  # Default 10 minutes
+            # Yield sample results as they become available from the worker
+            timeout_seconds = float(
+                os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "600")
+            )  # Default 10 minutes
 
-        while not finished:
-            try:
-                msg_type, item = await asyncio.wait_for(
-                    result_queue.get(), timeout=timeout_seconds
-                )
-            except asyncio.TimeoutError:
-                print(
-                    f"Timeout waiting for results after {timeout_seconds}s. Worker has not finished."
-                )
-                print(
-                    f"For longer sequences, increase the timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
-                )
-                # Cancel the task
-                if not worker_task.done():
-                    worker_task.cancel()
-                await asyncio.gather(worker_task, return_exceptions=True)
-                raise RuntimeError(
-                    f"Timeout waiting for worker results after {timeout_seconds}s. "
-                    f"For longer sequences, increase timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
-                )
+            while not finished:
+                try:
+                    msg_type, item = await asyncio.wait_for(
+                        result_queue.get(), timeout=timeout_seconds
+                    )
+                except asyncio.TimeoutError:
+                    print(
+                        f"Timeout waiting for results after {timeout_seconds}s. Worker has not finished."
+                    )
+                    print(
+                        f"For longer sequences, increase the timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
+                    )
+                    # Cancel the task
+                    if not worker_task.done():
+                        worker_task.cancel()
+                    await asyncio.gather(worker_task, return_exceptions=True)
+                    raise RuntimeError(
+                        f"Timeout waiting for worker results after {timeout_seconds}s. "
+                        f"For longer sequences, increase timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
+                    )
 
-            if msg_type == "sample":
-                # Yield individual sample result immediately
-                yield item
-            elif msg_type == "error":
-                # Cancel the task and propagate error
-                if not worker_task.done():
-                    worker_task.cancel()
-                await asyncio.gather(worker_task, return_exceptions=True)
-                raise item
-            elif msg_type == "worker_done":
-                # Worker finished, just continue the loop
-                pass
-            else:
-                raise RuntimeError(f"Unexpected message type: {msg_type}")
+                if msg_type == "sample":
+                    # Yield individual sample result immediately
+                    yielded_sample = True
+                    yield item
+                elif msg_type == "error":
+                    # Cancel the task and classify the error
+                    if not worker_task.done():
+                        worker_task.cancel()
+                    await asyncio.gather(worker_task, return_exceptions=True)
 
-        # Verify the task is actually done
-        assert worker_task.done(), (
-            f"Worker task {leader_worker_idx} should be done but isn't"
-        )
+                    if yielded_sample or not self._is_dp_rank_preempted(
+                        selected_dp_shard_idx
+                    ):
+                        raise item
+
+                    preempted_error = ShardPreemptedError(selected_dp_shard_idx)
+                    break
+                elif msg_type == "worker_done":
+                    # Worker finished, just continue the loop
+                    pass
+                else:
+                    raise RuntimeError(f"Unexpected message type: {msg_type}")
+
+            # Verify the task is actually done
+            assert worker_task.done(), (
+                f"Worker task {leader_worker_idx} should be done but isn't"
+            )
+
+            if preempted_error is None:
+                return
+
+            if attempt == max_shard_redispatch_attempts - 1:
+                raise preempted_error
 
     def _normalize_dp_ranks(self, dp_ranks: list[int]) -> list[int]:
         """Validate and normalize data parallel shard indices."""
@@ -742,7 +769,21 @@ class VllmGeneration(GenerationInterface):
                     return
             await asyncio.sleep(0.05)
 
-    def sleep_partial(self, dp_ranks: list[int], level: int | None = None) -> bool:
+    def _mark_preempted_dp_ranks(self, dp_ranks: list[int]) -> None:
+        with self._preempted_dp_ranks_lock:
+            self._preempted_dp_ranks.update(dp_ranks)
+
+    def _clear_preempted_dp_ranks(self, dp_ranks: list[int]) -> None:
+        with self._preempted_dp_ranks_lock:
+            self._preempted_dp_ranks.difference_update(dp_ranks)
+
+    def _is_dp_rank_preempted(self, dp_rank: int) -> bool:
+        with self._preempted_dp_ranks_lock:
+            return dp_rank in self._preempted_dp_ranks
+
+    def sleep_partial(
+        self, dp_ranks: list[int], level: int | None = None, mode: str = "wait"
+    ) -> bool:
         """Drain and sleep a subset of DP shards without stopping all inference."""
         if self.cfg["colocated"]["enabled"]:
             raise RuntimeError(
@@ -753,6 +794,8 @@ class VllmGeneration(GenerationInterface):
         if not target_dp_ranks:
             return True
 
+        mark_preempted = mode == "abort"
+
         with self._active_dp_ranks_lock:
             inactive_dp_ranks = sorted(
                 set(target_dp_ranks).difference(self._active_dp_ranks)
@@ -761,7 +804,17 @@ class VllmGeneration(GenerationInterface):
                 raise ValueError(
                     f"Cannot sleep inactive DP shards: {inactive_dp_ranks}"
                 )
+
+            remaining_active_dp_ranks = self._active_dp_ranks.difference(
+                target_dp_ranks
+            )
+            if not remaining_active_dp_ranks:
+                return False
+
             self._active_dp_ranks.difference_update(target_dp_ranks)
+
+        if mark_preempted:
+            self._mark_preempted_dp_ranks(target_dp_ranks)
 
         method_name = (
             "sleep_async" if self.cfg["vllm_cfg"]["async_engine"] else "sleep"
@@ -772,12 +825,14 @@ class VllmGeneration(GenerationInterface):
                 method_name,
                 target_dp_ranks,
                 level=level,
-                mode="wait",
+                mode=mode,
             )
         except Exception as e:
             print(f"Error dispatching partial sleep: {e}")
             with self._active_dp_ranks_lock:
                 self._active_dp_ranks.update(target_dp_ranks)
+            if mark_preempted:
+                self._clear_preempted_dp_ranks(target_dp_ranks)
             return False
 
         all_success = True
@@ -798,6 +853,8 @@ class VllmGeneration(GenerationInterface):
         if failed_dp_ranks:
             with self._active_dp_ranks_lock:
                 self._active_dp_ranks.update(failed_dp_ranks)
+            if mark_preempted:
+                self._clear_preempted_dp_ranks(failed_dp_ranks)
 
         return all_success
 
@@ -854,6 +911,7 @@ class VllmGeneration(GenerationInterface):
         if successful_dp_ranks:
             with self._active_dp_ranks_lock:
                 self._active_dp_ranks.update(successful_dp_ranks)
+            self._clear_preempted_dp_ranks(successful_dp_ranks)
 
         return all_success
 

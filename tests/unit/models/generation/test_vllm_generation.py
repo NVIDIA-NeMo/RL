@@ -34,6 +34,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.vllm_generation import ShardPreemptedError
 from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorker
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorker,
@@ -203,7 +204,63 @@ def _make_partial_overlap_policy(async_engine: bool = True, dp_size: int = 4):
     policy.current_generate_dp_shard_idx = 0
     policy._active_dp_ranks = set(range(dp_size))
     policy._active_dp_ranks_lock = threading.Lock()
+    policy._preempted_dp_ranks = set()
+    policy._preempted_dp_ranks_lock = threading.Lock()
     return policy
+
+
+def _make_generation_input() -> BatchedDataDict[GenerationDatumSpec]:
+    return BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "input_lengths": torch.tensor([3], dtype=torch.int32),
+        }
+    )
+
+
+def _make_generation_output(original_idx: int = 0) -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "output_ids": torch.tensor([[4, 5]], dtype=torch.long),
+            "logprobs": torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+            "generation_lengths": torch.tensor([2], dtype=torch.int32),
+            "unpadded_sequence_lengths": torch.tensor([2], dtype=torch.int32),
+        }
+    )
+
+
+def _make_successful_async_worker_proxy(original_idx: int = 0):
+    async def sample_result_ref():
+        return original_idx, _make_generation_output(original_idx)
+
+    async def worker_gen():
+        yield sample_result_ref()
+
+    return worker_gen()
+
+
+def _make_failing_async_worker_proxy(exc: Exception):
+    async def worker_gen():
+        if False:
+            yield None
+        raise exc
+
+    return worker_gen()
+
+
+async def _collect_async_generate_outputs(policy, data):
+    outputs = []
+    async for item in policy._async_generate_base(
+        data,
+        "generate_async",
+        lambda batched_data: bool(len(batched_data["input_ids"])),
+    ):
+        outputs.append(item)
+    return outputs
+
+
+def _extract_gen_leader_worker_indices(outputs: BatchedDataDict) -> set[int]:
+    return {int(idx) for idx in outputs["gen_leader_worker_idx"].reshape(-1).tolist()}
 
 
 def test_vllm_generation_worker_sleep_passes_configured_level_and_mode():
@@ -289,6 +346,87 @@ def test_vllm_generation_sleep_partial_restores_failed_shards(monkeypatch):
     assert not policy.sleep_partial([1, 3], level=2)
     assert policy._active_dp_ranks == {0, 2, 3}
 
+
+def test_vllm_generation_wait_mode_does_not_mark_preempted(monkeypatch):
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=4)
+    monkeypatch.setattr(ray, "get", lambda _future: True)
+
+    assert policy.sleep_partial([1], level=2, mode="wait")
+    assert policy._preempted_dp_ranks == set()
+
+
+def test_vllm_generation_abort_mode_marks_preempted(monkeypatch):
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=4)
+    monkeypatch.setattr(ray, "get", lambda _future: True)
+
+    assert policy.sleep_partial([1], level=2, mode="abort")
+    assert policy._preempted_dp_ranks == {1}
+
+
+def test_vllm_generation_rejects_sleeping_last_active_shard():
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=1)
+
+    assert not policy.sleep_partial([0], level=2, mode="wait")
+    assert policy._active_dp_ranks == {0}
+
+
+@pytest.mark.asyncio
+async def test_vllm_generation_retries_preempted_shard():
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=2)
+    data = _make_generation_input()
+    policy._preempted_dp_ranks = {0}
+    policy.worker_group.run_single_worker_single_data.side_effect = [
+        _make_failing_async_worker_proxy(RuntimeError("preempted")),
+        _make_successful_async_worker_proxy(),
+    ]
+
+    outputs = await _collect_async_generate_outputs(policy, data)
+
+    assert len(outputs) == 1
+    assert outputs[0][0] == 0
+    assert outputs[0][1]["gen_leader_worker_idx"] == [101]
+    assert policy.worker_group.run_single_worker_single_data.call_args_list == [
+        call(
+            method_name="generate_async",
+            worker_idx=100,
+            data=data,
+            greedy=False,
+        ),
+        call(
+            method_name="generate_async",
+            worker_idx=101,
+            data=data,
+            greedy=False,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_vllm_generation_raises_shard_preempted_after_retry_exhaustion():
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=2)
+    data = _make_generation_input()
+    policy._preempted_dp_ranks = {0, 1}
+    policy.worker_group.run_single_worker_single_data.side_effect = [
+        _make_failing_async_worker_proxy(RuntimeError("preempted-0")),
+        _make_failing_async_worker_proxy(RuntimeError("preempted-1")),
+    ]
+
+    with pytest.raises(ShardPreemptedError) as excinfo:
+        await _collect_async_generate_outputs(policy, data)
+
+    assert excinfo.value.dp_rank == 1
+
+
+@pytest.mark.asyncio
+async def test_vllm_generation_does_not_retry_non_preempt_error():
+    policy = _make_partial_overlap_policy(async_engine=True, dp_size=2)
+    data = _make_generation_input()
+    policy.worker_group.run_single_worker_single_data.return_value = (
+        _make_failing_async_worker_proxy(RuntimeError("boom"))
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await _collect_async_generate_outputs(policy, data)
 
 
 def test_vllm_generation_wake_partial_only_restores_successful_shards(monkeypatch):
@@ -607,6 +745,97 @@ async def _generate_async(vllm_policy, tokenizer, test_input_data, greedy=False)
         pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
     )
     return outputs
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.asyncio
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Test requires at least 2 GPUs.")
+async def test_vllm_async_partial_sleep_wake_runtime_smoke(tokenizer, test_input_data):
+    generation_cluster_separate = get_generation_cluster_separate(2)
+    vllm_generation = None
+
+    try:
+        vllm_config = deepcopy(basic_vllm_test_config)
+        vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
+        vllm_config["vllm_cfg"]["async_engine"] = True
+        vllm_config["vllm_cfg"]["tensor_parallel_size"] = 1
+        vllm_config["colocated"]["enabled"] = False
+
+        vllm_generation = VllmGeneration(generation_cluster_separate, vllm_config)
+
+        leader_0 = vllm_generation.worker_group.get_dp_leader_worker_idx(0)
+        leader_1 = vllm_generation.worker_group.get_dp_leader_worker_idx(1)
+
+        outputs1 = await _generate_async(
+            vllm_generation, tokenizer, test_input_data, greedy=True
+        )
+        assert _extract_gen_leader_worker_indices(outputs1) == {leader_0, leader_1}
+
+        assert vllm_generation.sleep_partial([0], level=2, mode="wait")
+        assert vllm_generation._active_dp_ranks == {1}
+
+        outputs2 = await _generate_async(
+            vllm_generation, tokenizer, test_input_data, greedy=True
+        )
+        assert _extract_gen_leader_worker_indices(outputs2) == {leader_1}
+
+        assert vllm_generation.wake_up_partial([0])
+        assert vllm_generation._active_dp_ranks == {0, 1}
+
+        outputs3 = await _generate_async(
+            vllm_generation, tokenizer, test_input_data, greedy=True
+        )
+        assert _extract_gen_leader_worker_indices(outputs3) == {leader_0, leader_1}
+
+    finally:
+        if vllm_generation:
+            vllm_generation.shutdown()
+        try:
+            generation_cluster_separate.shutdown()
+        except Exception:
+            pass
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.asyncio
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Test requires at least 2 GPUs.")
+async def test_vllm_partial_sleep_rejects_last_active_shard_tp2(
+    tokenizer, test_input_data
+):
+    generation_cluster_separate = get_generation_cluster_separate(2)
+    vllm_generation = None
+
+    try:
+        vllm_config = deepcopy(basic_vllm_test_config)
+        vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
+        vllm_config["vllm_cfg"]["async_engine"] = True
+        vllm_config["vllm_cfg"]["tensor_parallel_size"] = 2
+        vllm_config["colocated"]["enabled"] = False
+
+        vllm_generation = VllmGeneration(generation_cluster_separate, vllm_config)
+
+        leader_0 = vllm_generation.worker_group.get_dp_leader_worker_idx(0)
+
+        outputs1 = await _generate_async(
+            vllm_generation, tokenizer, test_input_data, greedy=True
+        )
+        assert _extract_gen_leader_worker_indices(outputs1) == {leader_0}
+
+        assert not vllm_generation.sleep_partial([0], level=2, mode="wait")
+        assert vllm_generation._active_dp_ranks == {0}
+
+        outputs2 = await _generate_async(
+            vllm_generation, tokenizer, test_input_data, greedy=True
+        )
+        assert _extract_gen_leader_worker_indices(outputs2) == {leader_0}
+
+    finally:
+        if vllm_generation:
+            vllm_generation.shutdown()
+        try:
+            generation_cluster_separate.shutdown()
+        except Exception:
+            pass
 
 
 @pytest.mark.asyncio
