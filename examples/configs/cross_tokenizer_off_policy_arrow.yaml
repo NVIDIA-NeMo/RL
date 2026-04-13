@@ -150,6 +150,12 @@ policy:
     algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
 
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 4096
+    sequence_length_round: 64
+
 teacher:
   model_name: "microsoft/Phi-4-mini-instruct"
   tokenizer:

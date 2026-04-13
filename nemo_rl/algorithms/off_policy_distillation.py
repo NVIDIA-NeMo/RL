@@ -908,6 +908,9 @@ def validate(
                     gbs=val_data.size,
                     mbs=val_mbs,
                     teacher_logits=teacher_logits,
+                    use_teacher_ipc_loss_postprocessor=isinstance(
+                        loss_fn, CrossTokenizerDistillationLossFn
+                    ),
                 )
                 del teacher_logits
             else:
@@ -1274,7 +1277,16 @@ def off_policy_distillation_train(
                     prefetched_batch_pack = _maybe_prefetch_next_batch(dataloader_iter)
 
                 # ==== Teacher Logprob Inference ====
-                use_ipc = master_config["distillation"].get("use_ipc", True)
+                requested_use_ipc = master_config["distillation"].get("use_ipc", True)
+                # Same-tokenizer off-policy supports the non-IPC top-k path.
+                # Keep IPC mandatory only for cross-tokenizer mode.
+                use_ipc = bool(requested_use_ipc and cross_tokenizer_enabled)
+                if requested_use_ipc and not cross_tokenizer_enabled:
+                    print(
+                        "⚠️ distillation.use_ipc=true requested, but same-tokenizer mode uses non-IPC "
+                        "teacher top-k path for stability.",
+                        flush=True,
+                    )
                 topk_k = master_config["distillation"]["topk_logits_k"]
 
                 print("▶ Preparing for teacher logprob inference...", flush=True)
@@ -1343,7 +1355,10 @@ def off_policy_distillation_train(
                 with timer.time("policy_training"):
                     if use_ipc:
                         train_results = student_policy.train(
-                            train_data, student_loss_fn, teacher_logits=teacher_logits
+                            train_data,
+                            student_loss_fn,
+                            teacher_logits=teacher_logits,
+                            use_teacher_ipc_loss_postprocessor=cross_tokenizer_enabled,
                         )
                         del teacher_logits
                     else:

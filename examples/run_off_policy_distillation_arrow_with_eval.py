@@ -48,6 +48,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     CrossTokenizerDistillationLossFn,
     DistillationLossFn,
 )
+from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.algorithms.off_policy_distillation import (
     OffPolicyDistillationSaveState,
     OffPolicyMasterConfig,
@@ -80,6 +81,43 @@ import ray
 
 OmegaConf.register_new_resolver("mul", lambda a, b: a * b, replace=True)
 OmegaConf.register_new_resolver("max", lambda a, b: max(a, b), replace=True)
+
+
+class DistillationLossFnCompat(DistillationLossFn):
+    """Runner-local compatibility layer for distillation loss input naming."""
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.input_type = LossInputType.LOGIT
+
+    def __call__(self, *args, **kwargs):
+        # Keep positional calling convention untouched:
+        #   loss_fn(logits, data, global_valid_seqs, global_valid_toks, ...)
+        if args:
+            return super().__call__(*args, **kwargs)
+
+        # Also support keyword-based calling convention with `logits=...`.
+        next_token_logits = kwargs.pop("next_token_logits", None)
+        if next_token_logits is None and "logits" in kwargs:
+            next_token_logits = kwargs.pop("logits")
+        return super().__call__(next_token_logits=next_token_logits, **kwargs)
+
+
+class CrossTokenizerDistillationLossFnCompat(CrossTokenizerDistillationLossFn):
+    """Runner-local compatibility layer for cross-tokenizer loss input naming."""
+
+    def __init__(self, cfg, token_aligner):
+        super().__init__(cfg, token_aligner)
+        self.input_type = LossInputType.LOGIT
+
+    def __call__(self, *args, **kwargs):
+        if args:
+            return super().__call__(*args, **kwargs)
+
+        next_token_logits = kwargs.pop("next_token_logits", None)
+        if next_token_logits is None and "logits" in kwargs:
+            next_token_logits = kwargs.pop("logits")
+        return super().__call__(next_token_logits=next_token_logits, **kwargs)
 
 
 # =========================================================================
@@ -611,9 +649,9 @@ def main():
     )
 
     if cross_tokenizer_enabled:
-        loss_fn = CrossTokenizerDistillationLossFn(config["loss_fn"], token_aligner)
+        loss_fn = CrossTokenizerDistillationLossFnCompat(config["loss_fn"], token_aligner)
     else:
-        loss_fn = DistillationLossFn(config["loss_fn"])
+        loss_fn = DistillationLossFnCompat(config["loss_fn"])
 
     # ── vLLM Generation (colocated, for eval only) ──
     generation: Optional[GenerationInterface] = None

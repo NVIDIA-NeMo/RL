@@ -560,6 +560,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         is_teacher: bool = False,
         teacher_logits: Optional[Any] = None,
         topk_logits: Optional[int] = None,
+        use_teacher_ipc_loss_postprocessor: bool = False,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         batch_size = gbs or self.cfg["train_global_batch_size"]
@@ -607,6 +608,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "teacher_logits": teacher_logits,
             "topk_logits": topk_logits,
         }
+        if use_teacher_ipc_loss_postprocessor:
+            common_kwargs["use_teacher_ipc_loss_postprocessor"] = True
 
         if is_teacher:
             output_replicated = [
