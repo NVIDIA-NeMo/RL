@@ -207,7 +207,7 @@ def _make_partial_overlap_policy(async_engine: bool = True, dp_size: int = 4):
 
 
 def test_vllm_generation_worker_sleep_passes_configured_level_and_mode():
-    worker = object.__new__(VllmGenerationWorker)
+    worker = object.__new__(VllmGenerationWorker.__ray_metadata__.modified_class)
     worker.cfg = {"vllm_cfg": {"async_engine": False, "sleep_level": 2}}
     worker.llm = MagicMock()
     worker.llm.renderer = MagicMock()
@@ -220,7 +220,7 @@ def test_vllm_generation_worker_sleep_passes_configured_level_and_mode():
 
 
 def test_vllm_generation_worker_sleep_explicit_level_overrides_config():
-    worker = object.__new__(VllmGenerationWorker)
+    worker = object.__new__(VllmGenerationWorker.__ray_metadata__.modified_class)
     worker.cfg = {"vllm_cfg": {"async_engine": False, "sleep_level": 2}}
     worker.llm = MagicMock()
     worker.llm.renderer = MagicMock()
@@ -232,7 +232,7 @@ def test_vllm_generation_worker_sleep_explicit_level_overrides_config():
 
 @pytest.mark.asyncio
 async def test_vllm_async_generation_worker_sleep_passes_configured_level_and_mode():
-    worker = object.__new__(VllmAsyncGenerationWorker)
+    worker = object.__new__(VllmAsyncGenerationWorker.__ray_metadata__.modified_class)
     worker.cfg = {"vllm_cfg": {"async_engine": True, "sleep_level": 2}}
     worker.llm = MagicMock()
     worker.llm.reset_prefix_cache = AsyncMock()
