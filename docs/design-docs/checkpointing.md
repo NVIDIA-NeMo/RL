@@ -64,10 +64,13 @@ uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
 
 Exports only the LoRA adapter weights in HuggingFace PEFT format without merging into the base model. This is useful when you want to serve the base model and adapter separately (e.g. with vLLM's LoRA support).
 
+Although the output is adapter-only, the converter still needs `--base-ckpt` to reconstruct the Megatron model, apply the LoRA modules, and load the adapter weights before exporting them to PEFT format.
+
 **Example:**
 
 ```sh
 uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
+    --base-ckpt <path_to_base_megatron_checkpoint>/iter_0000000 \
     --adapter-only \
     --adapter-ckpt <path_to_lora_adapter_checkpoint>/iter_0000000 \
     --hf-model-name <huggingface_model_name> \
@@ -78,7 +81,7 @@ uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
 
 | Argument | Description |
 |---|---|
-| `--base-ckpt` | Path to the base model's Megatron checkpoint directory (the `iter_XXXXXXX` folder). Required unless `--adapter-only` is set. |
+| `--base-ckpt` | Path to the base model's Megatron checkpoint directory (the `iter_XXXXXXX` folder). Required for both merged and adapter-only export. |
 | `--adapter-ckpt` | Path to the LoRA adapter's Megatron checkpoint directory (must contain a `run_config.yaml` with a `peft` section). |
 | `--hf-model-name` | HuggingFace model identifier used to resolve the model architecture and tokenizer (e.g. `Qwen/Qwen2.5-7B`). |
 | `--hf-ckpt-path` | Output directory for the exported HuggingFace checkpoint or adapter. Must not already exist. |
