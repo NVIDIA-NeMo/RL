@@ -67,6 +67,7 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.models.generation.dynamo import DynamoVllmConfig, DynamoVllmGeneration
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -717,6 +718,33 @@ def setup(
             flush=True,
         )
 
+    elif backend == "dynamo":
+        generation_config = cast(DynamoVllmConfig, generation_config)
+
+        generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
+            "hf_config_overrides", {}
+        )
+
+        def init_dynamo():
+            t0 = time.perf_counter()
+            pg = DynamoVllmGeneration(
+                cluster=inference_cluster, config=generation_config
+            )
+            return pg, time.perf_counter() - t0
+
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_dynamo,
+            generation_name="Dynamo+vLLM",
+            init_time_key="dynamo_init_time_s",
+            colocated_inference=colocated_inference,
+            worker_init_timing_metrics=worker_init_timing_metrics,
+        )
+
+        print(
+            f"  ✓ Using Dynamo+vLLM backend for generation with {policy_config['model_name']}",
+            flush=True,
+        )
+
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
@@ -724,7 +752,8 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    # Dynamo backend does not support weight updates — skip collective init and refit.
+    if not colocated_inference and backend != "dynamo":
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -745,7 +774,7 @@ def setup(
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None:
+    if policy_generation is not None and backend != "dynamo":
         policy_generation.prepare_refit_info(state_dict_info)
 
     # Calculate total setup time
@@ -985,7 +1014,7 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
         return False
 
     backend = generation_config.get("backend", "")
-    if backend != "vllm":
+    if backend != "vllm" and backend != "dynamo":
         return False
 
     vllm_cfg = generation_config.get("vllm_cfg", {})
@@ -999,12 +1028,17 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     if not should_use_nemo_gym:
         return should_use_nemo_gym
 
+    generation_config = master_config["policy"]["generation"]
+    backend = generation_config.get("backend", "")
+
+    # Dynamo backend always uses the frontend HTTP path — no extra validation needed.
+    if backend == "dynamo":
+        return should_use_nemo_gym
+
     # Validate the setup for training with NeMo-Gym
     assert _should_use_async_rollouts(master_config), (
-        "❌ Error: In order to use NeMo-Gym, you must use vllm generation backend with `async_engine: true`!"
+        "❌ Error: In order to use NeMo-Gym, you must use vllm or dynamo generation backend with `async_engine: true`!"
     )
-
-    generation_config = master_config["policy"]["generation"]
 
     # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
     should_expose_http_server = generation_config["vllm_cfg"].get("expose_http_server")
@@ -1332,6 +1366,8 @@ def grpo_train(
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
         policy_generation = policy  # type: ignore
+        NEED_REFIT = False
+    elif master_config["policy"]["generation"]["backend"] == "dynamo":
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
@@ -2426,6 +2462,8 @@ def async_grpo_train(
     # Setup generation interface
     if policy_generation is None:
         policy_generation = policy
+        NEED_REFIT = False
+    elif master_config["policy"]["generation"]["backend"] == "dynamo":
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True
     assert policy_generation is not None
