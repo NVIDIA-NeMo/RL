@@ -590,6 +590,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                   is different from the current policy, making filtered logprobs incompatible.
         On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
+        # If reference model was never initialized, yield without swapping
+        if not hasattr(self, "reference_state_dict") or self.reference_state_dict is None:
+            yield
+            return
+
         ## disable overlap param gather when swapping weights
         if self.should_disable_forward_pre_hook:
             self.disable_forward_pre_hook()
