@@ -21,7 +21,7 @@ policy:
       lr_decay_style: "cosine"
       lr_warmup_iters: 10
 
-# GDPO uses a single flat data config (GSM8K + math_gdpo_data_processor); replace parent's train/validation/default.
+# GDPO uses a single flat data config (GSM8K); replace parent's train/validation/default.
 data:
   _override_: true
 
@@ -41,7 +41,7 @@ data:
   default:
     prompt_file: null
     system_prompt_file: "examples/prompts/gsm8k.txt"
-    processor: "math_gdpo_data_processor"
+    processor: "math_hf_data_processor"
     env_name: "math_multi_reward"
 
 env:
