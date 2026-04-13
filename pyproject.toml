@@ -71,7 +71,7 @@ automodel = [
   "nv-grouped-gemm",
   "transformer-engine[pytorch]>=2.9.0a0,<2.12.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@7febc6e25660af0f54d95dd781ecdcd62265ecca ; platform_machine == 'aarch64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72 ; platform_machine == 'aarch64'",
 ]
 vllm = [
   "cuda-python",
@@ -80,7 +80,7 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@7febc6e25660af0f54d95dd781ecdcd62265ecca ; platform_machine == 'aarch64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72 ; platform_machine == 'aarch64'",
   "vllm==0.17.1",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.4",
@@ -110,7 +110,7 @@ mcore = [
   "flash-attn==2.8.1",
   "emerging-optimizers==0.2.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@7febc6e25660af0f54d95dd781ecdcd62265ecca ; platform_machine == 'aarch64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72 ; platform_machine == 'aarch64'",
 ]
 nemo_gym = ["nemo_gym"]
 
@@ -252,7 +252,7 @@ override-dependencies = [
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@7febc6e25660af0f54d95dd781ecdcd62265ecca ; platform_machine == 'aarch64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72 ; platform_machine == 'aarch64'",
   # Note: flashinfer versions are pinned per-extra (vllm uses 0.6.4, sglang uses 0.6.7.post2)
   # since vllm and sglang extras are mutually exclusive and have different requirements.
   # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm (0.6.4) and sglang (0.6.7.post2)
