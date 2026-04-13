@@ -69,8 +69,8 @@ RUN GITHUB_ARTIFACTORY=github.com \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Install uv and python
-ARG UV_VERSION=0.11.3
-ARG PYTHON_VERSION=3.13.11
+ARG UV_VERSION=0.11.6
+ARG PYTHON_VERSION=3.13.13
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
     uv python install ${PYTHON_VERSION}
