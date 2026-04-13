@@ -982,7 +982,7 @@ def off_policy_distillation_train(
 ) -> None:
     """Run off-policy distillation training algorithm.
     
-    Key differences from on-policy distillation_train():
+    Key differences from on-policy distillation train():
     - No student_generation parameter (we don't generate responses)
     - No task_to_env / val_task_to_env (no environment scoring)
     - No rollout generation step - uses fixed responses from dataset directly

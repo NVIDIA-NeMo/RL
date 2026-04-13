@@ -254,18 +254,18 @@ once offline:
 
 ```bash
 # Multi-token method (recommended)
-python nemo_rl/algorithms/x_token/minimal_projection_via_multitoken.py \
+python nemo_rl/utils/x_token/minimal_projection_via_multitoken.py \
     --student-model meta-llama/Llama-3.2-1B \
     --teacher-model Qwen/Qwen3-8B-Base
 
 # Optionally enforce exact matches for identical tokens
-python nemo_rl/algorithms/x_token/reapply_exact_map.py \
+python nemo_rl/utils/x_token/reapply_exact_map.py \
     --student-model meta-llama/Llama-3.2-1B \
     --teacher-model Qwen/Qwen3-8B-Base \
     --initial-projection-path cross_tokenizer_data/transformation_counts_via_multitoken.pt
 
 # Optionally sort and cut to top-k per row
-python nemo_rl/algorithms/x_token/sort_and_cut_projection_matrix.py \
+python nemo_rl/utils/x_token/sort_and_cut_projection_matrix.py \
     --input cross_tokenizer_data/transformation_counts_via_multitoken.pt \
     --top-k 32
 ```

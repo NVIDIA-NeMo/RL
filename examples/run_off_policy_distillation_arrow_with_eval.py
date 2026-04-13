@@ -59,6 +59,7 @@ from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
+from nemo_rl.data.datasets.utils import load_dataset_from_path
 from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
 from nemo_rl.data.llm_message_utils import get_keys_from_message_log
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
@@ -91,53 +92,6 @@ def parse_args():
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config")
     args, overrides = parser.parse_known_args()
     return args, overrides
-
-
-# =========================================================================
-# Arrow-text training data (reused from run_off_policy_distillation_arrow.py)
-# =========================================================================
-def _sft_preprocessor(
-    datum_dict: dict[str, Any],
-    task_data_spec: TaskDataSpec,
-    tokenizer,
-    max_seq_length: int,
-    idx: int,
-    add_bos: bool = True,
-    add_eos: bool = True,
-    add_generation_prompt: bool = False,
-    datum_preprocessor: Optional[Callable] = None,
-) -> DatumSpec:
-    from nemo_rl.data.llm_message_utils import get_formatted_message_log
-
-    if datum_preprocessor is not None:
-        datum_dict = datum_preprocessor(datum_dict)
-
-    message_log = get_formatted_message_log(
-        datum_dict["messages"],
-        tokenizer,
-        task_data_spec,
-        add_bos_token=add_bos,
-        add_eos_token=add_eos,
-        add_generation_prompt=add_generation_prompt,
-        tools=datum_dict.get("tools", None),
-    )
-
-    length = sum(len(m["token_ids"]) for m in message_log)
-    loss_multiplier = 1.0
-    if length > max_seq_length:
-        for message in message_log:
-            message["token_ids"] = message["token_ids"][
-                : min(4, max_seq_length // len(message_log))
-            ]
-        loss_multiplier = 0.0
-
-    return {
-        "message_log": message_log,
-        "length": length,
-        "extra_env_info": None,
-        "loss_multiplier": loss_multiplier,
-        "idx": idx,
-    }
 
 
 def _kd_preprocessor(
@@ -193,17 +147,83 @@ def _kd_preprocessor(
 def setup_train_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     from nemo_rl.data.datasets import load_response_dataset
 
+    if "train" not in data_config:
+        raise ValueError(
+            "The dataset config structure is updated. Please use data.train/default style."
+        )
+
+    train_cfg = data_config["train"]
+    if isinstance(train_cfg, list):
+        if len(train_cfg) != 1:
+            raise ValueError(
+                "Off-policy distillation currently supports exactly one train dataset config."
+            )
+        train_cfg = train_cfg[0]
+    train_data_config: dict[str, Any] = dict(train_cfg)
+    default_cfg = data_config.get("default")
+    if isinstance(default_cfg, dict):
+        merged_cfg = dict(default_cfg)
+        merged_cfg.update(train_data_config)
+        train_data_config = merged_cfg
+    train_data_config["max_input_seq_length"] = data_config["max_input_seq_length"]
+
     print("\n▶ Setting up training data...")
-    data = load_response_dataset(data_config, seed)
-    train_dataset_raw = data.formatted_ds["train"]
-    task_spec = data.task_spec
+    arrow_files = train_data_config.get("arrow_files")
+    if arrow_files:
+        data = load_response_dataset(train_data_config, seed)
+        train_dataset_raw = data.formatted_ds["train"]
+        task_spec = data.task_spec
+        print(f"  ✓ Using Arrow dataset input: {arrow_files}")
+    else:
+        # Fallback for user-provided non-arrow path or HF dataset id.
+        dataset_path = train_data_config.get(
+            "dataset_path", train_data_config.get("hf_dataset_name", "allenai/c4")
+        )
+        hf_dataset_subset_raw = train_data_config.get("hf_dataset_subset")
+        hf_dataset_subset = (
+            None
+            if hf_dataset_subset_raw in (None, "", "null")
+            else hf_dataset_subset_raw
+        )
+        hf_split = train_data_config.get("hf_split", "train")
+        text_key = train_data_config.get("text_key", "text")
+
+        print(
+            "  ↪ No data.arrow_files provided. "
+            f"Loading dataset_path='{dataset_path}', subset='{hf_dataset_subset}', split='{hf_split}'"
+        )
+        hf_dataset = load_dataset_from_path(
+            dataset_path, data_subset=hf_dataset_subset, data_split=hf_split
+        )
+        if text_key not in hf_dataset.column_names:
+            raise ValueError(
+                f"text_key='{text_key}' not found in HF dataset columns: {hf_dataset.column_names}"
+            )
+
+        def _to_messages(entry: dict[str, Any]) -> dict[str, Any]:
+            text = entry[text_key]
+            if not isinstance(text, str):
+                text = str(text)
+            return {
+                "messages": [{"role": "assistant", "content": text}],
+                "task_name": "off_policy_distillation",
+            }
+
+        train_dataset_raw = hf_dataset.map(
+            _to_messages, remove_columns=hf_dataset.column_names
+        )
+        task_spec = TaskDataSpec(
+            task_name="off_policy_distillation",
+            prompt_file=train_data_config.get("prompt_file"),
+            system_prompt_file=train_data_config.get("system_prompt_file"),
+        )
 
     train_dataset = AllTaskProcessedDataset(
         train_dataset_raw,
         tokenizer,
         task_spec,
         _kd_preprocessor,
-        max_seq_length=data_config["max_input_seq_length"],
+        max_seq_length=train_data_config["max_input_seq_length"],
     )
     print(f"  ✓ Training dataset loaded with {len(train_dataset)} samples")
     return train_dataset, task_spec

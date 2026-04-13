@@ -1,20 +1,20 @@
 # Cross-Tokenizer Off-Policy Distillation Configuration
-# Student: Llama-3.2-1B (128K vocab) <- Teacher: Qwen3-8B (151K vocab)
+# Student: Llama-3.2-1B (128K vocab) <- Teacher: Phi-4-mini-instruct
 #
 # Requires a precomputed projection matrix. Generate with:
-#   python nemo_rl/algorithms/x_token/minimal_projection_via_multitoken.py \
+#   python nemo_rl/utils/x_token/minimal_projection_via_multitoken.py \
 #     --student-model meta-llama/Llama-3.2-1B \
-#     --teacher-model Qwen/Qwen3-8B-Base
+#     --teacher-model microsoft/Phi-4-mini-instruct
 #
 # Then optionally enforce exact matches:
-#   python nemo_rl/algorithms/x_token/reapply_exact_map.py \
+#   python nemo_rl/utils/x_token/reapply_exact_map.py \
 #     --student-model meta-llama/Llama-3.2-1B \
-#     --teacher-model Qwen/Qwen3-8B-Base \
+#     --teacher-model microsoft/Phi-4-mini-instruct \
 #     --initial-projection-path cross_tokenizer_data/transformation_counts_via_multitoken.pt
 
 token_aligner:
   enabled: true
-  projection_matrix_path: "cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special.pt"
+  projection_matrix_path: "cross_tokenizer_data/projection_map_Llama-3.2_to_Phi-4-mini-instruct_multitoken_top_32_double_special.pt"
   use_sparse_format: false
   loss_type: "KL"
   exact_token_match_only: false
@@ -62,7 +62,7 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "checkpoints/cross-tokenizer-distillation-llama1b-qwen8b"
+  checkpoint_dir: "checkpoints/cross-tokenizer-distillation-llama1b-phi4mini-instruct"
   metric_name: "train:loss"
   higher_is_better: false
   keep_top_k: 3
@@ -151,9 +151,9 @@ policy:
     sequence_length_round: 64
 
 teacher:
-  model_name: "Qwen/Qwen3-8B-Base"
+  model_name: "microsoft/Phi-4-mini-instruct"
   tokenizer:
-    name: "Qwen/Qwen3-8B-Base"
+    name: "microsoft/Phi-4-mini-instruct"
     chat_template: null
   precision: "bfloat16"
   train_global_batch_size: 768
@@ -200,12 +200,20 @@ teacher:
   generation: null
 
 data:
-  dataset_name: "arrow_text"
-  arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-00[0-4][0-9][0-9]-of-02476.arrow"
-  # arrow_files="/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-000[0-5][0-9]-of-02476.arrow"
-  prompt_file: null
   max_input_seq_length: 4096
   shuffle: true
+  train:
+    dataset_name: "arrow_text"
+    # Preferred local path input for large-scale jobs (set via CLI override or submit script).
+    arrow_files: null
+    prompt_file: null
+  default:
+    # Fallback dataset used when train.arrow_files is not provided.
+    dataset_path: "allenai/c4"
+    hf_dataset_name: "allenai/c4"
+    hf_dataset_subset: "en"
+    hf_split: "train"
+    text_key: "text"
 
 eval:
   val_period: 1000
@@ -234,7 +242,7 @@ eval:
         verifier_type: "multilingual_multichoice"
 
 logger:
-  log_dir: "logs/cross-tokenizer-distillation-llama1b-qwen8b"
+  log_dir: "logs/cross-tokenizer-distillation-llama1b-phi4mini-instruct"
   num_val_samples_to_print: 5
   wandb_enabled: true
   swanlab_enabled: false
@@ -243,7 +251,7 @@ logger:
   monitor_gpus: true
   wandb:
     project: "nemo-cross-tokenizer-distillation"
-    name: "cross-tokenizer-llama1b-qwen8b-bs768"
+    name: "cross-tokenizer-llama1b-phi4mini-instruct-bs768"
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10

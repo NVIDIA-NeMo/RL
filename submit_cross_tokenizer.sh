@@ -1,4 +1,4 @@
-# Run Cross-Tokenizer Off-Policy Distillation (Llama 1B student, Phi-4-mini teacher)
+# Run Cross-Tokenizer Off-Policy Distillation (Llama 1B student, Qwen3.5-9B teacher)
 # Run 5 times: bash submit_cross_tokenizer.sh -n 5
 NUM_ACTOR_NODES=16
 
@@ -10,7 +10,33 @@ while getopts "n:" opt; do
   esac
 done
 
-EXP_NAME=CrossTokenizer-Distillation-Llama1B-Phi4MiniInstruct-Profile
+EXP_NAME=CrossTokenizer-Distillation-Llama1B-Qwen3p5_9B-Profile
+
+# Dataset inputs (user configurable):
+# - DATA_SOURCE=arrow with DATA_ARROW_FILES for local Arrow shards
+# - DATA_SOURCE=hf for public HuggingFace fallback
+DATA_SOURCE="${DATA_SOURCE:-arrow}"
+DATA_ARROW_FILES="${DATA_ARROW_FILES:-/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-00[0-4][0-9][0-9]-of-02476.arrow}"
+DATA_PATH="${DATA_PATH:-}"
+HF_DATASET_NAME="${HF_DATASET_NAME:-allenai/c4}"
+HF_DATASET_SUBSET="${HF_DATASET_SUBSET:-}"
+HF_DATASET_SPLIT="${HF_DATASET_SPLIT:-train}"
+DATA_TEXT_KEY="${DATA_TEXT_KEY:-text}"
+
+if [ "${DATA_SOURCE}" = "arrow" ]; then
+  if [ -z "${DATA_ARROW_FILES}" ]; then
+    echo "DATA_ARROW_FILES must be set when DATA_SOURCE=arrow"
+    exit 1
+  fi
+  DATASET_OVERRIDES="data.train.arrow_files='${DATA_ARROW_FILES}'"
+else
+  DATASET_PATH="${DATA_PATH:-${HF_DATASET_NAME}}"
+  DATASET_SUBSET="${HF_DATASET_SUBSET}"
+  if [ -z "${DATA_PATH}" ] && [ -z "${DATASET_SUBSET}" ] && [ "${HF_DATASET_NAME}" = "allenai/c4" ]; then
+    DATASET_SUBSET="en"
+  fi
+  DATASET_OVERRIDES="data.train.arrow_files=null data.default.dataset_path='${DATASET_PATH}' data.default.hf_dataset_name='${HF_DATASET_NAME}' data.default.hf_dataset_subset='${DATASET_SUBSET}' data.default.hf_split='${HF_DATASET_SPLIT}' data.default.text_key='${DATA_TEXT_KEY}'"
+fi
 
 read -r -d '' COMMAND <<EOF
 export WANDB_API_KEY=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
@@ -29,13 +55,14 @@ export NCCL_DEBUG=INFO
 
 uv run /lustre/fsw/portfolios/coreai/users/avenkateshha/nemo_rl/RL/examples/run_off_policy_distillation_arrow_with_eval.py \
   --config /lustre/fsw/portfolios/coreai/users/avenkateshha/nemo_rl/RL/examples/configs/cross_tokenizer_off_policy_arrow.yaml \
+  ${DATASET_OVERRIDES} \
   cluster.num_nodes=${NUM_ACTOR_NODES} \
   distillation.num_prompts_per_step=768 \
   policy.train_global_batch_size=768 \
   teacher.train_global_batch_size=768 \
-  teacher.model_name=microsoft/Phi-4-mini-instruct \
-  teacher.tokenizer.name=microsoft/Phi-4-mini-instruct \
-  token_aligner.projection_matrix_path=cross_tokenizer_data/projection_map_Llama-3.2_to_Phi-4-mini-instruct_multitoken_top_32_double_special.pt \
+  teacher.model_name=Qwen/Qwen3.5-9B-Base \
+  teacher.tokenizer.name=Qwen/Qwen3.5-9B-Base \
+  token_aligner.projection_matrix_path=cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special.pt \
   distillation.use_ipc=true \
   distillation.max_num_steps=10 \
   eval.val_period=0 \
