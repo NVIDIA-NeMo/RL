@@ -1,0 +1,87 @@
+# GRPO training for Nemotron-Omni (MoE ~30B) on CLEVR-CoGenT
+# Based on vlm_grpo_3B.yaml with automodel EP=8 for MoE
+defaults: "../../examples/configs/vlm_grpo_3B.yaml"
+
+grpo:
+  num_prompts_per_step: 8
+  reward_shaping:
+    overlong_buffer_length: 512
+
+checkpointing:
+  checkpoint_dir: results/vlm_grpo_nemotron_omni
+
+policy:
+  model_name: /lustre/fsw/portfolios/coreai/users/yuekaiz/HF/nemotron-3-nano-omni-ea1_v2.0
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  optimizer:
+    kwargs:
+      lr: 5.0e-07
+  dtensor_cfg:
+    expert_parallel_size: 8
+    activation_checkpointing: false
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: sdpa
+        linear: torch
+        rms_norm: torch_fp32
+        enable_deepep: true
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+  generation:
+    max_new_tokens: 1024
+    bad_words: ["<image>", "<img>", "</img>", "<so_embedding>", "<so_start>", "<so_end>"]
+    vllm_cfg:
+      skip_tokenizer_init: false
+      tensor_parallel_size: 8
+      enforce_eager: true
+      max_model_len: 8192
+      gpu_memory_utilization: 0.2
+    vllm_kwargs:
+      limit_mm_per_prompt: {"image": 2}
+      max_num_batched_tokens: 8192
+      mm_processor_cache_gb: 0
+      mamba_ssm_cache_dtype: "float32"
+      skip_mm_profiling: true
+
+data:
+  train:
+    dataset_name: clevr-cogent
+    split: train
+  validation:
+    dataset_name: clevr-cogent
+    split: valA
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot.txt
+    processor: vlm_hf_data_processor
+    env_name: clevr-cogent
+
+env:
+  clevr-cogent:
+    num_workers: 8
+    reward_functions:
+    - name: format
+      weight: 0.2
+    - name: exact_alnum
+      weight: 0.8
+
+logger:
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb_enabled: true
+  wandb:
+    project: grpo-vlm
+    name: nemotron-omni-grpo-clevr
+
+cluster:
+  gpus_per_node: 8

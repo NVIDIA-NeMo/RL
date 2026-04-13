@@ -509,13 +509,32 @@ def vlm_hf_data_processor(
 
     images = [resolve_to_image(image) for image in images]
 
+    # Detect processors that use <image> placeholder style (e.g., NemotronOmni/InternVL)
+    # vs OpenAI content list style (e.g., Qwen-VL, Gemma).
+    # These processors expand <image> tokens in __call__ but NOT in apply_chat_template,
+    # so we must use processor(text=..., images=...) directly.
+    _PLACEHOLDER_STYLE_PROCESSORS = ("NemotronNanoVLV2Processor",)
+    _uses_image_placeholder = type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSORS
+    if _uses_image_placeholder and images:
+        # Convert content list to <image> placeholder text format
+        image_token = getattr(processor, "image_token", "<image>")
+        text_parts = []
+        for content in user_message["content"]:
+            if content["type"] == "image":
+                text_parts.append(image_token)
+            elif content["type"] == "text":
+                text_parts.append(content["text"])
+        user_message_for_tokenize = {"role": "user", "content": "\n".join(text_parts)}
+    else:
+        user_message_for_tokenize = user_message
+
     # get formatted user message
     if hasattr(processor, "conversation_preprocessor"):
         user_message_for_chat_template = processor.conversation_preprocessor(
             user_message
         )
     else:
-        user_message_for_chat_template = user_message
+        user_message_for_chat_template = user_message_for_tokenize
 
     # this is the string-tokenized conversation template for the generation policy (for vllm)
     string_formatted_dialog = processor.apply_chat_template(
@@ -525,13 +544,23 @@ def vlm_hf_data_processor(
     )
 
     # this is the id-tokenized and image processed conversation template for the policy
-    message: dict = processor.apply_chat_template(
-        [user_message],
-        tokenize=True,
-        add_generation_prompt=True,
-        return_tensors="pt",
-        return_dict=True,
-    )
+    if _uses_image_placeholder and images:
+        # For processors that use <image> placeholder (e.g., NemotronOmni):
+        # apply_chat_template with images= kwarg still tries to parse content as list of dicts,
+        # so we use processor(text=..., images=...) directly on the string-formatted dialog.
+        message: dict = processor(
+            text=string_formatted_dialog,
+            images=images,
+            return_tensors="pt",
+        )
+    else:
+        message: dict = processor.apply_chat_template(
+            [user_message_for_tokenize],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
 
     # add this for backward compatibility
     user_message["token_ids"] = message["input_ids"][0]

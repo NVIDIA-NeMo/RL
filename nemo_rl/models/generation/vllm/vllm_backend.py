@@ -111,16 +111,18 @@ class VllmInternalWorkerExtension:
         from vllm.model_executor.model_loader.utils import (
             process_weights_after_loading,
         )
+        from vllm.config import set_current_vllm_config
 
         # Get target device for processing
         target_device = next(self.model_runner.model.parameters()).device
 
         # Call process_weights_after_loading to handle KV scales
-        process_weights_after_loading(
-            self.model_runner.model,
-            self.model_runner.model_config,
-            target_device,
-        )
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            process_weights_after_loading(
+                self.model_runner.model,
+                self.model_runner.model_config,
+                target_device,
+            )
 
     @staticmethod
     def _split_policy_and_draft_weights(
@@ -183,10 +185,12 @@ class VllmInternalWorkerExtension:
                     from vllm.model_executor.model_loader.utils import (
                         process_weights_after_loading,
                     )
+                    from vllm.config import set_current_vllm_config
 
-                    process_weights_after_loading(
-                        self.model_runner.model, self.model_config, self.device
-                    )
+                    with set_current_vllm_config(self.model_runner.vllm_config):
+                        process_weights_after_loading(
+                            self.model_runner.model, self.model_config, self.device
+                        )
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
