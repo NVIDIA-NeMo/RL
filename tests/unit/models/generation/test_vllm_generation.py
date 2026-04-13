@@ -260,7 +260,12 @@ async def _collect_async_generate_outputs(policy, data):
 
 
 def _extract_gen_leader_worker_indices(outputs: BatchedDataDict) -> set[int]:
-    return {int(idx) for idx in outputs["gen_leader_worker_idx"].reshape(-1).tolist()}
+    worker_indices = outputs["gen_leader_worker_idx"]
+    if hasattr(worker_indices, "reshape"):
+        worker_indices = worker_indices.reshape(-1).tolist()
+    elif not isinstance(worker_indices, list):
+        worker_indices = [worker_indices]
+    return {int(idx) for idx in worker_indices}
 
 
 def test_vllm_generation_worker_sleep_passes_configured_level_and_mode():
