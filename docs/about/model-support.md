@@ -2,7 +2,7 @@
 
 ## Broad coverage for 🤗Hugging Face models via [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel)
 
-NeMo-RL support 🤗Hugging Face models from the following classes
+NeMo-RL supports 🤗Hugging Face models from the following classes
 - LLMs ([AutoModelForCausalLM](https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForCausalLM))
 - VLMs ([AutoModelForImageTextToText](https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForImageTextToText))
 
@@ -14,7 +14,8 @@ for model sizes under 70B at up to 32k sequence length.
 
 **LLMs**:
 
-- **Qwen**: Qwen2.5-1.5B/7B/32B, Qwen3-1.5B/8B/32B, Qwen3-30B-A3B, Qwen3-235B-A22B
+- **Qwen**: Qwen3.5-9B/35B-A3B/397B-A17B, Qwen3-1.5B/8B/32B, Qwen3-30B-A3B, Qwen3-235B-A22B, Qwen2.5-1.5B/7B/32B
+- **GLM**: GLM-4.7-Flash
 - **Llama**: Llama 3.1/3.3-8B, Llama 3.1/3.3-70B, Llama 3.2-1B
 - **Deepseek**: Deepseek-V3/R1-671B
 - **Mistral**: Mistral-NeMo-12B
@@ -25,6 +26,6 @@ for model sizes under 70B at up to 32k sequence length.
 
 **VLMs**:
 
-- **Qwen**: Qwen2.5VL-3B
+- **Qwen**: Qwen3.5-35B-A3B/397B-A17B, Qwen2.5VL-3B
 
 In addition, please refer to our [performance page](https://docs.nvidia.com/nemo/rl/latest/about/performance-summary.html) for benchmarks and full reproducible yaml recipe configs.

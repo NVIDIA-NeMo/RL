@@ -27,6 +27,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.policy import AutomodelKwargs, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
 
 try:
@@ -317,9 +318,11 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
 @pytest.mark.hf_gated
 @pytest.mark.automodel
 @pytest.mark.timeout(360)
+@pytest.mark.parametrize("save_optimizer", [True, False])
 def test_dtensor_v2_checkpoint_save_and_load(
     two_gpu_virtual_cluster,
     tiny_llama_model_path,
+    save_optimizer,
 ):
     with tempfile.TemporaryDirectory() as tmpdir:
         checkpointing_config = {
@@ -330,6 +333,7 @@ def test_dtensor_v2_checkpoint_save_and_load(
             "keep_top_k": 2,
             "save_period": 30,
             "checkpoint_must_save_by": None,
+            "save_optimizer": save_optimizer,
         }
 
         config = create_test_config(
@@ -350,8 +354,10 @@ def test_dtensor_v2_checkpoint_save_and_load(
         )
 
         try:
-            weights_path = os.path.join(tmpdir, "weights")
-            optimizer_path = os.path.join(tmpdir, "optimizer")
+            weights_path = os.path.join(tmpdir, "policy", "weights")
+            optimizer_path = (
+                os.path.join(tmpdir, "policy", "optimizer") if save_optimizer else None
+            )
 
             # Save checkpoint
             policy.save_checkpoint(
@@ -375,6 +381,13 @@ def test_dtensor_v2_checkpoint_save_and_load(
             # Shutdown original policy first to free GPU memory
             policy.shutdown()
             policy = None
+
+            # Check if the optimizer exists in the checkpoint
+            weights_path, optimizer_path = CheckpointManager.get_resume_paths(tmpdir)
+            if save_optimizer:
+                assert optimizer_path is not None, "Optimizer path should not be None"
+            else:
+                assert optimizer_path is None, "Optimizer path should be None"
 
             policy2 = Policy(
                 tokenizer=get_tokenizer(config2["tokenizer"]),

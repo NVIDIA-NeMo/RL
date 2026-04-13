@@ -121,6 +121,7 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
 
     optimizer:
       optimizer: "adam"
@@ -167,6 +168,13 @@ policy:
       data_parallel_sharding_strategy: "optim_grads_params"
 
     env_vars: null
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
   # for more details on dynamic batching and sequence packing.

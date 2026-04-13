@@ -171,7 +171,7 @@ data:
 
 #### Data Format
 
-Your JSONL files should contain one JSON object per line with the following structure:
+Your JSONL files should contain one JSON object per line following the [OpenAI Chat Completions function calling format](https://platform.openai.com/docs/guides/function-calling):
 
 ```json
 {
@@ -179,23 +179,38 @@ Your JSONL files should contain one JSON object per line with the following stru
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "What's the weather in Paris?"},
     {"role": "assistant", "content": "I'll check the weather for you.", "tool_calls": [
-      {"name": "get_weather", "arguments": {"city": "Paris", "unit": "celsius"}}
+      {
+        "id": "call_123",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": {"city": "Paris", "unit": "celsius"}
+        }
+      }
     ]},
     {"role": "tool", "content": "22°C, sunny", "tool_call_id": "call_123"},
     {"role": "assistant", "content": "The weather in Paris is currently 22°C and sunny."}
   ],
   "tools": [
     {
+      "type": "function",
       "name": "get_weather",
       "description": "Get current weather for a city",
       "parameters": {
-        "city": {"type": "string", "description": "City name"},
-        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+        "type": "object",
+        "properties": {
+          "city": {"type": "string", "description": "City name"},
+          "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+        },
+        "required": ["city"]
       }
     }
   ]
 }
 ```
+
+> [!NOTE]
+> NeMo RL passes `messages` and `tools` directly to the tokenizer's `apply_chat_template()`, so correct tool call rendering also depends on the model's chat template supporting this format.
 
 #### Tool Calling with Heterogeneous Schemas
 
@@ -321,6 +336,10 @@ uv run examples/run_sft.py \
 ```
 
 For more details on LoRA, see [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685).
+
+### Exporting a LoRA Checkpoint to Hugging Face Format
+
+After training with LoRA on the Megatron backend, use the LoRA merger script to fold the adapter weights into the base model and produce a standalone Hugging Face checkpoint for inference or evaluation. See the [Checkpointing documentation](../design-docs/checkpointing.md#merging-megatron-lora-adapter-checkpoints-to-hugging-face-format) for full usage details.
 
 ## Optimizations
 

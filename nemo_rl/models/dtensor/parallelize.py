@@ -489,9 +489,10 @@ def _parallelize_nm5_h(
         "mixer.down_proj": RowwiseParallel(),
     }
 
-    # Native transformers NemotronH uses model.model.layers, custom uses model.backbone.layers
-    inner_model = model.backbone if hasattr(model, "backbone") else model.model
+    # NemotronH uses .backbone (trust_remote_code) or .model (native transformers >= 5.3.0)
+    inner_model = getattr(model, "backbone", model.model)
     layers: torch.nn.ModuleList = inner_model.layers
+
     parallelize_module(model, tp_mesh, model_tp_plan)
 
     for layer in inner_model.layers:
@@ -522,13 +523,21 @@ def _parallelize_nm5_h(
 
     # do not reshard after forward for root model
     # because its parameters will be used in backward immediately
-    return fully_shard(
+    result = fully_shard(
         model,
         mesh=dp_mesh,
         mp_policy=mp_policy,
         offload_policy=offload_policy,
         reshard_after_forward=False,
     )
+
+    # Register .model so the native transformers forward() (self.model(...)) resolves
+    # correctly after FSDP2 wrapping, regardless of whether the class uses .backbone
+    # (trust_remote_code) or .model (native transformers). kernel_patches.py wraps
+    # the native forward which always calls self.model(...).
+    result.register_module("model", inner_model)
+
+    return result
 
 
 def _parallelize_model(
@@ -572,14 +581,7 @@ def _parallelize_model(
 
     # Handle different model structures
     if model_cls == Gemma3ForConditionalGeneration:
-        # layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
-        layers: list = []
-        for layer in model.language_model.layers:
-            layers.append(layer)
-        # siglip encoder also has the same structure as clip encoder (being the same model after all)
-        for layer in model.vision_tower.vision_model.encoder.layers:
-            layers.append(layer)
-        layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
+        layers: torch.nn.ModuleList = model.model.language_model.layers  # type: ignore
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
 
@@ -602,7 +604,7 @@ def _parallelize_model(
         Qwen2VLForConditionalGeneration,
     ]:
         # VL models have the language model at model.language_model
-        layers: list = []
+        layers: list = []  # type: ignore
         # append language model layers
         for layer in model.language_model.layers:
             layers.append(layer)
@@ -614,7 +616,7 @@ def _parallelize_model(
         num_key_value_heads = model.language_model.config.num_key_value_heads
 
     elif model_cls == SmolVLMForConditionalGeneration:
-        layers: list = []
+        layers: list = []  # type: ignore
         for layer in model.model.text_model.layers:
             layers.append(layer)
         for layer in model.model.vision_model.encoder.layers:
@@ -628,7 +630,7 @@ def _parallelize_model(
         LlavaNextVideoForConditionalGeneration,
         LlavaOnevisionForConditionalGeneration,
     ]:
-        layers: list = []
+        layers: list = []  # type: ignore
         for layer in model.model.language_model.layers:
             layers.append(layer)
         for layer in model.vision_tower.vision_model.encoder.layers:
@@ -637,7 +639,7 @@ def _parallelize_model(
         num_key_value_heads = model.language_model.config.num_key_value_heads
 
     elif model_cls == Mistral3ForConditionalGeneration:
-        layers: list = []
+        layers: list = []  # type: ignore
         for layer in model.model.language_model.layers:
             layers.append(layer)
         for layer in model.model.vision_tower.transformer.layers:
@@ -646,7 +648,7 @@ def _parallelize_model(
         num_key_value_heads = model.model.language_model.config.num_key_value_heads
 
     elif model_cls == Llama4ForConditionalGeneration:
-        layers: list = []
+        layers: list = []  # type: ignore
         for layer in model.language_model.model.layers:
             layers.append(layer)
         for layer in model.vision_model.model.layers:

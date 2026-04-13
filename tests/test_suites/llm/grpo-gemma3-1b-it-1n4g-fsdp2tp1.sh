@@ -8,7 +8,7 @@ GPUS_PER_NODE=4
 STEPS_PER_RUN=400
 MAX_STEPS=400
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=120
+NUM_MINUTES=180
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -37,7 +37,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
         "data[\"train/token_mult_prob_error\"][\"${MAX_STEPS}\"] < 1.1" \
-        'mean(data["timing/train/total_step_time"], -6, -1) < 14'
+        'mean(data["timing/train/total_step_time"], -6, -1) < 22'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

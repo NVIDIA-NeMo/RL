@@ -172,7 +172,7 @@ Quality documentation is essential for both the usability of Nemo-RL and its abi
 
 ## Code Quality
 
-- Follow the existing code style and conventions
+- Follow the coding guidelines in [`.claude/skills/`](.claude/skills/) — each skill covers a specific topic (style, config conventions, error handling, testing, copyright, docs)
 - Write tests for new features
 - Update documentation to reflect your changes
 - Ensure all tests pass before submitting a PR

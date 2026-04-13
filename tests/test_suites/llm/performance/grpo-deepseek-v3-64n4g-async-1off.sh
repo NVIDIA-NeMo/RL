@@ -3,11 +3,16 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 # disable NVLS to avoid OOM issue
 export NCCL_NVLS_ENABLE=0
-# allow user to pass an existing HF checkpoint path based on instruction in https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/deepseek.md
-export MODEL_NAME=${NRL_DEEPSEEK_V3_BF16_CKPT:-"unsloth/DeepSeek-V3-0324-BF16"}
+
+# Use the DeepSeek-V3 checkpoint converted to BF16.
+if [[ -z "$NRL_DEEPSEEK_V3_BF16_CKPT" ]]; then
+    echo "Need to set NRL_DEEPSEEK_V3_BF16_CKPT to the path of DeepSeek-V3 checkpoint converted to BF16. See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/deepseek.md for more details."
+    exit 1
+fi
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=64
+GPUS_PER_NODE=4
 STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
@@ -21,8 +26,8 @@ cd $PROJECT_ROOT
 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
-    policy.model_name=$MODEL_NAME \
-    policy.tokenizer.name=$MODEL_NAME \
+    policy.model_name=$NRL_DEEPSEEK_V3_BF16_CKPT \
+    policy.tokenizer.name=$NRL_DEEPSEEK_V3_BF16_CKPT \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
