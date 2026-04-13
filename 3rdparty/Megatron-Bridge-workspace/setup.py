@@ -25,7 +25,6 @@ final_package_dir = {}
 bridge_src_dir = "Megatron-Bridge/src/megatron/bridge"
 bridge_package_name = "megatron.bridge"
 
-# Default dependencies from pyproject.toml
 CACHED_DEPENDENCIES = [
     "transformers>=5.0.0,<=5.3.0",
     "peft>=0.18.1",
@@ -51,7 +50,7 @@ CACHED_DEPENDENCIES = [
     # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13 base container
     "transformer-engine[pytorch,core_cu12]",
     "mamba-ssm",
-    "nvidia-resiliency-ext",
+    "nvidia-resiliency-ext~=0.5.0",
     "causal-conv1d",
     "flash-linear-attention",
     "timm",

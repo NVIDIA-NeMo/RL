@@ -50,8 +50,7 @@ CACHED_DEPENDENCIES = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
     # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13 base container
     "transformer-engine[pytorch,core_cu12]",
-    # VCS dependency - must match pyproject.toml [tool.uv.sources]
-    "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@63154570cea17f8805a7fd15cc3b8cc2919ba575",
+    "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@v0.5.0",
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
@@ -66,10 +65,10 @@ CACHED_DEPENDENCIES = [
     "flashinfer-python~=0.5.0",
     "wget",
     "onnxscript",
-    "fastapi~=0.50",
-    "datasets",
     # VCS dependency - must match pyproject.toml [tool.uv.sources]
-    "emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0",
+    "emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.1.0",
+    "datasets",
+    "fastapi~=0.50",
     "hypercorn",
     "quart",
     "openai[aiohttp]",
