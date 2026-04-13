@@ -112,6 +112,10 @@ ENV UV_LINK_MODE=copy
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
+# Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
+ENV CUDA_HOME=/usr/local/cuda
+
+
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.

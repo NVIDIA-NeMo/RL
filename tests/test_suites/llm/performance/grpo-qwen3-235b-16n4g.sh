@@ -23,6 +23,7 @@ uv run examples/run_grpo.py \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
     logger.wandb.name=$EXP_NAME \
+    logger.tensorboard_enabled=True \
     logger.monitor_gpus=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
