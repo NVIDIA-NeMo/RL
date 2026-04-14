@@ -10,8 +10,8 @@
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
-	url = https://github.com/NVIDIA-NeMo/Automodel.git
-	branch = main
+	url = https://github.com/sharonyu-115/Automodel.git
+	branch = gemma4-support
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
