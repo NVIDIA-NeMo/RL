@@ -16,10 +16,10 @@
 flush_cache, release_memory_occupation, resume_memory_occupation.
 
 Uses a real SGLang server (Qwen3-0.6B), parametrised over two
-configurations so the same tests exercise both a single-rank TP=1
-worker and a TP=2 worker:
+configurations so the same tests exercise both a single-worker TP=4
+setup and a two-worker TP=2 setup:
 
-  • tp1 — 1 worker × TP=1
+  • tp4 — 1 worker × TP=4
   • tp2_2workers — 2 workers × TP=2 (the memory tests target worker 0,
     but both workers share the router)
 
@@ -38,14 +38,14 @@ pytestmark = pytest.mark.sglang
 @pytest.fixture(
     scope="module",
     params=[
-        pytest.param({"tp_size": 1, "num_workers": 1}, id="tp1"),
+        pytest.param({"tp_size": 4, "num_workers": 1}, id="tp4"),
         pytest.param({"tp_size": 2, "num_workers": 2}, id="tp2_2workers"),
     ],
 )
 def worker(request, ray_cluster, router):
     """Worker(s) dedicated to memory tests.
 
-    For ``tp1`` a single TP=1 worker is created.  For ``tp2_2workers``
+    For ``tp4`` a single TP=4 worker is created.  For ``tp2_2workers``
     two TP=2 workers share the same router (mirroring the 2-servers
     configuration exercised elsewhere); memory tests run against the
     first worker but the second is kept alive so the router has the

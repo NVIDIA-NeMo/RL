@@ -74,6 +74,7 @@ def make_sglang_cfg(
             "num_gpus": num_gpus,
             "num_gpus_per_engine": tp_size,
             "needs_offload": True,
+            "cpu_weight_backup": False,
             "sglang_server_concurrency": 64,
         },
         "sglang_router": {
