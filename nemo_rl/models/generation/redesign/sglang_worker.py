@@ -554,7 +554,8 @@ def _compute_server_args(
         "trust_remote_code": True,
         "random_seed": sglang_cfg["sglang_cfg"]["random_seed"] + rank,
         # memory
-        "enable_memory_saver": sglang_cfg["sglang_cfg"]["enable_memory_saver"],
+        "enable_memory_saver": sglang_cfg["sglang_server"]["needs_offload"],
+        "enable_weights_cpu_backup": sglang_cfg["sglang_server"]["cpu_weight_backup"],
         # distributed
         "host": host,
         "port": port,

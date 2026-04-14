@@ -911,12 +911,18 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
     def stream_weights_via_http(
         self,
-        sglang_url_to_gpu_uuids: dict[str, list[str]],
+        rollout_engines,
+        num_gpus_per_engine: int,
+        buffer_size_bytes: int = 512 * 1024 * 1024,
     ) -> None:
-        """Stream model weights to SGLang servers via HTTP API.
+        """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
 
         Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+            rollout_engines: Ray actor handles for SGLang generation workers,
+                one per engine on this node.
+            num_gpus_per_engine: TP size per SGLang engine. Engine ``i`` is
+                assumed to own global ranks ``[i*K, (i+1)*K)``.
+            buffer_size_bytes: Max bucket size in bytes before flushing.
         """
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
@@ -924,34 +930,18 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         from nemo_rl.models.policy.utils import stream_weights_via_http_impl
 
-        # Get current GPU UUID
-        current_device_uuid = self.report_device_id()
+        if not hasattr(self, "_ipc_worker_state"):
+            self._ipc_worker_state: dict = {}
 
-        def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            state_dict_items = sorted(
-                self.model.state_dict().items(), key=lambda x: x[0]
-            )
-            for name, tensor in state_dict_items:
-                if isinstance(tensor, DTensor):
-                    # Convert DTensor to full tensor for streaming
-                    full_tensor = tensor.full_tensor()
-                    # Convert to target dtype
-                    yield (
-                        name,
-                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
-                else:
-                    # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
-
-        # Use the HTTP implementation
         stream_weights_via_http_impl(
-            params_generator=dtensor_params_generator(),
-            sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+            model=self.model,
+            rollout_engines=rollout_engines,
+            num_gpus_per_engine=num_gpus_per_engine,
             rank=self.rank,
+            world_size=torch.distributed.get_world_size(),
             worker_name=str(self),
-            current_device_uuid=current_device_uuid,
+            buffer_size_bytes=buffer_size_bytes,
+            worker_state=self._ipc_worker_state,
         )
 
     @torch.no_grad()

@@ -52,7 +52,6 @@ class SglangSpecificArgs(TypedDict):
     triton_attention_reduce_in_fp32: NotRequired[bool]
     triton_attention_num_kv_splits: NotRequired[int]
     num_continuous_decode_steps: NotRequired[int]
-    enable_memory_saver: NotRequired[bool]
     allow_auto_truncate: NotRequired[bool]
     attention_backend: NotRequired[str | None]
     enable_multimodal: NotRequired[bool]
@@ -100,8 +99,12 @@ class SglangSpecificArgs(TypedDict):
     rollout_health_check_first_wait: NotRequired[int]
 
 class SGLangServer(TypedDict):
+    # needs_offload true --> enable_memory_saver true
     needs_offload: bool
+    # for testing purpose. memory_saver
+    cpu_weight_backup: bool
     sglang_server_concurrency: int
+    # total num gpus for inference
     num_gpus: NotRequired[int]
     num_gpus_per_engine: NotRequired[int] 
 

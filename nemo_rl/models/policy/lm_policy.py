@@ -883,16 +883,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return futures
 
     def stream_weights_via_http(
-        self, sglang_url_to_gpu_uuids: dict[str, list[str]]
+        self,
+        rollout_engines,
+        num_gpus_per_engine: int,
     ) -> list[ray.ObjectRef]:
-        """Send the weights to SGLang servers via HTTP API.
+        """Send the weights to colocated SGLang engines via CUDA IPC over HTTP.
 
         Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+            rollout_engines: Ray actor handles for SGLang generation workers
+                (one per engine on this node).
+            num_gpus_per_engine: TP size per SGLang engine.
         """
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_http",
-            sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+            rollout_engines=rollout_engines,
+            num_gpus_per_engine=num_gpus_per_engine,
         )
         return futures
 

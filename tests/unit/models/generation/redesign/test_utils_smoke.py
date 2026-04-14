@@ -23,8 +23,10 @@ import multiprocessing
 
 from nemo_rl.models.generation.redesign.async_utils import AsyncLoopThread
 from nemo_rl.models.generation.redesign.misc import (
-    MultiprocessingSerializer,
     terminate_process,
+)
+from nemo_rl.models.policy.redesign_utils import (
+    MultiprocessingSerializer,
 )
 from nemo_rl.models.generation.redesign.ray_utils import (
     _wrap_ipv6,

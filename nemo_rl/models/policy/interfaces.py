@@ -189,12 +189,15 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     def stream_weights_via_http(
-        self, sglang_url_to_gpu_uuids: dict[str, list[str]]
+        self,
+        rollout_engines,
+        num_gpus_per_engine: int,
     ) -> list[ray.ObjectRef]:
-        """Stream model weights to SGLang servers via HTTP API.
+        """Stream model weights to colocated SGLang engines via CUDA IPC over HTTP.
 
         Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+            rollout_engines: Ray actor handles for the SGLang generation workers.
+            num_gpus_per_engine: TP size per SGLang engine.
         """
         raise NotImplementedError(
             "stream_weights_via_http is not implemented for this policy worker"

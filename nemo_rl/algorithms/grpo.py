@@ -1152,15 +1152,11 @@ def refit_policy_generation(
                 )
 
             if isinstance(policy_generation, SGLangGeneration):
-                sglang_url_to_gpu_uuids = (
-                    policy_generation.get_sglang_url_to_gpu_uuids()
-                )
-                # Stream weights via HTTP
-                flush_success = policy_generation.invalidate_kv_cache()
-                if not flush_success:
-                    print("SGLang KV cache invalidation failed before weight update. ")
+                # Stream weights to colocated SGLang engines via CUDA IPC over HTTP.
+                # Engine-i owns global ranks [i*K, (i+1)*K) where K = num_gpus_per_engine.
                 futures_train = policy.stream_weights_via_http(
-                    sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+                    rollout_engines=policy_generation.rollout_engines,
+                    num_gpus_per_engine=policy_generation.num_gpus_per_engine,
                 )
                 # Wait for all workers to complete
                 ray.get(futures_train)

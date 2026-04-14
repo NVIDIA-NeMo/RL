@@ -80,7 +80,6 @@ def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID, tp_size=1):
             "context_length": 1024,
             "log_level": "warning",
             "skip_server_warmup": True,
-            "enable_memory_saver": False,
             "dp_size": 1,
             "pp_size": 1,
             "ep_size": 1,
@@ -90,6 +89,7 @@ def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID, tp_size=1):
             "num_gpus": 4,
             "num_gpus_per_engine": tp_size,
             "needs_offload": True,
+            "cpu_weight_backup": True,
             "sglang_server_concurrency": 64,
         },
         "sglang_router": {

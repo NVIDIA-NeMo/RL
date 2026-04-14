@@ -61,7 +61,6 @@ def make_sglang_cfg(
         "sglang_cfg": {
             "model_path": model_path,
             "random_seed": 42,
-            "enable_memory_saver": False,
             "dp_size": 1,
             "pp_size": 1,
             "ep_size": 1,
