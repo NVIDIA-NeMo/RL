@@ -1,0 +1,56 @@
+# ProRL v2.1 Algorithm Configuration (MoE)
+#
+# Extends ProRLv2 for MoE model stability with three key changes:
+# 1. Pure Online Policy Gradient (force_on_policy_ratio=true, no PPO clipping)
+# 2. Seq-Mask-TIS instead of ICE-POP (sequence-level filtering for CoT coherence)
+# 3. Disable DAPO dynamic sampling and asymmetric clipping
+#
+# ProRL v2.1 = Pure Online Policy Gradient + Seq-Mask-TIS + REINFORCE++-Baseline
+#
+# Inherits from prorlv2.yaml (which inherits from grpo_math_1B.yaml)
+#
+# Usage:
+#   python examples/run_grpo_math.py --config examples/configs/prorlv2_1_moe.yaml
+#
+# Reference papers and blogs:
+# ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
+# Seq-Mask-TIS: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
+# Online IcePop: https://hijkzzz.notion.site/online-ice-pop
+
+defaults: "prorlv2.yaml"
+
+grpo:
+  # ============================================================================
+  # Disable DAPO Dynamic Sampling
+  # Not needed for MoE pure online workflow
+  # ============================================================================
+  use_dynamic_sampling: false
+
+loss_fn:
+  # ============================================================================
+  # Pure Online Policy Gradient
+  # Force PPO ratio to 1.0 — no clipping, no off-policy correction.
+  # Gradients flow through curr_logprobs directly.
+  # This eliminates Router Shift by removing any policy lag.
+  # (ratio_clip_min/ratio_clip_max are ignored when this is true)
+  # ============================================================================
+  force_on_policy_ratio: true
+
+  # ============================================================================
+  # Seq-Mask-TIS: Sequence-Level Masking for MoE Stability
+  # Handles Backend Mismatch (FSDP vs vLLM) by filtering entire sequences
+  # whose geometric-mean IS ratio falls outside tight bounds.
+  # Preserves Chain-of-Thought coherence vs token-level ICE-POP.
+  # ============================================================================
+  truncated_importance_sampling_type: "seq-mask-tis"
+  truncated_importance_sampling_ratio: 1.002      # Upper bound for geometric mean
+  truncated_importance_sampling_ratio_min: 0.999   # Lower bound for geometric mean
+
+# ============================================================================
+# Output directories
+# ============================================================================
+checkpointing:
+  checkpoint_dir: "results/prorl_v2_1_moe"
+
+logger:
+  log_dir: "logs/prorl_v2_1_moe"

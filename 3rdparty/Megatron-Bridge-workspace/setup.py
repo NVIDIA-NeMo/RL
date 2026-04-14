@@ -56,7 +56,7 @@ CACHED_DEPENDENCIES = [
     "flash-linear-attention",
     "timm",
     "open-clip-torch>=3.2.0",
-    "mlflow>=3.5.0",
+    "mlflow>=3.9.0",
     "comet-ml>=3.50.0",
     "torch>=2.6.0",
 ]
