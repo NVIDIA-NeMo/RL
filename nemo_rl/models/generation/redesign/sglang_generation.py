@@ -458,7 +458,7 @@ class SGLangGeneration(GenerationInterface):
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
-        """Generate a batch of data using vLLM generation.
+        """Generate a batch of data using Sglang generation.
 
         Args:
             data: BatchedDataDict containing input_ids and input_lengths tensors
