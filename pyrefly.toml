@@ -109,6 +109,7 @@ project-includes = [
   "nemo_rl/experience/rollouts.py",
   "nemo_rl/models/__init__.py",
   "nemo_rl/models/automodel/__init__.py",
+  "nemo_rl/models/automodel/model_handle.py",
   "nemo_rl/models/dtensor/__init__.py",
   "nemo_rl/models/dtensor/parallelize.py",
   "nemo_rl/models/generation/__init__.py",
