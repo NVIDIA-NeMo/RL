@@ -444,6 +444,7 @@ def install_thd_squeeze_hook(model_parts: list) -> list:
     """
     handles = []
     for part in model_parts:
+
         def _squeeze_hook(module, args, kwargs):
             if "cu_seqlens" not in kwargs:
                 return args, kwargs
@@ -546,9 +547,7 @@ def pack_for_thd(
         seq_lens_padded_list.append(row_padded_for_thd)
 
         # Clean cu_seqlens from actual lengths (for data slicing in loss wrapper)
-        cu = torch.nn.functional.pad(
-            row_actual.to(torch.int32).cumsum(dim=0), (1, 0)
-        )
+        cu = torch.nn.functional.pad(row_actual.to(torch.int32).cumsum(dim=0), (1, 0))
         cu_seqlens_per_row.append(cu)
 
         # Clean cu_seqlens from CP-padded lengths (for CP logit slicing)
@@ -560,14 +559,18 @@ def pack_for_thd(
 
     # Pad to uniform number of sequences per row
     max_seqs = max(len(s) for s in seq_lens_list)
-    seq_lens = torch.stack([
-        torch.nn.functional.pad(s, (0, max_seqs - len(s)), value=-1000)
-        for s in seq_lens_list
-    ])
-    seq_lens_padded = torch.stack([
-        torch.nn.functional.pad(s, (0, max_seqs - len(s)), value=-1000)
-        for s in seq_lens_padded_list
-    ])
+    seq_lens = torch.stack(
+        [
+            torch.nn.functional.pad(s, (0, max_seqs - len(s)), value=-1000)
+            for s in seq_lens_list
+        ]
+    )
+    seq_lens_padded = torch.stack(
+        [
+            torch.nn.functional.pad(s, (0, max_seqs - len(s)), value=-1000)
+            for s in seq_lens_padded_list
+        ]
+    )
 
     # Build labels with -100 for non-trainable positions:
     # (a) CP padding between sequences (beyond actual but within CP-padded)
@@ -594,7 +597,9 @@ def pack_for_thd(
     for row_idx in range(n_rows):
         row_actual = seq_lens_list[row_idx]
         row_cp_padded = cp_padded_lengths[
-            sum(packed_sequence_size[:row_idx]) : sum(packed_sequence_size[:row_idx + 1])
+            sum(packed_sequence_size[:row_idx]) : sum(
+                packed_sequence_size[: row_idx + 1]
+            )
         ]
         # Mark padding between each sequence's actual and CP-padded boundary
         pos = 0
@@ -625,6 +630,7 @@ def pack_for_thd(
         from nemo_automodel.components.distributed.cp_utils import (
             make_cp_batch_and_ctx,
         )
+
         _, thd_batch = make_cp_batch_and_ctx(
             device_mesh,
             thd_input,
