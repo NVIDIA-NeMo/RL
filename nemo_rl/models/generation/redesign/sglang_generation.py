@@ -364,6 +364,7 @@ class SGLangGeneration(GenerationInterface):
             except Exception as e:
                 logger.warning(f"Engine shutdown failed: {e}")
                 ok = False
+            self.all_engines = [None] * len(self.all_engines)
 
         if self._router_actor is not None:
             try:
