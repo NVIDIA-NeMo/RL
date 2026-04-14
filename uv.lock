@@ -4205,6 +4205,9 @@ mcore = [
 nemo-gym = [
     { name = "nemo-gym" },
 ]
+nvrx = [
+    { name = "nvidia-resiliency-ext" },
+]
 sglang = [
     { name = "sglang" },
     { name = "sglang-kernel" },
@@ -4302,6 +4305,7 @@ requires-dist = [
     { name = "nvidia-cutlass-dsl", marker = "extra == 'vllm'", specifier = ">=4.4.0.dev1" },
     { name = "nvidia-ml-py" },
     { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "nvidia-resiliency-ext", marker = "extra == 'nvrx'" },
     { name = "nvtx" },
     { name = "omegaconf" },
     { name = "pillow", specifier = ">=12.1.1" },
@@ -4331,7 +4335,7 @@ requires-dist = [
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.17.1" },
     { name = "wandb", specifier = ">=0.25.1" },
 ]
-provides-extras = ["fsdp", "automodel", "vllm", "sglang", "mcore", "nemo-gym"]
+provides-extras = ["fsdp", "automodel", "vllm", "sglang", "mcore", "nvrx", "nemo-gym"]
 
 [package.metadata.requires-dev]
 build = [
