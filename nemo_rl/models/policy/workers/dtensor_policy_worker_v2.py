@@ -1014,10 +1014,34 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         )
         return self.nccl_reshard_refit_info
 
+    def get_src_dtensor(self, param_name):
+        """Get a DTensorRef for a source parameter to use with xferdtensor_golden.
+
+        Handles DTensor state_dict quirks: DTensor.state_dict() returns float32
+        params even when model dtype is bfloat16, so this converts to the
+        correct dtype before wrapping.
+        """
+        from nemo_rl.distributed.nccl_reshard_utils import DTensorRef
+
+        src_tensor = self._param_map.get(param_name)
+        if src_tensor is None:
+            return None
+
+        # DTensor state_dict returns float32 — convert to model dtype
+        if isinstance(src_tensor, DTensor):
+            src_tensor = src_tensor.full_tensor()
+            torch.cuda.synchronize()
+        src_tensor = src_tensor.to(self.dtype).contiguous()
+
+        return DTensorRef(local_tensor=src_tensor, global_shape=src_tensor.shape)
+
     @torch.no_grad()
     def nccl_reshard_refit(self, kv_scales=None):
         """Transfer weights to generation workers via xferdtensor_golden."""
         from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
+
+        if self.model_update_group.rank == 0:
+            print("[DTensor nccl_reshard_refit] started", flush=True)
 
         if kv_scales is not None:
             raise NotImplementedError(
@@ -1028,37 +1052,24 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         if self.cpu_offload:
             self.model = self.move_to_cuda(self.model)
 
-        state_dict = dict(self.model.state_dict())
+        self._param_map = dict(self.model.state_dict())
 
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
             for param_info in self.nccl_reshard_refit_info["per_layer_params"][
                 layer_name
             ]:
-                name = param_info["name"]
-                src_tensor = state_dict.get(name)
-
-                # Pre-convert DTensor to a regular, contiguous tensor in the
-                # target dtype.  DTensor state_dict returns float32 params even
-                # when model dtype is bfloat16 — must convert to avoid NCCL
-                # size mismatch with the gen side's bfloat16 buffers.
-                if src_tensor is not None:
-                    if isinstance(src_tensor, DTensor):
-                        src_tensor = src_tensor.full_tensor()
-                        torch.cuda.synchronize()
-                    src_tensor = src_tensor.to(self.dtype).contiguous()
-
+                src_tensor = self.get_src_dtensor(param_info["name"])
                 xferdtensor_golden(
-                    src_tensor=src_tensor,
-                    src_mesh=param_info["src_mesh_info"],
-                    src_placement=param_info["src_placements"],
-                    dst_tensor=None,
-                    dst_mesh=param_info["dst_mesh_info"],
-                    dst_placement=param_info["dst_placements"],
-                    process_group=self.model_update_group,
-                    global_shape=param_info["global_shape"],
-                    dtype=param_info["dtype"],
-                    param_name=name,
+                    src_tensor,
+                    param_info["src_mesh_info"],
+                    param_info["src_placements"],
+                    None,
+                    param_info["dst_mesh_info"],
+                    param_info["dst_placements"],
+                    self.model_update_group,
                 )
+
+        del self._param_map
 
         # Manually move model to cpu for cpu offload case
         if self.cpu_offload:

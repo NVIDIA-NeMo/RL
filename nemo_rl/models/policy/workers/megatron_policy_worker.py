@@ -1073,6 +1073,21 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         )
         return self.nccl_reshard_refit_info
 
+    def get_src_dtensor(self, param_name):
+        """Get a DTensorRef for a source parameter to use with xferdtensor_golden.
+
+        Takes an HF parameter name and returns a DTensorRef wrapping the full
+        global tensor from Megatron export. The returned object satisfies the
+        xferdtensor_golden interface: ``.shape`` is the global shape and
+        ``.full_tensor()`` returns the tensor data.
+
+        Must be called after ``_param_map`` is populated (inside ``nccl_reshard_refit``).
+        """
+        from nemo_rl.distributed.nccl_reshard_utils import DTensorRef
+
+        tensor = self._param_map[param_name]
+        return DTensorRef(local_tensor=tensor, global_shape=tensor.shape)
+
     @torch.no_grad()
     def nccl_reshard_refit(self, kv_scales=None):
         """Transfer weights to generation workers via xferdtensor_golden."""
@@ -1084,31 +1099,28 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             )
 
         # Build map of param_name -> full HF tensor from Megatron export
-        param_map = {}
+        self._param_map = {}
         for name, tensor in self._iter_params_with_optional_kv_scales(
             kv_scales=kv_scales
         ):
-            param_map[name] = tensor
+            self._param_map[name] = tensor
 
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
             for param_info in self.nccl_reshard_refit_info["per_layer_params"][
                 layer_name
             ]:
-                name = param_info["name"]
-                src_tensor = param_map.get(name)
-
+                src_tensor = self.get_src_dtensor(param_info["name"])
                 xferdtensor_golden(
-                    src_tensor=src_tensor,
-                    src_mesh=param_info["src_mesh_info"],
-                    src_placement=param_info["src_placements"],
-                    dst_tensor=None,
-                    dst_mesh=param_info["dst_mesh_info"],
-                    dst_placement=param_info["dst_placements"],
-                    process_group=self.model_update_group,
-                    global_shape=param_info["global_shape"],
-                    dtype=param_info["dtype"],
-                    param_name=name,
+                    src_tensor,
+                    param_info["src_mesh_info"],
+                    param_info["src_placements"],
+                    None,
+                    param_info["dst_mesh_info"],
+                    param_info["dst_placements"],
+                    self.model_update_group,
                 )
+
+        del self._param_map
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)

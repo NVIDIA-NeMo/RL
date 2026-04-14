@@ -258,8 +258,14 @@ class VllmInternalWorkerExtension:
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Store per-layer param metadata for nccl_reshard-based refit."""
+        from nemo_rl.distributed.nccl_reshard_utils import (
+            normalize_refit_info_placements,
+        )
+
+        # Normalize placements that may have been dict-serialized by msgspec
+        # during vLLM's collective_rpc transport.
         self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
-            refit_info
+            normalize_refit_info_placements(refit_info)
         )
 
     def _build_hf_to_vllm_mapping(self, refit_info):
@@ -394,84 +400,105 @@ class VllmInternalWorkerExtension:
             start = tp_rank * shard_size
             return full_tensor[start : start + shard_size]
 
-    def _recv_broadcast(self, param_info, dst_tensor=None, all_replicate=False):
-        """Receive a single parameter broadcast from training workers.
+    def get_dst_dtensor(self, param_name, param_info):
+        """Get destination tensor info for xferdtensor_golden.
 
-        Args:
-            param_info: Per-parameter metadata from nccl_reshard_refit_info.
-            dst_tensor: TensorWrapper to write into, or None to discard.
-            all_replicate: If True, override dst_placements with all-Replicate
-                (used for merged params that need the full global tensor).
+        Takes an HF parameter name and returns a tuple suitable for calling
+        the canonical 7-arg xferdtensor_golden. Handles three cases:
+
+        1. **Direct param**: HF name maps 1:1 to a vLLM parameter.
+           Returns DTensorRef wrapping the vLLM param with global shape.
+        2. **Merged param**: HF name is part of a merged vLLM tensor
+           (qkv_proj, gate_up_proj). Returns DTensorRef wrapping a full-size
+           buffer with all-Replicate placement, plus a finalize callback.
+        3. **Unmapped param**: No vLLM parameter (e.g., tied lm_head).
+           Returns DTensorRef wrapping a dummy buffer for broadcast participation.
+
+        Must be called after ``_hf_to_vllm`` is populated (inside ``nccl_reshard_refit``).
+
+        Returns:
+            ``(dst_tensor, dst_placements, finalize_fn)`` where:
+            - ``dst_tensor``: DTensorRef to pass to xferdtensor_golden
+            - ``dst_placements``: placement list to use (may differ from param_info)
+            - ``finalize_fn``: callable to run after xferdtensor_golden, or None
         """
         from torch.distributed.tensor.placement_types import Replicate
 
-        from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
+        from nemo_rl.distributed.nccl_reshard_utils import _STR_TO_DTYPE, DTensorRef
 
-        dst_placement = (
-            [Replicate() for _ in param_info["dst_placements"]]
-            if all_replicate
-            else param_info["dst_placements"]
-        )
-        xferdtensor_golden(
-            src_tensor=None,
-            src_mesh=param_info["src_mesh_info"],
-            src_placement=param_info["src_placements"],
-            dst_tensor=dst_tensor,
-            dst_mesh=param_info["dst_mesh_info"],
-            dst_placement=dst_placement,
-            process_group=self.model_update_group,
-            global_shape=param_info["global_shape"],
-            dtype=param_info["dtype"],
-            param_name=param_info["name"],
-        )
+        vllm_param, dim0_slice = self._hf_to_vllm.get(param_name, (None, None))
+        global_shape = param_info["global_shape"]
+        dst_placements = param_info["dst_placements"]
+
+        if vllm_param is None:
+            # Unmapped — participate in broadcast but discard result
+            dtype = _STR_TO_DTYPE.get(param_info.get("dtype", ""), torch.bfloat16)
+            buf = torch.empty(global_shape, device=self.device, dtype=dtype)
+            return DTensorRef(buf, global_shape), dst_placements, None
+
+        if dim0_slice is not None:
+            # Merged param — receive full global tensor with all-Replicate
+            buf = torch.empty(global_shape, device=self.device, dtype=vllm_param.dtype)
+            all_replicate = [Replicate() for _ in dst_placements]
+            tp_rank = torch.distributed.get_rank()
+            tp_size = torch.distributed.get_world_size()
+
+            def finalize(
+                _buf=buf,
+                _name=param_name,
+                _vllm_param=vllm_param,
+                _slice=dim0_slice,
+                _tp_rank=tp_rank,
+                _tp_size=tp_size,
+            ):
+                local_data = self._compute_tp_local_slice(
+                    _buf, _name, _tp_rank, _tp_size
+                )
+                _vllm_param.data[_slice].copy_(local_data)
+
+            return DTensorRef(buf, global_shape), all_replicate, finalize
+
+        # Direct 1:1 mapping — xferdtensor_golden handles TP sharding.
+        # Use .data to avoid "leaf Variable that requires grad" error from
+        # in-place copy_ inside xferdtensor_golden.
+        return DTensorRef(vllm_param.data, global_shape), dst_placements, None
 
     def nccl_reshard_refit(self) -> bool:
         """Receive weights from training workers via xferdtensor_golden.
 
-        Writes directly into vLLM parameters using an HF->vLLM name mapping
-        that handles merged params (qkv_proj, gate_up_proj). For merged params,
-        receives the full global tensor (all-Replicate), then locally computes
-        the correct TP slice (handling KV head replication).
+        Uses ``get_dst_dtensor`` to prepare each parameter, then calls the
+        canonical 7-arg ``xferdtensor_golden``. For merged params (qkv_proj,
+        gate_up_proj), a finalize callback copies the TP-local slice.
         """
-        from nemo_rl.distributed.nccl_reshard_utils import TensorWrapper
+        from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
 
-        hf_to_vllm = self._build_hf_to_vllm_mapping(self.nccl_reshard_refit_info)
-        tp_rank = torch.distributed.get_rank()
-        tp_size = torch.distributed.get_world_size()
+        self._hf_to_vllm = self._build_hf_to_vllm_mapping(  # pyrefly: ignore[implicitly-defined-attribute]
+            self.nccl_reshard_refit_info
+        )
 
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
             for param_info in self.nccl_reshard_refit_info["per_layer_params"][
                 layer_name
             ]:
-                name = param_info["name"]
-                vllm_param, dim0_slice = hf_to_vllm.get(name, (None, None))
-
-                if vllm_param is None:
-                    # No vLLM mapping — must still participate in collective broadcast
-                    self._recv_broadcast(param_info)
-                elif dim0_slice is not None:
-                    # Merged param (qkv_proj, gate_up_proj): receive full tensor,
-                    # then compute the correct TP-local slice.
-                    full_buf = torch.empty(
-                        param_info["global_shape"],
-                        device=self.device,
-                        dtype=vllm_param.dtype,
-                    )
-                    self._recv_broadcast(
-                        param_info, TensorWrapper(full_buf), all_replicate=True
-                    )
-                    local_data = self._compute_tp_local_slice(
-                        full_buf, name, tp_rank, tp_size
-                    )
-                    vllm_param.data[dim0_slice].copy_(local_data)
-                    del full_buf
-                else:
-                    # Direct 1:1 mapping — xferdtensor handles sharding
-                    self._recv_broadcast(param_info, TensorWrapper(vllm_param))
+                dst_tensor, dst_placements, finalize = self.get_dst_dtensor(
+                    param_info["name"], param_info
+                )
+                xferdtensor_golden(
+                    None,
+                    param_info["src_mesh_info"],
+                    param_info["src_placements"],
+                    dst_tensor,
+                    param_info["dst_mesh_info"],
+                    dst_placements,
+                    self.model_update_group,
+                )
+                if finalize:
+                    finalize()
 
         # Ensure all NCCL broadcasts and copy_ ops complete before vLLM resumes.
         torch.cuda.synchronize()
         self._maybe_process_fp8_kv_cache()
+        del self._hf_to_vllm
         return True
 
     def cleanup(self) -> None:
