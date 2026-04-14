@@ -19,12 +19,8 @@ policy:
     empty_unused_memory_level: 1
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
-    expert_model_parallel_size: 8
+    expert_model_parallel_size: 16
     sequence_parallel: false
-    # HybridEP settings
-    moe_token_dispatcher_type: flex
-    moe_flex_dispatcher_backend: hybridep
-    moe_hybridep_num_sms: 16
     optimizer:
       lr: 3.0e-07
       min_lr: 3.0e-08
@@ -46,3 +42,4 @@ logger:
 cluster:
   gpus_per_node: 4
   num_nodes: 4
+
