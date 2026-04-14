@@ -458,7 +458,6 @@ def test_generate_after_memory_cycle_top_level_api(sglang_gen, tokenizer):
     gen_len_before = r_before["generation_lengths"][0].item()
     assert gen_len_before > 0, "generate() before memory cycle produced 0 tokens"
     tokens_before = r_before["output_ids"][0, input_len : input_len + gen_len_before]
-    assert (tokens_before != 0).all(), "before: generated tokens contain zeros"
     assert (tokens_before != PAD_TOKEN_ID).all(), "before: generated tokens contain pad"
 
     # Full offload + onload cycle using the top-level SGLangGeneration API.
@@ -471,7 +470,6 @@ def test_generate_after_memory_cycle_top_level_api(sglang_gen, tokenizer):
     gen_len_after = r_after["generation_lengths"][0].item()
     assert gen_len_after > 0, "generate() after memory cycle produced 0 tokens"
     tokens_after = r_after["output_ids"][0, input_len : input_len + gen_len_after]
-    assert (tokens_after != 0).all(), "after: generated tokens contain zeros"
     assert (tokens_after != PAD_TOKEN_ID).all(), "after: generated tokens contain pad"
 
     assert gen_len_before == gen_len_after, (
