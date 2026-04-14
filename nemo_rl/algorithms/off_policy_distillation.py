@@ -497,6 +497,27 @@ def check_vocab_equality(
     )
 
 
+def _ensure_topk_logprobs_for_non_ipc(
+    teacher_topk_logits: torch.Tensor,
+) -> tuple[torch.Tensor, bool]:
+    """Normalize teacher top-k values to log-probs for non-IPC distillation.
+
+    Depending on worker/backend path, `get_topk_logits` may return either:
+    - top-k log-probabilities, or
+    - raw top-k logits.
+    Distillation loss expects log-probs in this non-IPC data-dict path.
+    """
+    teacher_topk_logits = teacher_topk_logits.to(torch.float32)
+    topk_mass = teacher_topk_logits.exp().sum(dim=-1)
+    looks_like_logprobs = bool(
+        (teacher_topk_logits.max() <= 1e-6).item()
+        and (topk_mass.max() <= 1.0001).item()
+    )
+    if looks_like_logprobs:
+        return teacher_topk_logits, False
+    return torch.nn.functional.log_softmax(teacher_topk_logits, dim=-1), True
+
+
 def setup(
     master_config: OffPolicyMasterConfig,
     tokenizer: TokenizerType,
@@ -893,7 +914,10 @@ def validate(
                 )
             else:
                 teacher_topk = teacher_policy.get_topk_logits(val_data, k=topk_k)
-                val_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+                teacher_topk_logprobs, _ = _ensure_topk_logprobs_for_non_ipc(
+                    teacher_topk["topk_logits"]
+                )
+                val_data["teacher_topk_logits"] = teacher_topk_logprobs
                 val_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
                 del teacher_topk
             teacher_policy.offload_after_refit()
@@ -1277,16 +1301,7 @@ def off_policy_distillation_train(
                     prefetched_batch_pack = _maybe_prefetch_next_batch(dataloader_iter)
 
                 # ==== Teacher Logprob Inference ====
-                requested_use_ipc = master_config["distillation"].get("use_ipc", True)
-                # Same-tokenizer off-policy supports the non-IPC top-k path.
-                # Keep IPC mandatory only for cross-tokenizer mode.
-                use_ipc = bool(requested_use_ipc and cross_tokenizer_enabled)
-                if requested_use_ipc and not cross_tokenizer_enabled:
-                    print(
-                        "⚠️ distillation.use_ipc=true requested, but same-tokenizer mode uses non-IPC "
-                        "teacher top-k path for stability.",
-                        flush=True,
-                    )
+                use_ipc = bool(master_config["distillation"].get("use_ipc", True))
                 topk_k = master_config["distillation"]["topk_logits_k"]
 
                 print("▶ Preparing for teacher logprob inference...", flush=True)
@@ -1318,8 +1333,17 @@ def off_policy_distillation_train(
                     print("▶ Computing teacher logprobs (non-IPC, data dict)...", flush=True)
                     with timer.time("teacher_logprob_inference"):
                         teacher_topk = teacher_policy.get_topk_logits(train_data, k=topk_k)
-                        train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+                        teacher_topk_logprobs, converted_to_logprobs = _ensure_topk_logprobs_for_non_ipc(
+                            teacher_topk["topk_logits"]
+                        )
+                        train_data["teacher_topk_logits"] = teacher_topk_logprobs
                         train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                        if converted_to_logprobs and total_steps == 0 and current_step == 0:
+                            print(
+                                "⚠️ teacher.get_topk_logits returned raw logits in non-IPC mode; "
+                                "normalizing with log_softmax before distillation loss.",
+                                flush=True,
+                            )
                         del teacher_topk
 
                 # ==== Student Training ====
@@ -1353,16 +1377,19 @@ def off_policy_distillation_train(
                 student_loss_fn = None if cross_tokenizer_enabled else loss_fn
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
+                    train_kwargs: dict[str, Any] = {}
                     if use_ipc:
-                        train_results = student_policy.train(
-                            train_data,
-                            student_loss_fn,
-                            teacher_logits=teacher_logits,
-                            use_teacher_ipc_loss_postprocessor=cross_tokenizer_enabled,
-                        )
+                        train_kwargs["teacher_logits"] = teacher_logits
+                        train_kwargs["use_teacher_ipc_loss_postprocessor"] = True
+
+                    train_results = student_policy.train(
+                        train_data,
+                        student_loss_fn,
+                        **train_kwargs,
+                    )
+
+                    if use_ipc:
                         del teacher_logits
-                    else:
-                        train_results = student_policy.train(train_data, student_loss_fn)
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
