@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end weight update tests using SGLangGeneration + mock FSDP trainer.
+"""
+End-to-end weight update tests using SGLangGeneration + mock FSDP trainer.
 
 Verifies the full weight-streaming path:
   1. SGLangGeneration.check_weights("snapshot")  — save original weights
@@ -45,14 +46,28 @@ from helpers import make_actor_env_vars, post_and_assert_200
 
 pytestmark = pytest.mark.sglang
 
-MODEL_PATH = "Qwen/Qwen3-1.7B"
+MODEL_PATH = "Qwen/Qwen3-4B"
+PAD_TOKEN_ID = 151643
+EOS_TOKEN_ID = 151645
 
 
 # ---------------------------------------------------------------------------
 # SGLang config builder
 # ---------------------------------------------------------------------------
-def _make_sglang_cfg(tp_size):
+def _make_sglang_cfg(tp_size, pad_token_id=PAD_TOKEN_ID):
     return {
+        "backend": "sglang",
+        "model_name": MODEL_PATH,
+        "model_path": MODEL_PATH,
+        "tokenizer": {"name": MODEL_PATH},
+        "dtype": "bfloat16",
+        "max_new_tokens": 16,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": None,
+        "stop_token_ids": [EOS_TOKEN_ID],
+        "stop_strings": None,
+        "_pad_token_id": pad_token_id,
         "sglang_cfg": {
             "model_path": MODEL_PATH,
             "dtype": "bfloat16",
@@ -76,6 +91,7 @@ def _make_sglang_cfg(tp_size):
             "sglang_router_ip": None,
             "sglang_router_port": None,
         },
+        "sglang_kwargs": {},
     }
 
 

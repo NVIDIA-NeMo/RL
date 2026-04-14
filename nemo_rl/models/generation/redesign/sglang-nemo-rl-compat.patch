@@ -1,0 +1,48 @@
+# SGLang compatibility patch for NeMo-RL colocated refit
+#
+# Base:   lmsysorg/sglang:dev at commit 2e70e4f
+# Target: /sgl-workspace/sglang/
+# Apply:  cd /sgl-workspace/sglang && git apply /path/to/this.patch
+#
+# Two changes:
+#
+# 1. SafeUnpickler.ALLOWED_MODULE_PREFIXES
+#    NeMo-RL monkey-patches torch CUDA reductions with helpers that live in
+#    nemo_rl.models.policy.redesign_utils (_reduce_tensor_modified /
+#    _rebuild_cuda_tensor_modified -- they translate device index <-> GPU UUID
+#    so IPC handles survive mismatched CUDA_VISIBLE_DEVICES between trainer
+#    and SGLang worker). ForkingPickler emits that module path in the pickle
+#    stream sent to update_weights_from_tensor. SafeUnpickler (CVE-2025-10164
+#    mitigation) rejects anything outside its allowlist, so we add the
+#    single submodule prefix used by NeMo-RL.
+#
+# 2. WeightChecker._reset_tensors skip list
+#    cos_sin_cache / freqs_cis / _weight_fp32 are derived/precomputed buffers
+#    rather than trainable weights; overwriting them with random noise breaks
+#    attention and prevents the compare step from converging. Mirrors the
+#    sglang-miles branch:
+#    https://github.com/sgl-project/sglang/blob/sglang-miles/python/sglang/srt/utils/weight_checker.py
+
+diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
+--- a/python/sglang/srt/utils/common.py
++++ b/python/sglang/srt/utils/common.py
+@@ -2157,6 +2157,7 @@ class SafeUnpickler(pickle.Unpickler):
+         "sglang.srt.layers.",
+         "sglang.srt.utils.",
+         "torch_npu.",
++        "nemo_rl.models.policy.redesign_utils.",
+     }
+ 
+     DENY_CLASSES = {
+diff --git a/python/sglang/srt/utils/weight_checker.py b/python/sglang/srt/utils/weight_checker.py
+--- a/python/sglang/srt/utils/weight_checker.py
++++ b/python/sglang/srt/utils/weight_checker.py
+@@ -38,6 +38,8 @@ class WeightChecker:
+ 
+     def _reset_tensors(self):
+         for name, param in self._model_state():
++            if "cos_sin_cache" in name or "freqs_cis" in name or "_weight_fp32" in name:
++                continue
+             param.copy_(_random_like(param))
+ 
+     def _compare(self):

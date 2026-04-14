@@ -42,10 +42,11 @@ from nemo_rl.models.generation.redesign.sglang_generation import (
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 
 from helpers import (
-    MODEL_PATH,
     make_generation_sampling_params,
     post_and_assert_200,
 )
+
+MODEL_PATH = "Qwen/Qwen3-4B"
 
 pytestmark = pytest.mark.sglang
 

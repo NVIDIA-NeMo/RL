@@ -25,7 +25,24 @@ import pybase64
 from packaging import version as pkg_version
 torch_release = pkg_version.parse(torch.__version__).release
 
-SGLANG_TP_RANK = None
+# /sgl-workspace/sglang/python/sglang/srt/utils/common.py
+# class SafeUnpickler(pickle.Unpickler):
+#     ALLOWED_MODULE_PREFIXES = {
+#         ...
+#         "sglang.srt.weight_sync.tensor_bucket.",
+#         "sglang.srt.model_executor.model_runner.",
+#         "sglang.srt.layers.",
+#         "sglang.srt.utils.",
+#         "torch_npu.",
+# +        "nemo_rl.models.policy.redesign_utils.",
+#     }
+
+# Refer: https://github.com/sgl-project/sglang/blob/sglang-miles/python/sglang/srt/utils/weight_checker.py
+#     def _reset_tensors(self):
+#         for name, param in self._model_state():
+#             if "cos_sin_cache" in name or "freqs_cis" in name or "_weight_fp32" in name:
+#                 continue
+#             param.copy_(_random_like(param))
 
 class MultiprocessingSerializer:  # pragma: no cover
     """Serialize/deserialize Python objects using ForkingPickler for IPC.
@@ -93,12 +110,6 @@ def monkey_patch_torch_reductions():
 # The signature has not been changed for years, and we will not need this when the next version is released,
 # so it looks safe to use a constant.
 _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
-
-
-def register_sgl_tp_rank(rank: int):
-    global SGLANG_TP_RANK
-    SGLANG_TP_RANK = rank
-
 
 def _reduce_tensor_modified(*args, **kwargs):
     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
