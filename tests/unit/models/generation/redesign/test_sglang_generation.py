@@ -18,7 +18,11 @@ Spins up a real RayVirtualCluster + SGLangGeneration (router + workers)
 and tests ``generate()``, ``generate_async()``, and the underlying
 ``generate_one_sample()`` function against a live Qwen3-0.6B model.
 
-Model: Qwen/Qwen3-0.6B  (4 GPUs, TP=1 × 4 engines)
+Parametrised over two configurations (both use 4 GPUs total):
+  • tp4_1server  — 1 server × TP=4
+  • tp2_2servers — 2 servers × TP=2
+
+Model: Qwen/Qwen3-0.6B
 """
 
 import asyncio
@@ -55,7 +59,7 @@ EOS_TOKEN_ID = 151645
 # ---------------------------------------------------------------------------
 # SGLang config for SGLangGeneration (mirrors existing test pattern)
 # ---------------------------------------------------------------------------
-def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID):
+def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID, tp_size=1):
     return {
         "backend": "sglang",
         "model_name": MODEL_PATH,
@@ -84,7 +88,7 @@ def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID):
         },
         "sglang_server": {
             "num_gpus": 4,
-            "num_gpus_per_engine": 1,
+            "num_gpus_per_engine": tp_size,
             "needs_offload": True,
             "sglang_server_concurrency": 64,
         },
@@ -106,18 +110,31 @@ def tokenizer():
     return AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
 
 
-@pytest.fixture(scope="module")
-def sglang_gen(ray_cluster, tokenizer):
-    """Real SGLangGeneration: RayVirtualCluster → router → 4×TP=1 engines."""
+@pytest.fixture(
+    scope="module",
+    params=[
+        pytest.param({"tp_size": 4, "num_servers": 1}, id="tp4_1server"),
+        pytest.param({"tp_size": 2, "num_servers": 2}, id="tp2_2servers"),
+    ],
+)
+def sglang_gen(request, ray_cluster, tokenizer):
+    """Real SGLangGeneration: RayVirtualCluster → router → engines.
+
+    Parametrised over tp4_1server (1 server × TP=4) and tp2_2servers
+    (2 servers × TP=2). All variants use 4 GPUs.
+    """
+    tp_size = request.param["tp_size"]
     cluster = RayVirtualCluster(
         bundle_ct_per_node_list=[4],
         use_gpus=True,
         max_colocated_worker_groups=1,
         num_gpus_per_node=4,
-        name="gen-test",
+        name=f"gen-test-{request.param['num_servers']}srv-tp{tp_size}",
     )
     cluster_cfg = {"gpus_per_node": 4, "num_nodes": 1}
-    sglang_cfg = _make_sglang_generation_cfg(pad_token_id=tokenizer.pad_token_id)
+    sglang_cfg = _make_sglang_generation_cfg(
+        pad_token_id=tokenizer.pad_token_id, tp_size=tp_size,
+    )
 
     gen = SGLangGeneration(cluster, cluster_cfg, sglang_cfg)
     yield gen

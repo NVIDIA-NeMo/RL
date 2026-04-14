@@ -15,8 +15,16 @@
 """Tests for SGLangGenerationWorker memory management:
 flush_cache, release_memory_occupation, resume_memory_occupation.
 
-Uses a real SGLang server (Qwen3-0.6B, TP=1).  Each test is fully
-self-contained — it leaves the server in the same state it found it.
+Uses a real SGLang server (Qwen3-0.6B), parametrised over two
+configurations so the same tests exercise both a single-rank TP=1
+worker and a TP=2 worker:
+
+  • tp1 — 1 worker × TP=1
+  • tp2_2workers — 2 workers × TP=2 (the memory tests target worker 0,
+    but both workers share the router)
+
+Each test is fully self-contained — it leaves the server in the same
+state it found it.
 """
 
 import pytest
@@ -27,15 +35,43 @@ from helpers import create_worker, post_and_assert_200
 pytestmark = pytest.mark.sglang
 
 
-@pytest.fixture(scope="module")
-def worker(ray_cluster, router):
-    """A TP=1 worker dedicated to memory tests."""
-    w = create_worker(router, base_gpu_id=0, tp_size=1, rank=0)
-    yield w
-    try:
-        ray.get(w.shutdown.remote())
-    except Exception:
-        pass
+@pytest.fixture(
+    scope="module",
+    params=[
+        pytest.param({"tp_size": 1, "num_workers": 1}, id="tp1"),
+        pytest.param({"tp_size": 2, "num_workers": 2}, id="tp2_2workers"),
+    ],
+)
+def worker(request, ray_cluster, router):
+    """Worker(s) dedicated to memory tests.
+
+    For ``tp1`` a single TP=1 worker is created.  For ``tp2_2workers``
+    two TP=2 workers share the same router (mirroring the 2-servers
+    configuration exercised elsewhere); memory tests run against the
+    first worker but the second is kept alive so the router has the
+    multi-worker topology in place.
+    """
+    tp_size = request.param["tp_size"]
+    num_workers = request.param["num_workers"]
+
+    workers = []
+    for rank in range(num_workers):
+        workers.append(
+            create_worker(
+                router,
+                base_gpu_id=rank * tp_size,
+                tp_size=tp_size,
+                rank=rank,
+            )
+        )
+
+    yield workers[0]
+
+    for w in workers:
+        try:
+            ray.get(w.shutdown.remote())
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------
