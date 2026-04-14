@@ -63,7 +63,6 @@ PostProcessingFunction = Union[
 ]
 
 
-
 def _is_custom_automodel(model: nn.Module) -> bool:
     """Check if model is a custom nemo_automodel model (not standard HF).
 
@@ -585,8 +584,11 @@ class LossPostProcessor:
             # CP uses padded cu_seqlens for logit slicing (positions // cp_size).
             # TE's THD partitioning matches Megatron's dual-chunk-swap.
             cu_seqlens_padded = (
-                thd.cu_seqlens_padded_per_row[0].to(dtype=torch.int32, device=logits.device)
-                if self.cp_size > 1 else cu_seqlens_actual
+                thd.cu_seqlens_padded_per_row[0].to(
+                    dtype=torch.int32, device=logits.device
+                )
+                if self.cp_size > 1
+                else cu_seqlens_actual
             )
             cp_group = self.cp_mesh.get_group() if self.cp_size > 1 else None
             prepare_fn = partial(
@@ -600,7 +602,10 @@ class LossPostProcessor:
                 context_parallel_group=cp_group,
             )
             loss, loss_metrics = loss_fn(
-                logits, data_dict, global_valid_seqs, global_valid_toks,
+                logits,
+                data_dict,
+                global_valid_seqs,
+                global_valid_toks,
             )
             return loss, loss_metrics
 
@@ -713,9 +718,7 @@ class LogprobsPostProcessor:
             thd = processed_inputs.thd_batch
             cu_actual = thd.cu_seqlens_per_row[0]
             cu_padded = (
-                thd.cu_seqlens_padded_per_row[0]
-                if self.cp_size > 1
-                else cu_actual
+                thd.cu_seqlens_padded_per_row[0] if self.cp_size > 1 else cu_actual
             )
             cp_group = self.cp_mesh.get_group() if self.cp_size > 1 else None
             cp_size_val = self.cp_size
@@ -727,7 +730,8 @@ class LogprobsPostProcessor:
             n_seqs = min(len(cu_actual) - 1, original_batch_size)
             unpacked_logprobs = torch.zeros(
                 (original_batch_size, original_seq_len),
-                dtype=logits.dtype, device=logits.device,
+                dtype=logits.dtype,
+                device=logits.device,
             )
             for seq_idx in range(n_seqs):
                 actual_len = (cu_actual[seq_idx + 1] - cu_actual[seq_idx]).item()
@@ -738,18 +742,22 @@ class LogprobsPostProcessor:
                 logit_length = padded_len // cp_size_val
                 logit_slice = logits.narrow(1, logit_start, logit_length)
 
-                seq_input_ids = data_dict["input_ids"][seq_idx : seq_idx + 1, :actual_len]
+                seq_input_ids = data_dict["input_ids"][
+                    seq_idx : seq_idx + 1, :actual_len
+                ]
                 seq_logprobs = get_next_token_logprobs_from_logits(
                     input_ids=seq_input_ids,
                     next_token_logits=logit_slice,
                     context_parallel_group=cp_group,
                     sampling_params=self.sampling_params,
                 )
-                unpacked_logprobs[seq_idx, 1 : 1 + seq_logprobs.shape[1]] = seq_logprobs[0]
+                unpacked_logprobs[seq_idx, 1 : 1 + seq_logprobs.shape[1]] = (
+                    seq_logprobs[0]
+                )
 
             # Apply post-attention mask
             for i, length in enumerate(input_lengths):
-                unpacked_logprobs[i, int(length):] = 0
+                unpacked_logprobs[i, int(length) :] = 0
 
             if need_top_k_or_top_p_filtering(self.sampling_params):
                 mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
