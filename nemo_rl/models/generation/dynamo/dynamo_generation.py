@@ -76,14 +76,32 @@ class DynamoVllmGeneration(GenerationInterface):
 
     def __init__(
         self,
-        cluster: RayVirtualCluster,
+        cluster: Optional[RayVirtualCluster],
         config: DynamoVllmConfig,
         name_prefix: str = "dynamo_vllm",
         workers_per_node: Optional[Union[int, list[int]]] = None,
     ):
         self.cfg = config
-        vllm_cfg = config["vllm_cfg"]
         dynamo_cfg = config.get("dynamo_cfg", {})
+
+        # External mode: point at an already-running Dynamo deployment.
+        external_url = dynamo_cfg.get("external_url")
+        if external_url:
+            self._external = True
+            self._etcd_process = None
+            self._nats_process = None
+            self._frontend_process = None
+            self._planner_process = None
+            self._pool = None
+            self.dp_openai_server_base_urls: list[Optional[str]] = [external_url]
+            print(
+                f"  [Dynamo] External mode — using {external_url}",
+                flush=True,
+            )
+            return
+
+        self._external = False
+        vllm_cfg = config["vllm_cfg"]
 
         self.tp_size = vllm_cfg["tensor_parallel_size"]
         assert cluster.world_size() % self.tp_size == 0, (
@@ -485,6 +503,8 @@ class DynamoVllmGeneration(GenerationInterface):
 
     def _check_subprocesses(self) -> None:
         """Raise if any managed subprocess has exited unexpectedly."""
+        if self._external:
+            return
         for attr, name, _ in _SUBPROCESS_REGISTRY:
             proc: Optional[subprocess.Popen] = getattr(self, attr)
             if proc is not None:
@@ -502,6 +522,9 @@ class DynamoVllmGeneration(GenerationInterface):
         return True
 
     def shutdown(self) -> bool:
+        if self._external:
+            return True
+
         self._stop_virtual_connector_client()
 
         for attr, name, timeout in _SUBPROCESS_REGISTRY:

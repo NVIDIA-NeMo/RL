@@ -36,6 +36,7 @@ class DynamoSpecificArgs(TypedDict):
 class DynamoCfg(TypedDict, total=False):
     """Dynamo infrastructure configuration."""
 
+    external_url: str  # URL of an external Dynamo deployment (skips all local infra)
     frontend_http_port: int  # 0 = auto-assign
     router_mode: str  # "round-robin", "kv", "random", "least-loaded"
     etcd_port: int  # 0 = auto-assign

@@ -395,6 +395,10 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
+    is_external_dynamo = (
+        generation_config.get("backend") == "dynamo"
+        and bool(generation_config.get("dynamo_cfg", {}).get("external_url"))
+    )
 
     env_name_list = extract_necessary_env_names(data_config)
     rm_env_enabled = "reward_model" in env_name_list
@@ -417,7 +421,29 @@ def setup(
             f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
         )
 
-    if colocated_inference:
+    if is_external_dynamo:
+        # External Dynamo: no local inference resources — all GPUs go to training.
+        if total_nodes == 1:
+            train_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+        else:
+            train_gpus_per_node = cluster_config["gpus_per_node"]
+
+        train_cluster = RayVirtualCluster(
+            name="grpo_train_cluster",
+            bundle_ct_per_node_list=[train_gpus_per_node] * policy_nodes,
+            use_gpus=True,
+            num_gpus_per_node=train_gpus_per_node,
+            max_colocated_worker_groups=1,
+        )
+        inference_cluster = None
+        colocated_inference = False
+        print(
+            f"  ✓ External Dynamo mode — all {policy_nodes} node(s) with "
+            f"{train_gpus_per_node} GPUs/node allocated to training",
+            flush=True,
+        )
+
+    elif colocated_inference:
         if total_nodes == 1:
             policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
             assert policy_gpus_per_node > 0, (

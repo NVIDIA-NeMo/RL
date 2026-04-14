@@ -73,6 +73,7 @@ def configure_generation_config(
     # dynamo setting — always loads real weights (no refit support)
     elif config["backend"] == "dynamo":
         config = cast(DynamoVllmConfig, config)
-        config["vllm_cfg"]["load_format"] = "auto"
+        if not config.get("dynamo_cfg", {}).get("external_url"):
+            config["vllm_cfg"]["load_format"] = "auto"
 
     return config
