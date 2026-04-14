@@ -111,31 +111,6 @@ def destroy_parallel_state():
         except:
             pass  # Ignore errors if already destroyed
 
-    # Reset async calls queue to prevent call_idx mismatches after distributed context recreation
-    try:
-        import nemo.tron.utils.async_utils as nemo_async_utils
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
-
-        # Clean up any existing async callers first
-        old_call_idx = getattr(nemo_async_utils._async_calls_queue, "call_idx", None)
-        num_unfinalized = (
-            nemo_async_utils._async_calls_queue.get_num_unfinalized_calls()
-        )
-        if num_unfinalized > 0:
-            print(
-                f"[WARNING] Resetting async calls queue with {num_unfinalized} unfinalized calls"
-            )
-        try:
-            nemo_async_utils._async_calls_queue.close()
-        except:
-            pass  # Ignore errors during cleanup
-        # Reset the global async calls queue by creating a new instance
-        nemo_async_utils._async_calls_queue = AsyncCallsQueue()
-    except ImportError:
-        pass
-
     # Also reset the Megatron async calls queue if it exists
     try:
         import megatron.training.async_utils as megatron_async_utils
@@ -147,13 +122,14 @@ def destroy_parallel_state():
         old_call_idx = getattr(
             megatron_async_utils._async_calls_queue, "call_idx", None
         )
-        num_unfinalized = (
-            megatron_async_utils._async_calls_queue.get_num_unfinalized_calls()
-        )
-        if num_unfinalized > 0:
-            print(
-                f"[WARNING] Resetting Megatron async calls queue with {num_unfinalized} unfinalized calls"
+        if megatron_async_utils._async_calls_queue is not None:
+            num_unfinalized = (
+                megatron_async_utils._async_calls_queue.get_num_unfinalized_calls()
             )
+            if num_unfinalized > 0:
+                print(
+                    f"[WARNING] Resetting Megatron async calls queue with {num_unfinalized} unfinalized calls"
+                )
         try:
             megatron_async_utils._async_calls_queue.close()
         except:
@@ -163,29 +139,6 @@ def destroy_parallel_state():
         print(
             f"[DEBUG] Reset Megatron async calls queue (old call_idx: {old_call_idx})"
         )
-    except ImportError:
-        pass
-
-    # Reset the third global async_calls instance in base strategy module
-    try:
-        import megatron.core.dist_checkpointing.strategies.base as base_strategy
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
-
-        # Clean up and reset the global async_calls in base strategy
-        old_call_idx = getattr(base_strategy.async_calls, "call_idx", None)
-        num_unfinalized = base_strategy.async_calls.get_num_unfinalized_calls()
-        if num_unfinalized > 0:
-            print(
-                f"[WARNING] Resetting base strategy async_calls with {num_unfinalized} unfinalized calls"
-            )
-        try:
-            base_strategy.async_calls.close()
-        except:
-            pass
-        base_strategy.async_calls = AsyncCallsQueue()
-        print(f"[DEBUG] Reset base strategy async_calls (old call_idx: {old_call_idx})")
     except ImportError:
         pass
 
