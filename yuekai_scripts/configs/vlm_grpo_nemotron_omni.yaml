@@ -9,6 +9,7 @@ grpo:
 
 checkpointing:
   checkpoint_dir: results/vlm_grpo_nemotron_omni
+  save_optimizer: false
 
 policy:
   model_name: /lustre/fsw/portfolios/coreai/users/yuekaiz/HF/nemotron-3-nano-omni-ea1_v2.0
@@ -62,7 +63,7 @@ data:
     dataset_name: clevr-cogent
     split: valA
   default:
-    prompt_file: examples/prompts/clevr_cogent_cot.txt
+    prompt_file: examples/prompts/clevr_cogent_cot_nemotron_omni.txt
     processor: vlm_hf_data_processor
     env_name: clevr-cogent
 
