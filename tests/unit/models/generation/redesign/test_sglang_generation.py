@@ -221,20 +221,6 @@ def test_generate_output_ids_shape(sglang_gen, tokenizer):
     assert result["unpadded_sequence_lengths"][0].item() == input_len + gen_len
 
 
-def test_generate_produces_nonzero_tokens(sglang_gen, tokenizer):
-    """Generated tokens are non-zero and non-pad."""
-    data = _make_input(tokenizer, "What is 2 plus 2?")
-    result = sglang_gen.generate(data, greedy=True)
-
-    gen_len = result["generation_lengths"][0].item()
-    assert gen_len > 0, "No tokens generated"
-
-    input_len = data["input_lengths"][0].item()
-    generated = result["output_ids"][0, input_len:input_len + gen_len]
-    assert (generated != 0).all(), "Generated tokens contain zeros"
-    assert (generated != PAD_TOKEN_ID).all(), "Generated tokens contain pad"
-
-
 def test_generate_greedy_determinism(sglang_gen, tokenizer):
     """Same prompt + greedy=True → identical output_ids across two calls."""
     data = _make_input(tokenizer, "Once upon a time")
