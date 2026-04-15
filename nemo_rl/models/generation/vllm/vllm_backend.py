@@ -61,7 +61,7 @@ class VllmInternalWorkerExtension:
     def init_pp_comm_groups(
         self,
         rank_prefix: int,
-        ip: str,
+        pp_ips: list[str],
         pp_ports: list[int],
         pp_size: int,
         train_ranks_per_stage: int,
@@ -77,16 +77,36 @@ class VllmInternalWorkerExtension:
 
         local_rank = torch.distributed.get_rank()
         gen_rank_in_group = train_ranks_per_stage + rank_prefix + local_rank
+        print(
+            f"[GEN init_pp_comm_groups] rank_prefix={rank_prefix}, local_rank={local_rank}, "
+            f"gen_rank_in_group={gen_rank_in_group}, sub_world_size={sub_world_size}, "
+            f"pp_size={pp_size}, device={self.device}",
+            flush=True,
+        )
 
         self.pp_comm_groups = {}  # pyrefly: ignore[implicitly-defined-attribute]
         for stage in range(pp_size):
+            print(
+                f"[GEN init_pp_comm_groups] gen_rank={gen_rank_in_group} creating stage {stage} "
+                f"TCPStore at {pp_ips[stage]}:{pp_ports[stage]}",
+                flush=True,
+            )
             group = StatelessProcessGroup(
-                master_address=ip,
+                master_address=pp_ips[stage],
                 port=pp_ports[stage],
                 rank=gen_rank_in_group,
                 world_size=sub_world_size,
             )
+            print(
+                f"[GEN init_pp_comm_groups] gen_rank={gen_rank_in_group} stage {stage} "
+                f"TCPStore created, starting NCCL init",
+                flush=True,
+            )
             group.init_nccl_communicator(device=self.device)
+            print(
+                f"[GEN init_pp_comm_groups] gen_rank={gen_rank_in_group} stage {stage} DONE",
+                flush=True,
+            )
             self.pp_comm_groups[stage] = group
 
     def report_device_id(self) -> str:
@@ -333,7 +353,7 @@ class VllmInternalWorkerExtension:
         ]
 
         for hf_name in hf_shapes:
-            # 1) Direct match
+            # 1) Direct match (includes fused MoE expert params: w13_weight, w2_weight)
             if hf_name in vllm_params:
                 mapping[hf_name] = (vllm_params[hf_name], None)
                 continue
@@ -398,6 +418,10 @@ class VllmInternalWorkerExtension:
 
             if not matched:
                 mapping[hf_name] = (None, None)
+                print(
+                    f"[WARN] _build_hf_to_vllm_mapping: no vLLM param for '{hf_name}'",
+                    flush=True,
+                )
 
         return mapping
 

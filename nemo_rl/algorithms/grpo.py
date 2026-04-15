@@ -799,17 +799,26 @@ def setup(
             ranks_in_group = [
                 r % train_ranks_per_stage for r in range(train_world_size)
             ]
-            # Find a free port for each PP stage
+            # Find an IP and free port for each PP stage.
+            # Each stage's TCPStore server (rank 0) must run on the node
+            # whose IP is used as master_address.  Stage s's rank 0 is
+            # global train rank s*train_ranks_per_stage, which lives on
+            # node s*train_ranks_per_stage // gpus_per_node.
+            pp_ips = []
             pp_ports = []
-            for _ in range(pp_size):
-                _, pp_port = train_cluster.get_master_address_and_port()
-                pp_ports.append(pp_port)
+            for stage in range(pp_size):
+                node_idx = stage * train_ranks_per_stage // train_gpus_per_node
+                stage_ip, stage_port = train_cluster.get_available_address_and_port(
+                    pg_idx=node_idx, bundle_idx=0
+                )
+                pp_ips.append(stage_ip)
+                pp_ports.append(stage_port)
             print(
-                f"Per-PP-stage comm group ports: {pp_ports}",
+                f"Per-PP-stage comm group IPs/ports: {list(zip(pp_ips, pp_ports))}",
                 flush=True,
             )
             futures_train_pp = policy.init_pp_comm_groups(
-                ip=ip,
+                pp_ips=pp_ips,
                 pp_ports=pp_ports,
                 pp_size=pp_size,
                 pp_stages=pp_stages,
@@ -817,7 +826,7 @@ def setup(
                 ranks_in_group=ranks_in_group,
             )
             futures_gen_pp = policy_generation.init_pp_comm_groups(
-                ip=ip,
+                pp_ips=pp_ips,
                 pp_ports=pp_ports,
                 pp_size=pp_size,
                 train_ranks_per_stage=train_ranks_per_stage,

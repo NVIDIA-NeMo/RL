@@ -853,7 +853,7 @@ class VllmGeneration(GenerationInterface):
 
     def init_pp_comm_groups(
         self,
-        ip: str,
+        pp_ips: list[str],
         pp_ports: list[int],
         pp_size: int,
         train_ranks_per_stage: int,
@@ -878,7 +878,7 @@ class VllmGeneration(GenerationInterface):
             rank_prefix=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             common_kwargs={
-                "ip": ip,
+                "pp_ips": pp_ips,
                 "pp_ports": pp_ports,
                 "pp_size": pp_size,
                 "train_ranks_per_stage": train_ranks_per_stage,

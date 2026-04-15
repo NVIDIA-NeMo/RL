@@ -1155,6 +1155,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             train_world_size,
             gen_world_size,
             layer_to_pp_stage=layer_to_pp_stage,
+            metadata_ep_gathered=True,  # export_hf_weights does EP all-gather
         )
         return self.nccl_reshard_refit_info
 
@@ -1170,8 +1171,74 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         """
         from nemo_rl.distributed.nccl_reshard_utils import DTensorRef
 
-        tensor = self._param_map[param_info["name"]]
+        name = param_info["name"]
+        # Check fused MoE expert params first
+        if hasattr(self, "_fused_expert_map") and name in self._fused_expert_map:
+            tensor = self._fused_expert_map[name]
+        else:
+            tensor = self._param_map[name]
         return DTensorRef(local_tensor=tensor, global_shape=param_info["global_shape"])
+
+    def _fuse_expert_params(self):
+        """Build fused MoE expert tensors (w13/w2) from individual expert params.
+
+        Called after ``_param_map`` is populated with individual expert params.
+        Groups individual expert params by (prefix, projection_type) from the
+        current worker's ``_param_map`` (rank-agnostic — works regardless of
+        which expert indices this EP rank owns).
+        """
+        import re
+
+        expert_re = re.compile(
+            r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
+        )
+        self._fused_expert_map = {}
+
+        # Group individual expert params from _param_map by (prefix, proj_type)
+        groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
+        for name in self._param_map:
+            m = expert_re.match(name)
+            if m:
+                prefix = m.group(1)
+                idx = int(m.group(2))
+                proj = m.group(3)
+                groups.setdefault((prefix, proj), []).append((idx, name))
+
+        # Sort each group by expert index
+        for key in groups:
+            groups[key].sort()
+
+        # Build fused tensors for each fused entry in refit_info
+        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
+            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
+                layer_name
+            ]:
+                if not param_info.get("_moe_meta"):
+                    continue
+                fused_name = param_info["name"]
+                if fused_name in self._fused_expert_map:
+                    continue
+
+                meta = param_info["_moe_meta"]
+                if "gate_entries" in meta:
+                    # w13: fuse gate + up per expert, then stack
+                    prefix = fused_name.rsplit(".w13_weight", 1)[0]
+                    gate_group = groups.get((prefix, "gate_proj"), [])
+                    up_group = groups.get((prefix, "up_proj"), [])
+                    expert_tensors = []
+                    for (_, gn), (_, un) in zip(gate_group, up_group):
+                        expert_tensors.append(
+                            torch.cat([self._param_map[gn], self._param_map[un]], dim=0)
+                        )
+                    if expert_tensors:
+                        self._fused_expert_map[fused_name] = torch.stack(expert_tensors)
+                elif "down_entries" in meta:
+                    # w2: stack down_proj per expert
+                    prefix = fused_name.rsplit(".w2_weight", 1)[0]
+                    down_group = groups.get((prefix, "down_proj"), [])
+                    expert_tensors = [self._param_map[n] for _, n in down_group]
+                    if expert_tensors:
+                        self._fused_expert_map[fused_name] = torch.stack(expert_tensors)
 
     @torch.no_grad()
     def nccl_reshard_refit(self, kv_scales=None):
@@ -1192,6 +1259,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         self._param_map = {}
         for name, tensor in self._iter_local_hf_params():
             self._param_map[name] = tensor
+
+        # Fuse individual MoE expert params into w13/w2 stacked tensors
+        self._fuse_expert_params()
 
         use_per_stage = hasattr(self, "pp_comm_group")
 
@@ -1218,6 +1288,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 )
 
         del self._param_map
+        if hasattr(self, "_fused_expert_map"):
+            del self._fused_expert_map
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)

@@ -897,7 +897,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
     def init_pp_comm_groups(
         self,
-        ip: str,
+        pp_ips: list[str],
         pp_ports: list[int],
         pp_size: int,
         pp_stages: list[int],
@@ -910,7 +910,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             my_pp_stage=pp_stages,
             my_rank_in_group=ranks_in_group,
             common_kwargs={
-                "ip": ip,
+                "pp_ips": pp_ips,
                 "pp_ports": pp_ports,
                 "pp_size": pp_size,
                 "sub_world_size": sub_world_size,
