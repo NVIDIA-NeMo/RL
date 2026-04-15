@@ -51,7 +51,7 @@ CACHED_DEPENDENCIES = [
     # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13 base container
     "transformer-engine[pytorch,core_cu12]",
     # VCS dependency - must match pyproject.toml [tool.uv.sources]
-    "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@63154570cea17f8805a7fd15cc3b8cc2919ba575",
+    "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@15a851565a4ce846c04431ecb0cf09903ab4837e",
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",

@@ -4,10 +4,10 @@
 #     docker buildx build -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
 #
 #   Self-contained build (specific git ref):
-#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push .
+#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.6.0 --tag <registry>/nemo-rl:r0.6.0 --push .
 #
 #   Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL):
-#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push https://github.com/NVIDIA-NeMo/RL.git
+#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.6.0 --tag <registry>/nemo-rl:r0.6.0 --push https://github.com/NVIDIA-NeMo/RL.git
 #
 #   Local NeMo RL source override:
 #     docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
@@ -69,8 +69,8 @@ RUN GITHUB_ARTIFACTORY=github.com \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Install uv and python
-ARG UV_VERSION=0.11.3
-ARG PYTHON_VERSION=3.13.11
+ARG UV_VERSION=0.11.6
+ARG PYTHON_VERSION=3.13.13
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
     uv python install ${PYTHON_VERSION}
