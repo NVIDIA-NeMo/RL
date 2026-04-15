@@ -851,6 +851,42 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    def init_pp_comm_groups(
+        self,
+        ip: str,
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Initialize per-PP-stage comm groups on all gen workers."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        method_name = (
+            "init_pp_comm_groups_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "init_pp_comm_groups"
+        )
+
+        total_workers = len(self.worker_group.workers)
+        workers_per_group = total_workers // self.dp_size
+        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+
+        futures = self.worker_group.run_all_workers_multiple_data(
+            method_name,
+            rank_prefix=rank_prefix_list,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            common_kwargs={
+                "ip": ip,
+                "pp_ports": pp_ports,
+                "pp_size": pp_size,
+                "train_ranks_per_stage": train_ranks_per_stage,
+                "sub_world_size": sub_world_size,
+            },
+        )
+        return futures
+
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Forward per-layer param metadata to vLLM workers for nccl_reshard refit."""
         method_name = (

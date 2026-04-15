@@ -790,6 +790,41 @@ def setup(
                 "pipeline_parallel_size", 1
             ),
         }
+        # Create per-PP-stage comm groups when PP > 1
+        pp_size = train_parallelism.get("pp_size", 1)
+        if pp_size > 1:
+            train_ranks_per_stage = train_world_size // pp_size
+            sub_world_size = train_ranks_per_stage + inference_world_size
+            pp_stages = [r // train_ranks_per_stage for r in range(train_world_size)]
+            ranks_in_group = [
+                r % train_ranks_per_stage for r in range(train_world_size)
+            ]
+            # Find a free port for each PP stage
+            pp_ports = []
+            for _ in range(pp_size):
+                _, pp_port = train_cluster.get_master_address_and_port()
+                pp_ports.append(pp_port)
+            print(
+                f"Per-PP-stage comm group ports: {pp_ports}",
+                flush=True,
+            )
+            futures_train_pp = policy.init_pp_comm_groups(
+                ip=ip,
+                pp_ports=pp_ports,
+                pp_size=pp_size,
+                pp_stages=pp_stages,
+                sub_world_size=sub_world_size,
+                ranks_in_group=ranks_in_group,
+            )
+            futures_gen_pp = policy_generation.init_pp_comm_groups(
+                ip=ip,
+                pp_ports=pp_ports,
+                pp_size=pp_size,
+                train_ranks_per_stage=train_ranks_per_stage,
+                sub_world_size=sub_world_size,
+            )
+            ray.get(futures_train_pp + futures_gen_pp)
+
         nccl_reshard_refit_info = policy.prepare_nccl_reshard_refit_info(
             train_parallelism, gen_parallelism, train_world_size, inference_world_size
         )

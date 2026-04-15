@@ -72,12 +72,12 @@ class DTensorRef:
 
     Provides the interface expected by the canonical xferdtensor_golden:
     - ``.shape``: global tensor shape (torch.Size)
-    - ``.full_tensor()``: returns the underlying tensor (used on src side)
-    - ``._local_tensor``: local tensor for in-place copy (used on dst side)
+    - ``._local_tensor``: local shard (src side) or dst buffer (dst side)
     - ``.dtype``, ``.device``: tensor metadata
 
-    On the **src side** (train), ``local_tensor`` is the full global tensor
-    from Megatron export. ``.full_tensor()`` returns it directly.
+    On the **src side** (train), ``local_tensor`` is the TP-local shard
+    from Megatron parameters (no PP broadcast or TP gather needed).
+    ``global_shape`` is the full unsharded shape.
 
     On the **dst side** (gen), ``local_tensor`` is either the vLLM local
     parameter (for direct params) or a temporary buffer (for merged/unmapped
@@ -270,13 +270,18 @@ def xferdtensor_golden(
 ):
     """Broadcast-based reference implementation of XferDTensor.
 
-    The source mesh's rank-0 broadcasts the full (global) tensor to every rank.
-    Each destination rank then extracts its local shard based on ``dst_placement``.
+    Reconstructs the full (global) tensor from TP-local shards on the source
+    mesh, then each destination rank extracts its local shard based on
+    ``dst_placement``.
+
+    When all ``src_placement`` entries are ``Replicate``, a single broadcast
+    from ``src_ranks[0]`` suffices.  Otherwise, one broadcast per unique shard
+    region reconstructs the full tensor.
 
     This is the canonical 7-argument signature matching the real
     ``nccl_reshard.XferDTensor`` API.  Callers must wrap raw tensors in
     ``DTensorRef`` so that ``.shape`` reports the global shape and
-    ``.full_tensor()`` / ``._local_tensor`` are available.
+    ``._local_tensor`` holds the local shard.
     """
     rank = process_group.rank
     src_ranks = _flatten_mesh_ranks(src_mesh)
@@ -285,14 +290,47 @@ def xferdtensor_golden(
     global_shape, device = _get_tensor_meta(src_tensor, dst_tensor)
     if global_shape is None:
         raise ValueError("Unable to infer tensor shape/dtype from src or dst tensor.")
+    dtype = src_tensor.dtype if src_tensor is not None else dst_tensor.dtype
 
-    if src_tensor is not None:
-        full_tensor = src_tensor.full_tensor()
+    has_shard = any(isinstance(p, Shard) for p in src_placement)
+
+    if not has_shard:
+        # Fast path: all Replicate — single broadcast from src_ranks[0]
+        if src_tensor is not None:
+            full_tensor = src_tensor._local_tensor.clone()
+        else:
+            full_tensor = torch.empty(global_shape, device=device, dtype=dtype)
+        process_group.broadcast(full_tensor, src=src_ranks[0])
     else:
-        full_tensor = torch.empty(global_shape, device=device, dtype=dst_tensor.dtype)
+        # Reconstruct the full tensor from per-rank shards.
+        # Deduplicate: DP-replicated ranks hold the same shard, so only one
+        # representative rank broadcasts per unique shard region.
+        full_tensor = torch.empty(global_shape, device=device, dtype=dtype)
+        src_mesh_tensor = getattr(src_mesh, "mesh")
+        mesh_shape = list(src_mesh_tensor.shape)
 
-    process_group.broadcast(full_tensor, src=src_ranks[0])
+        seen_slices: dict[tuple, tuple] = {}
+        for src_rank in src_ranks:
+            coords = _get_mesh_coords(src_mesh, src_rank)
+            shard_slices = _compute_shard_slices(
+                global_shape, mesh_shape, coords, src_placement
+            )
+            slice_key = tuple((s.start, s.stop) for s in shard_slices)
+            if slice_key not in seen_slices:
+                seen_slices[slice_key] = (src_rank, shard_slices)
 
+        for src_rank, shard_slices in seen_slices.values():
+            shard_shape = tuple(
+                (s.stop - s.start) if s.start is not None else global_shape[i]
+                for i, s in enumerate(shard_slices)
+            )
+            shard_buf = torch.empty(shard_shape, device=device, dtype=dtype)
+            if rank == src_rank and src_tensor is not None:
+                shard_buf.copy_(src_tensor._local_tensor)
+            process_group.broadcast(shard_buf, src=src_rank)
+            full_tensor[tuple(shard_slices)] = shard_buf
+
+    # Destination side: extract local shard
     if rank in dst_ranks:
         mesh_coords = _get_mesh_coords(dst_mesh, rank)
         if mesh_coords is None:
@@ -460,6 +498,7 @@ def build_nccl_reshard_refit_info(
     gen_parallelism: dict[str, int],
     train_world_size: int,
     gen_world_size: int,
+    layer_to_pp_stage: Optional[dict[str, int]] = None,
 ) -> dict[str, Any]:
     """Build per-layer parameter info for nccl_reshard-based refit.
 
@@ -467,34 +506,83 @@ def build_nccl_reshard_refit_info(
         state_dict_metadata: ``{param_name: {"shape": list, "dtype": str}}``
         train_parallelism / gen_parallelism: ``{"tp_size", "ep_size", "pp_size"}``
         train_world_size / gen_world_size: number of GPUs per side
+        layer_to_pp_stage: optional mapping from layer name to PP stage index.
+            When provided (PP>1), per-stage meshes are built so each PP stage's
+            train ranks + all gen ranks form an independent sub-group.
 
     Returns:
-        ``{"layer_names": [...], "per_layer_params": {layer: [param_info, ...]}}``
+        ``{"layer_names": [...], "per_layer_params": {layer: [param_info, ...]},
+           "pp_size": int}``
     """
-    src_mesh, src_dim_map = build_mesh_info(
-        train_world_size,
-        rank_offset=0,
-        **{k: train_parallelism.get(k, 1) for k in ("tp_size", "ep_size", "pp_size")},
-    )
-    dst_mesh, dst_dim_map = build_mesh_info(
-        gen_world_size,
-        rank_offset=train_world_size,
-        **{k: gen_parallelism.get(k, 1) for k in ("tp_size", "ep_size", "pp_size")},
-    )
+    pp_size = train_parallelism.get("pp_size", 1)
+    use_per_stage = layer_to_pp_stage is not None and pp_size > 1
+
+    if use_per_stage:
+        # Per-PP-stage meshes: within each sub-group, train ranks are
+        # 0..train_ranks_per_stage-1 and gen ranks follow immediately after.
+        train_ranks_per_stage = train_world_size // pp_size
+        per_stage_parallelism = {
+            "tp_size": train_parallelism.get("tp_size", 1),
+            "ep_size": train_parallelism.get("ep_size", 1),
+            "pp_size": 1,
+        }
+        per_stage_src = {}
+        for s in range(pp_size):
+            mesh, dim_map = build_mesh_info(
+                train_ranks_per_stage, rank_offset=0, **per_stage_parallelism
+            )
+            per_stage_src[s] = (mesh, dim_map)
+
+        # dst mesh: gen ranks start at train_ranks_per_stage within each sub-group
+        dst_mesh, dst_dim_map = build_mesh_info(
+            gen_world_size,
+            rank_offset=train_ranks_per_stage,
+            **{k: gen_parallelism.get(k, 1) for k in ("tp_size", "ep_size", "pp_size")},
+        )
+    else:
+        # Single global mesh (PP=1 or no per-stage mapping)
+        src_mesh, src_dim_map = build_mesh_info(
+            train_world_size,
+            rank_offset=0,
+            **{
+                k: train_parallelism.get(k, 1)
+                for k in ("tp_size", "ep_size", "pp_size")
+            },
+        )
+        dst_mesh, dst_dim_map = build_mesh_info(
+            gen_world_size,
+            rank_offset=train_world_size,
+            **{k: gen_parallelism.get(k, 1) for k in ("tp_size", "ep_size", "pp_size")},
+        )
 
     per_layer_params: dict[str, list] = OrderedDict()
     for name, meta in state_dict_metadata.items():
         layer = _extract_layer_name(name)
         ndim = len(meta["shape"])
-        info = {
-            "name": name,
-            "global_shape": tuple(meta["shape"]),
-            "dtype": meta["dtype"],
-            "src_mesh_info": src_mesh,
-            "src_placements": get_placements(name, src_dim_map, ndim),
-            "dst_mesh_info": dst_mesh,
-            "dst_placements": get_placements(name, dst_dim_map, ndim),
-        }
+
+        if use_per_stage:
+            stage = layer_to_pp_stage.get(layer, 0)
+            stage_src_mesh, stage_src_dim_map = per_stage_src[stage]
+            info = {
+                "name": name,
+                "global_shape": tuple(meta["shape"]),
+                "dtype": meta["dtype"],
+                "pp_stage": stage,
+                "src_mesh_info": stage_src_mesh,
+                "src_placements": get_placements(name, stage_src_dim_map, ndim),
+                "dst_mesh_info": dst_mesh,
+                "dst_placements": get_placements(name, dst_dim_map, ndim),
+            }
+        else:
+            info = {
+                "name": name,
+                "global_shape": tuple(meta["shape"]),
+                "dtype": meta["dtype"],
+                "src_mesh_info": src_mesh,
+                "src_placements": get_placements(name, src_dim_map, ndim),
+                "dst_mesh_info": dst_mesh,
+                "dst_placements": get_placements(name, dst_dim_map, ndim),
+            }
         per_layer_params.setdefault(layer, []).append(info)
 
     return {
@@ -502,4 +590,5 @@ def build_nccl_reshard_refit_info(
         "per_layer_params": per_layer_params,
         "train_world_size": train_world_size,
         "gen_world_size": gen_world_size,
+        "pp_size": pp_size,
     }

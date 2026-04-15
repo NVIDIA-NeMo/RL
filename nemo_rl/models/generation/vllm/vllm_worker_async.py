@@ -1106,6 +1106,28 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
+    async def init_pp_comm_groups_async(
+        self,
+        rank_prefix: int,
+        ip: str,
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> None:
+        """Async version of init_pp_comm_groups."""
+        await self.llm.collective_rpc(
+            "init_pp_comm_groups",
+            args=(
+                rank_prefix,
+                ip,
+                pp_ports,
+                pp_size,
+                train_ranks_per_stage,
+                sub_world_size,
+            ),
+        )
+
     async def prepare_nccl_reshard_refit_info_async(self, refit_info: dict) -> None:
         """Async version of prepare_nccl_reshard_refit_info."""
         await self.llm.collective_rpc(

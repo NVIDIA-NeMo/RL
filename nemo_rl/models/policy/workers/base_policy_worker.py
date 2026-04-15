@@ -44,6 +44,33 @@ class AbstractPolicyWorker:
         device = torch.cuda.current_device()
         self.model_update_group.init_nccl_communicator(device=device)
 
+    def init_pp_comm_groups(
+        self,
+        ip: str,
+        pp_ports: list[int],
+        pp_size: int,
+        my_pp_stage: int,
+        sub_world_size: int,
+        my_rank_in_group: int,
+    ) -> None:
+        """Initialize a per-PP-stage communication group for nccl_reshard refit.
+
+        Each train worker creates exactly one group — for its own PP stage.
+        ``pp_ports[my_pp_stage]`` is the dedicated port for this stage's group.
+        """
+        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
+
+        port = pp_ports[my_pp_stage]
+        self.pp_comm_group = StatelessProcessGroup(
+            master_address=ip,
+            port=port,
+            rank=my_rank_in_group,
+            world_size=sub_world_size,
+        )
+        device = torch.cuda.current_device()
+        self.pp_comm_group.init_nccl_communicator(device=device)
+        self.my_pp_stage = my_pp_stage
+
     def is_alive(self) -> bool:
         """Check if the worker is alive."""
         return True

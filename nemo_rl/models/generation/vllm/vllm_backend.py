@@ -58,6 +58,37 @@ class VllmInternalWorkerExtension:
         )
         self.model_update_group.init_nccl_communicator(device=self.device)
 
+    def init_pp_comm_groups(
+        self,
+        rank_prefix: int,
+        ip: str,
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> None:
+        """Initialize per-PP-stage communication groups for nccl_reshard refit.
+
+        Gen workers join ALL ``pp_size`` groups sequentially (they need all
+        layers).  Groups are created in order stage 0, 1, … so that train
+        ranks (which only join their own stage) unblock deterministically.
+        """
+        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
+
+        local_rank = torch.distributed.get_rank()
+        gen_rank_in_group = train_ranks_per_stage + rank_prefix + local_rank
+
+        self.pp_comm_groups = {}  # pyrefly: ignore[implicitly-defined-attribute]
+        for stage in range(pp_size):
+            group = StatelessProcessGroup(
+                master_address=ip,
+                port=pp_ports[stage],
+                rank=gen_rank_in_group,
+                world_size=sub_world_size,
+            )
+            group.init_nccl_communicator(device=self.device)
+            self.pp_comm_groups[stage] = group
+
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""
         from nemo_rl.utils.nvml import get_device_uuid
@@ -476,10 +507,17 @@ class VllmInternalWorkerExtension:
             self.nccl_reshard_refit_info
         )
 
+        use_per_stage = hasattr(self, "pp_comm_groups") and self.pp_comm_groups
+
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
             for param_info in self.nccl_reshard_refit_info["per_layer_params"][
                 layer_name
             ]:
+                if use_per_stage:
+                    group = self.pp_comm_groups[param_info["pp_stage"]]
+                else:
+                    group = self.model_update_group
+
                 dst_tensor, dst_placements, finalize = self.get_dst_dtensor(
                     param_info["name"], param_info
                 )
@@ -490,7 +528,7 @@ class VllmInternalWorkerExtension:
                     dst_tensor,
                     param_info["dst_mesh_info"],
                     dst_placements,
-                    self.model_update_group,
+                    group,
                 )
                 if finalize:
                     finalize()

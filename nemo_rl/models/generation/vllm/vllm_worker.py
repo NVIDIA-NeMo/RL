@@ -865,6 +865,28 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
+    def init_pp_comm_groups(
+        self,
+        rank_prefix: int,
+        ip: str,
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> None:
+        """Forward per-PP-stage comm group init to vLLM backend workers."""
+        self.llm.collective_rpc(
+            "init_pp_comm_groups",
+            args=(
+                rank_prefix,
+                ip,
+                pp_ports,
+                pp_size,
+                train_ranks_per_stage,
+                sub_world_size,
+            ),
+        )
+
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Forward refit info to vLLM backend workers."""
         self.llm.collective_rpc("prepare_nccl_reshard_refit_info", args=(refit_info,))

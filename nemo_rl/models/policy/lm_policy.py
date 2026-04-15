@@ -895,6 +895,29 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
 
+    def init_pp_comm_groups(
+        self,
+        ip: str,
+        pp_ports: list[int],
+        pp_size: int,
+        pp_stages: list[int],
+        sub_world_size: int,
+        ranks_in_group: list[int],
+    ) -> list[ray.ObjectRef]:
+        """Initialize per-PP-stage comm groups on all train workers."""
+        futures = self.worker_group.run_all_workers_multiple_data(
+            "init_pp_comm_groups",
+            my_pp_stage=pp_stages,
+            my_rank_in_group=ranks_in_group,
+            common_kwargs={
+                "ip": ip,
+                "pp_ports": pp_ports,
+                "pp_size": pp_size,
+                "sub_world_size": sub_world_size,
+            },
+        )
+        return futures
+
     def prepare_nccl_reshard_refit_info(
         self, train_parallelism, gen_parallelism, train_world_size, gen_world_size
     ):

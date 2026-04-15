@@ -1038,6 +1038,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     @torch.no_grad()
     def nccl_reshard_refit(self, kv_scales=None):
         """Transfer weights to generation workers via xferdtensor_golden."""
+        from torch.distributed.tensor.placement_types import Replicate
+
         from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
 
         if self.model_update_group.rank == 0:
@@ -1059,10 +1061,14 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 layer_name
             ]:
                 src_tensor = self.get_src_dtensor(param_info["name"])
+                # DTensor path: get_src_dtensor calls .full_tensor(), so every
+                # src rank holds the complete tensor.  Use all-Replicate for src
+                # so xferdtensor_golden does a single broadcast.
+                src_placements = [Replicate() for _ in param_info["src_placements"]]
                 xferdtensor_golden(
                     src_tensor,
                     param_info["src_mesh_info"],
-                    param_info["src_placements"],
+                    src_placements,
                     None,
                     param_info["dst_mesh_info"],
                     param_info["dst_placements"],

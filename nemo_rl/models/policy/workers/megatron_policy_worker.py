@@ -1012,6 +1012,66 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             ).reshape(1)
             yield param_name, scale_tensor
 
+    def _iter_local_hf_params(self) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield (hf_name, local_tp_shard) for locally owned params.
+
+        Unlike ``_iter_params_with_optional_kv_scales`` which does PP broadcast
+        + TP gather via ``export_hf_weights``, this method yields TP-local
+        shards directly from Megatron parameters — no collectives needed.
+
+        Compound mappings (QKV, GatedMLP) are split into individual HF params
+        on the TP-local shard.  The returned tensors are views of the model
+        parameters and must not be modified in-place.
+        """
+        from types import SimpleNamespace
+
+        from megatron.bridge.models.conversion.param_mapping import (
+            GatedMLPMapping,
+            QKVMapping,
+            split_qkv_weights,
+        )
+
+        config = self.megatron_bridge.transformer_config
+
+        for task in self.refit_conversion_tasks:
+            if task.param_weight is None:
+                continue  # Non-local PP rank
+
+            local_tensor = task.param_weight
+            hf_param = task.mapping.hf_param
+
+            if isinstance(hf_param, dict):
+                if isinstance(task.mapping, QKVMapping):
+                    # Split interleaved QKV into separate Q, K, V on TP-local shard.
+                    # split_qkv_weights works on local shards with adjusted head counts
+                    # since heads_per_group = num_heads/num_query_groups stays constant.
+                    tp_size = task.mapping.tp_size
+                    local_config = SimpleNamespace(
+                        num_attention_heads=config.num_attention_heads // tp_size,
+                        num_query_groups=config.num_query_groups // tp_size,
+                        kv_channels=config.kv_channels,
+                        hidden_size=config.hidden_size,
+                        attention_output_gate=getattr(
+                            config, "attention_output_gate", False
+                        ),
+                    )
+                    q, k, v = split_qkv_weights(local_config, local_tensor)
+                    yield hf_param["q"], q
+                    yield hf_param["k"], k
+                    yield hf_param["v"], v
+                elif isinstance(task.mapping, GatedMLPMapping):
+                    # Each TP shard of linear_fc1 is [gate_shard; up_shard] along dim 0
+                    gate, up = torch.chunk(local_tensor, 2, dim=0)
+                    yield hf_param["gate"], gate
+                    yield hf_param["up"], up
+                else:
+                    raise ValueError(
+                        f"Unsupported compound mapping: {type(task.mapping).__name__}"
+                    )
+            else:
+                # Simple 1→1 mapping (Direct, ColumnParallel, RowParallel, Replicated)
+                yield str(hf_param), local_tensor
+
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(
@@ -1046,6 +1106,25 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             post_iter_func=lambda x: x[1],
         )
 
+    def _build_layer_to_pp_stage(self, pp_size: int) -> dict[str, int]:
+        """Build mapping from layer group name to PP stage index.
+
+        Uses ``num_layers`` from the Megatron transformer config to evenly
+        distribute transformer layers across ``pp_size`` stages.  Embedding
+        and final-norm layers are assigned to the first and last stages
+        respectively.
+        """
+        num_layers = self.megatron_bridge.transformer_config.num_layers
+        layers_per_stage = num_layers // pp_size
+
+        layer_to_pp_stage: dict[str, int] = {}
+        for i in range(num_layers):
+            layer_to_pp_stage[f"model.layers.{i}"] = i // layers_per_stage
+        layer_to_pp_stage["model.embed_tokens"] = 0
+        layer_to_pp_stage["model.norm"] = pp_size - 1
+        layer_to_pp_stage["lm_head"] = pp_size - 1
+        return layer_to_pp_stage
+
     @torch.no_grad()
     def prepare_nccl_reshard_refit_info(
         self, train_parallelism, gen_parallelism, train_world_size, gen_world_size
@@ -1054,7 +1133,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         from nemo_rl.distributed.nccl_reshard_utils import build_nccl_reshard_refit_info
 
         # Ensure refit_param_info_mcore is computed (needed by _iter_params_with_optional_kv_scales)
-        if not hasattr(self, "refit_conversion_tasks"):
+        if self.refit_conversion_tasks is None:
             self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         state_dict_metadata = {}
@@ -1064,33 +1143,44 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 "dtype": str(self.dtype),
             }
 
+        pp_size = train_parallelism.get("pp_size", 1)
+        layer_to_pp_stage = (
+            self._build_layer_to_pp_stage(pp_size) if pp_size > 1 else None
+        )
+
         self.nccl_reshard_refit_info = build_nccl_reshard_refit_info(
             state_dict_metadata,
             train_parallelism,
             gen_parallelism,
             train_world_size,
             gen_world_size,
+            layer_to_pp_stage=layer_to_pp_stage,
         )
         return self.nccl_reshard_refit_info
 
-    def get_src_dtensor(self, param_name):
+    def get_src_dtensor(self, param_info):
         """Get a DTensorRef for a source parameter to use with xferdtensor_golden.
 
-        Takes an HF parameter name and returns a DTensorRef wrapping the full
-        global tensor from Megatron export. The returned object satisfies the
-        xferdtensor_golden interface: ``.shape`` is the global shape and
-        ``.full_tensor()`` returns the tensor data.
+        Takes a ``param_info`` dict (from ``nccl_reshard_refit_info``) and
+        returns a DTensorRef wrapping the TP-local shard with the global shape.
+        The returned object satisfies the xferdtensor_golden interface:
+        ``.shape`` is the global shape and ``._local_tensor`` is the local shard.
 
         Must be called after ``_param_map`` is populated (inside ``nccl_reshard_refit``).
         """
         from nemo_rl.distributed.nccl_reshard_utils import DTensorRef
 
-        tensor = self._param_map[param_name]
-        return DTensorRef(local_tensor=tensor, global_shape=tensor.shape)
+        tensor = self._param_map[param_info["name"]]
+        return DTensorRef(local_tensor=tensor, global_shape=param_info["global_shape"])
 
     @torch.no_grad()
     def nccl_reshard_refit(self, kv_scales=None):
-        """Transfer weights to generation workers via xferdtensor_golden."""
+        """Transfer weights to generation workers via xferdtensor_golden.
+
+        Uses TP-local shards directly from Megatron parameters, bypassing
+        the Bridge's PP broadcast + TP gather.  The modified xferdtensor_golden
+        reconstructs the full tensor from per-rank shards internally.
+        """
         from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
 
         if kv_scales is not None:
@@ -1098,18 +1188,25 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 "FP8 kvcache is not currently supported for nccl_reshard refit path."
             )
 
-        # Build map of param_name -> full HF tensor from Megatron export
+        # Build map of param_name -> TP-local shard (no PP broadcast / TP gather)
         self._param_map = {}
-        for name, tensor in self._iter_params_with_optional_kv_scales(
-            kv_scales=kv_scales
-        ):
+        for name, tensor in self._iter_local_hf_params():
             self._param_map[name] = tensor
+
+        use_per_stage = hasattr(self, "pp_comm_group")
 
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
             for param_info in self.nccl_reshard_refit_info["per_layer_params"][
                 layer_name
             ]:
-                src_tensor = self.get_src_dtensor(param_info["name"])
+                if use_per_stage:
+                    if param_info.get("pp_stage", 0) != self.my_pp_stage:
+                        continue
+                    group = self.pp_comm_group
+                else:
+                    group = self.model_update_group
+
+                src_tensor = self.get_src_dtensor(param_info)
                 xferdtensor_golden(
                     src_tensor,
                     param_info["src_mesh_info"],
@@ -1117,7 +1214,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     None,
                     param_info["dst_mesh_info"],
                     param_info["dst_placements"],
-                    self.model_update_group,
+                    group,
                 )
 
         del self._param_map
