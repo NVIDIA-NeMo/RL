@@ -20,7 +20,6 @@ policy:
     freeze_moe_router: true
     moe_router_dtype: fp64
     moe_router_bias_update_rate: 0.0
-    moe_permute_fusion: true
     optimizer:
       lr: 1.0e-06
       min_lr: 1.0e-06
