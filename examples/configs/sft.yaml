@@ -12,6 +12,7 @@ sft:
   val_at_start: true
   val_at_end: false
   seed: 42
+  only_unmask_final: false
 
 checkpointing:
   enabled: true
