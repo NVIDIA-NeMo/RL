@@ -1,6 +1,6 @@
 defaults: ../../audio_grpo_3B_megatron.yaml
 grpo:
-  max_num_steps: 30
+  max_num_steps: 20
 checkpointing:
   checkpoint_dir: results/vlm_grpo-qwen2.5-omni-3b-avqa-1n8g-megatron
 logger:

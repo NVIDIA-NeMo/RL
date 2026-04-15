@@ -17,7 +17,7 @@ import json
 import os
 from collections import Counter
 from itertools import combinations
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 import ray
 import torch
@@ -32,6 +32,7 @@ from nemo_rl.data.llm_message_utils import get_keys_from_message_log
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.math_environment import MathEnvConfig
+from nemo_rl.environments.vlm_environment import VLMEnvConfig
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy import TokenizerConfig
@@ -50,8 +51,9 @@ class EvalConfig(TypedDict):
 
 
 # TODO: this should updated, but is left to avoid breaking changes
-class _PassThroughMathConfig(TypedDict):
-    math: MathEnvConfig
+class _PassThroughEnvConfig(TypedDict):
+    math: NotRequired[MathEnvConfig]
+    mmau: NotRequired[VLMEnvConfig]
 
 
 class MasterConfig(TypedDict):
@@ -59,7 +61,7 @@ class MasterConfig(TypedDict):
     generation: GenerationConfig  # Fixed: was 'generate'
     tokenizer: TokenizerConfig  # Added missing tokenizer key
     data: EvalDataConfigType
-    env: _PassThroughMathConfig
+    env: _PassThroughEnvConfig
     cluster: ClusterConfig
 
 
