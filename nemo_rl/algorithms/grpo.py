@@ -272,9 +272,7 @@ class GRPOConfigDefaults:
     reward_shaping: RewardShapingConfigDefaults = field(
         default_factory=RewardShapingConfigDefaults
     )
-    async_grpo: AsyncGRPOConfigDefaults = field(
-        default_factory=AsyncGRPOConfigDefaults
-    )
+    async_grpo: AsyncGRPOConfigDefaults = field(default_factory=AsyncGRPOConfigDefaults)
 
 
 @dataclass

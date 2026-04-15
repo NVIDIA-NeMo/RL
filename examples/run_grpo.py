@@ -18,7 +18,12 @@ import pprint
 
 from omegaconf import OmegaConf
 
-from nemo_rl.algorithms.grpo import GRPOMasterConfigDefaults, MasterConfig, grpo_train, setup
+from nemo_rl.algorithms.grpo import (
+    GRPOMasterConfigDefaults,
+    MasterConfig,
+    grpo_train,
+    setup,
+)
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
