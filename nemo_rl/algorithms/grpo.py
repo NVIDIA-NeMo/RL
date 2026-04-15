@@ -1929,7 +1929,7 @@ def grpo_train(
                         "mean_prompt_length",
                     }:
                         metrics[k] = np.mean(v).item()
-                    elif isinstance(v, (np.ndarray, list)):
+                    elif isinstance(v, (np.ndarray, list, float, int)):
                         metrics[k] = np.sum(v).item()
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
