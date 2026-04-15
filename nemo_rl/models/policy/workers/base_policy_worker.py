@@ -46,7 +46,7 @@ class AbstractPolicyWorker:
 
     def init_pp_comm_groups(
         self,
-        ip: str,
+        pp_ips: list[str],
         pp_ports: list[int],
         pp_size: int,
         my_pp_stage: int,
@@ -56,14 +56,14 @@ class AbstractPolicyWorker:
         """Initialize a per-PP-stage communication group for nccl_reshard refit.
 
         Each train worker creates exactly one group — for its own PP stage.
-        ``pp_ports[my_pp_stage]`` is the dedicated port for this stage's group.
+        ``pp_ips[my_pp_stage]`` and ``pp_ports[my_pp_stage]`` identify the
+        TCPStore master address for this stage's group.
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
-        port = pp_ports[my_pp_stage]
         self.pp_comm_group = StatelessProcessGroup(
-            master_address=ip,
-            port=port,
+            master_address=pp_ips[my_pp_stage],
+            port=pp_ports[my_pp_stage],
             rank=my_rank_in_group,
             world_size=sub_world_size,
         )

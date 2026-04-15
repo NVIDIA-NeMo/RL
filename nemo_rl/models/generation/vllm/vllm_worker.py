@@ -974,7 +974,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def init_pp_comm_groups(
         self,
         rank_prefix: int,
-        ip: str,
+        pp_ips: list[str],
         pp_ports: list[int],
         pp_size: int,
         train_ranks_per_stage: int,
@@ -985,7 +985,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             "init_pp_comm_groups",
             args=(
                 rank_prefix,
-                ip,
+                pp_ips,
                 pp_ports,
                 pp_size,
                 train_ranks_per_stage,

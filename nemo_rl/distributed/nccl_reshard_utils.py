@@ -117,12 +117,16 @@ COLUMN_PARALLEL_SUFFIXES = [
     "q_b_proj.weight",
     "kv_a_proj_with_mqa.weight",
     "kv_b_proj.weight",
+    # Fused MoE expert params (vLLM naming: gate+up fused)
+    "w13_weight",
 ]
 
 # Row-parallel suffixes: TP shards along dim 1 (input dimension)
 ROW_PARALLEL_SUFFIXES = [
     "o_proj.weight",
     "down_proj.weight",
+    # Fused MoE expert param (vLLM naming: down proj)
+    "w2_weight",
 ]
 
 # Vocabulary-parallel: TP shards along dim 0 (vocab dimension)
@@ -468,6 +472,123 @@ def get_placements(param_name: str, dim_map: dict, ndim: int) -> list:
 
 
 # =========================================================================
+# MoE expert param fusion
+# =========================================================================
+
+# Matches individual expert params: model.layers.X.mlp.experts.Y.proj.weight
+_INDIVIDUAL_EXPERT_RE = re.compile(
+    r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
+)
+
+
+def fuse_expert_params_in_metadata(
+    state_dict_metadata: dict[str, dict[str, Any]],
+    ep_size: int = 1,
+) -> dict[str, dict[str, Any]]:
+    """Fuse individual MoE expert params into combined w13/w2 entries.
+
+    Converts individual HF expert params (one per expert) into vLLM-style
+    fused params:
+    - gate_proj + up_proj → w13_weight: [num_experts_global, 2*intermediate, hidden]
+    - down_proj → w2_weight: [num_experts_global, hidden, intermediate]
+
+    When EP>1, each rank only sees a subset of experts. The metadata comes
+    from a single rank, so we multiply by ep_size to get the global count.
+
+    Non-expert params are passed through unchanged.
+    """
+    # Group individual expert params by (prefix, proj_type)
+    expert_groups: dict[tuple[str, str], list[tuple[str, dict]]] = {}
+    fused_metadata: dict[str, dict[str, Any]] = OrderedDict()
+
+    for name, meta in state_dict_metadata.items():
+        m = _INDIVIDUAL_EXPERT_RE.match(name)
+        if m:
+            prefix = m.group(1)  # e.g., "model.layers.0.mlp.experts"
+            proj = m.group(3)  # "gate_proj", "up_proj", "down_proj"
+            key = (prefix, proj)
+            expert_groups.setdefault(key, []).append((name, meta))
+        else:
+            fused_metadata[name] = meta
+
+    if not expert_groups:
+        return state_dict_metadata
+
+    # Build fused entries from expert groups
+    # Group gate_proj + up_proj → w13_weight, down_proj → w2_weight
+    w13_groups: dict[str, dict] = {}  # prefix → {gate: entries, up: entries}
+    w2_groups: dict[str, list] = {}  # prefix → entries
+
+    for (prefix, proj), entries in expert_groups.items():
+        if proj in ("gate_proj", "up_proj"):
+            w13_groups.setdefault(prefix, {})
+            w13_groups[prefix][proj] = entries
+        else:  # down_proj
+            w2_groups[prefix] = entries
+
+    # Create w13_weight entries (fused gate+up)
+    for prefix, projs in w13_groups.items():
+        gate_entries = projs.get("gate_proj", [])
+        up_entries = projs.get("up_proj", [])
+        if not gate_entries:
+            continue
+        num_experts_local = len(gate_entries)
+        num_experts_global = num_experts_local * ep_size
+        gate_shape = gate_entries[0][1]["shape"]  # [intermediate, hidden]
+        intermediate_size = gate_shape[0]
+        hidden_size = gate_shape[1]
+        fused_shape = [num_experts_global, 2 * intermediate_size, hidden_size]
+        fused_name = f"{prefix}.w13_weight"
+        fused_metadata[fused_name] = {
+            "shape": fused_shape,
+            "dtype": gate_entries[0][1]["dtype"],
+            "_moe_fused": True,
+            "_moe_num_experts_local": num_experts_local,
+            "_moe_gate_entries": [
+                n
+                for n, _ in sorted(
+                    gate_entries,
+                    key=lambda x: int(_INDIVIDUAL_EXPERT_RE.match(x[0]).group(2)),
+                )
+            ],
+            "_moe_up_entries": [
+                n
+                for n, _ in sorted(
+                    up_entries,
+                    key=lambda x: int(_INDIVIDUAL_EXPERT_RE.match(x[0]).group(2)),
+                )
+            ]
+            if up_entries
+            else [],
+        }
+
+    # Create w2_weight entries (down)
+    for prefix, entries in w2_groups.items():
+        num_experts_local = len(entries)
+        num_experts_global = num_experts_local * ep_size
+        down_shape = entries[0][1]["shape"]  # [hidden, intermediate]
+        hidden_size = down_shape[0]
+        intermediate_size = down_shape[1]
+        fused_shape = [num_experts_global, hidden_size, intermediate_size]
+        fused_name = f"{prefix}.w2_weight"
+        fused_metadata[fused_name] = {
+            "shape": fused_shape,
+            "dtype": entries[0][1]["dtype"],
+            "_moe_fused": True,
+            "_moe_num_experts_local": num_experts_local,
+            "_moe_down_entries": [
+                n
+                for n, _ in sorted(
+                    entries,
+                    key=lambda x: int(_INDIVIDUAL_EXPERT_RE.match(x[0]).group(2)),
+                )
+            ],
+        }
+
+    return fused_metadata
+
+
+# =========================================================================
 # Layer grouping and refit-info construction
 # =========================================================================
 
@@ -499,6 +620,7 @@ def build_nccl_reshard_refit_info(
     train_world_size: int,
     gen_world_size: int,
     layer_to_pp_stage: Optional[dict[str, int]] = None,
+    metadata_ep_gathered: bool = False,
 ) -> dict[str, Any]:
     """Build per-layer parameter info for nccl_reshard-based refit.
 
@@ -509,11 +631,23 @@ def build_nccl_reshard_refit_info(
         layer_to_pp_stage: optional mapping from layer name to PP stage index.
             When provided (PP>1), per-stage meshes are built so each PP stage's
             train ranks + all gen ranks form an independent sub-group.
+        metadata_ep_gathered: if True, the metadata already contains all experts
+            (e.g. from ``export_hf_weights`` which does EP all-gather). In this
+            case ``fuse_expert_params_in_metadata`` must not multiply by ep_size.
 
     Returns:
         ``{"layer_names": [...], "per_layer_params": {layer: [param_info, ...]},
            "pp_size": int}``
     """
+    # Fuse individual MoE expert params into combined w13/w2 entries.
+    # When metadata already contains all experts (post-EP-gather), use
+    # ep_size=1 so fusion does not multiply the expert count again.
+    ep_size = train_parallelism.get("ep_size", 1)
+    fusion_ep_size = 1 if metadata_ep_gathered else ep_size
+    state_dict_metadata = fuse_expert_params_in_metadata(
+        state_dict_metadata, ep_size=fusion_ep_size
+    )
+
     pp_size = train_parallelism.get("pp_size", 1)
     use_per_stage = layer_to_pp_stage is not None and pp_size > 1
 
@@ -583,6 +717,16 @@ def build_nccl_reshard_refit_info(
                 "dst_mesh_info": dst_mesh,
                 "dst_placements": get_placements(name, dst_dim_map, ndim),
             }
+
+        # Propagate MoE fusion metadata for train-side expert stacking
+        if meta.get("_moe_fused"):
+            moe_meta = {}
+            for k in ("_moe_gate_entries", "_moe_up_entries", "_moe_down_entries"):
+                if k in meta:
+                    # Strip the _moe_ prefix for cleaner access
+                    moe_meta[k.replace("_moe_", "")] = meta[k]
+            info["_moe_meta"] = moe_meta
+
         per_layer_params.setdefault(layer, []).append(info)
 
     return {
