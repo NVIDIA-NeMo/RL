@@ -187,15 +187,23 @@ def configure_dynamo_cache() -> None:
     torch._inductor.config.autotune_local_cache = False
 
 
+_HF_ENV_VARS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_HOME")
+
+
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
     """Get runtime environment configuration for policy workers.
 
     Note: expandable_segments configuration is handled directly in the worker init methods
     to ensure proper GPU detection after CUDA initialization.
     """
+    env_vars = {k: os.environ[k] for k in _HF_ENV_VARS if k in os.environ}
+
     runtime_env = {
         **get_nsight_config_if_pattern_matches(policy_worker_name),
     }
+
+    if env_vars:
+        runtime_env["env_vars"] = env_vars
 
     return runtime_env
 
