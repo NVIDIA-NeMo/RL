@@ -1,13 +1,13 @@
 ---
 name: config-conventions
-description: Configuration conventions for NeMo-RL. YAML is the single source of truth for defaults. Covers TypedDict usage, exemplar YAML updates, and forbidden default patterns. Auto-invoked during code review.
+description: Configuration conventions for NeMo-RL. YAML takes precedence; dataclass provides fallback defaults. Covers TypedDict usage, dataclass defaults, exemplar YAML updates, and forbidden default patterns. Auto-invoked during code review.
 ---
 
 # Configuration Conventions
 
 ## Core Rule
 
-**YAML is the single source of truth for defaults.** Do not set non-`None` defaults in code for configuration values. The loaded YAML (and any user overrides) must supply required values.
+**YAML values always take precedence; dataclass provides fallback defaults for missing keys.** Required fields must still come from YAML. Optional fields may define defaults in a companion `*ConfigDefaults` dataclass (see [design doc](docs/design-docs/dataclass-config-defaults.md)).
 
 ## Access Config Directly
 
@@ -43,18 +43,35 @@ uv run ./tools/config_cli.py minimize <recipe.yaml>
 
 This will minimize the config and assign the appropriate `defaults` key.
 
-## Accessing NotRequired Fields
+## Dataclass Defaults
 
-When accessing a `NotRequired` field, use an `in` check or `.get(key)` / `.get(key, None)`. Never provide a non-`None` default — that hides behavior and defeats the purpose of making the field optional.
+For fields with sensible default values, define a companion `*ConfigDefaults` dataclass next to the `TypedDict`. The dataclass is never instantiated at runtime — it only feeds `apply_config_defaults()`.
 
 **Do:**
 ```python
-# .get() with None (not a hidden default)
-stop_properly_penalty_coef = cfg.get("stop_properly_penalty_coef", None)
+@dataclass
+class GRPOConfigDefaults:
+    overlong_filtering: bool = False          # NotRequired field with default
+    calculate_advantages_on_gpu: bool = False  # NotRequired field with default
+```
 
-# Truthiness check for optional booleans
-if master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
+**Don't:**
+- Include required fields that have no sensible default (e.g. `num_prompts_per_step`).
+- Set defaults that disagree with the exemplar YAML — the consistency test will catch this.
+- Set non-`None` defaults in `.get()` calls — use a dataclass default instead.
+
+## Accessing NotRequired Fields
+
+When a `NotRequired` field has a dataclass default, access it directly with `config["key"]` — `apply_config_defaults()` guarantees the key exists. For fields without a dataclass default, use an `in` check or `.get(key)` / `.get(key, None)`.
+
+**Do:**
+```python
+# Field has a dataclass default — safe to access directly
+if master_config["grpo"]["calculate_advantages_on_gpu"]:
     ...
+
+# Field without a dataclass default — check presence
+stop_properly_penalty_coef = cfg.get("stop_properly_penalty_coef", None)
 
 # Nested NotRequired: check presence at each level explicitly
 if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
@@ -63,7 +80,7 @@ if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
 
 **Don't:**
 ```python
-# Hidden boolean default — should come from YAML
+# Hidden boolean default — use a dataclass default instead
 disable_ppo_ratio = cfg.get("disable_ppo_ratio", False)
 
 # Hidden non-trivial default — caller has no idea True is the fallback
@@ -73,13 +90,13 @@ normalize_rewards = grpo_config.get("normalize_rewards", True)
 megatron_enable = config.get("megatron_cfg", {}).get("enabled", False)
 ```
 
-If a `NotRequired` field is absent, the code should handle that explicitly — not paper over it with a magic default.
+If a `NotRequired` field is absent and has no dataclass default, the code should handle that explicitly — not paper over it with a magic default.
 
 ## Forbidden Patterns
 
 **Don't:**
 ```python
-# Hidden default in code
+# Hidden default in code — put it in a *ConfigDefaults dataclass instead
 precision = policy_cfg.get("precision", "bfloat16")
 
 # Function parameter defaulting a config value
@@ -92,9 +109,13 @@ def build_policy(policy_cfg, precision: str = "bfloat16"):
 # Required attribute: expect it from YAML or user override
 precision: str = policy_cfg["precision"]
 
-# Optional attribute: check for presence
+# Optional attribute with dataclass default: access directly
+if master_config["grpo"]["overlong_filtering"]:
+    ...
+
+# Optional attribute without dataclass default: check for presence
 if "milestones" in scheduler_cfg:
     configure_milestones(scheduler_cfg["milestones"])
 ```
 
-See also: [TypedDict and Configuration Defaults](docs/design-docs/design-and-philosophy.md#typeddict-and-configuration-defaults).
+See also: [Dataclass Config Defaults](docs/design-docs/dataclass-config-defaults.md), [TypedDict and Configuration Defaults](docs/design-docs/design-and-philosophy.md#typeddict-and-configuration-defaults).

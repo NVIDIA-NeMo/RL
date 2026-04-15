@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 from pathlib import Path
-from typing import Optional, Union, cast
+from typing import Any, Optional, Union, cast, get_type_hints
 
 from hydra._internal.config_loader_impl import ConfigLoaderImpl
 from hydra.core.override_parser.overrides_parser import OverridesParser
@@ -186,6 +187,51 @@ def parse_hydra_overrides(cfg: DictConfig, overrides: list[str]) -> DictConfig:
         return cfg
     except Exception as e:
         raise OverridesError(f"Failed to parse Hydra overrides: {str(e)}") from e
+
+
+def apply_config_defaults(config: dict[str, Any], defaults_cls: type) -> dict[str, Any]:
+    """Recursively fill missing config keys from a dataclass's default values.
+
+    Only keys that are absent from ``config`` are filled.  Existing keys
+    (including ``None`` and ``False``) are never overwritten.  This ensures
+    that YAML and CLI values always take precedence over dataclass defaults.
+
+    Args:
+        config: The loaded config dict (already resolved).
+        defaults_cls: A dataclass class whose fields define defaults.
+
+    Returns:
+        The same config dict, mutated in place, with missing keys filled.
+    """
+    if not dataclasses.is_dataclass(defaults_cls):
+        return config
+
+    hints = get_type_hints(defaults_cls)
+
+    for f in dataclasses.fields(defaults_cls):
+        # Determine the concrete default for this field.
+        if f.default is not dataclasses.MISSING:
+            default = f.default
+        elif f.default_factory is not dataclasses.MISSING:
+            default = f.default_factory()
+        else:
+            # No default — field is required and must come from YAML.
+            continue
+
+        if f.name not in config:
+            if dataclasses.is_dataclass(default):
+                # Nested defaults: create an empty dict and fill recursively.
+                config[f.name] = {}
+                apply_config_defaults(config[f.name], type(default))
+            else:
+                config[f.name] = default
+        elif isinstance(config[f.name], dict):
+            # Recurse into nested dataclass defaults.
+            nested_type = hints.get(f.name)
+            if nested_type is not None and dataclasses.is_dataclass(nested_type):
+                apply_config_defaults(config[f.name], nested_type)
+
+    return config
 
 
 def register_omegaconf_resolvers() -> None:
