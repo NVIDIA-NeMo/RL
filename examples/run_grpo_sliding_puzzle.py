@@ -23,7 +23,12 @@ from omegaconf import OmegaConf
 from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer
 
-from nemo_rl.algorithms.grpo import GRPOMasterConfigDefaults, MasterConfig, grpo_train, setup
+from nemo_rl.algorithms.grpo import (
+    GRPOMasterConfigDefaults,
+    MasterConfig,
+    grpo_train,
+    setup,
+)
 from nemo_rl.algorithms.utils import get_tokenizer, set_seed
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.virtual_cluster import init_ray

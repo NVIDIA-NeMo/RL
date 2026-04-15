@@ -74,7 +74,9 @@ def test_defaults_fields_subset_of_typeddict(defaults_cls, typeddict_cls):
     dc_keys = {f.name for f in dataclasses.fields(defaults_cls)}
     td_keys = set(typeddict_cls.__annotations__.keys())
     extra = dc_keys - td_keys
-    assert not extra, f"{defaults_cls.__name__} has fields not in {typeddict_cls.__name__}: {extra}"
+    assert not extra, (
+        f"{defaults_cls.__name__} has fields not in {typeddict_cls.__name__}: {extra}"
+    )
 
 
 # ===================================================================
@@ -93,10 +95,15 @@ def test_grpo_defaults_match_exemplar_yaml():
     grpo_yaml = yaml_dict["grpo"]
 
     for f in dataclasses.fields(GRPOConfigDefaults):
-        if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING:
+        if (
+            f.default is dataclasses.MISSING
+            and f.default_factory is dataclasses.MISSING
+        ):
             continue
         # Skip nested dataclass fields — tested separately.
-        default = f.default if f.default is not dataclasses.MISSING else f.default_factory()
+        default = (
+            f.default if f.default is not dataclasses.MISSING else f.default_factory()
+        )
         if dataclasses.is_dataclass(default):
             continue
         yaml_val = grpo_yaml.get(f.name)
