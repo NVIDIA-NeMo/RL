@@ -54,7 +54,6 @@ dependencies = [
   "cuda-bindings",                                                                                                    # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
   "nvidia-cudnn-cu12==9.19.0.56",                                                                                     # for transformer-engine no build isolation
-  # nvidia-resiliency-ext removed: no Python 3.13 wheels available (v0.5.0 only has cp310-cp312)
 ]
 
 [project.optional-dependencies]
@@ -112,6 +111,9 @@ mcore = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@7febc6e25660af0f54d95dd781ecdcd62265ecca ; platform_machine == 'aarch64'",
 ]
+nvrx = [
+  "nvidia-resiliency-ext",
+] # for ft_launcher (fault-tolerant training launcher)
 nemo_gym = ["nemo_gym"]
 
 [dependency-groups]
@@ -501,7 +503,7 @@ requires-dist = [
   "flash-linear-attention",
   "timm",
   "open-clip-torch>=3.2.0",
-  "mlflow>=3.5.0",
+  "mlflow>=3.9.0",
   "comet-ml>=3.50.0",
   "torch>=2.6.0",
 ]
