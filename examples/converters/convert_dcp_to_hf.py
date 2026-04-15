@@ -14,6 +14,7 @@
 
 import argparse
 import os
+
 import yaml
 
 from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf
@@ -50,14 +51,18 @@ def main():
         config = yaml.safe_load(f)
 
     model_name_or_path = config["policy"]["model_name"]
-    
+
     # Some algorithms may change the tokenizer property at runtime.
     # The train loop ensures dcp_ckpt_path is policy/weights/ and tokenizer files live under policy/tokenizer.
-    if os.path.exists(tokenizer_path := os.path.join(args.dcp_ckpt_path, "..", "tokenizer")):
+    if os.path.exists(
+        tokenizer_path := os.path.join(args.dcp_ckpt_path, "..", "tokenizer")
+    ):
         print(f"Using local tokenizer path at {tokenizer_path} for HF conversion")
         tokenizer_name_or_path = tokenizer_path
     else:
-        print(f"WARNING: No local tokenizer path found at {tokenizer_path}. Falling back to loading the vanilla tokenizer based on the config file. Please ensure this is what you want.")
+        print(
+            f"WARNING: No local tokenizer path found at {tokenizer_path}. Falling back to loading the vanilla tokenizer based on the config file. Please ensure this is what you want."
+        )
         tokenizer_name_or_path = config["policy"]["tokenizer"]["name"]
     hf_overrides = config["policy"].get("hf_overrides", {}) or {}
 
