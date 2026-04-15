@@ -51,10 +51,10 @@ dependencies = [
   "pyzmq",
   "decord2",
   "soundfile>=0.13.1",
-  "nccl4py",                      # for non-colocated refit
-  "cuda-bindings",                # for non-colocated refit
-  "pybase64",                     # for sglang refit
-  "nvidia-cudnn-cu12==9.19.0.56", # for transformer-engine no build isolation
+  "nccl4py",                                                                                                          # for non-colocated refit
+  "cuda-bindings",                                                                                                    # for non-colocated refit
+  "pybase64",                                                                                                         # for sglang refit
+  "nvidia-cudnn-cu12==9.19.0.56",                                                                                     # for transformer-engine no build isolation
   # nvidia-resiliency-ext removed: no Python 3.13 wheels available (v0.5.0 only has cp310-cp312)
 ]
 
