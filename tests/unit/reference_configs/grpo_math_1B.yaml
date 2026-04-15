@@ -52,6 +52,17 @@ grpo:
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
     recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
 
+# Reward-zeroing penalties applied to NeMo-Gym rollout results.
+reward_penalties:
+  penalize_duplicated_reasoning: false
+  penalize_empty_final_answer: false
+  penalize_eos_token: false
+  penalize_malformed_think_tag: false
+  # Optional model/tokenizer-specific overrides. When null, EOS is inferred
+  # from tokenizer.eos_token_id and think tags are inferred only if each tag
+  # encodes to one token. Example: {eos: 2, think_open: 12, think_close: 13}
+  token_ids: null
+
 loss_fn:
   reference_policy_kl_penalty: 0.01
   # Can be set to k1, k2, k3
