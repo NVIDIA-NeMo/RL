@@ -22,7 +22,7 @@ from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cas
 import numpy as np
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
@@ -79,6 +79,7 @@ from nemo_rl.environments.nemo_gym import (
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
+    get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -152,6 +153,25 @@ class AdvEstimatorConfig(TypedDict):
     use_leave_one_out_baseline: NotRequired[bool]
     # Reinforce++ specific
     minus_baseline: NotRequired[bool]
+
+
+class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
+    """Optional tokenizer-derived token ID overrides for reward penalties."""
+
+    eos: int | None = None
+    think_open: int | None = None
+    think_close: int | None = None
+
+
+class RewardPenaltyConfig(BaseModel, extra="allow"):
+    """Reward-zeroing penalties applied to NeMo-Gym rollout results."""
+
+    penalize_duplicated_reasoning: bool = False
+    penalize_empty_final_answer: bool = False
+    penalize_eos_token: bool = False
+    penalize_malformed_think_tag: bool = False
+    # Optional overrides; None infers from tokenizer when possible.
+    token_ids: Optional[RewardPenaltyTokenIdsConfig] = None
 
 
 class GRPOConfig(TypedDict):
@@ -239,6 +259,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: Optional[DataPlaneConfig] = None
 
 
@@ -469,7 +490,7 @@ def setup(
             nemo_gym_py_exec = create_local_venv_on_each_node(
                 nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
             )
-        nemo_gym_dict = env_configs["nemo_gym"]
+        nemo_gym_dict = dict(env_configs["nemo_gym"])
         # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
         # (where the detector reads them), not part of Gym's global config.
         invalid_tool_call_patterns = nemo_gym_dict.pop(
@@ -2199,6 +2220,8 @@ def grpo_train(
                             max_rollout_turns=None,
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
+                            reward_penalty_config=master_config.reward_penalties,
+                            thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -3025,6 +3048,8 @@ def validate(
                     max_rollout_turns=None,
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
+                    reward_penalty_config=master_config.reward_penalties,
+                    thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
