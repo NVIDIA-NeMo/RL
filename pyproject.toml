@@ -51,7 +51,6 @@ dependencies = [
   "pyzmq",
   "decord2",
   "soundfile>=0.13.1",
-
   "nccl4py",                      # for non-colocated refit
   "cuda-bindings",                # for non-colocated refit
   "pybase64",                     # for sglang refit
@@ -111,6 +110,9 @@ mcore = [
   "emerging-optimizers==0.2.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
 ]
+nvrx = [
+  "nvidia-resiliency-ext",
+] # for ft_launcher (fault-tolerant training launcher)
 nemo_gym = ["nemo_gym"]
 
 [dependency-groups]
