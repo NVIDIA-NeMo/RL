@@ -39,19 +39,14 @@ bash create-cluster.sh
 cd ../helm
 helmfile -e kind sync
 
-# 4. Create KAI scheduler queues
+# 4. Create KAI scheduler queues + RBAC
 kubectl apply -f ../examples/kai-queue.yaml
+kubectl apply -f ../examples/endpoint-registry-rbac.yaml
+kubectl apply -f ../examples/kyverno-kai-policies.yaml
 
-# 5. Test: gang-schedule two GPU pods
-kubectl apply -f ../examples/kai_scheduled_pods.yaml
-kubectl get pods -w                     # both go Running at the same time
-kubectl logs gpu-test-0                 # nvidia-smi output
-kubectl delete -f ../examples/kai_scheduled_pods.yaml
-
-# 6. Test: gang-schedule two RayClusters (each with 1 GPU worker)
-kubectl apply -f ../examples/kai_scheduled_rayclusters.yaml
-kubectl get rayclusters -w              # both become "ready"
-kubectl delete -f ../examples/kai_scheduled_rayclusters.yaml
+# 5. Deploy disaggregated RL + Gym
+kubectl apply -f ../examples/disagg-rayclusters.yaml
+kubectl get rayclusters -w    # both should become "ready"
 ```
 
 ## Deploy on a real cluster
@@ -59,6 +54,7 @@ kubectl delete -f ../examples/kai_scheduled_rayclusters.yaml
 ```sh
 cd infra/helm
 helmfile -e prod sync
+kubectl apply -f infra/examples/kai-queue-prod.yaml
 ```
 
 This installs the full **GPU Operator** (instead of just the device plugin) along with KAI scheduler and KubeRay. The GPU Operator manages the NVIDIA driver, container toolkit, device plugin, NFD, and DCGM exporter.
@@ -72,7 +68,7 @@ Set `driver.enabled=false` in `values/gpu-operator.yaml` if the cluster nodes al
 | `kind` | nvidia-device-plugin | Local dev — nvkind handles toolkit/runtime |
 | `prod` | gpu-operator (full) | Real clusters — operator manages everything |
 
-Both environments include KAI scheduler and KubeRay operator.
+Both environments include KAI scheduler, KubeRay operator, Kyverno, and Prometheus+Grafana.
 
 ## Tear down (kind only)
 
@@ -98,48 +94,35 @@ infra/
 │       ├── gpu-operator.yaml         # prod only
 │       ├── kai-scheduler.yaml
 │       ├── kuberay-operator.yaml
-│       ├── kyverno.yaml              # Kyverno policy engine
-│       └── kube-prometheus-stack.yaml # Prometheus + Grafana
-└── examples/
-    ├── kai-queue.yaml                # KAI queue hierarchy
-    ├── kai_scheduled_pods.yaml       # Gang-scheduled GPU test pods
-    ├── kai_scheduled_rayclusters.yaml # Gang-scheduled RayClusters
-    ├── kai_scheduled_sft.yaml        # Two gang-scheduled SFT RayJobs
-    ├── sft_rayjob.yaml               # 2-GPU SFT RayJob
-    ├── raycluster-blocker.yaml       # GPU blocker for testing KAI
-    ├── gym_standalone_config.yaml    # Gym standalone server config
-    ├── disagg_rl_raycluster.yaml     # Disagg RL cluster + peer-watcher
-    ├── disagg_gym_raycluster.yaml    # Disagg Gym cluster + peer-watcher
-    ├── endpoint-registry-rbac.yaml   # RBAC for ConfigMap endpoint registry
-    ├── peer-watcher.py               # Sidecar for failure cascading
-    ├── kai-queue-prod.yaml           # 256-GPU prod queue config
-    ├── kyverno-kai-policies.yaml     # Queue enforcement policies
-    ├── kai-service-monitors.yaml     # Prometheus ServiceMonitors for KAI
-    └── kai-grafana-dashboard.yaml    # Grafana dashboard for fairshare
+│       ├── kyverno.yaml
+│       └── kube-prometheus-stack.yaml
+├── examples/
+│   ├── disagg-rayclusters.yaml       # Disaggregated RL + Gym (main exemplar)
+│   ├── endpoint-registry-rbac.yaml   # RBAC for ConfigMap service discovery
+│   ├── gym_standalone_config.yaml    # Gym standalone server config
+│   ├── kai-queue.yaml                # 2-GPU kind cluster queues
+│   ├── kai-queue-prod.yaml           # 288-GPU NVL72 prod queues
+│   ├── kyverno-kai-policies.yaml     # Queue enforcement policies
+│   ├── kai-service-monitors.yaml     # Prometheus ServiceMonitors for KAI
+│   └── kai-grafana-dashboard.yaml    # Grafana fairshare dashboard
+└── extensions/
+    └── k8s_cli/                       # nrl-k8s CLI tool
 ```
+
+## Disaggregated RL + Gym
+
+The main workload exemplar is `disagg-rayclusters.yaml`: two RayClusters deployed together.
+
+- **RL cluster** (`raycluster-rl`): Ray head + GPU workers for training (vLLM + Megatron)
+- **Gym cluster** (`raycluster-gym`): CPU-only, runs NeMo Gym servers as HTTP service
+- **Service discovery**: K8s ConfigMap endpoint registry — RL publishes vLLM URLs, Gym publishes its head server address. Both poll until the peer registers.
+- **Failure cascading**: Peer-watcher sidecar (inlined Python script) on each head pod. If either cluster fails or is deleted, both are torn down.
 
 ## Notes
 
 - **nvkind vs vanilla kind**: nvkind automates GPU device injection, nvidia-container-toolkit installation inside nodes, containerd nvidia runtime configuration, and RuntimeClass registration.
-- **nvidia-device-plugin** (kind only): The full GPU Operator fails in kind because its driver validation doesn't work inside kind nodes. The lightweight device plugin with CDI discovery is sufficient since nvkind handles the runtime setup. On a real cluster, use the full GPU Operator (`helmfile -e prod sync`).
-- **Device plugin kind overrides**: Affinity is overridden because NFD isn't installed in kind. `runtimeClassName: nvidia` is set so the plugin pod gets NVIDIA libraries injected for NVML discovery. Neither override is needed on a real cluster.
-- **KAI scheduler** creates PodGroups automatically for recognized workload types (RayCluster, Job, PyTorchJob, etc.). For bare pods, create a PodGroup manually and annotate pods with `pod-group-name`.
-- **RayJob** (not RayCluster) is preferred for batch workloads — it auto-tears down the cluster after the job finishes, avoiding stale Ray state. Requires `submissionMode: HTTPMode` for KAI compatibility.
-
-## Failure cascading for disaggregated Gym
-
-The disaggregated RL/Gym manifests include a **peer-watcher sidecar** on each head pod that monitors the peer cluster via the K8s API. If the peer is deleted, fails, or signals an error via the ConfigMap, the watcher tears down both clusters to release resources.
-
-- `peer-watcher.py` — Python sidecar script (deployed as a ConfigMap)
-- Monitors: peer RayCluster status + ConfigMap `error` key
-- `MAX_PEER_FAILURES` (default 3) consecutive failures before teardown
-- Applications can signal errors via `K8sEndpointRegistry.signal_error("message")`
-
-Setup:
-```sh
-kubectl create configmap peer-watcher-script --from-file=peer-watcher.py=infra/examples/peer-watcher.py
-kubectl apply -f infra/examples/endpoint-registry-rbac.yaml
-```
+- **nvidia-device-plugin** (kind only): The full GPU Operator fails in kind because its driver validation doesn't work inside kind nodes. The lightweight device plugin with CDI discovery is sufficient since nvkind handles the runtime setup.
+- **KAI scheduler** creates PodGroups automatically for recognized workload types (RayCluster, Job, PyTorchJob, JobSet, etc.). For bare pods, create a PodGroup manually and annotate with `pod-group-name`.
 
 ## Fairshare scheduling
 
@@ -167,8 +150,8 @@ KAI distributes GPU resources using hierarchical fair-share with two phases:
 
 ### Example configs
 
-- `kai-queue.yaml` — 2-GPU kind cluster (team-a, team-b, equal quotas)
-- `kai-queue-prod.yaml` — 256-GPU production cluster (3 departments, 6 teams)
+- `kai-queue.yaml` — 2-GPU kind cluster (priority-team + community, imbalanced)
+- `kai-queue-prod.yaml` — 288-GPU NVL72 production cluster (priority + community departments)
 
 ### Monitoring (Grafana)
 
@@ -184,6 +167,20 @@ Key metrics: `kai_queue_allocated_gpus`, `kai_queue_deserved_gpus`, `kai_e2e_sch
 ### Kyverno queue enforcement
 
 RayCluster and RayJob resources must have a `kai.scheduler/queue` label or they're rejected by Kyverno. To enable user→queue access control, uncomment Policy 2 in `kyverno-kai-policies.yaml` and configure the `kai-queue-permissions` ConfigMap.
+
+## CLI (`nrl-k8s`)
+
+Standalone Python CLI for managing workloads. Install: `pip install -e extensions/k8s_cli`
+
+```sh
+nrl-k8s fairshare          # show queue config (quota, limit, weight, priority)
+nrl-k8s occupancy          # show GPU allocation per node and per queue
+nrl-k8s submit JOB_NAME \  # submit gang-scheduled RayJob
+  --queue priority-team \
+  --image nvcr.io/nvidian/nemo-rl:latest \
+  --entrypoint "bash tests/functional/sft.sh" \
+  --num-gpus 2
+```
 
 ## TODO: NVL72 topology-aware scheduling
 

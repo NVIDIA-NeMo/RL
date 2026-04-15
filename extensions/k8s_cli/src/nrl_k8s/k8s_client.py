@@ -171,6 +171,14 @@ def submit_gang_rayjob(
                                         {"containerPort": 6379, "name": "gcs-server"},
                                         {"containerPort": 8265, "name": "dashboard"},
                                     ],
+                                    "readinessProbe": {
+                                        "exec": {
+                                            "command": ["ray", "health-check"],
+                                        },
+                                        "initialDelaySeconds": 10,
+                                        "periodSeconds": 5,
+                                        "timeoutSeconds": 5,
+                                    },
                                 }
                             ],
                         }
