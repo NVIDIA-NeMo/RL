@@ -269,6 +269,8 @@ design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
+design-docs/dataclass-config-defaults.md
+design-docs/dataclass-config-defaults-changelog.md
 ```
 
 ```{toctree}
