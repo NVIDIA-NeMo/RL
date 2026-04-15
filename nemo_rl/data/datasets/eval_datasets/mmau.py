@@ -14,9 +14,12 @@
 
 """MMAU (Massive Multitask Audio Understanding) evaluation dataset."""
 
+import io
 from typing import Any
 
-from datasets import load_dataset
+import numpy as np
+import soundfile as sf
+from datasets import Audio, load_dataset
 
 from nemo_rl.data.datasets.response_datasets.avqa import _resample_audio
 from nemo_rl.data.interfaces import TaskDataSpec
@@ -45,6 +48,7 @@ class MMAUDataset:
         split: str = "v05.15.25",
     ):
         ds = load_dataset(dataset_name, split=split)
+        ds = ds.cast_column("audio", Audio(decode=False))
 
         self.rekeyed_ds = ds
         self.task_spec = TaskDataSpec(task_name="mmau")
@@ -53,14 +57,16 @@ class MMAUDataset:
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         """Convert a raw MMAU item into messages format for vlm_hf_data_processor."""
-        audio_data = data["audio"]
-        audio_array = audio_data["array"]
+        audio_raw = data["audio"]
+        audio_array, orig_sr = sf.read(io.BytesIO(audio_raw["bytes"]))
+
+        # Convert to mono if stereo
+        if audio_array.ndim > 1:
+            audio_array = np.mean(audio_array, axis=1)
 
         # Resample to 16kHz if needed
-        if audio_data["sampling_rate"] != 16000:
-            audio_array = _resample_audio(
-                audio_array, audio_data["sampling_rate"], 16000
-            )
+        if orig_sr != 16000:
+            audio_array = _resample_audio(audio_array, orig_sr, 16000)
 
         question = data["question"]
         choices = data["choices"]
