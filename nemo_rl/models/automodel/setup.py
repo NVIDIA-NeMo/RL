@@ -348,6 +348,7 @@ def validate_and_prepare_config(
                     "for the linear head of regression reward models."
                 )
                 model_config.num_labels = 1
+            model_config.classifier_dropout = 0.0
         else:
             raise ValueError(f"Unknown reward model type: {rm_type}")
     else:
@@ -653,6 +654,10 @@ def setup_model_and_optimizer(
     # Reward model num_labels override
     if is_reward_model and model_config.num_labels == 1:
         from_pretrained_kwargs["num_labels"] = 1
+
+    if is_reward_model and config["reward_model_cfg"].get("reward_model_type", None) == "regression":
+        from_pretrained_kwargs["config"] = model_config
+        from_pretrained_kwargs.pop("num_labels")
 
     # Auto-set force_hf if the custom model's adapter doesn't support per-tensor
     # HF conversion (required for weight syncing).
