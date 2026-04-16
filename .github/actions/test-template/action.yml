@@ -81,7 +81,11 @@ runs:
       if: ${{ inputs.has-azure-credentials == 'true' }}
       shell: bash
       run: |
-        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        for i in 1 2 3; do
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash && break
+          echo "Attempt $i failed, retrying in 10s..."
+          sleep 10
+        done
 
     - name: Install uuidgen
       shell: bash -x -e -u -o pipefail {0}
