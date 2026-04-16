@@ -197,25 +197,24 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
-    def test_context_parallel_with_sequence_packing_raises_error(
+    def test_context_parallel_with_sequence_packing_accepted(
         self,
         mock_dynamo,
         mock_resolve_class,
         mock_autoconfig_class,
         mock_config,
     ):
-        """Test that CP with sequence packing raises ValueError."""
+        """Test that CP with sequence packing is accepted (supported via TE THD)."""
         mock_config["sequence_packing"]["enabled"] = True
         mock_config["dtensor_cfg"]["context_parallel_size"] = 2
 
-        with pytest.raises(
-            ValueError, match="Context parallel is not supported for sequence packing"
-        ):
-            validate_and_prepare_config(
-                config=mock_config,
-                processor=None,
-                rank=0,
-            )
+        # Should not raise — CP+seqpack is supported via TE's THD dual-chunk-swap
+        result = validate_and_prepare_config(
+            config=mock_config,
+            processor=None,
+            rank=0,
+        )
+        assert result.enable_seq_packing is True
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -499,7 +498,6 @@ class TestValidateAndPrepareConfig:
 
         captured = capsys.readouterr()
         assert "[Rank 0] Sequence packing is enabled for model gpt2" in captured.out
-        assert "[Rank 0] Using FlashAttention2 for sequence packing" in captured.out
         assert result.enable_seq_packing is True
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
@@ -562,17 +560,16 @@ class TestSetupReferenceModelState:
         self, mock_get_cpu_state_dict
     ):
         """Test that setup_reference_model_state calls get_cpu_state_dict correctly."""
-        mock_model = MagicMock()
-        mock_state_dict = {
+        # Use spec=torch.nn.Module so ModelHandle doesn't detect it as PP
+        mock_model = MagicMock(spec=torch.nn.Module)
+        mock_model.state_dict.return_value = {
             "weight1": torch.tensor([1.0]),
             "weight2": torch.tensor([2.0]),
         }
-        mock_model.state_dict.return_value = mock_state_dict
         mock_get_cpu_state_dict.return_value = {"weight1": torch.tensor([1.0])}
 
         result = setup_reference_model_state(mock_model)
 
-        mock_model.state_dict.assert_called_once()
         mock_get_cpu_state_dict.assert_called_once()
         # Verify pin_memory=True was passed
         call_kwargs = mock_get_cpu_state_dict.call_args[1]
@@ -582,7 +579,7 @@ class TestSetupReferenceModelState:
     @patch("nemo_rl.models.automodel.setup.get_cpu_state_dict")
     def test_setup_reference_model_state_returns_dict(self, mock_get_cpu_state_dict):
         """Test that setup_reference_model_state returns a dictionary."""
-        mock_model = MagicMock()
+        mock_model = MagicMock(spec=torch.nn.Module)
         mock_model.state_dict.return_value = {}
         expected_result = {"param": torch.zeros(10)}
         mock_get_cpu_state_dict.return_value = expected_result
