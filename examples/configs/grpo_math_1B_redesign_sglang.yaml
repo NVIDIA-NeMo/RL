@@ -1,0 +1,36 @@
+defaults: grpo_math_1B.yaml
+
+grpo:
+  val_batch_size: 128
+
+policy:
+  generation:
+    backend: "sglang"    
+    sglang_cfg:
+      # SGLang specific configuration
+      model_path: ${policy.model_name} 
+      dtype: ${policy.precision}
+      context_length: 512  # Maximum context length
+      allow_auto_truncate: true
+      dp_size: 1
+      pp_size: 1
+      ep_size: 1
+      random_seed: 42
+      max_running_requests: null
+      mem_fraction_static: 0.7
+      skip_server_warmup: true
+      # Piecewise CUDA graph currently crashes with "illegal memory access"
+      # (likely torch 2.10 + sglang incompatibility). Keep disabled until upstream fix.
+      disable_piecewise_cuda_graph: true
+    sglang_server:
+      needs_offload: true
+      cpu_weight_backup: false
+      sglang_server_concurrency: 64
+      num_gpus: 4
+      num_gpus_per_engine: 2
+logger:
+  wandb_enabled: true
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1

@@ -590,6 +590,7 @@ def _compute_server_args(
         "mem_fraction_static",
         "allow_auto_truncate",
         "disable_piecewise_cuda_graph",
+        "disable_cuda_graph",
     ]:
         if key in sglang_cfg["sglang_cfg"]:
             kwargs[key] = sglang_cfg["sglang_cfg"][key]
