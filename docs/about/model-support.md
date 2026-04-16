@@ -2,7 +2,7 @@
 
 ## Broad coverage for 🤗Hugging Face models via [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel)
 
-NeMo-RL support 🤗Hugging Face models from the following classes
+NeMo-RL supports 🤗Hugging Face models from the following classes
 - LLMs ([AutoModelForCausalLM](https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForCausalLM))
 - VLMs ([AutoModelForImageTextToText](https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForImageTextToText))
 

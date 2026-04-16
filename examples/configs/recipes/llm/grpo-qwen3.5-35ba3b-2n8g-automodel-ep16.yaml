@@ -28,6 +28,7 @@ policy:
   generation:
     vllm_cfg:
       tensor_parallel_size: 8
+      # set to eager mode to mitigate https://github.com/vllm-project/vllm/issues/36237
       enforce_eager: true
 logger:
   wandb_enabled: true

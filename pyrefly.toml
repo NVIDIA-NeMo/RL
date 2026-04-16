@@ -1,4 +1,4 @@
-python-version = "3.13.11"
+python-version = "3.13.13"
 replace-imports-with-any = [
   "nemo_automodel.*",
   "pynvml.*",

@@ -265,7 +265,22 @@ def create_megatron_checkpoint(model_name: str, temp_dir: str) -> str:
 
     with temporary_distributed_context(backend="gloo"):
         megatron_checkpoint_path = os.path.join(temp_dir, "megatron_checkpoint")
-        import_model_from_hf_name(model_name, megatron_checkpoint_path)
+        megatron_config = {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "expert_tensor_parallel_size": 1,
+            "expert_model_parallel_size": 1,
+            "num_layers_in_first_pipeline_stage": None,
+            "num_layers_in_last_pipeline_stage": None,
+            "pipeline_dtype": "float32",
+            "sequence_parallel": False,
+            "gradient_accumulation_fusion": False,
+        }
+        # need to set `gradient_accumulation_fusion=False` to avoid RuntimeError
+        import_model_from_hf_name(
+            model_name, megatron_checkpoint_path, megatron_config=megatron_config
+        )
 
     if not check_file_exists(megatron_checkpoint_path):
         raise FileNotFoundError(
