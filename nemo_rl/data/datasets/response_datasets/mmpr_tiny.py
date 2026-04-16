@@ -14,6 +14,7 @@
 
 import fcntl
 import os
+import re
 import shutil
 import zipfile
 from typing import Any, Optional
@@ -24,19 +25,36 @@ from huggingface_hub import hf_hub_download
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
+# Matches <image>, <image_1>, <image_2>, etc.
+_IMAGE_PLACEHOLDER_RE = re.compile(r"<image(?:_\d+)?>")
+
 
 def format_mmpr_tiny_dataset(example: dict[str, Any]) -> dict[str, Any]:
-    """Format the MMPR-Tiny dataset into an OpenAI-API-like message log."""
-    user_content = [
-        {
-            "type": "image",
-            "image": example["images"][0],
-        },
-        {
-            "type": "text",
-            "text": str(example["question"]).replace("<image>", "").strip(),
-        },
-    ]
+    """Format the MMPR-Tiny dataset into an OpenAI-API-like message log.
+
+    Supports multi-image rows by splitting question text on <image> and
+    <image_N> placeholders and interleaving image content items with text
+    segments. Each placeholder consumes the next image path in order.
+    """
+    images = example["images"]
+    question = str(example["question"])
+
+    # Split question on image placeholders, interleaving text and images
+    segments = _IMAGE_PLACEHOLDER_RE.split(question)
+    user_content = []
+    img_idx = 0
+    for i, segment in enumerate(segments):
+        text = segment.strip()
+        if text:
+            user_content.append({"type": "text", "text": text})
+        # After each segment (except the last), insert the next image
+        if i < len(segments) - 1 and img_idx < len(images):
+            user_content.append({"type": "image", "image": images[img_idx]})
+            img_idx += 1
+
+    # If no placeholders were found but images exist, prepend the first image
+    if img_idx == 0 and images:
+        user_content.insert(0, {"type": "image", "image": images[0]})
 
     assistant_content = str(example["answer"])
 
@@ -125,7 +143,7 @@ def _load_mmpr_tiny_from_cache(download_dir: str) -> Dataset:
     df = pd.read_parquet(parquet_path)
 
     df["images"] = df["images"].apply(
-        lambda imgs: [os.path.join(download_dir, imgs[0]["path"])]
+        lambda imgs: [os.path.join(download_dir, img["path"]) for img in imgs]
     )
     df["question"] = df["extra_info"].apply(lambda ei: ei.get("question", ""))
     df["answer"] = df["reward_model"].apply(lambda rm: rm.get("ground_truth", ""))

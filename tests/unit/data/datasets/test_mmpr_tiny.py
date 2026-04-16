@@ -29,46 +29,33 @@ from nemo_rl.data.datasets.response_datasets.mmpr_tiny import (
 class TestFormatMMPRTinyDataset:
     """Tests for the MMPR-Tiny data formatting function."""
 
-    def test_format_produces_correct_message_structure(self):
+    def test_format_single_image_with_placeholder(self):
         sample = {
             "images": ["/path/to/image.png"],
-            "question": "What is the angle?",
+            "question": "<image>\nWhat is the angle?",
             "answer": "A",
             "task_name": "mmpr-tiny",
         }
         result = format_mmpr_tiny_dataset(sample)
 
-        assert "messages" in result
-        assert "task_name" in result
         assert result["task_name"] == "mmpr-tiny"
-
         messages = result["messages"]
         assert len(messages) == 2
         assert messages[0]["role"] == "user"
         assert messages[1]["role"] == "assistant"
-
-        user_content = messages[0]["content"]
-        assert len(user_content) == 2
-        assert user_content[0]["type"] == "image"
-        assert user_content[0]["image"] == "/path/to/image.png"
-        assert user_content[1]["type"] == "text"
-        assert user_content[1]["text"] == "What is the angle?"
-
         assert messages[1]["content"] == "A"
 
-    def test_format_strips_image_tokens_from_question(self):
-        sample = {
-            "images": ["/path/to/image.png"],
-            "question": "<image>\nWhat is the angle?",
-            "answer": "32",
-            "task_name": "mmpr-tiny",
-        }
-        result = format_mmpr_tiny_dataset(sample)
-        text = result["messages"][0]["content"][1]["text"]
-        assert "<image>" not in text
-        assert "What is the angle?" in text
+        # Content should be: image, then text (no <image> token in text)
+        user_content = messages[0]["content"]
+        image_items = [c for c in user_content if c["type"] == "image"]
+        text_items = [c for c in user_content if c["type"] == "text"]
+        assert len(image_items) == 1
+        assert image_items[0]["image"] == "/path/to/image.png"
+        assert all("<image>" not in t["text"] for t in text_items)
+        assert any("What is the angle?" in t["text"] for t in text_items)
 
-    def test_format_handles_numeric_answer(self):
+    def test_format_single_image_no_placeholder(self):
+        """When no <image> placeholder exists, the image is prepended."""
         sample = {
             "images": ["/path/to/image.png"],
             "question": "How many circles?",
@@ -76,7 +63,52 @@ class TestFormatMMPRTinyDataset:
             "task_name": "mmpr-tiny",
         }
         result = format_mmpr_tiny_dataset(sample)
+        user_content = result["messages"][0]["content"]
+
+        # Image should be prepended since there's no placeholder
+        assert user_content[0]["type"] == "image"
+        assert user_content[0]["image"] == "/path/to/image.png"
         assert result["messages"][1]["content"] == "4"
+
+    def test_format_multi_image_with_placeholders(self):
+        """Multi-image row with <image> placeholders interleaved in text."""
+        sample = {
+            "images": ["/img/a.png", "/img/b.png", "/img/c.png", "/img/d.png"],
+            "question": "A.\n<image>\nB.\n<image>\nC.\n<image>\nD.\n<image>\nChoose one.",
+            "answer": "B",
+            "task_name": "mmpr-tiny",
+        }
+        result = format_mmpr_tiny_dataset(sample)
+        user_content = result["messages"][0]["content"]
+
+        image_items = [c for c in user_content if c["type"] == "image"]
+        text_items = [c for c in user_content if c["type"] == "text"]
+
+        assert len(image_items) == 4
+        assert [c["image"] for c in image_items] == [
+            "/img/a.png", "/img/b.png", "/img/c.png", "/img/d.png"
+        ]
+        assert all("<image>" not in t["text"] for t in text_items)
+
+    def test_format_numbered_image_placeholders(self):
+        """Rows with <image><image_N> patterns should consume both tokens."""
+        sample = {
+            "images": ["/img/0.png", "/img/1.png"],
+            "question": "<image><image_1>\nFront\n<image><image_2>\nTop",
+            "answer": "6",
+            "task_name": "mmpr-tiny",
+        }
+        result = format_mmpr_tiny_dataset(sample)
+        user_content = result["messages"][0]["content"]
+
+        image_items = [c for c in user_content if c["type"] == "image"]
+        text_items = [c for c in user_content if c["type"] == "text"]
+
+        assert len(image_items) == 2
+        assert [c["image"] for c in image_items] == ["/img/0.png", "/img/1.png"]
+        # No <image_N> tokens should leak into text
+        for t in text_items:
+            assert "<image" not in t["text"]
 
 
 class TestMMPRTinyDataset:
