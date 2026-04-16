@@ -56,6 +56,7 @@ class SGLangGeneration(GenerationInterface):
         self.cluster = cluster
         self.cluster_cfg = cluster_cfg
         self.sglang_cfg = sglang_cfg
+        self._health_monitor = None
 
         pgs = cluster._init_placement_groups(
             strategy="PACK",
@@ -99,11 +100,10 @@ class SGLangGeneration(GenerationInterface):
 
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
 
-        monitor = None
         if sglang_cfg["sglang_cfg"].get("use_fault_tolerance"):
             monitor = RolloutHealthMonitor(self, sglang_cfg)
             monitor.start()
-        self._health_monitor = monitor
+            self._health_monitor = monitor
 
     # ------------------------------------------------------------------
     # Engine topology properties (formerly ``ServerGroup``)
@@ -796,11 +796,29 @@ class SGLangGeneration(GenerationInterface):
     
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up for colocated inference."""
-        pass
+        tags = kwargs.get("tags", None)
+        if self.needs_offload:
+            if tags is None:
+                self.onload_weights()
+                self.onload_kv()
+            else:
+                if "weights" in tags:
+                    self.onload_weights()
+                if "kv_cache" in tags:
+                    self.onload_kv()
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""
-        pass
+        tags = kwargs.get("tags", None)
+        if self.needs_offload:
+            if tags is None:
+                self.offload_weights()
+                self.offload_kv()
+            else:
+                if "weights" in tags:
+                    self.offload_weights()
+                if "kv_cache" in tags:
+                    self.offload_kv()
     
     def invalidate_kv_cache(self) -> bool:
         """Invalidate KV cache before weight updates (Megatron-style).
@@ -1029,8 +1047,8 @@ def _start_router(
     ``actor_handle=None`` (we do not own that router and must not terminate it).
     Otherwise spawn a ``RouterActor`` in sglang env to own the router process.
     """
-    router_cfg = sglang_cfg["sglang_router"]
-    if router_cfg["sglang_router_ip"] is not None:
+    router_cfg = sglang_cfg.get("sglang_router") or {}
+    if router_cfg.get("sglang_router_ip") is not None:
         return router_cfg["sglang_router_ip"], router_cfg["sglang_router_port"], None
 
     router_actor = RouterActor.options(
