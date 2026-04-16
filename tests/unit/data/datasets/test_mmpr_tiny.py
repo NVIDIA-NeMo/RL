@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import tempfile
+from unittest.mock import MagicMock
+
 import pytest
+import torch
+from PIL import Image
 
 from nemo_rl.data.datasets.response_datasets.mmpr_tiny import (
     MMPRTinyDataset,
@@ -106,3 +112,142 @@ class TestPromptFileFormatCompatibility:
 
         # Should not raise IndexError or KeyError
         prompt.format("test question")
+
+
+def _make_stub_nemotron_processor():
+    """Build a minimal stub whose class name is NemotronNanoVLV2Processor.
+
+    The stub implements just enough of the AutoProcessor interface for
+    vlm_hf_data_processor to exercise the placeholder-style code path.
+    """
+    fake_input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class NemotronNanoVLV2Processor:
+        image_token = "<image>"
+
+        def __init__(self):
+            self.image_processor = _ImageProcessor()
+            self.tokenizer = MagicMock()
+            self.tokenizer.model_input_names = ["input_ids"]
+
+        def apply_chat_template(self, messages, **kwargs):
+            # Flatten message content into a single string for the stub
+            parts = []
+            for msg in messages:
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    parts.append(content)
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and "text" in item:
+                            parts.append(item["text"])
+            return " ".join(parts)
+
+        def __call__(self, text=None, images=None, **kwargs):
+            return {
+                "input_ids": fake_input_ids,
+                "pixel_values": torch.randn(1, 3, 224, 224),
+            }
+
+    return NemotronNanoVLV2Processor()
+
+
+@pytest.fixture()
+def tiny_image_path(tmp_path):
+    """Create a minimal 1x1 PNG for processor smoke tests."""
+    img_path = tmp_path / "test_image.png"
+    Image.new("RGB", (1, 1), color="red").save(img_path)
+    return str(img_path)
+
+
+class TestVLMProcessorMMPRTiny:
+    """Smoke test: vlm_hf_data_processor with mmpr-tiny task through the
+    NemotronNanoVLV2Processor placeholder-style code path."""
+
+    def _make_sample(self, image_path):
+        return {
+            "images": [image_path],
+            "question": "<image>\nWhat is the measure of angle BAC?",
+            "answer": "A",
+            "task_name": "mmpr-tiny",
+        }
+
+    def test_processor_produces_valid_datum_spec(self, tiny_image_path):
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        task_data_spec = TaskDataSpec(
+            task_name="mmpr-tiny",
+            prompt_file="examples/prompts/mmpr_tiny_cot_nemotron_omni.txt",
+        )
+        processor = _make_stub_nemotron_processor()
+        sample = self._make_sample(tiny_image_path)
+
+        result = vlm_hf_data_processor(
+            datum_dict=sample,
+            task_data_spec=task_data_spec,
+            processor=processor,
+            max_seq_length=8192,
+            idx=0,
+        )
+
+        assert "message_log" in result
+        assert "length" in result
+        assert "extra_env_info" in result
+        assert "ground_truth" in result["extra_env_info"]
+        assert result["extra_env_info"]["ground_truth"] == "A"
+        assert "vllm_content" in result
+        assert "vllm_images" in result
+        assert len(result["vllm_images"]) == 1
+        assert result["task_name"] == "mmpr-tiny"
+
+    def test_prompted_text_contains_boxed_literal(self, tiny_image_path):
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        task_data_spec = TaskDataSpec(
+            task_name="mmpr-tiny",
+            prompt_file="examples/prompts/mmpr_tiny_cot_nemotron_omni.txt",
+        )
+        processor = _make_stub_nemotron_processor()
+        sample = self._make_sample(tiny_image_path)
+
+        result = vlm_hf_data_processor(
+            datum_dict=sample,
+            task_data_spec=task_data_spec,
+            processor=processor,
+            max_seq_length=8192,
+            idx=0,
+        )
+
+        vllm_content = result["vllm_content"]
+        assert "\\boxed{}" in vllm_content
+
+    def test_placeholder_conversion_for_nemotron_processor(self, tiny_image_path):
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        task_data_spec = TaskDataSpec(
+            task_name="mmpr-tiny",
+            prompt_file="examples/prompts/mmpr_tiny_cot_nemotron_omni.txt",
+        )
+        processor = _make_stub_nemotron_processor()
+        sample = self._make_sample(tiny_image_path)
+
+        result = vlm_hf_data_processor(
+            datum_dict=sample,
+            task_data_spec=task_data_spec,
+            processor=processor,
+            max_seq_length=8192,
+            idx=0,
+        )
+
+        # The vllm_content should contain the <image> placeholder (added by
+        # the processor path for NemotronNanoVLV2Processor) followed by the
+        # prompted question text
+        vllm_content = result["vllm_content"]
+        assert "<image>" in vllm_content
+        assert "What is the measure of angle BAC?" in vllm_content
