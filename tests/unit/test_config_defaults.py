@@ -206,11 +206,44 @@ def test_missing_nested_section_created():
     assert config == {"inner": {"enabled": False, "value": 5}}
 
 
+def test_required_fields_skipped():
+    """Fields without defaults (required) must be skipped, not injected."""
+
+    @dataclass
+    class Defaults:
+        required_field: int  # no default — must come from YAML
+        optional_field: bool = False
+
+    config = {"required_field": 42}
+    apply_config_defaults(config, Defaults)
+    # required_field was already present — kept; optional_field filled.
+    assert config == {"required_field": 42, "optional_field": False}
+
+    # When required field is absent, it must NOT be injected.
+    config2: dict = {}
+    apply_config_defaults(config2, Defaults)
+    assert "required_field" not in config2
+    assert config2 == {"optional_field": False}
+
+
 def test_non_dataclass_ignored():
     """Passing a non-dataclass as defaults_cls should be a no-op."""
     config = {"a": 1}
     result = apply_config_defaults(config, dict)
     assert result == {"a": 1}
+
+
+def test_non_type_hint_skipped():
+    """When a type hint is not a concrete type (e.g., Union), recursion is skipped."""
+
+    @dataclass
+    class Defaults:
+        items: list = field(default_factory=list)
+
+    config = {"items": {"nested": True}}
+    apply_config_defaults(config, Defaults)
+    # items is a dict in config but the hint (list) is not a dataclass → no recursion
+    assert config == {"items": {"nested": True}}
 
 
 def test_grpo_master_defaults_integration():
