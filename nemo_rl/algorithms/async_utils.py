@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import queue as _queue
 import threading as _threading
 import time
 from typing import Any, Optional
@@ -574,6 +575,9 @@ class AsyncTrajectoryCollector:
         self._completed_per_target: dict[int, int] = {}  # Prompt-group completions (counts once per prompt_idx; success + failure)
         self._counter_lock: _threading.Lock = _threading.Lock()
 
+        # Queue of target_weight_versions for failed trajectories that need replacement prompts
+        self._failed_trajectory_queue: _queue.Queue = _queue.Queue()
+
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
 
@@ -814,6 +818,9 @@ class AsyncTrajectoryCollector:
 
                 self._process_batch(batch)
 
+                # Backfill any failed trajectories with replacement prompts
+                self._backfill_failed_trajectories()
+
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
             import traceback
@@ -928,6 +935,67 @@ class AsyncTrajectoryCollector:
             import traceback
 
             traceback.print_exc()
+
+    def _backfill_failed_trajectories(self):
+        """Dispatch replacement prompts for any failed trajectory slots.
+
+        When a trajectory fails after all retries, instead of leaving a gap in the
+        buffer (which causes a permanent stall), we pull a fresh prompt from the
+        dataloader and spawn a new worker for the same target weight.
+        """
+        num_generations = self.master_config["grpo"]["num_generations_per_prompt"]
+        num_prompts = int(self.master_config["grpo"]["num_prompts_per_step"])
+        backfills = []
+        try:
+            while True:
+                target_wv = self._failed_trajectory_queue.get_nowait()
+                backfills.append(target_wv)
+        except _queue.Empty:
+            pass
+
+        if not backfills:
+            return
+
+        from collections import Counter
+        target_counts = Counter(backfills)
+        for target_wv, count in target_counts.items():
+            needed = ray.get(
+                self.replay_buffer.get_trajectories_needed.remote(target_wv, num_prompts)
+            )
+            if needed <= 0:
+                continue
+
+            to_dispatch = min(count, needed)
+            print(f"🔄 Backfilling {to_dispatch} replacement prompt(s) for target_weight {target_wv}")
+
+            for _ in range(to_dispatch):
+                try:
+                    replacement_batch = next(iter(self.dataloader))
+                    single_prompt = replacement_batch.slice(0, 1)
+                    repeated = single_prompt.repeat_interleave(num_generations)
+
+                    self._inflight_sema.acquire()
+                    worker = _threading.Thread(
+                        target=self._run_prompt_group_worker,
+                        args=(
+                            repeated,
+                            self.current_weight_version,
+                            target_wv,
+                            -1,  # sentinel prompt_idx for backfill
+                        ),
+                        daemon=True,
+                    )
+                    with self._threads_lock:
+                        self._inflight_threads.add(worker)
+                    # Track the backfill worker in spawned counters
+                    with self._counter_lock:
+                        self._spawned_per_target[target_wv] = (
+                            self._spawned_per_target.get(target_wv, 0) + 1
+                        )
+                    worker.start()
+                except StopIteration:
+                    print("⚠️ Dataloader exhausted during backfill, skipping")
+                    break
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
@@ -1211,13 +1279,13 @@ class AsyncTrajectoryCollector:
                 return  # Exit this worker, retry worker will handle cleanup
             else:
                 print(
-                    f"   ⚠️ Max retries ({MAX_RETRIES}) exceeded - trajectory will NOT be buffered!"
-                )
-                print(
-                    f"   ⚠️ This may cause training to stall if it expects this trajectory."
+                    f"   ⚠️ Max retries ({MAX_RETRIES}) exceeded - queuing backfill with replacement prompt"
                 )
                 import traceback
                 traceback.print_exc()
+                # Queue a backfill request so the collection loop dispatches a
+                # replacement prompt for this target, preventing a permanent stall.
+                self._failed_trajectory_queue.put(target_weight_version)
         finally:
             # Skip cleanup if we spawned a retry worker (it will handle cleanup)
             if _retry_spawned:
