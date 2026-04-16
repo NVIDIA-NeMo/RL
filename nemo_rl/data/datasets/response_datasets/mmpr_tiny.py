@@ -140,6 +140,8 @@ class MMPRTinyDataset(RawDataset):
     Supports loading from a local preprocessed cache or downloading from HuggingFace.
 
     Args:
+        split: Dataset split to use. Only "train" is supported (validation is
+            created via split_validation_size).
         download_dir: Directory containing the preprocessed MMPR-Tiny cache, or
             the target directory for downloading from HuggingFace.
         split_validation_size: Fraction of data to hold out for validation (default 0).
@@ -148,11 +150,18 @@ class MMPRTinyDataset(RawDataset):
 
     def __init__(
         self,
+        split: str = "train",
         download_dir: str = "",
         split_validation_size: float = 0,
         seed: int = 42,
         **kwargs,
     ):
+        if split != "train":
+            raise ValueError(
+                f"Invalid split: {split}. MMPR-Tiny only supports 'train'. "
+                "Use split_validation_size to create a validation split."
+            )
+
         if not download_dir:
             raise ValueError(
                 "download_dir is required for MMPR-Tiny dataset. "
