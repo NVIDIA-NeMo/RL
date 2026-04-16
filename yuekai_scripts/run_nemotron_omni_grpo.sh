@@ -12,5 +12,9 @@ mkdir -p ./results
 LOG_FILE=./results/nemotron_omni_grpo.log
 exec > >(tee "${LOG_FILE}") 2>&1
 
-uv run examples/run_vlm_grpo.py --config yuekai_scripts/configs/vlm_grpo_nemotron_omni.yaml \
-    cluster.gpus_per_node=8
+
+config_file="yuekai_scripts/configs/vlm_grpo_nemotron_omni.yaml"
+# config_file="yuekai_scripts/configs/vlm_grpo_nemotron_omni_multinode.yaml"
+uv run examples/run_vlm_grpo.py --config $config_file \
+    cluster.gpus_per_node=8 \
+    cluster.num_nodes=1

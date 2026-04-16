@@ -1,19 +1,19 @@
-# GRPO training for Nemotron-Omni (MoE ~30B) on CLEVR-CoGenT
-# Based on vlm_grpo_3B.yaml with automodel EP=8 for MoE
+# GRPO training for Nemotron-Omni (MoE ~30B) on CLEVR-CoGenT — multi-node
+# Scaled up from vlm_grpo_nemotron_omni.yaml for 2+ node training
 defaults: "../../examples/configs/vlm_grpo_3B.yaml"
 
 grpo:
-  num_prompts_per_step: 8
+  num_prompts_per_step: 64
   reward_shaping:
     overlong_buffer_length: 512
 
 checkpointing:
-  checkpoint_dir: results/vlm_grpo_nemotron_omni
+  checkpoint_dir: results/vlm_grpo_nemotron_omni_multinode
   save_optimizer: false
 
 policy:
   model_name: /lustre/fsw/portfolios/coreai/users/yuekaiz/HF/nemotron-3-nano-omni-ea1_v2.0
-  train_global_batch_size: 128
+  train_global_batch_size: 1024
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 8192
@@ -46,8 +46,8 @@ policy:
       skip_tokenizer_init: false
       tensor_parallel_size: 8
       enforce_eager: true
-      max_model_len: 8192
-      gpu_memory_utilization: 0.2
+      max_model_len: 16384
+      gpu_memory_utilization: 0.8
     vllm_kwargs:
       limit_mm_per_prompt: {"image": 2}
       max_num_batched_tokens: 8192
@@ -82,7 +82,8 @@ logger:
   wandb_enabled: true
   wandb:
     project: grpo-vlm
-    name: nemotron-omni-grpo-clevr-4k
+    name: nemotron-omni-grpo-clevr-multinode
 
 cluster:
   gpus_per_node: 8
+  num_nodes: 2

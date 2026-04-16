@@ -401,7 +401,10 @@ class WandbLogger(LoggerInterface):
             step: Global step value
             name: Name of the metric
         """
-        self.run.log({name: wandb.Histogram(histogram)}, step=step)
+        try:
+            self.run.log({name: wandb.Histogram(histogram)}, step=step)
+        except ValueError:
+            pass  # skip histogram when data range is too narrow for binning
 
 
 class SwanlabLogger(LoggerInterface):
