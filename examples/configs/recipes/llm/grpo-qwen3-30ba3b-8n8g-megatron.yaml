@@ -31,7 +31,7 @@ policy:
       lr_warmup_iters: 50
       lr_warmup_init: 3.0e-08
     env_vars:
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   generation:
     vllm_cfg:
       tensor_parallel_size: 4
