@@ -142,6 +142,43 @@ def bbox_giou_reward(
     return giou, giou > 0.5
 
 
+def verl_geo3k_reward(
+    ground_truth: str,
+    response: str,
+    format_score: float = 0.1,
+) -> tuple[float, bool]:
+    r"""Reward function for MMPR-Tiny task following verl's geo3k implementation.
+
+    Combines format checking and accuracy checking in a single function.
+    Format check looks for </think> tag and \\boxed{} pattern.
+    Accuracy check uses mathruler to extract and grade the boxed answer.
+
+    Args:
+        ground_truth: The correct answer.
+        response: Model's complete response (with <think> and \\boxed{}).
+        format_score: Weight for format check (default 0.1 = 10%).
+
+    Returns:
+        (reward, is_correct) where reward = (1-format_score)*accuracy + format_score*format.
+    """
+    from mathruler.grader import extract_boxed_content, grade_answer
+
+    format_pattern = re.compile(r"</think>.*\\boxed\{.*\}", re.DOTALL)
+    has_format = bool(re.search(format_pattern, response))
+    format_reward_value = 1.0 if has_format else 0.0
+
+    try:
+        answer = extract_boxed_content(response)
+        is_correct = grade_answer(answer, ground_truth)
+        acc_reward_value = 1.0 if is_correct else 0.0
+    except Exception:
+        acc_reward_value = 0.0
+        is_correct = False
+
+    final_reward = (1.0 - format_score) * acc_reward_value + format_score * format_reward_value
+    return final_reward, is_correct
+
+
 def combine_reward_functions(
     reward_functions: list[tuple[Callable[[str, str], tuple[float, bool]], float]],
 ) -> Callable[[str, str], tuple[float, bool]]:

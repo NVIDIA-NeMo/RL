@@ -472,6 +472,12 @@ def vlm_hf_data_processor(
         datum_dict = format_refcoco_dataset(datum_dict)
     elif datum_dict["task_name"] == "geometry3k":
         datum_dict = format_geometry3k_dataset(datum_dict)
+    elif datum_dict["task_name"] == "mmpr-tiny":
+        from nemo_rl.data.datasets.response_datasets.mmpr_tiny import (
+            format_mmpr_tiny_dataset,
+        )
+
+        datum_dict = format_mmpr_tiny_dataset(datum_dict)
     else:
         raise ValueError(f"No data processor for task {datum_dict['task_name']}")
 
