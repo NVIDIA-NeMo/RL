@@ -119,6 +119,7 @@ def _make_stub_nemotron_processor():
 
     The stub implements just enough of the AutoProcessor interface for
     vlm_hf_data_processor to exercise the placeholder-style code path.
+    It captures the exact text passed to __call__ for assertion.
     """
     fake_input_ids = torch.tensor([[1, 2, 3, 4, 5]])
 
@@ -132,9 +133,9 @@ def _make_stub_nemotron_processor():
             self.image_processor = _ImageProcessor()
             self.tokenizer = MagicMock()
             self.tokenizer.model_input_names = ["input_ids"]
+            self.captured_call_text = None
 
         def apply_chat_template(self, messages, **kwargs):
-            # Flatten message content into a single string for the stub
             parts = []
             for msg in messages:
                 content = msg.get("content", "")
@@ -147,6 +148,7 @@ def _make_stub_nemotron_processor():
             return " ".join(parts)
 
         def __call__(self, text=None, images=None, **kwargs):
+            self.captured_call_text = text
             return {
                 "input_ids": fake_input_ids,
                 "pixel_values": torch.randn(1, 3, 224, 224),
@@ -163,36 +165,46 @@ def tiny_image_path(tmp_path):
     return str(img_path)
 
 
+# The raw question text as it appears in the MMPR dataset (with <image> token)
+_RAW_QUESTION = "<image>\nWhat is the measure of angle BAC?"
+# The clean question after <image> stripping by format_mmpr_tiny_dataset
+_CLEAN_QUESTION = "What is the measure of angle BAC?"
+
+
+def _run_processor(tiny_image_path):
+    """Helper: run vlm_hf_data_processor on an MMPR sample and return
+    (result DatumSpec, stub processor with captured_call_text)."""
+    from nemo_rl.data.interfaces import TaskDataSpec
+    from nemo_rl.data.processors import vlm_hf_data_processor
+
+    task_data_spec = TaskDataSpec(
+        task_name="mmpr-tiny",
+        prompt_file="examples/prompts/mmpr_tiny_cot_nemotron_omni.txt",
+    )
+    processor = _make_stub_nemotron_processor()
+    sample = {
+        "images": [tiny_image_path],
+        "question": _RAW_QUESTION,
+        "answer": "A",
+        "task_name": "mmpr-tiny",
+    }
+
+    result = vlm_hf_data_processor(
+        datum_dict=sample,
+        task_data_spec=task_data_spec,
+        processor=processor,
+        max_seq_length=8192,
+        idx=0,
+    )
+    return result, processor
+
+
 class TestVLMProcessorMMPRTiny:
     """Smoke test: vlm_hf_data_processor with mmpr-tiny task through the
     NemotronNanoVLV2Processor placeholder-style code path."""
 
-    def _make_sample(self, image_path):
-        return {
-            "images": [image_path],
-            "question": "<image>\nWhat is the measure of angle BAC?",
-            "answer": "A",
-            "task_name": "mmpr-tiny",
-        }
-
     def test_processor_produces_valid_datum_spec(self, tiny_image_path):
-        from nemo_rl.data.interfaces import TaskDataSpec
-        from nemo_rl.data.processors import vlm_hf_data_processor
-
-        task_data_spec = TaskDataSpec(
-            task_name="mmpr-tiny",
-            prompt_file="examples/prompts/mmpr_tiny_cot_nemotron_omni.txt",
-        )
-        processor = _make_stub_nemotron_processor()
-        sample = self._make_sample(tiny_image_path)
-
-        result = vlm_hf_data_processor(
-            datum_dict=sample,
-            task_data_spec=task_data_spec,
-            processor=processor,
-            max_seq_length=8192,
-            idx=0,
-        )
+        result, _ = _run_processor(tiny_image_path)
 
         assert "message_log" in result
         assert "length" in result
@@ -204,50 +216,47 @@ class TestVLMProcessorMMPRTiny:
         assert len(result["vllm_images"]) == 1
         assert result["task_name"] == "mmpr-tiny"
 
-    def test_prompted_text_contains_boxed_literal(self, tiny_image_path):
-        from nemo_rl.data.interfaces import TaskDataSpec
-        from nemo_rl.data.processors import vlm_hf_data_processor
-
-        task_data_spec = TaskDataSpec(
-            task_name="mmpr-tiny",
-            prompt_file="examples/prompts/mmpr_tiny_cot_nemotron_omni.txt",
-        )
-        processor = _make_stub_nemotron_processor()
-        sample = self._make_sample(tiny_image_path)
-
-        result = vlm_hf_data_processor(
-            datum_dict=sample,
-            task_data_spec=task_data_spec,
-            processor=processor,
-            max_seq_length=8192,
-            idx=0,
-        )
-
+    def test_prompted_text_contains_boxed_literal_and_no_raw_dataset_string(
+        self, tiny_image_path
+    ):
+        result, _ = _run_processor(tiny_image_path)
         vllm_content = result["vllm_content"]
+
+        # Positive: literal \boxed{} must survive prompt formatting
         assert "\\boxed{}" in vllm_content
 
-    def test_placeholder_conversion_for_nemotron_processor(self, tiny_image_path):
-        from nemo_rl.data.interfaces import TaskDataSpec
-        from nemo_rl.data.processors import vlm_hf_data_processor
+        # Negative: the raw dataset string (with <image> prefix) must NOT leak through
+        assert _RAW_QUESTION not in vllm_content
 
-        task_data_spec = TaskDataSpec(
-            task_name="mmpr-tiny",
-            prompt_file="examples/prompts/mmpr_tiny_cot_nemotron_omni.txt",
-        )
-        processor = _make_stub_nemotron_processor()
-        sample = self._make_sample(tiny_image_path)
+    def test_placeholder_conversion_exact_string(self, tiny_image_path):
+        """Verify the exact tokenizer input for the placeholder-style processor path.
 
-        result = vlm_hf_data_processor(
-            datum_dict=sample,
-            task_data_spec=task_data_spec,
-            processor=processor,
-            max_seq_length=8192,
-            idx=0,
-        )
+        The processor stub captures the text argument passed to __call__.
+        It must equal "<image>\\n<prompted_question>" where prompted_question
+        is the prompt template formatted with the clean question text.
+        """
+        result, processor = _run_processor(tiny_image_path)
 
-        # The vllm_content should contain the <image> placeholder (added by
-        # the processor path for NemotronNanoVLV2Processor) followed by the
-        # prompted question text
+        # Build expected prompted question from the real prompt file
+        with open("examples/prompts/mmpr_tiny_cot_nemotron_omni.txt") as f:
+            prompt_template = f.read()
+        prompted_question = prompt_template.format(_CLEAN_QUESTION)
+
+        # The placeholder-style path should produce: "<image>\n<prompted_question>"
+        expected_tokenizer_input = "<image>\n" + prompted_question
+
+        # The stub's apply_chat_template joins message parts with spaces,
+        # so the captured text passed to __call__ is the chat-templated string.
+        # Verify the vllm_content (which is apply_chat_template output) matches.
         vllm_content = result["vllm_content"]
-        assert "<image>" in vllm_content
-        assert "What is the measure of angle BAC?" in vllm_content
+        assert vllm_content == expected_tokenizer_input
+
+        # Verify exactly one <image> token in the final output
+        assert vllm_content.count("<image>") == 1
+
+        # Verify the question text is present
+        assert _CLEAN_QUESTION in vllm_content
+
+        # Verify the captured __call__ text also matches
+        # (processor.__call__ receives the apply_chat_template output)
+        assert processor.captured_call_text == expected_tokenizer_input
