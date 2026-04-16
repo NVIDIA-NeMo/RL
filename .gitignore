@@ -48,5 +48,8 @@ code_snapshots*/
 *runtime_env.yaml
 !default_runtime_env.yaml
 
-# Claude Code review memory (local only)
+# Claude Code / Codex / Humanize (local only)
 .claude/review-memory/
+.claude/settings.local.json
+.codex
+.humanize/
