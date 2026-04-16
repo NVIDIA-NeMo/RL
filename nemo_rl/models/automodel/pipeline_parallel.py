@@ -711,6 +711,10 @@ def pp_forward_with_post_processing(
         vals = broadcasted["topk_logits"]
         idx = broadcasted["topk_indices"]
 
+        # Trim dummy-padded rows (same as logprobs path)
+        vals = vals[:actual_seqs]
+        idx = idx[:actual_seqs]
+
         # Pad to global seq dim
         pad_needed = seq_dim_size - vals.shape[1]
         if pad_needed > 0:
