@@ -228,7 +228,11 @@ def apply_config_defaults(config: dict[str, Any], defaults_cls: type) -> dict[st
         elif isinstance(config[f.name], dict):
             # Recurse into nested dataclass defaults.
             nested_type = hints.get(f.name)
-            if nested_type is not None and dataclasses.is_dataclass(nested_type):
+            if (
+                nested_type is not None
+                and isinstance(nested_type, type)
+                and dataclasses.is_dataclass(nested_type)
+            ):
                 apply_config_defaults(config[f.name], nested_type)
 
     return config
