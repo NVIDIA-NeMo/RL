@@ -459,10 +459,10 @@ jobs:
               needs.lint-check.result == 'success' &&
               (needs.pr-branch-up-to-date-check.result == 'success' || needs.pr-branch-up-to-date-check.result == 'skipped') &&
               (
-                needs.pre-flight.outputs.test_level != 'none' &&
-                needs.sphinx-build.result == 'success' &&
-                (needs.build-container.result == 'success' || needs.build-container.result == 'skipped') &&
+                needs.pre-flight.outputs.test_level == 'none' ||
                 (
+                  needs.sphinx-build.result == 'success' &&
+                  (needs.build-container.result == 'success' || needs.build-container.result == 'skipped') &&
                   (
                     (needs.cicd-doc-tests.result == 'success' || needs.cicd-doc-tests.result == 'skipped') &&
                     (needs.cicd-unit-tests.result == 'skipped' || needs.cicd-unit-tests.result == 'success') &&
