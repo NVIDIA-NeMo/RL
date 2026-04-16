@@ -170,6 +170,4 @@ class MMPRTinyDataset(RawDataset):
         )
         self.val_dataset = None
 
-        self.preprocessor = format_mmpr_tiny_dataset
-
         self.split_train_validation(split_validation_size, seed)
