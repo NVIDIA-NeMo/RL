@@ -78,11 +78,19 @@ def _ensure_mmpr_cached(download_dir: str) -> None:
 
             print(f"Downloading MMPR-Tiny to {download_dir}...")
 
+            temp = os.path.join(download_dir, "_temp")
+
+            # Clean up any partial state from a previous interrupted attempt
+            shutil.rmtree(temp, ignore_errors=True)
+            if os.path.exists(images_dir):
+                shutil.rmtree(images_dir)
+            if os.path.exists(parquet_path):
+                os.remove(parquet_path)
+
             zip_path = hf_hub_download(
                 "OpenGVLab/MMPR-Tiny", "images.zip", repo_type="dataset"
             )
             with zipfile.ZipFile(zip_path, "r") as zf:
-                temp = os.path.join(download_dir, "_temp")
                 zf.extractall(temp)
                 extracted_images = os.path.join(temp, "images")
                 os.makedirs(os.path.dirname(images_dir), exist_ok=True)
