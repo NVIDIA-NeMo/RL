@@ -81,14 +81,21 @@ runs:
       if: ${{ inputs.has-azure-credentials == 'true' }}
       shell: bash
       run: |
-        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        for i in 1 2 3; do
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash && break
+          echo "Attempt $i failed, retrying in 10s..."
+          sleep 10
+        done
 
     - name: Install uuidgen
       shell: bash -x -e -u -o pipefail {0}
       if: ${{ contains(inputs.runner, 'gcp') }}
       run: |
-        apt-get update
-        apt-get install -y uuid-runtime
+        for i in 1 2 3; do
+          apt-get update && apt-get install -y uuid-runtime && break
+          echo "Attempt $i failed, retrying in 10s..."
+          sleep 10
+        done
 
     - name: Docker system cleanup
       shell: bash
