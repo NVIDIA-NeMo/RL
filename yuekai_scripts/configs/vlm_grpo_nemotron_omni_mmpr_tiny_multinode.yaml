@@ -1,26 +1,41 @@
-# GRPO training for Nemotron-Omni (MoE ~30B) on MMPR-Tiny
-# Based on vlm_grpo_nemotron_omni.yaml with MMPR-Tiny dataset and verl_geo3k reward
+# GRPO training for Nemotron-Omni (MoE ~30B) on MMPR-Tiny — multi-node
+# Aligned with Megatron-Bridge vlm_grpo_nanov3vl_mmpr_tiny.yaml training recipe
+# AutoModel backend with EP=8
 defaults: "../../examples/configs/vlm_grpo_3B.yaml"
 
 grpo:
-  num_prompts_per_step: 16
-  num_generations_per_prompt: 8
+  num_prompts_per_step: 512
+  num_generations_per_prompt: 16
+  overlong_filtering: true
   val_at_start: true
+  val_period: 10
+  max_val_samples: 256
+  val_batch_size: 256
+  seq_logprob_error_threshold: 2
   reward_shaping:
     overlong_buffer_length: 512
 
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  use_on_policy_kl_approximation: true
+  sequence_level_importance_ratios: true
+  token_level_loss: false
+
 checkpointing:
-  checkpoint_dir: results/vlm_grpo_nemotron_omni_mmpr_tiny
+  checkpoint_dir: results/vlm_grpo_nemotron_omni_mmpr_tiny_multinode
   save_optimizer: false
+  save_period: 10
   checkpoint_must_save_by: "00:03:45:00"
 
 policy:
   model_name: /lustre/fs1/portfolios/coreai/users/aroshanghias/checkpoints/mpo-nanov3omni-mmpr-nanov2-filtered-conv3d-0303/step_400
-  train_global_batch_size: 128
+  train_global_batch_size: 2048
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  logprob_chunk_size: 256
-  max_total_sequence_length: 8196
+  logprob_chunk_size: 512
+  max_total_sequence_length: 16384
   dynamic_batching:
     enabled: false
   sequence_packing:
@@ -28,6 +43,19 @@ policy:
   optimizer:
     kwargs:
       lr: 3.0e-06
+      weight_decay: 0.0
+      betas: [0.9, 0.99]
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.01
+        end_factor: 1.0
+        total_iters: 10
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [10]
   dtensor_cfg:
     expert_parallel_size: 8
     activation_checkpointing: false
@@ -39,22 +67,22 @@ policy:
         attn: sdpa
         linear: torch
         rms_norm: torch_fp32
-        enable_deepep: true
+        enable_deepep: false
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
   generation:
-    max_new_tokens: 4096
+    max_new_tokens: 8192
     bad_words: ["<image>", "<img>", "</img>", "<so_embedding>", "<so_start>", "<so_end>"]
     vllm_cfg:
       skip_tokenizer_init: false
       tensor_parallel_size: 8
       enforce_eager: true
       max_model_len: ${policy.max_total_sequence_length}
-      gpu_memory_utilization: 0.2
+      gpu_memory_utilization: 0.7
     vllm_kwargs:
       limit_mm_per_prompt: {"image": 2}
-      max_num_batched_tokens: 8192
+      max_num_batched_tokens: 16384
       mm_processor_cache_gb: 0
       mamba_ssm_cache_dtype: "float32"
       skip_mm_profiling: true
@@ -85,7 +113,8 @@ logger:
   wandb_enabled: true
   wandb:
     project: grpo-vlm
-    name: nemotron-omni-grpo-mmpr-tiny
+    name: nemotron-omni-grpo-mmpr-tiny-multinode
 
 cluster:
   gpus_per_node: 8
+  num_nodes: 16
