@@ -131,6 +131,15 @@ policy:
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false
+    # recompute_granularity controls activation checkpointing depth.
+    # "full": recompute all activations (default, max memory savings).
+    # "selective": recompute only specific modules (see recompute_modules).
+    # Only takes effect when activation_checkpointing: true.
+    recompute_granularity: "full"
+    # Modules to selectively recompute when recompute_granularity="selective".
+    # Options: ["core_attn", "moe", "mla_up_proj"]. Null defaults to ["core_attn"].
+    # Use ["moe"] for MoE models to recompute expert activations only.
+    recompute_modules: null
     converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1

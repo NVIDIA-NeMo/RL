@@ -468,9 +468,21 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     # Activation checkpointing
     if config["megatron_cfg"]["activation_checkpointing"]:
-        model_cfg.recompute_granularity = "full"
-        model_cfg.recompute_method = "uniform"
-        model_cfg.recompute_num_layers = 1
+        granularity = config["megatron_cfg"].get("recompute_granularity", "full")
+        model_cfg.recompute_granularity = granularity
+        if granularity == "full":
+            model_cfg.recompute_method = "uniform"
+            model_cfg.recompute_num_layers = 1
+        elif granularity == "selective":
+            recompute_modules = config["megatron_cfg"].get("recompute_modules")
+            if recompute_modules is not None:
+                model_cfg.recompute_modules = recompute_modules
+            # else: MCore defaults to ["core_attn"] when recompute_modules is None
+        else:
+            raise ValueError(
+                f"Invalid recompute_granularity: {granularity!r}. "
+                "Valid options are 'full' or 'selective'."
+            )
 
     # Activation function validation
     if not model_cfg.gated_linear_unit:
