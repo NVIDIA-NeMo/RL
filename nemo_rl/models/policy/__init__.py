@@ -234,6 +234,11 @@ class MegatronConfig(TypedDict):
     # Options are 'allgather','alltoall' and 'flex'
     # Use 'flex' when using DeepEP
     moe_token_dispatcher_type: str
+    # Flex dispatcher backend: 'deepep' or 'hybridep'. Only used when
+    # moe_token_dispatcher_type == 'flex'. HybridEP is required on GB200/GB300 NVL72.
+    moe_flex_dispatcher_backend: NotRequired[str]
+    # Number of SMs allocated to the hybridep backend (default 16).
+    moe_hybridep_num_sms: NotRequired[int]
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
     peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
@@ -251,6 +256,11 @@ class MegatronConfig(TypedDict):
     linear_ce_fusion_chunk_size: NotRequired[int]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
+    # NCCL stream priority groups for communication overlap.
+    # Valid group names: "ep" (expert parallel), "dp_cp" (data+context parallel),
+    # "ep_dp" (expert+data parallel). Example: ["ep"] for EP-heavy MoE workloads.
+    # Boosts EP A2A communication priority, reducing latency in large EP configs.
+    high_priority_stream_groups: NotRequired[list[str]]
 
 
 class DraftConfigDisabled(TypedDict):

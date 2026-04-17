@@ -430,6 +430,13 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         "moe_shared_expert_overlap"
     ]
 
+    if "moe_flex_dispatcher_backend" in config["megatron_cfg"]:
+        model_cfg.moe_flex_dispatcher_backend = config["megatron_cfg"][
+            "moe_flex_dispatcher_backend"
+        ]
+    if "moe_hybridep_num_sms" in config["megatron_cfg"]:
+        model_cfg.moe_hybridep_num_sms = config["megatron_cfg"]["moe_hybridep_num_sms"]
+
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
 
@@ -738,6 +745,18 @@ def setup_model_and_optimizer(
     # TODO: Freeze state.cfg
 
     megatron_cfg.dist.external_gpu_device_mapping = True
+    high_priority_stream_groups = policy_cfg["megatron_cfg"].get(
+        "high_priority_stream_groups"
+    )
+    if high_priority_stream_groups:
+        _VALID_HP_GROUPS = {"ep", "dp_cp", "ep_dp"}
+        invalid = set(high_priority_stream_groups) - _VALID_HP_GROUPS
+        if invalid:
+            raise ValueError(
+                f"Invalid high_priority_stream_groups values: {invalid}. "
+                f"Valid values: {_VALID_HP_GROUPS}"
+            )
+        megatron_cfg.dist.high_priority_stream_groups = high_priority_stream_groups
     initialize_megatron(
         cfg=megatron_cfg,
         get_embedding_ranks=get_embedding_ranks,

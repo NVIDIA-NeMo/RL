@@ -156,6 +156,10 @@ policy:
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     gradient_accumulation_fusion: false
+    # NCCL stream priority for parallel groups. Reduces EP A2A communication latency.
+    # Valid values: "ep", "dp_cp", "ep_dp". Example: ["ep"] for MoE with large EP.
+    # Empty list or absent key disables (default: all groups use same priority).
+    high_priority_stream_groups: []
 
     peft:
       enabled: false
