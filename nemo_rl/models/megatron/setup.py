@@ -430,6 +430,49 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         "moe_shared_expert_overlap"
     ]
 
+    # HybridEP settings for MoE expert parallelism
+    # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
+    if "moe_flex_dispatcher_backend" in config["megatron_cfg"]:
+        model_cfg.moe_flex_dispatcher_backend = config["megatron_cfg"][
+            "moe_flex_dispatcher_backend"
+        ]
+    if "moe_hybridep_num_sms" in config["megatron_cfg"]:
+        model_cfg.moe_hybridep_num_sms = config["megatron_cfg"]["moe_hybridep_num_sms"]
+
+    # HybridEP environment variables
+    # These are required by DeepEP's hybrid-ep branch for NVLink domain configuration.
+    # Users can set them explicitly via config, or they will be auto-computed with a warning.
+    if config["megatron_cfg"].get("moe_flex_dispatcher_backend") == "hybridep":
+        ep_size = model_cfg.expert_model_parallel_size
+
+        # NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
+        if "hybridep_num_ranks_per_nvlink_domain" in config["megatron_cfg"]:
+            val = config["megatron_cfg"]["hybridep_num_ranks_per_nvlink_domain"]
+            os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = str(val)
+        elif "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" not in os.environ:
+            default_val = min(ep_size, 64)
+            os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = str(default_val)
+            warnings.warn(
+                f"HybridEP: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN not configured. "
+                f"Auto-setting to min(expert_model_parallel_size={ep_size}, 64) = {default_val}. "
+                f"Set 'hybridep_num_ranks_per_nvlink_domain' in megatron_cfg to override.",
+                stacklevel=2,
+            )
+
+        # USE_MNNVL
+        if "hybridep_use_mnnvl" in config["megatron_cfg"]:
+            val = config["megatron_cfg"]["hybridep_use_mnnvl"]
+            os.environ["USE_MNNVL"] = str(int(val))
+        elif "USE_MNNVL" not in os.environ:
+            default_val = int(ep_size > 4)
+            os.environ["USE_MNNVL"] = str(default_val)
+            warnings.warn(
+                f"HybridEP: USE_MNNVL not configured. "
+                f"Auto-setting to int(expert_model_parallel_size={ep_size} > 4) = {default_val}. "
+                f"Set 'hybridep_use_mnnvl' in megatron_cfg to override.",
+                stacklevel=2,
+            )
+
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
 
@@ -738,6 +781,18 @@ def setup_model_and_optimizer(
     # TODO: Freeze state.cfg
 
     megatron_cfg.dist.external_gpu_device_mapping = True
+    high_priority_stream_groups = policy_cfg["megatron_cfg"].get(
+        "high_priority_stream_groups"
+    )
+    if high_priority_stream_groups:
+        _VALID_HP_GROUPS = {"ep", "dp_cp", "ep_dp"}
+        invalid = set(high_priority_stream_groups) - _VALID_HP_GROUPS
+        if invalid:
+            raise ValueError(
+                f"Invalid high_priority_stream_groups values: {invalid}. "
+                f"Valid values: {_VALID_HP_GROUPS}"
+            )
+        megatron_cfg.dist.high_priority_stream_groups = high_priority_stream_groups
     initialize_megatron(
         cfg=megatron_cfg,
         get_embedding_ranks=get_embedding_ranks,

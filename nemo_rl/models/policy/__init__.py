@@ -236,6 +236,14 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # HybridEP settings for MoE expert parallelism (requires moe_token_dispatcher_type='flex')
+    # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
+    moe_flex_dispatcher_backend: NotRequired[str]
+    moe_hybridep_num_sms: NotRequired[int]
+    # Number of HybridEP ranks per NVLink domain (default: min(expert_model_parallel_size, 64))
+    hybridep_num_ranks_per_nvlink_domain: NotRequired[int]
+    # Enable multi-node NVLink support (default: expert_model_parallel_size > 4)
+    hybridep_use_mnnvl: NotRequired[bool]
     peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
@@ -251,6 +259,11 @@ class MegatronConfig(TypedDict):
     linear_ce_fusion_chunk_size: NotRequired[int]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
+    # NCCL stream priority groups for communication overlap.
+    # Valid group names: "ep" (expert parallel), "dp_cp" (data+context parallel),
+    # "ep_dp" (expert+data parallel). Example: ["ep"] for EP-heavy MoE workloads.
+    # Boosts EP A2A communication priority, reducing latency in large EP configs.
+    high_priority_stream_groups: NotRequired[list[str]]
 
 
 class DraftConfigDisabled(TypedDict):
