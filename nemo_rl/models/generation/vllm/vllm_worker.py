@@ -47,6 +47,34 @@ class BaseVllmGenerationWorker:
         return f"{self.__class__.__name__}"
 
     @staticmethod
+    def _load_logits_processor_classes(processor_specs: list[str]) -> list[type]:
+        """Load logits processor classes from module:class strings.
+
+        Args:
+            processor_specs: List of strings in format "module.path:ClassName"
+
+        Returns:
+            List of loaded processor classes
+        """
+        import importlib
+
+        processor_classes = []
+        for spec in processor_specs:
+            try:
+                if ":" not in spec:
+                    raise ValueError(f"Invalid spec '{spec}'. Must be 'module:ClassName'")
+
+                module_path, class_name = spec.split(":", 1)
+                module = importlib.import_module(module_path)
+                processor_class = getattr(module, class_name)
+                processor_classes.append(processor_class)
+            except Exception as e:
+                import warnings
+                warnings.warn(f"Failed to load logits processor '{spec}': {e}")
+
+        return processor_classes
+
+    @staticmethod
     def configure_worker(
         num_gpus: int | float, bundle_indices: Optional[tuple[int, list[int]]] = None
     ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
@@ -112,6 +140,11 @@ class BaseVllmGenerationWorker:
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         # Skip vllm P2P check and rely on driver to report peer to peer capability.
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
+
+        if "cfg" in init_kwargs:
+            cfg = init_kwargs["cfg"]
+            if "vllm_cfg" in cfg and "logits_processor_env_vars" in cfg["vllm_cfg"]:
+                env_vars.update(cfg["vllm_cfg"]["logits_processor_env_vars"])
 
         return resources, env_vars, init_kwargs
 
@@ -536,6 +569,12 @@ class BaseVllmGenerationWorker:
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
 
+        logits_processor_classes = []
+        if self.cfg["vllm_cfg"].get("logits_processors"):
+            logits_processor_classes = self._load_logits_processor_classes(
+                self.cfg["vllm_cfg"]["logits_processors"]
+            )
+
         llm_kwargs = dict(
             model=self.model_name,
             served_model_name=self.model_name,
@@ -561,6 +600,10 @@ class BaseVllmGenerationWorker:
             logprobs_mode="processed_logprobs",
             **vllm_kwargs,
         )
+
+        # Add logits processors if loaded
+        if logits_processor_classes:
+            llm_kwargs["logits_processors"] = logits_processor_classes
 
         self._create_engine(llm_kwargs)
 
