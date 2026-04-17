@@ -122,6 +122,12 @@ runs:
         COVERAGE_PREFIX=$([[ "${{ inputs.is_doc_test }}" == "true" ]] && echo "doc-test" || ([[ "${{ inputs.is_unit_test }}" == "true" ]] && echo "unit-test" || echo "e2e"))
         echo "coverage-prefix=$COVERAGE_PREFIX" | tee -a "$GITHUB_OUTPUT"
 
+        echo -e "\033[1;34m┌─ launching test ─────────────────────────────────────────────────────────┐\033[0m"
+        echo -e "\033[1;34m│  script    : ${{ inputs.script }}\033[0m"
+        echo -e "\033[1;34m│  runner    : ${{ inputs.runner }}\033[0m"
+        echo -e "\033[1;34m│  container : ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }}\033[0m"
+        echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
+
         docker run --rm -u root --runtime=nvidia --gpus all \
           --shm-size=64g \
           --env TRANSFORMERS_OFFLINE=0 \
@@ -155,24 +161,38 @@ runs:
 
     - name: Check result
       id: check
-      shell: bash
+      shell: bash -e -u -o pipefail {0}
+      if: always()
       run: |
         coverage_report=coverage-${{ steps.test.outputs.coverage-prefix }}-${{ github.run_id }}-$(uuidgen)
-        echo "coverage_report=$coverage_report" >> "$GITHUB_OUTPUT"
+        echo "coverage_report=$coverage_report" | tee -a "$GITHUB_OUTPUT"
 
         IS_SUCCESS=$(tail -n 1 err.log | grep -q "Finished successfully." && echo "true" || echo "false")
 
-        if [[ "$IS_SUCCESS" == "false" && "{% raw %}${{ inputs.is_optional }}" == "true" ]]; then
-          echo "::warning:: Test failed, but displayed as successful because it is marked as optional."
+        if [[ "$IS_SUCCESS" == "false" && "${{ inputs.is_optional }}" == "true" ]]; then
+          echo "::warning::Test failed but is marked optional — treating as success."
           IS_SUCCESS=true
         fi
 
-        if [[ "$IS_SUCCESS" == "false" ]]; then
-          echo Test did not finish successfully.
+        if [[ "$IS_SUCCESS" == "true" ]]; then
+          echo -e "\033[1;32m╔══════════════════════════════════════════════════════════════════════════╗\033[0m"
+          echo -e "\033[1;32m║                                                                          ║\033[0m"
+          echo -e "\033[1;32m║   ✅  PASSED                                                             ║\033[0m"
+          echo -e "\033[1;32m║   ${{ inputs.script }}\033[0m"
+          echo -e "\033[1;32m║                                                                          ║\033[0m"
+          echo -e "\033[1;32m╚══════════════════════════════════════════════════════════════════════════╝\033[0m"
+          echo "::notice title=Result::✅ ${{ inputs.script }} — PASSED"
+          exit 0
+        else
+          echo -e "\033[1;31m╔══════════════════════════════════════════════════════════════════════════╗\033[0m"
+          echo -e "\033[1;31m║                                                                          ║\033[0m"
+          echo -e "\033[1;31m║   ❌  FAILED                                                             ║\033[0m"
+          echo -e "\033[1;31m║   ${{ inputs.script }}\033[0m"
+          echo -e "\033[1;31m║                                                                          ║\033[0m"
+          echo -e "\033[1;31m╚══════════════════════════════════════════════════════════════════════════╝\033[0m"
+          echo "::error title=Result::❌ ${{ inputs.script }} — FAILED"
           exit 1
         fi
-
-        exit $EXIT_CODE
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v6
