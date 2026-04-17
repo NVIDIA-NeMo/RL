@@ -431,6 +431,7 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     ]
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
+    model_cfg.moe_grouped_gemm = config["megatron_cfg"].get("moe_grouped_gemm", False)
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -513,6 +514,22 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. "
                 "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
             )
+
+    # Fine-grained activation offloading: offloads specific module activations to CPU.
+    # Distinct from optimizer_cpu_offload. Requires offload_modules to be non-empty.
+    fine_grained_activation_offloading = config["megatron_cfg"].get(
+        "fine_grained_activation_offloading", False
+    )
+    if fine_grained_activation_offloading:
+        offload_modules = config["megatron_cfg"].get("offload_modules", ["moe_act"])
+        if not offload_modules:
+            raise ValueError(
+                "offload_modules must be a non-empty list when "
+                "fine_grained_activation_offloading is True. "
+                'Example: offload_modules: ["moe_act"]'
+            )
+        model_cfg.fine_grained_activation_offloading = True
+        model_cfg.offload_modules = offload_modules
 
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:

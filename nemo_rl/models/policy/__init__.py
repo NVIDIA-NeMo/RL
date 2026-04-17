@@ -236,6 +236,17 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput gain
+    # for large EP configs (e.g. EP=64 with 512 experts). Requires TE >= 1.11.0 for FP8.
+    moe_grouped_gemm: NotRequired[bool]
+    # Offload specific module activations to CPU to reduce peak GPU memory.
+    # Works with MoE models (offloads MoE expert activations). Different from
+    # optimizer_cpu_offload which offloads optimizer states.
+    fine_grained_activation_offloading: NotRequired[bool]
+    # Modules to offload when fine_grained_activation_offloading is True.
+    # Defaults to ["moe_act"] if not specified. Valid values include:
+    # "moe_act", "core_attn", "qkv_linear", "mlp_norm", "attn_norm".
+    offload_modules: NotRequired[list[str]]
     peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
