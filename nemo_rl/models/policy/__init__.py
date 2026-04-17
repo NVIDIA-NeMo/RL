@@ -236,6 +236,9 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
+    # gain for large EP configs. Requires TE >= 1.11.0 for FP8.
+    moe_grouped_gemm: NotRequired[bool]
     peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
