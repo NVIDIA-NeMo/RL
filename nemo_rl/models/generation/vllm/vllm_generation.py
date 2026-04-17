@@ -462,6 +462,23 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    def reset_collective(self) -> list[ray.ObjectRef]:
+        """Tear down the weight-sync NCCL group across all vLLM workers.
+
+        Idempotent — workers that don't currently hold a group are no-ops.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            return []
+        method_name = (
+            "reset_collective_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "reset_collective"
+        )
+        return self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:

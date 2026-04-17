@@ -509,8 +509,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             # The request sampling params need to exactly match those as are set in NeMo RL.
             # If they do not match, the inference will be off policy and destroy training stability.
-            assert request.temperature == generation_config["temperature"]
-            assert request.top_p == generation_config["top_p"]
+            # When params are None (not sent by client), use the generation config defaults.
+            if request.temperature is None:
+                request.temperature = generation_config["temperature"]
+            if request.top_p is None:
+                request.top_p = generation_config["top_p"]
+            assert request.temperature == generation_config["temperature"], (
+                f"temperature mismatch: request={request.temperature}, config={generation_config['temperature']}"
+            )
+            assert request.top_p == generation_config["top_p"], (
+                f"top_p mismatch: request={request.top_p}, config={generation_config['top_p']}"
+            )
 
             generator = await openai_serving_chat.create_chat_completion(
                 request, raw_request
@@ -571,6 +580,41 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 )
             elif isinstance(generator, TokenizeResponse):
                 return JSONResponse(content=generator.model_dump())
+
+        ########################################
+        # /v1/completions endpoint (for disaggregated direct-to-shard generation)
+        ########################################
+        from vllm.entrypoints.openai.completion.protocol import (
+            CompletionRequest,
+            CompletionResponse,
+        )
+        from vllm.entrypoints.openai.completion.serving import (
+            OpenAIServingCompletion,
+        )
+
+        openai_serving_completion = OpenAIServingCompletion(
+            engine_client=engine_client,
+            models=openai_serving_models,
+            request_logger=None,
+            return_tokens_as_token_ids=True,
+        )
+
+        @app.post("/v1/completions")
+        async def create_completion(
+            request: CompletionRequest, raw_request: Request
+        ):
+            generator = await openai_serving_completion.create_completion(
+                request, raw_request
+            )
+
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(
+                    content=generator.model_dump(), status_code=generator.error.code
+                )
+            elif isinstance(generator, CompletionResponse):
+                return JSONResponse(content=generator.model_dump())
+
+            return StreamingResponse(content=generator, media_type="text/event-stream")
 
         ########################################
         # Logging
@@ -681,6 +725,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 train_world_size,
             ),
         )
+
+    async def reset_collective_async(self) -> None:
+        await self.llm.collective_rpc("reset_collective")
 
     async def generate_async(
         self,
