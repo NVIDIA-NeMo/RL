@@ -394,6 +394,12 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
+    # HTTP-only disagg: gen server is external (separate cluster/process).
+    # Implicitly enabled when not colocated and `remote_generation_url` is set.
+    disagg_http_mode = (
+        not colocated_inference
+        and generation_config.get("remote_generation_url") is not None
+    )
 
     env_name_list = extract_necessary_env_names(data_config)
     rm_env_enabled = "reward_model" in env_name_list
@@ -457,8 +463,17 @@ def setup(
         inference_gpus_per_node = inference_resources["gpus_per_node"]
         inference_nodes = inference_resources["num_nodes"]
 
-        # validate and configure resources
-        if policy_nodes == 1:
+        if disagg_http_mode:
+            # External gen server manages its own GPUs. Training cluster uses
+            # ALL gpus from cluster config — no subtraction.
+            inference_nodes = inference_nodes or 1
+            print(
+                f"  ⚡ Disagg HTTP mode: training uses {train_gpus_per_node} GPUs/node, "
+                f"inference is external ({inference_gpus_per_node}×{inference_nodes} GPUs)",
+                flush=True,
+            )
+        elif policy_nodes == 1:
+            # validate and configure resources
             # When policy_nodes == 1, train and inference are on the same node
             assert (
                 inference_gpus_per_node is not None and inference_gpus_per_node > 0
@@ -518,18 +533,26 @@ def setup(
             flush=True,
         )
 
-        # initialize inference cluster
-        inference_cluster = RayVirtualCluster(
-            name="grpo_inference_cluster",
-            bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
-            use_gpus=True,
-            num_gpus_per_node=inference_gpus_per_node,
-            max_colocated_worker_groups=1,
-        )
-        print(
-            f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
-            flush=True,
-        )
+        if disagg_http_mode:
+            # No local inference cluster — gen server is external
+            inference_cluster = None
+            print(
+                "  ✓ No local inference cluster (disagg HTTP mode)",
+                flush=True,
+            )
+        else:
+            # initialize inference cluster
+            inference_cluster = RayVirtualCluster(
+                name="grpo_inference_cluster",
+                bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
+                use_gpus=True,
+                num_gpus_per_node=inference_gpus_per_node,
+                max_colocated_worker_groups=1,
+            )
+            print(
+                f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
+                flush=True,
+            )
 
     # ==========================
     #   Training and Inference
@@ -684,13 +707,34 @@ def setup(
             "hf_config_overrides", {}
         )
 
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_vllm,
-            generation_name="vLLM",
-            init_time_key="vllm_init_time_s",
-            colocated_inference=colocated_inference,
-            worker_init_timing_metrics=worker_init_timing_metrics,
-        )
+        if disagg_http_mode:
+            # HTTP-only disagg: gen server is external, don't create VllmGeneration.
+            # Only initialize policy training workers.
+            from nemo_rl.models.generation.remote_generation import RemoteGeneration
+
+            remote_url = generation_config["remote_generation_url"]
+            assert remote_url, (
+                "remote_generation_url must be set for disaggregated HTTP mode"
+            )
+
+            policy_generation = RemoteGeneration(
+                generation=None, server_url=remote_url, config=generation_config
+            )
+            print(
+                f"  ✓ Using HTTP-only RemoteGeneration (URL: {remote_url})",
+                flush=True,
+            )
+
+            policy, policy_time = init_policy()
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        else:
+            policy_generation, policy = initialize_generation_with_policy(
+                init_generation_fn=init_vllm,
+                generation_name="vLLM",
+                init_time_key="vllm_init_time_s",
+                colocated_inference=colocated_inference,
+                worker_init_timing_metrics=worker_init_timing_metrics,
+            )
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
