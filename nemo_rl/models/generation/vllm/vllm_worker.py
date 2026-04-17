@@ -688,6 +688,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             ),
         )
 
+    def reset_collective(self) -> None:
+        self.llm.collective_rpc("reset_collective")
+
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

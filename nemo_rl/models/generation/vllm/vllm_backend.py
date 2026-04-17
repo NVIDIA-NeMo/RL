@@ -72,6 +72,19 @@ class VllmInternalWorkerExtension:
         )
         self.model_update_group.init_nccl_communicator(device=self.device)
 
+    def reset_collective(self) -> None:
+        """Tear down the cross-cluster weight-sync collective on this worker.
+
+        Idempotent — a no-op if no collective is currently held.
+        """
+        group = getattr(self, "model_update_group", None)
+        if group is None:
+            return
+        try:
+            group.destroy()
+        finally:
+            self.model_update_group = None  # type: ignore[assignment]
+
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""
         from nemo_rl.utils.nvml import get_device_uuid
@@ -337,8 +350,11 @@ class VllmInternalWorkerExtension:
             self._maybe_process_fp8_kv_cache()
 
         except Exception as e:
+            import traceback as _tb
             print(
-                f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"
+                f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}\n"
+                f"{_tb.format_exc()}",
+                flush=True,
             )
             return False
 

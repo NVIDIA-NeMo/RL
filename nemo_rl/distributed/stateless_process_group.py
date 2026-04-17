@@ -70,3 +70,28 @@ class StatelessProcessGroup:
         self.nccl_communicator.broadcast(
             sendbuf=tensor, recvbuf=tensor, root=src, stream=int(stream.cuda_stream)
         )
+
+    def destroy(self):
+        """Tear down the NCCL communicator and TCP store so the group can be re-initialized.
+
+        Safe to call even if the communicator was never initialized. Any errors raised by
+        the NCCL library (e.g. the peers have already gone away) are swallowed so the
+        caller can always bring the group back up with a fresh `init_nccl_communicator`.
+        """
+        comm = getattr(self, "nccl_communicator", None)
+        if comm is not None:
+            for method in ("abort", "destroy", "finalize"):
+                fn = getattr(comm, method, None)
+                if callable(fn):
+                    try:
+                        fn()
+                        break
+                    except Exception:
+                        continue
+            self.nccl_communicator = None  # type: ignore[assignment]
+        store = getattr(self, "tcp_store", None)
+        if store is not None:
+            try:
+                del self.tcp_store
+            except Exception:
+                pass
