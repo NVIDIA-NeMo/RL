@@ -514,6 +514,24 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
             )
 
+    # Fine-grained activation offloading moves specified submodule activations
+    # to CPU. Works for both dense and MoE models; the user picks which
+    # submodules to offload via offload_modules. Megatron owns the list of
+    # valid module names and their per-model-type compatibility, so we only
+    # require a non-empty list here and let Megatron validate the contents.
+    fine_grained_activation_offloading = config["megatron_cfg"].get(
+        "fine_grained_activation_offloading", False
+    )
+    if fine_grained_activation_offloading:
+        offload_modules = config["megatron_cfg"].get("offload_modules", [])
+        if not offload_modules:
+            raise ValueError(
+                "offload_modules must be a non-empty list when "
+                "fine_grained_activation_offloading is True."
+            )
+        model_cfg.fine_grained_activation_offloading = True
+        model_cfg.offload_modules = offload_modules
+
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
     """Validate optimizer configuration."""
