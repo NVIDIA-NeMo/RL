@@ -1,0 +1,120 @@
+# GRPO training for Nemotron-Omni (MoE ~30B) on MMPR-Tiny — 4-node
+# Scaled down from 16-node multinode config (batch sizes / 4)
+# AutoModel backend with EP=8
+defaults: "../../examples/configs/vlm_grpo_3B.yaml"
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  overlong_filtering: true
+  val_at_start: true
+  val_period: 10
+  max_val_samples: 256
+  val_batch_size: 256
+  seq_logprob_error_threshold: 2
+  reward_shaping:
+    overlong_buffer_length: 512
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  use_on_policy_kl_approximation: true
+  sequence_level_importance_ratios: true
+  token_level_loss: false
+
+checkpointing:
+  checkpoint_dir: results/vlm_grpo_nemotron_omni_mmpr_tiny_4node
+  save_optimizer: false
+  save_period: 10
+  checkpoint_must_save_by: "00:03:45:00"
+
+policy:
+  model_name: /lustre/fs1/portfolios/coreai/users/aroshanghias/checkpoints/mpo-nanov3omni-mmpr-nanov2-filtered-conv3d-0303/step_400
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 128
+  max_total_sequence_length: 16384
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  optimizer:
+    kwargs:
+      lr: 3.0e-06
+      weight_decay: 0.0
+      betas: [0.9, 0.99]
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.01
+        end_factor: 1.0
+        total_iters: 10
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [10]
+  dtensor_cfg:
+    expert_parallel_size: 8
+    activation_checkpointing: false
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: sdpa
+        linear: torch
+        rms_norm: torch_fp32
+        enable_deepep: true
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+  generation:
+    max_new_tokens: 5000
+    bad_words: ["<image>", "<img>", "</img>", "<so_embedding>", "<so_start>", "<so_end>"]
+    vllm_cfg:
+      skip_tokenizer_init: false
+      tensor_parallel_size: 8
+      enforce_eager: true
+      max_model_len: ${policy.max_total_sequence_length}
+      gpu_memory_utilization: 0.7
+    vllm_kwargs:
+      limit_mm_per_prompt: {"image": 2}
+      max_num_batched_tokens: 16384
+      mm_processor_cache_gb: 0
+      mamba_ssm_cache_dtype: "float32"
+      skip_mm_profiling: true
+
+data:
+  train:
+    dataset_name: mmpr-tiny
+    download_dir: /lustre/fs1/portfolios/coreai/users/aroshanghias/data/mmpr_tiny/processed
+    split_validation_size: 0.008
+    seed: 42
+  default:
+    prompt_file: null
+    processor: vlm_hf_data_processor
+    env_name: mmpr-tiny
+
+env:
+  mmpr-tiny:
+    num_workers: 8
+    reward_functions:
+    - name: verl_geo3k
+      weight: 1.0
+      kwargs:
+        format_score: 0.1
+
+logger:
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb_enabled: true
+  wandb:
+    project: grpo-vlm
+    name: nemotron-omni-grpo-mmpr-tiny-4node
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4
