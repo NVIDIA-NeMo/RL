@@ -99,12 +99,9 @@ def import_model_from_hf_name(
             megatron_config["pipeline_dtype"]
         )
         model_provider.sequence_parallel = megatron_config["sequence_parallel"]
-        if (
-            gradient_accumulation_fusion := megatron_config.get(
-                "gradient_accumulation_fusion"
-            )
-        ) is not None:
-            model_provider.gradient_accumulation_fusion = gradient_accumulation_fusion
+        model_provider.gradient_accumulation_fusion = megatron_config[
+            "gradient_accumulation_fusion"
+        ]
     if transformer_layer_spec is not None:
         model_provider.transformer_layer_spec = transformer_layer_spec
     model_provider.finalize()
