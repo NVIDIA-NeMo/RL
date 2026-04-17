@@ -11,43 +11,35 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Control plane server + DP shard router for disaggregated vLLM generation.
+"""Control-plane server for disaggregated vLLM generation.
 
 Wraps a local VllmGeneration instance and exposes:
-  A) Control plane — weight sync triggers, lifecycle management, collective init.
-  B) DP Shard Router — reverse proxy for vLLM's OpenAI-compatible HTTP API with
-     intelligent routing across data-parallel shards.
+  * Weight sync & lifecycle — init/reset/update_weights_from_collective,
+    prepare_for_generation, finish_generation, prepare_refit_info,
+    invalidate_kv_cache.
+  * Shard discovery — ``GET /dp_openai_server_base_urls`` returns the list of
+    per-shard OpenAI-compatible URLs that clients (training, NemoGym)
+    round-robin across directly.
 
-Runs on a single port (default 8089). Training cluster discovers this one URL.
-The training client sends generation requests directly to per-shard
-``/v1/completions`` endpoints (round-robin); the reverse proxy here is for
-external OpenAI-compatible clients (e.g. NemoGym).
+Runs on a single port (default 8089). Training discovers this one URL, pulls
+the DP shard list once, and sends generation requests straight to the shards
+via OpenAI ``/v1/completions``. The control server never sits on the
+generation hot path.
 """
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import io
-import json
 import threading
 import traceback
-from enum import Enum
 from typing import Any, Optional
 
-import aiohttp
 import ray
 import torch
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from nemo_rl.models.generation.interfaces import GenerationInterface
-
-
-class RoutingStrategy(str, Enum):
-    ROUND_ROBIN = "round_robin"
-    LEAST_PENDING = "least_pending"
-    PREFIX_HASH = "prefix_hash"
 
 
 class GenerationControlServer:
@@ -57,11 +49,9 @@ class GenerationControlServer:
         self,
         generation: GenerationInterface,
         port: int = 8089,
-        routing_strategy: str = "round_robin",
     ):
         self.generation = generation
         self.port = port
-        self.routing_strategy = RoutingStrategy(routing_strategy)
 
         self.shard_urls: list[str] = [
             url
@@ -69,21 +59,8 @@ class GenerationControlServer:
             if url is not None
         ]
 
-        self._rr_index = 0
-        self._pending_counts: dict[int, int] = {i: 0 for i in range(len(self.shard_urls))}
-        self._lock = asyncio.Lock()
-        self._session: Optional[aiohttp.ClientSession] = None
-
         self._app = self._build_app()
         self._server_thread: Optional[threading.Thread] = None
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """Lazily create a persistent aiohttp session for the router."""
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=600)
-            )
-        return self._session
 
     def _build_app(self):
         app = FastAPI(title="Generation Control Server")
@@ -225,104 +202,7 @@ class GenerationControlServer:
                 return self.generation.get_step_metrics()
             return {}
 
-        # =====================================================================
-        # DP Shard Router (OpenAI-compatible reverse proxy for external clients)
-        # =====================================================================
-
-        @app.post("/v1/completions")
-        async def route_completions(request: Request):
-            return await self._route_request(request, "/v1/completions")
-
-        @app.post("/v1/chat/completions")
-        async def route_chat_completions(request: Request):
-            return await self._route_request(request, "/v1/chat/completions")
-
-        @app.post("/tokenize")
-        async def route_tokenize(request: Request):
-            return await self._route_request(request, "/tokenize")
-
         return app
-
-    # =====================================================================
-    # Router implementation
-    # =====================================================================
-
-    def _select_shard(self, body: dict | None = None) -> int:
-        """Select a DP shard index based on the routing strategy.
-
-        Safe without a lock: FastAPI runs on a single-threaded asyncio loop,
-        so _rr_index and _pending_counts mutations are non-concurrent.
-        """
-        if len(self.shard_urls) <= 1:
-            return 0
-
-        if self.routing_strategy == RoutingStrategy.ROUND_ROBIN:
-            idx = self._rr_index
-            self._rr_index = (self._rr_index + 1) % len(self.shard_urls)
-            return idx
-
-        if self.routing_strategy == RoutingStrategy.LEAST_PENDING:
-            return min(self._pending_counts, key=self._pending_counts.get)
-
-        if self.routing_strategy == RoutingStrategy.PREFIX_HASH:
-            prompt_ids = body.get("prompt_token_ids") if body else None
-            if prompt_ids:
-                prefix = tuple(prompt_ids[:128])
-                h = int(hashlib.md5(str(prefix).encode()).hexdigest(), 16)
-                return h % len(self.shard_urls)
-            return min(self._pending_counts, key=self._pending_counts.get)
-
-        return 0
-
-    async def _route_request(self, request: Request, path: str):
-        """Forward an HTTP request to a selected DP shard."""
-        body_bytes = await request.body()
-
-        body_dict = None
-        try:
-            body_dict = json.loads(body_bytes)
-        except Exception:
-            pass
-
-        shard_idx = self._select_shard(body_dict)
-        shard_base_url = self.shard_urls[shard_idx]
-        base = shard_base_url.rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
-        target_url = f"{base}{path}"
-
-        self._pending_counts[shard_idx] = self._pending_counts.get(shard_idx, 0) + 1
-        try:
-            is_streaming = body_dict and body_dict.get("stream", False)
-            session = await self._get_session()
-
-            async with session.post(
-                target_url,
-                data=body_bytes,
-                headers={"Content-Type": request.headers.get("content-type", "application/json")},
-            ) as resp:
-                if is_streaming:
-                    async def stream_response():
-                        async for chunk in resp.content.iter_any():
-                            yield chunk
-
-                    return StreamingResponse(
-                        stream_response(),
-                        status_code=resp.status,
-                        media_type=resp.headers.get("content-type", "text/event-stream"),
-                    )
-                else:
-                    response_body = await resp.read()
-                    return Response(
-                        content=response_body,
-                        status_code=resp.status,
-                        media_type=resp.headers.get("content-type", "application/json"),
-                    )
-        except Exception as e:
-            traceback.print_exc()
-            return JSONResponse(status_code=502, content={"error": f"Router failed to reach shard {shard_idx}: {e}"})
-        finally:
-            self._pending_counts[shard_idx] = max(0, self._pending_counts.get(shard_idx, 1) - 1)
 
     # =====================================================================
     # Server lifecycle
@@ -338,7 +218,7 @@ class GenerationControlServer:
         self._server_thread.start()
         print(
             f"GenerationControlServer started on port {self.port} "
-            f"(routing={self.routing_strategy.value}, shards={len(self.shard_urls)})"
+            f"(shards={len(self.shard_urls)})"
         )
 
     def get_app(self):

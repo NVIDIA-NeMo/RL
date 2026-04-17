@@ -30,6 +30,7 @@ Two modes:
 from __future__ import annotations
 
 import asyncio
+import io
 import time
 from typing import AsyncGenerator, Optional
 
@@ -100,8 +101,8 @@ class RemoteGeneration(GenerationInterface):
                 self.cfg[key] = config[key]
 
         # Fetch per-shard vLLM URLs once. JSON completions are sent directly to
-        # these (round-robin); the control server is used only for control-plane
-        # and the /v1/* reverse proxy for external clients.
+        # these (round-robin); the control server is only used for control-plane
+        # calls (weight sync, lifecycle, metrics).
         self._shard_urls: list[str] = []
         self._shard_rr_idx = 0
         if self._http_mode:
@@ -111,8 +112,11 @@ class RemoteGeneration(GenerationInterface):
                 flush=True,
             )
 
-        # Expose the router URL so NemoGym / external clients can reach generation
-        self.dp_openai_server_base_urls = [f"{self.server_url}/v1"]
+        # Expose per-shard URLs so NemoGym / external OpenAI clients can address
+        # DP shards directly (they round-robin / sticky-map internally).
+        self.dp_openai_server_base_urls = (
+            list(self._shard_urls) if self._http_mode else [f"{self.server_url}/v1"]
+        )
 
     def _fetch_shard_urls(self) -> list[str]:
         """Fetch per-shard vLLM URLs from the control server."""
