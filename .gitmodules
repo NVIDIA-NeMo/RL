@@ -11,7 +11,7 @@
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
 	url = https://github.com/sharonyu-115/Automodel.git
-	branch = gemma4-support
+	branch = fix/gemma4-moe-gate-double-norm
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
