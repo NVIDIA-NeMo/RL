@@ -10,6 +10,7 @@ grpo:
 checkpointing:
   checkpoint_dir: results/vlm_grpo_nemotron_omni_mmpr_tiny
   save_optimizer: false
+  checkpoint_must_save_by: "00:03:45:00"
 
 policy:
   model_name: /lustre/fs1/portfolios/coreai/users/aroshanghias/checkpoints/mpo-nanov3omni-mmpr-nanov2-filtered-conv3d-0303/step_400
@@ -78,7 +79,7 @@ env:
 logger:
   tensorboard_enabled: true
   monitor_gpus: false
-  wandb_enabled: false
+  wandb_enabled: true
   wandb:
     project: grpo-vlm
     name: nemotron-omni-grpo-mmpr-tiny

@@ -149,6 +149,13 @@ def _load_mmpr_tiny_from_cache(download_dir: str) -> Dataset:
     df["answer"] = df["reward_model"].apply(lambda rm: rm.get("ground_truth", ""))
     df = df[["images", "question", "answer"]]
 
+    # Filter out multi-image rows — current model only supports single-image input
+    multi_mask = df["images"].apply(lambda imgs: len(imgs) > 1)
+    num_multi = multi_mask.sum()
+    if num_multi > 0:
+        df = df[~multi_mask].reset_index(drop=True)
+        print(f"MMPR-Tiny: filtered out {num_multi} multi-image rows, {len(df)} rows remaining")
+
     features = Features(
         {
             "images": Sequence(Value("string")),
