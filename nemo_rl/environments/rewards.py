@@ -151,7 +151,7 @@ def verl_geo3k_reward(
 
     Combines format checking and accuracy checking in a single function.
     Format check looks for </think> tag and \\boxed{} pattern.
-    Accuracy check uses mathruler to extract and grade the boxed answer.
+    Accuracy check uses math_verify (HuggingFace math-verify) to grade the boxed answer.
 
     Args:
         ground_truth: The correct answer.
@@ -161,17 +161,38 @@ def verl_geo3k_reward(
     Returns:
         (reward, is_correct) where reward = (1-format_score)*accuracy + format_score*format.
     """
-    from mathruler.grader import extract_boxed_content, grade_answer
-
     format_pattern = re.compile(r"</think>.*\\boxed\{.*\}", re.DOTALL)
     has_format = bool(re.search(format_pattern, response))
     format_reward_value = 1.0 if has_format else 0.0
 
     try:
-        answer = extract_boxed_content(response)
-        is_correct = grade_answer(answer, ground_truth)
-        acc_reward_value = 1.0 if is_correct else 0.0
-    except Exception:
+        # Extract \boxed{} content and grade using math_verify (already a nemo-rl dependency)
+        boxed_match = re.search(r"\\boxed\{", response)
+        if boxed_match:
+            # Find matching closing brace
+            start = boxed_match.end()
+            depth = 1
+            for i, ch in enumerate(response[start:]):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                if depth == 0:
+                    answer = response[start : start + i].strip()
+                    break
+            else:
+                answer = None
+        else:
+            answer = None
+
+        if answer is not None:
+            score, _ = math_verify_func([boxed(ground_truth)], [boxed(answer)])
+            is_correct = score > 0.1
+            acc_reward_value = 1.0 if is_correct else 0.0
+        else:
+            acc_reward_value = 0.0
+            is_correct = False
+    except (Exception, TimeoutException):
         acc_reward_value = 0.0
         is_correct = False
 
