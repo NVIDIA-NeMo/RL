@@ -127,7 +127,7 @@ runs:
         echo -e "\033[1;34m│  runner    : ${{ inputs.runner }}\033[0m"
         echo -e "\033[1;34m│  container : ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }}\033[0m"
         echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
-
+        echo "::group::Logs"
         docker run --rm -u root --runtime=nvidia --gpus all \
           --shm-size=64g \
           --env TRANSFORMERS_OFFLINE=0 \
@@ -158,6 +158,7 @@ runs:
             fi
             bash tests/${{ inputs.is_doc_test == 'true' && 'docs' || (inputs.is_unit_test == 'true' && 'unit' || 'functional') }}/${{ inputs.script }}.sh && \
             echo "Finished successfully." || echo "Did not finish."' 2>&1 | tee err.log
+        echo "::endgroup::"
 
     - name: Check result
       id: check
