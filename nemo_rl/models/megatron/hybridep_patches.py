@@ -30,12 +30,15 @@ Fixes applied:
 """
 
 import logging
+import os
 
 import torch
 
 logger = logging.getLogger(__name__)
 
 _patched = False
+# Set NRL_HYBRIDEP_DEBUG=1 to print per-call dispatch/combine shapes and routing.
+_debug = os.environ.get("NRL_HYBRIDEP_DEBUG", "0") == "1"
 
 
 def apply_hybridep_patches() -> None:
@@ -140,6 +143,23 @@ def apply_hybridep_patches() -> None:
             )
             ctx.handle = handle
             ctx.pad_multiple = pad_multiple
+            if _debug:
+                rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else -1
+                )
+                ep_rank = torch.distributed.get_rank(group) if group is not None else -1
+                ep_size = (
+                    torch.distributed.get_world_size(group) if group is not None else -1
+                )
+                print(
+                    f"[HEDBG dispatch rank={rank} ep={ep_rank}/{ep_size}] "
+                    f"x={tuple(x.shape)} routing_map={tuple(routing_map.shape)} "
+                    f"dispatched={tuple(dispatched_hidden.shape)} "
+                    f"tokens_per_expert={tokens_per_expert.tolist()}",
+                    flush=True,
+                )
             return (
                 dispatched_hidden,
                 dispatched_probs,
@@ -167,6 +187,18 @@ def apply_hybridep_patches() -> None:
                 )
             )
             fused_a2a._hybrid_ep_buffer_needs_reset = True
+            if _debug:
+                rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else -1
+                )
+                print(
+                    f"[HEDBG dispatch.backward rank={rank}] "
+                    f"grad_x={tuple(grad_x.shape)} "
+                    f"combined={tuple(combined_hidden.shape)} needs_reset=True",
+                    flush=True,
+                )
             # 9 grads for 9 forward inputs
             # (x, routing_map, probs, group, num_local_experts,
             #  num_sms_dispatch_api, num_sms_combine_api,
@@ -257,4 +289,12 @@ def apply_hybridep_patches() -> None:
         fused_a2a.hybrid_ep_combine = hybrid_ep_combine
 
     _patched = True
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    if rank <= 0:
+        print(
+            f"[hybridep_patches] Applied 5 monkey-patches to fused_a2a "
+            f"(custom_allgather, buffer_realloc, needs_reset, backward_count) "
+            f"debug={_debug}",
+            flush=True,
+        )
     logger.info("Applied HybridEP monkey-patches to fused_a2a")
