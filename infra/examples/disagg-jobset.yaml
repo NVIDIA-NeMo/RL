@@ -319,11 +319,11 @@ spec:
               args:
               - |
                 HEAD=disagg-job-rl-head-0-0.disagg-job
-                echo "Waiting for RL Ray dashboard at ${HEAD}:8265..."
-                until curl -sf http://${HEAD}:8265/api/version >/dev/null 2>&1; do
+                echo "Waiting for RL head at ${HEAD}:6379..."
+                until ray health-check --address ${HEAD}:6379 >/dev/null 2>&1; do
                   sleep 5
                 done
-                echo "RL Ray dashboard is up."
+                echo "RL head is ready."
               resources:
                 requests: { cpu: "200m", memory: "256Mi" }
             containers:
@@ -334,17 +334,33 @@ spec:
               - |
                 set -eo pipefail
                 HEAD=disagg-job-rl-head-0-0.disagg-job
-                # No --working-dir: code is on all nodes via hostPath.
-                # --working-dir triggers Ray to zip+upload the directory to GCS.
-                # Instead, wrap the entrypoint with cd.
                 SUBMISSION_ID="grpo-$(date +%s)"
                 ray job submit --address http://${HEAD}:8265 \
                   --submission-id ${SUBMISSION_ID} \
-                  -- bash -c "cd /workspace/nemo-rl && python examples/nemo_gym/run_grpo_nemo_gym.py +env.disagg_job_id=disagg-job logger.wandb_enabled=false" \
+                  -- bash -c "cd /workspace/nemo-rl && python examples/nemo_gym/run_grpo_nemo_gym.py \
+                    --config examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml \
+                    +env.disagg_job_id=disagg-job \
+                    policy.model_name=Qwen/Qwen3-0.6B \
+                    cluster.gpus_per_node=2 \
+                    policy.megatron_cfg.tensor_model_parallel_size=1 \
+                    policy.megatron_cfg.pipeline_model_parallel_size=1 \
+                    policy.megatron_cfg.expert_model_parallel_size=1 \
+                    policy.megatron_cfg.context_parallel_size=1 \
+                    policy.megatron_cfg.sequence_parallel=false \
+                    policy.generation.vllm_cfg.tensor_parallel_size=1 \
+                    policy.generation.colocated.enabled=false \
+                    policy.generation.colocated.resources.num_nodes=1 \
+                    policy.generation.colocated.resources.gpus_per_node=1 \
+                    policy.generation.max_new_tokens=512 \
+                    policy.max_total_sequence_length=512 \
+                    grpo.num_prompts_per_step=4 grpo.num_generations_per_prompt=2 \
+                    grpo.max_num_steps=2 \
+                    policy.train_global_batch_size=4 policy.train_micro_batch_size=1 \
+                    logger.wandb_enabled=false" \
                   2>&1 | tee /workspace/nemo-rl/outputs/driver.log
               resources:
-                requests: { cpu: "500m", memory: "1Gi" }
-                limits:   { cpu: "1", memory: "2Gi" }
+                requests: { cpu: "500m", memory: "2Gi" }
+                limits:   { cpu: "2", memory: "8Gi" }
               env:
               - name: RAY_ADDRESS
                 value: "disagg-job-rl-head-0-0.disagg-job:6379"
