@@ -9,9 +9,13 @@
 #
 # Advantages over the KubeRay RayCluster approach:
 #   - Native failure cascading via failurePolicy (no peer-watcher sidecar)
-#   - Startup ordering via dependsOn (no init container polling)
-#   - Predictable DNS names (no Service or ConfigMap needed for discovery)
+#   - Predictable DNS names (no Service or ConfigMap needed for head discovery)
 #   - Single resource to manage (one JobSet instead of two RayClusters + RBAC)
+#
+# Note: KAI gang-schedules all pods in the JobSet together (one PodGroup),
+# so dependsOn cannot be used (it would deadlock — KAI waits for all pods,
+# JobSet waits for head to be Ready). Instead, workers use init containers
+# to wait for their head, same pattern as KubeRay.
 #
 # DNS names (auto-created by JobSet headless service):
 #   rl-head:      disagg-job-rl-head-0-0.disagg-job
@@ -40,7 +44,6 @@ spec:
     enableDNSHostnames: true
     publishNotReadyAddresses: true
 
-  # Head pod address propagated to all pods as a label.
   coordinator:
     replicatedJob: rl-head
     jobIndex: 0
@@ -51,20 +54,20 @@ spec:
     operator: All
     targetReplicatedJobs: [driver]
 
-  # Any critical failure tears down everything (replaces peer-watcher).
+  # Any failure tears down everything (replaces peer-watcher).
   failurePolicy:
     maxRestarts: 0
     rules:
-    - name: head-crash
+    - name: head_crash
       action: FailJobSet
       targetReplicatedJobs: [rl-head]
-    - name: driver-crash
+    - name: driver_crash
       action: FailJobSet
       targetReplicatedJobs: [driver]
-    - name: gym-crash
+    - name: gym_crash
       action: FailJobSet
       targetReplicatedJobs: [gym-head, gym-workers]
-    - name: worker-crash
+    - name: worker_crash
       action: FailJobSet
       targetReplicatedJobs: [rl-workers]
 
@@ -126,9 +129,6 @@ spec:
   # ========================
   - name: rl-workers
     replicas: 1
-    dependsOn:
-    - name: rl-head
-      status: Ready
     template:
       spec:
         backoffLimit: 0
@@ -140,6 +140,20 @@ spec:
             serviceAccountName: nemo-rl-endpoint-registry
             imagePullSecrets:
             - name: nvcr-secret
+            initContainers:
+            - name: wait-for-rl-head
+              image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                HEAD=disagg-job-rl-head-0-0.disagg-job
+                echo "Waiting for RL head at ${HEAD}:6379..."
+                until ray health-check --address ${HEAD}:6379 >/dev/null 2>&1; do
+                  sleep 5
+                done
+                echo "RL head is ready."
+              resources:
+                requests: { cpu: "200m", memory: "256Mi" }
             containers:
             - name: ray-worker
               image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
@@ -172,9 +186,6 @@ spec:
   # ========================
   - name: gym-head
     replicas: 1
-    dependsOn:
-    - name: rl-head
-      status: Ready
     template:
       spec:
         backoffLimit: 0
@@ -193,13 +204,11 @@ spec:
               args:
               - |
                 ulimit -n 65536
-                # Start Gym's own Ray head (separate cluster from RL).
                 ray start --head --port=6380 \
                   --dashboard-host=0.0.0.0 --dashboard-port=8266 \
                   --object-store-memory=200000000
-                # Run the standalone Gym server on this Ray head.
                 cd /workspace/nemo-rl
-                uv run --extra nemo_gym python -m nemo_rl.distributed.standalone_gym_server \
+                python -m nemo_rl.distributed.standalone_gym_server \
                   --job-id disagg-job \
                   --port 9090 \
                   --model-name Qwen/Qwen3-0.6B \
@@ -234,9 +243,6 @@ spec:
   # ========================
   - name: gym-workers
     replicas: 1
-    dependsOn:
-    - name: gym-head
-      status: Ready
     template:
       spec:
         backoffLimit: 0
@@ -247,6 +253,20 @@ spec:
             schedulerName: kai-scheduler
             imagePullSecrets:
             - name: nvcr-secret
+            initContainers:
+            - name: wait-for-gym-head
+              image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                GYM_HEAD=disagg-job-gym-head-0-0.disagg-job
+                echo "Waiting for Gym head at ${GYM_HEAD}:6380..."
+                until ray health-check --address ${GYM_HEAD}:6380 >/dev/null 2>&1; do
+                  sleep 5
+                done
+                echo "Gym head is ready."
+              resources:
+                requests: { cpu: "200m", memory: "256Mi" }
             containers:
             - name: ray-worker
               image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
@@ -278,9 +298,6 @@ spec:
   # ========================
   - name: driver
     replicas: 1
-    dependsOn:
-    - name: rl-head
-      status: Ready
     template:
       spec:
         backoffLimit: 0
@@ -292,6 +309,20 @@ spec:
             serviceAccountName: nemo-rl-endpoint-registry
             imagePullSecrets:
             - name: nvcr-secret
+            initContainers:
+            - name: wait-for-rl-head
+              image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                HEAD=disagg-job-rl-head-0-0.disagg-job
+                echo "Waiting for RL Ray dashboard at ${HEAD}:8265..."
+                until curl -sf http://${HEAD}:8265/api/version >/dev/null 2>&1; do
+                  sleep 5
+                done
+                echo "RL Ray dashboard is up."
+              resources:
+                requests: { cpu: "200m", memory: "256Mi" }
             containers:
             - name: driver
               image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
@@ -299,21 +330,12 @@ spec:
               args:
               - |
                 HEAD=disagg-job-rl-head-0-0.disagg-job
-                # Wait for Ray dashboard to be reachable.
-                until curl -sf http://${HEAD}:8265/api/version >/dev/null 2>&1; do
-                  echo "Waiting for Ray dashboard at ${HEAD}:8265..."
-                  sleep 5
-                done
-                echo "Ray dashboard is up, submitting job..."
-                # Submit GRPO training with disaggregated Gym.
                 ray job submit --address http://${HEAD}:8265 \
                   --submission-id grpo-run \
                   --working-dir /workspace/nemo-rl \
                   -- python examples/nemo_gym/run_grpo_nemo_gym.py \
                     +env.disagg_job_id=disagg-job
-                # Follow logs until completion (ray job submit --follow is not reliable).
                 ray job logs --follow --address http://${HEAD}:8265 grpo-run
-                # Exit with the job's exit code.
                 STATUS=$(ray job status --address http://${HEAD}:8265 grpo-run 2>/dev/null | grep -oP 'status: \K\w+')
                 [ "$STATUS" = "SUCCEEDED" ] && exit 0 || exit 1
               resources:
