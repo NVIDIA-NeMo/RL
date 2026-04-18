@@ -100,8 +100,7 @@ infra/
 │   ├── gym_standalone_config.yaml    # Gym standalone server config
 │   ├── kai-queue.yaml                # 2-GPU kind cluster queues
 │   ├── kai-queue-prod.yaml           # 288-GPU NVL72 prod queues
-│   ├── kai-service-monitors.yaml     # Prometheus ServiceMonitors for KAI
-│   └── kai-grafana-dashboard.yaml    # Grafana fairshare dashboard
+│   └── kai-service-monitors.yaml     # Prometheus ServiceMonitors for KAI
 ```
 
 ## Disaggregated RL + Gym
