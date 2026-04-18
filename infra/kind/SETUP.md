@@ -1,6 +1,6 @@
 # Local K8s GPU Development Environment
 
-nvkind-based Kubernetes cluster with NVIDIA GPU support, KAI scheduler (gang scheduling), and KubeRay.
+nvkind-based Kubernetes cluster with NVIDIA GPU support, KAI scheduler (gang scheduling), KubeRay, and JobSet.
 
 ## Prerequisites
 
@@ -67,7 +67,7 @@ Set `driver.enabled=false` in `values/gpu-operator.yaml` if the cluster nodes al
 | `kind` | nvidia-device-plugin | Local dev — nvkind handles toolkit/runtime |
 | `prod` | gpu-operator (full) | Real clusters — operator manages everything |
 
-Both environments include KAI scheduler and KubeRay operator.
+Both environments include KAI scheduler, KubeRay operator, and JobSet controller.
 
 ## Tear down (kind only)
 
@@ -93,22 +93,37 @@ infra/
 │       ├── gpu-operator.yaml         # prod only
 │       ├── kai-scheduler.yaml
 │       └── kuberay-operator.yaml
-├── examples/
-│   ├── disagg-rayclusters.yaml       # Disaggregated RL + Gym (main exemplar)
+├── examples/                          # Workload examples
+│   ├── rayjob-monolithic.yaml        # Single-cluster RayJob (1 GPU)
+│   ├── disagg-rayclusters.yaml       # Disagg RL + Gym via KubeRay RayClusters
+│   ├── disagg-jobset.yaml            # Disagg RL + Gym via JobSet (no KubeRay)
 │   ├── endpoint-registry-rbac.yaml   # RBAC for ConfigMap service discovery
 │   ├── gym_standalone_config.yaml    # Gym standalone server config
 │   ├── kai-queue.yaml                # 2-GPU kind cluster queues
 │   └── kai-queue-prod.yaml           # 288-GPU NVL72 prod queues
 ```
 
-## Disaggregated RL + Gym
+## Workload examples
 
-The main workload exemplar is `disagg-rayclusters.yaml`: two RayClusters deployed together.
+### `rayjob-monolithic.yaml` — Single-cluster RayJob
 
+Simplest deployment: KubeRay manages a RayCluster + submits an entrypoint via HTTP. One head, one GPU worker. Good for SFT or single-node training.
+
+### `disagg-rayclusters.yaml` — Disagg via KubeRay
+
+Two RayClusters deployed together:
 - **RL cluster** (`raycluster-rl`): Ray head + GPU workers for training (vLLM + Megatron)
-- **Gym cluster** (`raycluster-gym`): CPU-only, runs NeMo Gym servers as HTTP service
-- **Service discovery**: K8s ConfigMap endpoint registry — RL publishes vLLM URLs, Gym publishes its head server address. Both poll until the peer registers.
-- **Failure cascading**: Peer-watcher sidecar (inlined Python script) on each head pod. If either cluster fails or is deleted, both are torn down.
+- **Gym cluster** (`raycluster-gym`): CPU-only, runs standalone Gym HTTP server
+- **Service discovery**: K8s ConfigMap endpoint registry — RL publishes vLLM URLs, Gym publishes its head server address
+- **Failure cascading**: Peer-watcher sidecar on each head monitors the other cluster via K8s API
+
+### `disagg-jobset.yaml` — Disagg via JobSet (no KubeRay)
+
+Same disagg architecture as above but using a single JobSet instead of two RayClusters. Four ReplicatedJobs (rl-head, rl-workers, gym, driver) with:
+- **`dependsOn`**: workers, gym, and driver wait for rl-head to be Ready
+- **`failurePolicy`**: any failure tears down all jobs (replaces peer-watcher)
+- **`successPolicy`**: JobSet completes when driver exits 0
+- **Predictable DNS**: `disagg-job-rl-head-0-0.disagg-job` (no ConfigMap needed for head discovery)
 
 ## Notes
 

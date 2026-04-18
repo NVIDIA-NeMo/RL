@@ -1,0 +1,83 @@
+# Monolithic RayJob: single-cluster training with 1 GPU worker.
+#
+# KubeRay creates a RayCluster, waits for it to be ready, submits the
+# entrypoint via HTTP, polls until completion, then tears down the cluster.
+#
+# Prerequisites:
+#   kubectl apply -f kai-queue.yaml
+#
+# Usage:
+#   kubectl apply -f rayjob-monolithic.yaml
+#   kubectl get rayjob sft-job -w
+
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: sft-job
+  labels:
+    kai.scheduler/queue: high-prio
+spec:
+  entrypoint: "bash tests/functional/sft.sh"
+  submissionMode: HTTPMode     # K8sJobMode breaks KAI gang scheduling
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 60
+  rayClusterSpec:
+    rayVersion: "2.52.0"
+    headGroupSpec:
+      rayStartParams:
+        object-store-memory: "200000000"
+      template:
+        spec:
+          schedulerName: kai-scheduler
+          imagePullSecrets:
+          - name: nvcr-secret
+          containers:
+          - name: ray-head
+            image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+            resources:
+              requests: { cpu: "1", memory: "4Gi" }
+              limits:   { cpu: "4", memory: "16Gi" }
+            ports:
+            - { containerPort: 6379, name: gcs-server }
+            - { containerPort: 8265, name: dashboard }
+            readinessProbe:
+              exec:
+                command: ["ray", "health-check"]
+              initialDelaySeconds: 10
+              periodSeconds: 5
+              timeoutSeconds: 5
+            volumeMounts:
+            - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+            - { name: dshm, mountPath: /dev/shm }
+          volumes:
+          - name: nemo-rl-src
+            hostPath: { path: /workspace/nemo-rl, type: DirectoryOrCreate }
+          - name: dshm
+            emptyDir: { medium: Memory }
+    workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 1
+      rayStartParams:
+        num-gpus: "1"
+        object-store-memory: "200000000"
+      template:
+        spec:
+          schedulerName: kai-scheduler
+          imagePullSecrets:
+          - name: nvcr-secret
+          containers:
+          - name: ray-worker
+            image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+            resources:
+              requests: { cpu: "1", memory: "4Gi", nvidia.com/gpu: "1" }
+              limits:   { cpu: "8", memory: "32Gi", nvidia.com/gpu: "1" }
+            volumeMounts:
+            - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+            - { name: dshm, mountPath: /dev/shm }
+          volumes:
+          - name: nemo-rl-src
+            hostPath: { path: /workspace/nemo-rl, type: DirectoryOrCreate }
+          - name: dshm
+            emptyDir: { medium: Memory }
