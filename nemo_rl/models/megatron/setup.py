@@ -443,12 +443,6 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     # These are required by DeepEP's hybrid-ep branch for NVLink domain configuration.
     # Users can set them explicitly via config, or they will be auto-computed with a warning.
     if config["megatron_cfg"].get("moe_flex_dispatcher_backend") == "hybridep":
-        # Apply monkey-patches to fused_a2a.py to fix upstream HybridEP bugs
-        # (NCCL allgather hang, buffer overflow on seq_len growth, backward count).
-        from nemo_rl.models.megatron.hybridep_patches import apply_hybridep_patches
-
-        apply_hybridep_patches()
-
         ep_size = model_cfg.expert_model_parallel_size
 
         # NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
