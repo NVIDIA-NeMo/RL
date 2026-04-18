@@ -42,7 +42,6 @@ helmfile -e kind sync
 # 4. Create KAI scheduler queues + RBAC
 kubectl apply -f ../examples/kai-queue.yaml
 kubectl apply -f ../examples/endpoint-registry-rbac.yaml
-kubectl apply -f ../examples/kyverno-kai-policies.yaml
 
 # 5. Deploy disaggregated RL + Gym
 kubectl apply -f ../examples/disagg-rayclusters.yaml
@@ -68,7 +67,7 @@ Set `driver.enabled=false` in `values/gpu-operator.yaml` if the cluster nodes al
 | `kind` | nvidia-device-plugin | Local dev — nvkind handles toolkit/runtime |
 | `prod` | gpu-operator (full) | Real clusters — operator manages everything |
 
-Both environments include KAI scheduler, KubeRay operator, Kyverno, and Prometheus+Grafana.
+Both environments include KAI scheduler, KubeRay operator, and Prometheus+Grafana.
 
 ## Tear down (kind only)
 
@@ -94,7 +93,6 @@ infra/
 │       ├── gpu-operator.yaml         # prod only
 │       ├── kai-scheduler.yaml
 │       ├── kuberay-operator.yaml
-│       ├── kyverno.yaml
 │       └── kube-prometheus-stack.yaml
 ├── examples/
 │   ├── disagg-rayclusters.yaml       # Disaggregated RL + Gym (main exemplar)
@@ -102,7 +100,6 @@ infra/
 │   ├── gym_standalone_config.yaml    # Gym standalone server config
 │   ├── kai-queue.yaml                # 2-GPU kind cluster queues
 │   ├── kai-queue-prod.yaml           # 288-GPU NVL72 prod queues
-│   ├── kyverno-kai-policies.yaml     # Queue enforcement policies
 │   ├── kai-service-monitors.yaml     # Prometheus ServiceMonitors for KAI
 │   └── kai-grafana-dashboard.yaml    # Grafana fairshare dashboard
 ```
@@ -162,17 +159,12 @@ kubectl port-forward svc/kube-prometheus-stack-grafana -n monitoring 3000:80
 
 Key metrics: `kai_queue_allocated_gpus`, `kai_queue_deserved_gpus`, `kai_e2e_scheduling_latency_milliseconds`.
 
-### Kyverno queue enforcement
-
-RayCluster and RayJob resources must have a `kai.scheduler/queue` label or they're rejected by Kyverno. To enable user→queue access control, uncomment Policy 2 in `kyverno-kai-policies.yaml` and configure the `kai-queue-permissions` ConfigMap.
-
 ## TODO: NVL72 topology-aware scheduling
 
 KAI v0.14.0 added Ray topology-aware subgroup scheduling ([PR #1125](https://github.com/kai-scheduler/KAI-Scheduler/pull/1125)). Need to test on an actual NVL72 cluster:
 
 - **Confirm `--segment=N` equivalent works**: KAI's `subGroups` with per-subgroup `topologyConstraint.requiredTopologyLevel: "rack"` should be the equivalent of Slurm's `--segment=N`. Each subgroup of N nodes is constrained to one rack. Unclear if this works correctly for cross-rack scheduling (e.g., `--segment=16` with 32 total nodes = 2 racks).
 - **Auto-segmentation not yet implemented**: The design doc at [`docs/developer/designs/segmented-subgroups/`](https://github.com/kai-scheduler/KAI-Scheduler/blob/main/docs/developer/designs/segmented-subgroups/README.md) proposes `kai.scheduler/segment-size` annotation for automatic subgroup creation, but it depends on "Replica-Type SubGrouping" which isn't shipped yet. See [Issue #1189](https://github.com/kai-scheduler/KAI-Scheduler/issues/1189) and [PR #1127](https://github.com/kai-scheduler/KAI-Scheduler/pull/1127) (minSubGroup field, still open).
-- **Test with our k8s CLI**: The `nrl-k8s submit` command (see `extensions/k8s_cli/`) should support `--segment-size` that auto-generates the PodGroup subgroups until KAI ships native support.
 
 ## TODO: Log persistence
 
