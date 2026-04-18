@@ -124,6 +124,14 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
 
+        # Apply HybridEP monkey-patches if HybridEP is enabled.
+        if config["megatron_cfg"].get("moe_flex_dispatcher_backend") == "hybridep":
+            from nemo_rl.models.megatron.hybridep_patches import (
+                apply_hybridep_patches,
+            )
+
+            apply_hybridep_patches()
+
         self.cfg = config
 
         # Set rank for non-collocated to check which ranks to broadcast from
