@@ -207,6 +207,7 @@ class VllmInternalWorkerExtension:
                 ipc_handle, list_keys, used_bytes = payload
                 buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
 
+                weight = None
                 weights = []
                 offset = 0
                 for key in list_keys:
