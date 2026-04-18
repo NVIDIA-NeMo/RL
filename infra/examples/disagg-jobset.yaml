@@ -207,7 +207,9 @@ spec:
                 ray start --head --port=6380 \
                   --dashboard-host=0.0.0.0 --dashboard-port=8266 \
                   --object-store-memory=200000000
+                git config --global --add safe.directory /workspace/nemo-rl/3rdparty/Gym-workspace/Gym
                 cd /workspace/nemo-rl
+                uv pip install kubernetes
                 uv run --extra nemo_gym python -m nemo_rl.distributed.standalone_gym_server \
                   --job-id disagg-job \
                   --port 9090 \
@@ -223,6 +225,7 @@ spec:
                 initialDelaySeconds: 10
                 periodSeconds: 5
                 timeoutSeconds: 5
+                failureThreshold: 60
               resources:
                 requests: { cpu: "1", memory: "4Gi" }
                 limits:   { cpu: "4", memory: "16Gi" }
