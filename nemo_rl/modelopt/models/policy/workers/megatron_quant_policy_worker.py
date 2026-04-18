@@ -19,7 +19,6 @@ from typing import Generator
 
 import modelopt.torch.quantization as mtq
 import ray
-import torch
 from megatron.bridge.training.post_training.checkpointing import (
     has_modelopt_state,
     load_modelopt_state,
@@ -323,23 +322,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         """Save the checkpoint."""
         with self.without_model_config():
             return super().save_checkpoint(*args, **kwargs)
-
-    @torch.no_grad()
-    def prepare_refit_info(self):
-        """Prepare refit info, excluding weight_quantizer amax.
-
-        Weight quantizer amax is consumed on the Megatron side via pre-folding,
-        so only input_quantizer amax needs to be transferred to vLLM.
-        Uses the parent's iterator (without folding) since metadata is shape/dtype only.
-        """
-        self.refit_param_info_mcore = self._calculate_refit_param_info()
-
-        refit_param_info_hf = {}
-        for name, tensor in super()._iter_params_with_optional_kv_scales():
-            if "weight_quantizer" in name:
-                continue
-            refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
-        return refit_param_info_hf
 
     @staticmethod
     def _find_weight_quantizer(module, param_weight):
