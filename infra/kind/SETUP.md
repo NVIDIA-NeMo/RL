@@ -1,6 +1,14 @@
-# Local K8s GPU Development Environment
+# K8s Infrastructure for nemo-rl
 
-nvkind-based Kubernetes cluster with NVIDIA GPU support, KAI scheduler (gang scheduling), KubeRay, and JobSet.
+> [!WARNING]
+> These instructions are in active development and should not be relied on as stable yet.
+> APIs, manifests, and tooling may change without notice.
+
+## Overview
+
+This gives you a local GPU-enabled K8s playground for testing RL workloads — all you need is Docker and an NVIDIA GPU. The same example manifests can be brought to a production K8s cluster, but you may need to adapt them (work with your cluster operator).
+
+The helmfile here is for convenience. A production system should manage these components in Terraform or another infrastructure-as-code solution.
 
 ## Prerequisites
 
@@ -35,7 +43,7 @@ bash get-helm.sh
 # 2. Create cluster (all host GPUs exposed to a single worker node)
 bash create-cluster.sh
 
-# 3. Deploy infrastructure
+# 3. Deploy infrastructure (KAI scheduler, KubeRay, JobSet controller)
 cd ../helm
 helmfile -e kind sync
 
@@ -43,9 +51,26 @@ helmfile -e kind sync
 kubectl apply -f ../examples/kai-queue.yaml
 kubectl apply -f ../examples/endpoint-registry-rbac.yaml
 
-# 5. Deploy disaggregated RL + Gym
-kubectl apply -f ../examples/disagg-rayclusters.yaml
-kubectl get rayclusters -w    # both should become "ready"
+# 5. Deploy a workload (pick one)
+kubectl apply -f ../examples/rayjob-monolithic.yaml      # single-cluster RayJob
+kubectl apply -f ../examples/disagg-rayclusters.yaml      # disagg via KubeRay
+kubectl apply -f ../examples/disagg-jobset.yaml           # disagg via JobSet
+```
+
+### Testing locally with kind
+
+Once the cluster is up, you can:
+
+```sh
+kubectl get rayclusters -w           # watch cluster status
+kubectl get jobsets.jobset.x-k8s.io  # watch JobSet status
+kubectl get pods -o wide             # see pod placement and IPs
+kubectl logs <pod-name>              # check logs
+
+# Exec into RL head to run training manually:
+kubectl exec -it <rl-head-pod> -c ray-head -- bash
+cd /workspace/nemo-rl
+python examples/nemo_gym/run_grpo_nemo_gym.py +env.disagg_job_id=my-job logger.wandb_enabled=false
 ```
 
 ## Deploy on a real cluster
@@ -56,26 +81,87 @@ helmfile -e prod sync
 kubectl apply -f infra/examples/kai-queue-prod.yaml
 ```
 
-This installs the full **GPU Operator** (instead of just the device plugin) along with KAI scheduler and KubeRay. The GPU Operator manages the NVIDIA driver, container toolkit, device plugin, NFD, and DCGM exporter.
+This installs the full **GPU Operator** (instead of just the device plugin) along with KAI scheduler, KubeRay, and JobSet. The GPU Operator manages the NVIDIA driver, container toolkit, device plugin, NFD, and DCGM exporter.
 
 Set `driver.enabled=false` in `values/gpu-operator.yaml` if the cluster nodes already have the NVIDIA driver installed.
 
-## Helmfile environments
+## Architecture
 
-| Environment | GPU component | Use case |
-|-------------|---------------|----------|
-| `kind` | nvidia-device-plugin | Local dev — nvkind handles toolkit/runtime |
-| `prod` | gpu-operator (full) | Real clusters — operator manages everything |
+### Colocated (single Ray cluster)
 
-Both environments include KAI scheduler, KubeRay operator, and JobSet controller.
+All components run on a single RayCluster — vLLM generation, Megatron training, and Gym environment servers are colocated as Ray actors on the same cluster.
 
-## Tear down (kind only)
-
-```sh
-kind delete cluster --name nemo-rl
+```
+┌─────────────────────────────────────────────┐
+│              RayCluster / RayJob            │
+│                                             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │ vLLM     │  │ Megatron │  │ Gym      │  │
+│  │ (GPU)    │  │ (GPU)    │  │ (CPU)    │  │
+│  └──────────┘  └──────────┘  └──────────┘  │
+│           All on same Ray cluster           │
+└─────────────────────────────────────────────┘
 ```
 
-## Architecture
+Example: `rayjob-monolithic.yaml` — a single RayJob with head + GPU workers. KubeRay manages the lifecycle.
+
+### Disaggregated (separate RL + Gym clusters)
+
+The RL cluster (vLLM + Megatron) and Gym cluster (environment servers) run independently and communicate over HTTP. A K8s ConfigMap acts as an endpoint registry for dynamic URL exchange — RL publishes vLLM URLs, Gym publishes its head server address.
+
+```
+┌──────────────────────────┐     ┌──────────────────────────┐
+│    RL Ray Cluster        │     │    Gym Ray Cluster       │
+│                          │     │                          │
+│  ┌──────┐  ┌──────────┐ │     │  ┌──────────┐            │
+│  │ vLLM │  │ Megatron │ │     │  │ Gym      │            │
+│  │ (GPU)│  │ (GPU)    │ │     │  │ servers  │            │
+│  └──┬───┘  └──────────┘ │     │  └────┬─────┘            │
+│     │                    │     │       │                   │
+└─────┼────────────────────┘     └───────┼───────────────────┘
+      │                                  │
+      │     ┌──────────────────┐         │
+      └────►│ ConfigMap        │◄────────┘
+             │ (endpoint        │
+             │  registry)       │
+             └──────────────────┘
+             vLLM URLs ←→ Gym address
+```
+
+There are two ways to deploy the disagg architecture:
+
+#### Option A: Two KubeRay RayClusters (`disagg-rayclusters.yaml`)
+
+- KubeRay operator manages each RayCluster independently
+- **Failure cascading** requires a peer-watcher sidecar on each head pod (inlined Python script that monitors the peer cluster via K8s API and tears down both on failure)
+- **Startup ordering** is implicit — both clusters start simultaneously, the endpoint registry handles coordination
+- **Gang-of-gang scheduling** is not natively supported by KAI — each RayCluster gets its own PodGroup, and KAI cannot gang two PodGroups together. See [KAI issue #1420](https://github.com/kai-scheduler/KAI-Scheduler/issues/1420). The peer-watcher is a workaround
+- **ConfigMap** is required for both vLLM URL exchange and Gym head address discovery
+
+#### Option B: Single JobSet (`disagg-jobset.yaml`)
+
+- JobSet controller manages all pods as a single unit (no KubeRay needed for lifecycle)
+- **Failure cascading** is native via `failurePolicy: FailJobSet` — any job failure tears down everything
+- **Startup ordering** uses init containers (not `dependsOn` — see note below). Workers wait for their head via `ray health-check` polling, same pattern as KubeRay
+- **Gang scheduling** works naturally — KAI creates one PodGroup for the entire JobSet, so all pods are gang-scheduled together
+- **DNS names** are predictable (`disagg-job-rl-head-0-0.disagg-job`), so the Gym head address can be hardcoded instead of discovered via ConfigMap. However, **ConfigMap is still needed for vLLM URL exchange** — vLLM binds to a dynamic IP:port inside the RL worker, which isn't known until runtime
+
+> [!NOTE]
+> **Why not `dependsOn`?** KAI gang-schedules all pods in a JobSet together (one PodGroup with `minMember` = total pods). `dependsOn` prevents dependent pods from being created until the head is Ready. This deadlocks: KAI waits for all pods to exist, JobSet waits for the head to be scheduled. The fix is to create all pods simultaneously and use init containers for ordering.
+
+### Comparison
+
+| Feature | Colocated | Disagg (KubeRay) | Disagg (JobSet) |
+|---------|-----------|-------------------|-----------------|
+| Resources to manage | 1 RayJob | 2 RayClusters + RBAC | 1 JobSet + RBAC |
+| Failure cascading | KubeRay built-in | Peer-watcher sidecar | Native failurePolicy |
+| Gang scheduling | Single PodGroup | Two PodGroups (no cross-gang) | Single PodGroup |
+| Head discovery | KubeRay Service | ConfigMap registry | DNS (predictable) |
+| vLLM URL exchange | N/A (colocated) | ConfigMap registry | ConfigMap registry |
+| Startup ordering | KubeRay built-in | Implicit (both start) | Init containers |
+| KubeRay required | Yes | Yes | No |
+
+## File layout
 
 ```
 infra/
@@ -103,27 +189,20 @@ infra/
 │   └── kai-queue-prod.yaml           # 288-GPU NVL72 prod queues
 ```
 
-## Workload examples
+## Helmfile environments
 
-### `rayjob-monolithic.yaml` — Single-cluster RayJob
+| Environment | GPU component | Use case |
+|-------------|---------------|----------|
+| `kind` | nvidia-device-plugin | Local dev — nvkind handles toolkit/runtime |
+| `prod` | gpu-operator (full) | Real clusters — operator manages everything |
 
-Simplest deployment: KubeRay manages a RayCluster + submits an entrypoint via HTTP. One head, one GPU worker. Good for SFT or single-node training.
+Both environments include KAI scheduler, KubeRay operator, and JobSet controller.
 
-### `disagg-rayclusters.yaml` — Disagg via KubeRay
+## Tear down (kind only)
 
-Two RayClusters deployed together:
-- **RL cluster** (`raycluster-rl`): Ray head + GPU workers for training (vLLM + Megatron)
-- **Gym cluster** (`raycluster-gym`): CPU-only, runs standalone Gym HTTP server
-- **Service discovery**: K8s ConfigMap endpoint registry — RL publishes vLLM URLs, Gym publishes its head server address
-- **Failure cascading**: Peer-watcher sidecar on each head monitors the other cluster via K8s API
-
-### `disagg-jobset.yaml` — Disagg via JobSet (no KubeRay)
-
-Same disagg architecture as above but using a single JobSet instead of two RayClusters. Four ReplicatedJobs (rl-head, rl-workers, gym, driver) with:
-- **`dependsOn`**: workers, gym, and driver wait for rl-head to be Ready
-- **`failurePolicy`**: any failure tears down all jobs (replaces peer-watcher)
-- **`successPolicy`**: JobSet completes when driver exits 0
-- **Predictable DNS**: `disagg-job-rl-head-0-0.disagg-job` (no ConfigMap needed for head discovery)
+```sh
+kind delete cluster --name nemo-rl
+```
 
 ## Notes
 
@@ -157,7 +236,7 @@ KAI distributes GPU resources using hierarchical fair-share with two phases:
 
 ### Example configs
 
-- `kai-queue.yaml` — 2-GPU kind cluster (priority-team + community, imbalanced)
+- `kai-queue.yaml` — 2-GPU kind cluster (high-prio + low-prio)
 - `kai-queue-prod.yaml` — 288-GPU NVL72 production cluster (priority + community departments)
 
 ## TODO: NVL72 topology-aware scheduling
