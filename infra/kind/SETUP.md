@@ -67,7 +67,7 @@ Set `driver.enabled=false` in `values/gpu-operator.yaml` if the cluster nodes al
 | `kind` | nvidia-device-plugin | Local dev — nvkind handles toolkit/runtime |
 | `prod` | gpu-operator (full) | Real clusters — operator manages everything |
 
-Both environments include KAI scheduler, KubeRay operator, and Prometheus+Grafana.
+Both environments include KAI scheduler and KubeRay operator.
 
 ## Tear down (kind only)
 
@@ -92,15 +92,13 @@ infra/
 │       ├── nvidia-device-plugin.yaml # kind only
 │       ├── gpu-operator.yaml         # prod only
 │       ├── kai-scheduler.yaml
-│       ├── kuberay-operator.yaml
-│       └── kube-prometheus-stack.yaml
+│       └── kuberay-operator.yaml
 ├── examples/
 │   ├── disagg-rayclusters.yaml       # Disaggregated RL + Gym (main exemplar)
 │   ├── endpoint-registry-rbac.yaml   # RBAC for ConfigMap service discovery
 │   ├── gym_standalone_config.yaml    # Gym standalone server config
 │   ├── kai-queue.yaml                # 2-GPU kind cluster queues
-│   ├── kai-queue-prod.yaml           # 288-GPU NVL72 prod queues
-│   └── kai-service-monitors.yaml     # Prometheus ServiceMonitors for KAI
+│   └── kai-queue-prod.yaml           # 288-GPU NVL72 prod queues
 ```
 
 ## Disaggregated RL + Gym
@@ -146,17 +144,6 @@ KAI distributes GPU resources using hierarchical fair-share with two phases:
 
 - `kai-queue.yaml` — 2-GPU kind cluster (priority-team + community, imbalanced)
 - `kai-queue-prod.yaml` — 288-GPU NVL72 production cluster (priority + community departments)
-
-### Monitoring (Grafana)
-
-```sh
-kubectl port-forward svc/kube-prometheus-stack-grafana -n monitoring 3000:80
-# Open http://localhost:3000
-# Login: admin / prom-operator
-# Dashboard: search "KAI Scheduler Fairshare" or go to http://localhost:3000/d/kai-fairshare
-```
-
-Key metrics: `kai_queue_allocated_gpus`, `kai_queue_deserved_gpus`, `kai_e2e_scheduling_latency_milliseconds`.
 
 ## TODO: NVL72 topology-aware scheduling
 
