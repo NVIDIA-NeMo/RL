@@ -16,7 +16,7 @@
 # Usage:
 #   kubectl apply -f disagg-rayclusters.yaml
 #   # On RL head: run GRPO with +env.disagg_job_id=<job-id>
-#   # On Gym head: run standalone_server.py with --job-id=<job-id>
+#   # On Gym head: uv run --extra nemo_gym python -m nemo_rl.distributed.standalone_gym_server --job-id=<job-id>
 
 # ========================
 # RL RayCluster (GPU)
@@ -179,7 +179,7 @@ spec:
         imagePullSecrets:
         - name: nvcr-secret
         containers:
-        # --- Gym Ray head (runs standalone_server.py) ---
+        # --- Gym Ray head (runs standalone_gym_server) ---
         - name: ray-head
           image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
           resources:
