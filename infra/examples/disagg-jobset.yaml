@@ -208,7 +208,7 @@ spec:
                   --dashboard-host=0.0.0.0 --dashboard-port=8266 \
                   --object-store-memory=200000000
                 cd /workspace/nemo-rl
-                python -m nemo_rl.distributed.standalone_gym_server \
+                uv run --extra nemo_gym python -m nemo_rl.distributed.standalone_gym_server \
                   --job-id disagg-job \
                   --port 9090 \
                   --model-name Qwen/Qwen3-0.6B \
