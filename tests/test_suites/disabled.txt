@@ -6,6 +6,5 @@ tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.sh
 # Disable this due to know vLLM bug with Qwen3.5: https://github.com/vllm-project/vllm/issues/37856
 tests/test_suites/llm/grpo-qwen3.5-397ba17b-32n8g-megatron.sh
 
-# Gemma 4 recipes — disabled until convergence baselines are established
+# Gemma 4 31B — disabled until its own convergence baseline lands
 tests/test_suites/llm/dapo-gemma4-31b-it-4n8g-fsdp2-automodel.sh
-tests/test_suites/llm/grpo-gemma4-e2b-it-1n8g-fsdp2-automodel.sh
