@@ -332,16 +332,16 @@ spec:
               command: ["/bin/bash", "-c"]
               args:
               - |
+                set -eo pipefail
                 HEAD=disagg-job-rl-head-0-0.disagg-job
                 # No --working-dir: code is on all nodes via hostPath.
                 # --working-dir triggers Ray to zip+upload the directory to GCS.
                 # Instead, wrap the entrypoint with cd.
+                SUBMISSION_ID="grpo-$(date +%s)"
                 ray job submit --address http://${HEAD}:8265 \
-                  --submission-id grpo-run \
-                  -- bash -c "cd /workspace/nemo-rl && python examples/nemo_gym/run_grpo_nemo_gym.py +env.disagg_job_id=disagg-job"
-                ray job logs --follow --address http://${HEAD}:8265 grpo-run
-                STATUS=$(ray job status --address http://${HEAD}:8265 grpo-run 2>/dev/null | grep -oP 'status: \K\w+')
-                [ "$STATUS" = "SUCCEEDED" ] && exit 0 || exit 1
+                  --submission-id ${SUBMISSION_ID} \
+                  -- bash -c "cd /workspace/nemo-rl && python examples/nemo_gym/run_grpo_nemo_gym.py +env.disagg_job_id=disagg-job logger.wandb_enabled=false" \
+                  2>&1 | tee /workspace/nemo-rl/outputs/driver.log
               resources:
                 requests: { cpu: "500m", memory: "1Gi" }
                 limits:   { cpu: "1", memory: "2Gi" }
