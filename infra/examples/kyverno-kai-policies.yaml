@@ -1,14 +1,24 @@
 # Kyverno policies for KAI scheduler queue enforcement.
 #
 # Policy 1: RayCluster and RayJob must have a kai.scheduler/queue label.
+#   Only checks that the label exists and is non-empty — does NOT validate
+#   that the queue name is valid or that the user is allowed to use it.
 #   Validates at the CRD level (not Pod level) because the KubeRay operator
 #   creates pods — pod-level validation would check the operator's identity,
 #   not the actual user who submitted the workload.
 #
-# Policy 2 (optional): Validate that the queue is allowed for the requesting user.
-#   Uses a ConfigMap (kai-queue-permissions) for user→queue mapping.
-#   The user identity comes from the K8s AdmissionReview userInfo (OIDC email,
-#   certificate CN, or ServiceAccount name).
+# To extend this with more advanced validation, you could:
+#   - Validate the queue exists: add a context lookup against the K8s API for
+#     the Queue CRD and deny if not found.
+#   - Restrict queues per user: uncomment Policy 2 below, which uses a ConfigMap
+#     to map K8s usernames to allowed queue names.
+#   - Restrict queues per namespace: add a rule matching on request.namespace
+#     and comparing against an allowed list per namespace.
+#
+# Policy 2 (optional, commented out): Validate that the queue is allowed for
+#   the requesting user. Uses a ConfigMap (kai-queue-permissions) for user→queue
+#   mapping. The user identity comes from the K8s AdmissionReview userInfo
+#   (OIDC email, certificate CN, or ServiceAccount name).
 #
 # Prerequisites:
 #   helm install kyverno kyverno/kyverno -n kyverno --create-namespace

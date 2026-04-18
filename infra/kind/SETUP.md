@@ -105,8 +105,6 @@ infra/
 │   ├── kyverno-kai-policies.yaml     # Queue enforcement policies
 │   ├── kai-service-monitors.yaml     # Prometheus ServiceMonitors for KAI
 │   └── kai-grafana-dashboard.yaml    # Grafana fairshare dashboard
-└── extensions/
-    └── k8s_cli/                       # nrl-k8s CLI tool
 ```
 
 ## Disaggregated RL + Gym
@@ -167,20 +165,6 @@ Key metrics: `kai_queue_allocated_gpus`, `kai_queue_deserved_gpus`, `kai_e2e_sch
 ### Kyverno queue enforcement
 
 RayCluster and RayJob resources must have a `kai.scheduler/queue` label or they're rejected by Kyverno. To enable user→queue access control, uncomment Policy 2 in `kyverno-kai-policies.yaml` and configure the `kai-queue-permissions` ConfigMap.
-
-## CLI (`nrl-k8s`)
-
-Standalone Python CLI for managing workloads. Install: `pip install -e extensions/k8s_cli`
-
-```sh
-nrl-k8s fairshare          # show queue config (quota, limit, weight, priority)
-nrl-k8s occupancy          # show GPU allocation per node and per queue
-nrl-k8s submit JOB_NAME \  # submit gang-scheduled RayJob
-  --queue priority-team \
-  --image nvcr.io/nvidian/nemo-rl:latest \
-  --entrypoint "bash tests/functional/sft.sh" \
-  --num-gpus 2
-```
 
 ## TODO: NVL72 topology-aware scheduling
 
