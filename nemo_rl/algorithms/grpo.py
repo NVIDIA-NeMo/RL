@@ -680,7 +680,7 @@ def setup(
             )
 
         ## make vllm hf overrides match the training policy
-        generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
+        generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
             "hf_config_overrides", {}
         )
 
@@ -2118,6 +2118,8 @@ def grpo_train(
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
+            if "draft_loss" in metrics:
+                print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
             print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
             if master_config["grpo"]["use_dynamic_sampling"]:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
@@ -2473,12 +2475,16 @@ def async_grpo_train(
             "nemo_rl.algorithms.async_utils.ReplayBuffer",
         )
 
+    _replay_py_venv = os.path.dirname(
+        os.path.dirname(_replay_py_exec)
+    )  # to remove the "bin/python" suffix
+
     _replay_runtime_env = {
         "py_executable": _replay_py_exec,
         "env_vars": {
             **os.environ,
-            "VIRTUAL_ENV": _replay_py_exec,
-            "UV_PROJECT_ENVIRONMENT": _replay_py_exec,
+            "VIRTUAL_ENV": _replay_py_venv,
+            "UV_PROJECT_ENVIRONMENT": _replay_py_venv,
         },
     }
 
@@ -2504,12 +2510,16 @@ def async_grpo_train(
             "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
         )
 
+    _tc_py_venv = os.path.dirname(
+        os.path.dirname(_tc_py_exec)
+    )  # to remove the "bin/python" suffix
+
     _tc_runtime_env = {
         "py_executable": _tc_py_exec,
         "env_vars": {
             **os.environ,
-            "VIRTUAL_ENV": _tc_py_exec,
-            "UV_PROJECT_ENVIRONMENT": _tc_py_exec,
+            "VIRTUAL_ENV": _tc_py_venv,
+            "UV_PROJECT_ENVIRONMENT": _tc_py_venv,
         },
     }
 
@@ -3130,6 +3140,8 @@ def async_grpo_train(
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")
+            if "draft_loss" in metrics:
+                print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
             print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(f"  • Buffer Size: {buffer_size_current}")

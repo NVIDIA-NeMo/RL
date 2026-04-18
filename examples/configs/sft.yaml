@@ -101,6 +101,7 @@ policy:
     enabled: false
     use_linear_ce_fusion_loss: false
     linear_ce_fusion_chunk_size: 256
+    force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     env_vars: {}
     empty_unused_memory_level: 1
     activation_checkpointing: false
@@ -117,7 +118,7 @@ policy:
     moe_router_dtype: null
     moe_router_load_balancing_type: "aux_loss"
     moe_router_bias_update_rate: 1e-3
-    moe_permute_fusion: false
+    moe_permute_fusion: true
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
@@ -127,6 +128,7 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
 
     peft:
       enabled: false

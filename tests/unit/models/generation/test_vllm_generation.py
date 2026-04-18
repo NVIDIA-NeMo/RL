@@ -16,6 +16,7 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -143,6 +144,51 @@ basic_lora_test_config: LoRAConfig = {
 }
 
 
+def test_configure_generation_config_uses_real_startup_weights_without_draft_refit():
+    """Speculative training should not start the drafter from dummy weights without refit."""
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_kwargs"] = {
+        "speculative_config": {
+            "method": "eagle3",
+            "model": "/tmp/draft-model",
+            "num_speculative_tokens": 3,
+        }
+    }
+    tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+
+    with pytest.warns(UserWarning, match="Speculative decoding is enabled"):
+        configured = configure_generation_config(
+            vllm_config,
+            tokenizer,
+            is_eval=False,
+            has_refit_draft_weights=False,
+        )
+
+    assert configured["vllm_cfg"]["load_format"] == "auto"
+
+
+def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refit():
+    """Speculative training can keep dummy startup weights when draft refit is available."""
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_kwargs"] = {
+        "speculative_config": {
+            "method": "eagle3",
+            "model": "/tmp/draft-model",
+            "num_speculative_tokens": 3,
+        }
+    }
+    tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+
+    configured = configure_generation_config(
+        vllm_config,
+        tokenizer,
+        is_eval=False,
+        has_refit_draft_weights=True,
+    )
+
+    assert configured["vllm_cfg"]["load_format"] == "dummy"
+
+
 def get_basic_megatron_test_config(
     tp: int = 1,
     pp: int = 1,
@@ -199,6 +245,7 @@ def get_basic_megatron_test_config(
             "apply_rope_fusion": True,
             "bias_activation_fusion": True,
             "moe_per_layer_logging": False,
+            "gradient_accumulation_fusion": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -233,6 +280,7 @@ def get_basic_megatron_test_config(
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
         },
+        "draft": {"enabled": False},
         "optimizer": None,  # Remove default FSDP optimizer
         "scheduler": None,  # Remove default scheduler
         "max_grad_norm": 1.0,

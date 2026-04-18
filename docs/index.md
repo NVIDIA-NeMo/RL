@@ -107,11 +107,25 @@ Step-by-step guide for supervised fine-tuning on the OpenMathInstruct2 dataset.
 Create custom reward environments and integrate them with NeMo RL training pipelines.
 :::
 
+:::{grid-item-card} {octicon}`rocket` Eagle3 Speculative Decoding
+:link: guides/eagle3-speculative-decoding
+:link-type: doc
+
+Configure offline and online Eagle3 draft-model workflows to accelerate rollout generation with vLLM.
+:::
+
 :::{grid-item-card} {octicon}`plus-circle` Adding New Models
 :link: adding-new-models
 :link-type: doc
 
 Learn how to add support for new model architectures in NeMo RL.
+:::
+
+:::{grid-item-card} {octicon}`arrow-both` YaRN Long-Context Training
+:link: guides/yarn-long-context
+:link-type: doc
+
+Extend a model's context window with YaRN RoPE scaling on the Megatron backend for SFT, GRPO, and other workflows.
 :::
 
 ::::
@@ -219,6 +233,8 @@ guides/eval.md
 guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
+guides/eagle3-speculative-decoding.md
+guides/yarn-long-context.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
 guides/ft-launcher-guide.md

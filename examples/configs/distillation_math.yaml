@@ -87,6 +87,7 @@ policy: &POLICY_BASE
 
     megatron_cfg: &MEGATRON_BASE
         enabled: false
+        force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
         empty_unused_memory_level: 0
         activation_checkpointing: false
         converter_type: "Qwen3ForCausalLM"
@@ -103,7 +104,7 @@ policy: &POLICY_BASE
         moe_router_dtype: "fp64"
         moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
         moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
-        moe_permute_fusion: false
+        moe_permute_fusion: true
         #gives ~20% training perf speedup with sequence packing 
         apply_rope_fusion: True
         bias_activation_fusion: True
@@ -112,6 +113,7 @@ policy: &POLICY_BASE
         moe_enable_deepep: false
         moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
+        gradient_accumulation_fusion: false
         
         optimizer:
             optimizer: "adam"
@@ -196,6 +198,7 @@ policy: &POLICY_BASE
             num_last_layers_in_bf16: 0
             num_first_layers_in_bf16: 0
             distributed_executor_backend: null
+        vllm_kwargs: {}
 
         colocated:
             # true: generation shares training GPUs

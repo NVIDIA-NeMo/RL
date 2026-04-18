@@ -232,6 +232,60 @@ class BaseVllmGenerationWorker:
             with open(file_to_patch, "w") as f:
                 f.write(content)
 
+        def _patch_vllm_llama_eagle3_own_lm_head():
+            """Patch LlamaEagle3 to keep truncated draft lm_head ownership."""
+            try:
+                file_to_patch = _get_vllm_file("model_executor/models/llama_eagle3.py")
+            except RuntimeError:
+                logger.warning(
+                    "Could not locate llama_eagle3.py for lm_head ownership patch."
+                )
+                return
+
+            with open(file_to_patch, "r") as f:
+                content = f.read()
+
+            if "self.has_own_lm_head = (" in content:
+                logger.info("llama_eagle3 lm_head ownership patch already applied.")
+                return
+
+            old_snippet = (
+                "        self.lm_head = ParallelLMHead(\n"
+                "            self.config.draft_vocab_size,\n"
+                "            self.config.hidden_size,\n"
+                '            prefix=maybe_prefix(prefix, "lm_head"),\n'
+                "        )\n"
+                "        self.logits_processor = LogitsProcessor(\n"
+            )
+
+            new_snippet = (
+                "        self.lm_head = ParallelLMHead(\n"
+                "            self.config.draft_vocab_size,\n"
+                "            self.config.hidden_size,\n"
+                '            prefix=maybe_prefix(prefix, "lm_head"),\n'
+                "        )\n"
+                "        self.has_own_lm_head = (\n"
+                "            self.config.draft_vocab_size != self.config.vocab_size\n"
+                "        )\n"
+                "        self.logits_processor = LogitsProcessor(\n"
+            )
+
+            if old_snippet not in content:
+                logger.warning(
+                    "Could not apply llama_eagle3 lm_head ownership patch: "
+                    "expected code snippet not found in %s. "
+                    "The vLLM version may have changed.",
+                    file_to_patch,
+                )
+                return
+
+            content = content.replace(old_snippet, new_snippet, 1)
+
+            with open(file_to_patch, "w") as f:
+                f.write(content)
+
+            logger.info("Successfully patched llama_eagle3 lm_head ownership.")
+
         def _patch_vllm_hermes_tool_parser_thread_safety():
             """Patch Hermes2ProToolParser.__init__ to cache tokenizer calls.
 
@@ -355,6 +409,7 @@ class BaseVllmGenerationWorker:
         _patch_vllm_init_workers_ray()
         logger.info("Successfully patched vllm _init_workers_ray.")
 
+        _patch_vllm_llama_eagle3_own_lm_head()
         _patch_vllm_hermes_tool_parser_thread_safety()
 
         try:
@@ -444,9 +499,6 @@ class BaseVllmGenerationWorker:
 
         if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}
-        vllm_kwargs["hf_overrides"].update(
-            self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
-        )
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
@@ -458,12 +510,29 @@ class BaseVllmGenerationWorker:
                 )
                 # disable quantization
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
-        elif "Gemma3ForConditionalGeneration" in getattr(
-            hf_config, "architectures", []
+        elif any(
+            arch in getattr(hf_config, "architectures", [])
+            for arch in (
+                "Gemma3ForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            )
         ):
+            detected_arch = [
+                arch
+                for arch in getattr(hf_config, "architectures", [])
+                if arch
+                in (
+                    "Gemma3ForConditionalGeneration",
+                    "Qwen3_5ForConditionalGeneration",
+                    "Qwen3_5MoeForConditionalGeneration",
+                )
+            ]
             if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
                 print(
-                    "Gemma3ForConditionalGeneration models may crash when skip_tokenizer_init is True. NeMo-RL is forcing it to False for this architecture. See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
+                    f"Detected {detected_arch} which may crash when skip_tokenizer_init is True. "
+                    "NeMo-RL is forcing it to False for this architecture. "
+                    "See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
 
@@ -477,7 +546,9 @@ class BaseVllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
+            enable_prefix_caching=self.cfg["vllm_cfg"].get(
+                "enable_prefix_caching", torch.cuda.get_device_capability()[0] >= 8
+            ),
             dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
@@ -925,6 +996,16 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
         self.llm.llm_engine.reset_prefix_cache()
+        # Clear the renderer's multimodal processor cache (sender side) so it
+        # stays in sync with the receiver cache that vLLM clears internally
+        # during sleep.  Without this, the sender thinks images are already
+        # cached on the receiver and sends data=None, causing an assertion
+        # error.  We only clear the renderer (sender) cache here — the
+        # receiver and worker-level caches are reset by sleep() internally.
+        if hasattr(self.llm, "renderer") and hasattr(
+            self.llm.renderer, "clear_mm_cache"
+        ):
+            self.llm.renderer.clear_mm_cache()
         self.llm.sleep(level=1)
 
         gc.collect()

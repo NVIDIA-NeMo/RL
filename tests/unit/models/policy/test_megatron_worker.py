@@ -144,6 +144,7 @@ def create_megatron_test_config(
             "defer_fp32_logits": defer_fp32_logits,
             "use_linear_ce_fusion_loss": False,
             "linear_ce_fusion_chunk_size": 256,
+            "gradient_accumulation_fusion": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -184,6 +185,13 @@ def create_megatron_test_config(
                 "fp8_param": True,
             },
             "attention_backend": attention_backend,
+        },
+        "draft": {
+            "enabled": False,
+            "model_name": None,
+            "loss_weight": 0.1,
+            "num_layers": None,
+            "aux_layer_indices": None,
         },
         "make_sequence_length_divisible_by": tp,
         "optimizer": None,  # Remove default FSDP optimizer

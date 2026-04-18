@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
 import os
 import time
 import warnings
-from typing import Any, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 import torch
 from megatron.bridge import AutoBridge
@@ -23,6 +25,7 @@ from megatron.bridge.models.model_provider import get_model
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.checkpointing import (
+    _load_checkpoint_from_path,
     checkpoint_exists,
     init_checkpointing_context,
     load_checkpoint,
@@ -48,6 +51,7 @@ from megatron.bridge.training.setup import (
 )
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
+from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
@@ -73,6 +77,11 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
+from nemo_rl.models.megatron.draft.utils import (
+    build_draft_model,
+    find_draft_owner_chunk,
+    get_attached_draft_model,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -102,31 +111,6 @@ def destroy_parallel_state():
         except:
             pass  # Ignore errors if already destroyed
 
-    # Reset async calls queue to prevent call_idx mismatches after distributed context recreation
-    try:
-        import nemo.tron.utils.async_utils as nemo_async_utils
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
-
-        # Clean up any existing async callers first
-        old_call_idx = getattr(nemo_async_utils._async_calls_queue, "call_idx", None)
-        num_unfinalized = (
-            nemo_async_utils._async_calls_queue.get_num_unfinalized_calls()
-        )
-        if num_unfinalized > 0:
-            print(
-                f"[WARNING] Resetting async calls queue with {num_unfinalized} unfinalized calls"
-            )
-        try:
-            nemo_async_utils._async_calls_queue.close()
-        except:
-            pass  # Ignore errors during cleanup
-        # Reset the global async calls queue by creating a new instance
-        nemo_async_utils._async_calls_queue = AsyncCallsQueue()
-    except ImportError:
-        pass
-
     # Also reset the Megatron async calls queue if it exists
     try:
         import megatron.training.async_utils as megatron_async_utils
@@ -138,13 +122,14 @@ def destroy_parallel_state():
         old_call_idx = getattr(
             megatron_async_utils._async_calls_queue, "call_idx", None
         )
-        num_unfinalized = (
-            megatron_async_utils._async_calls_queue.get_num_unfinalized_calls()
-        )
-        if num_unfinalized > 0:
-            print(
-                f"[WARNING] Resetting Megatron async calls queue with {num_unfinalized} unfinalized calls"
+        if megatron_async_utils._async_calls_queue is not None:
+            num_unfinalized = (
+                megatron_async_utils._async_calls_queue.get_num_unfinalized_calls()
             )
+            if num_unfinalized > 0:
+                print(
+                    f"[WARNING] Resetting Megatron async calls queue with {num_unfinalized} unfinalized calls"
+                )
         try:
             megatron_async_utils._async_calls_queue.close()
         except:
@@ -154,29 +139,6 @@ def destroy_parallel_state():
         print(
             f"[DEBUG] Reset Megatron async calls queue (old call_idx: {old_call_idx})"
         )
-    except ImportError:
-        pass
-
-    # Reset the third global async_calls instance in base strategy module
-    try:
-        import megatron.core.dist_checkpointing.strategies.base as base_strategy
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
-
-        # Clean up and reset the global async_calls in base strategy
-        old_call_idx = getattr(base_strategy.async_calls, "call_idx", None)
-        num_unfinalized = base_strategy.async_calls.get_num_unfinalized_calls()
-        if num_unfinalized > 0:
-            print(
-                f"[WARNING] Resetting base strategy async_calls with {num_unfinalized} unfinalized calls"
-            )
-        try:
-            base_strategy.async_calls.close()
-        except:
-            pass
-        base_strategy.async_calls = AsyncCallsQueue()
-        print(f"[DEBUG] Reset base strategy async_calls (old call_idx: {old_call_idx})")
     except ImportError:
         pass
 
@@ -238,6 +200,26 @@ def validate_and_set_config(
             "tracked in https://github.com/NVIDIA-NeMo/RL/issues/720"
         )
 
+    # Validate yarn rope_scaling fields are fully specified
+    rope_scaling = (config.get("hf_config_overrides") or {}).get("rope_scaling") or {}
+    if rope_scaling.get("rope_type") == "yarn":
+        _YARN_REQUIRED_FIELDS = (
+            "factor",
+            "rope_theta",
+            "original_max_position_embeddings",
+            "truncate",
+            "beta_fast",
+            "beta_slow",
+            "mscale",
+            "mscale_all_dim",
+        )
+        missing = [f for f in _YARN_REQUIRED_FIELDS if f not in rope_scaling]
+        assert not missing, (
+            f"rope_scaling.rope_type is 'yarn' but the following required fields are not set: "
+            f"{missing}. Please specify all of {list(_YARN_REQUIRED_FIELDS)} in "
+            f"policy.hf_config_overrides.rope_scaling."
+        )
+
     megatron_cfg, model_cfg = setup_model_config(
         config,
         rank,
@@ -266,21 +248,37 @@ def validate_and_set_config(
     )
 
 
+def _canonicalize_hf_config_overrides(overrides: dict[str, Any]) -> str:
+    """Return a stable JSON string for hf_config_overrides."""
+    return json.dumps(
+        overrides, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+
+
+def _get_hf_config_overrides_hash(overrides: dict[str, Any]) -> str:
+    """Return a short stable hash for hf_config_overrides."""
+    canonical = _canonicalize_hf_config_overrides(overrides)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
 def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     """Validate and setup model paths."""
     # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
     hf_model_name = config["model_name"]
+    hf_config_overrides = config.get("hf_config_overrides", {}) or {}
 
     # Check if the checkpoint already exists
     hf_model_subdir = hf_model_name
     if os.path.exists(hf_model_name):
         hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
 
-    pretrained_path = f"{get_megatron_checkpoint_dir()}/{hf_model_subdir}"
+    if hf_config_overrides:
+        overrides_hash = _get_hf_config_overrides_hash(hf_config_overrides)
+        hf_model_subdir = f"{hf_model_subdir}__hfovr_{overrides_hash}"
+    pretrained_path = os.path.join(get_megatron_checkpoint_dir(), hf_model_subdir)
     pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
         os.path.join(pretrained_path, "iter_0000000")
     )
-
     return hf_model_name, pretrained_path, pt_checkpoint_exists
 
 
@@ -332,6 +330,9 @@ def setup_model_config(
 
     # Apply MoE settings
     _apply_moe_config(model_cfg, config)
+
+    # Apply MTP settings
+    _apply_mtp_config(model_cfg, config)
 
     # Apply precision settings
     _apply_precision_config(model_cfg, config, dtype)
@@ -430,6 +431,11 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     ]
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
+
+
+def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
+    if "mtp_num_layers" in config["megatron_cfg"]:
+        model_cfg.mtp_num_layers = config["megatron_cfg"]["mtp_num_layers"]
 
 
 def _apply_precision_config(
@@ -659,6 +665,67 @@ def _create_megatron_config(
     )
 
 
+def _create_draft_pre_wrap_hook(
+    policy_cfg: PolicyConfig,
+    megatron_cfg: ConfigContainer,
+    state: GlobalState,
+    *,
+    preload_policy_from_pretrained: bool,
+) -> Callable[[list[MegatronModule]], list[MegatronModule]]:
+    """Create the hook that attaches draft weights before mixed-precision/DDP wrapping."""
+    draft_cfg = policy_cfg["draft"]
+
+    def draft_pre_wrap_hook(model: list[MegatronModule]) -> list[MegatronModule]:
+        """Optionally preload the base policy, then attach the draft module to the owner chunk."""
+        if not draft_cfg["enabled"]:
+            return model
+
+        # Base pretrained checkpoints do not contain draft weights, so load the
+        # policy weights before attaching the nested draft module.
+        if preload_policy_from_pretrained:
+            pretrained_checkpoint = megatron_cfg.checkpoint.pretrained_checkpoint
+            if pretrained_checkpoint is None or not checkpoint_exists(
+                pretrained_checkpoint
+            ):
+                raise ValueError(
+                    f"Invalid pretrained checkpoint directory found: {pretrained_checkpoint}"
+                )
+            megatron_cfg.checkpoint.finetune = True
+            _load_checkpoint_from_path(
+                load_dir=pretrained_checkpoint,
+                state=state,
+                model=model,
+                optimizer=None,
+                opt_param_scheduler=None,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+                ignore_ckpt_step=True,
+            )
+
+        draft_owner = find_draft_owner_chunk(model)
+        if draft_owner is None:
+            return model
+
+        if getattr(draft_owner, "draft_model", None) is not None:
+            raise RuntimeError(
+                "Policy model chunk already has an attached `draft_model`."
+            )
+
+        pg_collection = get_pg_collection(model)
+        draft_model = build_draft_model(
+            megatron_cfg.model,
+            draft_config=draft_cfg,
+            pg_collection=pg_collection,
+            policy_model_chunk=draft_owner,
+        )
+        if draft_model is not None:
+            setattr(draft_owner, "draft_model", draft_model)
+
+        return model
+
+    return draft_pre_wrap_hook
+
+
 def setup_model_and_optimizer(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -721,6 +788,21 @@ def setup_model_and_optimizer(
     pre_wrap_hook = []
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
+    draft_enabled = "draft" in policy_cfg and policy_cfg["draft"]["enabled"]
+    resume_checkpoint_exists = (
+        megatron_cfg.checkpoint.load is not None
+        and checkpoint_exists(megatron_cfg.checkpoint.load)
+    )
+    pretrained_checkpoint_exists = (
+        megatron_cfg.checkpoint.pretrained_checkpoint is not None
+        and checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
+    )
+    preload_policy_from_pretrained_for_draft = (
+        draft_enabled
+        and not use_peft  # The PEFT pre-wrap hook loads the pretrained base policy before adapters are attached.
+        and not resume_checkpoint_exists  # Resume checkpoints already carry the attached draft module state.
+        and pretrained_checkpoint_exists
+    )
 
     mixed_precision_wrapper = Float16Module
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
@@ -779,6 +861,15 @@ def setup_model_and_optimizer(
 
         pre_wrap_hook.extend([composed_peft_hook])
 
+    if draft_enabled:
+        draft_pre_wrap_hook = _create_draft_pre_wrap_hook(
+            policy_cfg,
+            megatron_cfg,
+            state,
+            preload_policy_from_pretrained=preload_policy_from_pretrained_for_draft,
+        )
+        pre_wrap_hook.extend([draft_pre_wrap_hook])
+
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     setattr(megatron_cfg.model, "_pg_collection", pg_collection)
@@ -796,6 +887,7 @@ def setup_model_and_optimizer(
         mixed_precision_wrapper=mixed_precision_wrapper,
         pg_collection=pg_collection,
     )
+
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
             optimizer_config=megatron_cfg.optimizer,
@@ -811,21 +903,15 @@ def setup_model_and_optimizer(
     torch.distributed.barrier()
 
     if megatron_cfg.peft is not None:
-        should_load_checkpoint = (
-            megatron_cfg.checkpoint.load is not None
-            and checkpoint_exists(megatron_cfg.checkpoint.load)
-        )
+        should_load_checkpoint = resume_checkpoint_exists
         if should_load_checkpoint:
             # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
             # This is switched off here in order to load these states from the checkpoint
             megatron_cfg.checkpoint.finetune = False
     else:
-        should_load_checkpoint = (
-            megatron_cfg.checkpoint.load is not None
-            and checkpoint_exists(megatron_cfg.checkpoint.load)
-        ) or (
-            megatron_cfg.checkpoint.pretrained_checkpoint is not None
-            and checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
+        should_load_checkpoint = resume_checkpoint_exists or (
+            pretrained_checkpoint_exists
+            and not preload_policy_from_pretrained_for_draft
         )
 
     # Load checkpoint if applicable
@@ -840,6 +926,8 @@ def setup_model_and_optimizer(
         )
         print("Checkpoint loaded")
     torch.distributed.barrier()
+
+    draft_model = get_attached_draft_model(model)
 
     # Set the param sync function for the model
     param_sync_func = None
@@ -858,6 +946,7 @@ def setup_model_and_optimizer(
         scheduler,
         checkpointing_context,
         param_sync_func,
+        draft_model=draft_model,
     )
 
 
@@ -868,7 +957,11 @@ def handle_model_import(
     pt_checkpoint_exists: bool,
 ) -> None:
     """Handle HF model import if checkpoint doesn't exist."""
-    if pt_checkpoint_exists:
+    force_reconvert_from_hf = config["megatron_cfg"].get(
+        "force_reconvert_from_hf", False
+    )
+
+    if pt_checkpoint_exists and not force_reconvert_from_hf:
         print(f"Checkpoint already exists at {pretrained_path}. Skipping import.")
     else:
         hf_config_overrides = config.get("hf_config_overrides", {}) or {}
