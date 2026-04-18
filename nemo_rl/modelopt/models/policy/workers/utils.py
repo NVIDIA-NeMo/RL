@@ -14,6 +14,7 @@
 
 
 import os
+from pathlib import Path
 
 import modelopt.torch.quantization as mtq
 import torch
@@ -27,32 +28,35 @@ from modelopt.torch.utils.dataset_utils import (
 )
 from modelopt.torch.utils.plugins import megatron_prefill
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer
 
+from nemo_rl.algorithms.utils import get_tokenizer as _base_get_tokenizer
 from nemo_rl.modelopt.utils import resolve_quant_cfg
 
 MAX_SEQ_LEN = 2048
 MAX_OUTPUT_LEN = 512
 
 
-def get_tokenizer(ckpt_path, max_seq_len=MAX_SEQ_LEN, trust_remote_code=False):
-    """Returns the tokenizer from the model ckpt_path."""
+def symlink_pre_quantized_model(src: str, pretrained_path: str) -> None:
+    """Symlink an external pre-quantized checkpoint as ``<pretrained_path>/iter_0000000``."""
+    iter0_path = Path(pretrained_path) / "iter_0000000"
+    absolute_src = Path(src).resolve()
+    iter0_path.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(absolute_src.as_posix(), iter0_path.as_posix(), target_is_directory=True)
+    assert iter0_path.exists(), f"Symlink target does not exist: {absolute_src}"
+    print(f"Using pre-quantized model at: {absolute_src}")
+
+
+def get_tokenizer(ckpt_path, max_seq_len=MAX_SEQ_LEN):
+    """Returns a tokenizer configured for ModelOpt calibration.
+
+    Wraps :func:`nemo_rl.algorithms.utils.get_tokenizer` and applies the
+    extra configuration needed for batched calibration forward passes:
+    ``padding_side="left"`` and ``model_max_length`` truncation.
+    """
     print(f"Initializing tokenizer from {ckpt_path}")
-    tokenizer = AutoTokenizer.from_pretrained(
-        ckpt_path,
-        model_max_length=max_seq_len,
-        padding_side="left",
-        trust_remote_code=trust_remote_code,
-    )
-    if type(tokenizer).__name__ == "QWenTokenizer":
-        # qwen use token id 151643 as pad and eos tokens
-        tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
-        tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
-
-    # can't set attribute 'pad_token' for "<unk>"
-    if tokenizer.pad_token != "<unk>":
-        tokenizer.pad_token = tokenizer.eos_token
-
+    tokenizer = _base_get_tokenizer({"name": ckpt_path})
+    tokenizer.padding_side = "left"
+    tokenizer.model_max_length = max_seq_len
     return tokenizer
 
 

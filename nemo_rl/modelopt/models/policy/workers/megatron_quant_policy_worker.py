@@ -15,7 +15,6 @@
 
 import os
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Generator
 
 import modelopt.torch.quantization as mtq
@@ -25,19 +24,17 @@ from megatron.bridge.training.post_training.checkpointing import (
     has_modelopt_state,
     load_modelopt_state,
 )
-from megatron.core import parallel_state
 from megatron.core.utils import unwrap_model
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
-import nemo_rl.models.megatron.setup as megatron_setup
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from nemo_rl.modelopt.models.policy.workers.utils import (
     get_tokenizer,
     quantization_layer_spec,
     quantize_model,
+    symlink_pre_quantized_model,
 )
-from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
@@ -50,11 +47,26 @@ from nemo_rl.models.policy.workers.megatron_policy_worker import (
 class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def __init__(self, config, *args, **kwargs):
         """Initialize the MegatronQuantPolicyWorker."""
+        megatron_cfg = config.get("megatron_cfg", {}) or {}
+        assert not megatron_cfg.get("gradient_accumulation_fusion", False), (
+            "gradient_accumulation_fusion=True is not supported with "
+            "MegatronQuantPolicyWorker (ModelOpt quantization). "
+            "Set policy.megatron_cfg.gradient_accumulation_fusion=False."
+        )
+        # Enables Megatron-Bridge's Megatron->HF weight name mappings for
+        # ModelOpt quantizer state (e.g. amax).
         os.environ["ENABLE_BRIDGE_QUANT_MAPPING"] = "1"
         self._patch_validate_model_paths()
         self._patch_setup_model_and_optimizer()
-        with self._patched_model_loading():
-            super().__init__(config, *args, **kwargs)
+        # Hooks read by MegatronPolicyWorkerImpl.__init__ via getattr().
+        # _model_post_wrap_hook / _transformer_layer_spec are forwarded to
+        # handle_model_import; _pre_load_checkpoint_hook is forwarded to
+        # setup_model_and_optimizer / setup_reference_model_state and runs
+        # before load_checkpoint to install quantizers on the model.
+        self._model_post_wrap_hook = self._quantize
+        self._transformer_layer_spec = quantization_layer_spec
+        self._pre_load_checkpoint_hook = self._restore_modelopt_state_pre_load
+        super().__init__(config, *args, **kwargs)
 
         if hasattr(self, "reference_state_dict"):
             for name, item in self.model.state_dict().items():
@@ -95,49 +107,40 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         we need to save an extra quantized checkpoint. This patch checks for modelopt state
         and redirects to a _quantized suffix path. It also handles pre-quantized model symlinks.
         """
-        if hasattr(megatron_policy_worker, "_original_validate_model_paths"):
+        if getattr(megatron_policy_worker.validate_model_paths, "_is_patched", False):
             return
-        megatron_policy_worker._original_validate_model_paths = (
-            megatron_policy_worker.validate_model_paths
-        )
+        original_validate_model_paths = megatron_policy_worker.validate_model_paths
 
         def _validate_model_paths(config):
             hf_model_name, pretrained_path, pt_checkpoint_exists = (
-                megatron_policy_worker._original_validate_model_paths(config)
+                original_validate_model_paths(config)
             )
 
             iter0_path = os.path.join(pretrained_path, "iter_0000000")
             if pt_checkpoint_exists and not has_modelopt_state(iter0_path):
                 pretrained_path += "_quantized"
                 iter0_path = os.path.join(pretrained_path, "iter_0000000")
-                pt_checkpoint_exists = os.path.exists(
-                    pretrained_path
-                ) and os.path.exists(iter0_path)
+                pt_checkpoint_exists = os.path.exists(iter0_path)
 
             pre_quantized_model_path = os.environ.get(
                 "NRL_PRE_QUANTIZED_MEGATRON_MODEL_PATH"
             )
             if pre_quantized_model_path is not None and not pt_checkpoint_exists:
-                print(f"Using pre-quantized model at: {pre_quantized_model_path}")
-                absolute_path = Path(pre_quantized_model_path).resolve()
-                os.makedirs(pretrained_path, exist_ok=True)
-                os.symlink(
-                    absolute_path.as_posix(),
-                    iter0_path,
-                    target_is_directory=True,
-                )
-                assert os.path.exists(iter0_path)
+                symlink_pre_quantized_model(pre_quantized_model_path, pretrained_path)
                 pt_checkpoint_exists = True
 
             return hf_model_name, pretrained_path, pt_checkpoint_exists
 
+        _validate_model_paths._is_patched = True
         megatron_policy_worker.validate_model_paths = _validate_model_paths
 
     def _patch_setup_model_and_optimizer(self):
         """Patch setup_model_and_optimizer to restore modelopt state when loading quantized checkpoints."""
-        if hasattr(megatron_policy_worker, "_original_setup_model_and_optimizer"):
+        if getattr(
+            megatron_policy_worker.setup_model_and_optimizer, "_is_patched", False
+        ):
             return
-        megatron_policy_worker._original_setup_model_and_optimizer = (
+        original_setup_model_and_optimizer = (
             megatron_policy_worker.setup_model_and_optimizer
         )
 
@@ -153,61 +156,29 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 megatron_cfg.model.restore_modelopt_state = True
                 megatron_cfg.model.transformer_layer_spec = quantization_layer_spec
 
-            return megatron_policy_worker._original_setup_model_and_optimizer(
+            return original_setup_model_and_optimizer(
                 policy_cfg, megatron_cfg, *args, **kwargs
             )
 
+        _setup_model_and_optimizer._is_patched = True
         megatron_policy_worker.setup_model_and_optimizer = _setup_model_and_optimizer
 
-    @contextmanager
-    def _patched_model_loading(self):
-        """Context manager that patches handle_model_import and load_checkpoint for quantization.
+    def _restore_modelopt_state_pre_load(self, state, model):
+        """Restore ModelOpt state into the model before ``load_checkpoint`` runs.
 
-        Patches handle_model_import to pass quantization hooks during HF->Megatron conversion,
-        and patches load_checkpoint to restore modelopt state before loading checkpoint weights.
+        Forwarded as the ``pre_load_checkpoint_hook`` to
+        :func:`setup_model_and_optimizer` and :func:`setup_reference_model_state`
+        via the ``_pre_load_checkpoint_hook`` instance attribute. Quantizers
+        must exist on the model graph before ``load_checkpoint`` populates
+        their amax/scale buffers.
         """
-        original_handle_model_import = megatron_policy_worker.handle_model_import
-        original_load_checkpoint = megatron_setup.load_checkpoint
-
-        def _handle_model_import(
-            config, hf_model_name, pretrained_path, pt_checkpoint_exists
-        ):
-            if pt_checkpoint_exists:
-                print(
-                    f"Checkpoint already exists at {pretrained_path}. Skipping import."
-                )
-            else:
-                hf_config_overrides = config.get("hf_config_overrides", {}) or {}
-                import_model_from_hf_name(
-                    hf_model_name,
-                    pretrained_path,
-                    config["megatron_cfg"],
-                    model_post_wrap_hook=self._quantize,
-                    transformer_layer_spec=quantization_layer_spec,
-                    **hf_config_overrides,
-                )
-
-                if parallel_state.model_parallel_is_initialized():
-                    print("Reinitializing model parallel after loading model state.")
-                    parallel_state.destroy_model_parallel()
-
-        def _load_checkpoint(state, model, *args, **kwargs):
-            cfg = state.cfg
-            model_path = cfg.checkpoint.pretrained_checkpoint or cfg.checkpoint.load
-            if os.path.exists(os.path.join(model_path, "iter_0000000")):
-                model_path = os.path.join(model_path, "iter_0000000")
-            if has_modelopt_state(model_path):
-                unwrapped_model = unwrap_model(model)
-                load_modelopt_state(unwrapped_model, model_path)
-            return original_load_checkpoint(state, model, *args, **kwargs)
-
-        try:
-            megatron_policy_worker.handle_model_import = _handle_model_import
-            megatron_setup.load_checkpoint = _load_checkpoint
-            yield
-        finally:
-            megatron_policy_worker.handle_model_import = original_handle_model_import
-            megatron_setup.load_checkpoint = original_load_checkpoint
+        cfg = state.cfg
+        model_path = cfg.checkpoint.pretrained_checkpoint or cfg.checkpoint.load
+        if os.path.exists(os.path.join(model_path, "iter_0000000")):
+            model_path = os.path.join(model_path, "iter_0000000")
+        if has_modelopt_state(model_path):
+            unwrapped_model = unwrap_model(model)
+            load_modelopt_state(unwrapped_model, model_path)
 
     @contextmanager
     def hide_tensor_quantizers(self):
@@ -291,7 +262,15 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     @contextmanager
     def without_model_config(self):
-        """Context manager that temporarily removes the model config from modules."""
+        """Context manager that temporarily removes the ``config`` attribute from TensorQuantizer modules.
+
+        Used by :meth:`use_reference_model` and :meth:`save_checkpoint`. Both
+        of these flows traverse the module tree (e.g. for state-dict swapping
+        or checkpoint serialization) where the unrelated ``config`` attribute
+        on ``TensorQuantizer`` instances is detected as a model config and
+        triggers spurious validation/serialization errors. We strip it for
+        the duration of the call and restore it on exit.
+        """
         configs = {}
         try:
             for name, module in self.model.named_modules():
@@ -393,6 +372,10 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         weight_quantizer(weight) instead of the raw weight. The folded tensor
         is computed lazily when export_hf_weights accesses it, so only one
         extra weight-sized tensor exists at a time — O(1) extra memory.
+
+        Raises:
+            RuntimeError: If weight folding fails for a specific parameter,
+                with context about which parameter caused the failure.
         """
 
         class _FoldedTask:
@@ -407,7 +390,13 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 w = self._task.param_weight
                 if w is None:
                     return None
-                return self._wq(w.float()).to(w.dtype)
+                try:
+                    return self._wq(w.float()).to(w.dtype)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to apply weight quantizer for param "
+                        f"'{self._task.param_name}': {e}"
+                    ) from e
 
             def __getattr__(self, name):
                 return getattr(self._task, name)
@@ -424,10 +413,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 if (
                     task.param_weight is not None
                     and isinstance(task.megatron_module, QuantModule)
-                    and any(
-                        True
-                        for _ in task.megatron_module.iter_weights_for_calibration()
-                    )
+                    and next(task.megatron_module.iter_weights_for_calibration(), None)
+                    is not None
                 ):
                     skipped_fold.append(task.param_name)
                 folded_tasks.append(task)
@@ -445,5 +432,14 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 if "weight_quantizer" in name:
                     continue
                 yield name, tensor
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed during quantized weight refit iteration. "
+                f"Folded {len(folded_tasks)} tasks, skipped folding for: "
+                f"{skipped_fold[:5] if skipped_fold else 'none'}. "
+                f"Cause: {e}"
+            ) from e
         finally:
             self.refit_conversion_tasks = original_tasks

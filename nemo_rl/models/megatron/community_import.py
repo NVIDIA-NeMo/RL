@@ -53,7 +53,18 @@ def import_model_from_hf_name(
     Args:
         hf_model_name: Hugging Face model ID or local path (e.g., 'meta-llama/Llama-3.1-8B-Instruct').
         output_path: Directory to write the Megatron checkpoint (e.g., /tmp/megatron_ckpt).
-        megatron_config: Optional megatron config with paralellism settings for distributed megatron model import.
+        megatron_config: Optional megatron config with parallelism settings for distributed megatron model import.
+        model_post_wrap_hook: Optional callable invoked on each Megatron model
+            chunk after it is built (and before DDP wrapping). Forwarded to
+            ``provide_distributed_model(post_wrap_hook=...)``. Used to apply
+            in-place model transformations such as ModelOpt quantization to
+            insert quantizers into linear layers prior to checkpoint save.
+        transformer_layer_spec: Optional Megatron ``ModuleSpec`` (or callable
+            returning one) overriding the default layer spec selected by the
+            model provider. Used to inject custom layer implementations such
+            as the ModelOpt-quantized variants of attention/MLP submodules.
+        **config_overrides: Extra keyword arguments forwarded to
+            ``AutoBridge.from_hf_pretrained``.
     """
     bridge = AutoBridge.from_hf_pretrained(
         hf_model_name, trust_remote_code=True, **config_overrides
