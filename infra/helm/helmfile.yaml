@@ -17,8 +17,6 @@ repositories:
   url: https://ray-project.github.io/kuberay-helm/
 - name: prometheus-community
   url: https://prometheus-community.github.io/helm-charts
-- name: kyverno
-  url: https://kyverno.github.io/kyverno/
 
 releases:
 #
@@ -70,19 +68,6 @@ releases:
   wait: true
   values:
   - values/kuberay-operator.yaml
-
-#
-# Kyverno: policy engine for enforcing queue labels on Ray workloads.
-# Policies are applied separately: kubectl apply -f kyverno-kai-policies.yaml
-#
-- name: kyverno
-  namespace: kyverno
-  createNamespace: true
-  chart: kyverno/kyverno
-  version: 3.7.1
-  wait: true
-  values:
-  - values/kyverno.yaml
 
 #
 # Prometheus + Grafana: fairshare monitoring and dashboards.
