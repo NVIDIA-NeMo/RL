@@ -31,7 +31,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         amax buffers need to be loaded. Weight quantizer buffers are skipped.
         """
         original_named_parameters = model.named_parameters
-        buffers_with_loader = []
+        # input_quantizer buffers we attached a weight_loader to and must
+        # clean up on exit; pre-existing loaders (if any) are left untouched.
+        patched_quantizer_buffers = []
 
         def input_amax_loader(param, loaded_weight, *args, **kwargs):
             param.copy_(torch.max(param, loaded_weight))
@@ -43,7 +45,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                     continue
                 if not hasattr(buf, "weight_loader"):
                     buf.weight_loader = input_amax_loader
-                    buffers_with_loader.append(buf)
+                    patched_quantizer_buffers.append(buf)
                 yield name, buf
 
         model.named_parameters = types.MethodType(new_named_parameters, model)
@@ -51,7 +53,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             yield
         finally:
             model.named_parameters = original_named_parameters
-            for buf in buffers_with_loader:
+            for buf in patched_quantizer_buffers:
                 if hasattr(buf, "weight_loader"):
                     del buf.weight_loader
 
