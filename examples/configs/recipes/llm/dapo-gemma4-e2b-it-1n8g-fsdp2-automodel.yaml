@@ -25,7 +25,6 @@ policy:
   model_name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/models/google/gemma-4-E2B-it
   tokenizer:
     name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/models/google/gemma-4-E2B-it
-  train_global_batch_size: 512
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 4096
@@ -46,8 +45,6 @@ policy:
       total_iters: 10000000000
   - milestones:
     - 10
-  dtensor_cfg:
-    activation_checkpointing: false
   sequence_packing:
     enabled: false
   dynamic_batching:

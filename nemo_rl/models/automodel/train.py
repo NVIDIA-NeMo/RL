@@ -69,12 +69,17 @@ def _needs_kv_cache_for_shared_layers(model: nn.Module) -> bool:
     to pass K/V from anchor layers to shared layers. When use_cache=False,
     past_key_values is None and shared layers cannot retrieve shared K/V,
     producing incorrect outputs.
+
+    TODO: remove this workaround once upgraded to transformers>=5.5.2
+    (https://github.com/huggingface/transformers/pull/45312), which fixes
+    KV sharing without requiring use_cache=True.
     """
     model_config = getattr(model, "config", None)
     text_config = (
         getattr(model_config, "text_config", model_config) if model_config else None
     )
-    return getattr(text_config, "num_kv_shared_layers", 0) > 0
+    num_kv_shared_layers = getattr(text_config, "num_kv_shared_layers", 0)
+    return isinstance(num_kv_shared_layers, int) and num_kv_shared_layers > 0
 
 
 def model_forward(
