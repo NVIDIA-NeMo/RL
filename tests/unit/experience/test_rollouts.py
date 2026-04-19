@@ -824,8 +824,14 @@ def test_run_async_nemo_gym_rollout(
     expected_result = {
         "final_batch": {
             "agent_ref": [
-                {"name": "example_multi_step_simple_agent", "type": "responses_api_agents"},
-                {"name": "example_multi_step_simple_agent", "type": "responses_api_agents"},
+                {
+                    "name": "example_multi_step_simple_agent",
+                    "type": "responses_api_agents",
+                },
+                {
+                    "name": "example_multi_step_simple_agent",
+                    "type": "responses_api_agents",
+                },
             ],
             "length": torch.tensor([3088, 3056]),
             "loss_multiplier": torch.tensor([1.0, 1.0]),
