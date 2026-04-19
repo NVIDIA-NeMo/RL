@@ -130,6 +130,10 @@ spec:
                 code = r.get("code", 0)
                 if code == 404:
                     teardown(f"Peer {PEER} deleted")
+                if JOB_ID:
+                    cm = kube(f"/api/v1/namespaces/{NS}/configmaps/nemo-rl-endpoints-{JOB_ID}")
+                    if cm.get("data", {}).get("error", ""):
+                        teardown(f"Error via ConfigMap: {cm['data']['error']}")
                 state = r.get("status", {}).get("state", "")
                 if state in ("failed", "suspended") or (code != 0 and state == ""):
                     fails += 1
@@ -137,10 +141,6 @@ spec:
                     if fails >= MAX_FAIL:
                         teardown(f"Peer {PEER} failed {MAX_FAIL}x")
                     continue
-                if JOB_ID:
-                    cm = kube(f"/api/v1/namespaces/{NS}/configmaps/nemo-rl-endpoints-{JOB_ID}")
-                    if cm.get("data", {}).get("error", ""):
-                        teardown(f"Error via ConfigMap: {cm['data']['error']}")
                 if fails > 0:
                     print(f"[peer-watcher] Peer {PEER} recovered", flush=True)
                 fails = 0
@@ -267,6 +267,10 @@ spec:
                 code = r.get("code", 0)
                 if code == 404:
                     teardown(f"Peer {PEER} deleted")
+                if JOB_ID:
+                    cm = kube(f"/api/v1/namespaces/{NS}/configmaps/nemo-rl-endpoints-{JOB_ID}")
+                    if cm.get("data", {}).get("error", ""):
+                        teardown(f"Error via ConfigMap: {cm['data']['error']}")
                 state = r.get("status", {}).get("state", "")
                 if state in ("failed", "suspended") or (code != 0 and state == ""):
                     fails += 1
@@ -274,10 +278,6 @@ spec:
                     if fails >= MAX_FAIL:
                         teardown(f"Peer {PEER} failed {MAX_FAIL}x")
                     continue
-                if JOB_ID:
-                    cm = kube(f"/api/v1/namespaces/{NS}/configmaps/nemo-rl-endpoints-{JOB_ID}")
-                    if cm.get("data", {}).get("error", ""):
-                        teardown(f"Error via ConfigMap: {cm['data']['error']}")
                 if fails > 0:
                     print(f"[peer-watcher] Peer {PEER} recovered", flush=True)
                 fails = 0

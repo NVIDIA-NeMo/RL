@@ -230,7 +230,14 @@ The validation set you pass in will directly be used for validation with no addi
 
         # Wait for the Gym cluster to register its head server address.
         print("Waiting for Gym head server to register in endpoint registry...")
-        remote_gym_url = registry.get("gym_head_server")
+        try:
+            remote_gym_url = registry.get("gym_head_server")
+        except TimeoutError as e:
+            raise TimeoutError(
+                f"Timed out waiting for the Gym cluster to register its head server. "
+                f"Ensure the Gym RayCluster is running and the standalone_gym_server "
+                f"has started with --job-id={disagg_job_id}. Original error: {e}"
+            ) from e
         print(f"Discovered remote Gym service at: {remote_gym_url}")
     if remote_gym_url:
         nemo_gym_config["remote_gym_url"] = remote_gym_url

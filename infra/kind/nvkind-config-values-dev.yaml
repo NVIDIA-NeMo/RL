@@ -3,5 +3,6 @@
 workers:
 - devices: all
 extraMounts:
+# TODO: Edit hostPath to point to your local nemo-rl checkout.
 - hostPath: /home/terryk/nemo-rl
   containerPath: /workspace/nemo-rl

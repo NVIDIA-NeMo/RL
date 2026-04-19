@@ -1,6 +1,10 @@
 # RBAC for disaggregated RL-Gym service discovery.
 # Allows Ray pods to CRUD ConfigMaps (as an endpoint registry)
 # and read RayClusters (for ownerReference UID lookup).
+#
+# NOTE: This is an example for development/testing. For production deployments,
+# consider scoping the Role to specific ConfigMap names (resourceNames) and
+# using separate ServiceAccounts for the RL and Gym clusters.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
