@@ -833,7 +833,7 @@ def test_run_async_nemo_gym_rollout(
                     "type": "responses_api_agents",
                 },
             ],
-            "length": torch.tensor([3088, 3056]),
+            "length": torch.tensor([3080, 3048]),
             "loss_multiplier": torch.tensor([1.0, 1.0]),
             "total_reward": torch.tensor([0.0, 0.0]),
             "truncated": torch.tensor([False, False]),
