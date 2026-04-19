@@ -1,0 +1,9 @@
+defaults: ./grpo-qwen3-235b-16n4g.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-235b-32n4g
+logger:
+  log_dir: logs/grpo-qwen3-235b-32n4g
+  wandb:
+    name: grpo-qwen3-235b-32n4g
+cluster:
+  num_nodes: 32

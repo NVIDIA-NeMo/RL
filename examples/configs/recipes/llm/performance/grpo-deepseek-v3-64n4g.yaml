@@ -1,0 +1,9 @@
+defaults: ./grpo-deepseek-v3-32n4g.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-deepseek-v3-64n4g
+logger:
+  log_dir: logs/grpo-deepseek-v3-64n4g
+  wandb:
+    name: grpo-deepseek-v3-64n4g
+cluster:
+  num_nodes: 64
