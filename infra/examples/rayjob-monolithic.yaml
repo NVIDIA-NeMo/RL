@@ -51,6 +51,7 @@ spec:
               timeoutSeconds: 5
             volumeMounts:
             - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+            - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
             - { name: dshm, mountPath: /dev/shm }
           volumes:
           - name: nemo-rl-src
@@ -81,6 +82,7 @@ spec:
               limits:   { cpu: "8", memory: "32Gi", nvidia.com/gpu: "1" }
             volumeMounts:
             - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+            - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
             - { name: dshm, mountPath: /dev/shm }
           volumes:
           - name: nemo-rl-src

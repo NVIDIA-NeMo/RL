@@ -119,6 +119,7 @@ spec:
                 value: "true"
               volumeMounts:
               - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+              - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
               - { name: dshm, mountPath: /dev/shm }
             volumes:
             - name: nemo-rl-src
@@ -178,6 +179,7 @@ spec:
                 value: "true"
               volumeMounts:
               - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+              - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
               - { name: dshm, mountPath: /dev/shm }
             volumes:
             - name: nemo-rl-src
@@ -238,6 +240,7 @@ spec:
                 value: "127.0.0.1:6380"
               volumeMounts:
               - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+              - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
               - { name: dshm, mountPath: /dev/shm }
             volumes:
             - name: nemo-rl-src
@@ -293,6 +296,7 @@ spec:
                 value: "disagg-job-gym-head-0-0.disagg-job:6380"
               volumeMounts:
               - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+              - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
               - { name: dshm, mountPath: /dev/shm }
             volumes:
             - name: nemo-rl-src
@@ -370,6 +374,7 @@ spec:
                 value: "disagg-job-rl-head-0-0.disagg-job:6379"
               volumeMounts:
               - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+              - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
             volumes:
             - name: nemo-rl-src
               hostPath: { path: /workspace/nemo-rl, type: DirectoryOrCreate }
