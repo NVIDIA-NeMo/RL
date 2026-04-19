@@ -181,6 +181,9 @@ def test_nemo_gym_sanity(
 ):
     """Test basic functionality of MathEnvironment step with simple messages."""
 
+    # Save original input before mutation for writing the actual test data file
+    original_input = deepcopy(nemo_gym_sanity_test_data["input"])
+
     # We need to match NeMo RL generation config params before sending to NeMo-Gym
     generation_config = nemo_gym_vllm_generation.cfg
     examples = nemo_gym_sanity_test_data["input"]
@@ -208,7 +211,7 @@ def test_nemo_gym_sanity(
 
     # Write the actual result to a file so it can be used to update the expected output.
     # To update: cp actual_test_nemo_gym_sanity.json test_nemo_gym_sanity.json
-    _write_actual_test_data(nemo_gym_sanity_test_data["input"], actual_result)
+    _write_actual_test_data(original_input, actual_result)
 
     def _standardize_single_result(d: dict):
         d = deepcopy(d)
