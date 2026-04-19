@@ -79,6 +79,7 @@ spec:
           - { containerPort: 10001, name: client }
           volumeMounts:
           - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+          - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
         # --- Peer-watcher sidecar: tears down both clusters if Gym fails ---
         # Monitors raycluster-gym via K8s API. If peer is deleted, failed, or
         # signals an error via ConfigMap, deletes both RayClusters.
@@ -181,6 +182,7 @@ spec:
             requests: { cpu: "2", memory: "8Gi", nvidia.com/gpu: "2" }
           volumeMounts:
           - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+          - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
         volumes:
         - name: nemo-rl-src
           hostPath: { path: /workspace/nemo-rl, type: DirectoryOrCreate }
