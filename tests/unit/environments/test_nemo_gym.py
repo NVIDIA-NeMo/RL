@@ -16,10 +16,9 @@ import time
 from copy import deepcopy
 from pathlib import Path
 
-import torch
-
 import pytest
 import ray
+import torch
 from yaml import safe_load
 
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -162,8 +161,7 @@ def _write_actual_test_data(original_input: list, actual_result: list):
                 msg["generation_logprobs"] = []
 
     output_path = (
-        Path(__file__).parent
-        / "nemo_gym_test_data/actual_test_nemo_gym_sanity.json"
+        Path(__file__).parent / "nemo_gym_test_data/actual_test_nemo_gym_sanity.json"
     )
     data = _convert({"input": original_input, "expected_output": cleaned})
     with open(output_path, "w") as f:

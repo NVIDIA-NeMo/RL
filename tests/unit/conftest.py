@@ -189,9 +189,7 @@ def pytest_collection_modifyitems(config, items):
                 "Please run tests with: uv run --extra nemo_gym --group test pytest ..."
             )
         # Include only nemo_gym tests
-        new_items = [
-            item for item in new_items if item.get_closest_marker("nemo_gym")
-        ]
+        new_items = [item for item in new_items if item.get_closest_marker("nemo_gym")]
     else:
         # Exclude nemo_gym tests by default
         new_items = [
