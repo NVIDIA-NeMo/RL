@@ -68,6 +68,8 @@ spec:
           env:
           - name: RAY_CLUSTER_NAME
             value: raycluster-rl           # used by endpoint registry for ownerReference
+          - name: NRL_FORCE_REBUILD_VENVS
+            value: "true"
           resources:
             limits:   { cpu: "4", memory: "16Gi" }
             requests: { cpu: "1", memory: "4Gi" }
@@ -171,6 +173,9 @@ spec:
         containers:
         - name: ray-worker
           image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+          env:
+          - name: NRL_FORCE_REBUILD_VENVS
+            value: "true"
           resources:
             limits:   { cpu: "8", memory: "32Gi", nvidia.com/gpu: "2" }
             requests: { cpu: "2", memory: "8Gi", nvidia.com/gpu: "2" }

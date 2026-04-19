@@ -115,6 +115,8 @@ spec:
               env:
               - name: RAY_ADDRESS
                 value: "127.0.0.1:6379"
+              - name: NRL_FORCE_REBUILD_VENVS
+                value: "true"
               volumeMounts:
               - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
               - { name: dshm, mountPath: /dev/shm }
@@ -172,6 +174,8 @@ spec:
               env:
               - name: RAY_ADDRESS
                 value: "disagg-job-rl-head-0-0.disagg-job:6379"
+              - name: NRL_FORCE_REBUILD_VENVS
+                value: "true"
               volumeMounts:
               - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
               - { name: dshm, mountPath: /dev/shm }

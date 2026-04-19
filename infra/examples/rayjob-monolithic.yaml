@@ -34,6 +34,9 @@ spec:
           containers:
           - name: ray-head
             image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+            env:
+            - name: NRL_FORCE_REBUILD_VENVS
+              value: "true"
             resources:
               requests: { cpu: "1", memory: "4Gi" }
               limits:   { cpu: "4", memory: "16Gi" }
@@ -70,6 +73,9 @@ spec:
           containers:
           - name: ray-worker
             image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+            env:
+            - name: NRL_FORCE_REBUILD_VENVS
+              value: "true"
             resources:
               requests: { cpu: "1", memory: "4Gi", nvidia.com/gpu: "1" }
               limits:   { cpu: "8", memory: "32Gi", nvidia.com/gpu: "1" }
