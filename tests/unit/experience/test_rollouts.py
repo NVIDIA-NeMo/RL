@@ -47,7 +47,6 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 
 # These are all fixtures
 from tests.unit.environments.test_nemo_gym import (
-    NEMO_GYM_INSTALLED,
     cluster,  # noqa: F401
     nemo_gym,  # noqa: F401
     nemo_gym_sanity_test_data,  # noqa: F401
@@ -787,10 +786,7 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
     print("\nSliding Puzzle VLLM Test assertions passed.")
 
 
-@pytest.mark.skipif(
-    not NEMO_GYM_INSTALLED,
-    reason="Skipping NeMo-Gym test since NeMo-Gym is not installed!",
-)
+@pytest.mark.nemo_gym
 def test_run_async_nemo_gym_rollout(
     nemo_gym,  # noqa: F811
     nemo_gym_vllm_generation,  # noqa: F811

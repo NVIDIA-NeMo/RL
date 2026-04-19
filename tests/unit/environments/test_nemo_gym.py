@@ -35,20 +35,12 @@ from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
 
-try:
-    from nemo_gym import config_types  # noqa: F401
-
-    NEMO_GYM_INSTALLED = True
-except ImportError:
-    nemo_gym = None
-    NEMO_GYM_INSTALLED = False
 
 
-@pytest.mark.skipif(
-    not NEMO_GYM_INSTALLED,
-    reason="Skipping NeMo-Gym test since NeMo-Gym is not installed!",
-)
+@pytest.mark.nemo_gym
 def test_nemo_gym_stub_module():
+    from nemo_gym import config_types
+
     print(
         f"NeMo-Gym test successfully run! NeMo-Gym config_types module: {config_types}"
     )
@@ -141,10 +133,7 @@ def nemo_gym_sanity_test_data():
     return data
 
 
-@pytest.mark.skipif(
-    not NEMO_GYM_INSTALLED,
-    reason="Skipping NeMo-Gym test since NeMo-Gym is not installed!",
-)
+@pytest.mark.nemo_gym
 def test_nemo_gym_sanity(
     nemo_gym,
     nemo_gym_sanity_test_data,
