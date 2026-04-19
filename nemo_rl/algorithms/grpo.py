@@ -58,6 +58,7 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.utils import extract_necessary_env_names
+from nemo_rl.data.utils import get_default_stop_strings_from_env_config
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -208,9 +209,163 @@ class MasterConfig(TypedDict):
     checkpointing: CheckpointingConfig
 
 
+ROLLOUT_BUDGET_WARNING_TOKEN_THRESHOLD = 131_072
+
+
 # ===============================================================================
 # Setup & Initialization
 # ===============================================================================
+
+
+def _iter_dataset_configs(section_config: Any) -> list[dict[str, Any]]:
+    """Normalize a data-config section into a list of dataset configs."""
+    if section_config is None:
+        return []
+    if isinstance(section_config, dict):
+        return [section_config]
+    if isinstance(section_config, list):
+        return [cfg for cfg in section_config if isinstance(cfg, dict)]
+    return []
+
+
+def _resolved_train_dataset_configs(data_config: DataConfig) -> list[dict[str, Any]]:
+    """Return train dataset configs with `data.default` applied."""
+    default_cfg = data_config.get("default") or {}
+    resolved_configs = []
+    for cfg in _iter_dataset_configs(data_config["train"]):
+        resolved_cfg = dict(default_cfg)
+        resolved_cfg.update(cfg)
+        resolved_configs.append(resolved_cfg)
+    return resolved_configs
+
+
+def _has_obvious_first_turn_stop_strings(master_config: MasterConfig) -> bool:
+    """Best-effort check for clearly configured first-turn stop strings."""
+    generation_config = master_config["policy"]["generation"]
+    assert generation_config is not None, "GRPO requires a generation config"
+
+    if generation_config.get("stop_strings"):
+        return True
+
+    env_configs = master_config.get("env", {})
+    for cfg in _resolved_train_dataset_configs(master_config["data"]):
+        env_name = cfg.get("env_name")
+        if env_name is None:
+            continue
+        if get_default_stop_strings_from_env_config(env_configs.get(env_name)):
+            return True
+
+    return False
+
+
+def _compute_rollout_budget_summary(master_config: MasterConfig) -> dict[str, Any]:
+    """Compute a small rollout-budget summary for setup logging and warnings."""
+    generation_config = master_config["policy"]["generation"]
+    assert generation_config is not None, "GRPO requires a generation config"
+
+    grpo_config = master_config["grpo"]
+    effective_num_prompts = grpo_config["num_prompts_per_step"]
+    if grpo_config["use_dynamic_sampling"]:
+        effective_num_prompts = int(
+            effective_num_prompts * grpo_config.get("batch_multiplier", 1)
+        )
+
+    num_generations_per_prompt = grpo_config["num_generations_per_prompt"]
+    samples_per_step = effective_num_prompts * num_generations_per_prompt
+
+    colocated_cfg = generation_config.get("colocated", {})
+    colocated_enabled = bool(colocated_cfg.get("enabled", True))
+    generation_resources = colocated_cfg.get("resources") or {}
+
+    return {
+        "effective_num_prompts_per_step": effective_num_prompts,
+        "num_generations_per_prompt": num_generations_per_prompt,
+        "samples_per_step": samples_per_step,
+        "configured_max_new_tokens": generation_config["max_new_tokens"],
+        "theoretical_max_generated_tokens_per_step": (
+            samples_per_step * generation_config["max_new_tokens"]
+        ),
+        "generation_backend": generation_config["backend"],
+        "async_generation_enabled": bool(
+            generation_config.get("vllm_cfg", {}).get("async_engine", False)
+        ),
+        "colocated_generation_enabled": colocated_enabled,
+        "generation_gpus_per_node": generation_resources.get("gpus_per_node"),
+        "generation_num_nodes": generation_resources.get("num_nodes"),
+    }
+
+
+def _get_rollout_budget_warnings(master_config: MasterConfig) -> list[str]:
+    """Return advisory rollout-budget warnings for likely slow configs."""
+    summary = _compute_rollout_budget_summary(master_config)
+    warning_messages: list[str] = []
+
+    if (
+        summary["theoretical_max_generated_tokens_per_step"]
+        >= ROLLOUT_BUDGET_WARNING_TOKEN_THRESHOLD
+    ):
+        warning_messages.append(
+            "This GRPO/GDPO config requests a very large theoretical rollout budget "
+            f"({summary['theoretical_max_generated_tokens_per_step']:,} max generated tokens per step). "
+            "If training is slow, reduce policy.generation.max_new_tokens and/or "
+            "grpo.num_generations_per_prompt before tuning training-side settings."
+        )
+
+    if summary[
+        "configured_max_new_tokens"
+    ] >= 1024 and not _has_obvious_first_turn_stop_strings(master_config):
+        warning_messages.append(
+            "This GRPO/GDPO config uses a large max_new_tokens setting without any obvious first-turn "
+            "stop strings from policy.generation.stop_strings or env defaults. "
+            "Long unconstrained generations can dominate step time."
+        )
+
+    return warning_messages
+
+
+def _log_rollout_budget_summary(master_config: MasterConfig) -> None:
+    """Print a concise rollout-budget summary during setup."""
+    summary = _compute_rollout_budget_summary(master_config)
+    print("\n📦 Rollout Budget Summary:")
+    print(
+        f"  • Effective prompts per step: {summary['effective_num_prompts_per_step']}",
+        flush=True,
+    )
+    print(
+        f"  • Generations per prompt: {summary['num_generations_per_prompt']}",
+        flush=True,
+    )
+    print(f"  • Samples per step: {summary['samples_per_step']}", flush=True)
+    print(
+        f"  • Max new tokens per sample: {summary['configured_max_new_tokens']}",
+        flush=True,
+    )
+    print(
+        "  • Theoretical max generated tokens per step: "
+        f"{summary['theoretical_max_generated_tokens_per_step']:,}",
+        flush=True,
+    )
+    print(f"  • Generation backend: {summary['generation_backend']}", flush=True)
+    print(
+        f"  • Async generation enabled: {summary['async_generation_enabled']}",
+        flush=True,
+    )
+    print(
+        f"  • Colocated generation enabled: {summary['colocated_generation_enabled']}",
+        flush=True,
+    )
+    if not summary["colocated_generation_enabled"]:
+        print(
+            "  • Generation resources (gpus_per_node, num_nodes): "
+            f"({summary['generation_gpus_per_node']}, {summary['generation_num_nodes']})",
+            flush=True,
+        )
+
+
+def _warn_on_rollout_budget(master_config: MasterConfig) -> None:
+    """Emit advisory warnings for potentially expensive rollout configs."""
+    for warning_message in _get_rollout_budget_warnings(master_config):
+        warnings.warn(warning_message, stacklevel=2)
 
 
 def setup(
@@ -301,6 +456,9 @@ def setup(
             "Please check the configuration of num_prompts_per_step and num_prompts_per_dataloader. "
             "If use_dynamic_sampling is enabled and batch_multiplier is used, please also check the configuration of batch_multiplier."
         )
+
+    _log_rollout_budget_summary(master_config)
+    _warn_on_rollout_budget(master_config)
 
     # Load train dataset
     def init_train_dataloader(dataset, suffix: str = ""):
@@ -1576,6 +1734,15 @@ def grpo_train(
                     metrics_logging_data["mean_gen_tokens_per_sample"] = (
                         rollout_metrics["mean_gen_tokens_per_sample"]
                     )
+                    metrics_logging_data["max_gen_tokens_per_sample"] = rollout_metrics[
+                        "max_gen_tokens_per_sample"
+                    ]
+                    metrics_logging_data["truncation_rate"] = rollout_metrics[
+                        "truncation_rate"
+                    ]
+                    metrics_logging_data["mean_total_tokens_per_sample"] = (
+                        rollout_metrics["mean_total_tokens_per_sample"]
+                    )
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
 
                 repeated_batch = scale_rewards(
@@ -2130,6 +2297,19 @@ def grpo_train(
                 print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(
                 f"  • Mean Generation Length: {metrics_logging_data['mean_gen_tokens_per_sample']:.4f}",
+                flush=True,
+            )
+            print(
+                f"  • Max Generation Length: {metrics_logging_data['max_gen_tokens_per_sample']:.4f}",
+                flush=True,
+            )
+            print(
+                f"  • Truncation Rate: {metrics_logging_data['truncation_rate']:.4f}",
+                flush=True,
+            )
+            print(
+                "  • Mean Total Tokens Per Sample: "
+                f"{metrics_logging_data['mean_total_tokens_per_sample']:.4f}",
                 flush=True,
             )
 
