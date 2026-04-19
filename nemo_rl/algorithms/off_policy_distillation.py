@@ -1170,11 +1170,11 @@ def off_policy_distillation_train(
                 if use_ipc:
                     print("▶ Computing teacher logprobs (IPC)...", flush=True)
                     with timer.time("teacher_logprob_inference"):
-                        teacher_logits = teacher_policy.train(
+                        teacher_logits = teacher_policy.train_off_policy_distillation(
                             teacher_fwd_data,
                             None,
+                            role="teacher",
                             eval_mode=True,
-                            is_teacher=True,
                             topk_logits=teacher_topk_k,
                             gbs=master_config["policy"]["train_global_batch_size"],
                             mbs=master_config["policy"]["train_micro_batch_size"],
@@ -1260,9 +1260,10 @@ def off_policy_distillation_train(
                         train_kwargs["teacher_logits"] = teacher_logits
                         train_kwargs["use_teacher_ipc_loss_postprocessor"] = True
 
-                    train_results = student_policy.train(
+                    train_results = student_policy.train_off_policy_distillation(
                         train_data,
                         student_loss_fn,
+                        role="student",
                         **train_kwargs,
                     )
 
@@ -1595,11 +1596,11 @@ def validate(
 
             teacher_policy.prepare_for_lp_inference()
             if use_ipc:
-                teacher_logits = teacher_policy.train(
+                teacher_logits = teacher_policy.train_off_policy_distillation(
                     val_data,
                     None,
+                    role="teacher",
                     eval_mode=True,
-                    is_teacher=True,
                     topk_logits=topk_k,
                     gbs=val_data.size,
                     mbs=val_mbs,
@@ -1617,9 +1618,10 @@ def validate(
             # Student validation loss (eval mode, no gradient updates).
             student_policy.prepare_for_training()
             if use_ipc:
-                val_results = student_policy.train(
+                val_results = student_policy.train_off_policy_distillation(
                     val_data,
                     loss_fn,
+                    role="student",
                     eval_mode=True,
                     gbs=val_data.size,
                     mbs=val_mbs,
@@ -1630,9 +1632,10 @@ def validate(
                 )
                 del teacher_logits
             else:
-                val_results = student_policy.train(
+                val_results = student_policy.train_off_policy_distillation(
                     val_data,
                     loss_fn,
+                    role="student",
                     eval_mode=True,
                     gbs=val_data.size,
                     mbs=val_mbs,

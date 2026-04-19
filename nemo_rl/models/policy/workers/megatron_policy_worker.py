@@ -245,16 +245,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
-        is_teacher: bool = False,
-        teacher_logits: Optional[Any] = None,
-        topk_logits: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-        if is_teacher or teacher_logits is not None:
-            raise NotImplementedError(
-                "IPC-based teacher/student distillation requires DTensorPolicyWorkerV2 "
-            )
-
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
         if hasattr(self.model, "inference_params"):
@@ -452,6 +444,44 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
         return metrics
+
+    def train_off_policy_distillation(
+        self,
+        data: BatchedDataDict[Any],
+        loss_fn: Optional[LossFunction],
+        *,
+        role: str,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        teacher_logits: Optional[Any] = None,
+        topk_logits: Optional[int] = None,
+        use_teacher_ipc_loss_postprocessor: bool = False,
+        timer: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """Off-policy distillation entrypoint (unsupported on Megatron)."""
+        raise NotImplementedError(
+            "MegatronPolicyWorker does not support off-policy distillation; "
+            "use DTensorPolicyWorkerV2 (set dtensor_cfg._v2=true)."
+        )
+
+    def init_cross_tokenizer_loss_fn(
+        self, loss_config: Any, token_aligner_config: Any
+    ) -> None:
+        """Initialize cross-tokenizer distillation loss (unsupported on Megatron)."""
+        raise NotImplementedError(
+            "MegatronPolicyWorker does not support off-policy distillation; "
+            "use DTensorPolicyWorkerV2 (set dtensor_cfg._v2=true)."
+        )
+
+    def update_cross_tokenizer_data(
+        self, teacher_input_ids: Any, aligned_pairs: Any
+    ) -> None:
+        """Update per-step cross-tokenizer data (unsupported on Megatron)."""
+        raise NotImplementedError(
+            "MegatronPolicyWorker does not support off-policy distillation; "
+            "use DTensorPolicyWorkerV2 (set dtensor_cfg._v2=true)."
+        )
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
