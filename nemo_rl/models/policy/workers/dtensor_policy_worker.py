@@ -562,8 +562,16 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        is_teacher: bool = False,
+        teacher_logits: Optional[Any] = None,
+        topk_logits: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        if is_teacher or teacher_logits is not None:
+            raise NotImplementedError(
+                "IPC-based teacher/student distillation requires DTensorPolicyWorkerV2 "
+                "(set dtensor_cfg._v2=true in config)"
+            )
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
