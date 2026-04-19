@@ -562,16 +562,8 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
-        is_teacher: bool = False,
-        teacher_logits: Optional[Any] = None,
-        topk_logits: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-        if is_teacher or teacher_logits is not None:
-            raise NotImplementedError(
-                "IPC-based teacher/student distillation requires DTensorPolicyWorkerV2 "
-                "(set dtensor_cfg._v2=true in config)"
-            )
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -967,6 +959,44 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
             }
 
             return metrics
+
+    def train_off_policy_distillation(
+        self,
+        data: BatchedDataDict[Any],
+        loss_fn: Optional[LossFunction],
+        *,
+        role: str,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        teacher_logits: Optional[Any] = None,
+        topk_logits: Optional[int] = None,
+        use_teacher_ipc_loss_postprocessor: bool = False,
+        timer: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """Off-policy distillation entrypoint (unsupported on v1)."""
+        raise NotImplementedError(
+            "DTensorPolicyWorker (v1) does not support off-policy distillation; "
+            "use DTensorPolicyWorkerV2 (set dtensor_cfg._v2=true)."
+        )
+
+    def init_cross_tokenizer_loss_fn(
+        self, loss_config: Any, token_aligner_config: Any
+    ) -> None:
+        """Initialize cross-tokenizer distillation loss (unsupported on v1)."""
+        raise NotImplementedError(
+            "DTensorPolicyWorker (v1) does not support off-policy distillation; "
+            "use DTensorPolicyWorkerV2 (set dtensor_cfg._v2=true)."
+        )
+
+    def update_cross_tokenizer_data(
+        self, teacher_input_ids: Any, aligned_pairs: Any
+    ) -> None:
+        """Update per-step cross-tokenizer data (unsupported on v1)."""
+        raise NotImplementedError(
+            "DTensorPolicyWorker (v1) does not support off-policy distillation; "
+            "use DTensorPolicyWorkerV2 (set dtensor_cfg._v2=true)."
+        )
 
     # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
     @wrap_with_nvtx_name("dtensor_policy_worker/get_logprobs")
