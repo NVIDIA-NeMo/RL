@@ -27,7 +27,11 @@ from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-from nemo_rl.data.processors import nemo_gym_data_processor
+from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.processors import (
+    build_nemo_gym_vlm_prompt_message,
+    nemo_gym_data_processor,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.games.sliding_puzzle import (
@@ -38,6 +42,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
 )
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
+    rebuild_nemo_gym_vlm_message_log,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -63,6 +68,48 @@ from tests.unit.test_envs import (
 )
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+
+
+class _FakeImageProcessor:
+    model_input_names = ["pixel_values", "image_grid_thw"]
+
+
+class _FakeVLMProcessor:
+    def __init__(self, prompt_token_ids: list[int]):
+        self.prompt_token_ids = prompt_token_ids
+        self.image_processor = _FakeImageProcessor()
+        self.tokenizer = type(
+            "TokenizerStub",
+            (),
+            {"pad_token_id": 0, "model_input_names": ["input_ids"]},
+        )()
+        self.last_messages = None
+        self.last_tools = None
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        return_tensors,
+        return_dict,
+        tools=None,
+    ):
+        assert tokenize is True
+        assert add_generation_prompt is True
+        assert return_tensors == "pt"
+        assert return_dict is True
+        self.last_messages = messages
+        self.last_tools = tools
+        seq_len = len(self.prompt_token_ids)
+        return {
+            "input_ids": torch.tensor([self.prompt_token_ids], dtype=torch.long),
+            "pixel_values": torch.arange(6, dtype=torch.float32).reshape(1, 6),
+            "image_grid_thw": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "token_type_ids": torch.arange(seq_len, dtype=torch.long).unsqueeze(0),
+            "mm_token_type_ids": torch.full((1, seq_len), 7, dtype=torch.long),
+        }
 
 
 class TestCalculateSingleMetric:
@@ -99,6 +146,113 @@ class TestCalculateSingleMetric:
         result = _calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
 
         assert result["test/stddev"] == 0.0
+
+
+def test_build_nemo_gym_vlm_prompt_message_normalizes_responses_input() -> None:
+    prompt_token_ids = [11, 12, 13, 14]
+    processor = _FakeVLMProcessor(prompt_token_ids)
+    tools = [{"name": "click"}]
+    prompt_message = build_nemo_gym_vlm_prompt_message(
+        [
+            {"role": "system", "content": "You are helpful."},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AAAA",
+                        "detail": "auto",
+                    },
+                    {"type": "input_text", "text": "Click the red circle."},
+                ],
+            },
+        ],
+        processor,
+        prompt_token_ids,
+        tools=tools,
+    )
+
+    assert processor.last_messages == [
+        {"role": "system", "content": "You are helpful."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "data:image/png;base64,AAAA"},
+                {"type": "text", "text": "Click the red circle."},
+            ],
+        },
+    ]
+    assert processor.last_tools == tools
+    assert prompt_message["token_ids"].tolist() == prompt_token_ids
+    assert isinstance(prompt_message["pixel_values"], PackedTensor)
+    assert isinstance(prompt_message["image_grid_thw"], PackedTensor)
+    assert prompt_message["token_type_ids"].tolist() == [0, 1, 2, 3]
+    assert prompt_message["mm_token_type_ids"].tolist() == [7, 7, 7, 7]
+
+
+def test_build_nemo_gym_vlm_prompt_message_rejects_prompt_token_mismatch() -> None:
+    processor = _FakeVLMProcessor([1, 2, 3])
+    with pytest.raises(ValueError, match="prompt_token_ids"):
+        build_nemo_gym_vlm_prompt_message(
+            [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            processor,
+            [1, 2],
+        )
+
+
+def test_rebuild_nemo_gym_vlm_message_log_preserves_later_prompt_deltas() -> None:
+    prompt_token_ids = [11, 12, 13]
+    processor = _FakeVLMProcessor(prompt_token_ids)
+    full_result = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                        {"type": "input_text", "text": "Click the red circle."},
+                    ],
+                }
+            ],
+            "tools": [{"name": "click"}],
+        },
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": prompt_token_ids,
+                    "generation_token_ids": [21, 22],
+                    "generation_log_probs": [-0.1, -0.2],
+                },
+                {
+                    "prompt_token_ids": prompt_token_ids + [21, 22, 31],
+                    "generation_token_ids": [41],
+                    "generation_log_probs": [-0.3],
+                },
+            ]
+        },
+    }
+
+    input_message_log, message_log = rebuild_nemo_gym_vlm_message_log(
+        full_result, processor
+    )
+
+    assert len(input_message_log) == 1
+    assert input_message_log[0]["token_ids"].tolist() == prompt_token_ids
+    assert isinstance(input_message_log[0]["pixel_values"], PackedTensor)
+
+    assert [message["role"] for message in message_log] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert message_log[1]["token_ids"].tolist() == [21, 22]
+    assert torch.allclose(
+        message_log[1]["generation_logprobs"],
+        torch.tensor([-0.1, -0.2]),
+    )
+    assert message_log[2]["token_ids"].tolist() == [31]
+    assert message_log[3]["token_ids"].tolist() == [41]
 
 
 @pytest.fixture(scope="function")

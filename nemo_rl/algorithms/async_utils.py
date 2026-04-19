@@ -254,6 +254,17 @@ class AsyncTrajectoryCollector:
         self.master_config = master_config
         self.replay_buffer = replay_buffer
         self.running = False
+        self.processor = None
+
+        policy_config = master_config.get("policy", {})
+        if policy_config.get("is_vlm", False) or policy_config.get(
+            "tokenizer", {}
+        ).get("use_processor", False):
+            from nemo_rl.algorithms.utils import get_tokenizer
+
+            self.processor = get_tokenizer(
+                policy_config["tokenizer"], get_processor=True
+            )
 
         self._pg_lock: _threading.Lock = _threading.Lock()
 
@@ -659,6 +670,7 @@ class AsyncTrajectoryCollector:
                     task_to_env=self.task_to_env,
                     max_seq_len=None,
                     generation_config=generation_config,
+                    processor=self.processor,
                     max_rollout_turns=None,
                     greedy=False,
                 )

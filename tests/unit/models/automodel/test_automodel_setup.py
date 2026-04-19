@@ -1987,6 +1987,37 @@ class TestGetTokenizer:
         assert mock_processor.name_or_path == "test-model"
 
     @patch("nemo_rl.models.automodel.setup.AutoProcessor")
+    def test_get_processor_applies_chat_template_kwargs(self, mock_auto_processor):
+        """Test that processor.apply_chat_template also receives chat_template_kwargs."""
+        mock_processor = MagicMock()
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.pad_token = "<pad>"
+        mock_inner_tokenizer.eos_token = "<eos>"
+        mock_inner_tokenizer.bos_token = "<bos>"
+        mock_inner_tokenizer.pad_token_id = 0
+        mock_inner_tokenizer.eos_token_id = 1
+        mock_inner_tokenizer.bos_token_id = 2
+        mock_inner_tokenizer.name_or_path = "test-model"
+        mock_processor.tokenizer = mock_inner_tokenizer
+        original_apply = MagicMock(return_value="formatted")
+        mock_processor.apply_chat_template = original_apply
+        mock_auto_processor.from_pretrained.return_value = mock_processor
+
+        result = get_tokenizer(
+            {
+                "name": "test-vlm",
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            get_processor=True,
+        )
+
+        result.apply_chat_template([], tokenize=False)
+
+        original_apply.assert_called_once_with(
+            [], tokenize=False, enable_thinking=False
+        )
+
+    @patch("nemo_rl.models.automodel.setup.AutoProcessor")
     def test_get_processor_sets_pad_from_eos(self, mock_auto_processor):
         """Test that processor path also sets pad_token from eos when None."""
         mock_processor = MagicMock()

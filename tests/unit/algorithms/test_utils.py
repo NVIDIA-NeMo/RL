@@ -14,6 +14,7 @@
 
 import math
 from datetime import datetime
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -218,6 +219,45 @@ def test_maybe_pad_last_batch():
     assert result["sample_mask"].shape[0] == expected_size
     assert "token_mask" not in result
     assert "reference_policy_logprobs" not in result
+
+
+def test_get_tokenizer_processor_applies_chat_template_kwargs(monkeypatch):
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.bos_token = "<bos>"
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    tokenizer.bos_token_id = 2
+    tokenizer.name_or_path = "test-vlm"
+
+    original_processor_apply_chat_template = MagicMock(return_value="formatted")
+    processor = MagicMock()
+    processor.tokenizer = tokenizer
+    processor.apply_chat_template = original_processor_apply_chat_template
+
+    def _mock_from_pretrained(*args, **kwargs):
+        del args, kwargs
+        return processor
+
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.utils.AutoProcessor.from_pretrained",
+        _mock_from_pretrained,
+    )
+
+    result = get_tokenizer(
+        {
+            "name": "test-vlm",
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        get_processor=True,
+    )
+
+    result.apply_chat_template([], tokenize=False)
+
+    original_processor_apply_chat_template.assert_called_once_with(
+        [], tokenize=False, enable_thinking=False
+    )
 
 
 # Performance Metrics Tests

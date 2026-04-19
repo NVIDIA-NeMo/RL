@@ -26,18 +26,20 @@ from typing import Any, Optional
 
 import ray
 import torch
-from transformers import PreTrainedTokenizerBase
+from transformers import AutoProcessor, PreTrainedTokenizerBase
 from wandb import Histogram, Table
 
 from nemo_rl.data.interfaces import (
     DatumSpec,
     FlatMessagesType,
     LLMMessageLogType,
+    VLMMessageLogType,
 )
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.processors import build_nemo_gym_vlm_prompt_message
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -1068,6 +1070,75 @@ class AsyncNemoGymRolloutResult:
     rollout_metrics: dict[str, Any]
 
 
+def rebuild_nemo_gym_vlm_message_log(
+    full_result: dict[str, Any], processor: AutoProcessor
+) -> tuple[VLMMessageLogType, VLMMessageLogType]:
+    """Rebuild a NeMo-Gym rollout message log with processor-backed VLM prompt data.
+
+    The NeMo-Gym environment currently reconstructs prompt-side messages from raw
+    token deltas. For VLMs that drops the processor outputs required by the
+    training-side logprob path. This helper restores the first prompt using the
+    original structured NeMo-Gym input and keeps later prompt deltas token-based.
+    """
+
+    def _to_int_list(token_ids: list[int | str]) -> list[int]:
+        return [int(token_id) for token_id in token_ids]
+
+    output_items = full_result["response"]["output"]
+    generation_items = [
+        output_item
+        for output_item in output_items
+        if "generation_token_ids" in output_item
+    ]
+    if not generation_items:
+        raise ValueError("Expected at least one NeMo-Gym generation item for VLM.")
+
+    first_generation = generation_items[0]
+    prompt_message = build_nemo_gym_vlm_prompt_message(
+        full_result["responses_create_params"]["input"],
+        processor,
+        first_generation["prompt_token_ids"],
+        tools=full_result["responses_create_params"].get("tools"),
+    )
+
+    input_message_log: VLMMessageLogType = [copy.deepcopy(prompt_message)]
+    message_log: VLMMessageLogType = [prompt_message]
+    seen_token_ids = prompt_message["token_ids"].tolist()
+
+    for output_item in generation_items:
+        prompt_token_ids = _to_int_list(output_item["prompt_token_ids"])
+        assert seen_token_ids == prompt_token_ids[: len(seen_token_ids)], (
+            "Non-contiguous prompt tokens found while rebuilding a NeMo-Gym VLM "
+            "message log. This indicates prompt reconstruction drift."
+        )
+
+        prompt_delta = prompt_token_ids[len(seen_token_ids) :]
+        if prompt_delta:
+            message_log.append(
+                {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.tensor(prompt_delta, dtype=torch.long),
+                }
+            )
+            seen_token_ids.extend(prompt_delta)
+
+        generation_token_ids = _to_int_list(output_item["generation_token_ids"])
+        message_log.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor(generation_token_ids, dtype=torch.long),
+                "generation_logprobs": torch.tensor(
+                    output_item["generation_log_probs"]
+                ),
+            }
+        )
+        seen_token_ids.extend(generation_token_ids)
+
+    return input_message_log, message_log
+
+
 def _calculate_single_metric(
     values: list[float], batch_size: int, key_name: str
 ) -> dict:
@@ -1087,6 +1158,7 @@ def run_async_nemo_gym_rollout(
     tokenizer: TokenizerType,
     task_to_env: dict[str, EnvironmentInterface],
     generation_config: GenerationConfig,
+    processor: Optional[AutoProcessor] = None,
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
@@ -1139,6 +1211,15 @@ def run_async_nemo_gym_rollout(
                 nemo_gym_rows, tokenizer, timer_prefix
             )
         )
+
+        if processor is not None:
+            for result in results:
+                (
+                    result["input_message_log"],
+                    result["message_log"],
+                ) = rebuild_nemo_gym_vlm_message_log(
+                    result["full_result"], processor
+                )
 
         # Tensorize all token ids
         for r in results:
