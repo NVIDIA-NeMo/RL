@@ -567,28 +567,13 @@ def _get_pack_sequence_parameters_for_megatron(
         f"    - If both are enabled, the minimum pad factor is `cp_size * 2 * tp_size`."
     )
 
-    # packed sequence length, after sharding to TP and CP domains, needs to be divisible
-    # by a recipe-dependent divisor:
-    #   blockwise FP8 : 128  (cublas block size)
-    #   MXFP8         :  32  (MXFP8 block size)
-    #   other FP8     :  16
-    #   HybridEP+flex : 128  (MAX_NUM_OF_TOKENS_PER_RANK must be divisible by
-    #                         NUM_OF_TOKENS_PER_CHUNK=128 in deep_ep JIT kernels)
-    # When multiple constraints apply, take the max (128 is a multiple of 32/16).
-    divisor = 1
+    # packed sequence length, after splitted to TP and CP domains, needs to be divisible by 128 if using blockwise FP8, and divisible by 16 if using other FP8 recipes.
     if use_fp8:
+        divisor = 16
         if fp8_cfg["fp8_recipe"] == "blockwise":
-            divisor = max(divisor, 128)
+            divisor = 128
         elif fp8_cfg["fp8_recipe"] == "mxfp8":
-            divisor = max(divisor, 32)
-        else:
-            divisor = max(divisor, 16)
-    if (
-        megatron_cfg.get("moe_token_dispatcher_type") == "flex"
-        and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
-    ):
-        divisor = max(divisor, 128)
-    if divisor > 1:
+            divisor = 32
         pad_packed_seq_to_multiple_of = divisor
         if cp_size > 1:
             pad_packed_seq_to_multiple_of *= cp_size * 2
