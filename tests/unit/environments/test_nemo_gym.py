@@ -37,7 +37,6 @@ from tests.unit.models.generation.test_vllm_generation import (
 )
 
 
-
 @pytest.mark.nemo_gym
 def test_nemo_gym_stub_module():
     from nemo_gym import config_types
