@@ -16,6 +16,8 @@ import time
 from copy import deepcopy
 from pathlib import Path
 
+import torch
+
 import pytest
 import ray
 from yaml import safe_load
@@ -133,6 +135,43 @@ def nemo_gym_sanity_test_data():
     return data
 
 
+def _write_actual_test_data(original_input: list, actual_result: list):
+    """Write actual rollout results to actual_test_nemo_gym_sanity.json.
+
+    This makes it easy to update the expected output after a Gym commit bump:
+        cp nemo_gym_test_data/actual_test_nemo_gym_sanity.json nemo_gym_test_data/test_nemo_gym_sanity.json
+    """
+
+    def _convert(obj):
+        """Recursively convert torch tensors to Python lists for JSON serialization."""
+        if isinstance(obj, torch.Tensor):
+            return obj.tolist()
+        if isinstance(obj, dict):
+            return {k: _convert(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_convert(v) for v in obj]
+        return obj
+
+    cleaned = deepcopy(actual_result)
+    for r in cleaned:
+        r.pop("full_result", None)
+        for msg in r.get("message_log", [])[1:]:
+            if "token_ids" in msg:
+                msg["token_ids"] = []
+            if "generation_logprobs" in msg:
+                msg["generation_logprobs"] = []
+
+    output_path = (
+        Path(__file__).parent
+        / "nemo_gym_test_data/actual_test_nemo_gym_sanity.json"
+    )
+    data = _convert({"input": original_input, "expected_output": cleaned})
+    with open(output_path, "w") as f:
+        json.dump(data, f)
+        f.write("\n")
+    print(f"Wrote updated test data to {output_path}")
+
+
 @pytest.mark.nemo_gym
 def test_nemo_gym_sanity(
     nemo_gym,
@@ -166,6 +205,10 @@ def test_nemo_gym_sanity(
         # Right now, we don't need to swap the token ids in the message log since they pointto the same underlying dictionary as above.
         # for message in d["message_log"][:1]:
         #     message["token_ids"] = message["token_ids"].tolist()
+
+    # Write the actual result to a file so it can be used to update the expected output.
+    # To update: cp actual_test_nemo_gym_sanity.json test_nemo_gym_sanity.json
+    _write_actual_test_data(nemo_gym_sanity_test_data["input"], actual_result)
 
     def _standardize_single_result(d: dict):
         d = deepcopy(d)
