@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Conftest for redesign tests — real Ray, real SGLang.
+"""Conftest for sglang tests — real Ray, real SGLang.
 
-Tests in this directory exercise the redesign/ modules using real Ray actors
-and real SGLang servers.  The conftest stubs non-sglang heavy dependencies
-but lets sglang imports resolve naturally against the installed package.
+Tests in this directory exercise the sglang generation modules using real Ray
+actors and real SGLang servers.  The conftest stubs non-sglang heavy
+dependencies but lets sglang imports resolve naturally against the installed
+package.
 """
 
 import os
@@ -51,7 +52,7 @@ for _mod in _STUB_MODULES:
 import pytest
 import ray
 
-from nemo_rl.models.generation.redesign.sglang_router import RouterActor
+from nemo_rl.models.generation.sglang.sglang_router import RouterActor
 
 
 # ---------------------------------------------------------------------------

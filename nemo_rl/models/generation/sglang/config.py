@@ -16,7 +16,6 @@ from typing import Any, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
-
 class SglangSpecificArgs(TypedDict):
     """SGLang-specific configuration arguments.
 
@@ -25,7 +24,7 @@ class SglangSpecificArgs(TypedDict):
     """
 
     model_path: NotRequired[str]
-    gpus_per_server: NotRequired[int]
+    # Total number of gpus for rollout
     random_seed: NotRequired[int]
     skip_tokenizer_init: NotRequired[bool]
     disable_cuda_graph: NotRequired[bool]
@@ -41,6 +40,7 @@ class SglangSpecificArgs(TypedDict):
     disable_overlap_schedule: NotRequired[bool]
     enable_mixed_chunk: NotRequired[bool]
     enable_dp_attention: NotRequired[bool]
+    enable_deepep_moe: NotRequired[bool]
     enable_ep_moe: NotRequired[bool]
     enable_torch_compile: NotRequired[bool]
     torch_compile_max_bs: NotRequired[int]
@@ -52,7 +52,6 @@ class SglangSpecificArgs(TypedDict):
     triton_attention_reduce_in_fp32: NotRequired[bool]
     triton_attention_num_kv_splits: NotRequired[int]
     num_continuous_decode_steps: NotRequired[int]
-    enable_memory_saver: NotRequired[bool]
     allow_auto_truncate: NotRequired[bool]
     attention_backend: NotRequired[str | None]
     enable_multimodal: NotRequired[bool]
@@ -93,10 +92,31 @@ class SglangSpecificArgs(TypedDict):
     enable_fast_load: NotRequired[bool]
     # Server warmup
     skip_server_warmup: NotRequired[bool]
+    # Fault tolerance
+    use_fault_tolerance: NotRequired[bool]
+    rollout_health_check_interval: NotRequired[int]
+    rollout_health_check_timeout: NotRequired[int]
+    rollout_health_check_first_wait: NotRequired[int]
 
+class SGLangServer(TypedDict):
+    # needs_offload true --> enable_memory_saver true
+    needs_offload: bool
+    # for testing purpose. memory_saver
+    cpu_weight_backup: bool
+    sglang_server_concurrency: int
+    # total num gpus for inference
+    num_gpus: NotRequired[int]
+    num_gpus_per_engine: NotRequired[int] 
+
+class SGLangRouter(TypedDict):
+    sglang_router_ip: NotRequired[str]
+    sglang_router_port: NotRequired[int]
+    router_policy: NotRequired[str]
+    use_distributed_post: NotRequired[bool]
 
 class SGLangConfig(GenerationConfig):
     """Configuration for SGLang runtime."""
-
     sglang_cfg: SglangSpecificArgs
+    sglang_server: SGLangServer
+    sglang_router: SGLangRouter
     sglang_kwargs: NotRequired[dict[str, Any]]

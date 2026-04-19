@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared helpers for redesign tests.
+"""Shared helpers for sglang tests.
 
 Kept in a regular module (not conftest.py) so test files can import it
 directly.  conftest.py also imports from here for fixture definitions.
@@ -22,12 +22,12 @@ import os
 
 import ray
 
-from nemo_rl.models.generation.redesign.misc import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
-from nemo_rl.models.generation.redesign.ray_utils import (
+from nemo_rl.models.generation.sglang.misc import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+from nemo_rl.models.generation.sglang.ray_utils import (
     find_available_port,
     get_host_info,
 )
-from nemo_rl.models.generation.redesign.sglang_worker import SGLangGenerationWorker
+from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 
 # ---------------------------------------------------------------------------
 # Constants

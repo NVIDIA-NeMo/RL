@@ -5,7 +5,7 @@ import ray
 
 logger = logging.getLogger(__name__)
 
-SGLANG_WORKER_FQN = "nemo_rl.models.generation.redesign.sglang_worker.SGLangGenerationWorker"
+SGLANG_WORKER_FQN = "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker"
 
 @ray.remote(num_cpus=1, num_gpus=0)
 class RouterActor:
@@ -22,8 +22,8 @@ class RouterActor:
 
         from sglang_router.launch_router import RouterArgs
 
-        from nemo_rl.models.generation.redesign.misc import run_router
-        from nemo_rl.models.generation.redesign.ray_utils import (
+        from nemo_rl.models.generation.sglang.misc import run_router
+        from nemo_rl.models.generation.sglang.ray_utils import (
             _wrap_ipv6,
             find_available_port,
             get_host_info,
@@ -60,6 +60,6 @@ class RouterActor:
         return router_ip, router_port
 
     def stop(self):
-        from nemo_rl.models.generation.redesign.misc import terminate_process
+        from nemo_rl.models.generation.sglang.misc import terminate_process
         if hasattr(self, "_process"):
             terminate_process(self._process)

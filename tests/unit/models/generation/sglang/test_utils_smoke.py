@@ -21,14 +21,14 @@ require a running SGLang server or GPU.
 import asyncio
 import multiprocessing
 
-from nemo_rl.models.generation.redesign.async_utils import AsyncLoopThread
-from nemo_rl.models.generation.redesign.misc import (
+from nemo_rl.models.generation.sglang.async_utils import AsyncLoopThread
+from nemo_rl.models.generation.sglang.misc import (
     terminate_process,
 )
-from nemo_rl.models.policy.redesign_utils import (
+from nemo_rl.models.policy.torch_reductions_utils import (
     MultiprocessingSerializer,
 )
-from nemo_rl.models.generation.redesign.ray_utils import (
+from nemo_rl.models.generation.sglang.ray_utils import (
     _wrap_ipv6,
     find_available_port,
     get_host_info,

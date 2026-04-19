@@ -34,7 +34,7 @@ torch_release = pkg_version.parse(torch.__version__).release
 #         "sglang.srt.layers.",
 #         "sglang.srt.utils.",
 #         "torch_npu.",
-# +        "nemo_rl.models.policy.redesign_utils.",
+# +        "nemo_rl.models.policy.torch_reductions_utils.",
 #     }
 
 # Refer: https://github.com/sgl-project/sglang/blob/sglang-miles/python/sglang/srt/utils/weight_checker.py

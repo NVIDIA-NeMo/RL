@@ -35,7 +35,7 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.generation.redesign.sglang_generation import (
+from nemo_rl.models.generation.sglang.sglang_generation import (
     SGLangGeneration,
     generate_one_sample,
 )

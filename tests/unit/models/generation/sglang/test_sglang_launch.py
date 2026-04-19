@@ -26,7 +26,7 @@ import pytest
 import ray
 import requests
 
-from nemo_rl.models.generation.redesign.ray_utils import Lock
+from nemo_rl.models.generation.sglang.ray_utils import Lock
 
 from helpers import create_worker
 

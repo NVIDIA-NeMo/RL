@@ -5,7 +5,7 @@ import ray
 
 logger = logging.getLogger(__name__)
 
-from nemo_rl.models.generation.redesign.config import SGLangConfig 
+from nemo_rl.models.generation.sglang.config import SGLangConfig
 
 class RolloutHealthMonitor:
     """Health monitor for rollout engines.
