@@ -589,6 +589,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        is_teacher: bool = False,
+        teacher_logits: Optional[Any] = None,
+        topk_logits: Optional[int] = None,
+        use_teacher_ipc_loss_postprocessor: bool = False,
         timer: Optional[Timer] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
