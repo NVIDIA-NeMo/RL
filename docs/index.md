@@ -121,6 +121,13 @@ Configure offline and online Eagle3 draft-model workflows to accelerate rollout 
 Learn how to add support for new model architectures in NeMo RL.
 :::
 
+:::{grid-item-card} {octicon}`arrow-both` YaRN Long-Context Training
+:link: guides/yarn-long-context
+:link-type: doc
+
+Extend a model's context window with YaRN RoPE scaling on the Megatron backend for SFT, GRPO, and other workflows.
+:::
+
 ::::
 
 ## Advanced Topics
@@ -227,6 +234,7 @@ guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
 guides/eagle3-speculative-decoding.md
+guides/yarn-long-context.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
 guides/ft-launcher-guide.md
