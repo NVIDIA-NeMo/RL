@@ -104,6 +104,8 @@ class SGLangServer(TypedDict):
     # for testing purpose. memory_saver
     cpu_weight_backup: bool
     sglang_server_concurrency: int
+    # for pause/continue gen
+    pause_generation_mode: NotRequired[str]
     # total num gpus for inference
     num_gpus: NotRequired[int]
     num_gpus_per_engine: NotRequired[int] 

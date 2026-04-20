@@ -80,6 +80,9 @@ class SGLangGeneration(GenerationInterface):
         self.rank_offset: int = 0
         self.gpu_offset: int = 0
         self.needs_offload: bool = sglang_cfg["sglang_server"]["needs_offload"]
+        self.pause_generation_mode: str = sglang_cfg["sglang_server"].get(
+            "pause_generation_mode", "retract"
+        )
         self.model_path: str | None = sglang_cfg["sglang_cfg"]["model_path"]
 
         # --- Router bootstrap --------------------------------------------
@@ -343,6 +346,26 @@ class SGLangGeneration(GenerationInterface):
                 if engine is not None
             ]
         )
+
+
+    def pause_generation(self) -> None:
+        """Pause generation on every node-0 engine using the configured mode."""
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        ray.get(
+            [
+                e.pause_generation.remote(mode=self.pause_generation_mode)
+                for e in engines
+            ]
+        )
+
+    def continue_generation(self) -> None:
+        """Resume generation on every node-0 engine."""
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        ray.get([e.continue_generation.remote() for e in engines])
 
     def health_monitoring_pause(self) -> None:
         if self._health_monitor:
