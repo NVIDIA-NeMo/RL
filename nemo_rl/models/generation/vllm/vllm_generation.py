@@ -905,11 +905,11 @@ class VllmGeneration(GenerationInterface):
             dp_indices.append(dp_idx)
 
         results = ray.get(futures)
-        vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
+        vllm_logger_metrics: dict[str, Any] = {
             "inflight_batch_sizes": {},  # dp_idx -> list[int]
             "num_pending_samples": {},  # dp_idx -> list[int]
             "kv_cache_usage_perc": {},  # dp_idx -> list[float]
-            "generation_tokens": {},  # dp_idx -> list[int]
+            "generation_tokens": {},  # dp_idx -> int
         }
 
         for dp_idx, stats in zip(dp_indices, results):
@@ -927,7 +927,7 @@ class VllmGeneration(GenerationInterface):
             if kv_cache_usage_perc:
                 vllm_logger_metrics["kv_cache_usage_perc"][dp_idx] = kv_cache_usage_perc
             generation_tokens = stats.get("generation_tokens")
-            if generation_tokens:
+            if generation_tokens is not None:
                 vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
 
         return vllm_logger_metrics

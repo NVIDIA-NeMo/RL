@@ -700,7 +700,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         self.inflight_batch_sizes: list[int] = []
         self.num_pending_samples: list[int] = []
         self.kv_cache_usage_perc: list[float] = []
-        self.generation_tokens: list[int] = []
+        self._generation_tokens_start: int = 0
 
         def _logger_loop():
             # Brief delay so the engine can finish initialising before first poll.
@@ -718,9 +718,6 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                             elif m.name == "vllm:kv_cache_usage_perc":
                                 with self._vllm_metrics_lock:
                                     self.kv_cache_usage_perc.append(float(m.value))
-                            if m.name == "vllm:generation_tokens":
-                                with self._vllm_metrics_lock:
-                                    self.generation_tokens.append(int(m.value))
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
@@ -735,6 +732,15 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         self._vllm_metrics_logger_thread = t
         print("📋[vLLM Metric Logger] vLLM metrics logger thread started", flush=True)
 
+    def _read_generation_tokens_counter(self) -> int:
+        """Read the current cumulative value of the vllm:generation_tokens Counter."""
+        from vllm.v1.metrics.reader import Counter, get_metrics_snapshot
+
+        for m in get_metrics_snapshot():
+            if isinstance(m, Counter) and m.name == "vllm:generation_tokens":
+                return int(m.value)
+        return 0
+
     def get_vllm_logger_metrics(self) -> dict[str, Any]:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return {}
@@ -744,7 +750,8 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
                 "num_pending_samples": copy.deepcopy(self.num_pending_samples),
                 "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
-                "generation_tokens": copy.deepcopy(self.generation_tokens),
+                "generation_tokens": self._read_generation_tokens_counter()
+                - self._generation_tokens_start,
             }
 
     def clear_vllm_logger_metrics(self) -> None:
@@ -755,7 +762,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             self.inflight_batch_sizes = []
             self.num_pending_samples = []
             self.kv_cache_usage_perc = []
-            self.generation_tokens = []
+            self._generation_tokens_start = self._read_generation_tokens_counter()
 
     def init_collective(
         self,
