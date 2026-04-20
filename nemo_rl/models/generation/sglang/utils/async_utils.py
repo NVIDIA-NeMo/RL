@@ -16,6 +16,14 @@ class AsyncLoopThread:
         # Schedule a coroutine onto the loop and block until it's done
         return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
 
+    def close(self, timeout: float | None = 5.0) -> None:
+        """Stop the event loop, join the worker thread, and close the loop. Idempotent."""
+        if self._thread.is_alive():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self._thread.join(timeout=timeout)
+        if not self.loop.is_closed():
+            self.loop.close()
+
 
 # Create one global instance
 async_loop = None

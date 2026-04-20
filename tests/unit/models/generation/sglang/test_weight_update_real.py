@@ -39,7 +39,7 @@ import torch.distributed as dist
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.generation.sglang.ray_utils import find_available_port, get_host_info
+from nemo_rl.models.generation.sglang.utils.ray_utils import find_available_port, get_host_info
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 
 from helpers import make_actor_env_vars, post_and_assert_200

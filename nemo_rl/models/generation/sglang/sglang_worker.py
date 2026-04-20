@@ -11,13 +11,120 @@ import requests
 from packaging.version import parse
 from urllib3.exceptions import NewConnectionError
 
-from nemo_rl.models.generation.sglang.ray_utils import (
+from nemo_rl.models.generation.sglang.utils.ray_utils import (
     get_current_node_ip,
     get_free_port,
     get_host_info,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _get_sglang_file(relative_path: str) -> str:
+    from importlib.util import find_spec
+
+    spec = find_spec("sglang")
+    if spec is None or not spec.submodule_search_locations:
+        raise RuntimeError(
+            f"sglang package not found while attempting to patch '{relative_path}'. "
+            "SGLangGenerationWorker requires sglang to be installed in the "
+            "SGLANG_EXECUTABLE venv; weight streaming will fail at SGLang's "
+            "SafeUnpickler boundary without the compat patch."
+        )
+
+    base_dir = next(iter(spec.submodule_search_locations))
+    file_path = os.path.join(base_dir, *relative_path.split("/"))
+    if not os.path.exists(file_path):
+        raise RuntimeError(
+            f"Expected sglang file '{relative_path}' not found at '{file_path}'. "
+            "The sglang version may have moved this file; compat patch cannot be applied."
+        )
+    return file_path
+
+
+def _write_and_verify(file_path: str, content: str, sentinel: str) -> None:
+    tmp_path = f"{file_path}.nemo_rl_compat.{os.getpid()}.tmp"
+    with open(tmp_path, "w") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, file_path)
+
+    with open(file_path, "r") as f:
+        verify = f.read()
+    if sentinel not in verify:
+        raise RuntimeError(
+            f"Compat patch verification failed for {file_path}: "
+            f"sentinel '{sentinel}' not present after write. "
+            "The write may have been silently dropped by the filesystem."
+        )
+
+
+def _patch_sglang_safe_unpickler() -> None:
+    file_to_patch = _get_sglang_file("srt/utils/common.py")
+
+    with open(file_to_patch, "r") as f:
+        content = f.read()
+
+    sentinel = '"nemo_rl.models.policy.torch_reductions_utils."'
+    if sentinel in content:
+        return
+
+    anchor = '        "torch_npu.",\n'
+    insertion = anchor + '        "nemo_rl.models.policy.torch_reductions_utils.",\n'
+    if anchor not in content:
+        raise RuntimeError(
+            f"SafeUnpickler allowlist anchor '{anchor.strip()}' not found in "
+            f"{file_to_patch}. The sglang version may have changed its "
+            "ALLOWED_MODULE_PREFIXES layout; weight streaming would be rejected "
+            "by SafeUnpickler. Update the anchor in _patch_sglang_safe_unpickler."
+        )
+
+    content = content.replace(anchor, insertion, 1)
+    _write_and_verify(file_to_patch, content, sentinel)
+    logger.info("Patched SafeUnpickler allowlist in %s.", file_to_patch)
+
+
+def _patch_sglang_weight_checker() -> None:
+    file_to_patch = _get_sglang_file("srt/utils/weight_checker.py")
+
+    with open(file_to_patch, "r") as f:
+        content = f.read()
+
+    sentinel = '"cos_sin_cache" in name'
+    if sentinel in content:
+        return
+
+    old_snippet = (
+        "    def _reset_tensors(self):\n"
+        "        for name, param in self._model_state():\n"
+        "            param.copy_(_random_like(param))\n"
+    )
+    new_snippet = (
+        "    def _reset_tensors(self):\n"
+        "        for name, param in self._model_state():\n"
+        "            if \"cos_sin_cache\" in name or \"freqs_cis\" in name or \"_weight_fp32\" in name:\n"
+        "                continue\n"
+        "            param.copy_(_random_like(param))\n"
+    )
+    if old_snippet not in content:
+        raise RuntimeError(
+            f"WeightChecker._reset_tensors anchor not found in {file_to_patch}. "
+            "The sglang version may have changed this function; WeightChecker "
+            "would clobber derived buffers (cos_sin_cache / freqs_cis / _weight_fp32) "
+            "and the compare step would never converge. Update the anchor in "
+            "_patch_sglang_weight_checker."
+        )
+
+    content = content.replace(old_snippet, new_snippet, 1)
+    _write_and_verify(file_to_patch, content, sentinel)
+    logger.info("Patched WeightChecker._reset_tensors in %s.", file_to_patch)
+
+
+def _apply_sglang_compat_patches() -> None:
+    _patch_sglang_safe_unpickler()
+    _patch_sglang_weight_checker()
+
 
 def get_base_gpu_id(cluster_cfg, sglang_cfg, rank):
     num_gpus = min(cluster_cfg["gpus_per_node"], sglang_cfg["sglang_server"]["num_gpus_per_engine"])
@@ -106,6 +213,7 @@ class SGLangGenerationWorker:
         base_gpu_id: int | None = None,
         num_gpus_per_engine: int | None = None,
     ):
+        _apply_sglang_compat_patches()
         self.cluster_cfg = cluster_cfg
         self.sglang_cfg = sglang_cfg
         self.rank = rank
