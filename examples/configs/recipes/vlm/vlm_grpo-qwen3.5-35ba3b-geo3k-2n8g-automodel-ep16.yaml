@@ -31,6 +31,10 @@ policy:
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
+      freeze_config:
+        freeze_vision_tower: false
+        freeze_audio_tower: true
+        freeze_language_model: false
   generation:
     max_new_tokens: 2048
     vllm_cfg:

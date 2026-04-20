@@ -52,6 +52,10 @@ policy:
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
   sequence_packing:
     enabled: false
   dynamic_batching:
