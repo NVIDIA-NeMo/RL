@@ -1,0 +1,383 @@
+# Infra for the Qwen3-4B full-disaggregated run — paired with qwen3_4b_if_full_disagg.yaml.
+#
+# Usage:
+#   nrl-k8s run tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
+#     --infra tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml
+#
+# Everything K8s-specific lives here so the recipe stays cluster-agnostic.
+# Shared YAML anchors below keep the three cluster specs from repeating.
+
+# =============================================================================
+# Shared anchors — consumed during YAML parse.
+# =============================================================================
+_shared:
+  nodeSelector: &shared_node_selector
+    gpu-wrangler.nvidia.com/lease: nemo-rl-testing
+  tolerations: &shared_tolerations
+    - {key: gpu-wrangler.nvidia.com/lease, operator: Equal, value: nemo-rl-testing, effect: NoSchedule}
+    - {key: platform.nvidia.com/gpu,       operator: Equal, value: "true",          effect: NoSchedule}
+  # Keep pod-spec env minimal — the nemo-rl:nightly image already sets
+  # NCCL_NET_PLUGIN=aws-ofi, NCCL_SOCKET_IFNAME=enp71s0, etc. in its shell
+  # init. Overriding them here just causes Ray runtime-env merge conflicts
+  # when ray.init() captures os.environ inside the job entrypoint.
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                        value: /tmp/huggingface}
+    - {name: TRANSFORMERS_CACHE,             value: /tmp/huggingface}
+    - {name: NCCL_DEBUG,                     value: INFO}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                        value: /tmp/huggingface}
+    - {name: TRANSFORMERS_CACHE,             value: /tmp/huggingface}
+    - {name: NCCL_DEBUG,                     value: INFO}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+  headResources: &shared_head_resources
+    limits:   {cpu: "8", memory: "32Gi"}
+    requests: {cpu: "2", memory: "8Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    # Sized for p5.48xlarge (192 CPU / ~1957 GiB allocatable). We claim
+    # most of the node and leave ~16 CPU + ~150 GiB headroom for:
+    #   - the training head pod colocated here (~8 CPU / 32 GiB)
+    #   - a gym head pod if it lands on this node (~8 CPU / 32 GiB)
+    #   - daemonsets: kube-proxy, aws-node, nvidia-device-plugin,
+    #     node-exporter (~4 CPU / 16 GiB total)
+    # p5.48xlarge also exposes 32 EFA-capable ENIs. The AWS OFI NCCL plugin
+    # (bundled in the image as NCCL_NET_PLUGIN=aws-ofi) needs them mapped
+    # into the container as `vpc.amazonaws.com/efa` resources — the EFA
+    # device plugin on the node injects the character devices under
+    # /dev/infiniband/ and the libfabric provider discovers them at
+    # startup. Drop the EFA request and you'll see `FI_PROVIDER=efa` log
+    # "No usable providers found" and NCCL fall back to socket / hang.
+    # Also: `nvidia.com/gpu: "8"` must equal the rayStartParams num-gpus
+    # on the same worker template, otherwise Ray's resource view disagrees
+    # with what CUDA actually sees.
+    limits:
+      cpu: "176"
+      memory: "1800Gi"
+      nvidia.com/gpu: "8"
+      vpc.amazonaws.com/efa: "32"
+    requests:
+      cpu: "176"
+      memory: "1800Gi"
+      nvidia.com/gpu: "8"
+      vpc.amazonaws.com/efa: "32"
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+  dshmMounts: &dshm_mounts
+    - {mountPath: /dev/shm, name: dshm}
+  dshm16: &dshm_16
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 16Gi}
+  dshm64: &dshm_64
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 64Gi}
+  dshm4: &dshm_4
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 4Gi}
+
+# =============================================================================
+# Top-level InfraConfig (no wrapping `infra:` needed — the CLI accepts either)
+# =============================================================================
+namespace: nemo-rl-testing
+image: nvcr.io/nvidian/nemo-rl:nightly
+imagePullSecrets: [nvidia-ngcuser-pull-secret, ngc-registry-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+launch:
+  mode: attach
+  attach:
+    generation: raycluster-generation-qwen3-4b
+    gym: raycluster-gym-qwen3-4b
+    training: raycluster-rl-qwen3-4b
+  peerWatcher: false
+  # Minimal upload set — Ray caps working_dir at 100 MiB. We include only
+  # what this run needs: nemo_rl, examples, the nemo_gym subset, and the
+  # instruction_following data (~90 MiB, fits under the cap).
+  rayUploadPaths:
+    - nemo_rl
+    - examples
+    - infra/examples
+    - tests/check_metrics.py
+    - tests/json_dump_tb_logs.py
+    - 3rdparty/Gym-workspace/Gym/nemo_gym
+    - 3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model
+    - 3rdparty/Gym-workspace/Gym/responses_api_agents/simple_agent
+    - 3rdparty/Gym-workspace/Gym/pyproject.toml
+    - 3rdparty/Gym-workspace/Gym/uv.lock
+    # Only configs (not data/*.jsonl) — the big train/validation jsonls are
+    # pre-staged via kubectl cp onto the training pods' /tmp (see env above).
+    - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/configs
+    # nemo_rl.distributed.model_utils imports megatron.core.
+    - 3rdparty/Megatron-LM-workspace/Megatron-LM/megatron
+  # The CLI stages the merged recipe as ./nrl_k8s_run.yaml at the working_dir
+  # root — reference it by name from the entrypoint.
+  entrypoint: |
+    # kubernetes client is required by K8sEndpointRegistry (used by training
+    # to read vllm_base_urls from the ConfigMap). The image *usually* has it,
+    # but installing here is cheap insurance and keeps the recipe portable.
+    pip install kubernetes -q || true
+    # Inline exports — see note on launch.env below.
+    # GLOO_SOCKET_IFNAME: PyTorch distributed gloo backend (used for the
+    # rendezvous store). Default eth0 isn't the interface on p5 hosts.
+    export GLOO_SOCKET_IFNAME=enp71s0
+    # NCCL_SOCKET_IFNAME: control-plane interface NCCL uses before OFI
+    # takes over data. Must match the host's primary AWS VPC ENI.
+    export NCCL_SOCKET_IFNAME=enp71s0
+    # FI_PROVIDER: tells libfabric (and thus aws-ofi-nccl) to use EFA.
+    # Without it you'd get the TCP provider over eth0, ~10x slower.
+    export FI_PROVIDER=efa
+    # Data paths — files were pre-staged on the pods via kubectl cp onto
+    # each training pod's /tmp (the 87 MB jsonl blows the 100 MiB
+    # working_dir cap, so Ray can't ship it).
+    export DISAGG_TRAIN_PATH=/tmp/train.jsonl
+    export DISAGG_VALID_PATH=/tmp/validation.jsonl
+    # expandable_segments reduces CUDA memory fragmentation under varying
+    # batch shapes. Safe to set in disagg mode; UNSAFE in colocated mode
+    # (vLLM's CuMemAllocator asserts). The single-cluster recipe omits it.
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    # Kill Ray tasks that can never schedule instead of letting them
+    # queue forever — surfaces cluster-capacity bugs fast.
+    export RAY_enable_infeasible_task_early_exit=true
+    # Make sibling workspaces importable alongside the repo root.
+    export PYTHONPATH=.:3rdparty/Gym-workspace/Gym:3rdparty/Megatron-LM-workspace/Megatron-LM
+    # disagg_job_id is passed in three places — here (training),
+    # the gen daemon export DISAGG_JOB_ID (generation), and the gym daemon's
+    # --job-id flag (gym). It is deliberately NOT an InfraConfig field: the
+    # CLI infers the ConfigMap name by regex-parsing --job-id out of the gym
+    # entrypoint (orchestrate.py:_infer_disagg_job_id), so adding a separate
+    # key would just duplicate information and let the two go out of sync.
+    # Keep all three spellings in sync when you rename a run.
+    python -u examples/nemo_gym/run_grpo_nemo_gym.py \
+      --config nrl_k8s_run.yaml \
+      +policy.generation.remote_generation_url=http://raycluster-generation-qwen3-4b-head-svc.nemo-rl-testing.svc.cluster.local:8089 \
+      +env.disagg_job_id=qwen3-4b-if-gym \
+      ++env.nemo_gym.config_paths='[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/instruction_following/configs/instruction_following.yaml]' \
+      ~policy.optimizer.kwargs.foreach \
+      ~policy.optimizer.kwargs.fused
+  # All env flows through inline `export`s in the entrypoint — setting
+  # anything here puts it in runtime_env.env_vars, which can't merge with
+  # ray.init's captured env_vars and aborts with "Failed to merge".
+  env: {}
+
+clusters:
+  # -------------------------------------------------------------------------
+  # Generation — GPU head + worker, control-server on 8089.
+  # -------------------------------------------------------------------------
+  generation:
+    name: raycluster-generation-qwen3-4b
+    labels:
+      disagg.nemo-rl/cluster: generation-qwen3-4b
+      disagg.nemo-rl/run: qwen3-4b-gym
+    daemon:
+      submissionId: qwen3-4b-generation-server-v7
+      # Inline exports (not runtime_env.env_vars, which conflicts with
+      # ray.init's captured env). The Python process calls ray.init() after
+      # these are exported, ray captures them into its env, and propagates
+      # them to the worker actors + their subprocesses — so vLLM's
+      # EngineCore sees GLOO_SOCKET_IFNAME=enp71s0 and doesn't try eth0.
+      # DISAGG_JOB_ID triggers the K8sEndpointRegistry publish path so
+      # gym can discover the gen shards via the ConfigMap.
+      entrypoint: |
+        export GLOO_SOCKET_IFNAME=enp71s0
+        export NCCL_SOCKET_IFNAME=enp71s0
+        export FI_PROVIDER=efa
+        export DISAGG_JOB_ID=qwen3-4b-if-gym
+        # K8sEndpointRegistry needs the `kubernetes` client.
+        pip install kubernetes -q || true
+        python -u examples/run_standalone_generation_server.py \
+          --config infra/examples/generation_standalone_qwen3_4b_dapo.yaml \
+          --port 8089 --num-gpus 8
+      # Gen server doesn't need training data — keep the upload small.
+      rayUploadPaths:
+        - nemo_rl
+        - examples
+        - infra/examples
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams: {dashboard-host: "0.0.0.0", num-gpus: "0", object-store-memory: "200000000"}
+        template:
+          spec:
+            schedulerName: default-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *shared_node_selector
+            tolerations: *shared_tolerations
+            containers:
+              - name: ray-head
+                env: *shared_head_env
+                resources: *shared_head_resources
+                ports:
+                  - {containerPort: 6379,  name: gcs-server}
+                  - {containerPort: 8265,  name: dashboard}
+                  - {containerPort: 10001, name: client}
+                  - {containerPort: 8089,  name: control-server}
+                volumeMounts: *dshm_mounts
+            volumes: *dshm_16
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 1
+          minReplicas: 1
+          maxReplicas: 1
+          rayStartParams: {num-gpus: "8", object-store-memory: "200000000"}
+          template:
+            spec:
+              schedulerName: default-scheduler
+              # hostNetwork=true on GPU workers is required for EFA: the
+              # AWS OFI NCCL plugin opens raw libfabric endpoints bound to
+              # the host ENI (enp71s0, above), which a pod network
+              # namespace can't see. With the default CNI network the
+              # plugin initialises but communication never completes and
+              # NCCL hangs at the first AllReduce. `dnsPolicy:
+              # ClusterFirstWithHostNet` then restores in-cluster DNS so
+              # the worker can still resolve the head svc and the gen
+              # server's FQDN.
+              hostNetwork: true
+              dnsPolicy: ClusterFirstWithHostNet
+              nodeSelector: *shared_node_selector
+              tolerations: *shared_tolerations
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  resources: *gpu_worker_resources
+                  volumeMounts: *dshm_mounts
+              volumes: *dshm_64
+
+  # -------------------------------------------------------------------------
+  # Gym — CPU-only head, gym-server on 9090.
+  # -------------------------------------------------------------------------
+  gym:
+    name: raycluster-gym-qwen3-4b
+    daemon:
+      submissionId: qwen3-4b-if-gym-server-v7
+      # Ray runs entrypoints under /bin/dash. We stay POSIX here (no
+      # pipefail, no process substitution). OmegaConf ${...} escaped as
+      # \${...} — Python dollar-refs for ray.__version__ use a one-liner.
+      entrypoint: |
+        set -eu
+        ROOT_DIR=$(pwd)
+        GYM_DIR=\${ROOT_DIR}/3rdparty/Gym-workspace/Gym
+        export PYTHONPATH=\${ROOT_DIR}:\${GYM_DIR}:\${PYTHONPATH-}
+        cd \${GYM_DIR}
+        mkdir -p cache
+        RAY_VERSION=$(python -c "import ray; print(ray.__version__)")
+        echo "ray==\${RAY_VERSION}" > /tmp/ray-pin.txt
+        pip install -e "." --constraint /tmp/ray-pin.txt -q
+        pip install kubernetes -q
+        exec python -m nemo_gym.standalone_server \
+          --job-id qwen3-4b-if-gym \
+          --port 9090 \
+          --model-name Qwen/Qwen3-4B-Instruct-2507 \
+          --config-yaml \${ROOT_DIR}/infra/examples/gym_standalone_config_instruction_following.yaml
+      # Gym needs Gym code + infra configs + the nemo_rl.distributed package
+      # for the k8s endpoint registry. We list instruction_following files
+      # individually instead of the whole resources_servers/instruction_following
+      # directory because that directory holds an 87 MB train.jsonl — Ray's
+      # 100 MiB working_dir cap would kick in and submission would fail.
+      # Listing app.py and requirements.txt by name picks up the FastAPI
+      # resource server and the rubric-grader wheels at daemon start
+      # (the `pip install -e "."` above reads them) without shipping the
+      # bulk dataset. The smaller validation.jsonl / example.jsonl / etc.
+      # are included because gym's smoke tests and rollout warm-up read
+      # them, and together they're under 2 MiB.
+      rayUploadPaths:
+        - nemo_rl
+        - infra/examples
+        - 3rdparty/Gym-workspace/Gym/nemo_gym
+        - 3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model
+        - 3rdparty/Gym-workspace/Gym/responses_api_agents/simple_agent
+        - 3rdparty/Gym-workspace/Gym/pyproject.toml
+        - 3rdparty/Gym-workspace/Gym/uv.lock
+        # app.py: the instruction_following FastAPI resource server entry.
+        - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/app.py
+        # requirements.txt: rubric-grader deps gym installs on daemon start.
+        - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/requirements.txt
+        - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/configs
+        - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/tests
+        - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/data/validation.jsonl
+        - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/data/example.jsonl
+        - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/data/example_rollouts.jsonl
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams: {num-gpus: "0", dashboard-host: "0.0.0.0", object-store-memory: "200000000"}
+        template:
+          spec:
+            schedulerName: default-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *shared_node_selector
+            tolerations: *shared_tolerations
+            containers:
+              - name: ray-head
+                env:
+                  - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+                resources: *shared_head_resources
+                ports:
+                  - {containerPort: 6379,  name: gcs-server}
+                  - {containerPort: 8265,  name: dashboard}
+                  - {containerPort: 10001, name: client}
+                  - {containerPort: 9090,  name: gym-server}
+                volumeMounts: *dshm_mounts
+            volumes: *dshm_4
+
+  # -------------------------------------------------------------------------
+  # Training — GPU head + worker. Head has WANDB secret.
+  # -------------------------------------------------------------------------
+  training:
+    name: raycluster-rl-qwen3-4b
+    labels:
+      disagg.nemo-rl/cluster: rl-qwen3-4b
+      disagg.nemo-rl/run: qwen3-4b-gym
+    # No daemon: waits for `nrl-k8s launch` / `nrl-k8s run`.
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams: {dashboard-host: "0.0.0.0", num-gpus: "0", object-store-memory: "200000000"}
+        template:
+          spec:
+            schedulerName: default-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *shared_node_selector
+            tolerations: *shared_tolerations
+            containers:
+              - name: ray-head
+                env:
+                  - {name: HF_HOME,                        value: /tmp/huggingface}
+                  - {name: TRANSFORMERS_CACHE,             value: /tmp/huggingface}
+                  - {name: GLOO_SOCKET_IFNAME,             value: eth0}
+                  - {name: NCCL_SOCKET_IFNAME,             value: eth0}
+                  - {name: NCCL_DEBUG,                     value: INFO}
+                  - {name: NCCL_IB_DISABLE,                value: "1"}
+                  - {name: NCCL_NET,                       value: Socket}
+                  - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+                  - name: WANDB_API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: wandb-api-key
+                        key: WANDB_API_KEY
+                resources: *shared_head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *dshm_mounts
+            volumes: *dshm_16
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 1
+          minReplicas: 1
+          maxReplicas: 1
+          rayStartParams: {num-gpus: "8", object-store-memory: "200000000"}
+          template:
+            spec:
+              schedulerName: default-scheduler
+              # Same EFA + NCCL reasoning as the generation worker above.
+              # Training AllReduces run across these workers via aws-ofi;
+              # without hostNetwork they hang at the first collective.
+              hostNetwork: true
+              dnsPolicy: ClusterFirstWithHostNet
+              nodeSelector: *shared_node_selector
+              tolerations: *shared_tolerations
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  resources: *gpu_worker_resources
+                  volumeMounts: *dshm_mounts
+              volumes: *dshm_64

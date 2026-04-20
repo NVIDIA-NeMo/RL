@@ -150,6 +150,13 @@ def main():
             "dp_openai_server_base_urls",
             json.dumps(generation.dp_openai_server_base_urls),
         )
+        # Backward-compat alias: NemoGym's standalone_server reads
+        # `vllm_base_urls`. Keep publishing both keys until gym consumers
+        # migrate to the new name.
+        registry.set(
+            "vllm_base_urls",
+            json.dumps(generation.dp_openai_server_base_urls),
+        )
         print(f"Registered in K8sEndpointRegistry (job_id={disagg_job_id})")
 
     print(

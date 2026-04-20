@@ -135,14 +135,33 @@ class ReplayBuffer:
             min_valid_version = max(0, current_weight_version - max_age_steps)
             print(f"   {min_valid_version=}")
 
-            # Check for unexpected old trajectories
-            old_trajectories = [
-                v for v in self.trajectory_versions if v < min_valid_version
+            # Drop stale trajectories (generated under a policy older than the
+            # age window). In-flight weight updates can produce these during
+            # weight-sync windows; discarding is safer than stalling or raising.
+            stale_idxs = [
+                i
+                for i, v in enumerate(self.trajectory_versions)
+                if v < min_valid_version
             ]
-            if old_trajectories:
-                raise ValueError(
-                    f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}"
+            if stale_idxs:
+                print(
+                    f"   ⚠️  Dropping {len(stale_idxs)} stale trajectories older than "
+                    f"min_valid_version={min_valid_version} (current_weight_version={current_weight_version}, "
+                    f"max_age_steps={max_age_steps})"
                 )
+                keep = [
+                    i
+                    for i in range(len(self.trajectory_versions))
+                    if i not in set(stale_idxs)
+                ]
+                self.trajectories = [self.trajectories[i] for i in keep]
+                self.trajectory_versions = [
+                    self.trajectory_versions[i] for i in keep
+                ]
+                self.target_weight_versions = [
+                    self.target_weight_versions[i] for i in keep
+                ]
+                total_trajectories = len(self.trajectories)
 
             # Filter for valid trajectories without modifying the buffer
             valid_indices = [
@@ -392,6 +411,7 @@ class AsyncTrajectoryCollector:
     def _collection_loop(self):
         """Run the collection loop in background thread."""
         try:
+          while self.running:
             for batch in self.dataloader:
                 if not self.running:
                     break

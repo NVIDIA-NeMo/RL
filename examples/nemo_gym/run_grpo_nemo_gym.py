@@ -235,7 +235,18 @@ The validation set you pass in will directly be used for validation with no addi
     if remote_gym_url:
         nemo_gym_config["remote_gym_url"] = remote_gym_url
         print(f"Using remote Gym service at: {remote_gym_url}")
-    nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
+    # Schedule NemoGym on a worker node (not the head) to avoid head OOM.
+    # Find a non-head Ray node and use NodeAffinitySchedulingStrategy.
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+    head_node_id = ray.get_runtime_context().get_node_id()
+    worker_nodes = [n for n in ray.nodes() if n["Alive"] and n["NodeID"] != head_node_id]
+    gym_scheduling = {}
+    if worker_nodes:
+        gym_scheduling["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+            node_id=worker_nodes[0]["NodeID"], soft=False
+        )
+        print(f"Scheduling NemoGym on worker node {worker_nodes[0]['NodeManagerAddress']}")
+    nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config, num_cpus=4, **gym_scheduling)
     # Blocking wait for NeMo-Gym to spin up
     ray.get(nemo_gym.health_check.remote())
 
