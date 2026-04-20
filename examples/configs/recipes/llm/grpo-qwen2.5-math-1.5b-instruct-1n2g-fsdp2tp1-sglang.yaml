@@ -29,7 +29,7 @@ policy:
       ep_size: 1
       random_seed: 42
       max_running_requests: null
-      mem_fraction_static: 0.7
+      mem_fraction_static: 0.6
       skip_server_warmup: true
       # Piecewise CUDA graph currently crashes with "illegal memory access"
       # (likely torch 2.10 + sglang incompatibility). Keep disabled until upstream fix.
@@ -38,7 +38,7 @@ policy:
     sglang_server:
       needs_offload: true
       cpu_weight_backup: true
-      sglang_server_concurrency: 64
+      sglang_server_concurrency: 1024
       num_gpus: 2
       num_gpus_per_engine: 2
     sglang_router: {}

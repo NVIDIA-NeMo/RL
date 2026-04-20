@@ -70,7 +70,7 @@ def _patch_sglang_safe_unpickler() -> None:
     if sentinel in content:
         return
 
-    anchor = '        "torch_npu.",\n'
+    anchor = '        "torch.nn.parameter.",\n'
     insertion = anchor + '        "nemo_rl.models.policy.torch_reductions_utils.",\n'
     if anchor not in content:
         raise RuntimeError(
