@@ -468,7 +468,7 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     # Activation checkpointing
     if config["megatron_cfg"]["activation_checkpointing"]:
-        granularity = config["megatron_cfg"].get("recompute_granularity", "full")
+        granularity = config["megatron_cfg"]["recompute_granularity"]
         model_cfg.recompute_granularity = granularity
         if granularity == "full":
             model_cfg.recompute_method = "uniform"
