@@ -1,0 +1,260 @@
+# SFT Algorithm Configuration for Nemotron Super V3
+# Adapted from RLBase sft_superv3.yaml for RLSuper's config schema.
+# Matches the Super MLM config:
+#   super-v3-repeated-mtp_revised_notool-lowlr-jan30-iter80k.sh
+#
+# Key differences from Nano:
+#   - CP=16, EP=32 (vs CP=8, EP=8)
+#   - LR=1e-5, MIN_LR=2e-6, adam_beta2=0.95, weight_decay=0.1
+#   - MTP with 2 layers (mtp_loss_scaling_factor=0.3 comes from model config)
+#   - 512 experts, topk=22 (from model config)
+#   - moe_shared_expert_overlap=False
+#   - Selective recompute on MoE modules not supported in NeMo RL;
+#     set activation_checkpointing=false and rely on memory optimizations
+sft:
+  max_num_epochs: 10000
+  max_num_steps: 15625  # TRAIN_SAMPLES(1000000) / GBS(64) = 15625
+
+  val_period: 1000  # matches --eval-interval 1000
+  val_batches: 14   # matches --eval-iters 14
+  val_global_batch_size: 64
+  val_micro_batch_size: 1
+  val_at_start: false
+  val_at_end: false
+  seed: 42
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/sft_superv3"
+  metric_name: null
+  higher_is_better: false
+  keep_top_k: null
+  save_period: 100  # matches --save-interval 100
+  checkpoint_must_save_by: null
+
+policy:
+  # TODO: Provide the path to the Super V3 HF-format pretrained model.
+  # This should be a converted version of the Megatron checkpoint at:
+  #   /lustre/fsw/portfolios/llmservice/users/jjennings/runs/super-sft/checkpoints/super-reinit-embeddings-iter-80k/checkpoints
+  model_name: /mnt/superv3_pretrained
+  tokenizer:
+    # TODO: Verify this points to the correct Super V3 tokenizer.
+    # MLM uses: /lustre/fsw/portfolios/llmservice/users/jjennings/workspace/megatron-sft-right-truncation/tokenizers
+    name: /mnt/tokenizer
+    chat_template: null  # MLM uses --sft-tokenizer-prompt-format identity (no chat template)
+    chat_template_kwargs: null
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  max_total_sequence_length: 262144
+  precision: "bfloat16"
+
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    env_vars: {}
+    cpu_offload: False
+    sequence_parallel: true
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+    lora_cfg:
+      enabled: False
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-5
+      weight_decay: 0.1
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      foreach: False
+      fused: False
+
+  megatron_cfg:
+    enabled: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      UB_TIMEOUT: "720"
+      CUDA_DEVICE_MAX_CONNECTIONS: "1"
+      NVTE_FWD_LAYERNORM_SM_MARGIN: "16"
+      NVTE_BWD_LAYERNORM_SM_MARGIN: "16"
+      NCCL_P2P_NET_CHUNKSIZE: "2097152"
+      NCCL_DEBUG: "WARN"
+      TORCHINDUCTOR_WORKER_START: "fork"
+    empty_unused_memory_level: 1
+    activation_checkpointing: false  # ignored when recompute_granularity is set
+    # Selective recompute on MoE modules — matches MLM's
+    # --recompute-granularity selective --recompute-modules moe
+    recompute_granularity: "selective"
+    recompute_modules: ["moe"]
+    tensor_model_parallel_size: 8       # matches --tensor-model-parallel-size 8
+    expert_tensor_parallel_size: 1      # matches --expert-tensor-parallel-size 1
+    expert_model_parallel_size: 32      # matches --expert-model-parallel-size 32
+    pipeline_model_parallel_size: 1     # matches --pipeline-model-parallel-size 1
+    context_parallel_size: 16           # matches --context-parallel-size 16
+    pipeline_dtype: ${policy.precision}
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    sequence_parallel: true
+    freeze_moe_router: false
+    moe_router_dtype: fp32              # matches --moe-router-dtype fp32
+    moe_router_load_balancing_type: "seq_aux_loss"  # matches --moe-router-load-balancing-type seq_aux_loss
+    moe_aux_loss_coeff: 1e-4            # matches --moe-aux-loss-coeff 1e-4
+    moe_router_bias_update_rate: 1e-3
+    moe_permute_fusion: True            # matches --moe-permute-fusion
+    apply_rope_fusion: True
+    bias_activation_fusion: False
+    defer_fp32_logits: False
+    moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"  # matches --moe-token-dispatcher-type alltoall
+    moe_shared_expert_overlap: False    # Super uses --moe-shared-expert-compute-before-router (not overlap)
+
+    # MTP (Multi-Token Prediction) - Super-specific
+    mtp_num_layers: 2                   # matches --mtp-num-layers 2
+    mtp_loss_scaling_factor: 0.3        # matches --mtp-loss-scaling-factor 0.3
+    mtp_use_repeated_layer: false       # Super V3 has 2 distinct MTP layers (not repeated)
+    mtp_detach_heads: false             # train MTP heads end-to-end (matches MLM)
+
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: None
+
+    optimizer:
+      optimizer: "adam"
+      lr: 1.0e-5                        # matches --lr 1e-5
+      min_lr: 2.0e-6                    # matches --min-lr 2e-6
+      weight_decay: 0.1                 # matches --weight-decay 0.1
+      bf16: true
+      fp16: false
+      params_dtype: "bfloat16"
+
+      # adam
+      adam_beta1: 0.9                   # matches --adam-beta1 0.9
+      adam_beta2: 0.95                  # matches --adam-beta2 0.95
+      adam_eps: 1e-8
+
+      # sgd
+      sgd_momentum: 0.9
+
+      # distributed optimizer
+      use_distributed_optimizer: true   # matches --use-distributed-optimizer
+      use_precision_aware_optimizer: false
+
+      clip_grad: ${policy.max_grad_norm}  # matches --clip-grad 1.0
+
+      # optimizer cpu offload
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"        # matches --lr-decay-style constant
+      lr_decay_iters: 15156             # LR_DECAY_SAMPLES(970000) / GBS(64) = 15156
+      lr_warmup_iters: 469              # LR_WARMUP_SAMPLES(30000) / GBS(64) = 469
+      lr_warmup_init: 0.0
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true         # matches --overlap-grad-reduce
+      overlap_param_gather: true        # matches --overlap-param-gather
+      data_parallel_sharding_strategy: "no_shard"
+      use_custom_fsdp: false
+
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  add_bos: false
+  add_eos: true
+  add_generation_prompt: true
+  shuffle: true
+  num_workers: 2
+
+  train:
+    dataset_name: "openai_format"
+    data_path: /mnt/data/final_shuffled_25pct_materialized_filtered.jsonl
+    chat_key: "messages"
+    system_key: null
+    system_prompt: null
+    tool_key: "tools"
+    use_preserving_dataset: false
+
+  validation:
+    dataset_name: "openai_format"
+    data_path: /mnt/data/final_shuffled_25pct_materialized_filtered.jsonl
+    chat_key: "messages"
+    system_key: null
+    system_prompt: null
+    tool_key: "tools"
+    use_preserving_dataset: false
+
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: "sft_processor"
+
+logger:
+  log_dir: "logs"
+  wandb_enabled: True
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "pthombre-nemotron-sft"
+    name: "superv3"
+  tensorboard:
+    log_dir: "tb_logs-sft-superv3"
+  mlflow:
+    experiment_name: "sft-superv3"
+    run_name: "sft-superv3"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 64

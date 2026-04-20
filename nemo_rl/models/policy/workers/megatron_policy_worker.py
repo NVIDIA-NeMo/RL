@@ -345,6 +345,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     self.model.zero_grad_buffer()
                     self.optimizer.zero_grad()
 
+                    # Set moe_grad_scale_func for MOE aux loss scaling.
+                    # With calculate_per_token_loss=True, the router pre-multiplies
+                    # aux_loss by num_local_tokens. Setting loss_scale = 1/global_valid_toks
+                    # makes the final MOE gradient correctly normalized:
+                    #   (1/G) * N_local * aux_grad -> after DDP SUM -> avg(aux_grad)
+                    moe_scale = 1.0 / global_valid_toks.clamp(min=1).float()
+                    self._set_moe_grad_scale_func(lambda: moe_scale)
+
                     # Set mtp_grad_scale_func for MTP loss scaling (scales by valid tokens)
                     mtp_scale = 1.0 / global_valid_toks.clamp(min=1).float()
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
@@ -364,6 +372,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         global_valid_toks=global_valid_toks,
                         straggler_timer=self.mcore_state.straggler_timer,
                     )
+
+                # Clear moe_grad_scale_func after the forward-backward pass
+                self._set_moe_grad_scale_func(None)
 
                 # Clear mtp_grad_scale_func after the forward-backward pass so
                 # it doesn't get serialized in the run_config.yaml when saving
@@ -945,6 +956,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
         return refit_param_info_hf
+
+    def _set_moe_grad_scale_func(self, func):
+        """Set moe_grad_scale_func on the model config for MOE aux loss scaling."""
+        config = self._get_model_config()
+        if config is not None:
+            config.moe_grad_scale_func = func
 
     def _set_mtp_grad_scale_func(self, func):
         """Set mtp_grad_scale_func on the model config for MTP loss scaling."""

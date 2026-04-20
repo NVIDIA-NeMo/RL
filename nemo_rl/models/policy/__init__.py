@@ -163,6 +163,10 @@ class MegatronConfig(TypedDict):
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
     activation_checkpointing: bool
+    recompute_granularity: NotRequired[str | None]  # "full" or "selective"
+    recompute_modules: NotRequired[list[str] | None]  # e.g. ["moe"], ["core_attn"]
+    recompute_method: NotRequired[str | None]  # "uniform" or "block" (full granularity only)
+    recompute_num_layers: NotRequired[int | None]  # full granularity only
     tensor_model_parallel_size: int
     pipeline_model_parallel_size: int
     num_layers_in_first_pipeline_stage: int | None

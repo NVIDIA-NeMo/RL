@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
 import os
 import time
 import warnings
@@ -251,6 +252,22 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
     hf_model_name = config["model_name"]
 
+    # --- DEBUG: Direct Megatron checkpoint override via env var ---
+    # Set NRL_MLM_CHECKPOINT_DIR to a Megatron checkpoint directory (containing iter_*)
+    # to bypass the HF cache and load directly from that checkpoint.
+    # hf_model_name (model_name) is still used for tokenizer / AutoConfig.
+    mlm_ckpt_dir = os.environ.get("NRL_MLM_CHECKPOINT_DIR")
+    if mlm_ckpt_dir and os.path.isdir(mlm_ckpt_dir):
+        iter_dirs = sorted(glob.glob(os.path.join(mlm_ckpt_dir, "iter_*")))
+        if iter_dirs:
+            print(
+                f"[DEBUG] NRL_MLM_CHECKPOINT_DIR={mlm_ckpt_dir}, "
+                f"iter={os.path.basename(iter_dirs[-1])}. "
+                f"Using as pretrained_path (hf_model_name={hf_model_name} for tokenizer)"
+            )
+            return hf_model_name, mlm_ckpt_dir, True
+    # --- END DEBUG ---
+
     # Check if the checkpoint already exists
     hf_model_subdir = hf_model_name
     if os.path.exists(hf_model_name):
@@ -273,10 +290,30 @@ def setup_model_config(
     weights_path: Optional[str] = None,
 ) -> tuple[ConfigContainer, Any]:
     """Handle all the model configuration logic."""
-    # Load pretrained run config
-    pretrained_run_config = os.path.join(
-        pretrained_path, "iter_0000000/run_config.yaml"
-    )
+    # Load pretrained run config — find the actual iter_* directory
+    iter_dirs = sorted(glob.glob(os.path.join(pretrained_path, "iter_*")))
+    if not iter_dirs:
+        raise FileNotFoundError(
+            f"No iter_* directory found in {pretrained_path} on rank={rank}."
+        )
+    iter_dir = iter_dirs[-1]  # Use latest iteration (e.g. iter_0000001 for MLM)
+
+    pretrained_run_config = os.path.join(iter_dir, "run_config.yaml")
+
+    # DEBUG: MLM checkpoints don't have run_config.yaml. Fall back to the
+    # RL HF-converted cache which has the same model architecture config.
+    if not os.path.exists(pretrained_run_config):
+        fallback = os.path.join(
+            get_megatron_checkpoint_dir(),
+            "model__mnt_superv3_pretrained",
+            "iter_0000000",
+            "run_config.yaml",
+        )
+        print(
+            f"[DEBUG] run_config.yaml not found at {pretrained_run_config}, "
+            f"falling back to {fallback}"
+        )
+        pretrained_run_config = fallback
 
     if not os.path.exists(pretrained_run_config):
         raise FileNotFoundError(
@@ -449,8 +486,19 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply performance optimization configuration."""
     model_cfg.parallel_output = True
 
-    # Activation checkpointing
-    if config["megatron_cfg"]["activation_checkpointing"]:
+    # Activation checkpointing / recompute
+    recompute_granularity = config["megatron_cfg"].get("recompute_granularity", None)
+    if recompute_granularity is not None:
+        model_cfg.recompute_granularity = recompute_granularity
+        if recompute_granularity == "selective":
+            model_cfg.recompute_method = None
+            model_cfg.recompute_num_layers = None
+            recompute_modules = config["megatron_cfg"].get("recompute_modules", ["core_attn"])
+            model_cfg.recompute_modules = recompute_modules
+        else:
+            model_cfg.recompute_method = config["megatron_cfg"].get("recompute_method", "uniform")
+            model_cfg.recompute_num_layers = config["megatron_cfg"].get("recompute_num_layers", 1)
+    elif config["megatron_cfg"]["activation_checkpointing"]:
         model_cfg.recompute_granularity = "full"
         model_cfg.recompute_method = "uniform"
         model_cfg.recompute_num_layers = 1
@@ -516,6 +564,9 @@ def _create_checkpoint_config(
     pretrained_path: str, weights_path: Optional[str]
 ) -> CheckpointConfig:
     """Create checkpoint configurations."""
+    fully_parallel_load = os.environ.get("NRL_DISABLE_FULLY_PARALLEL_LOAD", "") == ""
+    if not fully_parallel_load:
+        print("[OOM DEBUG] fully_parallel_load DISABLED via NRL_DISABLE_FULLY_PARALLEL_LOAD env var")
     return CheckpointConfig(
         save_interval=100,
         save=weights_path,
@@ -523,7 +574,7 @@ def _create_checkpoint_config(
         pretrained_checkpoint=pretrained_path,
         async_save=False,
         fully_parallel_save=True,
-        fully_parallel_load=True,
+        fully_parallel_load=fully_parallel_load,
         load_rng=False,
     )
 
@@ -543,14 +594,9 @@ def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
     model_cfg.calculate_per_token_loss = True
     model_cfg.perform_initialization = True
 
-    # MoE aux loss validation
-    assert (
-        "aux_loss" not in model_cfg.moe_router_load_balancing_type
-        or model_cfg.moe_aux_loss_coeff == 0
-    ), (
-        "MoE aux loss is currently not supported due to a known bug in Megatron-LM. "
-        "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
-    )
+    # MoE aux loss validation - disabled to support aux loss normalization in RL SFT.
+    # The grad scaling is handled via moe_grad_scale_func in megatron_policy_worker.py.
+    # See https://github.com/NVIDIA/Megatron-LM/issues/1984 for the original issue.
 
 
 def _validate_dtype_config(
@@ -675,6 +721,12 @@ def setup_model_and_optimizer(
     )
     torch.distributed.barrier()
 
+    # === P0: Memory after initialize_megatron (process groups + CP mesh) ===
+    if torch.distributed.get_rank() == 0:
+        _alloc = torch.cuda.memory_allocated() / (1024**3)
+        _resv = torch.cuda.memory_reserved() / (1024**3)
+        print(f"[MEM PROBE P0] after initialize_megatron: allocated={_alloc:.2f} GB, reserved={_resv:.2f} GB")
+
     # Context used for persisting some state between checkpoint saves.
     checkpointing_context = init_checkpointing_context(megatron_cfg.checkpoint)
 
@@ -762,7 +814,42 @@ def setup_model_and_optimizer(
         mixed_precision_wrapper=mixed_precision_wrapper,
         pg_collection=pg_collection,
     )
-    if load_optimizer:
+    # === P2: Memory after get_model (model params + DDP grad buffers on GPU) ===
+    if torch.distributed.get_rank() == 0:
+        _alloc = torch.cuda.memory_allocated() / (1024**3)
+        _resv = torch.cuda.memory_reserved() / (1024**3)
+        _max = torch.cuda.max_memory_allocated() / (1024**3)
+        print(f"[MEM PROBE P2] after get_model+DDP: allocated={_alloc:.2f} GB, reserved={_resv:.2f} GB, max_allocated={_max:.2f} GB")
+
+    # Determine checkpoint loading strategy BEFORE creating optimizer to avoid
+    # OOM on memory-tight configs (e.g. Super V3 MoE with EP=32, TP=8, CP=16).
+    # For fine-tuning from a pretrained checkpoint, optimizer state is never
+    # loaded from the checkpoint anyway (Megatron sets finetune=True internally),
+    # so we can defer optimizer creation until after the checkpoint is loaded.
+    if megatron_cfg.peft is not None:
+        should_load_checkpoint = (
+            megatron_cfg.checkpoint.load is not None
+            and checkpoint_exists(megatron_cfg.checkpoint.load)
+        )
+        is_finetune_from_pretrained = False
+    else:
+        load_ckpt_exists = (
+            megatron_cfg.checkpoint.load is not None
+            and checkpoint_exists(megatron_cfg.checkpoint.load)
+        )
+        pretrained_ckpt_exists = (
+            megatron_cfg.checkpoint.pretrained_checkpoint is not None
+            and checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
+        )
+        should_load_checkpoint = load_ckpt_exists or pretrained_ckpt_exists
+        is_finetune_from_pretrained = pretrained_ckpt_exists and not load_ckpt_exists
+
+    defer_optimizer = load_optimizer and is_finetune_from_pretrained
+    print(f"[OOM DEBUG] load_optimizer={load_optimizer}, is_finetune_from_pretrained={is_finetune_from_pretrained}, defer_optimizer={defer_optimizer}")
+    print(f"[OOM DEBUG] checkpoint.load={megatron_cfg.checkpoint.load}, checkpoint.pretrained_checkpoint={megatron_cfg.checkpoint.pretrained_checkpoint}")
+    print(f"[OOM DEBUG] should_load_checkpoint={should_load_checkpoint}")
+
+    if load_optimizer and not defer_optimizer:
         optimizer, scheduler = setup_optimizer(
             optimizer_config=megatron_cfg.optimizer,
             scheduler_config=megatron_cfg.scheduler,
@@ -776,23 +863,16 @@ def setup_model_and_optimizer(
     print("Model, optimizer, and learning rate scheduler built")
     torch.distributed.barrier()
 
-    if megatron_cfg.peft is not None:
-        should_load_checkpoint = (
-            megatron_cfg.checkpoint.load is not None
-            and checkpoint_exists(megatron_cfg.checkpoint.load)
-        )
-        if should_load_checkpoint:
-            # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
-            # This is switched off here in order to load these states from the checkpoint
-            megatron_cfg.checkpoint.finetune = False
-    else:
-        should_load_checkpoint = (
-            megatron_cfg.checkpoint.load is not None
-            and checkpoint_exists(megatron_cfg.checkpoint.load)
-        ) or (
-            megatron_cfg.checkpoint.pretrained_checkpoint is not None
-            and checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
-        )
+    if megatron_cfg.peft is not None and should_load_checkpoint:
+        megatron_cfg.checkpoint.finetune = False
+
+    # === P3: Memory right before load_checkpoint ===
+    if torch.distributed.get_rank() == 0:
+        torch.cuda.empty_cache()
+        _alloc = torch.cuda.memory_allocated() / (1024**3)
+        _resv = torch.cuda.memory_reserved() / (1024**3)
+        _free = (torch.cuda.get_device_properties(0).total_memory / (1024**3)) - _resv
+        print(f"[MEM PROBE P3] before load_checkpoint: allocated={_alloc:.2f} GB, reserved={_resv:.2f} GB, free_on_device={_free:.2f} GB")
 
     # Load checkpoint if applicable
     if should_load_checkpoint:
@@ -806,6 +886,18 @@ def setup_model_and_optimizer(
         )
         print("Checkpoint loaded")
     torch.distributed.barrier()
+
+    # Create optimizer AFTER checkpoint loading if deferred for memory optimization
+    if defer_optimizer:
+        torch.cuda.empty_cache()
+        optimizer, scheduler = setup_optimizer(
+            optimizer_config=megatron_cfg.optimizer,
+            scheduler_config=megatron_cfg.scheduler,
+            model=model,
+            use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
+        )
+        print("Optimizer created after checkpoint loading (deferred for memory)")
+        torch.distributed.barrier()
 
     # Set the param sync function for the model
     param_sync_func = None
