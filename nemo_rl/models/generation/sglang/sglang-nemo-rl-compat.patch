@@ -8,7 +8,7 @@
 #
 # 1. SafeUnpickler.ALLOWED_MODULE_PREFIXES
 #    NeMo-RL monkey-patches torch CUDA reductions with helpers that live in
-#    nemo_rl.models.policy.redesign_utils (_reduce_tensor_modified /
+#    nemo_rl.models.policy.torch_reductions_utils (_reduce_tensor_modified /
 #    _rebuild_cuda_tensor_modified -- they translate device index <-> GPU UUID
 #    so IPC handles survive mismatched CUDA_VISIBLE_DEVICES between trainer
 #    and SGLang worker). ForkingPickler emits that module path in the pickle
@@ -30,7 +30,7 @@ diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.
          "sglang.srt.layers.",
          "sglang.srt.utils.",
          "torch_npu.",
-+        "nemo_rl.models.policy.redesign_utils.",
++        "nemo_rl.models.policy.torch_reductions_utils.",
      }
  
      DENY_CLASSES = {

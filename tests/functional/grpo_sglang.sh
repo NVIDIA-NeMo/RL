@@ -20,7 +20,7 @@ mkdir -p $EXP_DIR $LOG_DIR
 cd $PROJECT_ROOT
 uv run --group test coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo.py \
-    --config $PROJECT_ROOT/examples/configs/grpo_math_1B_sglang.yaml \
+    --config $PROJECT_ROOT/examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-1n2g-fsdp2tp1-sglang.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \

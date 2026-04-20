@@ -781,6 +781,12 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy preparation: {e}")
             return False
 
+    def pause_generation(self) -> None:
+        pass
+
+    def continue_generation(self) -> None:
+        pass
+
     def shutdown(self) -> bool:
         """Shut down all vLLM workers and clean up resources."""
         try:

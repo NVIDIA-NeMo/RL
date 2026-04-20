@@ -514,7 +514,7 @@ def stream_weights_via_http_impl(
     import ray
     from torch.distributed.tensor import DTensor, Replicate
 
-    from nemo_rl.models.policy.redesign_utils import (
+    from nemo_rl.models.policy.torch_reductions_utils import (
         FlattenedTensorBucket,
         MultiprocessingSerializer,
         monkey_patch_torch_reductions,

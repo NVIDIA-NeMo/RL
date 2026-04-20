@@ -4,7 +4,7 @@ import logging
 
 import httpx
 
-from nemo_rl.models.generation.redesign.config import SGLangConfig
+from nemo_rl.models.generation.sglang.config import SGLangConfig
 
 logger = logging.getLogger(__name__)
 

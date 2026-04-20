@@ -123,20 +123,7 @@ EXCLUDED_UNIT_TESTS=(
     --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_hf_training_colocated[False-False-bfloat16-True]
     --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_hf_training_colocated[True-False-bfloat16-True]
 
-    # test_sglang_generation.py — keep 2 key tests
-    # Kept: test_sglang_policy_generation (basic generation correctness),
-    #        test_sglang_generation_with_hf_training_colocated (generation + HF training A+B)
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_missing_required_config_key
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_top_p_top_k_validation
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_worker_seed_behavior
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_policy_tensor_parallel
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_generate_text
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_http_server
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_non_divisible_batch_handling
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_generation_with_hf_training_non_colocated
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_weight_update_and_prefix_cache_reset
-
-    # test_vllm_utils.py — exclude only the @vllm-marked test (rest are cheap)
+# test_vllm_utils.py — exclude only the @vllm-marked test (rest are cheap)
     --deselect=tests/unit/models/generation/test_vllm_utils.py::test_vllm_speculative_decoding_patch_still_needed
 
     # test_vllm_logprobs_mode.py — keep test_processed_logprobs_matches_manual_computation (66s, critical)
