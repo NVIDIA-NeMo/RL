@@ -30,7 +30,7 @@ uv run examples/run_sft.py \
     policy.megatron_cfg.optimizer.use_distributed_optimizer=false
 ```
 
-For a full list of Muon-related arguments and a description of each, please refer to the [Megatron documentation](https://github.com/terrykong/Megatron-LM/blob/25a62edf77b5130f888328ca8119d6a76117cf23/megatron/core/optimizer/optimizer_config.py#L128-L150). 
+For a full list of Muon-related arguments and a description of each, please refer to the [Megatron documentation](https://github.com/NVIDIA/Megatron-LM/blob/7928a84e86a79a783d70968660e067d2ab492f23/megatron/core/optimizer/optimizer_config.py#L259-L290). 
 
 _NOTE_: precision_aware_optimizer and distributed_optimizer are not supported with Muon and should be disabled.
 
@@ -111,13 +111,12 @@ uv run examples/run_sft.py \
   policy.model_name=Qwen/Qwen3-235B-A22B \
   policy.tokenizer.name=Qwen/Qwen3-235B-A22B \
   checkpointing.enabled=True \
-  cluster.num_nodes=16 \
   policy.megatron_cfg.num_layers_in_first_pipeline_stage=11 \
   policy.megatron_cfg.num_layers_in_last_pipeline_stage=11
 ```
 
 
-Here is a comparison of Muon vs Adam for DAPO with Qwen3.5-7B:
+Here is a comparison of Muon vs Adam for DAPO with Qwen2.5-7B:
 
 <p align="center">
 <img src="../assets/muon-dapo-reward.png" alt="Muon vs Adam DAPO Train Reward" height="300">
