@@ -5,5 +5,8 @@ logger:
   log_dir: logs/grpo-deepseek-v3-64n8g
   wandb:
     name: grpo-deepseek-v3-64n8g
+policy:
+  megatron_cfg:
+    expert_model_parallel_size: 32
 cluster:
   num_nodes: 64
