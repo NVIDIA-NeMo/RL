@@ -23,15 +23,15 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
-from nemo_rl.models.generation.sglang.async_utils import run
 from nemo_rl.models.generation.sglang.config import SGLangConfig
-from nemo_rl.models.generation.sglang.http_utils import (
+from nemo_rl.models.generation.sglang.utils.async_utils import AsyncLoopThread
+from nemo_rl.models.generation.sglang.utils.http_utils import (
     init_http_client,
     post,
 )
 from nemo_rl.distributed.ray_actor_environment_registry import SGLANG_EXECUTABLE
-from nemo_rl.models.generation.sglang.misc import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
-from nemo_rl.models.generation.sglang.ray_utils import Lock
+from nemo_rl.models.generation.sglang.utils.misc import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+from nemo_rl.models.generation.sglang.utils.ray_utils import Lock
 from nemo_rl.models.generation.sglang.sglang_router import RouterActor
 from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 from nemo_rl.models.generation.sglang.fault_tolerance import RolloutHealthMonitor
@@ -50,6 +50,9 @@ class SGLangGeneration(GenerationInterface):
     the router subprocess, and every ``SGLangGenerationWorker`` Ray actor.
     The former ``ServerGroup`` dataclass has been folded in so there is a
     single source of truth for engine state.
+
+    TODO: one sglang router(router ip, router port) --> different server group(eg: PD, different tp size, ...; each server group multiple engines/servsers with same settings)
+    router + [[p, ..., p] [d, ..., d]] or router + [[tp = 2, ... tp = 2], ..., [tp = 8, ..., tp = 8]]
     """
 
     def __init__(self, cluster: RayVirtualCluster, cluster_cfg: ClusterConfig, sglang_cfg: SGLangConfig):
@@ -57,6 +60,7 @@ class SGLangGeneration(GenerationInterface):
         self.cluster_cfg = cluster_cfg
         self.sglang_cfg = sglang_cfg
         self._health_monitor = None
+        self._async_loop: AsyncLoopThread | None = AsyncLoopThread()
 
         pgs = cluster._init_placement_groups(
             strategy="PACK",
@@ -398,6 +402,14 @@ class SGLangGeneration(GenerationInterface):
                 ok = False
             self._router_actor = None
 
+        if self._async_loop is not None:
+            try:
+                self._async_loop.close()
+            except Exception as e:
+                logger.warning(f"AsyncLoopThread close failed: {e}")
+                ok = False
+            self._async_loop = None
+
         return ok
 
     def __del__(self) -> None:
@@ -586,7 +598,7 @@ class SGLangGeneration(GenerationInterface):
             }
 
         router_results: dict[int, tuple[list[int], list[float], bool]] = (
-            run(_dispatch_all()) if sample_requests else {}
+            self._async_loop.run(_dispatch_all()) if sample_requests else {}
         )
 
         # Process the outputs - preserve the original input padding structure.

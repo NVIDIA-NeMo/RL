@@ -22,8 +22,8 @@ import os
 
 import ray
 
-from nemo_rl.models.generation.sglang.misc import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
-from nemo_rl.models.generation.sglang.ray_utils import (
+from nemo_rl.models.generation.sglang.utils.misc import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+from nemo_rl.models.generation.sglang.utils.ray_utils import (
     find_available_port,
     get_host_info,
 )
