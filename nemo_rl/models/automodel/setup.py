@@ -700,6 +700,23 @@ def setup_model_and_optimizer(
         if rank == 0:
             print("Froze visual encoder parameters for text-only training")
 
+    # For NemotronOmni (and similar VLMs with custom vision_model/sound_encoder
+    # attribute names), freeze the vision/audio towers during RL. Reasons:
+    # (1) the pretrained vision encoder is already good from SFT and doesn't need
+    # further RL updates; (2) backprop through vision_model under FSDP2 has hit
+    # CUDA illegal memory access in our runs, likely due to the forced
+    # eval()/train() toggle inside extract_feature interacting with sharded
+    # parameter all_gather. Freezing sidesteps that path entirely.
+    frozen_attrs = []
+    for attr in ("vision_model", "vision_projector", "sound_encoder", "sound_projection"):
+        mod = getattr(model, attr, None) or getattr(getattr(model, "model", None), attr, None)
+        if mod is not None:
+            for param in mod.parameters():
+                param.requires_grad_(False)
+            frozen_attrs.append(attr)
+    if frozen_attrs and rank == 0:
+        print(f"Froze VLM vision/audio towers: {frozen_attrs}")
+
     # CPU offload if needed
     if cpu_offload:
         # Move buffers to CPU for FSDP modules

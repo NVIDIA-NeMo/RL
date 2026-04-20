@@ -7,7 +7,7 @@ grpo:
   num_prompts_per_step: 128
   num_generations_per_prompt: 16
   overlong_filtering: true
-  val_at_start: true
+  val_at_start: false
   val_period: 10
   max_val_samples: 256
   val_batch_size: 256
@@ -15,6 +15,7 @@ grpo:
   reward_shaping:
     overlong_buffer_length: 512
 
+# below are the differences for importance sampling clever setting
 loss_fn:
   reference_policy_kl_penalty: 0.0
   ratio_clip_min: 0.2
@@ -34,8 +35,8 @@ policy:
   train_global_batch_size: 512
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  logprob_chunk_size: 128
-  max_total_sequence_length: 16384
+  logprob_chunk_size: 128 # V2 worker no effect
+  max_total_sequence_length: 10000
   dynamic_batching:
     enabled: false
   sequence_packing:
@@ -58,7 +59,7 @@ policy:
     - milestones: [10]
   dtensor_cfg:
     expert_parallel_size: 8
-    activation_checkpointing: false
+    activation_checkpointing: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
     automodel_kwargs:
@@ -72,14 +73,14 @@ policy:
         rope_fusion: false
         enable_hf_state_dict_adapter: true
   generation:
-    max_new_tokens: 5000
+    max_new_tokens: 8000
     bad_words: ["<image>", "<img>", "</img>", "<so_embedding>", "<so_start>", "<so_end>"]
     vllm_cfg:
       skip_tokenizer_init: false
       tensor_parallel_size: 8
       enforce_eager: true
       max_model_len: ${policy.max_total_sequence_length}
-      gpu_memory_utilization: 0.7
+      gpu_memory_utilization: 0.3
     vllm_kwargs:
       limit_mm_per_prompt: {"image": 2}
       max_num_batched_tokens: 16384
