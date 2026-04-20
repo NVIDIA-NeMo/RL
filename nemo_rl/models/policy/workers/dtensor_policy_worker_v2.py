@@ -241,6 +241,28 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         # Initialize checkpoint manager
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
 
+        # Force pad_token_id=None during HF model construction.
+        #
+        # Why: HF's `_init_weights(nn.Embedding)` zeros the padding row via
+        #      `init.zeros_(module.weight[module.padding_idx])`. Under DTensor
+        #      (torch>=2.10), this indexing op triggers a redistribute whose
+        #      shard_order metadata is None, hitting an assertion in
+        #      `torch.distributed.tensor._redistribute._gen_transform_infos_non_cached`.
+        #      This blocks Llama/Mistral/Phi-4/etc. (any model whose HF config
+        #      has pad_token_id set) from loading at all under `_v2=true`.
+        #
+        # What: inject `pad_token_id: None` into hf_config_overrides so
+        #       from_pretrained builds the embedding with padding_idx=None,
+        #       which makes _init_weights skip the zeros_ call entirely.
+        #       `setup_model_and_optimizer` later restores model.config.pad_token_id
+        #       from the tokenizer (automodel/setup.py), so runtime behavior is
+        #       unaffected (padding is masked via token_loss_mask, not via a
+        #       pre-zeroed embedding row).
+        hf_cfg_overrides = dict(config.get("hf_config_overrides") or {})
+        if "pad_token_id" not in hf_cfg_overrides:
+            hf_cfg_overrides["pad_token_id"] = None
+            config["hf_config_overrides"] = hf_cfg_overrides
+
         # Validate configuration and prepare runtime settings
         runtime_config = validate_and_prepare_config(
             config=config,
@@ -718,6 +740,17 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         timer: Optional[Any] = None,  # noqa: ARG002
     ) -> dict[str, Any]:
         """Student-side off-policy distillation training step."""
+        # Off-policy flow calls ``offload_after_refit()`` to free GPU memory
+        # for teacher inference; that helper unconditionally moves the optimizer
+        # to CPU, but ``prepare_for_training()`` only moves it back when
+        # ``offload_optimizer_for_logprob`` or ``is_generation_colocated`` is
+        # set. If neither is, Adam's state stays on CPU while param/grad are
+        # CUDA, crashing ``exp_avg.lerp_(grad)`` on the first ``step()``.
+        # Bring the optimizer back on every student call; no-op if already
+        # on CUDA.
+        if not eval_mode and self.optimizer is not None and not self.cpu_offload:
+            self.move_optimizer_to_device("cuda")
+
         if loss_fn is None:
             loss_fn = getattr(self, "_cached_loss_fn", None)
         if gbs is None:

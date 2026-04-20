@@ -1668,8 +1668,27 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             self.exact_match_only,
         )
         if total_chunks == 0:
-            zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
-            return zero_loss, {"loss": 0.0, "topk_accuracy": 0.0, "num_chunks": 0}
+            # Zero loss that is still connected to student_logits via the
+            # autograd graph. If we returned an unconnected
+            # ``torch.tensor(0.0, requires_grad=True)`` instead, the
+            # subsequent ``backward()`` on this rank would NOT trigger any
+            # DDP all-reduce, while peer ranks with non-zero chunks still
+            # do — causing a cross-rank collective mismatch and an NCCL
+            # hang on the very next synchronization.
+            zero_loss = (student_logits.to(torch.float32) * 0.0).sum()
+            # Match the shape of the success-path metrics so downstream
+            # microbatch aggregation (which indexes ``loss_metrics[...]``
+            # without a default) doesn't KeyError. ``num_valid_samples=0``
+            # tells the worker to skip this microbatch in its logging loop.
+            return zero_loss, {
+                "loss": 0.0,
+                "kl_loss": 0.0,
+                "ce_loss": 0.0,
+                "topk_accuracy": 0.0,
+                "num_valid_samples": 0,
+                "num_chunks": 0,
+                "alignment_density": 0.0,
+            }
 
         # --- 3. core KL: gold-loss vs. projection path ---
         if self.use_gold_loss:
