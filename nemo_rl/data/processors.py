@@ -686,6 +686,73 @@ def multichoice_qa_processor(
     return output
 
 
+def arrow_text_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+    add_bos: bool = True,
+    add_eos: bool = False,
+    add_generation_prompt: bool = False,
+) -> DatumSpec:
+    """Continued-pretraining-style processor for raw-text corpora.
+
+    Tokenizes the assistant message body **directly** without applying the
+    chat template, optionally prepending BOS and/or appending EOS, and marks
+    every token as a loss target. This mirrors the raw-text path in the
+    original off-policy distillation reference (`ruit/xtoken/off-policy-distillation-gh`)
+    and is the right choice for plain web-text / document corpora wrapped by
+    :class:`ArrowTextDataset`.
+
+    ``add_generation_prompt`` is accepted for API symmetry with
+    :func:`sft_processor` but unused (no chat template is applied).
+    """
+    del task_data_spec, add_generation_prompt  # not used for raw-text training
+
+    text = datum_dict["messages"][0]["content"]
+    if (
+        add_bos
+        and tokenizer.bos_token is not None
+        and not text.startswith(tokenizer.bos_token)
+    ):
+        text = tokenizer.bos_token + text
+    if (
+        add_eos
+        and tokenizer.eos_token is not None
+        and not text.endswith(tokenizer.eos_token)
+    ):
+        text = text + tokenizer.eos_token
+
+    token_ids = tokenizer(
+        text,
+        return_tensors="pt",
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_seq_length,
+    )["input_ids"][0]
+
+    token_loss_mask = torch.ones_like(token_ids)
+    length = int(token_ids.numel())
+
+    message_log: LLMMessageLogType = [
+        {
+            "role": "assistant",
+            "content": text[:500] + ("..." if len(text) > 500 else ""),
+            "token_ids": token_ids,
+            "token_loss_mask": token_loss_mask,
+        }
+    ]
+    return {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": {},
+        "loss_multiplier": 1.0,
+        "idx": idx,
+        "task_name": datum_dict.get("task_name", "arrow_text"),
+    }
+
+
 def nemo_gym_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -717,6 +784,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
     Dict[str, TaskDataProcessFnCallable],
     {
         "default": math_hf_data_processor,
+        "arrow_text_processor": arrow_text_processor,
         "helpsteer3_data_processor": helpsteer3_data_processor,
         "math_data_processor": math_data_processor,
         "math_hf_data_processor": math_hf_data_processor,
