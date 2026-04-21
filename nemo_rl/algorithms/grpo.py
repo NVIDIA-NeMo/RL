@@ -17,7 +17,10 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import field
+
+from pydantic import ConfigDict
+from pydantic.dataclasses import dataclass
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -218,7 +221,10 @@ class MasterConfig(TypedDict):
 # See docs/design-docs/dataclass-config-defaults.md for rationale.
 
 
-@dataclass
+_EXTRA_IGNORE = ConfigDict(extra="ignore")
+
+
+@dataclass(config=_EXTRA_IGNORE)
 class RewardScalingConfigDefaults:
     """Defaults for RewardScalingConfig (disabled by default)."""
 
@@ -229,14 +235,14 @@ class RewardScalingConfigDefaults:
     target_max: float = 1.0
 
 
-@dataclass
+@dataclass(config=_EXTRA_IGNORE)
 class RewardShapingConfigDefaults:
     """Defaults for RewardShapingConfig (disabled by default)."""
 
     enabled: bool = False
 
 
-@dataclass
+@dataclass(config=_EXTRA_IGNORE)
 class AsyncGRPOConfigDefaults:
     """Defaults for AsyncGRPOConfig (disabled by default)."""
 
@@ -245,7 +251,7 @@ class AsyncGRPOConfigDefaults:
     recompute_kv_cache_after_weight_updates: bool = False
 
 
-@dataclass
+@dataclass(config=_EXTRA_IGNORE)
 class GRPOConfigDefaults:
     """Defaults for GRPOConfig.
 
@@ -275,7 +281,7 @@ class GRPOConfigDefaults:
     async_grpo: AsyncGRPOConfigDefaults = field(default_factory=AsyncGRPOConfigDefaults)
 
 
-@dataclass
+@dataclass(config=_EXTRA_IGNORE)
 class ClippedPGLossConfigDefaults:
     """Defaults for ClippedPGLossConfig (NotRequired fields only)."""
 
@@ -287,7 +293,7 @@ class ClippedPGLossConfigDefaults:
     use_kl_in_reward: bool = False
 
 
-@dataclass
+@dataclass(config=_EXTRA_IGNORE)
 class GRPOMasterConfigDefaults:
     """Top-level defaults for GRPO's MasterConfig."""
 

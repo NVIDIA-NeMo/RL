@@ -46,21 +46,21 @@ All values must exist in the YAML file (or its `defaults:` parent chain). The ex
 
 ### Principle
 
-**Dataclass defines defaults; YAML and CLI can override; runtime stays dict.**
+**Dataclass defines defaults and types; YAML and CLI can override; runtime stays dict.**
 
 ```
 Priority (highest → lowest):
   CLI overrides  >  YAML values  >  dataclass defaults
 ```
 
-The dataclass is never instantiated as a runtime config object. It is only used to generate a defaults dict, which fills in missing keys after YAML loading.
+The dataclass is instantiated by pydantic during validation to check types and fill defaults, then converted back to a plain dict. It is never kept as a runtime config object.
 
 ### Architecture
 
-For each TypedDict config class, an **optional** companion dataclass defines default values:
+For each TypedDict config class, an **optional** companion pydantic dataclass defines default values and types:
 
 ```python
-# TypedDict stays — used for type checking
+# TypedDict stays — used for static type checking
 class GRPOConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
@@ -69,8 +69,11 @@ class GRPOConfig(TypedDict):
     overlong_filtering: NotRequired[bool]
     calculate_advantages_on_gpu: NotRequired[bool]
 
-# Dataclass added — used for default values
-@dataclass
+# Pydantic dataclass added — used for runtime validation + default values
+from pydantic import ConfigDict
+from pydantic.dataclasses import dataclass
+
+@dataclass(config=ConfigDict(extra='ignore'))
 class GRPOConfigDefaults:
     # Required fields are simply omitted — they must come from YAML.
     # Only fields with sensible defaults are listed here.
@@ -80,7 +83,7 @@ class GRPOConfigDefaults:
     calculate_advantages_on_gpu: bool = False
 ```
 
-> **Note:** Required fields (e.g. `num_prompts_per_step`) are omitted from the dataclass entirely. `apply_config_defaults` skips fields with no default, so they must be provided by YAML. This preserves the current requirement that essential parameters are explicitly configured.
+> **Note:** Required fields (e.g. `num_prompts_per_step`) are omitted from the dataclass entirely — they are passed through as extra keys (preserved by `_merge_extras_back`). `extra='ignore'` tells pydantic to silently skip unknown fields during validation rather than rejecting them, and `_merge_extras_back` restores them in the output.
 
 ### Injection Point
 
@@ -94,8 +97,8 @@ if overrides:
     config = parse_hydra_overrides(config, overrides)
 config: MasterConfig = OmegaConf.to_container(config, resolve=True)
 
-# NEW: fill missing keys from dataclass defaults
-config = apply_config_defaults(config, GRPOMasterConfigDefaults)
+# NEW: validate types + fill missing keys from dataclass defaults
+config = validate_config(config, GRPOMasterConfigDefaults)
 ```
 
 The updated pipeline becomes:
@@ -106,78 +109,69 @@ YAML file
   → load_config_with_inheritance()
   → parse_hydra_overrides()
   → OmegaConf.to_container(resolve=True)
-  → apply_config_defaults()              ← NEW STEP
+  → validate_config()                    ← NEW STEP (validate + fill defaults)
   → algorithm entry point
 ```
 
-### Core Utility: `apply_config_defaults`
+### Core Utility: `validate_config` ("left join")
 
-Added to `nemo_rl/utils/config.py`:
+Added to `nemo_rl/utils/config.py`. Implements the "left join" pattern from #2102:
 
 ```python
 import dataclasses
-from typing import Any, get_type_hints
+from typing import Any
+
+from pydantic import TypeAdapter
 
 
-def apply_config_defaults(config: dict[str, Any], defaults_cls: type) -> dict[str, Any]:
-    """Recursively fill missing config keys from a dataclass's default values.
+def _merge_extras_back(validated: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
+    """Merge extra keys from user (not in the schema) back into validated.
 
-    Only keys that are absent from ``config`` are filled.  Existing keys
-    (including ``None`` and ``False``) are never overwritten.  This ensures
-    that YAML and CLI values always take precedence over dataclass defaults.
-
-    Args:
-        config: The loaded config dict (already resolved).
-        defaults_cls: A dataclass class whose fields define defaults.
-
-    Returns:
-        The same config dict, mutated in place, with missing keys filled.
+    Pydantic with extra='ignore' drops unknown keys during validation.
+    This function restores them for backward compatibility.
     """
-    if not dataclasses.is_dataclass(defaults_cls):
-        return config
+    result = validated.copy()
+    for k, v in user.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _merge_extras_back(result[k], v)
+        elif k not in result:
+            result[k] = v
+    return result
 
-    hints = get_type_hints(defaults_cls)
 
-    for f in dataclasses.fields(defaults_cls):
-        # Determine the concrete default for this field.
-        if f.default is not dataclasses.MISSING:
-            default = f.default
-        elif f.default_factory is not dataclasses.MISSING:
-            default = f.default_factory()
-        else:
-            # No default — field is required and must come from YAML.
-            continue
+def validate_config(user_config: dict[str, Any], schema: type) -> dict[str, Any]:
+    """Validate user_config against a pydantic dataclass schema and fill defaults.
 
-        if f.name not in config:
-            if dataclasses.is_dataclass(default):
-                # Nested defaults: create an empty dict and fill recursively.
-                config[f.name] = {}
-                apply_config_defaults(config[f.name], type(default))
-            else:
-                config[f.name] = default
-        elif isinstance(config[f.name], dict):
-            # Recurse into nested dataclass defaults.
-            nested_type = hints.get(f.name)
-            if nested_type is not None and dataclasses.is_dataclass(nested_type):
-                apply_config_defaults(config[f.name], nested_type)
+    1. TypeAdapter validates types of known fields (raises ValidationError on mismatch)
+    2. dataclasses.asdict() produces a dict with all defaults filled
+    3. _merge_extras_back() restores unknown keys dropped by extra='ignore'
 
-    return config
+    Priority: CLI overrides > YAML values > dataclass defaults.
+    Unknown keys are always preserved.
+    """
+    ta = TypeAdapter(schema)
+    validated = ta.validate_python(user_config)
+    validated_dict = dataclasses.asdict(validated)
+    return _merge_extras_back(validated_dict, user_config)
 ```
+
+The previous `apply_config_defaults` is kept as a deprecated alias for backward compatibility.
 
 ### Nested Config Handling
 
 MasterConfig contains nested sub-configs. The defaults dataclass mirrors this nesting:
 
 ```python
-@dataclass
+@dataclass(config=ConfigDict(extra='ignore'))
 class GRPOMasterConfigDefaults:
     """Top-level defaults for GRPO's MasterConfig."""
     grpo: GRPOConfigDefaults = field(default_factory=GRPOConfigDefaults)
     loss_fn: ClippedPGLossConfigDefaults = field(default_factory=ClippedPGLossConfigDefaults)
-    # Sections without a defaults dataclass are skipped
+    # Sections without a defaults dataclass (e.g. policy, data) are
+    # passed through as extra keys and preserved by _merge_extras_back.
 ```
 
-`apply_config_defaults` recurses into nested dicts when the corresponding field type is a dataclass.
+Pydantic natively handles nested dataclass validation and recursion.
 
 ### Enabled/Disabled Variant Pattern
 
@@ -197,7 +191,7 @@ class LoRAConfig(TypedDict):
 For these, the defaults dataclass provides only the disabled variant as default:
 
 ```python
-@dataclass
+@dataclass(config=ConfigDict(extra='ignore'))
 class LoRACfgDefaults:
     enabled: bool = False
 ```
@@ -220,10 +214,11 @@ When `enabled: true` is set in YAML, the user must provide all required sub-fiel
 
 | Aspect | Before | After |
 |--------|--------|-------|
-| Where defaults are defined | Only in exemplar YAML | Exemplar YAML + dataclass (dataclass is authoritative for code) |
+| Where defaults are defined | Only in exemplar YAML | Exemplar YAML + pydantic dataclass (dataclass is authoritative for code) |
 | New field added to TypedDict | Must update exemplar YAML + all non-inheriting recipes | Add default in dataclass; YAML updates optional |
 | NotRequired field access | `.get("key")` returns None if absent | Field auto-filled by dataclass default; direct `["key"]` access safe |
-| Convention doc (`config-conventions`) | "YAML is the single source of truth" | "YAML takes precedence; dataclass provides fallback defaults" |
+| Type validation | None at config load time | pydantic validates types of known fields at load time |
+| Convention doc (`config-conventions`) | "YAML is the single source of truth" | "YAML takes precedence; dataclass provides fallback defaults with type validation" |
 
 ## Consistency Tests
 
@@ -334,9 +329,9 @@ Adding a new field `calculate_advantages_on_gpu` to GRPO requires:
        calculate_advantages_on_gpu: NotRequired[bool]
    ```
 
-2. Add to defaults dataclass (with default value):
+2. Add to defaults dataclass (with default value and type validation):
    ```python
-   @dataclass
+   @dataclass(config=ConfigDict(extra='ignore'))
    class GRPOConfigDefaults:
        ...
        calculate_advantages_on_gpu: bool = False
@@ -358,7 +353,7 @@ The principle evolves to: **YAML values always take precedence; dataclass provid
 
 ### Q: Why not fully replace TypedDict with dataclass?
 
-As discussed in [#1675](https://github.com/NVIDIA-NeMo/RL/issues/1675), TypedDict/dict tolerates extra keys — important for user forks that add custom config fields and for loading older YAML files with deprecated keys. Dataclass construction rejects unknown fields. The dual approach keeps dict flexibility while gaining centralized defaults.
+As discussed in [#1675](https://github.com/NVIDIA-NeMo/RL/issues/1675), TypedDict/dict tolerates extra keys — important for user forks that add custom config fields and for loading older YAML files with deprecated keys. Pydantic dataclasses with `ConfigDict(extra='ignore')` skip unknown fields during validation, and `_merge_extras_back` restores them afterward — achieving the best of both worlds: type validation for known fields, tolerance for unknown fields.
 
 ### Q: Do exemplar YAMLs become redundant?
 
