@@ -4,7 +4,7 @@
 defaults: "../../examples/configs/vlm_grpo_3B.yaml"
 
 grpo:
-  num_prompts_per_step: 128
+  num_prompts_per_step: 32
   num_generations_per_prompt: 16
   overlong_filtering: true
   val_at_start: false
@@ -32,7 +32,7 @@ checkpointing:
 
 policy:
   model_name: /lustre/fs1/portfolios/coreai/users/aroshanghias/checkpoints/mpo-nanov3omni-mmpr-nanov2-filtered-conv3d-0303/step_400
-  train_global_batch_size: 512
+  train_global_batch_size: 32
   train_micro_batch_size: 1
   logprob_batch_size: 1
   logprob_chunk_size: 128 # V2 worker no effect
@@ -114,7 +114,7 @@ logger:
   wandb_enabled: true
   wandb:
     project: grpo-vlm
-    name: nemotron-omni-grpo-mmpr-tiny-4node
+    name: nemotron-omni-grpo-mmpr-tiny-4node-32batch
 
 cluster:
   gpus_per_node: 8
