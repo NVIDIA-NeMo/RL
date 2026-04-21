@@ -28,7 +28,6 @@ from fastapi import FastAPI
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
-from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -144,9 +143,7 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
     )
 
 
-@ray.remote(
-    runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
-)  # pragma: no cover
+@ray.remote  # pragma: no cover
 class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         from vllm.config import CompilationConfig
