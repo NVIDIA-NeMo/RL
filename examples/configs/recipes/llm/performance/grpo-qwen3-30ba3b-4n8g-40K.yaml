@@ -1,12 +1,15 @@
 defaults: ../../../grpo_math_1B.yaml
 grpo:
-  num_prompts_per_step: 64
+  num_prompts_per_step: 32
   num_generations_per_prompt: 32
 checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n8g
+loss_fn:
+  force_on_policy_ratio: true
 policy:
   model_name: Qwen/Qwen3-30B-A3B
+  train_global_batch_size: 1024
   train_micro_batch_size: 1
   logprob_batch_size: 4
   max_total_sequence_length: 40960
@@ -36,13 +39,16 @@ policy:
   generation:
     vllm_cfg:
       tensor_parallel_size: 2
+      sync_dp_load_balancing: contiguous
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n8g
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
-    project: nemo-rl
-    name: grpo-qwen3-30ba3b-4n8g
+    project: nemo-rl-gen-study
+    name: grpo-qwen3-30ba3b-4n8g-40K
 cluster:
   gpus_per_node: 8
   num_nodes: 4

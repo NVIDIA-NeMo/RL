@@ -596,14 +596,13 @@ def print_performance_metrics(
 
     is_vllm_metrics_logger_enabled = master_config["policy"]["generation"].get(
         "vllm_cfg", {}
-    ).get("enable_vllm_metrics_logger", False) and master_config["policy"][
-        "generation"
-    ].get("vllm_cfg", {}).get("async_engine", False)
+    ).get("enable_vllm_metrics_logger", False)
     generation_logger_metrics = metrics.get("generation_logger_metrics", {})
     if is_vllm_metrics_logger_enabled and generation_logger_metrics:
         vllm_logger_metrics = generation_logger_metrics
-        # vllm_logger_metrics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
-        # metric_name: "inflight_batch_sizes" or "num_pending_samples"
+        # vllm_logger_metrics: dict[str (metric_name), dict[int (dp_idx), value]]
+        # Gauge metrics (list values): "inflight_batch_sizes", "num_pending_samples", "kv_cache_usage_perc"
+        # Counter metrics (int delta): "generation_tokens"
 
         assert "inflight_batch_sizes" in vllm_logger_metrics, (
             "inflight_batch_sizes not found in vllm_logger_metrics"
@@ -641,6 +640,16 @@ def print_performance_metrics(
                     "Num Pending Samples",
                     None,
                 )
+        # Token imbalance visualization for sync engine only.
+        # Async engine token imbalance is already printed via `per_worker_token_counts` in metrics.
+        if not master_config["policy"]["generation"]["vllm_cfg"].get("async_engine", False):
+            generation_tokens_per_worker = vllm_logger_metrics.get(
+                "generation_tokens", {}
+            )
+            if generation_tokens_per_worker and max(
+                generation_tokens_per_worker.values(), default=0
+            ) > 0:
+                visualize_per_worker_load(generation_tokens_per_worker)
 
     # =====================================================
     # Throughputs
@@ -841,9 +850,15 @@ def log_generation_metrics_to_wandb(
         timeline_interval: Interval between timeline points (in seconds)
         logger: Logger instance
     """
-    for generation_metric in generation_logger_metrics.keys():
+    # generation_tokens is a scalar int delta (not a timeline), skip it here
+    timeline_metrics = {
+        k: v
+        for k, v in generation_logger_metrics.items()
+        if k != "generation_tokens"
+    }
+    for generation_metric in timeline_metrics.keys():
         logger.log_plot_per_worker_timeline_metrics(
-            generation_logger_metrics[generation_metric],
+            timeline_metrics[generation_metric],
             step=step,
             prefix="generation_metrics",
             name=generation_metric,

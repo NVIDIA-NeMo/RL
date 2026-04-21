@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import math
 import os
 import warnings
 from collections import defaultdict
@@ -475,6 +476,28 @@ class VllmGeneration(GenerationInterface):
 
         # Shard the data across the tied worker groups
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+
+        # Reorder the batch for interleaved (round-robin) DP distribution.
+        # "contiguous" (default): rank r gets a contiguous slice of size total/dp_size.
+        # "interleaved": rank r gets every dp_size-th sample starting at r
+        # This can be useful to spread long sequences across different workers to 
+        # avoid long tail latency.
+        interleaved = (
+            self.cfg.get("vllm_cfg", {}).get("sync_dp_load_balancing", "contiguous")
+            == "interleaved"
+        )
+        perm: list[int] | None = None
+        if interleaved:
+            total = len(data["input_ids"])
+            shard_size = math.ceil(total / dp_size)
+            perm = [
+                r + s * dp_size
+                for r in range(dp_size)
+                for s in range(shard_size)
+                if r + s * dp_size < total
+            ]
+            data = data.select_indices(perm)
+
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
         )
@@ -494,6 +517,10 @@ class VllmGeneration(GenerationInterface):
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
             results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]}
         )
+
+        # Restore original sample order if we applied an interleaved permutation.
+        if perm is not None:
+            combined.reorder_data(perm)
 
         # Verify the output has all required fields
         required_keys = [
@@ -865,8 +892,6 @@ class VllmGeneration(GenerationInterface):
         """Collect vLLM logger metrics from vLLM workers (model-owner actors only)."""
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return {}
-        if not self.cfg["vllm_cfg"].get("async_engine", False):
-            return {}
 
         futures: list[ray.ObjectRef] = []
         dp_indices: list[int] = []
@@ -880,11 +905,11 @@ class VllmGeneration(GenerationInterface):
             dp_indices.append(dp_idx)
 
         results = ray.get(futures)
-        vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
+        vllm_logger_metrics: dict[str, Any] = {
             "inflight_batch_sizes": {},  # dp_idx -> list[int]
             "num_pending_samples": {},  # dp_idx -> list[int]
             "kv_cache_usage_perc": {},  # dp_idx -> list[float]
-            "generation_tokens": {},  # dp_idx -> list[int]
+            "generation_tokens": {},  # dp_idx -> int
         }
 
         for dp_idx, stats in zip(dp_indices, results):
@@ -902,15 +927,13 @@ class VllmGeneration(GenerationInterface):
             if kv_cache_usage_perc:
                 vllm_logger_metrics["kv_cache_usage_perc"][dp_idx] = kv_cache_usage_perc
             generation_tokens = stats.get("generation_tokens")
-            if generation_tokens:
+            if generation_tokens is not None:
                 vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
 
         return vllm_logger_metrics
 
     def clear_vllm_logger_metrics(self) -> None:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
-            return
-        if not self.cfg["vllm_cfg"].get("async_engine", False):
             return
         futures = self.worker_group.run_all_workers_single_data(
             "clear_vllm_logger_metrics",
