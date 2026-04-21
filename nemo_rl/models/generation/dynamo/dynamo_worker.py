@@ -34,6 +34,16 @@ from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_
 from nemo_rl.models.generation.dynamo.config import DynamoVllmConfig
 
 
+def _normalize_parser_name(value: Optional[str], default: Optional[str]) -> Optional[str]:
+    """Normalize parser names from config/env, treating empty/none as disabled."""
+    if value is None:
+        return default
+    normalized = value.strip()
+    if not normalized or normalized.lower() == "none":
+        return None
+    return normalized
+
+
 def _build_vllm_cli_args(
     model_name: str,
     vllm_cfg: dict[str, Any],
@@ -276,9 +286,21 @@ class DynamoVllmWorker:
                 kv_events_config_json=kv_events_json,
                 seed=seed,
             ),
-            "--dyn-tool-call-parser", "hermes",
-            "--dyn-reasoning-parser", "qwen3"
         ]
+
+        dynamo_cfg = config.get("dynamo_cfg", {})
+        tool_call_parser = _normalize_parser_name(
+            os.environ.get("DYNAMO_TOOL_CALL_PARSER"),
+            _normalize_parser_name(dynamo_cfg.get("tool_call_parser"), "hermes"),
+        )
+        reasoning_parser = _normalize_parser_name(
+            os.environ.get("DYNAMO_REASONING_PARSER"),
+            _normalize_parser_name(dynamo_cfg.get("reasoning_parser"), "qwen3"),
+        )
+        if tool_call_parser is not None:
+            cmd.extend(["--dyn-tool-call-parser", tool_call_parser])
+        if reasoning_parser is not None:
+            cmd.extend(["--dyn-reasoning-parser", reasoning_parser])
 
         # --- Subprocess environment ---
         env = os.environ.copy()
@@ -315,7 +337,9 @@ class DynamoVllmWorker:
         print(
             f"  [DynamoVllmWorker] Launched dynamo.vllm (pid={self._process.pid}, "
             f"CUDA_VISIBLE_DEVICES={cuda_visible}, "
-            f"TP={tp_size})",
+            f"TP={tp_size}, "
+            f"tool_call_parser={tool_call_parser or 'disabled'}, "
+            f"reasoning_parser={reasoning_parser or 'disabled'})",
             flush=True,
         )
 

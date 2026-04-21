@@ -44,6 +44,8 @@ class DynamoCfg(TypedDict, total=False):
     namespace: str
     enable_planner: bool  # Launch planner + VirtualConnectorClient for autoscaling
     initial_dp_size: int  # Workers at startup (must be <= cluster.world_size() // tp_size)
+    tool_call_parser: str  # Dynamo parser name, or "none" to disable
+    reasoning_parser: str  # Dynamo parser name, or "none" to disable
 
 
 class DynamoVllmConfig(GenerationConfig):

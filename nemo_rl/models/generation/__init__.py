@@ -44,8 +44,10 @@ def configure_generation_config(
     # vllm setting
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
-        # set load_format
-        config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
+        # set load_format (respect user override if they set it explicitly,
+        # e.g. to force "auto" for benchmarking without a Megatron refit).
+        if config["vllm_cfg"].get("load_format") is None:
+            config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
         if speculative_config:
             # Speculative decoding needs real startup weights unless the draft

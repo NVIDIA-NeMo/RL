@@ -326,7 +326,7 @@ class DynamoVllmGeneration(GenerationInterface):
             "pre_deployment_sweeping_mode": "none",
             "decode_engine_num_gpu": self.tp_size,
             "ttft": 500.0,
-            "itl": 50.0,
+            "itl": 1.0,
             "max_gpu_budget": self._inference_gpu_count,
             "min_endpoint": 1,
             "load_adjustment_interval": 5,
@@ -366,7 +366,8 @@ class DynamoVllmGeneration(GenerationInterface):
                 "--router-mode", "kv",
                 "--active-decode-blocks-threshold", "1000.0",
                 "--active-prefill-tokens-threshold", "1000000000000",
-                "--active-prefill-tokens-threshold-frac", "1000.0"
+                "--active-prefill-tokens-threshold-frac", "1000.0",
+                "--router-predict-on-route"
             ],
             env=env,
         )
@@ -542,6 +543,24 @@ class DynamoVllmGeneration(GenerationInterface):
 
         self._pool.shutdown()
         return True
+
+    # ------------------------------------------------------------------
+    # Serialization support (for Ray actor pickling in async GRPO)
+    # ------------------------------------------------------------------
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for attr, _, _ in _SUBPROCESS_REGISTRY:
+            state[attr] = None
+        state["_vc_stop"] = None
+        state["_vc_thread"] = None
+        state["_pool"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._external = True
+        self._vc_stop = threading.Event()
 
     # ------------------------------------------------------------------
     # Unsupported weight-update methods

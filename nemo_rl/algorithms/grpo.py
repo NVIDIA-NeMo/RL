@@ -779,7 +779,7 @@ def setup(
 
     # if it is not colocated inference, initialize collective communication for update weights
     # Dynamo backend does not support weight updates — skip collective init and refit.
-    if not colocated_inference and backend != "dynamo":
+    if not colocated_inference and backend not in ("dynamo", "vllm"):
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -800,7 +800,7 @@ def setup(
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None and backend != "dynamo":
+    if policy_generation is not None and backend not in ("dynamo", "vllm"):
         policy_generation.prepare_refit_info(state_dict_info)
 
     # Calculate total setup time
@@ -1393,7 +1393,7 @@ def grpo_train(
     if policy_generation is None:
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
-    elif master_config["policy"]["generation"]["backend"] == "dynamo":
+    elif master_config["policy"]["generation"]["backend"] in ("dynamo", "vllm"):
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
@@ -1579,7 +1579,9 @@ def grpo_train(
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
-                            max_seq_len=None,
+                            max_seq_len=master_config["policy"][
+                                "max_total_sequence_length"
+                            ],
                             generation_config=generation_config,
                             max_rollout_turns=None,
                             greedy=False,
@@ -2316,7 +2318,7 @@ def validate(
                     input_batch=val_batch,
                     tokenizer=tokenizer,
                     task_to_env=val_task_to_env,
-                    max_seq_len=None,
+                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
@@ -2489,7 +2491,7 @@ def async_grpo_train(
     if policy_generation is None:
         policy_generation = policy
         NEED_REFIT = False
-    elif master_config["policy"]["generation"]["backend"] == "dynamo":
+    elif master_config["policy"]["generation"]["backend"] in ("dynamo", "vllm"):
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True
     assert policy_generation is not None
@@ -2950,6 +2952,11 @@ def async_grpo_train(
                         weight_version += 1
                         trajectory_collector.set_weight_version.remote(weight_version)
                         trajectory_collector.resume_after_refit.remote()
+                else:
+                    # Advance the trajectory collector's weight version even when refit is skipped
+                    # so that the replay buffer can sample trajectories targeted for subsequent steps.
+                    weight_version += 1
+                    trajectory_collector.set_weight_version.remote(weight_version)
 
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:

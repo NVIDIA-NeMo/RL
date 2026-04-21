@@ -2151,13 +2151,18 @@ def _gpt_forward_with_linear_ce_fusion(
     # calculate the logprobs for the last token and then return the logprobs
     vocab_start_index = tp_rank * (self.vocab_size // tp_size)
     vocab_end_index = min((tp_rank + 1) * (self.vocab_size // tp_size), self.vocab_size)
-    output_weight_layer = self.output_layer.weight
+    # For models with tied embeddings (e.g. Qwen3), self.output_layer.weight is None —
+    # the real weight lives on the embedding and must be fetched via
+    # shared_embedding_or_output_weight().
+    output_weight_layer = (
+        self.shared_embedding_or_output_weight()
+        if self.share_embeddings_and_output_weights
+        else self.output_layer.weight
+    )
     logprobs = from_parallel_hidden_states_to_logprobs(
         hidden_states,  # .transpose(0, 1).contiguous(),
         output_weight_layer,
-        self.shared_embedding_or_output_weight()
-        if self.share_embeddings_and_output_weights
-        else self.output_layer.weight,
+        output_weight_layer,
         runtime_gather_output,
         labels,
         vocab_start_index=vocab_start_index,

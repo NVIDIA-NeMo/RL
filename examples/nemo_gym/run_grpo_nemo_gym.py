@@ -94,7 +94,7 @@ def collect_trajectories(
             input_batch=val_batch,
             tokenizer=tokenizer,
             task_to_env=val_task_to_env,
-            max_seq_len=None,
+            max_seq_len=master_config["policy"]["max_total_sequence_length"],
             generation_config=generation_config,
             max_rollout_turns=None,
             greedy=False,
