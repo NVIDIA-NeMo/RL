@@ -4,7 +4,8 @@
 # pairs — no student generation — and aligns the student to the teacher via
 # top-k KL on the dataset's responses.
 distillation:
-    num_prompts_per_step: 64
+    # The global batch size is taken from policy.train_global_batch_size;
+    # off-policy has no generation so num_prompts_per_step is redundant.
     max_num_steps: 1000
     max_num_epochs: 10
     topk_logits_k: 64 # top-k teacher logits used for the sparse KL loss

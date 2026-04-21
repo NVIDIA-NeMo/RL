@@ -107,11 +107,13 @@ class OffPolicyDistillationConfig(TypedDict):
     """Configuration for off-policy distillation training.
 
     Simplified compared to on-policy:
-    - No num_generations_per_prompt (we use fixed responses)
-    - No max_rollout_turns (no generation)
+    - No num_generations_per_prompt (we use fixed responses, so
+      the dataloader batch equals ``policy.train_global_batch_size``
+      directly — the on-policy ``num_prompts_per_step`` field is
+      redundant here and intentionally omitted).
+    - No max_rollout_turns (no generation).
     """
 
-    num_prompts_per_step: int  # Batch size
     max_num_steps: int  # Maximum number of steps to train for
     max_num_epochs: int  # Maximum number of epochs to train for
     topk_logits_k: int  # Top-k logits for sparse KL loss
@@ -639,6 +641,34 @@ def setup(
     logger_config = master_config["logger"]
     cluster_config = master_config["cluster"]
 
+    # Deprecated-field warning: legacy off-policy configs carried
+    # ``distillation.num_prompts_per_step`` as a batch-size knob. It is now
+    # ignored — ``policy.train_global_batch_size`` is the single source of
+    # truth — but if it is still present we emit a warning, and flag a
+    # mismatch explicitly so silent-value-drop behavior is visible.
+    legacy_nps = distillation_config.get("num_prompts_per_step")
+    if legacy_nps is not None:
+        gbs = policy_config["train_global_batch_size"]
+        if legacy_nps != gbs:
+            warnings.warn(
+                f"`distillation.num_prompts_per_step={legacy_nps}` is set in the "
+                f"config but does not match `policy.train_global_batch_size={gbs}`. "
+                f"Off-policy distillation ignores `num_prompts_per_step`; using "
+                f"`train_global_batch_size={gbs}` for both the dataloader and the "
+                f"teacher/student call gbs. Remove `num_prompts_per_step` from "
+                f"the YAML to silence this warning.",
+                UserWarning,
+                stacklevel=2,
+            )
+        else:
+            warnings.warn(
+                "`distillation.num_prompts_per_step` is deprecated for off-policy "
+                "distillation and is ignored; remove it from the YAML. "
+                "Batch size is taken from `policy.train_global_batch_size`.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
     # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
         dtensor_enabled = cfg["dtensor_cfg"]["enabled"]
@@ -682,7 +712,7 @@ def setup(
     # ==========================
     dataloader = StatefulDataLoader(
         train_dataset,
-        batch_size=distillation_config["num_prompts_per_step"],
+        batch_size=policy_config["train_global_batch_size"],
         shuffle=data_config.get("shuffle", True),
         collate_fn=rl_collate_fn,
         drop_last=True,
@@ -710,7 +740,7 @@ def setup(
         val_dataloader = StatefulDataLoader(
             val_dataset,
             batch_size=distillation_config.get(
-                "val_global_batch_size", distillation_config["num_prompts_per_step"]
+                "val_global_batch_size", policy_config["train_global_batch_size"]
             ),
             shuffle=False,
             collate_fn=rl_collate_fn,
@@ -1338,9 +1368,7 @@ def off_policy_distillation_train(
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
-                consumed_samples += master_config["distillation"][
-                    "num_prompts_per_step"
-                ]
+                consumed_samples += master_config["policy"]["train_global_batch_size"]
                 timeout.mark_iteration()
 
                 should_save_by_step = (
@@ -1540,7 +1568,7 @@ def validate(
         val_batches = master_config["distillation"].get("val_batches", 0)
         val_batch_size = master_config["distillation"].get(
             "val_global_batch_size",
-            master_config["distillation"]["num_prompts_per_step"],
+            master_config["policy"]["train_global_batch_size"],
         )
         val_mbs = master_config["distillation"].get(
             "val_micro_batch_size", val_batch_size
