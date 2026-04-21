@@ -46,7 +46,6 @@ policy:
   - milestones:
     - 10
   dtensor_cfg:
-    activation_checkpointing: false
     automodel_kwargs:
       freeze_config:
         freeze_vision_tower: true

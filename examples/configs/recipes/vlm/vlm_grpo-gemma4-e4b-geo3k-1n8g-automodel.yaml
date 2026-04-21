@@ -6,10 +6,9 @@ loss_fn:
   use_importance_sampling_correction: true
   truncated_importance_sampling_ratio: 2
 checkpointing:
-  checkpoint_dir: "results/vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel"
+  checkpoint_dir: results/vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel
 policy:
   model_name: google/gemma-4-E4B-it
-  train_micro_batch_size: 1
   train_global_batch_size: 32
   logprob_batch_size: 1
   max_total_sequence_length: 3072
@@ -37,7 +36,6 @@ policy:
     max_new_tokens: 2048
     vllm_cfg:
       tensor_parallel_size: 4
-      gpu_memory_utilization: 0.6
       enforce_eager: true
       max_model_len: 3072
 data:
@@ -57,4 +55,3 @@ logger:
     name: vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel
 cluster:
   gpus_per_node: 8
-  num_nodes: 1
