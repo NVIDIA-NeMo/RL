@@ -1,0 +1,322 @@
+# Cross-Tokenizer Off-Policy Distillation — Llama-3.2-1B ← Qwen3-8B-Base
+#
+# Small-scale recipe (1 node x 8 GPU, bs=8, 100 steps) mirrored from a
+# previous wandb run. Requires a precomputed projection matrix:
+#   cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special.pt
+distillation:
+    num_prompts_per_step: 8
+    max_num_steps: 100
+    max_num_epochs: 20
+    topk_logits_k: 8192 # top-k teacher logits used for the sparse KL loss
+    seed: 42
+
+    # validation (disabled: split_validation_size=0.0 below means no val split.
+    # To enable: bump split_validation_size to e.g. 0.01 AND set val_period>0.)
+    val_period: 0
+    val_at_start: false
+    val_batches: 0 # 0 = run on the full validation dataloader
+    val_global_batch_size: 64
+    val_micro_batch_size: 1
+
+    # IPC plumbing for teacher->student logit handoff
+    use_ipc: true # required when token_aligner.enabled=true
+    cross_tokenizer_num_workers: 4
+
+loss_fn:
+    # same-tokenizer fields (unused when token_aligner.enabled=true)
+    kl_type: "mixed"
+    mixed_kl_weight: 0.5
+    zero_outside_topk: false
+
+    # cross-tokenizer fields (used by CrossTokenizerDistillationLossFn)
+    loss_type: "KL"
+    temperature: 1.0
+    vocab_topk: 8192
+    exact_token_match_only: false
+    reverse_kl: false
+    project_teacher_to_student: false
+    gold_loss: false
+    xtoken_loss: false
+    ce_loss_scale: 0.1 # aux next-token CE weight
+    dynamic_loss_scaling: true # rescale KL to match CE magnitude
+
+checkpointing:
+    enabled: true
+    checkpoint_dir: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/results/xtokenizer/cross-tokenizer-off-distillation"
+    metric_name: "train:loss"
+    higher_is_better: false
+    keep_top_k: 3
+    save_period: 10
+    checkpoint_must_save_by: null
+    model_save_format: "safetensors"
+    save_consolidated: false
+    save_optimizer: true
+
+policy: &POLICY_BASE
+    model_name: "unsloth/Llama-3.2-1B"
+    tokenizer:
+        name: ${..model_name}
+        chat_template_kwargs: null
+    train_global_batch_size: 8
+    train_micro_batch_size: 1
+    logprob_batch_size: 1
+    max_total_sequence_length: 4096
+    precision: "bfloat16"
+    logprob_chunk_size: null
+
+    offload_optimizer_for_logprob: false
+
+    dtensor_cfg: &DTENSOR_BASE
+        enabled: true
+        _v2: true
+        cpu_offload: false
+        sequence_parallel: false
+        activation_checkpointing: true
+        tensor_parallel_size: 1
+        context_parallel_size: 1
+        custom_parallel_plan: null
+
+    dynamic_batching:
+        enabled: false
+        train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+        logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+        sequence_length_round: 64
+
+    sequence_packing:
+        enabled: false
+        train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+        logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+        algorithm: "modified_first_fit_decreasing"
+        sequence_length_round: 64
+
+    max_grad_norm: 1.0
+    make_sequence_length_divisible_by: ${mul:${mul:${.dtensor_cfg.tensor_parallel_size}, ${.dtensor_cfg.context_parallel_size}}, 2}
+
+    optimizer:
+        name: "torch.optim.AdamW"
+        kwargs:
+            lr: 5.0e-5
+            weight_decay: 0.1
+            betas: [0.9, 0.98]
+            eps: 1.0e-5
+            foreach: false
+            fused: false
+
+    megatron_cfg: &MEGATRON_BASE
+        enabled: false
+        force_reconvert_from_hf: false
+        empty_unused_memory_level: 0
+        activation_checkpointing: false
+        converter_type: "LlamaForCausalLM"
+        tensor_model_parallel_size: 1
+        expert_tensor_parallel_size: 1
+        expert_model_parallel_size: 1
+        pipeline_model_parallel_size: 1
+        num_layers_in_first_pipeline_stage: null
+        num_layers_in_last_pipeline_stage: null
+        context_parallel_size: 1
+        pipeline_dtype: ${policy.precision}
+        sequence_parallel: false
+        freeze_moe_router: true
+        moe_router_dtype: "fp64"
+        moe_router_load_balancing_type: "none"
+        moe_router_bias_update_rate: 0.0
+        moe_permute_fusion: true
+        apply_rope_fusion: true
+        bias_activation_fusion: true
+        defer_fp32_logits: false
+        moe_per_layer_logging: false
+        moe_enable_deepep: false
+        moe_token_dispatcher_type: "alltoall"
+        moe_shared_expert_overlap: false
+        gradient_accumulation_fusion: false
+
+        optimizer:
+            optimizer: "adam"
+            lr: 5.0e-5
+            min_lr: 5.0e-6
+            weight_decay: 0.1
+            bf16: true
+            fp16: false
+            params_dtype: "float32"
+            adam_beta1: 0.9
+            adam_beta2: 0.98
+            adam_eps: 1.0e-5
+            sgd_momentum: 0.9
+            use_distributed_optimizer: true
+            use_precision_aware_optimizer: true
+            optimizer_cpu_offload: false
+            optimizer_offload_fraction: 0.0
+            clip_grad: ${policy.max_grad_norm}
+
+        scheduler:
+            start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+            end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+            weight_decay_incr_style: "constant"
+            lr_decay_style: "cosine"
+            lr_decay_iters: 76000
+            lr_warmup_iters: 4000
+            lr_warmup_init: 1.0e-6
+
+        distributed_data_parallel_config:
+            grad_reduce_in_fp32: false
+            overlap_grad_reduce: true
+            overlap_param_gather: true
+            use_custom_fsdp: false
+            data_parallel_sharding_strategy: "optim_grads_params"
+
+        fp8_cfg:
+            enabled: false
+            fp8: "e4m3"
+            fp8_recipe: "blockwise"
+            fp8_param: false
+
+    scheduler:
+        - name: "torch.optim.lr_scheduler.LinearLR"
+          kwargs:
+              start_factor: 0.02
+              end_factor: 1.0
+              total_iters: 4000
+        - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+          kwargs:
+              T_max: 76000
+              eta_min: 0.0
+        - milestones: [4000]
+
+    generation:
+        backend: "vllm"
+        max_new_tokens: 2048
+        temperature: 0.0
+        top_p: 1.0
+        top_k: null
+        stop_token_ids: [128001]
+        stop_strings: null
+        vllm_cfg:
+            async_engine: false
+            precision: "bfloat16"
+            kv_cache_dtype: "auto"
+            tensor_parallel_size: 1
+            pipeline_parallel_size: 1
+            expert_parallel_size: 1
+            gpu_memory_utilization: 0.6
+            max_model_len: 2048
+            enforce_eager: false
+            use_deep_gemm: false
+            num_last_layers_in_bf16: 0
+            num_first_layers_in_bf16: 0
+            distributed_executor_backend: null
+            load_format: "dummy"
+            skip_tokenizer_init: true
+        vllm_kwargs: {}
+        colocated:
+            enabled: true
+            resources:
+                gpus_per_node: null
+                num_nodes: null
+
+teacher:
+    <<: *POLICY_BASE
+    model_name: "Qwen/Qwen3-8B-Base"
+    generation: null # teacher never generates
+    dtensor_cfg:
+        <<: *DTENSOR_BASE
+        tensor_parallel_size: 1
+        context_parallel_size: 1
+
+data:
+    max_input_seq_length: ${policy.max_total_sequence_length}
+    add_bos: true # ArrowTextDataset + arrow_text_processor already adds BOS
+    add_eos: false
+    add_generation_prompt: false
+    shuffle: true
+
+    # dataset (load_response_dataset registry; arrow_text expects a glob)
+    train:
+        dataset_name: arrow_text
+        # raw-text continued-pretraining: no chat template, BOS only, loss on every token.
+        processor: arrow_text_processor
+        arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-000[0-5][0-9]-of-02476.arrow"
+        text_key: "text"
+        split_validation_size: 0.0
+        seed: ${distillation.seed}
+        cache_dir: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/cross_tokenizer_data/arrow_cache"
+        num_proc: 32
+    default:
+        prompt_file: null
+        system_prompt_file: null
+
+# Optional eval section (consumed only by run_off_policy_distillation_arrow_with_eval.py;
+# ignored by the basic run_off_policy_distillation.py entry point).
+eval:
+    val_period: 0
+    val_at_start: false
+    val_batch_size: 64
+    max_val_samples: 512
+    max_rollout_turns: 1
+    benchmarks:
+        math:
+            dataset_name: "math"
+            prompt_file: "examples/prompts/cot.txt"
+            env:
+                num_workers: 8
+        mmlu:
+            dataset_name: "mmlu"
+            prompt_file: "examples/prompts/mmlu.txt"
+            env:
+                num_workers: 8
+                verifier_type: "multilingual_multichoice"
+        mmlu_5shot:
+            dataset_name: "mmlu"
+            prompt_file: "examples/prompts/mmlu.txt"
+            num_few_shot: 5
+            env:
+                num_workers: 8
+                verifier_type: "multilingual_multichoice"
+
+logger:
+    log_dir: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/logs/xtokenizer/cross-tokenizer-off-distillation"
+    num_val_samples_to_print: 5
+    wandb_enabled: true
+    tensorboard_enabled: false
+    mlflow_enabled: false
+    swanlab_enabled: false
+    monitor_gpus: true
+    wandb:
+        project: "xtokenizer"
+        name: "cross-tokenizer-off-distillation_student_unsloth/Llama-3.2-1B_teacher_Qwen/Qwen3-8B-Base_REFACTORED"
+    swanlab:
+        project: "xtokenizer"
+        name: "cross-tokenizer-off-distillation-llama1b-qwen8b"
+    tensorboard:
+        log_dir: "tb_logs-cross-tokenizer-off-distillation"
+    mlflow:
+        experiment_name: "cross-tokenizer-off-distillation-dev"
+        run_name: "cross-tokenizer-off-distillation"
+        tracking_uri: "http://localhost:5000"
+    gpu_monitoring:
+        collection_interval: 10
+        flush_interval: 10
+
+cluster:
+    gpus_per_node: 8
+    num_nodes: 1
+
+# cross-tokenizer distillation
+token_aligner:
+    enabled: true
+    projection_matrix_path: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special.pt"
+    use_sparse_format: false
+    loss_type: "KL"
+    exact_token_match_only: false
+    temperature: 1.0
+    vocab_topk: 8192
+    reverse_kl: false
+    projection_matrix_multiplier: 1.0
+    max_comb_len: 4
+    learnable: false
+    project_teacher_to_student: false
+    use_char_offset: false
+    force_dp_only: false
+    use_cuda_dp: false
+    dp_chunk_size: 128
+    use_align_fast: false
