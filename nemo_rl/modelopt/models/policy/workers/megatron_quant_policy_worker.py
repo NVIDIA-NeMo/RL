@@ -47,7 +47,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def __init__(self, config, *args, **kwargs):
         """Initialize the MegatronQuantPolicyWorker."""
         megatron_cfg = config.get("megatron_cfg", {}) or {}
-        assert not megatron_cfg.get("gradient_accumulation_fusion", False), (
+        # Default to True to match the underlying Megatron-Bridge
+        assert not megatron_cfg.get("gradient_accumulation_fusion", True), (
             "gradient_accumulation_fusion=True is not supported with "
             "MegatronQuantPolicyWorker (ModelOpt quantization). "
             "Set policy.megatron_cfg.gradient_accumulation_fusion=False."
