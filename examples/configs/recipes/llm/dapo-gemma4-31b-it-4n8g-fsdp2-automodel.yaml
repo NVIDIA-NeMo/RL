@@ -50,6 +50,11 @@ policy:
     - 10
   dtensor_cfg:
     activation_checkpointing: true
+    automodel_kwargs:
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
   sequence_packing:
     enabled: false
   dynamic_batching:

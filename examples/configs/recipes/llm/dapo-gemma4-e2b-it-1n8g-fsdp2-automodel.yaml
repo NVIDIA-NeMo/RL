@@ -45,6 +45,13 @@ policy:
       total_iters: 10000000000
   - milestones:
     - 10
+  dtensor_cfg:
+    activation_checkpointing: false
+    automodel_kwargs:
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
   sequence_packing:
     enabled: false
   dynamic_batching:

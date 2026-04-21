@@ -686,29 +686,6 @@ def setup_model_and_optimizer(
     if is_tied_lm_head:
         model.tie_weights()
 
-    # Freeze visual/audio encoders when not doing VLM training.
-    # Without this, the optimizer creates state entries for visual/audio params that
-    # never receive gradients, causing a key mismatch when resuming from checkpoint.
-    # Note: encoders may be nested under model.model (e.g. model.model.visual for
-    # Qwen3_5MoeForConditionalGeneration), not directly on model.
-    if not is_vlm:
-        for attr in (
-            "visual",
-            "vision_tower",
-            "audio_tower",
-            "embed_vision",
-            "embed_audio",
-        ):
-            # Handle both direct attributes and nested under model.model (FSDP wrapping)
-            module = getattr(model, attr, None)
-            if module is None:
-                module = getattr(getattr(model, "model", None), attr, None)
-            if module is not None:
-                for param in module.parameters():
-                    param.requires_grad_(False)
-                if rank == 0:
-                    print(f"Froze {attr} parameters for text-only training")
-
     # CPU offload if needed
     if cpu_offload:
         # Move buffers to CPU for FSDP modules
