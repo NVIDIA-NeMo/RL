@@ -506,6 +506,7 @@ requires-dist = [
 
 # Override logsage metadata to remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
 # (numpy cap conflicts with onnx>=1.21.0rc4 CVE fix via nvidia-resiliency-ext)
+# Tracking: https://github.com/NVIDIA/nvidia-resiliency-ext/issues/301
 [[tool.uv.dependency-metadata]]
 name = "logsage"
 version = "0.1.5"
@@ -522,6 +523,7 @@ requires-dist = [
 ]
 
 # Override drain3 to relax cachetools==4.2.1 pin (conflicts with mlflow's cachetools>=5.0.0)
+# Tracking: https://github.com/logpai/Drain3/issues/119
 [[tool.uv.dependency-metadata]]
 name = "drain3"
 version = "0.9.11"
