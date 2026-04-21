@@ -117,10 +117,11 @@ policy:
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
     defer_fp32_logits: false
-    moe_permute_fusion: false
+    moe_permute_fusion: true
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
 
     optimizer:
       optimizer: "adam"
