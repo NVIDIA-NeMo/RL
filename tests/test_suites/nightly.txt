@@ -45,7 +45,7 @@ tests/test_suites/vlm/h100/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-megatrontp
 # tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.sh
 
 # Removing this until this issue is resolved: https://github.com/huggingface/transformers/issues/41190
-# tests/test_suites/vlm/vlm_grpo-smolvlm2-2.2b-instruct-clevr-1n2g-dtensor2tp1.v2.sh
+# tests/test_suites/vlm/h100/vlm_grpo-smolvlm2-2.2b-instruct-clevr-1n2g-dtensor2tp1.v2.sh.disabled
 
 # Deepscaler (short tests)
 tests/test_suites/llm/h100/grpo-deepscaler-1.5b-16K.sh

@@ -272,7 +272,12 @@ def test_nightly_compute_stays_below_1340_hours(nightly_test_suite, tracker):
 
 
 def test_dry_run_does_not_fail_and_prints_total_gpu_hours():
-    command = "DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch ./tests/test_suites/**/*.sh"
+    # Use Python glob so scripts at any depth under test_suites/ are found
+    test_scripts = sorted(
+        os.path.relpath(p, project_root)
+        for p in glob.glob(os.path.join(test_suites_dir, "**", "*.sh"), recursive=True)
+    )
+    command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(test_scripts)}"
 
     # Run the command from the project root directory
     result = subprocess.run(
