@@ -58,11 +58,12 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         self._patch_validate_model_paths()
         self._patch_setup_model_and_optimizer()
         # Hooks read by MegatronPolicyWorkerImpl.__init__ via getattr().
-        # _model_post_wrap_hook / _transformer_layer_spec are forwarded to
-        # handle_model_import; _pre_load_checkpoint_hook is forwarded to
-        # setup_model_and_optimizer / setup_reference_model_state and runs
-        # before load_checkpoint to install quantizers on the model.
-        self._model_post_wrap_hook = self._quantize
+        # _model_import_post_wrap_hook / _transformer_layer_spec are forwarded
+        # to handle_model_import (HF->Megatron import only);
+        # _pre_load_checkpoint_hook is forwarded to setup_model_and_optimizer /
+        # setup_reference_model_state and runs before load_checkpoint to resume
+        # quantizers on the model.
+        self._model_import_post_wrap_hook = self._quantize
         self._transformer_layer_spec = quantization_layer_spec
         self._pre_load_checkpoint_hook = self._restore_modelopt_state_pre_load
         super().__init__(config, *args, **kwargs)

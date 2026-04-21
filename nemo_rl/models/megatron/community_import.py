@@ -56,13 +56,10 @@ def import_model_from_hf_name(
         megatron_config: Optional megatron config with parallelism settings for distributed megatron model import.
         model_post_wrap_hook: Optional callable invoked on each Megatron model
             chunk after it is built (and before DDP wrapping). Forwarded to
-            ``provide_distributed_model(post_wrap_hook=...)``. Used to apply
-            in-place model transformations such as ModelOpt quantization to
-            insert quantizers into linear layers prior to checkpoint save.
+            ``provide_distributed_model(post_wrap_hook=...)``.
         transformer_layer_spec: Optional Megatron ``ModuleSpec`` (or callable
             returning one) overriding the default layer spec selected by the
-            model provider. Used to inject custom layer implementations such
-            as the ModelOpt-quantized variants of attention/MLP submodules.
+            model provider.
         **config_overrides: Extra keyword arguments forwarded to
             ``AutoBridge.from_hf_pretrained``.
     """
