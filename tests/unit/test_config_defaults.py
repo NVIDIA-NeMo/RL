@@ -16,11 +16,14 @@
 
 import dataclasses
 import os
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import field
 from pathlib import Path
 
 import pytest
 from omegaconf import OmegaConf
+from pydantic import ConfigDict, ValidationError
+from pydantic.dataclasses import dataclass
 
 from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
@@ -39,6 +42,7 @@ from nemo_rl.utils.config import (
     apply_config_defaults,
     load_config_with_inheritance,
     register_omegaconf_resolvers,
+    validate_config,
 )
 
 register_omegaconf_resolvers()
@@ -49,6 +53,8 @@ register_omegaconf_resolvers()
 _TESTS_DIR = Path(os.path.abspath(__file__)).parent
 _REPO_ROOT = _TESTS_DIR.parent.parent
 _EXEMPLAR_YAML = _REPO_ROOT / "examples" / "configs" / "grpo_math_1B.yaml"
+
+_EXTRA_IGNORE = ConfigDict(extra="ignore")
 
 
 # ===================================================================
@@ -140,110 +146,206 @@ def test_loss_fn_defaults_match_exemplar_yaml():
 
 
 # ===================================================================
-# 3. apply_config_defaults — unit tests
+# 3. validate_config — unit tests
 # ===================================================================
 
 
 def test_missing_keys_filled():
     """Missing keys should be filled with dataclass defaults."""
 
-    @dataclass
+    @dataclass(config=_EXTRA_IGNORE)
     class Defaults:
         a: int = 1
         b: str = "hello"
 
     config = {"x": 99}
-    apply_config_defaults(config, Defaults)
-    assert config == {"x": 99, "a": 1, "b": "hello"}
+    result = validate_config(config, Defaults)
+    assert result == {"x": 99, "a": 1, "b": "hello"}
 
 
 def test_existing_keys_not_overwritten():
     """Existing keys (including None and False) must never be overwritten."""
 
-    @dataclass
+    @dataclass(config=_EXTRA_IGNORE)
     class Defaults:
         a: int = 1
         b: bool = True
-        c: str = "default"
+        c: str | None = "default"  # nullable so None is a valid value
 
     config = {"a": 999, "b": False, "c": None}
-    apply_config_defaults(config, Defaults)
-    assert config == {"a": 999, "b": False, "c": None}
+    result = validate_config(config, Defaults)
+    assert result["a"] == 999
+    assert result["b"] is False
+    assert result["c"] is None
 
 
 def test_nested_recursion():
     """Nested dataclass defaults should recurse into existing dicts."""
 
-    @dataclass
+    @dataclass(config=_EXTRA_IGNORE)
     class Inner:
         x: int = 10
         y: bool = False
 
-    @dataclass
+    @dataclass(config=_EXTRA_IGNORE)
     class Outer:
         inner: Inner = field(default_factory=Inner)
         top: str = "ok"
 
     config = {"inner": {"x": 42}}
-    apply_config_defaults(config, Outer)
-    assert config == {"inner": {"x": 42, "y": False}, "top": "ok"}
+    result = validate_config(config, Outer)
+    assert result == {"inner": {"x": 42, "y": False}, "top": "ok"}
 
 
 def test_missing_nested_section_created():
     """When a nested section is entirely absent, create it from defaults."""
 
-    @dataclass
+    @dataclass(config=_EXTRA_IGNORE)
     class Inner:
         enabled: bool = False
         value: int = 5
 
-    @dataclass
+    @dataclass(config=_EXTRA_IGNORE)
     class Outer:
         inner: Inner = field(default_factory=Inner)
 
     config = {}
-    apply_config_defaults(config, Outer)
-    assert config == {"inner": {"enabled": False, "value": 5}}
+    result = validate_config(config, Outer)
+    assert result == {"inner": {"enabled": False, "value": 5}}
 
 
-def test_required_fields_skipped():
-    """Fields without defaults (required) must be skipped, not injected."""
+def test_extra_keys_preserved():
+    """Keys not in the schema must survive the round-trip."""
 
-    @dataclass
+    @dataclass(config=_EXTRA_IGNORE)
     class Defaults:
-        required_field: int  # no default — must come from YAML
-        optional_field: bool = False
+        a: int = 1
 
-    config = {"required_field": 42}
-    apply_config_defaults(config, Defaults)
-    # required_field was already present — kept; optional_field filled.
-    assert config == {"required_field": 42, "optional_field": False}
-
-    # When required field is absent, it must NOT be injected.
-    config2: dict = {}
-    apply_config_defaults(config2, Defaults)
-    assert "required_field" not in config2
-    assert config2 == {"optional_field": False}
+    config = {"a": 2, "unknown_key": "keep_me", "another": [1, 2, 3]}
+    result = validate_config(config, Defaults)
+    assert result["a"] == 2
+    assert result["unknown_key"] == "keep_me"
+    assert result["another"] == [1, 2, 3]
 
 
-def test_non_dataclass_ignored():
-    """Passing a non-dataclass as defaults_cls should be a no-op."""
-    config = {"a": 1}
-    result = apply_config_defaults(config, dict)
-    assert result == {"a": 1}
+def test_nested_extra_keys_preserved():
+    """Extra keys inside nested dicts must also survive."""
+
+    @dataclass(config=_EXTRA_IGNORE)
+    class Inner:
+        x: int = 10
+
+    @dataclass(config=_EXTRA_IGNORE)
+    class Outer:
+        inner: Inner = field(default_factory=Inner)
+
+    config = {"inner": {"x": 42, "extra_inner": "hi"}, "extra_top": 999}
+    result = validate_config(config, Outer)
+    assert result["inner"]["x"] == 42
+    assert result["inner"]["extra_inner"] == "hi"
+    assert result["extra_top"] == 999
 
 
-def test_non_type_hint_skipped():
-    """When a type hint is not a concrete type (e.g., Union), recursion is skipped."""
+# ===================================================================
+# 4. Type validation tests (NEW — the core upgrade)
+# ===================================================================
 
-    @dataclass
+
+def test_type_error_raises_validation_error():
+    """Passing a wrong type for a known field must raise ValidationError."""
+
+    @dataclass(config=_EXTRA_IGNORE)
     class Defaults:
-        items: list = field(default_factory=list)
+        seed: int = 42
 
-    config = {"items": {"nested": True}}
-    apply_config_defaults(config, Defaults)
-    # items is a dict in config but the hint (list) is not a dataclass → no recursion
-    assert config == {"items": {"nested": True}}
+    with pytest.raises(ValidationError):
+        validate_config({"seed": "not_an_int"}, Defaults)
+
+
+def test_type_error_nested():
+    """Type errors in nested configs must also be caught."""
+
+    @dataclass(config=_EXTRA_IGNORE)
+    class Inner:
+        value: int = 5
+
+    @dataclass(config=_EXTRA_IGNORE)
+    class Outer:
+        inner: Inner = field(default_factory=Inner)
+
+    with pytest.raises(ValidationError):
+        validate_config({"inner": {"value": "bad"}}, Outer)
+
+
+def test_type_coercion():
+    """Pydantic should coerce compatible types (e.g. str "42" → int 42)."""
+
+    @dataclass(config=_EXTRA_IGNORE)
+    class Defaults:
+        count: int = 0
+        rate: float = 1.0
+
+    result = validate_config({"count": "42", "rate": "3.14"}, Defaults)
+    assert result["count"] == 42
+    assert isinstance(result["count"], int)
+    assert abs(result["rate"] - 3.14) < 1e-6
+    assert isinstance(result["rate"], float)
+
+
+def test_nullable_fields():
+    """Fields typed as T | None should accept None."""
+
+    @dataclass(config=_EXTRA_IGNORE)
+    class Defaults:
+        threshold: float | None = None
+
+    result = validate_config({"threshold": None}, Defaults)
+    assert result["threshold"] is None
+
+    result2 = validate_config({"threshold": 0.5}, Defaults)
+    assert result2["threshold"] == 0.5
+
+    result3 = validate_config({}, Defaults)
+    assert result3["threshold"] is None
+
+
+# ===================================================================
+# 5. Backward compatibility — deprecated apply_config_defaults
+# ===================================================================
+
+
+def test_apply_config_defaults_deprecated_warns():
+    """apply_config_defaults should emit DeprecationWarning."""
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        apply_config_defaults({"grpo": {}}, GRPOMasterConfigDefaults)
+        deprecation_warnings = [
+            x for x in w if issubclass(x.category, DeprecationWarning)
+        ]
+        assert len(deprecation_warnings) >= 1
+        assert "validate_config" in str(deprecation_warnings[0].message)
+
+
+def test_apply_config_defaults_still_works():
+    """Deprecated apply_config_defaults should produce the same result as validate_config."""
+    config_a = {
+        "grpo": {"num_prompts_per_step": 32, "seed": 100},
+        "loss_fn": {"reference_policy_kl_penalty": 0.01},
+    }
+    config_b = {
+        "grpo": {"num_prompts_per_step": 32, "seed": 100},
+        "loss_fn": {"reference_policy_kl_penalty": 0.01},
+    }
+    result_new = validate_config(config_a, GRPOMasterConfigDefaults)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        result_old = apply_config_defaults(config_b, GRPOMasterConfigDefaults)
+    assert result_new == result_old
+
+
+# ===================================================================
+# 6. Integration test — GRPOMasterConfigDefaults
+# ===================================================================
 
 
 def test_grpo_master_defaults_integration():
@@ -257,17 +359,33 @@ def test_grpo_master_defaults_integration():
         "loss_fn": {
             "reference_policy_kl_penalty": 0.01,
         },
+        "policy": {"some_policy_key": True},  # extra top-level section
     }
-    apply_config_defaults(config, GRPOMasterConfigDefaults)
+    result = validate_config(config, GRPOMasterConfigDefaults)
 
     # seed was already set — must not be overwritten
-    assert config["grpo"]["seed"] == 100
+    assert result["grpo"]["seed"] == 100
     # overlong_filtering was missing — filled from defaults
-    assert config["grpo"]["overlong_filtering"] is False
+    assert result["grpo"]["overlong_filtering"] is False
     # calculate_advantages_on_gpu was missing — filled
-    assert config["grpo"]["calculate_advantages_on_gpu"] is False
+    assert result["grpo"]["calculate_advantages_on_gpu"] is False
     # nested reward_scaling should be filled
-    assert config["grpo"]["reward_scaling"]["enabled"] is False
+    assert result["grpo"]["reward_scaling"]["enabled"] is False
     # loss_fn NotRequired fields filled
-    assert config["loss_fn"]["disable_ppo_ratio"] is False
-    assert config["loss_fn"]["force_on_policy_ratio"] is False
+    assert result["loss_fn"]["disable_ppo_ratio"] is False
+    assert result["loss_fn"]["force_on_policy_ratio"] is False
+    # extra top-level section preserved
+    assert result["policy"]["some_policy_key"] is True
+    # extra keys inside grpo preserved
+    assert result["grpo"]["num_prompts_per_step"] == 32
+
+
+def test_grpo_master_defaults_with_exemplar_yaml():
+    """validate_config on full exemplar YAML should not raise."""
+    yaml_dict = _load_exemplar()
+    result = validate_config(yaml_dict, GRPOMasterConfigDefaults)
+    # All original keys must still be present
+    assert "grpo" in result
+    assert "loss_fn" in result
+    assert "policy" in result
+    assert "data" in result

@@ -125,3 +125,52 @@ Tests verified via standalone script (full pytest requires `ray`/`torch` in CI).
 | `tests/unit/test_config_defaults.py` | **New** | +234 |
 | `docs/design-docs/dataclass-config-defaults.md` | Modified | ~20 lines updated |
 | `.claude/skills/config-conventions/SKILL.md` | Modified | +37 -12 |
+
+---
+
+### Session 3 — Pydantic "left join" upgrade (2026-04-20)
+
+Implements @terrykong's ideal "left join" pattern from #2102: validate types via pydantic,
+fill defaults, and preserve extra keys for backward compatibility.
+
+#### 1. `nemo_rl/utils/config.py` — Core upgrade
+
+| # | Change |
+|---|--------|
+| 1 | Added import: `warnings`, `from pydantic import TypeAdapter` |
+| 2 | Added `_merge_extras_back(validated, user)` — recursively restores extra keys dropped by `extra='ignore'` |
+| 3 | Added `validate_config(user_config, schema)` — the new "left join": TypeAdapter validates + fills defaults + merge extras back |
+| 4 | Refactored `apply_config_defaults()` to deprecated wrapper — emits `DeprecationWarning`, delegates to `validate_config` for pydantic dataclasses, legacy fallback for stdlib dataclasses |
+
+#### 2. `nemo_rl/algorithms/grpo.py` — Pydantic dataclass migration
+
+| # | Change |
+|---|--------|
+| 1 | Changed import: `from dataclasses import dataclass, field` → `from dataclasses import field` + `from pydantic import ConfigDict` + `from pydantic.dataclasses import dataclass` |
+| 2 | Added `_EXTRA_IGNORE = ConfigDict(extra="ignore")` shared config |
+| 3 | All 7 `*ConfigDefaults` classes: `@dataclass` → `@dataclass(config=_EXTRA_IGNORE)` |
+
+#### 3. `examples/run_grpo.py`, `run_vlm_grpo.py`, `run_grpo_sliding_puzzle.py`, `nemo_gym/run_grpo_nemo_gym.py`
+
+| # | Change |
+|---|--------|
+| 1 | Import: `apply_config_defaults` → `validate_config` |
+| 2 | Call site: `apply_config_defaults(config, ...)` → `validate_config(config, ...)` |
+
+#### 4. `tests/unit/test_config_defaults.py` — Rewritten
+
+| Test category | Count | Description |
+|---------------|-------|-------------|
+| Field-subset tests | 5 | Unchanged — verify defaults fields ⊆ TypedDict fields |
+| YAML consistency tests | 3 | Unchanged — verify defaults match exemplar YAML |
+| `validate_config` unit tests | 6 | Missing keys, existing keys, nested recursion, missing section, extra keys preserved, nested extra keys preserved |
+| Type validation tests (NEW) | 4 | Wrong type → ValidationError, nested type error, coercion (str→int), nullable fields |
+| Backward compat tests (NEW) | 2 | `apply_config_defaults` emits DeprecationWarning, produces same result |
+| Integration tests | 2 | GRPOMasterConfigDefaults realistic config, exemplar YAML round-trip |
+
+#### 5. Design documentation
+
+| File | Changes |
+|------|---------|
+| `dataclass-config-defaults.md` | Updated principle, architecture examples, core utility code block, FAQ to reflect pydantic validation |
+| `dataclass-config-defaults-changelog.md` | Added Session 3 entry |

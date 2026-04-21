@@ -50,10 +50,10 @@ from nemo_rl.environments.utils import create_env
 from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
-    apply_config_defaults,
     load_config,
     parse_hydra_overrides,
     register_omegaconf_resolvers,
+    validate_config,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
 
@@ -139,7 +139,7 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config: MasterConfig = OmegaConf.to_container(config, resolve=True)
-    config = apply_config_defaults(config, GRPOMasterConfigDefaults)
+    config = validate_config(config, GRPOMasterConfigDefaults)
     print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
