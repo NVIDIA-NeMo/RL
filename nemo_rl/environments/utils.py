@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import Any, Dict, NotRequired, TypedDict
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Any, Dict, NotRequired, TypedDict
+else:
+    from typing import Any, Dict, TypedDict
+    from typing_extensions import NotRequired
 
 from hydra.utils import get_object
 

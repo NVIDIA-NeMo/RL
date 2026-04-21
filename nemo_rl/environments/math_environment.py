@@ -15,7 +15,12 @@ import contextlib
 import io
 import logging
 import re
-from typing import Any, NotRequired, TypedDict, Union
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Any, NotRequired, TypedDict, Union
+else:
+    from typing import Any, TypedDict, Union
+    from typing_extensions import NotRequired
 
 import ray
 import torch

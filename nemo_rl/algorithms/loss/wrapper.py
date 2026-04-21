@@ -19,7 +19,6 @@ import torch
 import torch.distributed
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
@@ -248,6 +247,10 @@ class DraftLossWrapper:
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
+        # Import lazily so non-draft workflows don't fail if this optional
+        # symbol is absent in custom/rebased loss_functions implementations.
+        from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
+
         self.draft_loss_fn = DraftCrossEntropyLossFn(
             vocab_parallel_group=vocab_parallel_group,
         )

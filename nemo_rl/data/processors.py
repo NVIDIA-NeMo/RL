@@ -593,10 +593,15 @@ def vlm_hf_data_processor(
 
 
 def _construct_multichoice_prompt(
-    prompt: str, question: str, options: dict[str, str]
+    prompt: str,
+    question: str,
+    options: dict[str, str],
+    few_shot_prefix: str = "",
 ) -> str:
-    """Construct prompt from question and options."""
+    """Construct prompt from question and options, with optional few-shot examples."""
     output = prompt
+    if few_shot_prefix:
+        output += f"\n\n{few_shot_prefix}"
     output += f"\n\nQuestion: {question}\nOptions:\n"
     output += "\n".join(
         [
@@ -645,7 +650,10 @@ def multichoice_qa_processor(
     # user prompt
     if task_data_spec.prompt:
         question = _construct_multichoice_prompt(
-            task_data_spec.prompt, question, options
+            task_data_spec.prompt,
+            question,
+            options,
+            few_shot_prefix=datum_dict.get("few_shot_prefix", ""),
         )
     user_message = {"role": "user", "content": question}
     message = tokenizer.apply_chat_template(

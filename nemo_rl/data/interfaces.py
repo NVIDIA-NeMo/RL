@@ -13,7 +13,12 @@
 # limitations under the License.
 import os
 from dataclasses import dataclass
-from typing import Any, NotRequired, Optional, Protocol, TypedDict, Union
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Any, NotRequired, Optional, Protocol, TypedDict, Union
+else:
+    from typing import Any, Optional, Protocol, TypedDict, Union
+    from typing_extensions import NotRequired
 
 import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase

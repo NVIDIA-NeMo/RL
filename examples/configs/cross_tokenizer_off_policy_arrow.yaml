@@ -1,0 +1,267 @@
+# Cross-Tokenizer Off-Policy Distillation Configuration
+# Student: Llama-3.2-1B (128K vocab) <- Teacher: Phi-4-mini-instruct
+#
+# Requires a precomputed projection matrix. Generate with:
+#   python nemo_rl/utils/x_token/minimal_projection_via_multitoken.py \
+#     --student-model meta-llama/Llama-3.2-1B \
+#     --teacher-model microsoft/Phi-4-mini-instruct
+#
+# Then optionally enforce exact matches:
+#   python nemo_rl/utils/x_token/reapply_exact_map.py \
+#     --student-model meta-llama/Llama-3.2-1B \
+#     --teacher-model microsoft/Phi-4-mini-instruct \
+#     --initial-projection-path cross_tokenizer_data/transformation_counts_via_multitoken.pt
+
+token_aligner:
+  enabled: true
+  projection_matrix_path: "cross_tokenizer_data/projection_map_Llama-3.2_to_Phi-4-mini-instruct_multitoken_top_32_double_special.pt"
+  use_sparse_format: false
+  loss_type: "KL"
+  exact_token_match_only: false
+  temperature: 1.0
+  vocab_topk: 8192
+  reverse_kl: false
+  projection_matrix_multiplier: 1.0
+  max_comb_len: 4
+  learnable: false
+  project_teacher_to_student: false   # Remove this  
+  use_char_offset: false
+  use_align_fast: true
+  use_cuda_dp: false
+  dp_chunk_size: 128
+
+distillation:
+  num_prompts_per_step: 768
+  num_generations_per_prompt: 1
+  max_num_steps: 80000
+  max_num_epochs: 1
+  val_period: 1000
+  val_at_start: false
+  max_val_samples: 128
+  val_batch_size: 64
+  topk_logits_k: 8192
+  use_ipc: true
+  loss_on_all_tokens: true
+  seed: 42
+  # Number of CPU processes for cross-tokenizer decode/encode/align.
+  # Heuristic currently used: total GPUs / 2 (16 nodes * 8 GPUs = 128 -> 64 workers).
+  # Note: this is workload-dependent; tune per batch size and cluster shape.
+  cross_tokenizer_num_workers: 64
+
+loss_fn:
+  loss_type: "KL"
+  temperature: 1.0
+  vocab_topk: 8192
+  exact_token_match_only: false
+  reverse_kl: false
+  project_teacher_to_student: false
+  gold_loss: true
+  xtoken_loss: true
+  ce_loss_scale: 0.1
+  dynamic_loss_scaling: true
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "checkpoints/cross-tokenizer-distillation-llama1b-phi4mini-instruct"
+  metric_name: "train:loss"
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 10
+  save_optimizer: true
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+policy:
+  model_name: "meta-llama/Llama-3.2-1B"
+  tokenizer:
+    name: "meta-llama/Llama-3.2-1B"
+    chat_template: null
+  train_global_batch_size: 768
+  train_micro_batch_size: 1
+  max_total_sequence_length: 4096
+  precision: "bfloat16"
+
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  max_grad_norm: 1.0
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.1
+      betas: [0.9, 0.98]
+      eps: 1e-5
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.02
+        end_factor: 1.0
+        total_iters: 4000
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+      kwargs:
+        T_max: 76000
+        eta_min: 0.0
+    - milestones: [4000]
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: 2048
+    temperature: 0.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: "bfloat16"
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: 2048
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      distributed_executor_backend: null
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 4096
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 4096
+    sequence_length_round: 64
+
+teacher:
+  model_name: "microsoft/Phi-4-mini-instruct"
+  tokenizer:
+    name: "microsoft/Phi-4-mini-instruct"
+    chat_template: null
+  precision: "bfloat16"
+  train_global_batch_size: 768
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  max_grad_norm: 1.0
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 4096
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 4096
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.1
+      betas: [0.9, 0.98]
+      eps: 1e-5
+      foreach: false
+      fused: false
+
+  generation: null
+
+data:
+  max_input_seq_length: 4096
+  shuffle: true
+  train:
+    dataset_name: "arrow_text"
+    # Preferred local path input for large-scale jobs (set via CLI override or submit script).
+    arrow_files: null
+    prompt_file: null
+  default:
+    # Fallback dataset used when train.arrow_files is not provided.
+    dataset_path: "allenai/c4"
+    hf_dataset_name: "allenai/c4"
+    hf_dataset_subset: "en"
+    hf_split: "train"
+    text_key: "text"
+
+eval:
+  val_period: 1000
+  val_at_start: false
+  max_val_samples: 512
+  val_batch_size: 64
+  max_rollout_turns: 1
+  benchmarks:
+    math:
+      dataset_name: "math"
+      prompt_file: "examples/prompts/cot.txt"
+      env:
+        num_workers: 8
+    mmlu:
+      dataset_name: "mmlu"
+      prompt_file: "examples/prompts/mmlu.txt"
+      env:
+        num_workers: 8
+        verifier_type: "multilingual_multichoice"
+    mmlu_5shot:
+      dataset_name: "mmlu"
+      prompt_file: "examples/prompts/mmlu.txt"
+      num_few_shot: 5
+      env:
+        num_workers: 8
+        verifier_type: "multilingual_multichoice"
+
+logger:
+  log_dir: "logs/cross-tokenizer-distillation-llama1b-phi4mini-instruct"
+  num_val_samples_to_print: 5
+  wandb_enabled: true
+  swanlab_enabled: false
+  mlflow_enabled: false
+  tensorboard_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "nemo-cross-tokenizer-distillation"
+    name: "cross-tokenizer-llama1b-phi4mini-instruct-bs768"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16

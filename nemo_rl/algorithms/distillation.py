@@ -13,7 +13,13 @@
 # limitations under the License.
 import os
 import warnings
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from pathlib import Path
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+else:
+    from typing import Any, Optional, TypedDict, TypeVar, cast
+    from typing_extensions import NotRequired
 
 import numpy as np
 import ray
@@ -23,7 +29,7 @@ from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import _should_use_async_rollouts, refit_policy_generation
-from nemo_rl.algorithms.loss import (
+from nemo_rl.algorithms.loss.loss_functions import (
     DistillationLossConfig,
     DistillationLossDataDict,
     DistillationLossFn,
@@ -79,9 +85,6 @@ class DistillationConfig(TypedDict):
     val_batch_size: int
     val_period: int
     val_at_start: bool
-    # Whether to run validation on the last training step. Setting this to True ensures the
-    # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
-    val_at_end: bool
     max_val_samples: int
     topk_logits_k: int
     seed: int
@@ -259,11 +262,7 @@ def setup(
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
     # If validation is enabled, load the validation dataloader
-    if (
-        distillation_config["val_period"] > 0
-        or distillation_config["val_at_start"]
-        or distillation_config["val_at_end"]
-    ):
+    if distillation_config["val_period"] > 0 or distillation_config["val_at_start"]:
         assert val_dataset is not None, (
             "Validation dataset is required if validation is enabled"
         )
@@ -412,7 +411,7 @@ def setup(
         generation_config = cast(VllmConfig, generation_config)
         if "vllm_cfg" in generation_config:
             ## make vllm hf overrides match the training policy
-            generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
+            generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
                 "hf_config_overrides", {}
             )
         student_generation = VllmGeneration(
@@ -430,7 +429,12 @@ def setup(
     print("\n▶ Setting up student policy...", flush=True)
 
     # Checkpoint paths
-    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    if last_checkpoint_path:
+        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+    else:
+        weights_path = None
+        optimizer_path = None
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         ## NOTE: this is equal to the total number of scheduler steps
@@ -540,7 +544,6 @@ def distillation_train(
     total_valid_tokens = distillation_save_state["total_valid_tokens"]
     val_period = master_config["distillation"]["val_period"]
     val_at_start = master_config["distillation"]["val_at_start"]
-    val_at_end = master_config["distillation"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
     max_epochs = master_config["distillation"][
         "max_num_epochs"
@@ -697,12 +700,13 @@ def distillation_train(
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
                     teacher_topk = teacher_policy.get_topk_logits(
-                        train_data,
-                        k=master_config["distillation"]["topk_logits_k"],
-                        timer=timer,
+                        train_data, k=master_config["distillation"]["topk_logits_k"]
                     )
-                    train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
-                    train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                    if isinstance(teacher_topk, list):
+                        train_data["teacher_topk_ipc_handles"] = teacher_topk
+                    else:
+                        train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+                        train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -712,21 +716,15 @@ def distillation_train(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
-                    train_results = student_policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    train_results = student_policy.train(train_data, loss_fn)
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
                     and (current_step + 1 == len(dataloader))
                 )
 
-                # Run validation if it's a validation step or last step with val_at_end
-                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
+                # Run validation if it's a validation step
+                if val_period > 0 and (total_steps + 1) % val_period == 0:
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
                             student_policy, student_generation, colocated_inference
@@ -844,9 +842,7 @@ def distillation_train(
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            )
-                            if checkpointer.save_optimizer
-                            else None,
+                            ),
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
@@ -943,6 +939,7 @@ def distillation_train(
         # End of epoch
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+
 
 
 def validate(

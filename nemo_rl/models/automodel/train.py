@@ -45,7 +45,12 @@ from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_inp
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.ipc_utils import (
+    get_handle_from_tensor,
+    rebuild_cuda_tensor_from_ipc,
+)
 from nemo_rl.distributed.model_utils import (
+    _compute_distributed_log_softmax,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
@@ -56,6 +61,8 @@ from nemo_rl.models.policy import PolicyConfig
 # Union type for any post-processing function
 PostProcessingFunction = Union[
     "LossPostProcessor",
+    "XTokenTeacherIPCLossPostProcessor",
+    "XTokenTeacherIPCExportPostProcessor",
     "LogprobsPostProcessor",
     "TopkLogitsPostProcessor",
     "ScorePostProcessor",
@@ -586,6 +593,265 @@ class LossPostProcessor:
             )
 
         return loss, loss_metrics
+
+
+class XTokenTeacherIPCLossPostProcessor(LossPostProcessor):
+    """Loss post-processor that injects teacher logits via CUDA IPC handles."""
+
+    def __init__(
+        self, *args: Any, teacher_result: Optional[dict[str, Any]] = None, **kwargs: Any
+    ):
+        super().__init__(*args, **kwargs)
+        self._teacher_result = teacher_result
+        self._microbatch_idx = 0
+
+    def set_microbatch_index(self, mb_idx: int) -> None:
+        self._microbatch_idx = mb_idx
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        data_dict: BatchedDataDict[Any],
+        processed_inputs: ProcessedInputs,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        sequence_dim: int = 1,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if self.cp_size > 1:
+            _, data_dict = prepare_data_for_cp(
+                data_dict, processed_inputs, self.cp_mesh, sequence_dim
+            )
+            logits = redistribute_logits_for_cp(
+                logits, self.device_mesh, self.cp_mesh, sequence_dim
+            )
+
+        if self.enable_seq_packing:
+            loss_fn_ = SequencePackingLossWrapper(
+                loss_fn=self.loss_fn,
+                cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
+                cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
+            )
+        else:
+            loss_fn_ = self.loss_fn
+
+        loss_kwargs = {}
+        if (
+            self._teacher_result is not None
+            and not self.enable_seq_packing
+            and "microbatch_handles" in self._teacher_result
+        ):
+            handles = self._teacher_result["microbatch_handles"]
+            if self._microbatch_idx < len(handles):
+                rank = torch.distributed.get_rank()
+                current_device_id = torch.cuda.current_device()
+                handle = handles[self._microbatch_idx]
+                aB, aS, aK = handle["actual_shape"]
+
+                teacher_logits_tensor = rebuild_cuda_tensor_from_ipc(
+                    handle[rank], current_device_id
+                ).detach()
+                teacher_logits_tensor = teacher_logits_tensor[:aB, :aS, :aK].clone()
+                loss_kwargs["teacher_logits"] = teacher_logits_tensor
+
+                is_topk = self._teacher_result.get("is_topk", False)
+                if is_topk and "topk_indices_ipc" in handle:
+                    teacher_topk_indices_tensor = rebuild_cuda_tensor_from_ipc(
+                        handle["topk_indices_ipc"], current_device_id
+                    ).detach()
+                    teacher_topk_indices_tensor = teacher_topk_indices_tensor[
+                        :aB, :aS, :aK
+                    ].clone()
+                    loss_kwargs["teacher_topk_indices_ipc"] = teacher_topk_indices_tensor
+
+        loss, loss_metrics = loss_fn_(
+            logits,
+            data_dict,
+            global_valid_seqs,
+            global_valid_toks,
+            **loss_kwargs,
+        )
+        return loss, loss_metrics
+
+
+class XTokenTeacherIPCExportPostProcessor(LossPostProcessor):
+    """Teacher-side post-processor that exports per-microbatch logits via CUDA IPC."""
+
+    def __init__(
+        self,
+        *args: Any,
+        tp_mesh: Any,
+        topk_logits: Optional[int],
+        is_mdlm: bool = False,
+        **kwargs: Any,
+    ):
+        # Keep explicit tp_mesh for local use and also forward it to base init.
+        super().__init__(*args, tp_mesh=tp_mesh, **kwargs)
+        self.tp_mesh = tp_mesh
+        self.topk_logits = topk_logits
+        self.is_mdlm = is_mdlm
+        self.microbatch_handles: list[dict[str, Any]] = []
+        self._microbatch_idx = 0
+        self._mb_vals_buffers: list[torch.Tensor] = []
+        self._mb_vals_ipcs: list[tuple[Any]] = []
+        self._mb_idx_buffers: list[torch.Tensor] = []
+        self._mb_idx_ipcs: list[tuple[Any]] = []
+        self._mb_logits_buffers: list[torch.Tensor] = []
+        self._mb_logits_ipcs: list[tuple[Any]] = []
+
+    def set_microbatch_index(self, mb_idx: int) -> None:
+        self._microbatch_idx = mb_idx
+
+    def _ensure_topk_buffer(
+        self,
+        buf_idx: int,
+        B: int,
+        S: int,
+        K: int,
+        vals_dtype: torch.dtype,
+        idx_dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        while len(self._mb_vals_buffers) <= buf_idx:
+            vals_buf = torch.empty((B, S, K), dtype=vals_dtype, device=device)
+            idx_buf = torch.empty((B, S, K), dtype=idx_dtype, device=device)
+            self._mb_vals_buffers.append(vals_buf)
+            self._mb_vals_ipcs.append(get_handle_from_tensor(vals_buf))
+            self._mb_idx_buffers.append(idx_buf)
+            self._mb_idx_ipcs.append(get_handle_from_tensor(idx_buf))
+        vals_buf = self._mb_vals_buffers[buf_idx]
+        idx_buf = self._mb_idx_buffers[buf_idx]
+        needs_realloc = (
+            vals_buf.shape[0] < B
+            or vals_buf.shape[1] < S
+            or vals_buf.shape[2] < K
+            or vals_buf.dtype != vals_dtype
+            or vals_buf.device != device
+            or idx_buf.shape[0] < B
+            or idx_buf.shape[1] < S
+            or idx_buf.shape[2] < K
+            or idx_buf.dtype != idx_dtype
+            or idx_buf.device != device
+        )
+        if needs_realloc:
+            vals_buf = torch.empty((B, S, K), dtype=vals_dtype, device=device)
+            idx_buf = torch.empty((B, S, K), dtype=idx_dtype, device=device)
+            self._mb_vals_buffers[buf_idx] = vals_buf
+            self._mb_vals_ipcs[buf_idx] = get_handle_from_tensor(vals_buf)
+            self._mb_idx_buffers[buf_idx] = idx_buf
+            self._mb_idx_ipcs[buf_idx] = get_handle_from_tensor(idx_buf)
+
+    def _ensure_logits_buffer(
+        self,
+        buf_idx: int,
+        B: int,
+        S: int,
+        V: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        while len(self._mb_logits_buffers) <= buf_idx:
+            buf = torch.empty((B, S, V), dtype=dtype, device=device)
+            self._mb_logits_buffers.append(buf)
+            self._mb_logits_ipcs.append(get_handle_from_tensor(buf))
+        buf = self._mb_logits_buffers[buf_idx]
+        needs_realloc = (
+            buf.shape[0] < B
+            or buf.shape[1] < S
+            or buf.shape[2] < V
+            or buf.dtype != dtype
+            or buf.device != device
+        )
+        if needs_realloc:
+            buf = torch.empty((B, S, V), dtype=dtype, device=device)
+            self._mb_logits_buffers[buf_idx] = buf
+            self._mb_logits_ipcs[buf_idx] = get_handle_from_tensor(buf)
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        data_dict: BatchedDataDict[Any],  # noqa: ARG002
+        processed_inputs: ProcessedInputs,  # noqa: ARG002
+        global_valid_seqs: torch.Tensor,  # noqa: ARG002
+        global_valid_toks: torch.Tensor,  # noqa: ARG002
+        sequence_dim: int = 1,  # noqa: ARG002
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if isinstance(logits, DTensor):
+            mb_logits_local = logits.to_local()
+        else:
+            mb_logits_local = logits
+
+        tp_group = self.tp_mesh.get_group()
+        tp_rank = torch.distributed.get_rank(tp_group)
+        V_local = int(mb_logits_local.shape[-1])
+        vocab_start_index = tp_rank * V_local
+        vocab_end_index = (tp_rank + 1) * V_local
+
+        mb_logits_local = mb_logits_local.to(torch.float32)
+        mb_log_prob = _compute_distributed_log_softmax(mb_logits_local, group=tp_group)
+        del mb_logits_local
+
+        if isinstance(mb_log_prob, DTensor):
+            mb_log_prob = mb_log_prob.to_local()
+
+        if self.is_mdlm:
+            shared_seq_len = int(mb_log_prob.shape[1] / 2)
+            mb_log_prob = mb_log_prob[:, shared_seq_len:, :]
+
+        if self.topk_logits is not None:
+            mb_topk_vals, mb_topk_idx = distributed_vocab_topk(
+                mb_log_prob,
+                k=self.topk_logits,
+                tp_group=tp_group,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index,
+            )
+            del mb_log_prob
+
+            B_mb, S_mb, K_mb = mb_topk_vals.shape
+            buf_idx = self._microbatch_idx
+            self._ensure_topk_buffer(
+                buf_idx,
+                B_mb,
+                S_mb,
+                K_mb,
+                mb_topk_vals.dtype,
+                mb_topk_idx.dtype,
+                mb_topk_vals.device,
+            )
+            self._mb_vals_buffers[buf_idx][:B_mb, :S_mb, :K_mb].copy_(mb_topk_vals)
+            self._mb_idx_buffers[buf_idx][:B_mb, :S_mb, :K_mb].copy_(mb_topk_idx)
+            del mb_topk_vals, mb_topk_idx
+
+            rank = torch.distributed.get_rank()
+            handle = {
+                rank: self._mb_vals_ipcs[buf_idx],
+                "actual_shape": (B_mb, S_mb, K_mb),
+                "topk_indices_ipc": self._mb_idx_ipcs[buf_idx],
+            }
+        else:
+            B_mb, S_mb, V_mb = mb_log_prob.shape
+            buf_idx = self._microbatch_idx
+            self._ensure_logits_buffer(
+                buf_idx,
+                B_mb,
+                S_mb,
+                V_mb,
+                mb_log_prob.dtype,
+                mb_log_prob.device,
+            )
+            self._mb_logits_buffers[buf_idx][:B_mb, :S_mb, :V_mb].copy_(mb_log_prob)
+            del mb_log_prob
+
+            rank = torch.distributed.get_rank()
+            handle = {
+                rank: self._mb_logits_ipcs[buf_idx],
+                "actual_shape": (B_mb, S_mb, V_mb),
+            }
+
+        self.microbatch_handles.append(handle)
+
+        dummy_loss = torch.zeros((), device="cuda", dtype=torch.float32)
+        return dummy_loss, {"num_valid_samples": 1.0}
 
 
 class LogprobsPostProcessor:

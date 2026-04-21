@@ -14,50 +14,72 @@
 
 import contextlib
 import gc
+import itertools
+import os
 import warnings
+from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Optional
+from typing import Any, Generator, Optional, cast
 
 import ray
 import torch
-from nemo_automodel.components._peft.lora import LinearLoRA
+from accelerate import init_empty_weights
+from hydra.utils import get_class
+from nemo_automodel import (
+    NeMoAutoModelForSequenceClassification,
+)
+from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.components._peft.lora import (
+    PeftConfig,
+    apply_lora_to_linear_modules,
+)
+from nemo_automodel.components.config.loader import _resolve_target
+from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
-)
-from nemo_automodel.components.distributed.cp_utils import (
     get_train_context as get_train_context_automodel,
+)
+from nemo_automodel.components.distributed.device_mesh import create_device_mesh
+from nemo_automodel.components.distributed.fsdp2 import (
+    FSDP2Manager,
 )
 from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
 )
+from nemo_automodel.components.moe.parallelizer import (
+    parallelize_model as moe_parallelize_model,
+)
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from torch import nn
-from torch.distributed.tensor import DTensor
+from torch.distributed.fsdp import (
+    CPUOffloadPolicy,
+    MixedPrecisionPolicy,
+)
+from torch.distributed.tensor import DTensor, Shard
+from transformers import (
+    AutoConfig,
+    AutoProcessor,
+    AutoTokenizer,
+    PreTrainedModel,
+)
+from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
-from nemo_rl.models.automodel.data import (
-    check_sequence_dim,
-    get_microbatch_iterator,
-    process_global_batch,
+from nemo_rl.distributed.model_utils import (
+    _compute_distributed_log_softmax,
+    allgather_cp_sharded_tensor,
+    distributed_vocab_topk,
+    get_logprobs_from_vocab_parallel_logits,
 )
-from nemo_rl.models.automodel.setup import (
-    setup_distributed,
-    setup_model_and_optimizer,
-    setup_reference_model_state,
-    validate_and_prepare_config,
+from nemo_rl.distributed.ipc_utils import (
+    get_handle_from_tensor,
 )
-from nemo_rl.models.automodel.train import (
-    LogprobsPostProcessor,
-    LossPostProcessor,
-    ScorePostProcessor,
-    TopkLogitsPostProcessor,
-    aggregate_training_statistics,
-    automodel_forward_backward,
-    forward_with_post_processing_fn,
+from nemo_rl.models.huggingface.common import (
+    get_flash_attention_kwargs,
+    pack_sequences,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -65,98 +87,47 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ScoreOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    configure_dynamo_cache,
+    get_runtime_env_for_policy_worker,
+    resolve_model_class,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import (
     apply_transformer_engine_patch,
 )
+from nemo_rl.models.automodel.setup import (
+    setup_distributed,
+    setup_model_and_optimizer,
+    setup_reference_model_state,
+    validate_and_prepare_config,
+)
+from nemo_rl.models.automodel.data import (
+    check_sequence_dim,
+    get_microbatch_iterator,
+    process_global_batch,
+)
+from nemo_rl.models.automodel.train import (
+    LossPostProcessor,
+    LogprobsPostProcessor,
+    ScorePostProcessor,
+    TopkLogitsPostProcessor,
+    XTokenTeacherIPCExportPostProcessor,
+    XTokenTeacherIPCLossPostProcessor,
+    aggregate_training_statistics,
+    automodel_forward_backward,
+    forward_with_post_processing_fn,
+)
+from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
-
-def dtensor_params_generator(
-    model: nn.Module, target_dtype: torch.dtype
-) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
-
-    Args:
-        model: The model whose parameters to generate.
-        target_dtype: The dtype to convert tensors to.
-        peft_config: Optional LoRA config for filtering which layers to merge.
-
-    Yields:
-        Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
-    """
-    module_map = dict(model.named_modules())
-    for name, tensor in model.state_dict().items():
-        if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
-            continue
-        full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
-        merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
-
-        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
-        for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            # Convert to target dtype
-            yield (
-                adapted_fqn,
-                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
-            )
-            del adapted_tensor
-        del adapted_fqn_tensors
-        del merged_tensor
-        del full_tensor
-
-
-@torch.no_grad()
-def _maybe_merge_lora_weight(
-    module_map: dict[str, nn.Module],
-    fqn: str,
-    tensor: torch.Tensor,
-) -> torch.Tensor:
-    if not fqn.endswith(".weight"):
-        return tensor
-    module_name = fqn[: -len(".weight")]
-    module = module_map.get(module_name)
-    if not isinstance(module, LinearLoRA):
-        return tensor
-    if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
-        return tensor
-
-    lora_a = (
-        module.lora_A.weight.full_tensor()
-        if isinstance(module.lora_A.weight, DTensor)
-        else module.lora_A.weight
-    )
-    lora_b = (
-        module.lora_B.weight.full_tensor()
-        if isinstance(module.lora_B.weight, DTensor)
-        else module.lora_B.weight
-    )
-    lora_a = lora_a.to(device=tensor.device, dtype=tensor.dtype)
-    lora_b = lora_b.to(device=tensor.device, dtype=tensor.dtype)
-    scale = getattr(module, "scale", None)
-
-    if scale is None and hasattr(module, "alpha") and hasattr(module, "dim"):
-        scale = module.alpha / module.dim
-    if scale is None:
-        scale = 1.0
-
-    return tensor + torch.matmul(lora_b, lora_a) * scale
-
-
-def _maybe_adapt_tensor_to_hf(
-    model_part: nn.Module, fqn: str, tensor: torch.Tensor, quantization: bool = False
-) -> list[tuple[str, torch.Tensor]]:
-    adapter = getattr(model_part, "state_dict_adapter", None)
-    if adapter:
-        return adapter.convert_single_tensor_to_hf(
-            fqn,
-            tensor,
-            exclude_key_regex=r".*_extra_state.*",
-            quantization=quantization,
-        )
-    return [(fqn, tensor)]
+STRING_TO_DTYPE = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
 
 
 @contextlib.contextmanager
@@ -172,7 +143,6 @@ def get_train_context(
     with contextlib.ExitStack() as stack:
         context_parallel_ctx = None
         if cp_size > 1:
-            # Create context parallel context
             context_parallel_ctx = create_context_parallel_ctx(
                 cp_mesh=cp_mesh,
                 cp_buffers=cp_buffers,
@@ -188,9 +158,10 @@ def get_train_context(
         yield
 
 
-# Classes with @ray.remote can't be inherited from, so we split the implementation out.
-# This is useful when using worker extension classes.
-class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface):
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+)  # pragma: no cover
+class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -204,6 +175,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     def __init__(
         self,
         config: PolicyConfig,
+        tokenizer: AutoTokenizer,
+        processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
@@ -214,44 +187,41 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
 
-        # Store configuration
         self.cfg = config
 
-        # Reconstruct tokenizer/processor locally to avoid pickling across
-        # incompatible transformers versions (v4 head node → v5 worker).
-        from nemo_rl.models.automodel.setup import get_tokenizer
+        # Keep legacy call compatibility (tokenizer/processor passed from caller),
+        # but default to main-branch local reconstruction path when needed.
+        if tokenizer is None:
+            from nemo_rl.models.automodel.setup import get_tokenizer
 
-        use_processor = config["tokenizer"].get("use_processor", False)
-        result = get_tokenizer(config["tokenizer"], get_processor=use_processor)
-        if use_processor:
-            self.processor = result
-            self.tokenizer = result.tokenizer
+            use_processor = config["tokenizer"].get("use_processor", False)
+            result = get_tokenizer(config["tokenizer"], get_processor=use_processor)
+            if use_processor:
+                self.processor = result
+                self.tokenizer = result.tokenizer
+            else:
+                self.tokenizer = result
+                self.processor = None
         else:
-            self.tokenizer = result
-            self.processor = None
+            self.tokenizer = tokenizer
+            self.processor = processor
         self.is_vlm = self.processor is not None
+        print(f"Initializing DTensorPolicyWorkerV2 with is_vlm={self.is_vlm}")
+
+        self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
         self.lora_enabled = (
             config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
 
-        print(f"Initializing DTensorPolicyWorkerV2 with is_vlm={self.is_vlm}")
-
-        # Initialize checkpoint manager
-        self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
-
-        # Validate configuration and prepare runtime settings
         runtime_config = validate_and_prepare_config(
             config=config,
             processor=self.processor,
-            rank=0,  # Temporary, will be updated after distributed init
+            rank=0,
         )
-
-        # Set up distributed environment (returns DistributedContext)
         distributed_context = setup_distributed(
             config=config,
             runtime_config=runtime_config,
         )
-        # Set instance attributes from distributed context
         self.rank = torch.distributed.get_rank()
         self.device_mesh = distributed_context.device_mesh
         self.dp_cp_mesh = self.device_mesh["dp_cp"]
@@ -263,7 +233,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         self.tp_size = distributed_context.tp_size
         self.cp_size = distributed_context.cp_size
 
-        # Initialize checkpoint manager now that distributed is set up
         self._init_checkpoint_manager(
             config_updates={
                 "model_repo_id": config["model_name"],
@@ -275,7 +244,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             },
         )
 
-        # Set up model and optimizer
         model_and_optimizer_state = setup_model_and_optimizer(
             config=config,
             tokenizer=self.tokenizer,
@@ -287,30 +255,28 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             weights_path=weights_path,
             optimizer_path=optimizer_path,
         )
-
-        # Set instance attributes from model and optimizer state (tuple unpacking)
         (
             self.model,
             self.optimizer,
             self.scheduler,
             self.is_hf_model,
             self.is_moe_model,
-            self._is_reward_model,  # Note: using underscore prefix for internal naming
+            self._is_reward_model,
             self.model_class,
             self.model_config,
             self.peft_config,
             self.autocast_enabled,
         ) = model_and_optimizer_state
 
-        # Initialize reference model if requested
+        self._fix_phi_rope_meta_buffers()
+
         self.reference_model_state_dict = None
         if init_reference_model:
             self.reference_model_state_dict = setup_reference_model_state(self.model)
 
-        # Set instance attributes from runtime config (tuple unpacking)
         (
-            self.model_class,  # Already set above, but includes in tuple for completeness
-            self.model_config,  # Already set above, but includes in tuple for completeness
+            self.model_class,
+            self.model_config,
             self.hf_config_overrides,
             self.allow_flash_attn_args,
             self.attn_impl,
@@ -321,8 +287,100 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             self.offload_optimizer_for_logprob,
             self.is_generation_colocated,
             self.sampling_params,
-            _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
+            _runtime_is_reward_model,
         ) = runtime_config
+
+    def _fix_phi_rope_meta_buffers(self) -> None:
+        """Repair Phi RoPE original_inv_freq when loaded from meta init.
+
+        Some Phi remote-code revisions keep `original_inv_freq` as a meta tensor
+        after model materialization, which later crashes in `.to(device)` calls.
+        """
+        model_name = str(self.cfg.get("model_name", "")).lower()
+        architectures = getattr(getattr(self, "model_config", None), "architectures", [])
+        arch_blob = " ".join(
+            a.lower() for a in architectures if isinstance(a, str)
+        )
+        # Scope to Phi-4/Phi3-style remote-code paths only.
+        if "phi-4" not in model_name and "phi4" not in model_name and "phi3" not in arch_blob:
+            return
+
+        fixed_count = 0
+        for module in self.model.modules():
+            if not hasattr(module, "inv_freq"):
+                continue
+            inv_freq = getattr(module, "inv_freq")
+            original_inv_freq = getattr(module, "original_inv_freq", None)
+
+            inv_needs_repair = torch.is_tensor(inv_freq) and (
+                getattr(inv_freq, "is_meta", False) or (not torch.isfinite(inv_freq).all())
+            )
+            original_needs_repair = torch.is_tensor(original_inv_freq) and (
+                getattr(original_inv_freq, "is_meta", False)
+                or (not torch.isfinite(original_inv_freq).all())
+            )
+
+            if not inv_needs_repair and not original_needs_repair:
+                continue
+
+            if hasattr(module, "rope_init_fn") and hasattr(module, "config"):
+                try:
+                    repaired_inv_freq, _ = module.rope_init_fn(
+                        module.config, torch.device("cuda")
+                    )
+                    if hasattr(module, "_buffers") and "inv_freq" in module._buffers:
+                        module._buffers["inv_freq"] = repaired_inv_freq
+                    else:
+                        module.inv_freq = repaired_inv_freq
+                    if hasattr(module, "original_inv_freq"):
+                        module.original_inv_freq = repaired_inv_freq.detach().clone()
+                    fixed_count += 1
+                except Exception:
+                    # Keep original behavior if re-init fails for any model variant.
+                    pass
+
+        if fixed_count > 0 and self.rank == 0:
+            print(
+                f"[Phi4 compatibility] repaired {fixed_count} RoPE meta buffer(s) after model setup."
+            )
+
+    def _apply_temperature_scaling(self, logits: torch.Tensor, skip: bool = False) -> torch.Tensor:
+        if skip:
+            return logits
+        if "generation" in self.cfg and self.cfg["generation"] is not None:
+            temp = self.cfg["generation"]["temperature"]
+            if temp > 0:
+                logits.div_(temp)
+        return logits
+
+    def init_cross_tokenizer_loss_fn(self, loss_config, token_aligner_config):
+        """Build CrossTokenizerDistillationLossFn locally from config + shared filesystem."""
+        from nemo_rl.algorithms.x_token import TokenAligner
+        from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
+
+        aligner = TokenAligner(
+            teacher_tokenizer_name=token_aligner_config["teacher_model"],
+            student_tokenizer_name=token_aligner_config["student_model"],
+            max_comb_len=token_aligner_config.get("max_comb_len", 4),
+            projection_matrix_multiplier=token_aligner_config.get("projection_matrix_multiplier", 1.0),
+        )
+        aligner._load_logits_projection_map(
+            file_path=token_aligner_config["projection_matrix_path"],
+            use_sparse_format=token_aligner_config.get("use_sparse_format", True),
+            learnable=token_aligner_config.get("learnable", False),
+            device="cpu",
+        )
+        if token_aligner_config.get("project_teacher_to_student", False):
+            aligner.create_reverse_projection_matrix(device="cpu")
+        self._cached_loss_fn = CrossTokenizerDistillationLossFn(loss_config, aligner)
+
+    def update_cross_tokenizer_data(self, teacher_input_ids, aligned_pairs) -> None:
+        """Update per-step cross-tokenizer data on the cached loss function."""
+        if hasattr(self, '_cached_loss_fn') and self._cached_loss_fn is not None:
+            self._cached_loss_fn.set_cross_tokenizer_data(
+                teacher_input_ids=teacher_input_ids,
+                aligned_pairs=aligned_pairs,
+            )
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -332,8 +390,14 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        is_teacher: bool = False,
+        teacher_logits: Optional[Any] = None,
+        topk_logits: Optional[int] = None,
+        use_teacher_ipc_loss_postprocessor: bool = False,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        if loss_fn is None:
+            loss_fn = getattr(self, '_cached_loss_fn', None)
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -347,31 +411,173 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         )
         num_global_batches = int(total_dataset_size.item()) // gbs
 
-        # Validate sequence dimension
+        # Student path: use mainline automodel forward/backward.
+        if not is_teacher:
+            sequence_dim, _ = check_sequence_dim(data)
+            if eval_mode:
+                ctx: AbstractContextManager[Any] = torch.no_grad()
+                self.model.eval()
+            else:
+                ctx = nullcontext()
+                self.model.train()
+
+            teacher_worker_result = None
+            if teacher_logits is not None:
+                rank = torch.distributed.get_rank()
+                teacher_worker_result = teacher_logits[rank]
+
+            def train_context_fn(processed_inputs):
+                return get_train_context(
+                    cp_size=self.cp_size,
+                    cp_mesh=self.cp_mesh,
+                    cp_buffers=processed_inputs.cp_buffers,
+                    sequence_dim=sequence_dim,
+                    dtype=self.dtype,
+                    autocast_enabled=self.autocast_enabled,
+                )
+
+            empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
+                "clear_cache_every_n_steps"
+            )
+            if empty_cache_steps:
+                warnings.warn(
+                    f"Emptying cache every {empty_cache_steps} microbatches; doing so unnecessarily would incur a large performance overhead.",
+                )
+
+            if use_teacher_ipc_loss_postprocessor and teacher_worker_result is not None:
+                loss_post_processor = XTokenTeacherIPCLossPostProcessor(
+                    loss_fn=loss_fn,
+                    cfg=self.cfg,
+                    device_mesh=self.device_mesh,
+                    cp_mesh=self.cp_mesh,
+                    tp_mesh=self.tp_mesh,
+                    cp_size=self.cp_size,
+                    dp_size=self.dp_size,
+                    enable_seq_packing=self.enable_seq_packing,
+                    sampling_params=None,
+                    teacher_result=teacher_worker_result,
+                )
+            else:
+                loss_post_processor = LossPostProcessor(
+                    loss_fn=loss_fn,
+                    cfg=self.cfg,
+                    device_mesh=self.device_mesh,
+                    cp_mesh=self.cp_mesh,
+                    tp_mesh=self.tp_mesh,
+                    cp_size=self.cp_size,
+                    dp_size=self.dp_size,
+                    enable_seq_packing=self.enable_seq_packing,
+                    sampling_params=None,
+                )
+
+            def on_microbatch_start(mb_idx):
+                if use_teacher_ipc_loss_postprocessor and hasattr(
+                    loss_post_processor, "set_microbatch_index"
+                ):
+                    loss_post_processor.set_microbatch_index(mb_idx)
+                if empty_cache_steps and mb_idx % empty_cache_steps == 0:
+                    torch.cuda.empty_cache()
+
+            with ctx:
+                data = data.to("cuda")
+                losses = []
+                all_mb_metrics = []
+                grad_norm: Optional[float | torch.Tensor] = None
+
+                for gb_idx in range(num_global_batches):
+                    gb_result = process_global_batch(
+                        data,
+                        loss_fn,
+                        self.dp_mesh.get_group(),
+                        batch_idx=gb_idx,
+                        batch_size=local_gbs,
+                    )
+                    batch = gb_result["batch"]
+                    global_valid_seqs = gb_result["global_valid_seqs"]
+                    global_valid_toks = gb_result["global_valid_toks"]
+
+                    self.optimizer.zero_grad()
+                    processed_iterator, iterator_len = get_microbatch_iterator(
+                        batch,
+                        self.cfg,
+                        mbs,
+                        self.dp_mesh,
+                        tokenizer=self.tokenizer,
+                        cp_size=self.cp_size,
+                    )
+
+                    mb_results = automodel_forward_backward(
+                        model=self.model,
+                        data_iterator=processed_iterator,
+                        post_processing_fn=loss_post_processor,
+                        forward_only=eval_mode,
+                        is_reward_model=self._is_reward_model,
+                        allow_flash_attn_args=self.allow_flash_attn_args,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        sampling_params=None,
+                        sequence_dim=sequence_dim,
+                        dp_size=self.dp_size,
+                        cp_size=self.cp_size,
+                        num_global_batches=num_global_batches,
+                        train_context_fn=train_context_fn,
+                        num_valid_microbatches=iterator_len,
+                        on_microbatch_start=on_microbatch_start,
+                    )
+
+                    mb_losses = []
+                    for mb_idx, (loss, loss_metrics) in enumerate(mb_results):
+                        if mb_idx < iterator_len:
+                            num_valid_samples = loss_metrics["num_valid_samples"]
+                            loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                            loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                            loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                            if num_valid_samples > 0:
+                                mb_losses.append(loss.item())
+                                all_mb_metrics.append(loss_metrics)
+
+                    if not eval_mode:
+                        grad_norm = scale_grads_and_clip_grad_norm(
+                            self.max_grad_norm,
+                            [self.model],
+                            norm_type=2.0,
+                            pp_enabled=False,
+                            device_mesh=self.device_mesh,
+                            moe_mesh=self.moe_mesh,
+                            ep_axis_name="ep"
+                            if self.moe_mesh is not None
+                            and "ep" in self.moe_mesh.mesh_dim_names
+                            else None,
+                            pp_axis_name=None,
+                            foreach=True,
+                            num_label_tokens=1,
+                            dp_group_size=self.dp_size * self.cp_size,
+                        )
+                        grad_norm = torch.tensor(
+                            grad_norm, device="cpu", dtype=torch.float32
+                        )
+                        self.optimizer.step()
+
+                    losses.append(torch.tensor(mb_losses).sum().item())
+
+                self.optimizer.zero_grad()
+                if not eval_mode:
+                    self.scheduler.step()
+                torch.cuda.empty_cache()
+
+                return aggregate_training_statistics(
+                    losses=losses,
+                    all_mb_metrics=all_mb_metrics,
+                    grad_norm=grad_norm,
+                    dp_group=self.dp_mesh.get_group(),
+                    dtype=self.dtype,
+                )
+
+        # Teacher path aligned with automodel forward/backward and IPC export post-processor.
         sequence_dim, _ = check_sequence_dim(data)
+        ctx = torch.no_grad()
+        self.model.eval()
 
-        if eval_mode:
-            ctx: AbstractContextManager[Any] = torch.no_grad()
-            self.model.eval()
-        else:
-            ctx = nullcontext()
-            # Ensure model is in training mode
-            self.model.train()
-
-        # Create loss post-processor
-        loss_post_processor = LossPostProcessor(
-            loss_fn=loss_fn,
-            cfg=self.cfg,
-            device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
-            tp_mesh=self.tp_mesh,
-            cp_size=self.cp_size,
-            dp_size=self.dp_size,
-            enable_seq_packing=self.enable_seq_packing,
-            sampling_params=self.sampling_params,
-        )
-
-        # Create train context factory
         def train_context_fn(processed_inputs):
             return get_train_context(
                 cp_size=self.cp_size,
@@ -382,7 +588,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 autocast_enabled=self.autocast_enabled,
             )
 
-        # Setup cache clearing callback if configured
         empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
             "clear_cache_every_n_steps"
         )
@@ -391,18 +596,28 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 f"Emptying cache every {empty_cache_steps} microbatches; doing so unnecessarily would incur a large performance overhead.",
             )
 
+        teacher_post_processor = XTokenTeacherIPCExportPostProcessor(
+            loss_fn=loss_fn,
+            cfg=self.cfg,
+            device_mesh=self.device_mesh,
+            cp_mesh=self.cp_mesh,
+            tp_mesh=self.tp_mesh,
+            cp_size=self.cp_size,
+            dp_size=self.dp_size,
+            enable_seq_packing=self.enable_seq_packing,
+            sampling_params=None,
+            topk_logits=topk_logits,
+            is_mdlm=self.cfg.get("is_mdlm", False),
+        )
+
         def on_microbatch_start(mb_idx):
+            teacher_post_processor.set_microbatch_index(mb_idx)
             if empty_cache_steps and mb_idx % empty_cache_steps == 0:
                 torch.cuda.empty_cache()
 
         with ctx:
-            # Get data from batch and move to device
             data = data.to("cuda")
-
-            losses = []
-            all_mb_metrics = []
             for gb_idx in range(num_global_batches):
-                # Process global batch and compute normalization factors
                 gb_result = process_global_batch(
                     data,
                     loss_fn,
@@ -414,9 +629,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
-                self.optimizer.zero_grad()
-
-                # Get microbatch iterator based on batching strategy
                 processed_iterator, iterator_len = get_microbatch_iterator(
                     batch,
                     self.cfg,
@@ -426,17 +638,16 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     cp_size=self.cp_size,
                 )
 
-                # Use automodel_forward_backward for the training loop
-                mb_results = automodel_forward_backward(
+                automodel_forward_backward(
                     model=self.model,
                     data_iterator=processed_iterator,
-                    post_processing_fn=loss_post_processor,
-                    forward_only=eval_mode,
+                    post_processing_fn=teacher_post_processor,
+                    forward_only=True,
                     is_reward_model=self._is_reward_model,
                     allow_flash_attn_args=self.allow_flash_attn_args,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
-                    sampling_params=self.sampling_params,
+                    sampling_params=None,
                     sequence_dim=sequence_dim,
                     dp_size=self.dp_size,
                     cp_size=self.cp_size,
@@ -445,68 +656,17 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
                 )
+                break
 
-                # Extract losses and metrics from results
-                mb_losses = []
-                for mb_idx, (loss, loss_metrics) in enumerate(mb_results):
-                    # Only process valid (non-dummy) batches for metrics
-                    if mb_idx < iterator_len:
-                        num_valid_samples = loss_metrics["num_valid_samples"]
-                        loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
-                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
-                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
+        # Ensure writes to IPC-exported buffers are complete before returning handles.
+        torch.cuda.current_stream().synchronize()
+        self.teacher_logits = {
+            "microbatch_handles": teacher_post_processor.microbatch_handles,
+            "is_topk": topk_logits is not None,
+        }
+        return self.teacher_logits
 
-                        if num_valid_samples > 0:
-                            mb_losses.append(loss.item())
-                            all_mb_metrics.append(loss_metrics)
-
-                grad_norm: Optional[float | torch.Tensor] = None
-                if not eval_mode:
-                    grad_norm = scale_grads_and_clip_grad_norm(
-                        self.max_grad_norm,
-                        [self.model],
-                        norm_type=2.0,
-                        pp_enabled=False,
-                        device_mesh=self.device_mesh,
-                        moe_mesh=self.moe_mesh,
-                        ep_axis_name="ep"
-                        if self.moe_mesh is not None
-                        and "ep" in self.moe_mesh.mesh_dim_names
-                        else None,
-                        pp_axis_name=None,
-                        foreach=True,
-                        num_label_tokens=1,
-                        dp_group_size=self.dp_size * self.cp_size,
-                    )
-                    grad_norm = torch.tensor(
-                        grad_norm, device="cpu", dtype=torch.float32
-                    )
-
-                    # Update parameters
-                    self.optimizer.step()
-
-                losses.append(torch.tensor(mb_losses).sum().item())
-
-            # release gradient memory before rollouts
-            self.optimizer.zero_grad()
-            # increment scheduler after all batches in rollout are processed
-            if not eval_mode:
-                self.scheduler.step()
-            # dynamic batch and sequence dims causes alot of fragmentation, so clear
-            # the memory allocator before moving on
-            torch.cuda.empty_cache()
-
-            # Aggregate training statistics across microbatches and ranks
-            metrics = aggregate_training_statistics(
-                losses=losses,
-                all_mb_metrics=all_mb_metrics,
-                grad_norm=grad_norm,
-                dp_group=self.dp_mesh.get_group(),
-                dtype=self.dtype,
-            )
-
-            return metrics
-
+    # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
     def get_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
@@ -743,10 +903,40 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 if batch_idx >= iterator_len:
                     continue
 
-                # Keep only real sequence tokens (no trimming here; padded positions can be masked downstream)
                 # Shapes remain [B, S, k].
-                out_topk_vals.append(vals.cpu())
-                out_topk_idx.append(idx.cpu())
+                B_mb, S_mb, K_mb = vals.shape
+                target_dtype = vals.dtype
+                target_device = vals.device
+
+                # Pre-allocate two IPC buffers (values + indices) exactly once.
+                if not hasattr(self, '_teacher_topk_vals_buffer') or self._teacher_topk_vals_buffer is None:
+                    max_S = self.cfg.get("max_total_sequence_length", S_mb)
+                    vals_buf_shape = (B_mb, max_S, K_mb)
+                    self._teacher_topk_vals_buffer = torch.empty(
+                        vals_buf_shape, dtype=target_dtype, device=target_device
+                    )
+                    self._teacher_topk_vals_ipc = {
+                        torch.distributed.get_rank(): get_handle_from_tensor(self._teacher_topk_vals_buffer)
+                    }
+                    idx_buf_shape = (B_mb, max_S, K_mb)
+                    self._teacher_topk_idx_buffer = torch.empty(
+                        idx_buf_shape, dtype=idx.dtype, device=target_device
+                    )
+                    self._teacher_topk_idx_ipc = {
+                        torch.distributed.get_rank(): get_handle_from_tensor(self._teacher_topk_idx_buffer)
+                    }
+                    print(f" rank {torch.distributed.get_rank()} Allocated topk IPC buffers: "
+                          f"vals={vals_buf_shape} ({self._teacher_topk_vals_buffer.numel() * self._teacher_topk_vals_buffer.element_size() / 1e9:.4f} GB), "
+                          f"idx={idx_buf_shape} ({self._teacher_topk_idx_buffer.numel() * self._teacher_topk_idx_buffer.element_size() / 1e9:.4f} GB) "
+                          f"(actual data: [{B_mb}, {S_mb}, {K_mb}])")
+
+                # Copy actual data into the top-left slice of the buffers
+                self._teacher_topk_vals_buffer[:B_mb, :S_mb, :K_mb].copy_(vals)
+                self._teacher_topk_idx_buffer[:B_mb, :S_mb, :K_mb].copy_(idx)
+                del vals, idx
+
+                out_topk_vals.append(self._teacher_topk_vals_buffer[:B_mb, :S_mb, :K_mb].cpu())
+                out_topk_idx.append(self._teacher_topk_idx_buffer[:B_mb, :S_mb, :K_mb].cpu())
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
@@ -782,48 +972,30 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     def use_reference_model(self) -> Generator[None, None, None]:
         """Context manager that temporarily swaps the reference model and active model.
 
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
-                  Also disables top-k/top-p filtering since the reference policy's distribution
-                  is different from the current policy, making filtered logprobs incompatible.
-        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
+        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
+        On exit: Restores original references and re-flips cuda/cpu
         """
         with torch.no_grad():
-            # Save train model state_dict
-            curr_state_dict = get_cpu_state_dict(
-                self.model.state_dict().items(), pin_memory=True
-            )
-
-            # Swap reference model state_dict to self.model
-            for k, v in self.model.state_dict().items():
-                val = to_local_if_dtensor(v)
-                val.copy_(self.reference_model_state_dict[k])
-
-            # Temporarily disable top-k/top-p filtering for reference policy logprobs.
-            # The reference policy has different weights, so its top-k/top-p set is
-            # inherently different from the current policy. Using filtered logprobs
-            # would cause -inf mismatches that cannot be resolved by masking.
-            # Note: We keep temperature scaling since it was applied to prev_logprobs.
-            saved_sampling_params = self.sampling_params
-            if saved_sampling_params is not None:
-                self.sampling_params = TrainingSamplingParams(
-                    top_k=None,
-                    top_p=1.0,
-                    temperature=saved_sampling_params.temperature,
+            try:
+                # Save train model state_dict
+                curr_state_dict = get_cpu_state_dict(
+                    self.model.state_dict().items(), pin_memory=True
                 )
-            else:
-                self.sampling_params = None
 
-            # - self.model is the original reference_model, now on CUDA
-            # - curr_state_dict is the train model, now on CPU
-            yield
+                # Swap reference model state_dict to self.model
+                for k, v in self.model.state_dict().items():
+                    val = to_local_if_dtensor(v)
+                    val.copy_(self.reference_model_state_dict[k])
 
-            # Restore sampling_params
-            self.sampling_params = saved_sampling_params
+                # - self.model is the original reference_model, now on CUDA
+                # - curr_state_dict is the train model, now on CPU
+                yield
 
-            # Restore train model state_dict
-            for k, v in self.model.state_dict().items():
-                val = to_local_if_dtensor(v)
-                val.copy_(curr_state_dict[k])
+            finally:
+                # Restore train model state_dict
+                for k, v in self.model.state_dict().items():
+                    val = to_local_if_dtensor(v)
+                    val.copy_(curr_state_dict[k])
 
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
@@ -850,17 +1022,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
-            if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
-                continue
-            full_tensor = (
-                tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
-            )
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
-            adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
-                self.model, name, full_tensor
-            )
-            for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
+            state_dict_info[name] = (tensor.shape, self.dtype)
 
         return state_dict_info
 
@@ -898,41 +1061,9 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
-        # Use the shared implementation
-        stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(self.model, self.dtype),
-            buffer_size_bytes=buffer_size_bytes,
-            zmq_socket=self.zmq_socket,
-            rank=self.rank,
-            worker_name=str(self),
-        )
-
-    @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
-    def stream_weights_via_http(
-        self,
-        sglang_url_to_gpu_uuids: dict[str, list[str]],
-    ) -> None:
-        """Stream model weights to SGLang servers via HTTP API.
-
-        Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
-        """
-        # Manually move model to cuda for cpu offload case
-        if self.cpu_offload:
-            self.model = self.move_to_cuda(self.model)
-
-        from nemo_rl.models.policy.utils import stream_weights_via_http_impl
-
-        # Get current GPU UUID
-        current_device_uuid = self.report_device_id()
-
         def dtensor_params_generator():
             """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            state_dict_items = sorted(
-                self.model.state_dict().items(), key=lambda x: x[0]
-            )
-            for name, tensor in state_dict_items:
+            for name, tensor in self.model.state_dict().items():
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()
@@ -945,13 +1076,13 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     # Convert to target dtype
                     yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
 
-        # Use the HTTP implementation
-        stream_weights_via_http_impl(
+        # Use the shared implementation
+        stream_weights_via_ipc_zmq_impl(
             params_generator=dtensor_params_generator(),
-            sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+            buffer_size_bytes=buffer_size_bytes,
+            zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
-            current_device_uuid=current_device_uuid,
         )
 
     @torch.no_grad()
@@ -972,11 +1103,17 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             )
             self.model = self.move_to_cuda(self.model)
 
+        def _dtensor_post_iter_func(tensor, dtype):
+            if isinstance(tensor, DTensor):
+                tensor = tensor.full_tensor()
+            tensor = tensor.to(dtype, non_blocking=True)
+            return tensor
+
         # param_iterator will return (name, tensor), we only need tensor
-        dtensor_post_iter_func = lambda x: x[1]
+        dtensor_post_iter_func = lambda x: _dtensor_post_iter_func(x[1], self.dtype)
 
         packed_broadcast_producer(
-            iterator=dtensor_params_generator(self.model, self.dtype),
+            iterator=iter(self.model.state_dict().items()),
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,
@@ -1102,7 +1239,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             optimizer=self.optimizer,
             optimizer_path=optimizer_path,
             scheduler=self.scheduler,
-            tokenizer=self.tokenizer if tokenizer_path else None,
+            tokenizer=self.tokenizer if tokenizer_path is None else None,
             tokenizer_path=tokenizer_path,
             checkpointing_cfg=checkpointing_cfg,
             lora_enabled=self.lora_enabled,
@@ -1147,10 +1284,3 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 config_updates=config_updates,
                 checkpoint_root=checkpoint_root,
             )
-
-
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
-)  # pragma: no cover
-class DTensorPolicyWorkerV2(DTensorPolicyWorkerV2Impl):
-    pass
