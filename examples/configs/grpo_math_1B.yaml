@@ -31,6 +31,15 @@ grpo:
     normalize_rewards: ${grpo.normalize_rewards}
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+  kondo:
+    enabled: false
+    mode: "response_dense_rows_v2"
+    target_backward_token_fraction: 0.7
+    recall_floor: 1.0
+    priority_mode: "delight"
+    block_size: 8
+    min_selected_rows: 1
+    bypass_on_nonfinite: true
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -68,6 +77,8 @@ loss_fn:
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
   use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
+  dg_enabled: false
+  dg_eta: 1.0
 
 checkpointing:
   enabled: true

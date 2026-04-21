@@ -36,7 +36,15 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.kondo import (
+    KondoConfig,
+    apply_kondo_mode,
+    compute_required_row_multiple,
+    disabled_kondo_metrics,
+    resolve_kondo_config,
+    screen_kondo_tokens,
+)
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -169,6 +177,7 @@ class GRPOConfig(TypedDict):
     seq_logprob_error_threshold: float | None
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
+    kondo: NotRequired[KondoConfig]
 
 
 class GRPOSaveState(TypedDict):
@@ -211,6 +220,35 @@ class MasterConfig(TypedDict):
 # ===============================================================================
 # Setup & Initialization
 # ===============================================================================
+
+
+def _get_policy_data_parallel_size(policy: Policy) -> int:
+    sharding_annotations = getattr(policy, "sharding_annotations", None)
+    if sharding_annotations is None:
+        return 1
+    return sharding_annotations.get_axis_size("data_parallel")
+
+
+def _prepare_kondo_configuration(
+    *,
+    policy: Policy,
+    master_config: MasterConfig,
+    loss_fn: ClippedPGLossFn,
+) -> tuple[KondoConfig, int]:
+    kondo_cfg = resolve_kondo_config(master_config["grpo"].get("kondo"))
+    if getattr(loss_fn, "dg_enabled", False):
+        raise ValueError("DG and Kondo are mutually exclusive in v1")
+    if getattr(loss_fn, "loss_type", None) != LossType.TOKEN_LEVEL:
+        raise ValueError("Kondo requires token-level clipped PG loss")
+
+    dp_size = _get_policy_data_parallel_size(policy)
+    row_multiple = compute_required_row_multiple(
+        dp_size=dp_size,
+        train_micro_batch_size=master_config["policy"]["train_micro_batch_size"],
+        use_dynamic_batching=master_config["policy"]["dynamic_batching"]["enabled"],
+        use_sequence_packing=master_config["policy"]["sequence_packing"]["enabled"],
+    )
+    return kondo_cfg, row_multiple
 
 
 def setup(
@@ -1801,6 +1839,28 @@ def grpo_train(
                     )
                     del baseline_for_log
 
+                kondo_metrics = disabled_kondo_metrics("off")
+                policy_train_data = train_data
+                if master_config["grpo"].get("kondo", {}).get(
+                    "enabled", False
+                ) and master_config["grpo"].get("kondo", {}).get(
+                    "mode", "routed"
+                ) != "off":
+                    kondo_cfg, row_multiple = _prepare_kondo_configuration(
+                        policy=policy,
+                        master_config=master_config,
+                        loss_fn=loss_fn,
+                    )
+                    with timer.time("kondo_screen"):
+                        kondo_screening = screen_kondo_tokens(train_data, kondo_cfg)
+                    with timer.time("kondo_compact"):
+                        policy_train_data, kondo_metrics = apply_kondo_mode(
+                            train_data=train_data,
+                            screening=kondo_screening,
+                            cfg=kondo_cfg,
+                            row_multiple=row_multiple,
+                        )
+
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -1810,8 +1870,9 @@ def grpo_train(
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
                     train_results = policy.train(
-                        train_data,
+                        policy_train_data,
                         loss_fn,
+                        gbs=policy_train_data.size,
                         timer=timer,
                     )
 
@@ -1823,7 +1884,7 @@ def grpo_train(
                             flush=True,
                         )
                         kv_scales_cache = policy.calibrate_qkv_fp8_scales(
-                            train_data, include_q=True
+                            policy_train_data, include_q=True
                         )["layers"]
                         # Set generation as stale to force refit with new scales
                         POLICY_GENERATION_STALE = True
@@ -1898,6 +1959,7 @@ def grpo_train(
                     else 0.0,
                     **ds_metrics,
                 }
+                metrics.update(kondo_metrics)
                 if "moe_metrics" in train_results:
                     metrics.update(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
@@ -1908,13 +1970,27 @@ def grpo_train(
 
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(gen_step_metrics)
+                dg_mean_metrics = {
+                    "dg_enabled",
+                    "dg_eta",
+                    "dg_gate_mean",
+                    "dg_gate_std",
+                    "dg_gate_positive_mean",
+                    "dg_gate_negative_mean",
+                    "dg_gate_spread",
+                    "dg_surprisal_mean",
+                }
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
                         valid_values = [x for x in v if not np.isinf(x)]
                         metrics[k] = (
                             np.min(valid_values).item() if valid_values else -1.0
                         )
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                    elif k in {
+                        "probs_ratio_max",
+                        "probs_ratio_clamped_max",
+                        "dg_surprisal_max",
+                    }:
                         valid_values = [x for x in v if not np.isinf(x)]
                         metrics[k] = (
                             np.max(valid_values).item() if valid_values else -1.0
@@ -1927,10 +2003,12 @@ def grpo_train(
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",
-                    }:
+                    } | dg_mean_metrics:
                         metrics[k] = np.mean(v).item()
                     elif isinstance(v, (np.ndarray, list)):
                         metrics[k] = np.sum(v).item()
+                    elif np.isscalar(v):
+                        metrics[k] = float(v)
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
 
@@ -2059,6 +2137,12 @@ def grpo_train(
                 log_data["token_ids"] = train_data["input_ids"].tolist()
                 log_data["token_loss_mask"] = train_data["token_mask"].tolist()
                 log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+                if "loss_token_mask" in train_data:
+                    log_data["loss_token_mask"] = train_data["loss_token_mask"].tolist()
+                if "kondo_row_selected" in train_data:
+                    log_data["kondo_row_selected"] = train_data[
+                        "kondo_row_selected"
+                    ].tolist()
                 log_data["advantages"] = train_data["advantages"].tolist()
                 log_data["generation_logprobs"] = train_data[
                     "generation_logprobs"
@@ -2846,6 +2930,28 @@ def async_grpo_train(
                         f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
                     )
 
+                kondo_metrics = disabled_kondo_metrics("off")
+                policy_train_data = train_data
+                if master_config["grpo"].get("kondo", {}).get(
+                    "enabled", False
+                ) and master_config["grpo"].get("kondo", {}).get(
+                    "mode", "routed"
+                ) != "off":
+                    kondo_cfg, row_multiple = _prepare_kondo_configuration(
+                        policy=policy,
+                        master_config=master_config,
+                        loss_fn=loss_fn,
+                    )
+                    with timer.time("kondo_screen"):
+                        kondo_screening = screen_kondo_tokens(train_data, kondo_cfg)
+                    with timer.time("kondo_compact"):
+                        policy_train_data, kondo_metrics = apply_kondo_mode(
+                            train_data=train_data,
+                            screening=kondo_screening,
+                            cfg=kondo_cfg,
+                            row_multiple=row_multiple,
+                        )
+
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
                     policy.prepare_for_training()
@@ -2854,8 +2960,9 @@ def async_grpo_train(
                 print("▶ Training policy...")
                 with timer.time("policy_training"):
                     train_results = policy.train(
-                        train_data,
+                        policy_train_data,
                         loss_fn,
+                        gbs=policy_train_data.size,
                         timer=timer,
                     )
 
@@ -2961,18 +3068,33 @@ def async_grpo_train(
                     if response_advantages.numel() > 0
                     else 0.0,
                 }
+                metrics.update(kondo_metrics)
                 if "moe_metrics" in train_results:
                     metrics.update(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
                     )
                 metrics.update(train_results["all_mb_metrics"])
+                dg_mean_metrics = {
+                    "dg_enabled",
+                    "dg_eta",
+                    "dg_gate_mean",
+                    "dg_gate_std",
+                    "dg_gate_positive_mean",
+                    "dg_gate_negative_mean",
+                    "dg_gate_spread",
+                    "dg_surprisal_mean",
+                }
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
                         valid_values = [x for x in v if not np.isinf(x)]
                         metrics[k] = (
                             np.min(valid_values).item() if valid_values else -1.0
                         )
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                    elif k in {
+                        "probs_ratio_max",
+                        "probs_ratio_clamped_max",
+                        "dg_surprisal_max",
+                    }:
                         valid_values = [x for x in v if not np.isinf(x)]
                         metrics[k] = (
                             np.max(valid_values).item() if valid_values else -1.0
@@ -2984,8 +3106,10 @@ def async_grpo_train(
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",
-                    }:
+                    } | dg_mean_metrics:
                         metrics[k] = np.mean(v).item()
+                    elif np.isscalar(v):
+                        metrics[k] = float(v)
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
@@ -3094,6 +3218,10 @@ def async_grpo_train(
             log_data["token_ids"] = train_data["input_ids"].tolist()
             log_data["token_loss_mask"] = train_data["token_mask"].tolist()
             log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+            if "loss_token_mask" in train_data:
+                log_data["loss_token_mask"] = train_data["loss_token_mask"].tolist()
+            if "kondo_row_selected" in train_data:
+                log_data["kondo_row_selected"] = train_data["kondo_row_selected"].tolist()
             log_data["advantages"] = train_data["advantages"].tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()

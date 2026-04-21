@@ -112,6 +112,9 @@ class ClippedPGLossConfig(TypedDict):
     force_on_policy_ratio: NotRequired[bool]
     # If True, add KL penalty to reward instead of loss (used by Reinforce++)
     use_kl_in_reward: NotRequired[bool]
+    # Delightful Policy Gradient gate settings.
+    dg_enabled: NotRequired[bool]
+    dg_eta: NotRequired[float]
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -124,6 +127,8 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    loss_token_mask: NotRequired[torch.Tensor]
+    loss_normalizer: NotRequired[torch.Tensor]
     __extra__: Any
 
 
@@ -182,6 +187,8 @@ class ClippedPGLossFn(LossFunction):
         self.force_on_policy_ratio = cfg.get(
             "force_on_policy_ratio", False
         )  # Force ratio to 1.0
+        self.dg_enabled = cfg.get("dg_enabled", False)
+        self.dg_eta = cfg.get("dg_eta", 1.0)
         self.use_on_policy_kl_approximation = cfg["use_on_policy_kl_approximation"]
         self.use_importance_sampling_correction = cfg[
             "use_importance_sampling_correction"
@@ -243,6 +250,7 @@ class ClippedPGLossFn(LossFunction):
                     f"Set truncated_importance_sampling_ratio to enable truncated importance sampling.",
                     flush=True,
                 )
+        assert self.dg_eta > 0, "dg_eta must be positive"
 
     def __call__(
         self,
@@ -255,6 +263,9 @@ class ClippedPGLossFn(LossFunction):
         curr_logprobs = next_token_logprobs
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
+        loss_token_mask = data.get("loss_token_mask")
+        if loss_token_mask is not None:
+            loss_token_mask = loss_token_mask[:, 1:]
         advantages = data["advantages"][:, 1:]
         prev_logprobs = data["prev_logprobs"][:, 1:]
         generation_logprobs = data["generation_logprobs"][:, 1:]
@@ -265,6 +276,21 @@ class ClippedPGLossFn(LossFunction):
             )
 
         mask = token_mask * sample_mask.unsqueeze(-1)
+        pg_mask = (
+            loss_token_mask * sample_mask.unsqueeze(-1)
+            if loss_token_mask is not None
+            else mask
+        )
+        loss_normalizer = data.get("loss_normalizer")
+        if loss_normalizer is not None:
+            if self.loss_type != LossType.TOKEN_LEVEL:
+                raise ValueError("loss_normalizer is only supported for token-level PG")
+            loss_normalizer = loss_normalizer.reshape(-1)[0].to(curr_logprobs.device)
+        kl_normalizer = data.get("kl_normalizer")
+        if kl_normalizer is not None:
+            if self.loss_type != LossType.TOKEN_LEVEL:
+                raise ValueError("kl_normalizer is only supported for token-level PG")
+            kl_normalizer = kl_normalizer.reshape(-1)[0].to(curr_logprobs.device)
 
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
@@ -366,9 +392,12 @@ class ClippedPGLossFn(LossFunction):
 
             # Reduce KL loss
             if self.loss_type == LossType.TOKEN_LEVEL:
-                kl = masked_mean(
-                    kl, mask, global_normalization_factor=global_valid_toks
-                )
+                if kl_normalizer is None:
+                    kl = masked_mean(
+                        kl, mask, global_normalization_factor=global_valid_toks
+                    )
+                else:
+                    kl = (kl * mask).sum() / kl_normalizer.clamp(min=1.0)
             else:
                 kl = masked_mean(
                     masked_mean(kl, token_mask, dim=-1),
@@ -404,8 +433,20 @@ class ClippedPGLossFn(LossFunction):
             ratios = curr_logprobs
             ratios_clamped = curr_logprobs
 
-        loss1 = -advantages * ratios
-        loss2 = -advantages * ratios_clamped
+        if self.dg_enabled:
+            # DG uses the sampled token surprisal under the rollout policy.
+            # prev_logprobs are re-scored with the training backend before any updates,
+            # so they are the cleanest available surrogate in the current pipeline.
+            dg_surprisal = (-prev_logprobs).detach()
+            dg_gate = torch.sigmoid((advantages.detach() * dg_surprisal) / self.dg_eta)
+            pg_advantages = advantages * dg_gate
+        else:
+            dg_surprisal = (-prev_logprobs).detach()
+            dg_gate = torch.ones_like(advantages)
+            pg_advantages = advantages
+
+        loss1 = -pg_advantages * ratios
+        loss2 = -pg_advantages * ratios_clamped
 
         # Determine which value to use for clipping (max for pessimistic estimate)
         clip_loss = torch.max(loss1, loss2)
@@ -415,7 +456,7 @@ class ClippedPGLossFn(LossFunction):
             assert self.ratio_clip_c > 1, (
                 f"ratio_clip_c must exceed 1 representing a lower bound of the ratios, got {self.ratio_clip_c}."
             )
-            loss3 = -advantages * self.ratio_clip_c
+            loss3 = -pg_advantages * self.ratio_clip_c
             clip_loss = torch.where(
                 advantages < 0, torch.min(clip_loss, loss3), clip_loss
             )
@@ -531,11 +572,17 @@ class ClippedPGLossFn(LossFunction):
             importance_weights_to_use = torch.ones_like(prev_logprobs)
 
         if self.loss_type == LossType.TOKEN_LEVEL:
-            actor_loss = masked_mean(
-                importance_weights_to_use * clip_loss,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            )
+            if loss_normalizer is None:
+                actor_loss = masked_mean(
+                    importance_weights_to_use * clip_loss,
+                    pg_mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            else:
+                actor_loss = (
+                    (importance_weights_to_use * clip_loss * pg_mask).sum()
+                    / loss_normalizer.clamp(min=1.0)
+                )
         else:
             actor_loss = masked_mean(
                 masked_mean(
@@ -600,6 +647,36 @@ class ClippedPGLossFn(LossFunction):
                 probs_ratio_clamped_min = float("inf")
                 probs_ratio_clamped_max = float("-inf")
 
+            valid_mask = mask.bool()
+            valid_gates = dg_gate.detach()[valid_mask]
+            valid_surprisal = dg_surprisal.detach()[valid_mask]
+            valid_advantages = advantages.detach()[valid_mask]
+
+            if valid_gates.numel() > 0:
+                dg_gate_mean = valid_gates.mean().item()
+                dg_gate_std = valid_gates.std(unbiased=False).item()
+                dg_surprisal_mean = valid_surprisal.mean().item()
+                dg_surprisal_max = valid_surprisal.max().item()
+            else:
+                dg_gate_mean = 1.0
+                dg_gate_std = 0.0
+                dg_surprisal_mean = 0.0
+                dg_surprisal_max = 0.0
+
+            pos_gate_mask = valid_advantages > 0
+            neg_gate_mask = valid_advantages < 0
+            dg_gate_positive_mean = (
+                valid_gates[pos_gate_mask].mean().item()
+                if pos_gate_mask.any()
+                else dg_gate_mean
+            )
+            dg_gate_negative_mean = (
+                valid_gates[neg_gate_mask].mean().item()
+                if neg_gate_mask.any()
+                else dg_gate_mean
+            )
+            dg_gate_spread = dg_gate_positive_mean - dg_gate_negative_mean
+
         # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
         # by either sequence or token count, depending on particular metric.
         # To get the true metric, you'll need to sum over the microbatch.
@@ -621,6 +698,15 @@ class ClippedPGLossFn(LossFunction):
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
+                "dg_enabled": float(self.dg_enabled),
+                "dg_eta": self.dg_eta,
+                "dg_gate_mean": dg_gate_mean,
+                "dg_gate_std": dg_gate_std,
+                "dg_gate_positive_mean": dg_gate_positive_mean,
+                "dg_gate_negative_mean": dg_gate_negative_mean,
+                "dg_gate_spread": dg_gate_spread,
+                "dg_surprisal_mean": dg_surprisal_mean,
+                "dg_surprisal_max": dg_surprisal_max,
                 **_is_filter_metrics,
             },
         )
