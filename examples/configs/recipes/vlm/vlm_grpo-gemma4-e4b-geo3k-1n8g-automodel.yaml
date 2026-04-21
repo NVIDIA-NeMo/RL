@@ -1,0 +1,60 @@
+defaults: ../../vlm_grpo_3B.yaml
+grpo:
+  num_prompts_per_step: 32
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 2
+checkpointing:
+  checkpoint_dir: "results/vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel"
+policy:
+  model_name: google/gemma-4-E4B-it
+  train_micro_batch_size: 1
+  train_global_batch_size: 32
+  logprob_batch_size: 1
+  max_total_sequence_length: 3072
+  optimizer:
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+  dtensor_cfg:
+    activation_checkpointing: true
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: te
+        enable_deepep: true
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+      freeze_config:
+        freeze_vision_tower: false
+        freeze_audio_tower: true
+        freeze_language_model: false
+  generation:
+    max_new_tokens: 2048
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.6
+      enforce_eager: true
+      max_model_len: 3072
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: geometry3k
+  validation:
+    dataset_name: geometry3k
+    split: test
+  default:
+    prompt_file: examples/prompts/geo3k.txt
+    env_name: geometry3k
+logger:
+  wandb_enabled: true
+  wandb:
+    project: nemo-rl
+    name: vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
