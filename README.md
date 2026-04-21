@@ -9,6 +9,8 @@
 
 </div>
 
+> Fork note: this branch adds experimental GRPO extensions for Delightful Policy Gradient (DG) and Kondo-style compute skipping. It includes learner-side DG gating, dense-reference and row-compacted Kondo modes such as `response_dense_rows_v2`, GRPO logging/diagnostics for the new metrics, and DTensor worker compatibility fixes needed to run these experiments on the current stack.
+
 ## 📣 News
 * [04/06/2026] New Model Support
     * Added support for [Qwen3.5](https://huggingface.co/collections/Qwen/qwen35) dense and MoE models (LLM and VLM) for GRPO training.
