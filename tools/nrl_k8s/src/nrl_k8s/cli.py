@@ -20,7 +20,7 @@ from omegaconf import OmegaConf
 from . import __version__
 from .config import LoadedConfig, load_recipe_with_infra
 from .orchestrate import ALL_ROLES
-from .schema import ClusterSpec
+from .schema import ClusterSpec, CodeSource, RunMode, SubmitterMode
 
 
 _INFRA_OPTION = click.option(
@@ -32,6 +32,124 @@ _INFRA_OPTION = click.option(
     "contain an `infra:` key.",
 )
 _ROLE_CHOICE = click.Choice(list(ALL_ROLES))
+_MODE_CHOICE = click.Choice([m.value for m in RunMode])
+_SUBMITTER_CHOICE = click.Choice([m.value for m in SubmitterMode])
+_CODE_SOURCE_CHOICE = click.Choice([m.value for m in CodeSource])
+
+
+# Macro -> (submitter, codeSource, no_wait). CLI --mode wins over
+# infra.launch.runMode; explicit --submitter / --code-source /
+# --wait/--no-wait flags win over both.
+_MODE_DEFAULTS: dict[RunMode, tuple[SubmitterMode, CodeSource, bool]] = {
+    RunMode.INTERACTIVE: (SubmitterMode.PORT_FORWARD, CodeSource.UPLOAD, False),
+    RunMode.BATCH:       (SubmitterMode.EXEC,         CodeSource.IMAGE,  True),
+}
+
+
+def _resolve_mode_defaults(
+    *,
+    cli_mode: str | None,
+    infra_mode: RunMode,
+    cli_submitter: str | None,
+    cli_code_source: str | None,
+    cli_wait: bool | None,
+) -> tuple[RunMode, SubmitterMode, CodeSource, bool]:
+    """Return (resolved_mode, submitter, code_source, no_wait).
+
+    ``cli_wait`` is the tri-state carried by click's ``--wait/--no-wait``
+    flag pair (True / False / None=unset).
+    """
+    mode = RunMode(cli_mode) if cli_mode else infra_mode
+    default_submitter, default_code_src, default_no_wait = _MODE_DEFAULTS[mode]
+    submitter = SubmitterMode(cli_submitter) if cli_submitter else default_submitter
+    code_src = CodeSource(cli_code_source) if cli_code_source else default_code_src
+    if cli_wait is None:
+        no_wait = default_no_wait
+    else:
+        no_wait = not cli_wait
+    return mode, submitter, code_src, no_wait
+
+
+def _apply_mode_overrides(
+    loaded: LoadedConfig,
+    *,
+    submitter: SubmitterMode,
+    code_source: CodeSource,
+    code_path: str | None,
+) -> None:
+    """Mutate the loaded InfraConfig so downstream sees the resolved values.
+
+    `_resolve_mode_defaults` produces the final submitter/codeSource; we
+    push those into the pydantic model so `orchestrate.submit_training`
+    and `build_submitter` read one source of truth. `code_path` overrides
+    `launch.codePath` when set; else the infra YAML keeps its value.
+    """
+    # Pydantic models are immutable by default; use model_copy via deep set.
+    infra = loaded.infra
+    infra.submit.submitter = submitter
+    infra.launch.codeSource = code_source
+    if code_path is not None:
+        infra.launch.codePath = code_path
+    # Re-run the validator manually so codePath-required rule fires with
+    # the effective values.
+    if code_source in (CodeSource.IMAGE, CodeSource.LUSTRE) and not infra.launch.codePath:
+        _cli_error(
+            f"--code-source {code_source.value} requires --code-path (or infra.launch.codePath)",
+            hint="pass --code-path /opt/nemo-rl (image default) or a Lustre mount path",
+        )
+
+
+# Shared decorator factory for the flag block added to both launch and run.
+def _mode_options(fn):
+    fn = click.option(
+        "--mode",
+        "cli_mode",
+        type=_MODE_CHOICE,
+        default=None,
+        help="Macro: interactive = port-forward + working_dir upload + tail "
+        "(dev default). batch = kubectl exec + code from image + no wait "
+        "(production). Overrides infra.launch.runMode.",
+    )(fn)
+    fn = click.option(
+        "--submitter",
+        "cli_submitter",
+        type=_SUBMITTER_CHOICE,
+        default=None,
+        help="Transport for the training entrypoint. Overrides --mode's default.",
+    )(fn)
+    fn = click.option(
+        "--code-source",
+        "cli_code_source",
+        type=_CODE_SOURCE_CHOICE,
+        default=None,
+        help="Where the code lives. `upload` stages a working_dir from the "
+        "laptop; `image` / `lustre` expect code on disk inside the pod.",
+    )(fn)
+    fn = click.option(
+        "--code-path",
+        "cli_code_path",
+        type=str,
+        default=None,
+        help="Absolute container path for code when --code-source is "
+        "image or lustre. Overrides infra.launch.codePath.",
+    )(fn)
+    fn = click.option(
+        "--run-id",
+        "cli_run_id",
+        type=str,
+        default=None,
+        help="Human-readable tag for this run. Used as the Ray submission "
+        "id (port-forward) or pidfile directory name (exec). Defaults to "
+        "`training-<timestamp>`.",
+    )(fn)
+    fn = click.option(
+        "--wait/--no-wait",
+        "cli_wait",
+        default=None,
+        help="Override mode's wait default: --wait tails logs and exits "
+        "on terminal state; --no-wait returns immediately after submit.",
+    )(fn)
+    return fn
 
 
 # =============================================================================
@@ -227,27 +345,33 @@ def validate(ctx, recipe, overrides, infra_path) -> None:
     help="NeMo-RL repo root used to source files for the working_dir upload.",
 )
 @click.option(
-    "--follow",
-    is_flag=True,
-    help="Stream training-job logs after submit.",
-)
-@click.option(
     "--replace",
     is_flag=True,
     help="Stop any running training job on the cluster before submitting.",
 )
+@_mode_options
 def launch(
     recipe: Path,
     overrides: tuple[str, ...],
     infra_path: Path | None,
     repo_root: Path,
-    follow: bool,
     replace: bool,
+    cli_mode: str | None,
+    cli_submitter: str | None,
+    cli_code_source: str | None,
+    cli_code_path: str | None,
+    cli_run_id: str | None,
+    cli_wait: bool | None,
 ) -> None:
     """Submit a training job against an already-up training cluster.
 
-    ``--replace`` stops any RUNNING Ray Job on the training cluster first so
-    the new submission doesn't queue behind GPU-holding stragglers.
+    ``--mode interactive`` (default) uses port-forward + working_dir
+    upload and tails logs. ``--mode batch`` uses kubectl exec + in-image
+    code, returns as soon as the driver is running via nohup, and the
+    laptop can disconnect.
+
+    ``--replace`` stops any RUNNING Ray Job on the training cluster first
+    so the new submission doesn't queue behind GPU-holding stragglers.
     """
     from . import orchestrate, submit as submit_mod
 
@@ -259,17 +383,35 @@ def launch(
             "infra.launch.entrypoint is empty",
             hint="launch command requires infra.launch.entrypoint; see docs/recipes.md",
         )
+
+    mode, submitter, code_src, no_wait = _resolve_mode_defaults(
+        cli_mode=cli_mode,
+        infra_mode=loaded.infra.launch.runMode,
+        cli_submitter=cli_submitter,
+        cli_code_source=cli_code_source,
+        cli_wait=cli_wait,
+    )
+    _apply_mode_overrides(loaded, submitter=submitter, code_source=code_src, code_path=cli_code_path)
+    click.echo(
+        f"[launch] mode={mode.value} submitter={submitter.value} "
+        f"code_source={code_src.value} no_wait={no_wait}",
+        err=True,
+    )
+
     try:
         result = orchestrate.submit_training(
-            loaded, log=click.echo, repo_root=repo_root.resolve(), replace=replace
+            loaded,
+            log=click.echo,
+            repo_root=repo_root.resolve(),
+            replace=replace,
+            run_id=cli_run_id,
         )
     except Exception as exc:  # noqa: BLE001
         _explain_and_exit(exc, context="launch failed")
 
-    click.echo(f"training job: {result.training_job_id}")
-    click.echo(f"dashboard:    {result.training_dashboard}")
-    if follow:
-        _tail(result.training_dashboard, result.training_job_id)
+    _emit_handle(result.handle)
+    if not no_wait:
+        _follow_handle(result.handle)
 
 
 @main.command()
@@ -284,22 +426,23 @@ def launch(
     help="NeMo-RL repo root used to source files for the working_dir upload.",
 )
 @click.option(
-    "--follow",
-    is_flag=True,
-    help="Stream training-job logs after submit.",
-)
-@click.option(
     "--replace",
     is_flag=True,
     help="Stop any running daemon/training job before submitting new ones.",
 )
+@_mode_options
 def run(
     recipe: Path,
     overrides: tuple[str, ...],
     infra_path: Path | None,
     repo_root: Path,
-    follow: bool,
     replace: bool,
+    cli_mode: str | None,
+    cli_submitter: str | None,
+    cli_code_source: str | None,
+    cli_code_path: str | None,
+    cli_run_id: str | None,
+    cli_wait: bool | None,
 ) -> None:
     """Bring up every cluster + daemon declared in the recipe, then submit training.
 
@@ -307,27 +450,49 @@ def run(
     RayCluster, submit its daemon (for generation/gym), then submit the
     training entrypoint against the training cluster.
 
-    ``--replace`` stops any previous RUNNING instance of a daemon or training
-    job before submitting (and suffixes daemon submissionIds with a
-    timestamp so Ray accepts the resubmit). Use it to re-run with code
-    changes without manually bumping IDs or calling ``job stop``.
+    ``--mode batch`` is the production shape: bring up the training
+    cluster, exec into its head, start the entrypoint under nohup, and
+    return. Pair with ``--code-source image`` or ``--code-source lustre``
+    to skip the laptop-side working_dir upload entirely.
+
+    ``--replace`` stops any previous RUNNING instance of a daemon or
+    training job before submitting (and suffixes daemon submissionIds
+    with a timestamp so Ray accepts the resubmit).
     """
     from . import orchestrate, submit as submit_mod
 
     loaded = _load_or_exit(recipe, overrides, infra_path)
     if not submit_mod.is_in_cluster():
         _preflight_or_exit(loaded.infra.namespace)
+
+    mode, submitter, code_src, no_wait = _resolve_mode_defaults(
+        cli_mode=cli_mode,
+        infra_mode=loaded.infra.launch.runMode,
+        cli_submitter=cli_submitter,
+        cli_code_source=cli_code_source,
+        cli_wait=cli_wait,
+    )
+    _apply_mode_overrides(loaded, submitter=submitter, code_source=code_src, code_path=cli_code_path)
+    click.echo(
+        f"[run] mode={mode.value} submitter={submitter.value} "
+        f"code_source={code_src.value} no_wait={no_wait}",
+        err=True,
+    )
+
     try:
         result = orchestrate.run(
-            loaded, log=click.echo, repo_root=repo_root.resolve(), replace=replace
+            loaded,
+            log=click.echo,
+            repo_root=repo_root.resolve(),
+            replace=replace,
+            run_id=cli_run_id,
         )
     except Exception as exc:  # noqa: BLE001
         _explain_and_exit(exc, context="run failed")
 
-    click.echo(f"training job: {result.training_job_id}")
-    click.echo(f"dashboard:    {result.training_dashboard}")
-    if follow:
-        _tail(result.training_dashboard, result.training_job_id)
+    _emit_handle(result.handle)
+    if not no_wait:
+        _follow_handle(result.handle)
 
 
 @main.command()
@@ -586,6 +751,144 @@ def cluster_list(namespace: str | None) -> None:
         click.echo(f"{name}\t{state}")
 
 
+@cluster.command("dashboard")
+@click.argument("name")
+@click.option(
+    "--namespace",
+    "-n",
+    default=None,
+    help="Kubernetes namespace. Defaults to the current kube context's namespace.",
+)
+@click.option(
+    "--port",
+    "local_port",
+    type=int,
+    default=8265,
+    show_default=True,
+    help="Local port to bind the forward to.",
+)
+@click.option(
+    "--open/--no-open",
+    "open_browser",
+    default=True,
+    show_default=True,
+    help="Open the dashboard URL in a browser once the forward is up.",
+)
+@click.option(
+    "--fix/--no-fix",
+    "auto_fix",
+    default=True,
+    show_default=True,
+    help="If Ray's dashboard static assets are symlinks on the head pod "
+    "(uv install default), reinstall ray[default] with --link-mode=copy "
+    "before forwarding. Pass --no-fix on images already built with "
+    "UV_LINK_MODE=copy.",
+)
+def cluster_dashboard(
+    name: str,
+    namespace: str | None,
+    local_port: int,
+    open_browser: bool,
+    auto_fix: bool,
+) -> None:
+    """Port-forward a RayCluster's dashboard (and fix it if blank).
+
+    ``NAME`` is the RayCluster name (as shown by ``nrl-k8s cluster list``
+    or ``kubectl get rayclusters``). No recipe / infra YAML required.
+
+    Does everything in one go:
+
+    1. Resolve the head pod for ``NAME``.
+    2. If ``--fix`` (default): check for symlinked dashboard assets and,
+       if any are present, ``uv pip install --reinstall --link-mode=copy
+       ray[default]`` on the head pod so aiohttp can actually serve the
+       JS/CSS (the assets are otherwise 404 → blank page).
+    3. ``kubectl port-forward svc/<cluster>-head-svc <port>:8265``.
+    4. Open ``http://localhost:<port>`` in the default browser.
+    5. Ctrl+C kills the forward; the cluster keeps running.
+
+    The permanent fix is in the image build — ``ENV UV_LINK_MODE=copy``
+    before the first ``uv pip install`` step in your Dockerfile. The
+    auto-fix here is a convenience for images without that flag.
+    """
+    import time
+    import webbrowser
+    from . import submit as submit_mod
+    from .config import _infer_kube_namespace
+
+    ns = namespace or _infer_kube_namespace()
+    if not submit_mod.is_in_cluster():
+        _preflight_or_exit(ns)
+
+    if auto_fix:
+        _reinstall_ray_if_symlinked(name, ns)
+
+    url = f"http://localhost:{local_port}"
+    pf = submit_mod._PortForward(name, ns, local_port)
+    click.echo(f"[dashboard] forwarding {name} head :8265 → {url}")
+    try:
+        pf.start()
+    except Exception as exc:  # noqa: BLE001
+        _explain_and_exit(exc, context="dashboard port-forward failed")
+    if open_browser:
+        webbrowser.open(url)
+    click.echo("[dashboard] Ctrl+C to stop.")
+    try:
+        while pf.alive():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        click.echo("\n[dashboard] stopping forward.")
+    finally:
+        pf.stop()
+
+
+def _reinstall_ray_if_symlinked(cluster_name: str, namespace: str) -> None:
+    """Reinstall ray[default] in copy mode when its assets are symlinks.
+
+    Checks for any symlink under Ray's dashboard build dir and, if one
+    exists, runs ``uv pip install --reinstall --link-mode=copy
+    ray[default]==<current>`` to replace every symlink in the package
+    with a real file. Idempotent: no-op when the dir has no symlinks.
+    """
+    import subprocess as _sp
+
+    from . import k8s
+
+    pod = k8s.get_head_pod(cluster_name, namespace)
+    script = (
+        "set -eu\n"
+        "BUILD=$(python3 -c 'import ray, os; "
+        "print(os.path.join(os.path.dirname(ray.__file__),"
+        '"dashboard/client/build"))\' 2>/dev/null)\n'
+        'if [ -z "$BUILD" ] || [ ! -d "$BUILD" ]; then\n'
+        '  echo "[dashboard] ray install not found on pod; skipping fix"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if ! find "$BUILD" -type l -print -quit 2>/dev/null | grep -q .; then\n'
+        '  echo "[dashboard] assets already real files; no fix needed"\n'
+        "  exit 0\n"
+        "fi\n"
+        "VER=$(python3 -c 'import ray; print(ray.__version__)')\n"
+        'echo "[dashboard] reinstalling ray[default]==$VER with --link-mode=copy (~30s) ..."\n'
+        "UV=$(command -v uv || echo /opt/nemo_rl_venv/bin/uv)\n"
+        '"$UV" pip install --reinstall --link-mode=copy --quiet "ray[default]==$VER"\n'
+        'echo "[dashboard] reinstall complete."\n'
+    )
+    cmd = [
+        "kubectl", "exec", "-n", namespace, pod.metadata.name, "--",
+        "bash", "-c", script,
+    ]
+    try:
+        res = _sp.run(cmd, check=False, capture_output=True, text=True, timeout=180)
+    except (_sp.TimeoutExpired, FileNotFoundError) as exc:
+        click.echo(f"[dashboard] fix skipped: {exc}", err=True)
+        return
+    for line in (res.stdout or "").splitlines():
+        click.echo(line)
+    if res.returncode != 0 and (res.stderr or "").strip():
+        click.echo(f"[dashboard] stderr: {res.stderr.strip()}", err=True)
+
+
 # ---- `job` group --------------------------------------------------------
 
 @main.group()
@@ -645,16 +948,37 @@ def job_list(
     required=True,
     help="Which cluster hosts the job.",
 )
+@click.option(
+    "-f", "--follow", is_flag=True, help="Stream new output until Ctrl+C."
+)
 def job_logs(
     submission_id: str,
     recipe: Path,
     overrides: tuple[str, ...],
     infra_path: Path | None,
     role: str,
+    follow: bool,
 ) -> None:
-    """Stream logs for a Ray Job by submission id on a given role's cluster."""
+    """Stream logs for a submitted run by its id on a given role's cluster.
+
+    Dispatches on the cached handle (``~/.cache/nrl-k8s/runs/<id>.json``):
+    port-forward handles go through Ray's log tail API; exec handles go
+    through ``kubectl exec … tail -F`` on the head pod's stdout file.
+
+    When no cached handle exists we fall back to the Ray dashboard — so
+    this command keeps working against jobs submitted by older CLI
+    versions or by ``ray job submit`` directly.
+    """
+    del follow  # always follows — flag kept for back-compat / readability
+    from .submitters import load_handle
+
     loaded = _load_or_exit(recipe, overrides, infra_path)
     cluster = _pick_cluster_or_exit(loaded, role)
+
+    handle = load_handle(submission_id)
+    if handle is not None and handle.kind == "exec":
+        _follow_handle(handle)
+        return
     _tail_daemon(cluster.name, loaded.infra.namespace, submission_id)
 
 
@@ -669,20 +993,44 @@ def job_logs(
     required=True,
     help="Which cluster hosts the job.",
 )
+@click.option(
+    "--force", is_flag=True, help="Exec mode only: send SIGKILL instead of SIGTERM."
+)
 def job_stop(
     submission_id: str,
     recipe: Path,
     overrides: tuple[str, ...],
     infra_path: Path | None,
     role: str,
+    force: bool,
 ) -> None:
-    """Stop a Ray Job by submission id."""
+    """Stop a submitted run by id.
+
+    Transport-aware via the cached handle — Ray jobs go through
+    ``stop_job``; exec runs are killed with SIGTERM (or SIGKILL with
+    ``--force``). Falls back to Ray's API when no cached handle exists.
+    """
+    from .submitters import load_handle
+
+    loaded = _load_or_exit(recipe, overrides, infra_path)
+    cluster = _pick_cluster_or_exit(loaded, role)
+
+    handle = load_handle(submission_id)
+    if handle is not None and handle.kind == "exec":
+        from .submitters.exec_ import ExecSubmitter
+
+        tmp_root = (handle.tmp_dir or "/tmp/nrl-x").rsplit("/", 1)[0] or "/tmp"
+        try:
+            ExecSubmitter(exec_tmp_dir=tmp_root).stop(handle, force=force)
+        except Exception as exc:  # noqa: BLE001
+            _explain_and_exit(exc, context=f"stop {submission_id} failed")
+        click.echo(f"stopped {submission_id} (exec)")
+        return
+
     from ray.job_submission import JobSubmissionClient
 
     from . import submit
 
-    loaded = _load_or_exit(recipe, overrides, infra_path)
-    cluster = _pick_cluster_or_exit(loaded, role)
     try:
         with submit.dashboard_url(cluster.name, loaded.infra.namespace) as dash:
             clnt = JobSubmissionClient(dash)
@@ -781,6 +1129,47 @@ def _tail_daemon(cluster_name: str, namespace: str, submission_id: str) -> None:
         click.echo("\n(interrupted — job continues running)", err=True)
     except Exception as exc:  # noqa: BLE001
         _explain_and_exit(exc, context=f"tailing {submission_id} failed")
+
+
+def _emit_handle(handle) -> None:  # type: ignore[no-untyped-def]
+    """Print the resolved handle + next-step commands to stdout.
+
+    Kept close to the submit call sites so the user sees a coherent
+    "here's what you submitted, here's how to follow it" block in both
+    interactive and batch flows.
+    """
+    click.echo(f"run id:  {handle.run_id}")
+    click.echo(f"kind:    {handle.kind}")
+    click.echo(f"cluster: {handle.cluster_name}  (ns={handle.namespace})")
+    if handle.kind == "exec":
+        click.echo(f"pod:     {handle.pod}")
+        click.echo(f"tmp:     {handle.tmp_dir}")
+    click.echo(
+        f"follow:  nrl-k8s job logs {handle.run_id} "
+        f"<recipe> --role training -f"
+    )
+    click.echo(
+        f"stop:    nrl-k8s job stop {handle.run_id} "
+        f"<recipe> --role training"
+    )
+
+
+def _follow_handle(handle) -> None:  # type: ignore[no-untyped-def]
+    """Stream logs for a handle using whichever transport submitted it."""
+    from .submitters import build_submitter
+    from .schema import SubmitterMode
+
+    class _Stub:  # minimal infra shim so build_submitter picks the right transport
+        class submit:
+            submitter = SubmitterMode.EXEC if handle.kind == "exec" else SubmitterMode.PORT_FORWARD
+            execTmpDir = handle.tmp_dir.rsplit("/", 1)[0] if (handle.kind == "exec" and handle.tmp_dir) else "/tmp"
+
+    submitter = build_submitter(_Stub)  # type: ignore[arg-type]
+    try:
+        for line in submitter.follow(handle):
+            click.echo(line, nl=False)
+    except KeyboardInterrupt:
+        click.echo("\n(interrupted — run continues)", err=True)
 
 
 def _first_worker_pod_or_exit(cluster_name: str, namespace: str) -> str:

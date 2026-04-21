@@ -179,11 +179,37 @@ def delete_configmap(name: str, namespace: str, *, ignore_missing: bool = True) 
         raise
 
 
+def get_head_pod(cluster_name: str, namespace: str) -> Any:
+    """Return the first ``Running`` head pod for a RayCluster.
+
+    Used by the exec submitter to pick a shell target. KubeRay labels every
+    head pod with ``ray.io/cluster=<name>,ray.io/node-type=head`` — that
+    selector uniquely identifies a single pod today (KubeRay runs exactly
+    one head per cluster), but we still filter on phase to avoid returning
+    a ``Pending`` or ``Terminating`` instance from a mid-rollout restart.
+    """
+    load_kubeconfig()
+    core = client.CoreV1Api()
+    selector = f"ray.io/cluster={cluster_name},ray.io/node-type=head"
+    resp = with_retries(
+        lambda: core.list_namespaced_pod(namespace=namespace, label_selector=selector)
+    )
+    for pod in resp.items:
+        if pod.status and pod.status.phase == "Running":
+            return pod
+    raise RuntimeError(
+        f"no Running head pod found for RayCluster {cluster_name!r} in "
+        f"namespace {namespace!r} (label selector: {selector}). Check "
+        f"`kubectl -n {namespace} get pods -l {selector}`."
+    )
+
+
 __all__ = [
     "apply_raycluster",
     "custom_objects_api",
     "delete_configmap",
     "delete_raycluster",
+    "get_head_pod",
     "get_raycluster",
     "list_rayclusters",
     "load_kubeconfig",

@@ -33,7 +33,8 @@ from ray.job_submission import JobStatus, JobSubmissionClient
 from . import k8s, submit, workdir
 from .config import LoadedConfig
 from .manifest import build_raycluster_manifest
-from .schema import ClusterSpec, InfraConfig
+from .schema import ClusterSpec, CodeSource, InfraConfig, SubmitterMode
+from .submitters import SubmissionHandle, build_submitter, save_handle
 
 Role = Literal["generation", "gym", "training"]
 ALL_ROLES: tuple[Role, ...] = ("generation", "gym", "training")
@@ -41,8 +42,17 @@ ALL_ROLES: tuple[Role, ...] = ("generation", "gym", "training")
 
 @dataclass
 class RunResult:
-    training_dashboard: str
-    training_job_id: str
+    """Outcome of a training submission.
+
+    ``handle`` carries the transport-specific identifiers the observability
+    commands need. ``training_dashboard`` / ``training_job_id`` remain for
+    back-compat with earlier callers that printed Ray submission ids
+    directly; they are set to ``None``/``""`` for exec submissions.
+    """
+
+    handle: SubmissionHandle
+    training_dashboard: str | None = None
+    training_job_id: str = ""
 
 
 # =============================================================================
@@ -157,8 +167,26 @@ def submit_training(
     log: callable,
     repo_root: Path,
     replace: bool = False,
+    run_id: str | None = None,
 ) -> RunResult:
-    """Stage + submit the training job against the training cluster."""
+    """Submit the training job against the training cluster.
+
+    Dispatches on ``infra.submit.submitter`` + ``infra.launch.codeSource``:
+
+    * ``submitter=portForward`` + ``codeSource=upload`` — today's path.
+      Stages a working_dir, opens port-forward, submits via Ray SDK.
+    * ``submitter=portForward`` + ``codeSource in (image, lustre)`` — no
+      staging; Ray job inherits the head pod's cwd. The entrypoint is
+      responsible for ``cd`` + ``source``.
+    * ``submitter=exec`` — ``kubectl exec`` into the head, run the user
+      entrypoint under ``nohup`` + ``disown``. No staging, no
+      port-forward. ``codeSource`` must not be ``upload`` on this path.
+
+    ``run_id`` is used as the submission id / pidfile tag. Ray
+    port-forward submissions generate one if ``run_id`` is None (Ray's
+    default behaviour); exec submissions require a non-empty value and
+    caller is expected to synthesize one via :func:`default_run_id`.
+    """
     infra = loaded.infra
     launch = infra.launch
     if not launch.entrypoint:
@@ -170,19 +198,35 @@ def submit_training(
     cluster = _require_cluster(infra, "training")
     name = cluster.name
 
-    log("[training] staging working_dir ...")
-    recipe_yaml = OmegaConf.to_yaml(loaded.recipe)
-    wd = workdir.stage_workdir(
-        repo_root,
-        include_paths=_upload_paths(infra),
-        extra_files={"nrl_k8s_run.yaml": recipe_yaml},
-    )
+    submitter = build_submitter(infra)
+    is_exec = infra.submit.submitter is SubmitterMode.EXEC
+    upload = launch.codeSource is CodeSource.UPLOAD
 
-    with submit.dashboard_url(name, infra.namespace) as dash:
-        # Training jobs have auto-generated submissionIds, so no ID collision;
-        # ``--replace`` just stops any RUNNING job on the cluster so the new
-        # one can claim GPUs.
-        if replace:
+    if is_exec and upload:
+        raise ValueError(
+            "infra.submit.submitter=exec is incompatible with "
+            "infra.launch.codeSource=upload — pick image or lustre, "
+            "or switch submitter to portForward."
+        )
+
+    # Stage only if we're actually uploading. Exec + image/lustre modes
+    # rely on the code being on the pod's filesystem already.
+    wd: Path | None = None
+    if upload:
+        log("[training] staging working_dir ...")
+        recipe_yaml = OmegaConf.to_yaml(loaded.recipe)
+        wd = workdir.stage_workdir(
+            repo_root,
+            include_paths=_upload_paths(infra),
+            extra_files={"nrl_k8s_run.yaml": recipe_yaml},
+        )
+
+    # `--replace` semantics: stop any running job on the training cluster
+    # so the new one can claim GPUs. Only applies to the Ray path; exec
+    # runs are keyed by run_id (unique per submission) so replace is a
+    # no-op there.
+    if replace and not is_exec:
+        with submit.dashboard_url(name, infra.namespace) as dash:
             client = JobSubmissionClient(dash)
             for job in client.list_jobs():
                 if job.status is JobStatus.RUNNING:
@@ -193,15 +237,40 @@ def submit_training(
                     except Exception as exc:  # noqa: BLE001
                         log(f"[training] warning: stop failed: {exc}")
 
-        log(f"[training] submitting training job via {dash}")
-        job_id = submit.submit_ray_job(
-            dash,
-            entrypoint=launch.entrypoint,
-            working_dir=wd,
-            env_vars=launch.env,
-        )
-        log(f"[training] training job submitted: {job_id}")
-        return RunResult(training_dashboard=dash, training_job_id=job_id)
+    if is_exec:
+        run_id = run_id or default_run_id("training")
+        log(f"[training] exec submitter: launching as run_id={run_id} on head pod")
+    else:
+        log("[training] port-forward submitter: submitting Ray Job")
+
+    # Always expose the run id to the training entrypoint. Both transports
+    # see the same variable so recipe authors can reference
+    # ``$NRL_K8S_RUN_ID`` (in ``logger.wandb.name`` etc.) without caring
+    # which submitter the CLI picked.
+    env_vars = {**dict(launch.env)}
+    if run_id:
+        env_vars.setdefault("NRL_K8S_RUN_ID", run_id)
+
+    handle = submitter.submit(
+        name,
+        infra.namespace,
+        entrypoint=launch.entrypoint,
+        run_id=run_id or "",
+        env_vars=env_vars,
+        working_dir=wd,
+    )
+    save_handle(handle)
+    log(f"[training] training run handle: kind={handle.kind} id={handle.run_id}")
+    return RunResult(
+        handle=handle,
+        training_dashboard=None,  # per-call port-forward, not persistent
+        training_job_id=handle.run_id,
+    )
+
+
+def default_run_id(role: str) -> str:
+    """Human-readable default id when the user didn't supply ``--run-id``."""
+    return f"{role}-{int(time.time())}"
 
 
 def run(
@@ -210,6 +279,7 @@ def run(
     log: callable,
     repo_root: Path,
     replace: bool = False,
+    run_id: str | None = None,
 ) -> RunResult:
     """Do the full sequence: bring up all 3 clusters + daemons, submit training."""
     if replace:
@@ -222,7 +292,9 @@ def run(
         name = bring_up_cluster(role, loaded, log=log)
         submit_daemon(role, loaded, name, log=log, repo_root=repo_root, replace=replace)
 
-    return submit_training(loaded, log=log, repo_root=repo_root, replace=replace)
+    return submit_training(
+        loaded, log=log, repo_root=repo_root, replace=replace, run_id=run_id
+    )
 
 
 _JOB_ID_RE = re.compile(r"--job-id[= ]+(\S+)")
@@ -317,8 +389,10 @@ def _wait_for_http(url: str, timeout_s: int, log: callable, role: Role) -> None:
 
 
 __all__ = [
+    "ALL_ROLES",
     "RunResult",
     "bring_up_cluster",
+    "default_run_id",
     "run",
     "submit_daemon",
     "submit_training",

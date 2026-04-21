@@ -16,13 +16,17 @@ from nrl_k8s.schema import (
     AttachSpec,
     CheckpointsKind,
     CheckpointsSpec,
+    CodeSource,
     HFCacheKind,
     HFCacheSpec,
     InfraConfig,
     LaunchMode,
     LaunchSpec,
+    RunMode,
     SchedulerKind,
     SchedulerSpec,
+    SubmitSpec,
+    SubmitterMode,
     WorkspaceKind,
     WorkspaceSpec,
 )
@@ -170,6 +174,44 @@ class TestLaunchSpec:
         )
         assert spec.attach.generation == "rc-gen"
         assert spec.attach.training is None
+
+    def test_run_mode_defaults_to_interactive(self) -> None:
+        assert LaunchSpec().runMode is RunMode.INTERACTIVE
+
+    def test_code_source_defaults_to_upload(self) -> None:
+        assert LaunchSpec().codeSource is CodeSource.UPLOAD
+
+    def test_code_path_required_for_image(self) -> None:
+        with pytest.raises(ValidationError, match="codePath is required"):
+            LaunchSpec.model_validate({"codeSource": "image"})
+
+    def test_code_path_required_for_lustre(self) -> None:
+        with pytest.raises(ValidationError, match="codePath is required"):
+            LaunchSpec.model_validate({"codeSource": "lustre"})
+
+    def test_code_path_ok_with_image(self) -> None:
+        spec = LaunchSpec.model_validate(
+            {"codeSource": "image", "codePath": "/opt/nemo-rl"}
+        )
+        assert spec.codeSource is CodeSource.IMAGE
+        assert spec.codePath == "/opt/nemo-rl"
+
+    def test_code_path_not_required_for_upload(self) -> None:
+        spec = LaunchSpec.model_validate({"codeSource": "upload"})
+        assert spec.codePath is None
+
+
+class TestSubmitterMode:
+    def test_default_is_port_forward(self) -> None:
+        assert SubmitSpec().submitter is SubmitterMode.PORT_FORWARD
+
+    def test_exec_tmp_dir_default(self) -> None:
+        assert SubmitSpec().execTmpDir == "/tmp"
+
+    def test_exec_tmp_dir_override(self) -> None:
+        spec = SubmitSpec.model_validate({"submitter": "exec", "execTmpDir": "/workspace/tmp"})
+        assert spec.submitter is SubmitterMode.EXEC
+        assert spec.execTmpDir == "/workspace/tmp"
 
 
 # =============================================================================
