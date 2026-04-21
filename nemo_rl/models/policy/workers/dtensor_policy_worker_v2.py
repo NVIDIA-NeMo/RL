@@ -55,8 +55,8 @@ from nemo_rl.models.automodel.train import (
     LossPostProcessor,
     ScorePostProcessor,
     TopkLogitsPostProcessor,
+    XTokenStudentIPCLossPostProcessor,
     XTokenTeacherIPCExportPostProcessor,
-    XTokenTeacherIPCLossPostProcessor,
     aggregate_training_statistics,
     automodel_forward_backward,
     forward_with_post_processing_fn,
@@ -598,7 +598,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         teacher_logits: Optional[Any] = None,
         topk_logits: Optional[int] = None,
         use_teacher_ipc_loss_postprocessor: bool = False,
-        timer: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Off-policy distillation entrypoint.
 
@@ -617,9 +616,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             return self._run_teacher_ipc_export(
                 data=data,
                 loop_state=loop_state,
-                eval_mode=eval_mode,
                 topk_logits=topk_logits,
-                timer=timer,
             )
         if role == "student":
             return self._run_student_off_policy_distillation(
@@ -629,7 +626,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 eval_mode=eval_mode,
                 teacher_logits=teacher_logits,
                 use_teacher_ipc_loss_postprocessor=use_teacher_ipc_loss_postprocessor,
-                timer=timer,
             )
         raise ValueError(f"Unknown role {role!r}; must be 'teacher' or 'student'.")
 
@@ -717,9 +713,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         data: BatchedDataDict[Any],
         *,
         loop_state: _OffPolicyLoopState,
-        eval_mode: bool = False,  # noqa: ARG002
         topk_logits: Optional[int] = None,
-        timer: Optional[Any] = None,  # noqa: ARG002
     ) -> dict[str, Any]:
         """Teacher-side forward-only pass exporting logits via CUDA IPC handles."""
         ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -804,7 +798,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         eval_mode: bool = False,
         teacher_logits: Optional[Any] = None,
         use_teacher_ipc_loss_postprocessor: bool = False,
-        timer: Optional[Any] = None,  # noqa: ARG002
     ) -> dict[str, Any]:
         """Student-side off-policy distillation training step."""
         # Off-policy flow calls ``offload_after_refit()`` to free GPU memory
@@ -834,7 +827,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             teacher_worker_result = teacher_logits[rank]
 
         if use_teacher_ipc_loss_postprocessor and teacher_worker_result is not None:
-            loss_post_processor = XTokenTeacherIPCLossPostProcessor(
+            loss_post_processor = XTokenStudentIPCLossPostProcessor(
                 loss_fn=loss_fn,
                 cfg=self.cfg,
                 device_mesh=self.device_mesh,

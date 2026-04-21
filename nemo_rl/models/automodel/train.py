@@ -61,7 +61,7 @@ from nemo_rl.models.policy.utils import (
 # Union type for any post-processing function
 PostProcessingFunction = Union[
     "LossPostProcessor",
-    "XTokenTeacherIPCLossPostProcessor",
+    "XTokenStudentIPCLossPostProcessor",
     "XTokenTeacherIPCExportPostProcessor",
     "LogprobsPostProcessor",
     "TopkLogitsPostProcessor",
@@ -1011,7 +1011,7 @@ def aggregate_training_statistics(
     return metrics
 
 
-class XTokenTeacherIPCLossPostProcessor(LossPostProcessor):
+class XTokenStudentIPCLossPostProcessor(LossPostProcessor):
     """Loss post-processor that injects teacher logits via CUDA IPC handles."""
 
     def __init__(

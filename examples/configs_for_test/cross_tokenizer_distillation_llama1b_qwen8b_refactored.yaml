@@ -239,7 +239,7 @@ data:
         text_key: "text"
         split_validation_size: 0.0
         seed: ${distillation.seed}
-        cache_dir: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/cross_tokenizer_data/arrow_cache"
+        cache_dir: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/test_assets/xtokenizer/cross_tokenizer_data/arrow_cache"
         num_proc: 32
     default:
         prompt_file: null
@@ -304,7 +304,7 @@ cluster:
 # cross-tokenizer distillation
 token_aligner:
     enabled: true
-    projection_matrix_path: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special.pt"
+    projection_matrix_path: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/ruit/RL/test_assets/xtokenizer/cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special.pt"
     use_sparse_format: false
     loss_type: "KL"
     exact_token_match_only: false
