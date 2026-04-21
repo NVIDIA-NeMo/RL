@@ -319,6 +319,8 @@ class SequencePackingGradientTestActor:
                 "tensor_model_parallel_size": 1,
                 "sequence_parallel": False,
                 "pipeline_model_parallel_size": 1,
+                "virtual_pipeline_model_parallel_size": None,
+                "pipeline_model_parallel_layout": None,
                 "context_parallel_size": cp_size,
             },
         }

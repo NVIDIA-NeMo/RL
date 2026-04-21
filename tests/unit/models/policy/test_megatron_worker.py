@@ -61,6 +61,7 @@ def create_megatron_test_config(
     model_name: str,
     tp: int = 1,
     pp: int = 1,
+    vpp: Optional[int] = None,
     precision: str = "float32",
     activation_checkpointing: bool = False,
     generation_backend: str = "megatron",
@@ -127,6 +128,8 @@ def create_megatron_test_config(
             "pipeline_model_parallel_size": pp,
             "num_layers_in_first_pipeline_stage": None,
             "num_layers_in_last_pipeline_stage": None,
+            "virtual_pipeline_model_parallel_size": vpp,
+            "pipeline_model_parallel_layout": None,
             "context_parallel_size": 1,
             "pipeline_dtype": precision,
             "sequence_parallel": sequence_parallel,
@@ -333,6 +336,10 @@ def training_setup(request):
                 config["megatron_cfg"]["attention_backend"] = config_updates[
                     "attention_backend"
                 ]
+            if "virtual_pipeline_model_parallel_size" in config_updates:
+                config["megatron_cfg"]["virtual_pipeline_model_parallel_size"] = (
+                    config_updates["virtual_pipeline_model_parallel_size"]
+                )
 
         tokenizer = get_tokenizer(config["tokenizer"])
         config["generation"] = configure_generation_config(
@@ -403,6 +410,13 @@ def training_setup(request):
             "tiny_llama_model_path",
             {"attention_backend": "flash", "precision": "bfloat16"},
         ),
+        (
+            2,
+            1,
+            2,
+            "tiny_llama_4layer_model_path",
+            {"virtual_pipeline_model_parallel_size": 2},
+        ),
     ],
     indirect=True,
     ids=[
@@ -415,6 +429,7 @@ def training_setup(request):
         "2gpu_tp2_llama_sp",
         "2gpu_tp2_llama_fp8",
         "2gpu_dp2_llama_attention_backend_flash",
+        "2gpu_pp2_vpp2_llama",
     ],
 )
 def test_megatron_policy_training(training_setup):
@@ -629,6 +644,7 @@ def logprob_setup(request):
     """Setup and teardown specifically for logprob tests."""
     # Parse parameters: (num_gpus, tp, pp, model_fixture_name)
     if hasattr(request, "param") and request.param is not None:
+        param = request.param
         (
             num_gpus,
             tp,
@@ -636,7 +652,8 @@ def logprob_setup(request):
             logprob_chunk_size,
             defer_fp32_logits,
             model_fixture_name,
-        ) = request.param
+        ) = param[:6]
+        vpp = param[6] if len(param) > 6 else None
     else:
         (
             num_gpus,
@@ -645,7 +662,8 @@ def logprob_setup(request):
             logprob_chunk_size,
             defer_fp32_logits,
             model_fixture_name,
-        ) = (2, 1, 1, None, None, "tiny_llama_model_path")
+            vpp,
+        ) = (2, 1, 1, None, None, "tiny_llama_model_path", None)
 
     # Get the actual model path from the requested fixture
     model_name = request.getfixturevalue(model_fixture_name)
@@ -656,8 +674,10 @@ def logprob_setup(request):
 
     try:
         cluster_name = f"test-megatron-logprob-{num_gpus}gpu-tp{tp}-pp{pp}"
+        if vpp is not None:
+            cluster_name += f"-vpp{vpp}"
         print(
-            f"Creating logprob cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})"
+            f"Creating logprob cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp}, VPP={vpp})"
         )
 
         cluster = RayVirtualCluster(
@@ -679,6 +699,7 @@ def logprob_setup(request):
             model_name=model_name,
             tp=tp,
             pp=pp,
+            vpp=vpp,
             converter_type=converter_type,
             logprob_chunk_size=logprob_chunk_size,
             defer_fp32_logits=defer_fp32_logits,
@@ -730,7 +751,7 @@ def logprob_setup(request):
 @pytest.mark.parametrize(
     "logprob_setup",
     [
-        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name)
+        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name[, vpp])
         (2, 1, 1, None, None, "tiny_llama_model_path"),
         (2, 2, 1, None, None, "tiny_llama_model_path"),
         (2, 1, 1, None, None, "tiny_qwen2_model_path"),
@@ -743,6 +764,8 @@ def logprob_setup(request):
         (2, 2, 1, 16, True, "tiny_llama_model_path"),
         (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
         (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
+        # VPP: pp=2, vpp=2 requires a 4-layer model (pp*vpp=4 layers)
+        (2, 1, 2, None, None, "tiny_llama_4layer_model_path", 2),
     ],
     indirect=True,
     ids=[
@@ -758,6 +781,7 @@ def logprob_setup(request):
         "2gpu_tp2_chunked_deferfp32_llama",
         "2gpu_dp2_chunked_deferfp32_qwen2",
         "2gpu_tp2_chunked_deferfp32_qwen2",
+        "2gpu_pp2_vpp2_llama",
     ],
 )
 def test_megatron_policy_logprobs(logprob_setup):
@@ -1110,22 +1134,29 @@ def test_megatron_reference_policy_functionality(tiny_llama_model_path):
 @pytest.mark.timeout(400)
 @pytest.mark.hf_gated
 @pytest.mark.parametrize(
-    "num_gpus,tp,pp,save_optimizer",
+    "num_gpus,tp,pp,save_optimizer,vpp,model_fixture_name",
     [
-        (2, 1, 1, False),  # Data parallel
-        (2, 1, 2, True),  # Pipeline parallel
-        (2, 2, 1, True),  # Tensor parallel
+        (2, 1, 1, False, None, "tiny_llama_model_path"),  # Data parallel
+        (2, 1, 2, True, None, "tiny_llama_model_path"),  # Pipeline parallel
+        (2, 2, 1, True, None, "tiny_llama_model_path"),  # Tensor parallel
+        # VPP: pp=2, vpp=2 requires a 4-layer model (pp*vpp=4 layers)
+        (2, 1, 2, True, 2, "tiny_llama_4layer_model_path"),  # Virtual pipeline parallel
     ],
-    ids=["2gpu_dp2_save_restore", "2gpu_pp2_save_restore", "2gpu_tp2_save_restore"],
+    ids=[
+        "2gpu_dp2_save_restore",
+        "2gpu_pp2_save_restore",
+        "2gpu_tp2_save_restore",
+        "2gpu_pp2_vpp2_save_restore",
+    ],
 )
 def test_megatron_checkpoint_save_kill_and_restore(
-    num_gpus, tp, pp, tiny_llama_model_path, save_optimizer
+    num_gpus, tp, pp, save_optimizer, vpp, model_fixture_name, request
 ):
     """Test full checkpoint save/restore cycle: save -> kill worker -> restart -> verify restore."""
     from copy import deepcopy
 
     # Use tiny model for faster testing
-    model_name = tiny_llama_model_path
+    model_name = request.getfixturevalue(model_fixture_name)
     tokenizer = get_tokenizer({"name": model_name})
 
     with tempfile.TemporaryDirectory(prefix="megatron_save_restore_") as temp_dir:
@@ -1142,7 +1173,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
 
         # Create initial config
         initial_config = create_megatron_test_config(
-            model_name=model_name, tp=tp, pp=pp, precision="float32"
+            model_name=model_name, tp=tp, pp=pp, vpp=vpp, precision="float32"
         )
 
         # Step 1: Create first policy and train
@@ -1483,6 +1514,7 @@ def topk_setup(request):
     """Setup and teardown specifically for top-k logits tests."""
     # Parse parameters: (num_gpus, tp, pp, logprob_chunk_size, defer_fp32_logits, model_fixture_name)
     if hasattr(request, "param") and request.param is not None:
+        param = request.param
         (
             num_gpus,
             tp,
@@ -1490,7 +1522,8 @@ def topk_setup(request):
             logprob_chunk_size,
             defer_fp32_logits,
             model_fixture_name,
-        ) = request.param
+        ) = param[:6]
+        vpp = param[6] if len(param) > 6 else None
     else:
         (
             num_gpus,
@@ -1499,7 +1532,8 @@ def topk_setup(request):
             logprob_chunk_size,
             defer_fp32_logits,
             model_fixture_name,
-        ) = (2, 1, 1, None, None, "tiny_llama_model_path")
+            vpp,
+        ) = (2, 1, 1, None, None, "tiny_llama_model_path", None)
 
     # Get the actual model path from the requested fixture
     model_name = request.getfixturevalue(model_fixture_name)
@@ -1510,8 +1544,10 @@ def topk_setup(request):
 
     try:
         cluster_name = f"test-megatron-topk-{num_gpus}gpu-tp{tp}-pp{pp}"
+        if vpp is not None:
+            cluster_name += f"-vpp{vpp}"
         print(
-            f"Creating topk cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})"
+            f"Creating topk cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp}, VPP={vpp})"
         )
 
         cluster = RayVirtualCluster(
@@ -1533,6 +1569,7 @@ def topk_setup(request):
             model_name=model_name,
             tp=tp,
             pp=pp,
+            vpp=vpp,
             converter_type=converter_type,
             logprob_chunk_size=logprob_chunk_size,
             defer_fp32_logits=defer_fp32_logits,
@@ -1584,7 +1621,7 @@ def topk_setup(request):
 @pytest.mark.parametrize(
     "topk_setup",
     [
-        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name)
+        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name[, vpp])
         (2, 1, 1, None, None, "tiny_llama_model_path"),
         (2, 2, 1, None, None, "tiny_llama_model_path"),
         (2, 1, 1, None, None, "tiny_qwen2_model_path"),
@@ -1597,6 +1634,8 @@ def topk_setup(request):
         (2, 2, 1, 16, True, "tiny_llama_model_path"),
         (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
         (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
+        # VPP: pp=2, vpp=2 requires a 4-layer model (pp*vpp=4 layers)
+        (2, 1, 2, None, None, "tiny_llama_4layer_model_path", 2),
     ],
     indirect=True,
     ids=[
@@ -1612,6 +1651,7 @@ def topk_setup(request):
         "2gpu_tp2_chunked_deferfp32_llama",
         "2gpu_dp2_chunked_deferfp32_qwen2",
         "2gpu_tp2_chunked_deferfp32_qwen2",
+        "2gpu_pp2_vpp2_llama",
     ],
 )
 def test_megatron_policy_topk_logits(topk_setup):

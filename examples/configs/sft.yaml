@@ -113,6 +113,8 @@ policy:
     pipeline_dtype: ${policy.precision}
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
+    virtual_pipeline_model_parallel_size: null
+    pipeline_model_parallel_layout: null
     sequence_parallel: false
     freeze_moe_router: false
     moe_router_dtype: null

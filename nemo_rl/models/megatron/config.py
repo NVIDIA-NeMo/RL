@@ -70,7 +70,11 @@ class ModelAndOptimizerState(NamedTuple):
     """
 
     state: GlobalState
-    model: MegatronModule
+    model: (
+        list[
+            MegatronModule
+        ]  # every instance is a model chunk corresponding to a virtual pipeline stage
+    )
     optimizer: MegatronOptimizer
     scheduler: OptimizerParamScheduler
     checkpointing_context: dict[str, Any]

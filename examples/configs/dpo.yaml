@@ -128,6 +128,8 @@ policy:
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
     pipeline_model_parallel_size: 1
+    virtual_pipeline_model_parallel_size: null
+    pipeline_model_parallel_layout: null
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
     num_layers_in_first_pipeline_stage: null

@@ -210,6 +210,8 @@ def setup_configs(args, tokenizer):
             "context_parallel_size": 1,
             "num_layers_in_first_pipeline_stage": None,
             "num_layers_in_last_pipeline_stage": None,
+            "virtual_pipeline_model_parallel_size": None,
+            "pipeline_model_parallel_layout": None,
             "activation_checkpointing": False,
             "moe_router_dtype": "fp64",
             "moe_router_load_balancing_type": "none",

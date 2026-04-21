@@ -283,6 +283,8 @@ def test_sequence_packing_basic():
         input_lengths_key="sequence_lengths",
         algorithm="modified_first_fit_decreasing",
         sequence_length_pad_multiple=1,
+        min_bin_count=None,
+        bin_count_multiple=None,
     )
 
     # Shard the batch with sequence packing
@@ -346,6 +348,8 @@ def test_sequence_packing_uniform_lengths():
         input_lengths_key="sequence_lengths",
         algorithm="modified_first_fit_decreasing",
         sequence_length_pad_multiple=1,
+        min_bin_count=None,
+        bin_count_multiple=None,
     )
 
     sharded_batches, sorted_indices = batch_data.shard_by_batch_size(
@@ -406,6 +410,8 @@ def test_sequence_packing_long_sequences():
         input_lengths_key="sequence_lengths",
         algorithm="modified_first_fit_decreasing",
         sequence_length_pad_multiple=1,
+        min_bin_count=None,
+        bin_count_multiple=None,
     )
 
     sharded_batches, sorted_indices = batch_data.shard_by_batch_size(
@@ -450,6 +456,8 @@ def test_sequence_packing_with_dynamic_batching_conflict():
         input_key="input_ids",
         input_lengths_key="sequence_lengths",
         algorithm="modified_first_fit_decreasing",
+        min_bin_count=None,
+        bin_count_multiple=None,
     )
 
     dynamic_batching_args: DynamicBatchingArgs = {
@@ -646,6 +654,77 @@ def test_from_batches_pads_3d_tensors_along_sequence_dim():
     assert torch.equal(stacked_logits, expected)
 
 
+@pytest.mark.parametrize(
+    "min_bin_count,bin_count_multiple,expected_total_bins",
+    [
+        (6, None, 6),  # min_bin_count forces at least 6 bins (natural=2)
+        (None, 4, 4),  # bin_count_multiple rounds 2 up to the next multiple of 4
+        (5, 4, 8),  # combined: enforce min 5, then round up to multiple of 4 → 8
+    ],
+)
+def test_sequence_packing_bin_count_constraints(
+    min_bin_count, bin_count_multiple, expected_total_bins
+):
+    """Test that min_bin_count and bin_count_multiple constrain the number of microbatches.
+
+    8 sequences of 200 tokens with max_tokens=1024 naturally pack into 2 bins
+    (5 sequences in the first bin, 3 in the second).  The parametrized cases
+    verify that explicit min_bin_count / bin_count_multiple values override the
+    default (shards) and produce the expected total bin count.
+    """
+    batch_size = 8
+    shards = 2
+    sequence_lengths = torch.full((batch_size,), 200)
+
+    batch_data = BatchedDataDict(
+        {
+            "input_ids": torch.ones(batch_size, 200, dtype=torch.long),
+            "sequence_lengths": sequence_lengths,
+            "problem_ids": torch.arange(batch_size),
+        }
+    )
+
+    sequence_packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=1024,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=1,
+        min_bin_count=min_bin_count,
+        bin_count_multiple=bin_count_multiple,
+    )
+
+    sharded_batches, sorted_indices = batch_data.shard_by_batch_size(
+        shards=shards, sequence_packing_args=sequence_packing_args
+    )
+
+    assert len(sharded_batches) == shards
+    assert len(sorted_indices) == batch_size
+
+    # Bins are distributed round-robin across shards, so total microbatches and
+    # per-shard microbatch count should both match expected_total_bins.
+    total_microbatches = sum(
+        len(shard.micro_batch_indices[0]) for shard in sharded_batches
+    )
+    assert total_microbatches == expected_total_bins
+    for shard in sharded_batches:
+        assert len(shard.micro_batch_indices[0]) == expected_total_bins // shards
+
+    # All problem IDs seen exactly once, token limits respected.
+    problem_ids_seen = set()
+    for shard in sharded_batches:
+        for mb in shard.make_microbatch_iterator_for_packable_sequences():
+            mb_len = mb["sequence_lengths"].sum().item()
+            assert mb_len <= sequence_packing_args["max_tokens_per_microbatch"]
+            for i in range(mb["input_ids"].shape[0]):
+                problem_id = mb["problem_ids"][i].item()
+                assert problem_id not in problem_ids_seen, (
+                    f"Problem ID {problem_id} seen twice"
+                )
+                problem_ids_seen.add(problem_id)
+    assert len(problem_ids_seen) == batch_size
+
+
 @pytest.mark.parametrize("pad_to_multiple_of", [1, 32, 64, 256])
 def test_sequence_packing_microbatch_boundaries(pad_to_multiple_of):
     """Test that microbatch boundaries are correctly maintained across chunks with random sequences."""
@@ -690,6 +769,8 @@ def test_sequence_packing_microbatch_boundaries(pad_to_multiple_of):
         input_lengths_key="sequence_lengths",
         algorithm="modified_first_fit_decreasing",
         sequence_length_pad_multiple=pad_to_multiple_of,
+        min_bin_count=None,
+        bin_count_multiple=None,
     )
 
     # Test with multiple shards and explicit batch_size to create chunks
