@@ -97,9 +97,10 @@ class IPCProtocol(Enum):
 
 def resolve_model_class(model_name: str) -> Any:
     """Resolve the appropriate model class for a given model name."""
-    if NEMO_AUTOMODEL_AVAILABLE:
-        return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
-    return AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
+    resolved = AUTOMODEL_FACTORY.get(model_name.lower())
+    if resolved is not None:
+        return resolved
+    return AutoModelForCausalLM
 
 
 def is_vllm_v1_engine_enabled() -> bool:

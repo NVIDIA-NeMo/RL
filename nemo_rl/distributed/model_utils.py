@@ -15,12 +15,6 @@
 from typing import Any, Optional
 
 import torch
-from megatron.core.models.gpt import GPTModel
-from megatron.core.parallel_state import (
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-)
-from megatron.core.utils import deprecate_inference_params, get_pg_size
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 from nemo_rl.algorithms.logits_sampling_utils import (
@@ -28,6 +22,29 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
 )
+
+
+def _get_megatron_model_utils():
+    """Lazily import Megatron symbols used only by linear-CE-fusion helpers.
+
+    Importing Megatron at module import time also pulls in Transformer Engine.
+    DTensor/FSDP GRPO paths do not need those symbols unless they explicitly
+    enable the Megatron-only linear-CE-fusion patch, so keep the dependency lazy.
+    """
+    from megatron.core.models.gpt import GPTModel
+    from megatron.core.parallel_state import (
+        get_tensor_model_parallel_group,
+        get_tensor_model_parallel_rank,
+    )
+    from megatron.core.utils import deprecate_inference_params, get_pg_size
+
+    return (
+        GPTModel,
+        get_tensor_model_parallel_group,
+        get_tensor_model_parallel_rank,
+        deprecate_inference_params,
+        get_pg_size,
+    )
 
 
 @torch.no_grad()
@@ -2045,6 +2062,7 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
 
 
 def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
+    GPTModel, _, _, _, _ = _get_megatron_model_utils()
     if getattr(GPTModel, "_linear_ce_fusion_forward_patched", False):
         GPTModel._linear_ce_fusion_chunk_size = chunk_size
         return
@@ -2055,7 +2073,7 @@ def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
 
 
 def _gpt_forward_with_linear_ce_fusion(
-    self: GPTModel,
+    self: Any,
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -2071,6 +2089,13 @@ def _gpt_forward_with_linear_ce_fusion(
     padding_mask: Optional[torch.Tensor] = None,
     return_logprobs_for_linear_ce_fusion: bool = False,
 ) -> torch.Tensor:
+    (
+        _GPTModel,
+        get_tensor_model_parallel_group,
+        get_tensor_model_parallel_rank,
+        deprecate_inference_params,
+        get_pg_size,
+    ) = _get_megatron_model_utils()
     if not return_logprobs_for_linear_ce_fusion:
         return self._original_forward_for_linear_ce_fusion(
             input_ids=input_ids,

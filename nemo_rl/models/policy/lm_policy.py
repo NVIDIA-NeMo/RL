@@ -224,8 +224,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             # pickling across incompatible transformers versions (v4 head → v5 worker).
             config["tokenizer"]["use_processor"] = processor is not None
         else:
-            worker_kwargs["tokenizer"] = tokenizer
-            worker_kwargs["processor"] = processor
+            # DTensor v1 workers can also reconstruct tokenizer/processor locally.
+            # This avoids pickling tokenizer objects across worker envs that may carry
+            # a different transformers version than the driver.
+            config["tokenizer"]["use_processor"] = processor is not None
 
         worker_builder = RayWorkerBuilder(
             worker_builder_cls_fqn,

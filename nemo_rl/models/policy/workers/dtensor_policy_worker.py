@@ -178,7 +178,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
     def __init__(
         self,
         config: PolicyConfig,
-        tokenizer: AutoTokenizer,
+        tokenizer: Optional[AutoTokenizer] = None,
         processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
@@ -187,6 +187,18 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorker."""
+        if tokenizer is None and processor is None:
+            from nemo_rl.algorithms.utils import get_tokenizer
+
+            use_processor = config["tokenizer"].get("use_processor", False)
+            result = get_tokenizer(config["tokenizer"], get_processor=use_processor)
+            if use_processor:
+                processor = result
+                tokenizer = result.tokenizer
+            else:
+                tokenizer = result
+
+        assert tokenizer is not None, "Tokenizer must be available for DTensorPolicyWorker"
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None
