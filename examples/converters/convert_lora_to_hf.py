@@ -258,7 +258,22 @@ def export_lora_adapter_to_hf(
     hf_model_name: str,
     hf_ckpt_path: str,
 ) -> str:
-    """Export only the LoRA adapter in HuggingFace PEFT format without using AutoBridge.export_adapter_ckpt."""
+    """Export a Megatron LoRA adapter to HuggingFace PEFT format.
+
+    Args:
+        base_ckpt: Path to the base model Megatron checkpoint (iter_XXXXXXX directory).
+        adapter_ckpt: Path to the LoRA adapter Megatron checkpoint (iter_XXXXXXX directory).
+                      Must contain a ``run_config.yaml`` with a ``peft`` section.
+        hf_model_name: HuggingFace model identifier (e.g. ``zai-org/GLM-5``).
+        hf_ckpt_path: Output directory for the HuggingFace PEFT adapter checkpoint.
+
+    Returns:
+        The *hf_ckpt_path* that was written to.
+
+    Raises:
+        FileExistsError: If *hf_ckpt_path* already exists.
+        ValueError: If the adapter's ``run_config.yaml`` has no ``peft`` section.
+    """
     if os.path.exists(hf_ckpt_path):
         raise FileExistsError(f"Output path already exists: {hf_ckpt_path}")
 
