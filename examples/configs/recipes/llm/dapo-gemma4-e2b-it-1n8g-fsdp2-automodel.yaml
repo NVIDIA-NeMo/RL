@@ -1,13 +1,18 @@
 defaults: ../../grpo_math_1B.yaml
 grpo:
+  batch_multiplier: 3
+  val_period: 15
+  max_val_samples: 960
+  val_batch_size: 960
   use_leave_one_out_baseline: false
+  use_dynamic_sampling: true
   reward_scaling:
     enabled: true
     target_min: -1.0
   reward_shaping:
     enabled: true
-    overlong_buffer_length: 512
-    max_response_length: 8192
+    overlong_buffer_length: 384
+    max_response_length: 2048
 loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
@@ -15,17 +20,18 @@ loss_fn:
   ratio_clip_max: 0.28
   ratio_clip_c: 10
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel
+  checkpoint_dir: results/dapo-gemma4-e2b-it-1n8g-fsdp2-automodel
 policy:
-  model_name: Qwen/Qwen3.5-35B-A3B-Base
+  model_name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/models/google/gemma-4-E2B-it
+  tokenizer:
+    name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/models/google/gemma-4-E2B-it
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  max_total_sequence_length: 9216
+  max_total_sequence_length: 4096
   logprob_chunk_size: 4096
-  offload_optimizer_for_logprob: true
   optimizer:
     kwargs:
-      lr: 1.0e-06
+      lr: 2.0e-06
       weight_decay: 0.1
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
@@ -40,18 +46,7 @@ policy:
   - milestones:
     - 10
   dtensor_cfg:
-    expert_parallel_size: 32
-    activation_checkpointing: true
     automodel_kwargs:
-      backend:
-        _target_: nemo_automodel.components.models.common.utils.BackendConfig
-        attn: sdpa
-        linear: torch
-        rms_norm: torch
-        enable_deepep: true
-        fake_balanced_gate: false
-        rope_fusion: false
-        enable_hf_state_dict_adapter: true
       freeze_config:
         freeze_vision_tower: true
         freeze_audio_tower: true
@@ -60,10 +55,10 @@ policy:
     enabled: false
   dynamic_batching:
     enabled: true
+  make_sequence_length_divisible_by: 1
   generation:
-    max_new_tokens: 8192
+    max_new_tokens: 2048
     vllm_cfg:
-      tensor_parallel_size: 4
       gpu_memory_utilization: 0.5
 data:
   max_input_seq_length: 2048
@@ -78,11 +73,11 @@ env:
     num_workers: 16
     math_verify_impl: dapo_math_verify
 logger:
+  log_dir: logs/dapo-gemma4-e2b-it-1n8g-fsdp2-automodel
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
-    project: nemo-rl
-    name: grpo-qwen3.5-35ba3b-dapo-4n8g-automodel
+    project: nemorl-gemma4
+    name: dapo-gemma4-e2b-it-1n8g-fsdp2-automodel
 cluster:
   gpus_per_node: 8
-  num_nodes: 4

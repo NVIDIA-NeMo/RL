@@ -62,11 +62,32 @@ PostProcessingFunction = Union[
 ]
 
 
+def _needs_kv_cache_for_shared_layers(model: nn.Module) -> bool:
+    """Check if the model uses KV sharing and needs use_cache=True for correct inference.
+
+    Models with num_kv_shared_layers > 0 (e.g. Gemma4 E2B) rely on DynamicCache
+    to pass K/V from anchor layers to shared layers. When use_cache=False,
+    past_key_values is None and shared layers cannot retrieve shared K/V,
+    producing incorrect outputs.
+
+    TODO: remove this workaround once upgraded to transformers>=5.5.2
+    (https://github.com/huggingface/transformers/pull/45312), which fixes
+    KV sharing without requiring use_cache=True.
+    """
+    model_config = getattr(model, "config", None)
+    text_config = (
+        getattr(model_config, "text_config", model_config) if model_config else None
+    )
+    num_kv_shared_layers = getattr(text_config, "num_kv_shared_layers", 0)
+    return isinstance(num_kv_shared_layers, int) and num_kv_shared_layers > 0
+
+
 def model_forward(
     model: nn.Module,
     processed_inputs: ProcessedInputs,
     is_reward_model: bool = False,
     allow_flash_attn_args: bool = True,
+    use_cache: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -75,6 +96,9 @@ def model_forward(
         processed_inputs: ProcessedInputs containing all tensors for forward pass
         is_reward_model: Whether this is a reward model
         allow_flash_attn_args: Whether to pass flash_attn_kwargs to model
+        use_cache: Whether to use KV cache. Must be True for inference on models
+            with KV sharing (num_kv_shared_layers > 0). Must be False for training
+            (backward pass / gradient checkpointing).
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -83,7 +107,7 @@ def model_forward(
         input_ids=processed_inputs.input_ids,
         attention_mask=processed_inputs.attention_mask,
         position_ids=processed_inputs.position_ids,
-        use_cache=False,
+        use_cache=use_cache,
     )
 
     # Add flash attention kwargs if applicable
@@ -102,6 +126,13 @@ def model_forward(
     )
     if is_gemma3 and "token_type_ids" not in model_args:
         model_args["token_type_ids"] = torch.zeros_like(processed_inputs.input_ids)
+
+    # Gemma 4 requires mm_token_type_ids even for text-only inputs
+    if getattr(getattr(model, "config", None), "model_type", None) == "gemma4":
+        if "mm_token_type_ids" not in model_args:
+            model_args["mm_token_type_ids"] = torch.zeros_like(
+                processed_inputs.input_ids
+            )
 
     # Reward models don't support flash_attn_kwargs
     if is_reward_model:
@@ -307,12 +338,22 @@ def forward_with_post_processing_fn(
     data_dict = processed_mb.data_dict
     processed_inputs = processed_mb.processed_inputs
 
+    # Models with KV sharing (num_kv_shared_layers > 0, e.g. Gemma4 E2B) need
+    # use_cache=True so that DynamicCache is created and shared layers can
+    # retrieve K/V from anchor layers. Without it, shared layers fall back to
+    # untrained K/V projections and produce garbage.
+    # Note: use_cache=True is incompatible with gradient/activation checkpointing
+    # (DynamicCache is stateful and recomputation doubles the cache). Callers
+    # must disable activation_checkpointing when training KV-sharing models.
+    use_cache = _needs_kv_cache_for_shared_layers(model)
+
     # Model forward pass
     outputs = model_forward(
         model,
         processed_inputs,
         is_reward_model=is_reward_model,
         allow_flash_attn_args=allow_flash_attn_args,
+        use_cache=use_cache,
     )
 
     # Extract logits from model outputs

@@ -6,10 +6,10 @@ loss_fn:
   use_importance_sampling_correction: true
   truncated_importance_sampling_ratio: 2
 checkpointing:
-  checkpoint_dir: results/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16
+  checkpoint_dir: results/vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel
 policy:
-  model_name: Qwen/Qwen3.5-35B-A3B-Base
-  train_global_batch_size: 512
+  model_name: google/gemma-4-E4B-it
+  train_global_batch_size: 32
   logprob_batch_size: 1
   max_total_sequence_length: 3072
   optimizer:
@@ -17,10 +17,7 @@ policy:
       lr: 1.0e-06
       weight_decay: 0.1
   dtensor_cfg:
-    expert_parallel_size: 16
     activation_checkpointing: true
-    env_vars:
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
@@ -38,7 +35,7 @@ policy:
   generation:
     max_new_tokens: 2048
     vllm_cfg:
-      tensor_parallel_size: 8
+      tensor_parallel_size: 4
       enforce_eager: true
       max_model_len: 3072
 data:
@@ -55,7 +52,6 @@ logger:
   wandb_enabled: true
   wandb:
     project: nemo-rl
-    name: vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16
+    name: vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel
 cluster:
   gpus_per_node: 8
-  num_nodes: 2

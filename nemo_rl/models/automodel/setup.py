@@ -686,20 +686,6 @@ def setup_model_and_optimizer(
     if is_tied_lm_head:
         model.tie_weights()
 
-    # Freeze visual encoder when not doing VLM training.
-    # Without this, the optimizer creates state entries for visual params that never
-    # receive gradients, causing a key mismatch when resuming from checkpoint.
-    # Note: visual encoder is nested under model.model (e.g. model.model.visual for
-    # Qwen3_5MoeForConditionalGeneration), not directly on model.
-    visual_module = getattr(getattr(model, "model", None), "visual", None) or getattr(
-        model, "visual", None
-    )
-    if not is_vlm and visual_module is not None:
-        for param in visual_module.parameters():
-            param.requires_grad_(False)
-        if rank == 0:
-            print("Froze visual encoder parameters for text-only training")
-
     # CPU offload if needed
     if cpu_offload:
         # Move buffers to CPU for FSDP modules

@@ -26,6 +26,9 @@ tests/test_suites/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.sh
 # GLM-4.7-Flash GRPO run
 tests/test_suites/llm/grpo-glm47-flash-4n8g-automodel.sh
 
+# Gemma 4 26B-A4B DAPO run
+tests/test_suites/llm/dapo-gemma4-26ba4b-it-4n8g-fsdp2-automodel.sh
+
 # Deepseek-V3 on DAPO dataset
 tests/test_suites/llm/grpo-dapomath17k-dsv3-megatron.sh
 
