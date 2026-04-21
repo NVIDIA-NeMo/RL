@@ -77,4 +77,5 @@ repos:
           - -lc
           - |
             set -euo pipefail
-            ./tools/config_cli.py minimize-check examples/configs/recipes/{llm,vlm}/*.yaml
+            shopt -s globstar
+            ./tools/config_cli.py minimize-check examples/configs/recipes/{llm,vlm}/**/*.yaml

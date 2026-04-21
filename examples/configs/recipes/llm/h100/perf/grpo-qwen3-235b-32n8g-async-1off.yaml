@@ -1,0 +1,26 @@
+defaults: ./grpo-qwen3-235b-16n8g.yaml
+grpo:
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-235b-32n8g-async-1off
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    context_parallel_size: 1
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 16
+        gpus_per_node: 8
+    vllm_cfg:
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.8
+logger:
+  log_dir: logs/grpo-qwen3-235b-32n8g-16T16G-async-1off
+  wandb:
+    name: grpo-qwen3-235b-32n8g-16T16G-async-1off
+cluster:
+  num_nodes: 32

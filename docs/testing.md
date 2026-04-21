@@ -229,7 +229,7 @@ Vanilla flow:
 # Copy bisect utilities outside of VCS to ensure a stable runner
 rsync -ahP --delete tools/ tools.bisect/
 
-TEST_CASE=tests/test_suites/llm/sft-llama3.2-1b-1n8g-fsdp2tp1.v3.sh
+TEST_CASE=tests/test_suites/llm/h100/sft-llama3.2-1b-1n8g-fsdp2tp1.v3.sh
 
 HF_HOME=... \
 HF_DATASETS_CACHE=... \

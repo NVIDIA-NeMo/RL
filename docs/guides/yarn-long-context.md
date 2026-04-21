@@ -80,17 +80,17 @@ This re-runs the HF → Megatron conversion and overwrites the cached checkpoint
 
 Two end-to-end YaRN recipes ship with NeMo RL:
 
-- **SFT, 64K context**: [`examples/configs/recipes/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-64k.yaml`](../../examples/configs/recipes/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-64k.yaml) — Qwen3-0.6B fine-tuned to a 64K sequence length on Nemotron-Cascade-2-SFT-Math using `factor: 1.6` (64K / 40960).
-- **GRPO, 256K context**: [`examples/configs/recipes/llm/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.yaml`](../../examples/configs/recipes/llm/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.yaml) — Qwen2.5-1.5B trained at 256K sequence length with `factor` derived from `max_total_sequence_length / original_max_position_embeddings`.
+- **SFT, 64K context**: [`examples/configs/recipes/llm/h100/sft-qwen3-0.6B-1n8g-megatron-yarn-64k.yaml`](../../examples/configs/recipes/llm/h100/sft-qwen3-0.6B-1n8g-megatron-yarn-64k.yaml) — Qwen3-0.6B fine-tuned to a 64K sequence length on Nemotron-Cascade-2-SFT-Math using `factor: 1.6` (64K / 40960).
+- **GRPO, 256K context**: [`examples/configs/recipes/llm/h100/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.yaml`](../../examples/configs/recipes/llm/h100/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.yaml) — Qwen2.5-1.5B trained at 256K sequence length with `factor` derived from `max_total_sequence_length / original_max_position_embeddings`.
 
 Launch them the same way as any other recipe:
 
 ```bash
 uv run examples/run_sft.py \
-    --config examples/configs/recipes/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-64k.yaml
+    --config examples/configs/recipes/llm/h100/sft-qwen3-0.6B-1n8g-megatron-yarn-64k.yaml
 
 uv run examples/run_grpo_math.py \
-    --config examples/configs/recipes/llm/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.yaml
+    --config examples/configs/recipes/llm/h100/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.yaml
 ```
 
 ## Practical Tips

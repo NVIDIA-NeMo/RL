@@ -1,0 +1,58 @@
+defaults: ../../../sft.yaml
+sft:
+  max_num_steps: 100
+checkpointing:
+  checkpoint_dir: results/sft-qwen3-0.6B-1n8g-megatron-yarn-64k
+  save_period: 20
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  train_global_batch_size: 16
+  max_total_sequence_length: 65536
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    context_parallel_size: 8
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+    optimizer:
+      lr: 2.0e-05
+      min_lr: 2.0e-05
+      weight_decay: 0.01
+      adam_eps: 1.0e-08
+      clip_grad: 0
+      params_dtype: bfloat16
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_warmup_iters: 1
+      lr_warmup_init: 1.999999e-05
+  sequence_packing:
+    enabled: true
+  make_sequence_length_divisible_by: 16
+  optimizer: null
+  hf_config_overrides:
+    rope_scaling:
+      rope_type: yarn
+      rope_theta: 1000000
+      factor: 1.6
+      original_max_position_embeddings: 40960
+      truncate: true
+      beta_fast: 32
+      beta_slow: 1
+      mscale: 1
+      mscale_all_dim: 0
+data:
+  add_generation_prompt: true
+  train:
+    dataset_name: Nemotron-Cascade-2-SFT-Math
+    split_validation_size: 0.05
+    max_samples: 100000
+  validation: null
+logger:
+  wandb:
+    project: yarn
+    name: sft-qwen3-0.6B-1n8g-megatron-yarn-64k
+  tensorboard:
+    log_dir: tb_logs-sft-qwen3-0.6B-1n8g-megatron-yarn-64k
+cluster:
+  gpus_per_node: 8
