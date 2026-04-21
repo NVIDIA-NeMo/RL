@@ -93,14 +93,6 @@ def model_forward(
     # Add VLM kwargs if applicable
     if processed_inputs.is_multimodal:
         model_args.update(processed_inputs.vlm_kwargs)
-        # One-shot (per process) sanity print to confirm image_flags is flowing.
-        if not getattr(model_forward, "_mm_dbg_printed", False):
-            _shapes = {
-                k: (tuple(v.shape), str(v.dtype)) if hasattr(v, "shape") else type(v).__name__
-                for k, v in processed_inputs.vlm_kwargs.items()
-            }
-            print(f"[mm-debug forward] vlm_kwargs={_shapes}", flush=True)
-            model_forward._mm_dbg_printed = True  # type: ignore[attr-defined]
         # flash_attn_kwargs is not supported for multimodal
         if "flash_attn_kwargs" in model_args:
             del model_args["flash_attn_kwargs"]

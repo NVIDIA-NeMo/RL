@@ -663,6 +663,30 @@ def setup_model_and_optimizer(
         **automodel_kwargs,
     )
 
+    # NemotronOmni: route RADIO's timm Attention modules through
+    # F.scaled_dot_product_attention so we don't materialize the full
+    # (B, H, seq, seq) attention tensor (~5 GiB per block at RADIO-v2-H +
+    # dynamic-resolution patch counts). Parity with the Megatron-Bridge path
+    # which sets `vision_config.use_flash_attn=True` via
+    # `attn_implementation="flash_attention_2"`.
+    vision_model = getattr(model, "vision_model", None) or getattr(
+        getattr(model, "model", None), "vision_model", None
+    )
+    vit_blocks = getattr(
+        getattr(getattr(vision_model, "radio_model", None), "model", None),
+        "blocks",
+        None,
+    )
+    if vit_blocks is not None:
+        flipped = 0
+        for block in vit_blocks:
+            attn = getattr(block, "attn", None)
+            if attn is not None:
+                attn.fused_attn = True
+                flipped += 1
+        if rank == 0:
+            print(f"Enabled fused_attn on {flipped} RADIO ViT blocks")
+
     print(model)
 
     # Compute model metadata after from_pretrained
@@ -700,22 +724,21 @@ def setup_model_and_optimizer(
         if rank == 0:
             print("Froze visual encoder parameters for text-only training")
 
-    # For NemotronOmni (and similar VLMs with custom vision_model/sound_encoder
-    # attribute names), freeze the vision/audio towers during RL. Reasons:
-    # (1) the pretrained vision encoder is already good from SFT and doesn't need
-    # further RL updates; (2) backprop through vision_model under FSDP2 has hit
-    # CUDA illegal memory access in our runs, likely due to the forced
-    # eval()/train() toggle inside extract_feature interacting with sharded
-    # parameter all_gather. Freezing sidesteps that path entirely.
-    frozen_attrs = []
-    for attr in ("vision_model", "vision_projector", "sound_encoder", "sound_projection"):
-        mod = getattr(model, attr, None) or getattr(getattr(model, "model", None), attr, None)
+    # NemotronOmni: freeze audio towers when training on non-audio data.
+    # Without this, their params are in the optimizer but never receive grads;
+    # the optimizer doesn't create state for them, so the saved checkpoint lacks
+    # those entries, and `dcp.load` fails on resume with "Missing key in checkpoint
+    # state_dict: optim.state.sound_encoder.*.step". Frozen + filtered-out of the
+    # optimizer below sidesteps this entirely.
+    for attr in ("sound_encoder", "sound_projection"):
+        mod = getattr(model, attr, None) or getattr(
+            getattr(model, "model", None), attr, None
+        )
         if mod is not None:
             for param in mod.parameters():
                 param.requires_grad_(False)
-            frozen_attrs.append(attr)
-    if frozen_attrs and rank == 0:
-        print(f"Froze VLM vision/audio towers: {frozen_attrs}")
+            if rank == 0:
+                print(f"Froze {attr} parameters (image-only training)")
 
     # CPU offload if needed
     if cpu_offload:
@@ -724,11 +747,15 @@ def setup_model_and_optimizer(
             v.data = v.data.to("cpu")
         model = model.to("cpu")
 
-    # Initialize optimizer
+    # Initialize optimizer — only on parameters that require grad so that frozen
+    # modules (e.g. audio towers on image-only data) don't sit in param_groups
+    # without optimizer state, which otherwise breaks resume via dcp.load
+    # ("Missing key in checkpoint state_dict").
     optimizer = None
     if init_optimizer:
         optimizer_cls = get_class(config["optimizer"]["name"])
-        optimizer = optimizer_cls(model.parameters(), **config["optimizer"]["kwargs"])
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = optimizer_cls(trainable_params, **config["optimizer"]["kwargs"])
 
     # Initialize scheduler
     scheduler = None

@@ -1722,16 +1722,6 @@ def grpo_train(
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
                         as_tensors=False
                     )
-                    if current_step < 2:
-                        _mm_shapes = {}
-                        for _k, _v in extra_multimodal_data.items():
-                            if hasattr(_v, "data") and isinstance(_v.data, list):
-                                _mm_shapes[_k] = f"PackedTensor n={len(_v.data)} first_shape={_v.data[0].shape if _v.data else None}"
-                            elif hasattr(_v, "shape"):
-                                _mm_shapes[_k] = f"tensor shape={tuple(_v.shape)} dtype={_v.dtype}"
-                            else:
-                                _mm_shapes[_k] = type(_v).__name__
-                        print(f"[mm-debug step={current_step}] extra_multimodal_data: {_mm_shapes}", flush=True)
                     train_data.update(extra_multimodal_data)
                     train_data.to("cpu")
 
