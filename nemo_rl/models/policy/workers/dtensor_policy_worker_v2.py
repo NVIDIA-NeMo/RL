@@ -16,7 +16,7 @@ import contextlib
 import gc
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Optional
+from typing import Any, Callable, Generator, NamedTuple, Optional
 
 import ray
 import torch
@@ -188,6 +188,23 @@ def get_train_context(
         if autocast_enabled:
             stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
         yield
+
+
+class _OffPolicyLoopState(NamedTuple):
+    """Per-call loop state shared by the off-policy paths.
+
+    Produced by :meth:`DTensorPolicyWorkerV2Impl._prepare_off_policy_loop_state`
+    and consumed by both ``_run_teacher_ipc_export`` and
+    ``_run_student_off_policy_distillation``.
+    """
+
+    gbs: int
+    mbs: int
+    local_gbs: int
+    num_global_batches: int
+    sequence_dim: int
+    train_context_fn: Callable[[Any], Any]
+    empty_cache_steps: Optional[int]
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -591,12 +608,16 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         Student role: consume teacher IPC outputs and run the usual
         loss/backward/update cycle with a cross-tokenizer-aware loss post-processor.
         """
+        # Shared setup (DP aggregation, train-context factory, etc.) lives in
+        # one place so the teacher- and student-side helpers below only need
+        # to receive the prepared state.
+        loop_state = self._prepare_off_policy_loop_state(data, gbs, mbs)
+
         if role == "teacher":
             return self._run_teacher_ipc_export(
                 data=data,
+                loop_state=loop_state,
                 eval_mode=eval_mode,
-                gbs=gbs,
-                mbs=mbs,
                 topk_logits=topk_logits,
                 timer=timer,
             )
@@ -604,30 +625,32 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             return self._run_student_off_policy_distillation(
                 data=data,
                 loss_fn=loss_fn,
+                loop_state=loop_state,
                 eval_mode=eval_mode,
-                gbs=gbs,
-                mbs=mbs,
                 teacher_logits=teacher_logits,
                 use_teacher_ipc_loss_postprocessor=use_teacher_ipc_loss_postprocessor,
                 timer=timer,
             )
         raise ValueError(f"Unknown role {role!r}; must be 'teacher' or 'student'.")
 
-    def _run_teacher_ipc_export(
+    def _prepare_off_policy_loop_state(
         self,
         data: BatchedDataDict[Any],
-        eval_mode: bool = False,  # noqa: ARG002
-        gbs: Optional[int] = None,
-        mbs: Optional[int] = None,
-        topk_logits: Optional[int] = None,
-        timer: Optional[Any] = None,  # noqa: ARG002
-    ) -> dict[str, Any]:
-        """Teacher-side forward-only pass exporting logits via CUDA IPC handles."""
+        gbs: Optional[int],
+        mbs: Optional[int],
+    ) -> _OffPolicyLoopState:
+        """Prepare the shared per-call loop state for off-policy paths.
+
+        Resolves batch sizes, aggregates the dataset size across the DP group,
+        pulls the sequence dimension, and builds the per-step training-context
+        factory used by both the teacher-export and student-training paths.
+        """
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
             mbs = self.cfg["train_micro_batch_size"]
         local_gbs = gbs // self.dp_size
+
         total_dataset_size = torch.tensor(data.size, device="cuda")
         torch.distributed.all_reduce(
             total_dataset_size,
@@ -637,8 +660,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         num_global_batches = int(total_dataset_size.item()) // gbs
 
         sequence_dim, _ = check_sequence_dim(data)
-        ctx: AbstractContextManager[Any] = torch.no_grad()
-        self.model.eval()
 
         def train_context_fn(processed_inputs):
             return get_train_context(
@@ -655,8 +676,54 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         )
         if empty_cache_steps:
             warnings.warn(
-                f"Emptying cache every {empty_cache_steps} microbatches; doing so unnecessarily would incur a large performance overhead.",
+                f"Emptying cache every {empty_cache_steps} microbatches; "
+                "doing so unnecessarily would incur a large performance overhead.",
             )
+
+        return _OffPolicyLoopState(
+            gbs=gbs,
+            mbs=mbs,
+            local_gbs=local_gbs,
+            num_global_batches=num_global_batches,
+            sequence_dim=sequence_dim,
+            train_context_fn=train_context_fn,
+            empty_cache_steps=empty_cache_steps,
+        )
+
+    def _make_on_microbatch_start(
+        self,
+        post_processor: Any,
+        empty_cache_steps: Optional[int],
+    ) -> Any:
+        """Build the ``on_microbatch_start`` callback for the inner loop.
+
+        Forwards the microbatch index to ``post_processor.set_microbatch_index``
+        when that method exists (IPC-aware post-processors need it; the plain
+        ``LossPostProcessor`` does not define it and is silently skipped).
+        Optionally empties the CUDA cache every ``empty_cache_steps``
+        microbatches.
+        """
+
+        def on_microbatch_start(mb_idx: int) -> None:
+            if hasattr(post_processor, "set_microbatch_index"):
+                post_processor.set_microbatch_index(mb_idx)
+            if empty_cache_steps and mb_idx % empty_cache_steps == 0:
+                torch.cuda.empty_cache()
+
+        return on_microbatch_start
+
+    def _run_teacher_ipc_export(
+        self,
+        data: BatchedDataDict[Any],
+        *,
+        loop_state: _OffPolicyLoopState,
+        eval_mode: bool = False,  # noqa: ARG002
+        topk_logits: Optional[int] = None,
+        timer: Optional[Any] = None,  # noqa: ARG002
+    ) -> dict[str, Any]:
+        """Teacher-side forward-only pass exporting logits via CUDA IPC handles."""
+        ctx: AbstractContextManager[Any] = torch.no_grad()
+        self.model.eval()
 
         teacher_post_processor = XTokenTeacherIPCExportPostProcessor(
             loss_fn=None,
@@ -672,20 +739,20 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             is_mdlm=self.cfg.get("is_mdlm", False),
         )
 
-        def on_microbatch_start(mb_idx):
-            teacher_post_processor.set_microbatch_index(mb_idx)
-            if empty_cache_steps and mb_idx % empty_cache_steps == 0:
-                torch.cuda.empty_cache()
+        on_microbatch_start = self._make_on_microbatch_start(
+            post_processor=teacher_post_processor,
+            empty_cache_steps=loop_state.empty_cache_steps,
+        )
 
         with ctx:
             data = data.to("cuda")
-            for gb_idx in range(num_global_batches):
+            for gb_idx in range(loop_state.num_global_batches):
                 gb_result = process_global_batch(
                     data,
                     None,
                     self.dp_mesh.get_group(),
                     batch_idx=gb_idx,
-                    batch_size=local_gbs,
+                    batch_size=loop_state.local_gbs,
                 )
                 batch = gb_result["batch"]
                 global_valid_seqs = gb_result["global_valid_seqs"]
@@ -694,7 +761,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 processed_iterator, iterator_len = get_microbatch_iterator(
                     batch,
                     self.cfg,
-                    mbs,
+                    loop_state.mbs,
                     self.dp_mesh,
                     tokenizer=self.tokenizer,
                     cp_size=self.cp_size,
@@ -710,11 +777,11 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
                     sampling_params=None,
-                    sequence_dim=sequence_dim,
+                    sequence_dim=loop_state.sequence_dim,
                     dp_size=self.dp_size,
                     cp_size=self.cp_size,
-                    num_global_batches=num_global_batches,
-                    train_context_fn=train_context_fn,
+                    num_global_batches=loop_state.num_global_batches,
+                    train_context_fn=loop_state.train_context_fn,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
                 )
@@ -732,9 +799,9 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         self,
         data: BatchedDataDict[Any],
         loss_fn: Optional[LossFunction],
+        *,
+        loop_state: _OffPolicyLoopState,
         eval_mode: bool = False,
-        gbs: Optional[int] = None,
-        mbs: Optional[int] = None,
         teacher_logits: Optional[Any] = None,
         use_teacher_ipc_loss_postprocessor: bool = False,
         timer: Optional[Any] = None,  # noqa: ARG002
@@ -753,20 +820,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         if loss_fn is None:
             loss_fn = getattr(self, "_cached_loss_fn", None)
-        if gbs is None:
-            gbs = self.cfg["train_global_batch_size"]
-        if mbs is None:
-            mbs = self.cfg["train_micro_batch_size"]
-        local_gbs = gbs // self.dp_size
-        total_dataset_size = torch.tensor(data.size, device="cuda")
-        torch.distributed.all_reduce(
-            total_dataset_size,
-            op=torch.distributed.ReduceOp.SUM,
-            group=self.dp_mesh.get_group(),
-        )
-        num_global_batches = int(total_dataset_size.item()) // gbs
 
-        sequence_dim, _ = check_sequence_dim(data)
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
             self.model.eval()
@@ -778,24 +832,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         if teacher_logits is not None:
             rank = torch.distributed.get_rank()
             teacher_worker_result = teacher_logits[rank]
-
-        def train_context_fn(processed_inputs):
-            return get_train_context(
-                cp_size=self.cp_size,
-                cp_mesh=self.cp_mesh,
-                cp_buffers=processed_inputs.cp_buffers,
-                sequence_dim=sequence_dim,
-                dtype=self.dtype,
-                autocast_enabled=self.autocast_enabled,
-            )
-
-        empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
-            "clear_cache_every_n_steps"
-        )
-        if empty_cache_steps:
-            warnings.warn(
-                f"Emptying cache every {empty_cache_steps} microbatches; doing so unnecessarily would incur a large performance overhead.",
-            )
 
         if use_teacher_ipc_loss_postprocessor and teacher_worker_result is not None:
             loss_post_processor = XTokenTeacherIPCLossPostProcessor(
@@ -823,13 +859,10 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 sampling_params=None,
             )
 
-        def on_microbatch_start(mb_idx):
-            if use_teacher_ipc_loss_postprocessor and hasattr(
-                loss_post_processor, "set_microbatch_index"
-            ):
-                loss_post_processor.set_microbatch_index(mb_idx)
-            if empty_cache_steps and mb_idx % empty_cache_steps == 0:
-                torch.cuda.empty_cache()
+        on_microbatch_start = self._make_on_microbatch_start(
+            post_processor=loss_post_processor,
+            empty_cache_steps=loop_state.empty_cache_steps,
+        )
 
         with ctx:
             data = data.to("cuda")
@@ -837,13 +870,13 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             all_mb_metrics = []
             grad_norm: Optional[float | torch.Tensor] = None
 
-            for gb_idx in range(num_global_batches):
+            for gb_idx in range(loop_state.num_global_batches):
                 gb_result = process_global_batch(
                     data,
                     loss_fn,
                     self.dp_mesh.get_group(),
                     batch_idx=gb_idx,
-                    batch_size=local_gbs,
+                    batch_size=loop_state.local_gbs,
                 )
                 batch = gb_result["batch"]
                 global_valid_seqs = gb_result["global_valid_seqs"]
@@ -853,7 +886,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 processed_iterator, iterator_len = get_microbatch_iterator(
                     batch,
                     self.cfg,
-                    mbs,
+                    loop_state.mbs,
                     self.dp_mesh,
                     tokenizer=self.tokenizer,
                     cp_size=self.cp_size,
@@ -869,11 +902,11 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
                     sampling_params=None,
-                    sequence_dim=sequence_dim,
+                    sequence_dim=loop_state.sequence_dim,
                     dp_size=self.dp_size,
                     cp_size=self.cp_size,
-                    num_global_batches=num_global_batches,
-                    train_context_fn=train_context_fn,
+                    num_global_batches=loop_state.num_global_batches,
+                    train_context_fn=loop_state.train_context_fn,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
                 )
