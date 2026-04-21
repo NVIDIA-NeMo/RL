@@ -38,6 +38,7 @@ Usage:
 
     save_trace(tracer.get_events(), actors=())
 """
+import itertools
 import json
 import os
 import threading
@@ -52,6 +53,27 @@ from nemo_rl.utils.timer import Timer
 
 Event = dict[str, Any]
 
+# Counter used to mint unique virtual TIDs per async span so Perfetto renders
+# each span in its own thread lane (real-thread-shared Complete events overlap
+# badly and get visually collapsed). Starts at a high base so virtual TIDs
+# cannot collide with real OS thread IDs (typically < 2**22).
+_virtual_tid_counter = itertools.count(0x70000000)
+
+# Counter for minting virtual PIDs. A Tracer with ``virtual_process_name`` set
+# uses a virtual PID so Perfetto renders it as its own process block (with the
+# real tracer thread and every per-span virtual TID contained inside). High
+# base keeps virtual PIDs clear of any real OS PIDs.
+_virtual_pid_counter = itertools.count(0x60000000)
+
+# Per-tracer sort-index block. Without thread_sort_index metadata, Perfetto
+# orders threads within a process by TID, which places virtual TIDs (very
+# large numbers) far from their real owning thread. Each tracer reserves a
+# block of sort indices so the real thread and its virtual TIDs render
+# adjacently. Block size (100) caps concurrent async spans per tracer in the
+# sort-adjacent view; overflow still renders correctly, just not adjacent.
+_sort_index_counter = itertools.count(0)
+_SORT_BLOCK_SIZE = 100
+
 
 class Tracer:
     """Lightweight tracer for NemoRL training that outputs Chrome Trace Format.
@@ -64,18 +86,43 @@ class Tracer:
         self,
         enabled: bool = False,
         name: str = "",
+        virtual_process_name: Optional[str] = None,
     ):
         """Initialize the tracer.
 
         Args:
             enabled: Whether tracing is enabled. If False, all operations are no-ops.
+            name: Label used for the tracer's real thread lane in Perfetto.
+            virtual_process_name: If set, the tracer emits events under a minted
+                virtual PID with this label, so Perfetto renders all of the
+                tracer's events (real thread + per-span virtual threads) inside
+                a dedicated process block. Use this for tracers whose activity
+                is a logical unit that should be grouped together (e.g. a
+                prompt-group worker and its concurrent samples).
         """
         self._enabled = enabled
         self._events: list[Event] = []
         self._events_lock = threading.Lock()
         self._span_stack: list[tuple[str, float, dict[str, Any]]] = []
+        # Active async spans keyed by (name, async_id, category) ->
+        # (start_ts, metadata, virtual_tid). We emit a single Chrome Trace "X"
+        # Complete event on end so spans render on the thread (real or virtual)
+        # rather than on a shared process-level async track.
+        self._async_spans: dict[
+            tuple[str, str, str], tuple[float, dict[str, Any], int]
+        ] = {}
+        # async_id -> virtual TID, stable within a tracer's lifetime.
+        self._virtual_tids: dict[str, int] = {}
+        # Sort-index block reserved for this tracer; real TID occupies offset 0
+        # and virtual TIDs occupy offsets 1, 2, ... within this block so they
+        # render adjacent to the real TID in Perfetto.
+        self._sort_index_base = next(_sort_index_counter) * _SORT_BLOCK_SIZE
 
-        self._pid = os.getpid()
+        if virtual_process_name is not None:
+            self._pid = next(_virtual_pid_counter)
+        else:
+            self._pid = os.getpid()
+        self._virtual_process_name = virtual_process_name
         self._name = name
         # We only intitialize tid upon the first span. This allows us to create the
         # tracer on a different thread from the one it'll be used on.
@@ -85,6 +132,38 @@ class Tracer:
         tid = threading.current_thread().native_id
         if self._tid is None:
             self._tid = tid
+            ts = int(time.monotonic() * 1_000_000)
+            with self._events_lock:
+                # If this tracer owns a virtual process, label it so Perfetto
+                # renders a named process block.
+                if self._virtual_process_name:
+                    self._events.append({
+                        "name": "process_name",
+                        "ph": "M",
+                        "ts": ts,
+                        "pid": self._pid,
+                        "args": {"name": self._virtual_process_name},
+                    })
+                # Emit Chrome Trace metadata so Perfetto displays the thread
+                # with the tracer's name instead of a raw TID, and sorts it
+                # next to this tracer's virtual-TID sample lanes.
+                if self._name:
+                    self._events.append({
+                        "name": "thread_name",
+                        "ph": "M",
+                        "ts": ts,
+                        "pid": self._pid,
+                        "tid": self._tid,
+                        "args": {"name": self._name},
+                    })
+                    self._events.append({
+                        "name": "thread_sort_index",
+                        "ph": "M",
+                        "ts": ts,
+                        "pid": self._pid,
+                        "tid": self._tid,
+                        "args": {"sort_index": self._sort_index_base},
+                    })
         else:
             assert tid == self._tid, f"Tracer used on different threads: {tid=} <> {self._tid=}"
 
@@ -215,6 +294,162 @@ class Tracer:
         with self._events_lock:
             self._events.append(event)
 
+    def _get_virtual_tid(self, async_id: str) -> int:
+        """Assign (once) a unique virtual TID for this async span.
+
+        Chrome Trace Complete events on a shared real TID overlap in ways
+        Perfetto collapses during rendering. Giving each concurrent span its
+        own virtual TID makes every span appear as a distinct thread lane.
+        The real owning thread is preserved via ``owner_tid`` in span args.
+        """
+        if async_id not in self._virtual_tids:
+            vtid = next(_virtual_tid_counter)
+            slot = len(self._virtual_tids) + 1  # real TID occupies slot 0
+            self._virtual_tids[async_id] = vtid
+            # If the tracer owns a virtual process, the process block already
+            # names the group, so the per-span lane just needs the async_id.
+            # Otherwise prefix with the tracer name so virtual lanes are still
+            # identifiable among the many threads of a shared process.
+            if self._virtual_process_name:
+                thread_name = async_id
+            elif self._name:
+                thread_name = f"{self._name}/{async_id}"
+            else:
+                thread_name = async_id
+            ts = int(time.monotonic() * 1_000_000)
+            with self._events_lock:
+                self._events.append({
+                    "name": "thread_name",
+                    "ph": "M",
+                    "ts": ts,
+                    "pid": self._pid,
+                    "tid": vtid,
+                    "args": {"name": thread_name},
+                })
+                self._events.append({
+                    "name": "thread_sort_index",
+                    "ph": "M",
+                    "ts": ts,
+                    "pid": self._pid,
+                    "tid": vtid,
+                    "args": {"sort_index": self._sort_index_base + slot},
+                })
+        return self._virtual_tids[async_id]
+
+    def start_async_span(
+        self,
+        name: str,
+        async_id: str,
+        category: str = "async",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Start an async span that may overlap with other async spans on the same thread.
+
+        Unlike ``start_span`` these spans do not use the LIFO stack, so concurrent
+        asyncio tasks on the same thread can each have their own live span. The
+        actual event is emitted by ``end_async_span`` as a single Chrome Trace
+        "X" (Complete) event on a per-span virtual TID so Perfetto renders each
+        span in its own lane.
+        """
+        if not self._enabled:
+            return
+        self._ensure_tid()
+
+        if metadata is None:
+            metadata = {}
+        metadata = {
+            **metadata,
+            "tracer_name": self._name,
+            "async_id": async_id,
+            "owner_tid": self._tid,
+        }
+
+        vtid = self._get_virtual_tid(async_id)
+        self._async_spans[(name, async_id, category)] = (
+            time.monotonic(),
+            metadata,
+            vtid,
+        )
+
+    def end_async_span(
+        self,
+        name: str,
+        async_id: str,
+        category: str = "async",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """End an async span and emit a single Chrome Trace "X" Complete event.
+
+        Optional metadata is merged with the start metadata and attached as
+        ``args`` on the emitted event, so callers can record values only known
+        after the span body runs (e.g. output token counts, truncation flag).
+        """
+        if not self._enabled:
+            return
+
+        key = (name, async_id, category)
+        state = self._async_spans.pop(key, None)
+        if state is None:
+            raise ValueError(
+                f"No active async span to end (name={name!r}, async_id={async_id!r}, "
+                f"category={category!r})"
+            )
+        start_ts, start_metadata, vtid = state
+        end_ts = time.monotonic()
+
+        args = dict(start_metadata)
+        if metadata:
+            args.update(metadata)
+
+        event = {
+            "name": name,
+            "cat": category,
+            "ph": "X",  # Complete event: rendered on the (virtual) thread lane
+            "ts": int(start_ts * 1_000_000),
+            "dur": int((end_ts - start_ts) * 1_000_000),
+            "pid": self._pid,
+            "tid": vtid,
+            "args": args,
+        }
+
+        with self._events_lock:
+            self._events.append(event)
+
+    @contextmanager
+    def async_span(
+        self,
+        name: str,
+        async_id: str,
+        category: str = "async",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Context manager for an async (overlapping) span.
+
+        Yields a mutable dict. Anything written into it before the context exits
+        is attached as ``args`` to the end event, so callers can record values
+        that are only known after the span body runs.
+
+        Example:
+            with tracer.async_span("sample_rollout", "p0_g3",
+                                   category="sample",
+                                   metadata={"sample_idx": 3}) as end_meta:
+                result = await run_sample(...)
+                end_meta["output_tokens"] = result.num_tokens
+        """
+        if not self._enabled:
+            yield {}
+            return
+
+        self.start_async_span(name, async_id, category, metadata)
+        end_metadata: dict[str, Any] = {}
+        try:
+            yield end_metadata
+        finally:
+            self.end_async_span(
+                name, async_id, category,
+                metadata=end_metadata or None,
+            )
+
     def add_counter(
         self,
         name: str,
@@ -273,8 +508,15 @@ def tracing_enabled():
     return os.environ.get("NEMORL_TRACE_ENABLED", "0").lower() in ("1", "true", "yes")
 
 
-def new_tracer(name: str = "") -> Tracer:
-    return Tracer(enabled=tracing_enabled(), name=name)
+def new_tracer(
+    name: str = "",
+    virtual_process_name: Optional[str] = None,
+) -> Tracer:
+    return Tracer(
+        enabled=tracing_enabled(),
+        name=name,
+        virtual_process_name=virtual_process_name,
+    )
 
 
 def define_collect_trace(get_tracer_events):

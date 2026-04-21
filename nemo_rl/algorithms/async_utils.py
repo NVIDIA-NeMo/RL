@@ -532,7 +532,12 @@ class AsyncTrajectoryCollector:
                 repeated_batch = single_prompt_batch.repeat_interleave(num_generations)
 
                 self._inflight_sema.acquire()
-                worker_tracer = new_tracer(f"trajectory_collector_worker_prompt{prompt_idx}")
+                worker_tracer = new_tracer(
+                    name="group",
+                    virtual_process_name=(
+                        f"prompt_group_tw{target_weight}_p{prompt_idx}"
+                    ),
+                )
                 if self._tracer.enabled:
                     self._worker_tracers.append(worker_tracer)
                 worker = _threading.Thread(
@@ -743,6 +748,8 @@ class AsyncTrajectoryCollector:
                         ],
                             max_rollout_turns=self.master_config["grpo"]["max_rollout_turns"],
                             greedy=False,
+                            tracer=worker_tracer,
+                            sample_id_prefix=f"tw{target_weight_version}_p{prompt_idx}",
                         )
 
             # Move to CPU and push to buffer (avoid blocking on GC/push)

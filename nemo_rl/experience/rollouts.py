@@ -21,6 +21,7 @@ import json
 import math
 import statistics
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -50,6 +51,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.trace import Tracer
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -867,6 +869,8 @@ def run_async_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    tracer: Optional[Tracer] = None,
+    sample_id_prefix: str = "",
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Run multi-turn rollouts with sample-level processing.
 
@@ -881,6 +885,12 @@ def run_async_multi_turn_rollout(
         max_seq_len: Maximum sequence length allowed
         max_rollout_turns: Maximum number of agent-environment interaction turns
         greedy: Whether to use greedy decoding
+        tracer: Optional Tracer to emit per-sample async spans on. Must be the same
+            Tracer instance that is live on the calling thread (asyncio.run below runs
+            on this thread).
+        sample_id_prefix: Prefix used to construct unique async-event ids per sample
+            (e.g. ``f"tw{target_weight}_p{prompt_idx}"``). Final id is
+            ``f"{prefix}_g{sample_idx}"``.
 
     Returns:
         Tuple containing:
@@ -907,20 +917,55 @@ def run_async_multi_turn_rollout(
         # Run all samples concurrently
         async def run_single_sample_with_error_handling(i, sample_state):
             """Wrapper to handle errors for individual sample rollouts."""
-            try:
-                result = await run_sample_multi_turn_rollout(
-                    sample_idx=i,
-                    initial_sample_state=sample_state,
-                    policy_generation=policy_generation,
-                    tokenizer=tokenizer,
-                    task_to_env=task_to_env,
-                    max_seq_len=max_seq_len,
-                    max_rollout_turns=max_rollout_turns,
-                    greedy=greedy,
+            async_id = (
+                f"{sample_id_prefix}_g{i}" if sample_id_prefix else f"g{i}"
+            )
+            initial_input_tokens = sum(
+                len(m.get("token_ids", [])) for m in sample_state["message_log"]
+            )
+            span_ctx = (
+                tracer.async_span(
+                    "sample_rollout",
+                    async_id,
+                    category="sample",
+                    metadata={
+                        "sample_idx": i,
+                        "prefix": sample_id_prefix,
+                        "initial_input_tokens": initial_input_tokens,
+                        "task_name": sample_state.get("task_name"),
+                    },
                 )
-                return result
-            except Exception as e:
-                raise RuntimeError(f"Error in sample {i} rollout: {e}") from e
+                if tracer is not None
+                else nullcontext({})
+            )
+            with span_ctx as end_meta:
+                try:
+                    result = await run_sample_multi_turn_rollout(
+                        sample_idx=i,
+                        initial_sample_state=sample_state,
+                        policy_generation=policy_generation,
+                        tokenizer=tokenizer,
+                        task_to_env=task_to_env,
+                        max_seq_len=max_seq_len,
+                        max_rollout_turns=max_rollout_turns,
+                        greedy=greedy,
+                    )
+                    _, sample_metrics = result
+                    end_meta.update({
+                        "num_turns": sample_metrics["turn_count"],
+                        "output_tokens": sample_metrics["assistant_tokens"],
+                        "env_tokens": sample_metrics["env_tokens"],
+                        "total_tokens": sample_metrics["total_tokens"],
+                        "truncated": bool(sample_metrics["truncated"]),
+                        "terminated": bool(sample_metrics["terminated"]),
+                        "max_turns_reached": bool(
+                            sample_metrics["max_turns_reached"]
+                        ),
+                        "total_reward": float(sample_metrics["total_reward"]),
+                    })
+                    return result
+                except Exception as e:
+                    raise RuntimeError(f"Error in sample {i} rollout: {e}") from e
 
         # Create tasks for all samples and run them concurrently
         sample_tasks = [
