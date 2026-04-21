@@ -186,12 +186,35 @@ class DevPodMode(str, Enum):
     SKIP = "skip"
 
 
+class SubmitterMode(str, Enum):
+    """How the CLI ships the training entrypoint onto the cluster.
+
+    ``portForward`` (default) goes through Ray's Job SDK via a brief
+    ``kubectl port-forward`` to the head dashboard. The Ray job carries a
+    submission id the dashboard tracks.
+
+    ``exec`` shells into the training head pod with ``kubectl exec`` and
+    launches the entrypoint as a backgrounded ``nohup`` process — the
+    same shape as a Slurm driver running on a login node. No Ray Job
+    abstraction; the process calls ``ray.init(address="auto")`` from
+    inside the head pod and joins the already-running cluster.
+    """
+
+    PORT_FORWARD = "portForward"
+    EXEC = "exec"
+
+
 class SubmitSpec(_StrictModel):
     kind: SubmitKind = SubmitKind.SDK
     portForward: PortForwardMode = PortForwardMode.AUTO
     devPod: DevPodMode = DevPodMode.AUTO
     # Local port when port-forwarding; default avoids collision with `kubectl-ray session`.
     localDashboardPort: int = 18265
+    # Transport used to deliver the training entrypoint to the cluster.
+    submitter: SubmitterMode = SubmitterMode.PORT_FORWARD
+    # Pod directory ExecSubmitter uses for the launcher script, stdout log,
+    # and pidfile. Override if PodSecurityPolicy makes /tmp read-only.
+    execTmpDir: str = "/tmp"
 
 
 # =============================================================================
@@ -206,6 +229,46 @@ class LaunchMode(str, Enum):
     BRINGUP = "bringup"  # create a long-lived RayCluster, no job
 
 
+class RunMode(str, Enum):
+    """Interactive vs batch defaults for ``nrl-k8s run`` / ``launch``.
+
+    ``interactive`` (default) preserves the dev-iteration UX: port-forward
+    submitter, ``codeSource=upload``, foreground log tailing, exits on
+    terminal state.
+
+    ``batch`` flips production defaults: exec submitter, ``codeSource=image``,
+    no wait — the CLI returns a run id and exits as soon as ``nohup`` fires
+    so laptops are off the critical path for long-running training.
+
+    Both defaults are macros — each individual dimension (submitter,
+    codeSource, no_wait) can still be overridden via explicit flag.
+    """
+
+    INTERACTIVE = "interactive"
+    BATCH = "batch"
+
+
+class CodeSource(str, Enum):
+    """Where the training code lives at submission time.
+
+    ``upload`` (default) stages a working_dir from the laptop and uploads it
+    via Ray's Job SDK. Subject to Ray's 100 MiB working_dir cap.
+
+    ``image`` assumes the code is baked into the container image at
+    ``LaunchSpec.codePath`` (typically ``/opt/nemo-rl``). No CLI-side
+    staging, no upload. The entrypoint is responsible for ``cd``-ing there.
+
+    ``lustre`` is structurally identical to ``image`` but implies the
+    ``codePath`` points at a Lustre / shared-FS mount populated by an
+    out-of-band snapshot step. Kept distinct so ``nrl-k8s check`` output
+    and future snapshot tooling can reason about it.
+    """
+
+    UPLOAD = "upload"
+    IMAGE = "image"
+    LUSTRE = "lustre"
+
+
 class AttachSpec(_StrictModel):
     generation: str | None = None
     gym: str | None = None
@@ -214,13 +277,18 @@ class AttachSpec(_StrictModel):
 
 class LaunchSpec(_StrictModel):
     mode: LaunchMode = LaunchMode.SINGLE
+    # Interactive vs batch defaults — see :class:`RunMode`. Overridden by
+    # ``--mode`` on the CLI; unset on the infra layer means "interactive".
+    runMode: RunMode = RunMode.INTERACTIVE
     attach: AttachSpec = Field(default_factory=AttachSpec)
     peerWatcher: bool = True
     # Shell command the training job runs inside the Ray cluster. Required
     # for `nrl-k8s launch` / `nrl-k8s run`. Typically a line like
     # ``python -u examples/.../entry.py --config nrl_k8s_run.yaml ...``.
     # The CLI stages the resolved recipe as ``nrl_k8s_run.yaml`` at the
-    # working_dir root so this command can reference it by name.
+    # working_dir root so this command can reference it by name (only when
+    # ``codeSource=upload``; in image/lustre mode the entrypoint must use
+    # the in-container recipe path directly).
     entrypoint: str | None = None
     # Env vars injected into the training job's runtime_env.
     env: dict[str, str] = Field(default_factory=dict)
@@ -228,7 +296,15 @@ class LaunchSpec(_StrictModel):
     # None means "use the built-in default" (see nrl_k8s.workdir). Keeping
     # this narrow matters — Ray caps working_dir uploads at 100 MiB, so
     # recipes should exclude datasets they don't need for the run.
+    # Only consulted when ``codeSource=upload``.
     rayUploadPaths: list[str] | None = None
+    # Where the training code lives — see :class:`CodeSource`. When
+    # ``image`` or ``lustre``, ``codePath`` must be set.
+    codeSource: CodeSource = CodeSource.UPLOAD
+    # Absolute path inside the container where the code lives when
+    # codeSource is image or lustre. The entrypoint is expected to ``cd``
+    # there and (if applicable) ``source`` any env setup.
+    codePath: str | None = None
 
     @model_validator(mode="after")
     def _attach_fields(self) -> "LaunchSpec":
@@ -238,6 +314,16 @@ class LaunchSpec(_StrictModel):
                     "infra.launch.mode=attach requires at least one of "
                     "infra.launch.attach.{generation,gym,training}"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _code_path_required_for_non_upload(self) -> "LaunchSpec":
+        if self.codeSource in (CodeSource.IMAGE, CodeSource.LUSTRE) \
+                and not self.codePath:
+            raise ValueError(
+                f"infra.launch.codePath is required when codeSource="
+                f"{self.codeSource.value}"
+            )
         return self
 
 
@@ -374,6 +460,7 @@ __all__ = [
     "CheckpointsSpec",
     "ClusterSpec",
     "ClustersSpec",
+    "CodeSource",
     "DaemonSpec",
     "DevPodMode",
     "HFCacheKind",
@@ -387,10 +474,12 @@ __all__ = [
     "PortForwardMode",
     "ResourceProfile",
     "ResourcesSpec",
+    "RunMode",
     "SchedulerKind",
     "SchedulerSpec",
     "SubmitKind",
     "SubmitSpec",
+    "SubmitterMode",
     "Toleration",
     "WorkspaceKind",
     "WorkspaceSpec",

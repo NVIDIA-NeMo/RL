@@ -46,8 +46,20 @@ infra:
     portForward: auto
     devPod: auto
     localDashboardPort: 18265
+    # Transport: portForward = Ray Job SDK via kubectl port-forward;
+    # exec = kubectl exec + nohup python (for batch production).
+    submitter: portForward
+    # Pod path ExecSubmitter uses for launcher + stdout + pidfile.
+    execTmpDir: /tmp
   launch:
     mode: single
+    # interactive (default) = port-forward + upload + tail; batch = exec + image + no-wait.
+    # Can be overridden per-invocation with `--mode` on launch/run.
+    runMode: interactive
+    # Where the code lives: upload (default, Ray SDK), image (baked
+    # at launch.codePath), or lustre (mounted at launch.codePath).
+    codeSource: upload
+    codePath: null
     attach:
       generation: null
       gym: null

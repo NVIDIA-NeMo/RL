@@ -337,6 +337,174 @@ before a re-run (though `launch --replace` does this automatically).
 Not yet implemented — stubs print `not yet implemented (phase: ...)` and
 exit `2`.
 
+## Modes: interactive vs batch
+
+`launch` and `run` both take `--mode {interactive, batch}`. The flag is a
+macro — it flips a coherent set of defaults that a researcher would
+otherwise pick individually.
+
+| dimension | `--mode interactive` (default) | `--mode batch` |
+|---|---|---|
+| Submitter transport | port-forward + Ray Job SDK | `kubectl exec` + `nohup` on head pod |
+| Code source | `upload` (zipped working_dir via Ray SDK) | `image` (baked at `launch.codePath`) |
+| Foreground wait | yes — tails logs, exits on terminal state | no — returns as soon as nohup fires |
+| Laptop on critical path? | yes, for run lifetime | no |
+| Typical use | dev iteration | long production runs |
+
+Each piece is independently overridable: `--submitter portForward`,
+`--code-source {upload, image, lustre}`, `--code-path /opt/nemo-rl`,
+`--run-id <tag>`, `--wait` / `--no-wait`.
+
+You can also set the mode in the infra YAML so researchers don't have
+to remember the flag every run:
+
+```yaml
+# recipe.infra.yaml
+launch:
+  runMode: batch            # flips defaults; --mode on CLI still wins
+  codeSource: image
+  codePath: /opt/nemo-rl
+submit:
+  submitter: exec
+```
+
+### Batch submission walkthrough
+
+The canonical example is `qwen3_4b_if_gym_disagg.yaml` paired with its
+production infra variant. Same recipe as the dev example above, but
+submission goes through `kubectl exec` and code comes from
+`/opt/nemo-rl` inside the container instead of a laptop upload.
+
+```bash
+RECIPE=tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml
+INFRA=tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.prod.infra.yaml
+
+# Admin, once: bring up the two RayClusters.
+nrl-k8s cluster up "$RECIPE" --infra "$INFRA" --role gym
+nrl-k8s cluster up "$RECIPE" --infra "$INFRA" --role training
+
+# Researcher, per run — returns in seconds, laptop can close.
+RUN_ID=qwen3-4b-gym-disagg-$(date +%Y%m%d-%H%M%S)
+nrl-k8s launch "$RECIPE" --infra "$INFRA" --run-id "$RUN_ID"
+# run id:  qwen3-4b-gym-disagg-20260421-103012
+# kind:    exec
+# cluster: raycluster-gym-disagg-qwen3-4b  (ns=nemo-rl-testing)
+# pod:     raycluster-gym-disagg-qwen3-4b-head-xyz42
+# tmp:     /tmp/nrl-qwen3-4b-gym-disagg-20260421-103012
+# follow:  nrl-k8s job logs $RUN_ID <recipe> --role training -f
+
+# Observe from any laptop, any time — the handle is cached under
+# ~/.cache/nrl-k8s/runs/<run-id>.json.
+nrl-k8s job logs "$RUN_ID" "$RECIPE" --infra "$INFRA" --role training -f
+nrl-k8s job stop "$RUN_ID" "$RECIPE" --infra "$INFRA" --role training
+```
+
+The prod infra declares `submit.submitter: exec` + `launch.runMode:
+batch` + `launch.codeSource: image`, so `--mode batch` is implicit.
+The dev infra (`qwen3_4b_if_gym_disagg.infra.yaml`) keeps the
+port-forward + upload path, letting `launch` / `run` default to
+foreground log tailing for dev iteration.
+
+The exec submitter writes a launcher script onto the head pod, runs it
+under `nohup` + `disown`, captures the PID and (on exit) the exitcode.
+`job logs` streams the driver's stdout via `kubectl exec tail -F`;
+`job stop` sends SIGTERM via `kubectl exec kill` (SIGKILL with
+`--force`).
+
+Because the driver calls `ray.init(address="auto")` and registers with
+the cluster, the run also shows up under `ray job list` on the head
+dashboard and is reachable with `ray job logs` — a bonus if you prefer
+the Ray CLI for log tailing.
+
+### Env vars and `$NRL_K8S_RUN_ID`
+
+Both submitters inject the resolved run id as `$NRL_K8S_RUN_ID`
+(alongside anything in `infra.launch.env`) by prepending shell
+`export` lines to the entrypoint. Recipes can reference it:
+
+```yaml
+launch:
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    python -u examples/nemo_gym/run_grpo_nemo_gym.py \
+      --config examples/nemo_gym/grpo_qwen3_4b_instruct_k8s_base.yaml \
+      logger.wandb.name=my-run-$NRL_K8S_RUN_ID
+```
+
+Inlining envs as `export` (rather than `runtime_env.env_vars`) avoids
+Ray's "Failed to merge the Job's runtime env" error, which triggers
+when the head pod's captured `os.environ` conflicts with a submission's
+declared env. The shell path is portable; the Ray path isn't.
+
+### Viewing the Ray dashboard
+
+```
+nrl-k8s cluster dashboard <cluster-name> [-n <namespace>]
+```
+
+`<cluster-name>` is what `nrl-k8s cluster list` / `kubectl get
+rayclusters` shows. Namespace defaults to the current kube context.
+Port-forwards `svc/<cluster-name>-head-svc:8265` to `localhost:8265`
+and opens the URL in the default browser. Ctrl+C kills the forward.
+
+**Blank dashboard?** The Ray dashboard serves its frontend from
+`ray/dashboard/client/build/static/`. If those JS/CSS files are
+symlinks into the uv cache (`/root/.cache/uv/archive-v0/...`),
+aiohttp's `follow_symlinks=False` default 404s every request — the
+browser renders an empty page.
+
+The command's default `--fix` detects this and reinstalls
+`ray[default]==<current-version>` in copy mode on the head pod
+(`uv pip install --reinstall --link-mode=copy`). Idempotent: skipped
+when the assets are already real files; ~30s when it runs. Pass
+`--no-fix` on images that were already built correctly.
+
+**The permanent fix is in the image build.** Set
+`UV_LINK_MODE=copy` *before* the `uv pip install` that brings in
+`ray[default]`:
+
+```Dockerfile
+ENV UV_LINK_MODE=copy
+RUN uv pip install "ray[default]==2.54.0" ...
+```
+
+Or scope it to just the ray install:
+
+```Dockerfile
+RUN uv pip install --link-mode=copy "ray[default]==2.54.0"
+```
+
+Setting `UV_LINK_MODE=copy` only at pod runtime has no effect on an
+already-populated venv — existing symlinks stay symlinks until the
+package is reinstalled (which is exactly what `--fix` does on demand).
+
+### Entrypoint shell
+
+Ray's Job submission API runs the entrypoint through `/bin/dash` by
+default, which does not support `set -o pipefail` or bash arrays. If
+your entrypoint needs bash-only syntax, either:
+
+- use `set -eu` instead of `set -euo pipefail`, or
+- wrap the body: `exec bash -c '<your entrypoint>'`.
+
+The exec submitter runs the launcher under `bash` directly, so
+bash-specific features work there regardless.
+
+### Code sources
+
+`launch.codeSource` picks what's on disk inside the pod at run time:
+
+| value | behaviour | when to use |
+|---|---|---|
+| `upload` (default) | Stage + upload `working_dir` via Ray Job SDK (100 MiB cap) | dev iteration with `--mode interactive` |
+| `image` | Code baked into the container at `launch.codePath` (default `/opt/nemo-rl`) | production from a frozen image tag |
+| `lustre` | Code pre-staged on a Lustre mount at `launch.codePath` | production with per-run snapshots without rebuilding |
+
+For `image` and `lustre`, the entrypoint is responsible for `cd`ing
+into `codePath` and `source`ing any env (`3rdparty/vllm/nemo-rl.env`,
+etc.) — the CLI does not inject `cd` for you.
+
 ## `--replace` semantics
 
 Both `nrl-k8s launch` and `nrl-k8s run` accept `--replace`. It performs
