@@ -24,7 +24,7 @@ uv run examples/run_sft.py \
     ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
     ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
     ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
-    ++policy.megatron_cfg.optimizer.muon_use_nesterov=False \
+    ++policy.megatron_cfg.optimizer.muon_nesterov=False \
     ++policy.megatron_cfg.optimizer.muon_extra_scale_factor=0.5 \
     policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false \
     policy.megatron_cfg.optimizer.use_distributed_optimizer=false
@@ -53,7 +53,7 @@ policy:
       
       # Muon-specific settings
       muon_momentum: 0.95
-      muon_use_nesterov: false
+      muon_nesterov: false
       muon_scale_mode: "spectral"
       muon_fp32_matmul_prec: "medium"
       muon_num_ns_steps: 5
@@ -96,7 +96,7 @@ uv run examples/run_sft.py \
   ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
   ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
   ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
-  ++policy.megatron_cfg.optimizer.muon_use_nesterov=False \
+  ++policy.megatron_cfg.optimizer.muon_nesterov=False \
   ++policy.megatron_cfg.optimizer.muon_extra_scale_factor=0.2 \
   policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false \
   ++policy.megatron_cfg.optimizer.lr=2e-5 \
@@ -133,7 +133,7 @@ uv run examples/run_grpo_math.py \
   ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
   ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
   ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
-  ++policy.megatron_cfg.optimizer.muon_use_nesterov=False \
+  ++policy.megatron_cfg.optimizer.muon_nesterov=False \
   ++policy.megatron_cfg.optimizer.muon_extra_scale_factor=0.5 \
   policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false \
   policy.megatron_cfg.optimizer.use_distributed_optimizer=False \
