@@ -136,8 +136,12 @@ for SCRIPT in $SCRIPTS; do
 
     rel_script=$(check_file_in_version_control_and_get_relpath_from_git_root $SCRIPT)
 
-    EXP_NAME=$(basename $SCRIPT .sh)
-    SNAPSHOT_DIR=$(bash $PROJECT_ROOT/tools/code_snapshot.sh $EXP_NAME)
+    # Use path relative to tests/test_suites/ as EXP_NAME so that scripts with the
+    # same basename in different accelerator dirs (e.g. h100/ vs gb200/) get distinct
+    # snapshot directories (code_snapshot.sh uses mkdir -p so slashes work).
+    EXP_NAME="${rel_script#tests/test_suites/}"
+    EXP_NAME="${EXP_NAME%.sh}"
+    SNAPSHOT_DIR=$(bash $PROJECT_ROOT/tools/code_snapshot.sh "$EXP_NAME")
 
     # Now use the variables
     for i in $(seq 1 $NUM_RUNS); do

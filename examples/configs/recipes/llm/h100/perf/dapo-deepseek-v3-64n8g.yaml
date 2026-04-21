@@ -1,0 +1,76 @@
+defaults: ../../../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 256
+  batch_multiplier: 3
+  max_num_steps: 10
+  use_leave_one_out_baseline: false
+  val_period: 5
+  use_dynamic_sampling: true
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    max_response_length: 1024
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10.0
+checkpointing:
+  checkpoint_dir: results/grpo_dapomath17k_dsv3_megatron
+  keep_top_k: 100
+policy:
+  model_name: Follow instructions in https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/deepseek.md
+  hf_config_overrides:
+    max_position_embeddings: 1536
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 1536
+  dtensor_cfg:
+    enabled: false
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
+  megatron_cfg:
+    empty_unused_memory_level: 2
+    enabled: true
+    activation_checkpointing: true
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 32
+    pipeline_model_parallel_size: 8
+    num_layers_in_first_pipeline_stage: 7
+    num_layers_in_last_pipeline_stage: 6
+    context_parallel_size: 4
+    sequence_parallel: true
+    apply_rope_fusion: false
+    mtp_num_layers: 0
+    optimizer:
+      lr: 5.0e-07
+      min_lr: 5.0e-08
+    scheduler:
+      lr_warmup_init: 5.0e-08
+  generation:
+    max_new_tokens: 1536
+    vllm_cfg:
+      tensor_parallel_size: 64
+      enforce_eager: true
+data:
+  max_input_seq_length: 512
+  prompt_file: null
+  dataset_name: DAPOMath17K
+env:
+  dapo:
+    num_workers: 64
+  math:
+    num_workers: 64
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb:
+    project: DAPO
+    name: DAPO-DeepSeek-671b-megatron
+  mlflow:
+    experiment_name: DAPO
+    run_name: DAPO-DeepSeek-671b-megatron
+cluster:
+  gpus_per_node: 8
+  num_nodes: 64

@@ -13,10 +13,10 @@ This document focuses on DAPO-specific features: Dynamic Sampling and Overlong R
 
 ## Quickstart: Launch a DAPO Run
 
-To get started quickly, use the example configuration [examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml](../../examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml). You can launch this using the same script as GRPO:
+To get started quickly, use the example configuration [examples/configs/recipes/llm/h100/dapo-qwen2.5-7b.yaml](../../examples/configs/recipes/llm/h100/dapo-qwen2.5-7b.yaml). You can launch this using the same script as GRPO:
 
 ```bash
-uv run examples/run_grpo.py --config examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml {overrides}
+uv run examples/run_grpo.py --config examples/configs/recipes/llm/h100/dapo-qwen2.5-7b.yaml {overrides}
 ```
 
 **Reminder**: Don't forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for LLaMA models.
@@ -85,10 +85,10 @@ grpo:
 > - Set `ratio_clip_max` to enable Clip-Higher (e.g., `ratio_clip_max: 0.28`)
 > - Set `token_level_loss: true` to enable Token-Level Policy Gradient Loss
 > 
-> See the full [DAPO example config](../../examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml) for reference.
+> See the full [DAPO example config](../../examples/configs/recipes/llm/h100/dapo-qwen2.5-7b.yaml) for reference.
 
 ## Example Training Results
-Using the [DAPO example config](../../examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml), you can expect to see intermediate plots such as the training reward curve and validation accuracy on AIME24 for Qwen/Qwen2.5-Math-7B. These plots serve as reference outputs to help verify reproducibility. They are not intended to reflect the best accuracy that can be achieved using DAPO for this model.
+Using the [DAPO example config](../../examples/configs/recipes/llm/h100/dapo-qwen2.5-7b.yaml), you can expect to see intermediate plots such as the training reward curve and validation accuracy on AIME24 for Qwen/Qwen2.5-Math-7B. These plots serve as reference outputs to help verify reproducibility. They are not intended to reflect the best accuracy that can be achieved using DAPO for this model.
 
 ![DAPO Qwen2.5-7B Training Reward](../assets/dapo_train_reward.png)
 ![DAPO Qwen2.5-7B Validation Accuracy](../assets/dapo_val_acc.png)

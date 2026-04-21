@@ -1,0 +1,21 @@
+defaults: ./grpo-llama3.1-8b-instruct-2n4g.yaml
+grpo:
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n4g-async-1off
+policy:
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 1
+        gpus_per_node: 4
+    vllm_cfg:
+      async_engine: true
+      gpu_memory_utilization: 0.8
+logger:
+  log_dir: logs/grpo-llama3.1-8b-instruct-2n4g-async-1off
+  wandb:
+    name: grpo-llama3.1-8b-instruct-2n4g-async-1off

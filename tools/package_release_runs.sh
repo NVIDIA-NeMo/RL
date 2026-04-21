@@ -15,7 +15,7 @@ shopt -s globstar
 
 OUTPUT_TAR="release_runs-$(git rev-parse --short HEAD).tar.gz"
 
-TB_EVENTS=$(ls code_snapshots/*/tests/test_suites/**/logs/*/tensorboard/**/events* || true)
+TB_EVENTS=$(ls code_snapshots/**/tests/test_suites/**/logs/*/tensorboard/**/events* || true)
 
 # Check if the glob expanded to any files
 if [[ -z "$TB_EVENTS" ]]; then
@@ -34,7 +34,7 @@ trap "echo 'Cleaning up temporary directory $TMP_DIR'; rm -rf $TMP_DIR" EXIT
 
 # Loop over all the recipe runs and package them into a tarball
 for tbevent in $TB_EVENTS; do
-    exp_name=$(basename -- $(cut -d/ -f2 <<<$tbevent) -logs)
+    exp_name=$(echo "$tbevent" | sed 's|.*/\([^/]*\)/tests/test_suites/.*|\1|')
     # Redact the hostname
     # events.out.tfevents.1744822578.<host-name>.780899.0
     redacted_event_path=$(basename $tbevent | awk -F. '{print $1"."$2"."$3"."$4".HOSTNAME."$(NF-1)"."$NF}')
