@@ -30,7 +30,7 @@ nightly_test_suite_path = os.path.join(test_suites_dir, "nightly.txt")
 release_test_suite_path = os.path.join(test_suites_dir, "release.txt")
 nightly_gb200_test_suite_path = os.path.join(test_suites_dir, "nightly_gb200.txt")
 release_gb200_test_suite_path = os.path.join(test_suites_dir, "release_gb200.txt")
-h100_performance_test_suite_path = os.path.join(test_suites_dir, "performance_h100.txt")
+h100_performance_test_suite_path = os.path.join(test_suites_dir, "performance.txt")
 gb200_performance_test_suite_path = os.path.join(
     test_suites_dir, "performance_gb200.txt"
 )
