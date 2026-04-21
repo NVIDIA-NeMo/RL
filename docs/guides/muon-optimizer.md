@@ -106,7 +106,7 @@ uv run examples/run_sft.py \
   ++policy.megatron_cfg.optimizer.lr=2e-5 \
   policy.megatron_cfg.optimizer.use_distributed_optimizer=false \
   policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=false \
-  cluster.num_nodes=4 \
+  cluster.num_nodes=16 \
   cluster.gpus_per_node=8 \
   policy.megatron_cfg.pipeline_model_parallel_size=8 \
   policy.megatron_cfg.sequence_parallel=true \
