@@ -18,14 +18,13 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import field
-
-from pydantic import ConfigDict
-from pydantic.dataclasses import dataclass
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
 import torch
+from pydantic import ConfigDict
+from pydantic.dataclasses import dataclass
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
