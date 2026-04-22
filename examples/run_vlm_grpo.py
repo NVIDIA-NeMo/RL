@@ -19,8 +19,8 @@ import pprint
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.grpo import (
-    GRPOMasterConfigDefaults,
     MasterConfig,
+    MasterConfigDefaults,
     grpo_train,
     setup,
 )
@@ -67,7 +67,7 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config: MasterConfig = OmegaConf.to_container(config, resolve=True)
-    config = validate_config(config, GRPOMasterConfigDefaults)
+    config = validate_config(config, MasterConfigDefaults)
     print("Applied CLI overrides")
 
     # Print config

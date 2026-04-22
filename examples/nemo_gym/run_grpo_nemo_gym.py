@@ -29,9 +29,9 @@ from nemo_rl.algorithms.grpo import (
     ColocatablePolicyInterface,
     EnvironmentInterface,
     GenerationInterface,
-    GRPOMasterConfigDefaults,
     Logger,
     MasterConfig,
+    MasterConfigDefaults,
     StatefulDataLoader,
     TokenizerType,
     _should_use_nemo_gym,
@@ -139,7 +139,7 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config: MasterConfig = OmegaConf.to_container(config, resolve=True)
-    config = validate_config(config, GRPOMasterConfigDefaults)
+    config = validate_config(config, MasterConfigDefaults)
     print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID

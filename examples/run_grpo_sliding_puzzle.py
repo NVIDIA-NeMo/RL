@@ -24,8 +24,8 @@ from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.grpo import (
-    GRPOMasterConfigDefaults,
     MasterConfig,
+    MasterConfigDefaults,
     grpo_train,
     setup,
 )
@@ -216,7 +216,7 @@ def main():
         config = parse_hydra_overrides(config, overrides)
 
     config: MasterConfig = OmegaConf.to_container(config, resolve=True)
-    config = validate_config(config, GRPOMasterConfigDefaults)
+    config = validate_config(config, MasterConfigDefaults)
     print("Applied CLI overrides")
 
     # Print config
