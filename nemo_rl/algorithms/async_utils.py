@@ -53,10 +53,13 @@ class ReplayBuffer:
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
 
-        self._tracer = new_tracer("replay_buffer")
+        self._tracer = new_tracer(
+            "replay_buffer", process_name="replay_buffer_actor"
+        )
 
     @define_collect_trace
     def collect_trace(self):
+        self._tracer.finalize_open_spans()
         return self._tracer.get_events()
 
     def push_with_wait_signal(
@@ -305,12 +308,20 @@ class AsyncTrajectoryCollector:
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
 
-        self._tracer = new_tracer("trajectory_collector")
+        self._tracer = new_tracer(
+            "trajectory_collector", process_name="trajectory_collector_actor"
+        )
         self._loop_tracer = new_tracer("trajectory_collector_loop")
         self._worker_tracers = []
 
     @define_collect_trace
     def collect_trace(self):
+        # Close out any spans still open on every tracer we own so in-flight
+        # rollouts don't render as "open-to-infinity" or invisible in Perfetto.
+        self._tracer.finalize_open_spans()
+        self._loop_tracer.finalize_open_spans()
+        for worker_tracer in self._worker_tracers:
+            worker_tracer.finalize_open_spans()
         events = self._tracer.get_events()
         events.extend(self._loop_tracer.get_events())
         for worker_tracer in self._worker_tracers:

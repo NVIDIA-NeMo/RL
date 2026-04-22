@@ -15,10 +15,12 @@
 import asyncio
 import copy
 import gc
+import os
 import threading
 import time
 import uuid
 import warnings
+from contextlib import nullcontext
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -686,6 +688,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         greedy: bool = False,
+        trace_sample_id: str = "",
+        trace_pid: Optional[int] = None,
+        trace_tid: Optional[int] = None,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate a batch of data using vLLM's AsyncLLMEngine, yielding results as they are ready.
 
@@ -793,6 +798,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             request_id = str(uuid.uuid4())
 
+            # Time the vLLM generation block so we can emit a "vllm_generate"
+            # span under the *driver-side* prompt_group sample lane. Placing it
+            # on the caller's pid/tid lets Perfetto render it nested inside
+            # generate_responses_async instead of on a separate vllm_worker
+            # process (which otherwise mixes samples from many prompt groups).
+            gen_start_ts = time.monotonic()
+
             # Generate using vLLM async engine
             vllm_request_generator = self.llm.generate(
                 prompt=prompt,
@@ -806,7 +818,38 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 final_request_output = req_output
 
             if final_request_output is None:
-                raise RuntimeError(f"No output received for request {request_id}")
+                raise RuntimeError(
+                    f"No output received for request {request_id}"
+                )
+
+            gen_end_ts = time.monotonic()
+
+            # Emit to the driver's prompt_group pid/tid. The event is stored in
+            # our local tracer buffer, so save_trace still applies this actor's
+            # clock-delta to align ts with the driver's monotonic timeline.
+            if (
+                self._tracer.enabled
+                and trace_sample_id
+                and trace_pid is not None
+                and trace_tid is not None
+            ):
+                self._tracer.emit_external_x_event(
+                    name="vllm_generate",
+                    start_ts_mono=gen_start_ts,
+                    end_ts_mono=gen_end_ts,
+                    pid=trace_pid,
+                    tid=trace_tid,
+                    category="vllm",
+                    args={
+                        "request_id": request_id,
+                        "sample_idx": sample_idx,
+                        "async_id": trace_sample_id,
+                        "output_tokens": len(
+                            final_request_output.outputs[0].token_ids
+                        ),
+                        "worker_pid": os.getpid(),
+                    },
+                )
 
             # Process the output
             generation_details = final_request_output.outputs[0]

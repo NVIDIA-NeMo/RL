@@ -16,6 +16,7 @@ import asyncio
 import os
 import warnings
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import (
     Any,
     AsyncGenerator,
@@ -41,6 +42,7 @@ from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
 )
+from nemo_rl.utils.trace import Tracer
 
 
 class VllmGeneration(GenerationInterface):
@@ -562,6 +564,8 @@ class VllmGeneration(GenerationInterface):
         method_name: str,
         data_validation_fn,
         greedy: bool = False,
+        tracer: Optional["Tracer"] = None,
+        trace_sample_id: str = "",
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Base async generation method that handles common worker management logic.
 
@@ -592,12 +596,25 @@ class VllmGeneration(GenerationInterface):
             self.current_generate_dp_shard_idx
         )
 
+        # Look up the driver-side virtual pid/tid that Perfetto uses to render
+        # this sample's lane under its prompt_group process, so the worker can
+        # emit its vllm_generate span there (instead of under a separate
+        # vllm_worker_pid... process far away from the prompt_group).
+        trace_pid: Optional[int] = None
+        trace_tid: Optional[int] = None
+        if tracer is not None and tracer.enabled and trace_sample_id:
+            trace_pid = tracer._pid  # virtual pid owned by this tracer
+            trace_tid = tracer.get_virtual_tid(trace_sample_id)
+
         # Run the async method on the selected leader worker
         worker_gen_proxy = self.worker_group.run_single_worker_single_data(
             method_name=method_name,
             worker_idx=leader_worker_idx,
             data=data,
             greedy=greedy,
+            trace_sample_id=trace_sample_id,
+            trace_pid=trace_pid,
+            trace_tid=trace_tid,
         )
 
         # Increment the round-robin worker group index
@@ -614,7 +631,22 @@ class VllmGeneration(GenerationInterface):
             worker_name = f"Worker-{worker_idx}"
             try:
                 async for sample_result_ref in worker_gen:
-                    sample_result = await sample_result_ref
+                    # Time the driver-side Ray receive. Pairs with the
+                    # worker-side "vllm_generate" span keyed by the same
+                    # trace_sample_id so the gap between the two = Ray
+                    # transfer overhead.
+                    recv_ctx = (
+                        tracer.nested_span(
+                            "vllm_ray_receive",
+                            parent_async_id=trace_sample_id,
+                            category="vllm",
+                            metadata={"worker_idx": int(worker_idx)},
+                        )
+                        if tracer is not None and trace_sample_id
+                        else nullcontext({})
+                    )
+                    with recv_ctx:
+                        sample_result = await sample_result_ref
                     # sample_result is a tuple: (original_idx, BatchedDataDict)
                     # Tag the result with worker index for downstream attribution
                     original_idx, result_batch = sample_result
@@ -708,12 +740,23 @@ class VllmGeneration(GenerationInterface):
             yield result
 
     async def generate_async(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        tracer: Optional["Tracer"] = None,
+        trace_sample_id: str = "",
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate responses asynchronously, yielding individual samples as they complete.
 
         This method provides per-sample streaming across all workers, yielding each
         sample result as soon as it's ready, regardless of which worker processed it.
+
+        When ``tracer`` and ``trace_sample_id`` are provided, the driver-side
+        wait for the per-sample Ray ObjectRef is wrapped in a ``nested_span``
+        on the sample's virtual TID, and ``trace_sample_id`` is forwarded to
+        the worker so its matching ``vllm_generate`` span uses the same id.
+        The difference between worker and driver timestamps quantifies Ray
+        transfer overhead.
         """
 
         def validate_generate_data(data):
@@ -726,7 +769,8 @@ class VllmGeneration(GenerationInterface):
             return True
 
         async for result in self._async_generate_base(
-            data, "generate_async", validate_generate_data, greedy
+            data, "generate_async", validate_generate_data, greedy,
+            tracer=tracer, trace_sample_id=trace_sample_id,
         ):
             yield result
 

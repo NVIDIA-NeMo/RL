@@ -53,17 +53,24 @@ from nemo_rl.utils.timer import Timer
 
 Event = dict[str, Any]
 
-# Counter used to mint unique virtual TIDs per async span so Perfetto renders
-# each span in its own thread lane (real-thread-shared Complete events overlap
-# badly and get visually collapsed). Starts at a high base so virtual TIDs
-# cannot collide with real OS thread IDs (typically < 2**22).
-_virtual_tid_counter = itertools.count(0x70000000)
-
-# Counter for minting virtual PIDs. A Tracer with ``virtual_process_name`` set
-# uses a virtual PID so Perfetto renders it as its own process block (with the
-# real tracer thread and every per-span virtual TID contained inside). High
-# base keeps virtual PIDs clear of any real OS PIDs.
-_virtual_pid_counter = itertools.count(0x60000000)
+# Counters for minting virtual TIDs/PIDs. Each Python process that imports
+# this module gets its own module-level counter; Ray actors are separate
+# processes, so without process-specific offsets two actors would mint
+# overlapping values and Perfetto would collapse them. We derive a compact
+# per-process slot from ``os.getpid()`` and reserve spacing for multiple
+# tracers per process. All resulting IDs are kept within positive int32
+# range (< 2**31) because Perfetto's JSON parser downcasts large pid/tid
+# values and wraps them, which hides virtual processes entirely.
+_PID_SPACING = 32
+_TID_SPACING = 512
+# Low 20 bits of the OS pid — collision-free on typical Linux systems where
+# pids stay under ~1M; with pid recycling up to 4M some wrap is possible but
+# extremely unlikely to collide between two *live* tracers.
+_pid_slot = os.getpid() & 0x000FFFFF
+# Max pid = 0x10000000 + 0xFFFFF*32 + 31  ≈ 302M  (safe for int32)
+# Max tid = 0x40000000 + 0xFFFFF*512 + 511 ≈ 1.61G (safe for int32)
+_virtual_pid_counter = itertools.count(0x10000000 + _pid_slot * _PID_SPACING)
+_virtual_tid_counter = itertools.count(0x40000000 + _pid_slot * _TID_SPACING)
 
 # Per-tracer sort-index block. Without thread_sort_index metadata, Perfetto
 # orders threads within a process by TID, which places virtual TIDs (very
@@ -87,6 +94,7 @@ class Tracer:
         enabled: bool = False,
         name: str = "",
         virtual_process_name: Optional[str] = None,
+        process_name: Optional[str] = None,
     ):
         """Initialize the tracer.
 
@@ -99,6 +107,10 @@ class Tracer:
                 a dedicated process block. Use this for tracers whose activity
                 is a logical unit that should be grouped together (e.g. a
                 prompt-group worker and its concurrent samples).
+            process_name: If set (and ``virtual_process_name`` is not used),
+                emits a process_name metadata event labelling the real OS PID
+                in Perfetto. Only set this on ONE tracer per process, otherwise
+                later emissions overwrite earlier ones in the viewer.
         """
         self._enabled = enabled
         self._events: list[Event] = []
@@ -111,6 +123,11 @@ class Tracer:
         self._async_spans: dict[
             tuple[str, str, str], tuple[float, dict[str, Any], int]
         ] = {}
+        # Active nested_span contexts keyed by a per-instance token ->
+        # (name, category, parent_async_id, vtid, start_ts, args_dict, end_metadata).
+        # Tracked so finalize_open_spans can emit truncated X events for
+        # nested_spans still running at collection time.
+        self._nested_spans: dict[int, tuple[str, str, str, int, float, dict, dict]] = {}
         # async_id -> virtual TID, stable within a tracer's lifetime.
         self._virtual_tids: dict[str, int] = {}
         # Sort-index block reserved for this tracer; real TID occupies offset 0
@@ -120,8 +137,10 @@ class Tracer:
 
         if virtual_process_name is not None:
             self._pid = next(_virtual_pid_counter)
+            self._process_name_to_emit: Optional[str] = virtual_process_name
         else:
             self._pid = os.getpid()
+            self._process_name_to_emit = process_name
         self._virtual_process_name = virtual_process_name
         self._name = name
         # We only intitialize tid upon the first span. This allows us to create the
@@ -134,15 +153,17 @@ class Tracer:
             self._tid = tid
             ts = int(time.monotonic() * 1_000_000)
             with self._events_lock:
-                # If this tracer owns a virtual process, label it so Perfetto
-                # renders a named process block.
-                if self._virtual_process_name:
+                # Label the (virtual or real) process so Perfetto doesn't render
+                # it as an unnamed numeric box. For real-pid tracers we only do
+                # this when the caller explicitly asked via process_name, to
+                # avoid racing with other tracers in the same process.
+                if self._process_name_to_emit:
                     self._events.append({
                         "name": "process_name",
                         "ph": "M",
                         "ts": ts,
                         "pid": self._pid,
-                        "args": {"name": self._virtual_process_name},
+                        "args": {"name": self._process_name_to_emit},
                     })
                 # Emit Chrome Trace metadata so Perfetto displays the thread
                 # with the tracer's name instead of a raw TID, and sorts it
@@ -294,6 +315,50 @@ class Tracer:
         with self._events_lock:
             self._events.append(event)
 
+    def get_virtual_tid(self, async_id: str) -> Optional[int]:
+        """Return the virtual TID previously assigned to ``async_id``, or None."""
+        return self._virtual_tids.get(async_id)
+
+    def emit_external_x_event(
+        self,
+        name: str,
+        start_ts_mono: float,
+        end_ts_mono: float,
+        pid: int,
+        tid: int,
+        category: str = "async",
+        args: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Emit a Chrome Trace "X" Complete event with externally-supplied pid/tid.
+
+        Use this to place a span's rectangle under a *different* process/thread
+        in Perfetto (e.g. a vLLM worker's ``vllm_generate`` span rendered under
+        the driving prompt_group's sample lane). The event is stored in this
+        tracer's buffer, so ``save_trace`` still applies this actor's per-clock
+        ``ts_delta`` adjustment — the timeline position is therefore correct
+        relative to the unified driver clock.
+
+        start_ts_mono / end_ts_mono are seconds from ``time.monotonic()`` taken
+        on this actor's clock.
+        """
+        if not self._enabled:
+            return
+        base_args: dict[str, Any] = {"tracer_name": self._name}
+        if args:
+            base_args.update(args)
+        event = {
+            "name": name,
+            "cat": category,
+            "ph": "X",
+            "ts": int(start_ts_mono * 1_000_000),
+            "dur": int((end_ts_mono - start_ts_mono) * 1_000_000),
+            "pid": pid,
+            "tid": tid,
+            "args": base_args,
+        }
+        with self._events_lock:
+            self._events.append(event)
+
     def _get_virtual_tid(self, async_id: str) -> int:
         """Assign (once) a unique virtual TID for this async span.
 
@@ -416,6 +481,70 @@ class Tracer:
             self._events.append(event)
 
     @contextmanager
+    def nested_span(
+        self,
+        name: str,
+        parent_async_id: str,
+        category: str = "async",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Emit a Complete event on an existing async span's virtual TID.
+
+        Call this inside a ``start_async_span``/``end_async_span`` block (or
+        the equivalent ``async_span`` context) to record a nested operation
+        that happens sequentially within the parent. Because one parent async
+        span owns a single virtual TID and all its nested calls are strictly
+        sequential in one asyncio task, the resulting X events render as a
+        call stack underneath the parent span in Perfetto.
+
+        If ``parent_async_id`` has no virtual TID yet, one is assigned as a
+        side effect (useful when instrumentation runs before the enclosing
+        span's explicit start).
+        """
+        if not self._enabled:
+            yield {}
+            return
+        self._ensure_tid()
+
+        vtid = self._get_virtual_tid(parent_async_id)
+        start_ts = time.monotonic()
+        args: dict[str, Any] = dict(metadata) if metadata else {}
+        args["tracer_name"] = self._name
+        args["parent_async_id"] = parent_async_id
+        end_metadata: dict[str, Any] = {}
+
+        # Register this nested span so finalize_open_spans can emit a
+        # truncated X event if the process is shut down before the
+        # enclosing context exits.
+        token = id(end_metadata)
+        with self._events_lock:
+            self._nested_spans[token] = (
+                name, category, parent_async_id, vtid,
+                start_ts, args, end_metadata,
+            )
+        try:
+            yield end_metadata
+        finally:
+            end_ts = time.monotonic()
+            if end_metadata:
+                args.update(end_metadata)
+            event = {
+                "name": name,
+                "cat": category,
+                "ph": "X",
+                "ts": int(start_ts * 1_000_000),
+                "dur": int((end_ts - start_ts) * 1_000_000),
+                "pid": self._pid,
+                "tid": vtid,
+                "args": args,
+            }
+            with self._events_lock:
+                # Remove the open-span registration under the same lock so
+                # finalize_open_spans doesn't double-emit.
+                self._nested_spans.pop(token, None)
+                self._events.append(event)
+
+    @contextmanager
     def async_span(
         self,
         name: str,
@@ -487,6 +616,75 @@ class Tracer:
         with self._events_lock:
             self._events.append(event)
 
+    def finalize_open_spans(self) -> None:
+        """Close any spans still open at collection time.
+
+        When tracing is sampled mid-run (e.g. async_grpo training stops while the
+        trajectory collector still has rollouts in flight), open async/sync spans
+        would otherwise be invisible (X events are only emitted on end) or
+        rendered as "open to infinity" by Perfetto (unmatched B with no E).
+        This method closes them with ``time.monotonic()`` as the synthetic end,
+        so in-flight work renders as a clearly truncated bar.
+
+        Safe to call multiple times; idempotent (the second call finds nothing
+        open).
+        """
+        if not self._enabled:
+            return
+        now_mono = time.monotonic()
+        now_us = int(now_mono * 1_000_000)
+
+        with self._events_lock:
+            # Close open async spans — emit synthetic X events.
+            for (name, async_id, category), (start_ts, metadata, vtid) in list(
+                self._async_spans.items()
+            ):
+                args = dict(metadata)
+                args["truncated_at_finalize"] = True
+                self._events.append({
+                    "name": name,
+                    "cat": category,
+                    "ph": "X",
+                    "ts": int(start_ts * 1_000_000),
+                    "dur": max(0, now_us - int(start_ts * 1_000_000)),
+                    "pid": self._pid,
+                    "tid": vtid,
+                    "args": args,
+                })
+            self._async_spans.clear()
+
+            # Close open nested spans — same treatment.
+            for token, (
+                name, category, parent_async_id, vtid,
+                start_ts, args, end_metadata,
+            ) in list(self._nested_spans.items()):
+                args_c = dict(args)
+                if end_metadata:
+                    args_c.update(end_metadata)
+                args_c["truncated_at_finalize"] = True
+                self._events.append({
+                    "name": name,
+                    "cat": category,
+                    "ph": "X",
+                    "ts": int(start_ts * 1_000_000),
+                    "dur": max(0, now_us - int(start_ts * 1_000_000)),
+                    "pid": self._pid,
+                    "tid": vtid,
+                    "args": args_c,
+                })
+            self._nested_spans.clear()
+
+            # Close open sync spans — emit synthetic E events in LIFO order.
+            while self._span_stack:
+                span_name, _span_start, _span_metadata = self._span_stack.pop()
+                self._events.append({
+                    "name": span_name,
+                    "ph": "E",
+                    "ts": now_us,
+                    "pid": self._pid,
+                    "tid": self._tid,
+                })
+
     def get_events(self) -> list[Event]:
         """Get the accumulated trace events.
 
@@ -511,11 +709,13 @@ def tracing_enabled():
 def new_tracer(
     name: str = "",
     virtual_process_name: Optional[str] = None,
+    process_name: Optional[str] = None,
 ) -> Tracer:
     return Tracer(
         enabled=tracing_enabled(),
         name=name,
         virtual_process_name=virtual_process_name,
+        process_name=process_name,
     )
 
 

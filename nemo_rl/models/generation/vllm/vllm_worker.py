@@ -35,6 +35,7 @@ from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generati
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.trace import define_collect_trace, new_tracer
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -144,6 +145,14 @@ class BaseVllmGenerationWorker:
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
+
+        # Per-actor tracer. We intentionally DON'T set virtual_process_name:
+        # the vllm_generate span is emitted via emit_external_x_event into the
+        # driver-side prompt_group pid/tid (so Perfetto renders it nested under
+        # the sample's lane with the rest of the rollout stack), and no other
+        # events originate from this tracer. Creating a virtual process block
+        # here would just leave an empty box in the viewer.
+        self._tracer = new_tracer(name="vllm_worker")
 
         # Skip model loading if we're not the model owner
         if not self.is_model_owner:
@@ -655,6 +664,11 @@ class BaseVllmGenerationWorker:
                 elif hasattr(metric, "value"):
                     metrics[metric.name] = metric.value
         return metrics
+
+    @define_collect_trace
+    def collect_trace(self):
+        self._tracer.finalize_open_spans()
+        return self._tracer.get_events()
 
 
 @ray.remote(

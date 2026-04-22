@@ -2418,7 +2418,7 @@ def async_grpo_train(
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
-    tracer = new_tracer()
+    tracer = new_tracer(process_name="driver")
     timer = Timer()
     trace_and_time = partial(_trace_and_time, tracer, timer)
     timeout = TimeoutChecker(
@@ -3208,7 +3208,19 @@ def async_grpo_train(
     finally:
         try:
             ray.get(trajectory_collector.pause.remote())
-            save_trace(tracer.get_events(), (replay_buffer, trajectory_collector))
+            # Close any driver-side spans still open at this point so Perfetto
+            # doesn't render them as unbounded bars.
+            tracer.finalize_open_spans()
+            # Include vLLM worker actors so their per-sample "vllm_generate"
+            # spans are merged into the trace alongside the driver-side
+            # "vllm_ray_receive" spans (see consume_worker_generator).
+            vllm_actors = tuple(
+                getattr(policy_generation, "worker_group", None).workers
+            ) if getattr(policy_generation, "worker_group", None) is not None else ()
+            save_trace(
+                tracer.get_events(),
+                (replay_buffer, trajectory_collector, *vllm_actors),
+            )
         except Exception as e:
             print(f"Error saving tracer events: {e}")
 

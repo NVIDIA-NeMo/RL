@@ -135,6 +135,8 @@ async def generate_responses_async(
     input_lengths: torch.Tensor,
     include_logprobs: bool = True,
     greedy: bool = False,
+    tracer: Optional[Tracer] = None,
+    sample_async_id: str = "",
 ) -> tuple[BatchedDataDict[DatumSpec], list[torch.Tensor], dict[str, float | int]]:
     """Async version of generate_responses that properly calls generate_async."""
     # Add stop_strings to generation_input_data if present in the batch
@@ -161,7 +163,10 @@ async def generate_responses_async(
         tuple[int, BatchedDataDict[GenerationOutputSpec]]
     ] = []
     async for original_idx, single_item_output in policy_generation.generate_async(
-        generation_input_data, greedy=greedy
+        generation_input_data,
+        greedy=greedy,
+        tracer=tracer,
+        trace_sample_id=sample_async_id,
     ):
         collected_indexed_outputs.append((original_idx, single_item_output))
 
@@ -605,6 +610,8 @@ async def async_generate_response_for_sample_turn(
     tokenizer: TokenizerType,
     max_seq_len: int,
     greedy: bool = False,
+    tracer: Optional[Tracer] = None,
+    sample_async_id: str = "",
 ) -> tuple[list[dict], torch.Tensor, torch.Tensor, dict[str, float]]:
     """Generate a response for a single sample's turn using async generation.
 
@@ -648,15 +655,28 @@ async def async_generate_response_for_sample_turn(
     )
 
     # Generate response using the async version
-    updated_batch, generated_ids, gen_metrics = await generate_responses_async(
-        policy_generation,
-        generation_input_data,
-        dummy_batch,
-        tokenizer,
-        input_lengths=input_lengths,
-        include_logprobs=True,
-        greedy=greedy,
+    gen_ctx = (
+        tracer.nested_span(
+            "generate_responses_async",
+            parent_async_id=sample_async_id,
+            category="rollout",
+        )
+        if tracer is not None and sample_async_id
+        else nullcontext({})
     )
+    with gen_ctx as gen_meta:
+        updated_batch, generated_ids, gen_metrics = await generate_responses_async(
+            policy_generation,
+            generation_input_data,
+            dummy_batch,
+            tokenizer,
+            input_lengths=input_lengths,
+            include_logprobs=True,
+            greedy=greedy,
+            tracer=tracer,
+            sample_async_id=sample_async_id,
+        )
+        gen_meta["input_length"] = int(input_lengths)
 
     # Extract results for the single sample
     updated_message_log = updated_batch["message_log"][0]
@@ -674,6 +694,8 @@ async def run_sample_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    tracer: Optional[Tracer] = None,
+    sample_async_id: str = "",
 ) -> tuple[dict, dict[str, Any]]:
     """Run a multi-turn rollout for a single sample.
 
@@ -728,19 +750,34 @@ async def run_sample_multi_turn_rollout(
 
         # Generate response for this sample using async generation
         try:
-            (
-                updated_message_log,
-                generated_tokens,
-                input_lengths,
-                gen_metrics,
-            ) = await async_generate_response_for_sample_turn(
-                policy_generation,
-                current_message_log,
-                current_stop_strings,
-                tokenizer,
-                max_seq_len,
-                greedy=greedy,
+            turn_ctx = (
+                tracer.nested_span(
+                    "turn_generate",
+                    parent_async_id=sample_async_id,
+                    category="turn",
+                    metadata={"turn": turn_count},
+                )
+                if tracer is not None and sample_async_id
+                else nullcontext({})
             )
+            with turn_ctx as turn_meta:
+                (
+                    updated_message_log,
+                    generated_tokens,
+                    input_lengths,
+                    gen_metrics,
+                ) = await async_generate_response_for_sample_turn(
+                    policy_generation,
+                    current_message_log,
+                    current_stop_strings,
+                    tokenizer,
+                    max_seq_len,
+                    greedy=greedy,
+                    tracer=tracer,
+                    sample_async_id=sample_async_id,
+                )
+                turn_meta["gen_tokens"] = int(len(generated_tokens))
+                turn_meta["input_length"] = int(input_lengths)
             current_message_log = updated_message_log
 
             # Check if response was truncated (hit max_tokens without stop token)
@@ -949,6 +986,8 @@ def run_async_multi_turn_rollout(
                         max_seq_len=max_seq_len,
                         max_rollout_turns=max_rollout_turns,
                         greedy=greedy,
+                        tracer=tracer,
+                        sample_async_id=async_id,
                     )
                     _, sample_metrics = result
                     end_meta.update({
