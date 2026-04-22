@@ -497,8 +497,13 @@ class RayWorkerGroup:
                         "AVAILABLE_PORT_LIST": str(available_ports),
                     }
                 )
-                # Remove Ray-specific environment variables, let the worker itself set them.
-                worker_env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+                # Preserve RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 to prevent Ray
+                # from masking CUDA_VISIBLE_DEVICES per actor. GPU masking triggers NCCL
+                # bugs on NVSwitch topologies (H200/P5en, H100/P5) including cuMem import
+                # penalty (nccl#1749) and NVLS rank ordering corruption (nccl#1906).
+                # Workers use explicit torch.cuda.set_device(local_rank) instead.
+                # See: https://github.com/NVIDIA-NeMo/RL/issues/1963
+                worker_env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
                 worker_env_vars.pop("RAY_CLIENT_MODE", None)
                 worker_env_vars.pop("RAY_JOB_ID", None)
                 worker_env_vars.pop("RAY_LD_PRELOAD", None)
