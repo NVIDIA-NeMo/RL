@@ -32,7 +32,7 @@ from nemo_rl.algorithms.grpo import (
     ClippedPGLossConfigDefaults,
     GRPOConfig,
     GRPOConfigDefaults,
-    GRPOMasterConfigDefaults,
+    MasterConfigDefaults,
     RewardScalingConfig,
     RewardScalingConfigDefaults,
     RewardShapingConfigDefaults,
@@ -318,7 +318,7 @@ def test_apply_config_defaults_deprecated_warns():
     """apply_config_defaults should emit DeprecationWarning."""
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        apply_config_defaults({"grpo": {}}, GRPOMasterConfigDefaults)
+        apply_config_defaults({"grpo": {}}, MasterConfigDefaults)
         deprecation_warnings = [
             x for x in w if issubclass(x.category, DeprecationWarning)
         ]
@@ -336,20 +336,20 @@ def test_apply_config_defaults_still_works():
         "grpo": {"num_prompts_per_step": 32, "seed": 100},
         "loss_fn": {"reference_policy_kl_penalty": 0.01},
     }
-    result_new = validate_config(config_a, GRPOMasterConfigDefaults)
+    result_new = validate_config(config_a, MasterConfigDefaults)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        result_old = apply_config_defaults(config_b, GRPOMasterConfigDefaults)
+        result_old = apply_config_defaults(config_b, MasterConfigDefaults)
     assert result_new == result_old
 
 
 # ===================================================================
-# 6. Integration test — GRPOMasterConfigDefaults
+# 6. Integration test — MasterConfigDefaults
 # ===================================================================
 
 
 def test_grpo_master_defaults_integration():
-    """GRPOMasterConfigDefaults should fill missing keys in a realistic config."""
+    """MasterConfigDefaults should fill missing keys in a realistic config."""
     config = {
         "grpo": {
             "num_prompts_per_step": 32,
@@ -361,7 +361,7 @@ def test_grpo_master_defaults_integration():
         },
         "policy": {"some_policy_key": True},  # extra top-level section
     }
-    result = validate_config(config, GRPOMasterConfigDefaults)
+    result = validate_config(config, MasterConfigDefaults)
 
     # seed was already set — must not be overwritten
     assert result["grpo"]["seed"] == 100
@@ -383,7 +383,7 @@ def test_grpo_master_defaults_integration():
 def test_grpo_master_defaults_with_exemplar_yaml():
     """validate_config on full exemplar YAML should not raise."""
     yaml_dict = _load_exemplar()
-    result = validate_config(yaml_dict, GRPOMasterConfigDefaults)
+    result = validate_config(yaml_dict, MasterConfigDefaults)
     # All original keys must still be present
     assert "grpo" in result
     assert "loss_fn" in result

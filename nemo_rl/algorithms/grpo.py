@@ -294,8 +294,13 @@ class ClippedPGLossConfigDefaults:
 
 
 @dataclass(config=_EXTRA_IGNORE)
-class GRPOMasterConfigDefaults:
-    """Top-level defaults for GRPO's MasterConfig."""
+class MasterConfigDefaults:
+    """Defaults for MasterConfig.
+
+    Sections with defaults (grpo, loss_fn) are validated and filled
+    automatically.  Other sections (policy, data, env, logger, cluster,
+    checkpointing) pass through unchanged as extras.
+    """
 
     grpo: GRPOConfigDefaults = field(default_factory=GRPOConfigDefaults)
     loss_fn: ClippedPGLossConfigDefaults = field(

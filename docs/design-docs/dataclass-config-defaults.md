@@ -98,7 +98,7 @@ if overrides:
 config: MasterConfig = OmegaConf.to_container(config, resolve=True)
 
 # NEW: validate types + fill missing keys from dataclass defaults
-config = validate_config(config, GRPOMasterConfigDefaults)
+config = validate_config(config, MasterConfigDefaults)
 ```
 
 The updated pipeline becomes:
@@ -163,8 +163,8 @@ MasterConfig contains nested sub-configs. The defaults dataclass mirrors this ne
 
 ```python
 @dataclass(config=ConfigDict(extra='ignore'))
-class GRPOMasterConfigDefaults:
-    """Top-level defaults for GRPO's MasterConfig."""
+class MasterConfigDefaults:
+    """Defaults for MasterConfig."""
     grpo: GRPOConfigDefaults = field(default_factory=GRPOConfigDefaults)
     loss_fn: ClippedPGLossConfigDefaults = field(default_factory=ClippedPGLossConfigDefaults)
     # Sections without a defaults dataclass (e.g. policy, data) are
@@ -265,7 +265,7 @@ The migration is incremental. Each phase is a standalone PR.
 
 Files changed:
 - `nemo_rl/utils/config.py` — add `apply_config_defaults()`
-- `nemo_rl/algorithms/grpo.py` — add `GRPOConfigDefaults`, `ClippedPGLossConfigDefaults`, `GRPOMasterConfigDefaults`
+- `nemo_rl/algorithms/grpo.py` — add `GRPOConfigDefaults`, `ClippedPGLossConfigDefaults`, `MasterConfigDefaults`
 - `examples/run_grpo.py` — inject `apply_config_defaults()` call
 - `examples/run_vlm_grpo.py` — inject `apply_config_defaults()` call
 - `examples/run_grpo_sliding_puzzle.py` — inject `apply_config_defaults()` call
