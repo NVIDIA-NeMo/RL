@@ -553,6 +553,7 @@ markers = [
   "automodel: marks tests that require the automodel extra",
   "vllm: marks tests that require the vllm extra",
   "sglang: marks tests that require the sglang extra",
+  "nemo_gym: marks tests that require the nemo_gym extra",
 ]
 
 [tool.pyrefly]
