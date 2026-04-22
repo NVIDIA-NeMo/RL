@@ -50,6 +50,7 @@ policy:
       overlap_grad_reduce: false
 
 data:
+  num_workers: 0
   train:
     dataset_name: avqa
     split: train
