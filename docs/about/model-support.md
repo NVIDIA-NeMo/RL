@@ -22,7 +22,7 @@ for model sizes under 70B at up to 32k sequence length.
 - **Moonlight-16B-A3B**
 - **Gemma**: Gemma-3-1B/27B
 - **GPT-OSS**: GPT-OSS-20B/120B
-- **NeMotron**: [Llama-Nemotron-Super-49B](https://github.com/NVIDIA-NeMo/RL/blob/super-v3/docs/guides/nemotron-3-super.md) (available on the [`super-v3` branch](https://github.com/NVIDIA-NeMo/RL/tree/super-v3) — see the branch-specific guide), Nemotron-nano-v2-12B, Nemotron-Nano-v3-30A3B
+- **NeMotron**: [NVIDIA-Nemotron-3-Super-120B-A12B](https://github.com/NVIDIA-NeMo/RL/blob/super-v3/docs/guides/nemotron-3-super.md) (available on the [`super-v3` branch](https://github.com/NVIDIA-NeMo/RL/tree/super-v3) — see the branch-specific guide), Nemotron-nano-v2-12B, Nemotron-Nano-v3-30A3B
 
 **VLMs**:
 
