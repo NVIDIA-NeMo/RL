@@ -78,6 +78,8 @@ def import_model_from_hf_name(
         model_provider.gradient_accumulation_fusion = megatron_config[
             "gradient_accumulation_fusion"
         ]
+        if megatron_config["context_parallel_size"] > 1:
+            model_provider.calculate_per_token_loss = True
     model_provider.finalize()
 
     from megatron.core import parallel_state
