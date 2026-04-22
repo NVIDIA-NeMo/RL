@@ -24,6 +24,10 @@ uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
   --hf-model-name <repo>/model_name \
   --megatron-ckpt-path <path_to_ckpt>/policy/weights/iter_xxxxx \
   --hf-ckpt-path <path_to_save_hf_ckpt>
+
+For models with frozen components not in the Megatron checkpoint (e.g. Qwen2.5-Omni
+talker/token2wav), use --no-strict so that partial shards are still saved:
+  --no-strict
 """
 
 
@@ -53,7 +57,12 @@ def parse_args():
     parser.add_argument(
         "--hf-ckpt-path", type=str, default=None, help="Path to save HF checkpoint"
     )
-    # Parse known args for the script
+    parser.add_argument(
+        "--no-strict",
+        action="store_true",
+        default=False,
+        help="Save partial shards even when some tensors are missing (e.g. frozen modules)",
+    )
     args = parser.parse_args()
 
     return args
@@ -79,6 +88,7 @@ def main():
         output_path=args.hf_ckpt_path,
         hf_tokenizer_path=tokenizer_name,
         hf_overrides=hf_overrides,
+        strict=not args.no_strict,
     )
 
 

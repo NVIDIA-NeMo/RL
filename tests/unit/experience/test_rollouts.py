@@ -47,7 +47,6 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 
 # These are all fixtures
 from tests.unit.environments.test_nemo_gym import (
-    NEMO_GYM_INSTALLED,
     cluster,  # noqa: F401
     nemo_gym,  # noqa: F401
     nemo_gym_sanity_test_data,  # noqa: F401
@@ -787,10 +786,7 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
     print("\nSliding Puzzle VLLM Test assertions passed.")
 
 
-@pytest.mark.skipif(
-    not NEMO_GYM_INSTALLED,
-    reason="Skipping NeMo-Gym test since NeMo-Gym is not installed!",
-)
+@pytest.mark.nemo_gym
 def test_run_async_nemo_gym_rollout(
     nemo_gym,  # noqa: F811
     nemo_gym_vllm_generation,  # noqa: F811
@@ -827,9 +823,20 @@ def test_run_async_nemo_gym_rollout(
 
     expected_result = {
         "final_batch": {
-            "length": torch.tensor([3088, 3056]),
+            "agent_ref": [
+                {
+                    "name": "example_multi_step_simple_agent",
+                    "type": "responses_api_agents",
+                },
+                {
+                    "name": "example_multi_step_simple_agent",
+                    "type": "responses_api_agents",
+                },
+            ],
+            "length": torch.tensor([3080, 3048]),
             "loss_multiplier": torch.tensor([1.0, 1.0]),
             "total_reward": torch.tensor([0.0, 0.0]),
+            "truncated": torch.tensor([False, False]),
         },
         "rollout_metrics": {
             # core metrics
@@ -909,6 +916,7 @@ def test_run_async_nemo_gym_rollout(
         final_batch["total_reward"] = final_batch["total_reward"].tolist()
         final_batch["loss_multiplier"] = final_batch["loss_multiplier"].tolist()
         final_batch["length"] = final_batch["length"].tolist()
+        final_batch["truncated"] = final_batch["truncated"].tolist()
 
         for key in d["rollout_metrics"]:
             # We remove these fields from comparison since we cannot guarantee exact generation reproducibility
