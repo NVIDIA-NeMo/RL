@@ -1,78 +1,38 @@
-# Monolithic RL JobSet for GB300 — single Ray cluster, colocated generation.
+# Same as monolithic-jobset.yaml but WITHOUT KAI scheduler.
+# Uses default-scheduler so your colleague can diff the two and compare
+# pod specs, resource claim allocation, and CDI device injection.
 #
-# Three ReplicatedJobs:
-#   head     — Ray head daemon (CPU-only)
-#   workers  — GPU worker pods (4 GPUs each), topology-aware via compute-domain + RoCE
-#   driver   — Submits training job via ray job submit, gates JobSet success
-#
-# Prerequisites:
-#   kubectl apply -f kai-queue.yaml
-#   kubectl apply -f endpoint-registry-rbac.yaml
+# The only differences from monolithic-jobset.yaml:
+#   - No kai.scheduler/queue label
+#   - No schedulerName: kai-scheduler on pod specs
+#   - Resource names suffixed with "-no-kai" to avoid conflicts
 #
 # Usage:
-#   kubectl apply -f monolithic-jobset.yaml
-#   kubectl get jobset monolithic-job -w
-#
-# Cleanup:
-#   kubectl delete jobset monolithic-job
-#   kubectl delete computedomain compute-domain-monolithic
-#   kubectl delete resourceclaimtemplate roce-monolithic
-#   # Note: the compute-domain ResourceClaimTemplate is auto-created by the
-#   # controller and will be cleaned up when the ComputeDomain CR is deleted.
-#
-# ---
-# Topology-aware scheduling (DRA)
-#
-# Raw JobSets require you to create DRA resources yourself. Higher-level
-# abstractions like Kubeflow TrainJob + TrainingRuntime auto-create them per job,
-# but with raw JobSets you manage them explicitly.
-#
-# Each job needs its own set so its pods are co-located together (not mixed
-# with another job's pods). Create a unique set per job and clean them up after.
-#
-# There are two things to create:
-#
-# 1. ComputeDomain CR (resource.nvidia.com/v1beta1):
-#    Ensures all worker pods land in the same NVSwitch/MNNVL compute domain.
-#    Set spec.channel.resourceClaimTemplate.name to a name of your choice.
-#    The compute-domain controller will AUTO-CREATE a ResourceClaimTemplate with
-#    that name, populated with the correct domainID (the ComputeDomain's UID),
-#    labels, and finalizer. Do NOT pre-create the ResourceClaimTemplate yourself
-#    — if one already exists with that name, the controller will skip creation
-#    and the template will be missing the domainID, breaking topology placement.
-#    Set numNodes to 0 for elastic mode (recommended).
-#
-# 2. ResourceClaimTemplate for RoCE NICs:
-#    Allocates RoCE (RDMA) NICs per worker pod for inter-node communication.
-#    This is a separate DRA driver (dra.networking.k8s.aws) — you create it yourself.
-#    Adjust the count based on your node type:
-#      - GB300 (p6e-gb300r.36xlarge): count: 8 (8 RoCE NICs per node)
-#
-# Only GPU worker pods need these claims (referenced via resources.claims in the
-# container spec and resourceClaims in the pod spec).
+#   kubectl apply -f monolithic-jobset-no-kai.yaml
+#   kubectl get jobset monolithic-job-no-kai -w
 
 # --- 1. ComputeDomain (controller auto-creates the ResourceClaimTemplate) ---
 apiVersion: resource.nvidia.com/v1beta1
 kind: ComputeDomain
 metadata:
-  name: compute-domain-monolithic
+  name: compute-domain-monolithic-no-kai
 spec:
   channel:
     resourceClaimTemplate:
-      name: compute-domain-monolithic   # controller creates RCT with this name
-  numNodes: 0   # elastic mode — controller doesn't wait for a fixed node count
+      name: compute-domain-monolithic-no-kai
+  numNodes: 0
 ---
 # --- 2. RoCE ResourceClaimTemplate (manually created) ---
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
-  name: roce-monolithic
+  name: roce-monolithic-no-kai
 spec:
   spec:
     devices:
       requests:
       - exactly:
-          count: 8   # 8 RoCE NICs per GB300 node; adjust for other node types
+          count: 8
           deviceClassName: roce.networking.k8s.aws
         name: roce
 ---
@@ -80,9 +40,7 @@ spec:
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
-  name: monolithic-job
-  labels:
-    kai.scheduler/queue: default-queue
+  name: monolithic-job-no-kai
 spec:
   network:
     enableDNSHostnames: true
@@ -123,7 +81,6 @@ spec:
         parallelism: 1
         template:
           spec:
-            schedulerName: kai-scheduler
             imagePullSecrets:
             - name: nvcr-secret
             tolerations:
@@ -177,7 +134,6 @@ spec:
         parallelism: 4
         template:
           spec:
-            schedulerName: kai-scheduler
             imagePullSecrets:
             - name: nvcr-secret
             tolerations:
@@ -188,7 +144,7 @@ spec:
               command: ["/bin/bash", "-c"]
               args:
               - |
-                HEAD=monolithic-job-head-0-0.monolithic-job
+                HEAD=monolithic-job-no-kai-head-0-0.monolithic-job-no-kai
                 echo "Waiting for head at ${HEAD}:6379..."
                 until ray health-check --address ${HEAD}:6379 >/dev/null 2>&1; do
                   sleep 5
@@ -203,7 +159,7 @@ spec:
               args:
               - |
                 ulimit -n 65536
-                HEAD=monolithic-job-head-0-0.monolithic-job
+                HEAD=monolithic-job-no-kai-head-0-0.monolithic-job-no-kai
                 ray start --address=${HEAD}:6379 \
                   --num-gpus=4 \
                   --object-store-memory=200000000 \
@@ -221,7 +177,7 @@ spec:
                   memory: "800Gi"
                   nvidia.com/gpu: "4"
               env:
-              - { name: RAY_ADDRESS, value: "monolithic-job-head-0-0.monolithic-job:6379" }
+              - { name: RAY_ADDRESS, value: "monolithic-job-no-kai-head-0-0.monolithic-job-no-kai:6379" }
               - { name: RAY_memory_monitor_refresh_ms, value: "0" }
               - { name: HF_HOME, value: /mnt/rl-workspace/shared/hf-cache }
               - { name: HF_DATASETS_CACHE, value: /mnt/rl-workspace/shared/hf-cache/datasets }
@@ -236,9 +192,9 @@ spec:
                   add: [IPC_LOCK]
             resourceClaims:
             - name: compute-domain-channel
-              resourceClaimTemplateName: compute-domain-monolithic
+              resourceClaimTemplateName: compute-domain-monolithic-no-kai
             - name: roce-channel
-              resourceClaimTemplateName: roce-monolithic
+              resourceClaimTemplateName: roce-monolithic-no-kai
             volumes:
             - name: dshm
               emptyDir: { medium: Memory, sizeLimit: 64Gi }
@@ -257,7 +213,6 @@ spec:
         parallelism: 1
         template:
           spec:
-            schedulerName: kai-scheduler
             imagePullSecrets:
             - name: nvcr-secret
             tolerations:
@@ -268,7 +223,7 @@ spec:
               command: ["/bin/bash", "-c"]
               args:
               - |
-                HEAD=monolithic-job-head-0-0.monolithic-job
+                HEAD=monolithic-job-no-kai-head-0-0.monolithic-job-no-kai
                 echo "Waiting for head at ${HEAD}:6379..."
                 until ray health-check --address ${HEAD}:6379 >/dev/null 2>&1; do
                   sleep 5
@@ -283,7 +238,7 @@ spec:
               args:
               - |
                 set -eo pipefail
-                HEAD=monolithic-job-head-0-0.monolithic-job
+                HEAD=monolithic-job-no-kai-head-0-0.monolithic-job-no-kai
                 SUBMISSION_ID="sft-$(date +%s)"
 
                 ray job submit --address http://${HEAD}:8265 \
@@ -313,7 +268,7 @@ spec:
                 requests: { cpu: "500m", memory: "2Gi" }
                 limits:   { cpu: "2", memory: "8Gi" }
               env:
-              - { name: RAY_ADDRESS, value: "monolithic-job-head-0-0.monolithic-job:6379" }
+              - { name: RAY_ADDRESS, value: "monolithic-job-no-kai-head-0-0.monolithic-job-no-kai:6379" }
               volumeMounts:
               - { name: rl-workspace, mountPath: /mnt/rl-workspace }
             volumes:
