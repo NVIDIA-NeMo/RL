@@ -211,6 +211,15 @@ runs:
           ${{ github.workspace }}/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl/tests/.coverage
         include-hidden-files: true
 
+    - name: Upload nemo_gym actual test data
+      uses: actions/upload-artifact@v6
+      if: always()
+      with:
+        name: actual_test_nemo_gym_sanity-${{ github.run_id }}
+        path: |
+          ${{ github.workspace }}/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl/tests/unit/environments/nemo_gym_test_data/actual_test_nemo_gym_sanity.json
+        if-no-files-found: ignore
+
     - name: Container shutdown
       if: always()
       shell: bash

@@ -20,18 +20,15 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omegaconf import OmegaConf
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+from nemo_rl.data.datasets.eval_datasets import _is_multimodal_dataset
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.math_environment import MathEnvironment
+from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config
-
-TokenizerType = PreTrainedTokenizerBase
 
 
 def parse_args():
@@ -50,36 +47,25 @@ def parse_args():
     return args, overrides
 
 
-def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
+def setup_data(tokenizer, data_config, env_configs):
     print("Setting up data...")
 
     # load dataset
     base_dataset = load_eval_dataset(data_config)
     rekeyed_ds = base_dataset.rekeyed_ds
 
-    # hardcode math for now
-    env_name = "math"
-
-    if env_name == "math_multi_reward":
-        raise NotImplementedError(
-            "MathMultiRewardEnvironment is not supported for evaluation, "
-            "please set env_name to a different environment. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/2088 for more details."
-        )
-
-    env = MathEnvironment.options(
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.math_environment.MathEnvironment"
-            )
-        }
-    ).remote(env_configs[env_name])
+    # Determine env from config: use explicit env_name if provided,
+    # otherwise fall back to the single key in env_configs.
+    env_key = next(iter(env_configs))
+    env_name = data_config.get("env_name", env_key)
+    env = create_env(env_name=env_name, env_config=env_configs[env_key])
 
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,
         tokenizer=tokenizer,
         default_task_data_spec=base_dataset.task_spec,
         task_data_processors=base_dataset.processor,
+        task_data_preprocessors=getattr(base_dataset, "preprocessor", None),
         max_seq_length=data_config["max_input_seq_length"],
     )
 
@@ -114,8 +100,9 @@ def main():
     # Init ray
     init_ray()
 
-    # Setup tokenizer
-    tokenizer = get_tokenizer(config["tokenizer"])
+    # Setup tokenizer — get_tokenizer handles both text-only and multimodal
+    is_multimodal = _is_multimodal_dataset(config["data"]["dataset_name"])
+    tokenizer = get_tokenizer(config["tokenizer"], get_processor=is_multimodal)
     config["generation"] = configure_generation_config(
         config["generation"], tokenizer, is_eval=True
     )
