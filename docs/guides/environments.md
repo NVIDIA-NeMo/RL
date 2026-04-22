@@ -100,6 +100,8 @@ from nemo_rl.environments.code_environment import CodeEnvironment
 env_config = {
     "num_workers": 2,
     "terminate_on_evaluation": True,  # Terminate after code execution
+    "default_timeout_seconds": 1.0,  # Optional default wall-clock timeout per step
+    "default_memory_limit_bytes": 268435456,  # Optional default memory limit per step
 }
 
 code_env = CodeEnvironment.remote(env_config)
@@ -108,6 +110,32 @@ code_env = CodeEnvironment.remote(env_config)
 ### Configuration
 - `num_workers`: Number of parallel workers for code execution
 - `terminate_on_evaluation`: Whether to terminate after code execution (True for single-turn, False for multi-turn).
+- `default_timeout_seconds`: Optional default wall-clock timeout for each code execution step.
+- `default_memory_limit_bytes`: Optional default virtual-memory cap for each code execution step.
+
+Timeouts are enforced in the child process, with a small parent-side startup grace so worker bootstrapping does not immediately trip very small limits.
+
+### Per-sample execution limits
+
+The code environment reads limits from `extra_env_info`, so you can set them per sample:
+
+```python
+{
+    "context": {},
+    "working_dir": "/tmp/code-env/sample-123",
+    "timeout_seconds": 1.0,
+    "memory_limit_bytes": 268435456,
+}
+```
+
+If both per-sample limits and environment defaults are provided, the per-sample values win.
+
+`context` and `working_dir` still behave the same as before:
+
+- `context` stores variables and functions defined by prior turns.
+- `working_dir` bounds file access for `open()`.
+
+The memory limit uses `resource.RLIMIT_AS` and is currently supported on Linux only. On other platforms, configuring `memory_limit_bytes` returns an error observation instead of enforcing the limit.
 
 We are tracking an end-to-end example of this environment in [#858](https://github.com/NVIDIA-NeMo/RL/issues/858). Add a 👍 to show your interest.
 
