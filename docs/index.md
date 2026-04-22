@@ -128,6 +128,13 @@ Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-A
 Learn how to add support for new model architectures in NeMo RL.
 :::
 
+:::{grid-item-card} {octicon}`arrow-both` YaRN Long-Context Training
+:link: guides/yarn-long-context
+:link-type: doc
+
+Extend a model's context window with YaRN RoPE scaling on the Megatron backend for SFT, GRPO, and other workflows.
+:::
+
 ::::
 
 ## Advanced Topics
@@ -235,6 +242,7 @@ guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
 guides/eagle3-speculative-decoding.md
+guides/yarn-long-context.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
 guides/ft-launcher-guide.md
