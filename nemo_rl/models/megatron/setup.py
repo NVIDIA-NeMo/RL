@@ -75,7 +75,10 @@ except ImportError:
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.megatron.community_import import import_model_from_hf_name
+from nemo_rl.models.megatron.community_import import (
+    import_model_from_hf_name,
+    import_model_from_mlm,
+)
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
 from nemo_rl.models.megatron.draft.utils import (
     build_draft_model,
@@ -262,12 +265,70 @@ def _get_hf_config_overrides_hash(overrides: dict[str, Any]) -> str:
 
 
 def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
-    """Validate and setup model paths."""
-    # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
+    """Validate and setup model paths.
+
+    Returns:
+        A ``(hf_model_name, pretrained_path, pt_checkpoint_exists)`` tuple where:
+
+        * ``hf_model_name`` is the HuggingFace model name / path used for
+          architecture config resolution and tokenizer setup.
+        * ``pretrained_path`` is the root directory of the Megatron-Bridge
+          checkpoint that will be used as the pretrained starting point.
+        * ``pt_checkpoint_exists`` is ``True`` when the checkpoint at
+          ``pretrained_path`` is already present and does not need to be
+          created.
+    """
+    pretrained_ckpt = config.get("pretrained_checkpoint")
+
+    if pretrained_ckpt is not None:
+        fmt = pretrained_ckpt["format"]
+        hf_model_name = pretrained_ckpt["hf_model_name"]
+
+        if fmt == "megatron_bridge":
+            path = pretrained_ckpt["path"]
+            # For megatron_bridge, path must be the specific iteration directory
+            # (e.g. /checkpoints/iter_0005000/).  We verify this by checking for
+            # run_config.yaml, which is the authoritative marker of a valid
+            # megatron-bridge checkpoint iteration directory.
+            run_config = os.path.join(path, "run_config.yaml")
+            if not os.path.exists(run_config):
+                raise FileNotFoundError(
+                    f"pretrained_checkpoint.path={path!r} does not contain "
+                    f"run_config.yaml.  For megatron_bridge format, path must "
+                    f"point to a specific iteration directory "
+                    f"(e.g. /checkpoints/iter_0005000/), not the checkpoint root."
+                )
+            # The checkpoint is already in the required format; nothing to convert.
+            return hf_model_name, path, True
+
+        elif fmt == "megatron_lm":
+            mlm_iter_path = pretrained_ckpt["path"]
+            if not os.path.isdir(mlm_iter_path):
+                raise FileNotFoundError(
+                    f"pretrained_checkpoint.path={mlm_iter_path!r} does not exist or "
+                    f"is not a directory.  For megatron_lm format, path must point to "
+                    f"a specific iteration directory (e.g. /checkpoints/iter_0005000/)."
+                )
+            pretrained_path = pretrained_ckpt.get("output_path")
+            if not pretrained_path:
+                raise ValueError(
+                    "pretrained_checkpoint.output_path is required for megatron_lm format."
+                )
+            pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
+                os.path.join(pretrained_path, "iter_0000000")
+            )
+            return hf_model_name, pretrained_path, pt_checkpoint_exists
+
+        else:
+            raise ValueError(
+                f"Unknown pretrained_checkpoint format: {fmt!r}. "
+                "Expected 'megatron_bridge' or 'megatron_lm'."
+            )
+
+    # Existing HF path: cfg["model_name"] is an HF model name or local HF checkpoint.
     hf_model_name = config["model_name"]
     hf_config_overrides = config.get("hf_config_overrides", {}) or {}
 
-    # Check if the checkpoint already exists
     hf_model_subdir = hf_model_name
     if os.path.exists(hf_model_name):
         hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
@@ -292,16 +353,24 @@ def setup_model_config(
     optimizer_path: Optional[str] = None,
 ) -> tuple[ConfigContainer, Any]:
     """Handle all the model configuration logic."""
-    # Load pretrained run config
-    pretrained_run_config = os.path.join(
-        pretrained_path, "iter_0000000/run_config.yaml"
-    )
+    # Locate the run_config.yaml.
+    # - megatron_bridge: pretrained_path IS the iter dir, so run_config.yaml
+    #   lives directly inside it (validated in validate_model_paths).
+    # - megatron_lm (converted) and HF (converted): pretrained_path is the
+    #   cache root; the conversion always writes to iter_0000000/.
+    pretrained_ckpt = config.get("pretrained_checkpoint")
+    if pretrained_ckpt is not None and pretrained_ckpt["format"] == "megatron_bridge":
+        pretrained_run_config = os.path.join(pretrained_path, "run_config.yaml")
+    else:
+        pretrained_run_config = os.path.join(
+            pretrained_path, "iter_0000000", "run_config.yaml"
+        )
 
     if not os.path.exists(pretrained_run_config):
         raise FileNotFoundError(
             f"Pretrained run config not found at {pretrained_run_config} on rank={rank}. "
-            "This usually means that the one-time HF->mcore conversion on rank=0 saved to a directory "
-            "not being mounted on this node. Please check"
+            "This usually means that the checkpoint conversion on rank=0 saved to a "
+            "directory not mounted on this node. Please check."
         )
 
     try:
@@ -312,8 +381,8 @@ def setup_model_config(
         # Add helpful context as a note to the exception
         e.add_note(
             f"\n{'=' * 80}\n"
-            f"NOTE: A common cause of this error is when the HF->mcore converted checkpoint is\n"
-            f"created with an older version of megatron-bridge.\n"
+            f"NOTE: A common cause of this error is when the converted checkpoint was created\n"
+            f"with an older version of megatron-bridge.\n"
             f"If this checkpoint is old or was generated by a different code version,\n"
             f"try deleting it and rerunning the code.\n"
             f"The checkpoint will be automatically regenerated with the current version.\n\n"
@@ -956,14 +1025,44 @@ def handle_model_import(
     pretrained_path: str,
     pt_checkpoint_exists: bool,
 ) -> None:
-    """Handle HF model import if checkpoint doesn't exist."""
-    force_reconvert_from_hf = config["megatron_cfg"].get(
-        "force_reconvert_from_hf", False
-    )
+    """Convert and cache the initial model checkpoint if it does not yet exist.
 
-    if pt_checkpoint_exists and not force_reconvert_from_hf:
+    Behaviour depends on ``policy.pretrained_checkpoint.format``:
+
+    * ``"megatron_bridge"``: The checkpoint is already in the correct format;
+      no conversion is performed.
+    * ``"megatron_lm"``: The Megatron-LM checkpoint is converted to
+      Megatron-Bridge format and written to ``pretrained_path`` (a cache
+      directory derived from the source path).
+    * No ``pretrained_checkpoint`` (default): The HuggingFace model identified
+      by ``hf_model_name`` is converted to Megatron-Bridge format (existing
+      behaviour).
+
+    In all cases the ``force_reconvert_from_hf`` flag forces the conversion to
+    run again even if the output already exists.
+    """
+    pretrained_ckpt = config.get("pretrained_checkpoint")
+    fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else "hf"
+
+    if fmt == "megatron_bridge":
+        # The user-supplied checkpoint is already in megatron-bridge format.
+        # validate_model_paths() already confirmed it exists, so nothing to do.
+        return
+
+    force_reconvert = config["megatron_cfg"].get("force_reconvert_from_hf", False)
+
+    if pt_checkpoint_exists and not force_reconvert:
         print(f"Checkpoint already exists at {pretrained_path}. Skipping import.")
-    else:
+        return
+
+    if fmt == "megatron_lm":
+        import_model_from_mlm(
+            hf_model_name=hf_model_name,
+            mlm_iter_path=pretrained_ckpt["path"],
+            output_path=pretrained_path,
+            megatron_config=config["megatron_cfg"],
+        )
+    else:  # hf
         hf_config_overrides = config.get("hf_config_overrides", {}) or {}
         import_model_from_hf_name(
             hf_model_name,
@@ -972,9 +1071,9 @@ def handle_model_import(
             **hf_config_overrides,
         )
 
-        if parallel_state.model_parallel_is_initialized():
-            print("Reinitializing model parallel after loading model state.")
-            parallel_state.destroy_model_parallel()
+    if parallel_state.model_parallel_is_initialized():
+        print("Reinitializing model parallel after loading model state.")
+        parallel_state.destroy_model_parallel()
 
 
 def setup_reference_model_state(
