@@ -23,9 +23,9 @@ checkpointing:
   checkpoint_dir: results/dapo-gemma4-31b-it-4n8g-fsdp2-automodel
   save_period: 15
 policy:
-  model_name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/models/google/gemma-4-31B-it
+  model_name: google/gemma-4-31B-it
   tokenizer:
-    name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/models/google/gemma-4-31B-it
+    name: google/gemma-4-31B-it
   train_global_batch_size: 32
   train_micro_batch_size: 1
   logprob_batch_size: 1
@@ -64,6 +64,7 @@ policy:
     max_new_tokens: 3072
     vllm_cfg:
       tensor_parallel_size: 4
+      gpu_memory_utilization: 0.5
 data:
   max_input_seq_length: 2048
   train:
