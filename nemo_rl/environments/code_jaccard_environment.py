@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional, TypedDict, Union
+from typing import Any, Optional, TypedDict
 
 import ray
 import torch
@@ -36,6 +36,12 @@ class CodeJaccardEnvironmentMetadata(TypedDict):
     ground_truth: str
 
 
+class CodeJaccardVerifyResult(TypedDict):
+    scores: list[float]
+    reward_valid_mask: list[bool]
+    extracted_answers: list[str | None] | None
+
+
 @ray.remote  # pragma: no cover
 class CodeJaccardVerifyWorker:
     """Worker for evaluating code responses using Jaccard-based similarity."""
@@ -48,7 +54,7 @@ class CodeJaccardVerifyWorker:
         pred_responses: list[str],
         ground_truths: list[str],
         return_extracted_answer: bool = False,
-    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
+    ) -> CodeJaccardVerifyResult:
         """Verify code responses against ground-truth solutions using Jaccard-based similarity.
 
         We use a simple text similarity approach (Jaccard over tokenized words)
@@ -65,7 +71,10 @@ class CodeJaccardVerifyWorker:
             If return_extracted_answer is True, returns (scores, extracted_answers).
         """
         results = []
-        extracted_answers: list[str | None] = []
+        extracted_answers: list[str | None] | None = (
+            [] if return_extracted_answer else None
+        )
+        reward_valid_mask: list[bool] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
             try:
@@ -73,20 +82,25 @@ class CodeJaccardVerifyWorker:
                 # This is a basic implementation - could be enhanced with more sophisticated metrics
                 score = self._calculate_preference_score(response, ground_truth)
                 results.append(float(score))
+                reward_valid_mask.append(True)
 
                 if return_extracted_answer:
+                    assert extracted_answers is not None
                     # For CodeJaccard, the "extracted answer" is the full response
                     extracted_answers.append(response.strip())
 
             except Exception:
                 results.append(0.0)
+                reward_valid_mask.append(False)
                 if return_extracted_answer:
+                    assert extracted_answers is not None
                     extracted_answers.append(None)
 
-        if return_extracted_answer:
-            return results, extracted_answers
-        else:
-            return results
+        return {
+            "scores": results,
+            "reward_valid_mask": reward_valid_mask,
+            "extracted_answers": extracted_answers,
+        }
 
     def _calculate_preference_score(self, response: str, ground_truth: str) -> float:
         """Calculate a Jaccard-based alignment score between response and ground truth.
@@ -212,18 +226,20 @@ class CodeJaccardEnvironment(EnvironmentInterface[CodeJaccardEnvironmentMetadata
         worker_results = ray.get(futures)
 
         # Flatten the results and extract both scores and answers
-        results = []
+        results: list[float] = []
+        reward_valid_mask: list[bool] = []
         extracted_answers: list[str | None] | None = (
             [] if return_extracted_answer else None
         )
 
         for worker_result in worker_results:
+            results.extend(worker_result["scores"])
+            reward_valid_mask.extend(worker_result["reward_valid_mask"])
             if return_extracted_answer:
-                worker_scores, worker_answers = worker_result
-                results.extend(worker_scores)
+                worker_answers = worker_result["extracted_answers"]
+                assert extracted_answers is not None
+                assert worker_answers is not None
                 extracted_answers.extend(worker_answers)
-            else:
-                results.extend(worker_result)
 
         # Create observations based on Jaccard alignment
         observations = [
@@ -240,6 +256,9 @@ class CodeJaccardEnvironment(EnvironmentInterface[CodeJaccardEnvironmentMetadata
         rewards = torch.tensor(results).cpu()
         done = torch.ones_like(rewards).cpu()
         next_stop_strings = [None] * len(message_log_batch)
+        reward_valid_mask_tensor = torch.tensor(
+            reward_valid_mask, dtype=torch.bool
+        ).cpu()
 
         return EnvironmentReturn(
             observations=observations,
@@ -248,6 +267,7 @@ class CodeJaccardEnvironment(EnvironmentInterface[CodeJaccardEnvironmentMetadata
             rewards=rewards,
             terminateds=done,
             answers=extracted_answers,
+            reward_valid_mask=reward_valid_mask_tensor,
         )
 
     def global_post_process_and_metrics(

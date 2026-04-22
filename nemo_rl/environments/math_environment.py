@@ -15,7 +15,7 @@ import contextlib
 import io
 import logging
 import re
-from typing import Any, NotRequired, TypedDict, Union
+from typing import Any, NotRequired, TypedDict
 
 import ray
 import torch
@@ -45,6 +45,18 @@ class MathEnvConfig(TypedDict):
     # The verifier type. None defaults to "math".
     verifier_type: NotRequired[str | None]
     math_verify_impl: NotRequired[str | None]
+
+
+class SingleRewardVerificationResult(TypedDict):
+    scores: list[float]
+    reward_valid_mask: list[bool]
+    extracted_answers: list[str | None] | None
+
+
+class MultiRewardVerificationResult(TypedDict):
+    scores: list[list[float]]
+    reward_valid_mask: list[bool]
+    extracted_answers: list[str | None] | None
 
 
 @contextlib.contextmanager
@@ -78,7 +90,7 @@ class HFVerifyWorker:
         ground_truths: list[str],
         return_extracted_answer: bool = False,
         **kwargs,
-    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
+    ) -> SingleRewardVerificationResult:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -91,18 +103,21 @@ class HFVerifyWorker:
             If return_extracted_answer is True, returns (scores, extracted_answers).
         """
         results = []
-        extracted_answers: list[str | None] = []
+        extracted_answers: list[str | None] | None = (
+            [] if return_extracted_answer else None
+        )
+        reward_valid_mask: list[bool] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
             try:
                 with _mute_output():
                     math_verify_impl = kwargs.get("math_verify_impl", "hf_math_verify")
-                    if kwargs.get("math_verify_impl") == "dapo_math_verify":
+                    if math_verify_impl == "dapo_math_verify":
                         # This compute_score is from the DAPO Math Verifier from Verl
                         reward_dict = dapo_math_verify(response, ground_truth)
                         ret_score = reward_dict["score"]
                         extracted_answer = reward_dict["pred"]
-                    elif kwargs.get("math_verify_impl") == "hf_math_verify":
+                    elif math_verify_impl == "hf_math_verify":
                         ground_truth_parsable = "\\boxed{" + ground_truth + "}"
                         ret_score, extracted_answer = self.verify_func(
                             [ground_truth_parsable], [response]
@@ -113,8 +128,10 @@ class HFVerifyWorker:
                         )
 
                 results.append(float(ret_score))
+                reward_valid_mask.append(True)
 
                 if return_extracted_answer:
+                    assert extracted_answers is not None
                     # Make sure the extracted answer is not None and is a list of two elements
                     assert extracted_answer is not None
                     assert len(extracted_answer) == 2
@@ -133,12 +150,16 @@ class HFVerifyWorker:
             # to catch it.
             except (Exception, TimeoutException):
                 results.append(0.0)
-                extracted_answers.append(None)
+                reward_valid_mask.append(False)
+                if return_extracted_answer:
+                    assert extracted_answers is not None
+                    extracted_answers.append(None)
 
-        if return_extracted_answer:
-            return results, extracted_answers
-        else:
-            return results
+        return {
+            "scores": results,
+            "reward_valid_mask": reward_valid_mask,
+            "extracted_answers": extracted_answers,
+        }
 
 
 @ray.remote  # pragma: no cover
@@ -149,7 +170,7 @@ class MultilingualMultichoiceVerifyWorker:
         ground_truths: list[str],
         return_extracted_answer: bool = False,
         **kwargs,
-    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
+    ) -> SingleRewardVerificationResult:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -162,7 +183,10 @@ class MultilingualMultichoiceVerifyWorker:
             If return_extracted_answer is True, returns (scores, extracted_answers).
         """
         results = []
-        extracted_answers: list[str | None] = []
+        extracted_answers: list[str | None] | None = (
+            [] if return_extracted_answer else None
+        )
+        reward_valid_mask: list[bool] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
             response = answer_parsing.normalize_response(response)
@@ -179,12 +203,16 @@ class MultilingualMultichoiceVerifyWorker:
                     break
             score = 1.0 if extracted_answer == ground_truth else 0.0
             results.append(score)
-            extracted_answers.append(extracted_answer)
+            reward_valid_mask.append(True)
+            if return_extracted_answer:
+                assert extracted_answers is not None
+                extracted_answers.append(extracted_answer)
 
-        if return_extracted_answer:
-            return results, extracted_answers
-        else:
-            return results
+        return {
+            "scores": results,
+            "reward_valid_mask": reward_valid_mask,
+            "extracted_answers": extracted_answers,
+        }
 
 
 @ray.remote  # pragma: no cover
@@ -195,7 +223,7 @@ class EnglishMultichoiceVerifyWorker:
         ground_truths: list[str],
         return_extracted_answer: bool = False,
         **kwargs,
-    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
+    ) -> SingleRewardVerificationResult:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -208,7 +236,10 @@ class EnglishMultichoiceVerifyWorker:
             If return_extracted_answer is True, returns (scores, extracted_answers).
         """
         results = []
-        extracted_answers: list[str | None] = []
+        extracted_answers: list[str | None] | None = (
+            [] if return_extracted_answer else None
+        )
+        reward_valid_mask: list[bool] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
             ground_truth = answer_parsing.normalize_response(ground_truth)
@@ -221,13 +252,16 @@ class EnglishMultichoiceVerifyWorker:
                 )
             score = 1.0 if extracted_answer == ground_truth else 0.0
             results.append(score)
+            reward_valid_mask.append(True)
             if return_extracted_answer:
+                assert extracted_answers is not None
                 extracted_answers.append(extracted_answer)
 
-        if return_extracted_answer:
-            return results, extracted_answers
-        else:
-            return results
+        return {
+            "scores": results,
+            "reward_valid_mask": reward_valid_mask,
+            "extracted_answers": extracted_answers,
+        }
 
 
 @ray.remote  # pragma: no cover
@@ -253,7 +287,7 @@ class HFMultiRewardVerifyWorker:
         ground_truths: list[str],
         return_extracted_answer: bool = False,
         **kwargs,
-    ) -> Union[list[list[float]], tuple[list[list[float]], list[str | None]]]:
+    ) -> MultiRewardVerificationResult:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -297,7 +331,10 @@ class HFMultiRewardVerifyWorker:
             return rewards
 
         results = [[] for _ in range(self.number_of_rewards)]
-        extracted_answers: list[str | None] = []
+        extracted_answers: list[str | None] | None = (
+            [] if return_extracted_answer else None
+        )
+        reward_valid_mask: list[bool] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
             try:
@@ -314,8 +351,10 @@ class HFMultiRewardVerifyWorker:
                 results[0].extend(cor_reward)
                 results[1].extend(int_reward)
                 results[2].extend(format_reward)
+                reward_valid_mask.append(True)
 
                 if return_extracted_answer:
+                    assert extracted_answers is not None
                     extracted_answer = extract_xml_answer(response)
                     extracted_answers.append(extracted_answer)
 
@@ -326,13 +365,16 @@ class HFMultiRewardVerifyWorker:
                 results[0].append(0.0)
                 results[1].append(0.0)
                 results[2].append(0.0)
-                extracted_answers.append(None)
+                reward_valid_mask.append(False)
+                if return_extracted_answer:
+                    assert extracted_answers is not None
+                    extracted_answers.append(None)
 
-        if return_extracted_answer:
-            return results, extracted_answers
-        else:
-            # return results --> [[0,1,0], [0,2,0], .........]
-            return results
+        return {
+            "scores": results,
+            "reward_valid_mask": reward_valid_mask,
+            "extracted_answers": extracted_answers,
+        }
 
 
 class MathEnvironmentMetadata(TypedDict):
@@ -469,15 +511,19 @@ class MathEnvironment(BaseMathEnvironment):
         worker_results = ray.get(futures)
 
         # Flatten the results and extract both scores and answers
-        results = []
+        results: list[float] = []
+        reward_valid_mask: list[bool] = []
         extracted_answers: list[str | None] | None = (
             [] if return_extracted_answer else None
         )
 
         for worker_result in worker_results:
-            worker_scores = worker_result
+            worker_scores = worker_result["scores"]
+            reward_valid_mask.extend(worker_result["reward_valid_mask"])
             if return_extracted_answer:
-                worker_scores, worker_answers = worker_result
+                worker_answers = worker_result["extracted_answers"]
+                assert extracted_answers is not None
+                assert worker_answers is not None
                 extracted_answers.extend(worker_answers)
             results.extend(worker_scores)
 
@@ -495,6 +541,9 @@ class MathEnvironment(BaseMathEnvironment):
         rewards = torch.tensor(results).cpu()
         done = torch.ones_like(rewards).cpu()
         next_stop_strings = [None] * len(message_log_batch)
+        reward_valid_mask_tensor = torch.tensor(
+            reward_valid_mask, dtype=torch.bool
+        ).cpu()
 
         return EnvironmentReturn(
             observations=observations,
@@ -503,6 +552,7 @@ class MathEnvironment(BaseMathEnvironment):
             rewards=rewards,
             terminateds=done,
             answers=extracted_answers,
+            reward_valid_mask=reward_valid_mask_tensor,
         )
 
 
@@ -566,16 +616,20 @@ class MathMultiRewardEnvironment(BaseMathEnvironment):
         worker_results = ray.get(futures)
 
         # Flatten the results and extract both scores and answers
-        number_of_rewards = len(worker_results[0])
+        number_of_rewards = len(worker_results[0]["scores"])
         results = [[] for _ in range(number_of_rewards)]
+        reward_valid_mask: list[bool] = []
         extracted_answers: list[str | None] | None = (
             [] if return_extracted_answer else None
         )
 
         for worker_result in worker_results:
-            worker_scores = worker_result
+            worker_scores = worker_result["scores"]
+            reward_valid_mask.extend(worker_result["reward_valid_mask"])
             if return_extracted_answer:
-                worker_scores, worker_answers = worker_result
+                worker_answers = worker_result["extracted_answers"]
+                assert extracted_answers is not None
+                assert worker_answers is not None
                 extracted_answers.extend(worker_answers)
             for i in range(number_of_rewards):
                 results[i].extend(worker_scores[i])
@@ -595,6 +649,9 @@ class MathMultiRewardEnvironment(BaseMathEnvironment):
         ## hard fixed this done to
         done = torch.ones(rewards.shape[0]).cpu()
         next_stop_strings = [None] * len(message_log_batch)
+        reward_valid_mask_tensor = torch.tensor(
+            reward_valid_mask, dtype=torch.bool
+        ).cpu()
 
         return EnvironmentReturn(
             observations=observations,
@@ -603,4 +660,5 @@ class MathMultiRewardEnvironment(BaseMathEnvironment):
             rewards=rewards,
             terminateds=done,
             answers=extracted_answers,
+            reward_valid_mask=reward_valid_mask_tensor,
         )
