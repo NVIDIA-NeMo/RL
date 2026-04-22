@@ -4,15 +4,13 @@ environments:
     - gpu_backend: device-plugin   # nvkind handles toolkit/runtime, only need device plugin
   prod:
     values:
-    - gpu_backend: gpu-operator    # full operator manages driver, toolkit, device plugin, NFD
+    - gpu_backend: existing-nkx-gpu-operator  # managed by NKX, not by us
 
 ---
 
 repositories:
 - name: nvdp
   url: https://nvidia.github.io/k8s-device-plugin
-- name: nvidia
-  url: https://helm.ngc.nvidia.com/nvidia
 - name: kuberay
   url: https://ray-project.github.io/kuberay-helm/
 
@@ -28,20 +26,6 @@ releases:
   wait: true
   values:
   - values/nvidia-device-plugin.yaml
-{{ end }}
-
-#
-# GPU: full operator (prod) — manages driver, toolkit, device plugin, NFD, DCGM
-#
-{{ if eq .Environment.Values.gpu_backend "gpu-operator" }}
-- name: gpu-operator
-  namespace: gpu-operator
-  createNamespace: true
-  chart: nvidia/gpu-operator
-  wait: true
-  waitForJobs: true
-  values:
-  - values/gpu-operator.yaml
 {{ end }}
 
 #

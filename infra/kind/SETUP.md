@@ -81,9 +81,7 @@ helmfile -e prod sync
 kubectl apply -f infra/examples/kai-queue-prod.yaml
 ```
 
-This installs the full **GPU Operator** (instead of just the device plugin) along with KAI scheduler, KubeRay, and JobSet. The GPU Operator manages the NVIDIA driver, container toolkit, device plugin, NFD, and DCGM exporter.
-
-Set `driver.enabled=false` in `values/gpu-operator.yaml` if the cluster nodes already have the NVIDIA driver installed.
+This installs KAI scheduler, KubeRay, and JobSet. The cluster is expected to already have the GPU Operator (or equivalent GPU provisioning) installed.
 
 ## Architecture
 
@@ -176,7 +174,6 @@ infra/
 │   ├── helmfile.yaml                 # environments: kind, prod
 │   └── values/
 │       ├── nvidia-device-plugin.yaml # kind only
-│       ├── gpu-operator.yaml         # prod only
 │       ├── kai-scheduler.yaml
 │       └── kuberay-operator.yaml
 ├── examples/                          # Workload examples
@@ -194,7 +191,7 @@ infra/
 | Environment | GPU component | Use case |
 |-------------|---------------|----------|
 | `kind` | nvidia-device-plugin | Local dev — nvkind handles toolkit/runtime |
-| `prod` | gpu-operator (full) | Real clusters — operator manages everything |
+| `prod` | (none — cluster provides GPU Operator) | Real clusters |
 
 Both environments include KAI scheduler, KubeRay operator, and JobSet controller.
 
@@ -207,7 +204,7 @@ kind delete cluster --name nemo-rl
 ## Notes
 
 - **nvkind vs vanilla kind**: nvkind automates GPU device injection, nvidia-container-toolkit installation inside nodes, containerd nvidia runtime configuration, and RuntimeClass registration.
-- **nvidia-device-plugin** (kind only): The full GPU Operator fails in kind because its driver validation doesn't work inside kind nodes. The lightweight device plugin with CDI discovery is sufficient since nvkind handles the runtime setup.
+- **nvidia-device-plugin** (kind only): The GPU Operator doesn't work in kind because its driver validation fails inside kind nodes. The lightweight device plugin with CDI discovery is sufficient since nvkind handles the runtime setup.
 - **KAI scheduler** creates PodGroups automatically for recognized workload types (RayCluster, Job, PyTorchJob, JobSet, etc.). For bare pods, create a PodGroup manually and annotate with `pod-group-name`.
 
 ## Fairshare scheduling
