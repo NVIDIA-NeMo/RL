@@ -283,7 +283,7 @@ class LaunchSpec(_StrictModel):
     attach: AttachSpec = Field(default_factory=AttachSpec)
     peerWatcher: bool = True
     # Shell command the training job runs inside the Ray cluster. Required
-    # for `nrl-k8s launch` / `nrl-k8s run`. Typically a line like
+    # for `nrl-k8s run` / `nrl-k8s rayjob`. Typically a line like
     # ``python -u examples/.../entry.py --config nrl_k8s_run.yaml ...``.
     # The CLI stages the resolved recipe as ``nrl_k8s_run.yaml`` at the
     # working_dir root so this command can reference it by name (only when

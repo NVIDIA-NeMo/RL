@@ -359,11 +359,11 @@ class TestEnsureCluster:
 
 
 # =============================================================================
-# go — idempotent run
+# run — idempotent bring-up + daemon + training submit
 # =============================================================================
 
 
-class TestGo:
+class TestRun:
     def test_skip_daemons_bypasses_daemon_submit(self, monkeypatch, log) -> None:
         log_fn, lines = log
         loaded = _loaded(gym_entrypoint="python gym.py --job-id run-q")
@@ -375,7 +375,7 @@ class TestGo:
         monkeypatch.setattr(orchestrate, "submit_daemon", daemon)
         monkeypatch.setattr(orchestrate, "submit_training", train)
 
-        out = orchestrate.go(
+        out = orchestrate.run(
             loaded, log=log_fn, repo_root=Path("/tmp"), skip_daemons=True
         )
 
@@ -397,7 +397,7 @@ class TestGo:
         monkeypatch.setattr(orchestrate, "submit_daemon", MagicMock())
         monkeypatch.setattr(orchestrate, "submit_training", MagicMock())
 
-        orchestrate.go(
+        orchestrate.run(
             loaded, log=log_fn, repo_root=Path("/tmp"), recreate=True
         )
 

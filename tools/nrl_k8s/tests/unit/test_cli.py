@@ -289,7 +289,7 @@ class TestRayJob:
         runner = CliRunner()
         result = runner.invoke(
             cli.main,
-            ["rayjob", str(recipe), "--dry-run"],
+            ["run", str(recipe), "--rayjob", "--dry-run"],
         )
         assert result.exit_code == 0, result.output
         assert applied == []
@@ -319,7 +319,7 @@ class TestRayJob:
         monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
 
         runner = CliRunner()
-        result = runner.invoke(cli.main, ["rayjob", str(recipe)])
+        result = runner.invoke(cli.main, ["run", str(recipe), "--rayjob"])
         assert result.exit_code == 0, result.output
         assert len(applied) == 1
         manifest, ns = applied[0]
@@ -343,7 +343,7 @@ class TestRayJob:
         monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
 
         runner = CliRunner()
-        result = runner.invoke(cli.main, ["rayjob", str(recipe)])
+        result = runner.invoke(cli.main, ["run", str(recipe), "--rayjob"])
         assert result.exit_code == 1
 
     def test_no_wait_skips_poll(self, tmp_path, monkeypatch):
@@ -358,22 +358,22 @@ class TestRayJob:
         monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
 
         runner = CliRunner()
-        result = runner.invoke(cli.main, ["rayjob", str(recipe), "--no-wait"])
+        result = runner.invoke(cli.main, ["run", str(recipe), "--rayjob", "--no-wait"])
         assert result.exit_code == 0, result.output
         assert waited == []
 
     def test_errors_when_entrypoint_missing(self, tmp_path):
         recipe = self._recipe_with_training(tmp_path, entrypoint=None)
         runner = CliRunner()
-        result = runner.invoke(cli.main, ["rayjob", str(recipe), "--dry-run"])
+        result = runner.invoke(cli.main, ["run", str(recipe), "--rayjob", "--dry-run"])
         assert result.exit_code == 1
         assert "entrypoint" in result.output
 
 
-class TestGoCommand:
-    """`nrl-k8s go` delegates to orchestrate.go with the CLI's resolved flags."""
+class TestRunCommand:
+    """`nrl-k8s run` delegates to orchestrate.run with the CLI's resolved flags."""
 
-    def test_go_invokes_orchestrate_with_flags(self, tmp_path, monkeypatch) -> None:
+    def test_run_invokes_orchestrate_with_flags(self, tmp_path, monkeypatch) -> None:
         spec = {
             "headGroupSpec": {
                 "template": {"spec": {"containers": [{"name": "h", "image": "old"}]}}
@@ -404,21 +404,21 @@ class TestGoCommand:
         class _FakeResult:
             handle = _FakeHandle()
 
-        def _fake_go(loaded, *, log, repo_root, replace, run_id, skip_daemons, recreate):
+        def _fake_run(loaded, *, log, repo_root, replace, run_id, skip_daemons, recreate):
             captured["skip_daemons"] = skip_daemons
             captured["recreate"] = recreate
             captured["replace"] = replace
             captured["run_id"] = run_id
             return _FakeResult()
 
-        monkeypatch.setattr("nrl_k8s.orchestrate.go", _fake_go)
+        monkeypatch.setattr("nrl_k8s.orchestrate.run", _fake_run)
         monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
 
         runner = CliRunner()
         result = runner.invoke(
             cli.main,
             [
-                "go",
+                "run",
                 str(recipe),
                 "--mode", "batch",
                 "--code-source", "image",

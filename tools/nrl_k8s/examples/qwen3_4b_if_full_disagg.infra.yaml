@@ -328,7 +328,7 @@ clusters:
     labels:
       disagg.nemo-rl/cluster: rl-qwen3-4b
       disagg.nemo-rl/run: qwen3-4b-gym
-    # No daemon: waits for `nrl-k8s launch` / `nrl-k8s run`.
+    # No daemon: waits for `nrl-k8s run` / `nrl-k8s rayjob`.
     spec:
       rayVersion: "2.52.0"
       headGroupSpec:

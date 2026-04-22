@@ -29,15 +29,15 @@
 #     nvidia.com/gpu.clique as a placement key.
 #
 # Usage:
-#   # One-time per cluster:
-#   nrl-k8s cluster up tools/nrl_k8s/examples/qwen3_30b_math_8n_4gpu.yaml \
-#       --infra tools/nrl_k8s/examples/qwen3_30b_math_8n_4gpu.gb300.infra.yaml \
-#       --role training
-#
-#   # Per run — returns fast, Ray job continues in the background:
-#   nrl-k8s launch tools/nrl_k8s/examples/qwen3_30b_math_8n_4gpu.yaml \
+#   # Long-lived cluster — idempotent; reuses the live cluster if it
+#   # already matches, applies if absent. Submits training per invocation.
+#   nrl-k8s run tools/nrl_k8s/examples/qwen3_30b_math_8n_4gpu.yaml \
 #       --infra tools/nrl_k8s/examples/qwen3_30b_math_8n_4gpu.gb300.infra.yaml \
 #       --run-id qwen3-30b-math-$(date +%Y%m%d-%H%M%S)
+#
+#   # One-shot with auto-teardown (ephemeral RayCluster, no cleanup needed):
+#   nrl-k8s rayjob tools/nrl_k8s/examples/qwen3_30b_math_8n_4gpu.yaml \
+#       --infra tools/nrl_k8s/examples/qwen3_30b_math_8n_4gpu.gb300.infra.yaml
 
 _shared:
   headNodeSelector: &head_node_selector

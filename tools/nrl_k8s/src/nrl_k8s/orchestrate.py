@@ -274,7 +274,7 @@ def submit_training(
     infra = loaded.infra
     launch = infra.launch
     if not launch.entrypoint:
-        raise ValueError("infra.launch.entrypoint must be set for `nrl-k8s launch`")
+        raise ValueError("infra.launch.entrypoint must be set for `nrl-k8s run` / `rayjob`")
 
     if replace:
         _reset_endpoint_registry(loaded, log=log)
@@ -368,34 +368,20 @@ def run(
     repo_root: Path,
     replace: bool = False,
     run_id: str | None = None,
-) -> RunResult:
-    """Do the full sequence: bring up all 3 clusters + daemons, submit training."""
-    if replace:
-        _reset_endpoint_registry(loaded, log=log)
-
-    for role in ALL_ROLES:
-        if _get_cluster(loaded.infra, role) is None:
-            log(f"[{role}] not defined in recipe — skipping")
-            continue
-        name = bring_up_cluster(role, loaded, log=log)
-        submit_daemon(role, loaded, name, log=log, repo_root=repo_root, replace=replace)
-
-    return submit_training(
-        loaded, log=log, repo_root=repo_root, replace=replace, run_id=run_id
-    )
-
-
-def go(
-    loaded: LoadedConfig,
-    *,
-    log: callable,
-    repo_root: Path,
-    replace: bool = False,
-    run_id: str | None = None,
     skip_daemons: bool = False,
     recreate: bool = False,
 ) -> RunResult:
-    """Idempotent ``run``: reuse matching clusters, warn on drift, then launch."""
+    """Idempotent bring-up + daemon + training submit.
+
+    For each declared role, reuse the live RayCluster when its spec matches
+    the rendered manifest, apply when it is absent, warn + reuse on drift
+    (or delete + re-apply when ``recreate=True``). Then submit daemons and
+    the training entrypoint.
+
+    ``skip_daemons=True`` bypasses gym/generation daemon submission — use
+    when those roles are already healthy and you only want to re-submit
+    training.
+    """
     if replace:
         _reset_endpoint_registry(loaded, log=log)
 
@@ -515,7 +501,6 @@ __all__ = [
     "bring_up_cluster",
     "default_run_id",
     "ensure_cluster",
-    "go",
     "run",
     "submit_daemon",
     "submit_training",
