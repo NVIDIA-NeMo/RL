@@ -22,6 +22,12 @@ from ._retry import with_retries
 RAY_GROUP = "ray.io"
 RAY_VERSION = "v1"
 RAYCLUSTER_PLURAL = "rayclusters"
+RAYJOB_PLURAL = "rayjobs"
+
+# RayJob jobDeploymentStatus terminal states. `Complete` covers a job that
+# succeeded end-to-end; `Failed` covers driver exit != 0; the rest are
+# actively-running / suspended states where we keep polling.
+_RAYJOB_TERMINAL_DEPLOYMENT = ("Complete", "Failed")
 
 
 # =============================================================================
@@ -168,6 +174,119 @@ def wait_for_raycluster_gone(
     raise TimeoutError(f"RayCluster {name} not deleted after {timeout_s}s")
 
 
+# =============================================================================
+# RayJob lifecycle
+# =============================================================================
+
+
+def apply_rayjob(manifest: dict[str, Any], namespace: str) -> dict[str, Any]:
+    """Create-or-replace a RayJob. Returns the server-side object."""
+    name = manifest["metadata"]["name"]
+    api = custom_objects_api()
+    try:
+        return with_retries(
+            lambda: api.create_namespaced_custom_object(
+                group=RAY_GROUP,
+                version=RAY_VERSION,
+                namespace=namespace,
+                plural=RAYJOB_PLURAL,
+                body=manifest,
+            )
+        )
+    except ApiException as exc:
+        if exc.status == 409:
+            return with_retries(
+                lambda: api.patch_namespaced_custom_object(
+                    group=RAY_GROUP,
+                    version=RAY_VERSION,
+                    namespace=namespace,
+                    plural=RAYJOB_PLURAL,
+                    name=name,
+                    body=manifest,
+                )
+            )
+        exc.nrl_k8s_manifest = redact(manifest)  # type: ignore[attr-defined]
+        raise
+
+
+def delete_rayjob(
+    name: str, namespace: str, *, ignore_missing: bool = True
+) -> None:
+    api = custom_objects_api()
+    try:
+        with_retries(
+            lambda: api.delete_namespaced_custom_object(
+                group=RAY_GROUP,
+                version=RAY_VERSION,
+                namespace=namespace,
+                plural=RAYJOB_PLURAL,
+                name=name,
+            )
+        )
+    except ApiException as exc:
+        if exc.status == 404 and ignore_missing:
+            return
+        raise
+
+
+def get_rayjob(name: str, namespace: str) -> dict[str, Any] | None:
+    api = custom_objects_api()
+    try:
+        return with_retries(
+            lambda: api.get_namespaced_custom_object(
+                group=RAY_GROUP,
+                version=RAY_VERSION,
+                namespace=namespace,
+                plural=RAYJOB_PLURAL,
+                name=name,
+            )
+        )
+    except ApiException as exc:
+        if exc.status == 404:
+            return None
+        raise
+
+
+def wait_for_rayjob_terminal(
+    name: str,
+    namespace: str,
+    *,
+    timeout_s: int = 86400,
+    poll_s: int = 10,
+    on_update: callable | None = None,
+) -> dict[str, Any]:
+    """Block until a RayJob's ``jobDeploymentStatus`` is Complete or Failed.
+
+    Returns the final server-side object so callers can read the
+    ``.status.jobStatus`` / ``.status.message`` fields. ``on_update`` is
+    invoked with ``(jobDeploymentStatus, jobStatus)`` on every transition —
+    useful for printing progress without this module owning the logger.
+    """
+    deadline = time.monotonic() + timeout_s
+    last: tuple[str | None, str | None] = (None, None)
+    while time.monotonic() < deadline:
+        obj = get_rayjob(name, namespace)
+        if obj is None:
+            raise RuntimeError(
+                f"RayJob {name} disappeared from {namespace} before reaching terminal state"
+            )
+        status = obj.get("status") or {}
+        dep = status.get("jobDeploymentStatus")
+        job = status.get("jobStatus")
+        if (dep, job) != last:
+            if on_update is not None:
+                on_update(dep, job)
+            last = (dep, job)
+        if dep in _RAYJOB_TERMINAL_DEPLOYMENT:
+            return obj
+        time.sleep(poll_s)
+    raise TimeoutError(
+        f"RayJob {name} in {namespace} did not reach a terminal state "
+        f"(last seen jobDeploymentStatus={last[0]!r}, jobStatus={last[1]!r}) "
+        f"after {timeout_s}s"
+    )
+
+
 def delete_configmap(name: str, namespace: str, *, ignore_missing: bool = True) -> bool:
     """Delete a ConfigMap. Returns True if deleted, False if it didn't exist."""
     load_kubeconfig()
@@ -210,13 +329,17 @@ def get_head_pod(cluster_name: str, namespace: str) -> Any:
 
 __all__ = [
     "apply_raycluster",
+    "apply_rayjob",
     "custom_objects_api",
     "delete_configmap",
     "delete_raycluster",
+    "delete_rayjob",
     "get_head_pod",
     "get_raycluster",
+    "get_rayjob",
     "list_rayclusters",
     "load_kubeconfig",
     "wait_for_raycluster_gone",
     "wait_for_raycluster_ready",
+    "wait_for_rayjob_terminal",
 ]

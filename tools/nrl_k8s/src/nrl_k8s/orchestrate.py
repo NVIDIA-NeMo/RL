@@ -89,6 +89,87 @@ def bring_up_cluster(
     return name
 
 
+def ensure_cluster(
+    role: Role,
+    loaded: LoadedConfig,
+    *,
+    log: callable,
+    recreate: bool = False,
+    wait_ready: bool = True,
+    ready_timeout_s: int = 900,
+) -> str:
+    """Idempotent cluster up: reuse when live matches rendered, warn on drift.
+
+    Unlike :func:`bring_up_cluster`, we never silently patch a live cluster.
+    If the RayCluster already exists and its spec matches the rendered one
+    we just wait for readiness. If it exists but drifted we log a warning
+    and reuse anyway — pass ``recreate=True`` to delete + re-apply instead.
+    """
+    cluster = _require_cluster(loaded.infra, role)
+    manifest = build_raycluster_manifest(cluster, loaded.infra)
+    name = cluster.name
+    namespace = loaded.infra.namespace
+
+    live = k8s.get_raycluster(name, namespace)
+    if live is None:
+        log(f"[{role}] applying RayCluster {name} in namespace {namespace}")
+        k8s.apply_raycluster(manifest, namespace)
+    elif _spec_drifted(live.get("spec") or {}, manifest["spec"]):
+        if recreate:
+            log(
+                f"[{role}] --recreate: RayCluster {name} has drifted from the "
+                f"rendered manifest; deleting and re-applying"
+            )
+            k8s.delete_raycluster(name, namespace)
+            k8s.wait_for_raycluster_gone(name, namespace)
+            k8s.apply_raycluster(manifest, namespace)
+        else:
+            log(
+                f"[{role}] warning: live RayCluster {name} has drifted from the "
+                f"rendered manifest; reusing as-is (pass --recreate to replace)"
+            )
+    else:
+        log(f"[{role}] RayCluster {name} already exists and matches — reusing")
+
+    if wait_ready:
+        log(f"[{role}] waiting for RayCluster {name} to reach state=ready ...")
+        k8s.wait_for_raycluster_ready(name, namespace, timeout_s=ready_timeout_s)
+        log(f"[{role}] RayCluster {name} is ready.")
+
+    return name
+
+
+# Server-managed fields that never appear in a rendered manifest and should
+# be ignored when diffing for drift.
+_DRIFT_IGNORE_TOP = ("status",)
+_DRIFT_IGNORE_METADATA = (
+    "creationTimestamp",
+    "generation",
+    "managedFields",
+    "resourceVersion",
+    "selfLink",
+    "uid",
+)
+
+
+def _spec_drifted(live_spec: dict, rendered_spec: dict) -> bool:
+    """Return True if the live RayCluster ``.spec`` diverges from rendered."""
+    return _strip_server_fields(live_spec) != _strip_server_fields(rendered_spec)
+
+
+def _strip_server_fields(obj):
+    """Recursively drop keys the API server injects so comparisons are stable."""
+    if isinstance(obj, dict):
+        return {
+            k: _strip_server_fields(v)
+            for k, v in obj.items()
+            if k not in _DRIFT_IGNORE_TOP and k not in _DRIFT_IGNORE_METADATA
+        }
+    if isinstance(obj, list):
+        return [_strip_server_fields(v) for v in obj]
+    return obj
+
+
 def submit_daemon(
     role: Role,
     loaded: LoadedConfig,
@@ -304,6 +385,35 @@ def run(
     )
 
 
+def go(
+    loaded: LoadedConfig,
+    *,
+    log: callable,
+    repo_root: Path,
+    replace: bool = False,
+    run_id: str | None = None,
+    skip_daemons: bool = False,
+    recreate: bool = False,
+) -> RunResult:
+    """Idempotent ``run``: reuse matching clusters, warn on drift, then launch."""
+    if replace:
+        _reset_endpoint_registry(loaded, log=log)
+
+    for role in ALL_ROLES:
+        if _get_cluster(loaded.infra, role) is None:
+            log(f"[{role}] not defined in recipe — skipping")
+            continue
+        name = ensure_cluster(role, loaded, log=log, recreate=recreate)
+        if skip_daemons and role != "training":
+            log(f"[{role}] --skip-daemons: not submitting daemon")
+            continue
+        submit_daemon(role, loaded, name, log=log, repo_root=repo_root, replace=replace)
+
+    return submit_training(
+        loaded, log=log, repo_root=repo_root, replace=replace, run_id=run_id
+    )
+
+
 _JOB_ID_RE = re.compile(r"--job-id[= ]+(\S+)")
 
 
@@ -404,6 +514,8 @@ __all__ = [
     "RunResult",
     "bring_up_cluster",
     "default_run_id",
+    "ensure_cluster",
+    "go",
     "run",
     "submit_daemon",
     "submit_training",

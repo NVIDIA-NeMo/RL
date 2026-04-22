@@ -255,6 +255,190 @@ class TestClusterDashboard:
         assert fix_called == []
 
 
+# =============================================================================
+# rayjob — ephemeral RayJob submission
+# =============================================================================
+
+
+class TestRayJob:
+    @staticmethod
+    def _recipe_with_training(tmp_path: Path, entrypoint: str | None) -> Path:
+        spec = {
+            "headGroupSpec": {
+                "template": {"spec": {"containers": [{"name": "h", "image": "old"}]}}
+            }
+        }
+        infra = {
+            "namespace": "ns",
+            "image": "img:new",
+            "clusters": {"training": {"name": "rc-train", "spec": spec}},
+        }
+        if entrypoint is not None:
+            infra["launch"] = {"entrypoint": entrypoint}
+        return _write_recipe(tmp_path, {"infra": infra})
+
+    def test_dry_run_prints_manifest_without_applying(self, tmp_path, monkeypatch):
+        recipe = self._recipe_with_training(tmp_path, "python run.py")
+
+        applied: list[dict] = []
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.apply_rayjob",
+            lambda manifest, ns: applied.append((manifest, ns)),
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli.main,
+            ["rayjob", str(recipe), "--dry-run"],
+        )
+        assert result.exit_code == 0, result.output
+        assert applied == []
+        assert "kind: RayJob" in result.output
+        assert "entrypoint: python run.py" in result.output
+
+    def test_apply_then_wait_success(self, tmp_path, monkeypatch):
+        recipe = self._recipe_with_training(tmp_path, "echo")
+
+        applied: list[tuple[dict, str]] = []
+
+        def _fake_apply(manifest, ns):
+            applied.append((manifest, ns))
+            return manifest
+
+        def _fake_wait(name, namespace, *, timeout_s, on_update=None):
+            return {
+                "metadata": {"name": name},
+                "status": {
+                    "jobDeploymentStatus": "Complete",
+                    "jobStatus": "SUCCEEDED",
+                },
+            }
+
+        monkeypatch.setattr("nrl_k8s.k8s.apply_rayjob", _fake_apply)
+        monkeypatch.setattr("nrl_k8s.k8s.wait_for_rayjob_terminal", _fake_wait)
+        monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
+
+        runner = CliRunner()
+        result = runner.invoke(cli.main, ["rayjob", str(recipe)])
+        assert result.exit_code == 0, result.output
+        assert len(applied) == 1
+        manifest, ns = applied[0]
+        assert ns == "ns"
+        assert manifest["kind"] == "RayJob"
+        assert manifest["metadata"]["name"] == "rc-train"
+        assert manifest["spec"]["entrypoint"] == "echo"
+        assert manifest["spec"]["shutdownAfterJobFinishes"] is True
+
+    def test_failed_job_exits_non_zero(self, tmp_path, monkeypatch):
+        recipe = self._recipe_with_training(tmp_path, "echo")
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.apply_rayjob", lambda m, ns: m
+        )
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.wait_for_rayjob_terminal",
+            lambda *a, **kw: {
+                "status": {"jobDeploymentStatus": "Failed", "jobStatus": "FAILED"}
+            },
+        )
+        monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
+
+        runner = CliRunner()
+        result = runner.invoke(cli.main, ["rayjob", str(recipe)])
+        assert result.exit_code == 1
+
+    def test_no_wait_skips_poll(self, tmp_path, monkeypatch):
+        recipe = self._recipe_with_training(tmp_path, "echo")
+        waited: list[int] = []
+
+        monkeypatch.setattr("nrl_k8s.k8s.apply_rayjob", lambda m, ns: m)
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.wait_for_rayjob_terminal",
+            lambda *a, **kw: waited.append(1) or {},
+        )
+        monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
+
+        runner = CliRunner()
+        result = runner.invoke(cli.main, ["rayjob", str(recipe), "--no-wait"])
+        assert result.exit_code == 0, result.output
+        assert waited == []
+
+    def test_errors_when_entrypoint_missing(self, tmp_path):
+        recipe = self._recipe_with_training(tmp_path, entrypoint=None)
+        runner = CliRunner()
+        result = runner.invoke(cli.main, ["rayjob", str(recipe), "--dry-run"])
+        assert result.exit_code == 1
+        assert "entrypoint" in result.output
+
+
+class TestGoCommand:
+    """`nrl-k8s go` delegates to orchestrate.go with the CLI's resolved flags."""
+
+    def test_go_invokes_orchestrate_with_flags(self, tmp_path, monkeypatch) -> None:
+        spec = {
+            "headGroupSpec": {
+                "template": {"spec": {"containers": [{"name": "h", "image": "old"}]}}
+            }
+        }
+        recipe = _write_recipe(
+            tmp_path,
+            {
+                "infra": {
+                    "namespace": "ns",
+                    "image": "img:new",
+                    "launch": {"entrypoint": "python run.py"},
+                    "clusters": {"training": {"name": "rc-train", "spec": spec}},
+                }
+            },
+        )
+
+        captured: dict = {}
+
+        class _FakeHandle:
+            run_id = "training-1"
+            kind = "port-forward"
+            cluster_name = "rc-train"
+            namespace = "ns"
+            pod = None
+            tmp_dir = None
+
+        class _FakeResult:
+            handle = _FakeHandle()
+
+        def _fake_go(loaded, *, log, repo_root, replace, run_id, skip_daemons, recreate):
+            captured["skip_daemons"] = skip_daemons
+            captured["recreate"] = recreate
+            captured["replace"] = replace
+            captured["run_id"] = run_id
+            return _FakeResult()
+
+        monkeypatch.setattr("nrl_k8s.orchestrate.go", _fake_go)
+        monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli.main,
+            [
+                "go",
+                str(recipe),
+                "--mode", "batch",
+                "--code-source", "image",
+                "--code-path", "/opt/nemo-rl",
+                "--run-id", "run-x",
+                "--skip-daemons",
+                "--recreate",
+                "--no-wait",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert captured == {
+            "skip_daemons": True,
+            "recreate": True,
+            "replace": False,
+            "run_id": "run-x",
+        }
+        assert "run id:  training-1" in result.output
+
+
 class TestClusterDown:
     def test_errors_without_role_or_name(self, tmp_path, monkeypatch) -> None:
         recipe = _write_recipe(

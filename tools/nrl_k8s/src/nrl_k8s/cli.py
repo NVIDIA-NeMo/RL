@@ -512,6 +512,238 @@ def run(
 @click.argument("recipe", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.argument("overrides", nargs=-1, type=click.UNPROCESSED)
 @_INFRA_OPTION
+@click.option(
+    "--repo-root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=Path.cwd(),
+    show_default="cwd",
+    help="NeMo-RL repo root used to source files for the working_dir upload.",
+)
+@click.option(
+    "--replace",
+    is_flag=True,
+    help="Stop any running daemon/training job before submitting new ones.",
+)
+@click.option(
+    "--recreate",
+    is_flag=True,
+    help="Delete + re-apply any RayCluster whose live spec has drifted from "
+    "the rendered manifest. Default is to warn and reuse as-is.",
+)
+@click.option(
+    "--skip-daemons",
+    is_flag=True,
+    help="Bring up every declared cluster but only submit training — skip "
+    "daemons on gym/generation roles.",
+)
+@_mode_options
+def go(
+    recipe: Path,
+    overrides: tuple[str, ...],
+    infra_path: Path | None,
+    repo_root: Path,
+    replace: bool,
+    recreate: bool,
+    skip_daemons: bool,
+    cli_mode: str | None,
+    cli_submitter: str | None,
+    cli_code_source: str | None,
+    cli_code_path: str | None,
+    cli_run_id: str | None,
+    cli_wait: bool | None,
+) -> None:
+    """Idempotent ``run``: reuse matching clusters, then launch training.
+
+    For each role declared in the recipe, reuse the live RayCluster when
+    its spec matches the rendered manifest, apply when it is absent, and
+    warn + reuse when it has drifted (pass ``--recreate`` to delete +
+    re-apply). Then submit daemons and the training entrypoint, same as
+    :command:`launch`.
+
+    Use ``--skip-daemons`` on a disaggregated recipe when the gym /
+    generation daemons are already healthy and you only want to re-submit
+    training.
+    """
+    from . import orchestrate
+    from . import submit as submit_mod
+
+    loaded = _load_or_exit(recipe, overrides, infra_path)
+    if not submit_mod.is_in_cluster():
+        _preflight_or_exit(loaded.infra.namespace)
+
+    mode, submitter, code_src, no_wait = _resolve_mode_defaults(
+        cli_mode=cli_mode,
+        infra_mode=loaded.infra.launch.runMode,
+        cli_submitter=cli_submitter,
+        cli_code_source=cli_code_source,
+        cli_wait=cli_wait,
+    )
+    _apply_mode_overrides(loaded, submitter=submitter, code_source=code_src, code_path=cli_code_path)
+    click.echo(
+        f"[go] mode={mode.value} submitter={submitter.value} "
+        f"code_source={code_src.value} no_wait={no_wait} "
+        f"recreate={recreate} skip_daemons={skip_daemons}",
+        err=True,
+    )
+
+    try:
+        result = orchestrate.go(
+            loaded,
+            log=click.echo,
+            repo_root=repo_root.resolve(),
+            replace=replace,
+            run_id=cli_run_id,
+            skip_daemons=skip_daemons,
+            recreate=recreate,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _explain_and_exit(exc, context="go failed")
+
+    _emit_handle(result.handle)
+    if not no_wait:
+        _follow_handle(result.handle)
+
+
+@main.command("rayjob")
+@click.argument("recipe", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("overrides", nargs=-1, type=click.UNPROCESSED)
+@_INFRA_OPTION
+@click.option(
+    "--name",
+    "name_opt",
+    type=str,
+    default=None,
+    help="RayJob metadata name. Defaults to the training cluster name.",
+)
+@click.option(
+    "--shutdown/--no-shutdown",
+    "shutdown_after",
+    default=True,
+    show_default=True,
+    help="Delete the ephemeral RayCluster once the Ray Job reaches a "
+    "terminal state (KubeRay's shutdownAfterJobFinishes).",
+)
+@click.option(
+    "--ttl",
+    "ttl_seconds",
+    type=int,
+    default=3600,
+    show_default=True,
+    help="Seconds to keep the RayJob object after the run finishes "
+    "(ttlSecondsAfterFinished). Useful for post-mortem log access.",
+)
+@click.option(
+    "--wait/--no-wait",
+    default=True,
+    help="Poll the RayJob until jobDeploymentStatus is Complete or Failed. "
+    "Pass --no-wait to return as soon as the RayJob is applied.",
+)
+@click.option(
+    "--timeout",
+    "timeout_s",
+    type=int,
+    default=86400,
+    show_default=True,
+    help="Seconds to wait for the RayJob to reach a terminal state.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Render the RayJob manifest and print it; do not apply.",
+)
+def rayjob(
+    recipe: Path,
+    overrides: tuple[str, ...],
+    infra_path: Path | None,
+    name_opt: str | None,
+    shutdown_after: bool,
+    ttl_seconds: int,
+    wait: bool,
+    timeout_s: int,
+    dry_run: bool,
+) -> None:
+    """Submit the recipe as an ephemeral RayJob.
+
+    KubeRay creates the RayCluster declared under ``clusters.training``,
+    submits ``infra.launch.entrypoint`` over the dashboard HTTP API, polls
+    until the driver is terminal, then tears the cluster down. Convenient
+    for one-shot runs where you don't want a long-lived RayCluster left
+    over after the job finishes.
+
+    Contrast with ``nrl-k8s run`` / ``launch`` which attach a job to a
+    long-lived cluster and leave the cluster up for future submissions.
+    """
+    from . import k8s
+    from . import submit as submit_mod
+    from .rayjob import build_rayjob_manifest
+
+    loaded = _load_or_exit(recipe, overrides, infra_path)
+    cluster = _pick_cluster_or_exit(loaded, "training")
+    if not loaded.infra.launch.entrypoint:
+        _cli_error(
+            "infra.launch.entrypoint is empty",
+            hint="rayjob requires infra.launch.entrypoint; see docs/recipes.md",
+        )
+
+    manifest = build_rayjob_manifest(
+        cluster,
+        loaded.infra,
+        entrypoint=loaded.infra.launch.entrypoint,
+        name=name_opt,
+        shutdown_after_finishes=shutdown_after,
+        ttl_seconds_after_finished=ttl_seconds,
+    )
+    job_name = manifest["metadata"]["name"]
+    namespace = loaded.infra.namespace
+
+    if dry_run:
+        click.echo(yaml.safe_dump(manifest, sort_keys=False).rstrip())
+        return
+
+    if not submit_mod.is_in_cluster():
+        _preflight_or_exit(namespace)
+
+    click.echo(f"[rayjob] applying RayJob {job_name} in {namespace}")
+    try:
+        k8s.apply_rayjob(manifest, namespace)
+    except ApiException as exc:
+        _explain_and_exit(exc, context=f"rayjob {job_name} apply failed")
+    except Exception as exc:  # noqa: BLE001
+        _explain_and_exit(exc, context=f"rayjob {job_name} apply failed")
+
+    click.echo(
+        f"follow:  kubectl get rayjob {job_name} -n {namespace} -w\n"
+        f"logs:    nrl-k8s job logs <submission-id> {recipe} --role training -f",
+    )
+    if not wait:
+        return
+
+    click.echo(f"[rayjob] waiting for {job_name} to reach a terminal state ...")
+
+    def _on_update(deployment: str | None, job: str | None) -> None:
+        click.echo(f"[rayjob] {job_name} deployment={deployment} job={job}")
+
+    try:
+        final = k8s.wait_for_rayjob_terminal(
+            job_name, namespace, timeout_s=timeout_s, on_update=_on_update
+        )
+    except Exception as exc:  # noqa: BLE001
+        _explain_and_exit(exc, context=f"rayjob {job_name} wait failed")
+
+    status = final.get("status") or {}
+    dep = status.get("jobDeploymentStatus")
+    job_status = status.get("jobStatus")
+    message = (status.get("message") or "").strip()
+    click.echo(f"[rayjob] {job_name} finished: deployment={dep} job={job_status}")
+    if message:
+        click.echo(f"[rayjob] message: {message}")
+    sys.exit(0 if dep == "Complete" else 1)
+
+
+@main.command()
+@click.argument("recipe", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("overrides", nargs=-1, type=click.UNPROCESSED)
+@_INFRA_OPTION
 def status(recipe: Path, overrides: tuple[str, ...], infra_path: Path | None) -> None:
     """Summarise every cluster declared in the recipe.
 

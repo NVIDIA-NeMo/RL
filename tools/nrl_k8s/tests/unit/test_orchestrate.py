@@ -257,6 +257,154 @@ class TestSubmitTraining:
 
 
 # =============================================================================
+# ensure_cluster — idempotent path used by `go`
+# =============================================================================
+
+
+class TestEnsureCluster:
+    def test_applies_when_absent(self, monkeypatch, log) -> None:
+        log_fn, lines = log
+        get = MagicMock(return_value=None)
+        apply = MagicMock()
+        wait = MagicMock()
+        monkeypatch.setattr(orchestrate.k8s, "get_raycluster", get)
+        monkeypatch.setattr(orchestrate.k8s, "apply_raycluster", apply)
+        monkeypatch.setattr(orchestrate.k8s, "wait_for_raycluster_ready", wait)
+
+        name = orchestrate.ensure_cluster("training", _loaded(), log=log_fn)
+
+        assert name == "rc-train"
+        apply.assert_called_once()
+        wait.assert_called_once()
+
+    def test_reuses_when_live_matches(self, monkeypatch, log) -> None:
+        log_fn, lines = log
+        loaded = _loaded()
+        rendered = orchestrate.build_raycluster_manifest(
+            loaded.infra.clusters.training, loaded.infra
+        )
+        live = {
+            "metadata": {
+                "name": "rc-train",
+                "resourceVersion": "9",
+                "uid": "abc",
+            },
+            "spec": rendered["spec"],
+            "status": {"state": "ready"},
+        }
+        monkeypatch.setattr(
+            orchestrate.k8s, "get_raycluster", MagicMock(return_value=live)
+        )
+        apply = MagicMock()
+        wait = MagicMock()
+        monkeypatch.setattr(orchestrate.k8s, "apply_raycluster", apply)
+        monkeypatch.setattr(orchestrate.k8s, "wait_for_raycluster_ready", wait)
+
+        orchestrate.ensure_cluster("training", loaded, log=log_fn)
+
+        apply.assert_not_called()
+        wait.assert_called_once()
+        assert any("already exists and matches" in ln for ln in lines)
+
+    def test_warns_on_drift_and_reuses(self, monkeypatch, log) -> None:
+        log_fn, lines = log
+        loaded = _loaded()
+        # Start from the rendered spec, mutate one field to simulate drift.
+        rendered = orchestrate.build_raycluster_manifest(
+            loaded.infra.clusters.training, loaded.infra
+        )
+        drifted = {"metadata": {"name": "rc-train"}, "spec": dict(rendered["spec"])}
+        drifted["spec"]["rayVersion"] = "drifted"
+        monkeypatch.setattr(
+            orchestrate.k8s, "get_raycluster", MagicMock(return_value=drifted)
+        )
+        apply = MagicMock()
+        delete = MagicMock()
+        monkeypatch.setattr(orchestrate.k8s, "apply_raycluster", apply)
+        monkeypatch.setattr(orchestrate.k8s, "delete_raycluster", delete)
+        monkeypatch.setattr(orchestrate.k8s, "wait_for_raycluster_ready", MagicMock())
+
+        orchestrate.ensure_cluster("training", loaded, log=log_fn)
+
+        apply.assert_not_called()
+        delete.assert_not_called()
+        assert any("drifted" in ln and "reusing" in ln for ln in lines)
+
+    def test_recreate_deletes_and_reapplies_on_drift(self, monkeypatch, log) -> None:
+        log_fn, lines = log
+        loaded = _loaded()
+        rendered = orchestrate.build_raycluster_manifest(
+            loaded.infra.clusters.training, loaded.infra
+        )
+        drifted = {"metadata": {"name": "rc-train"}, "spec": dict(rendered["spec"])}
+        drifted["spec"]["rayVersion"] = "drifted"
+        monkeypatch.setattr(
+            orchestrate.k8s, "get_raycluster", MagicMock(return_value=drifted)
+        )
+        apply = MagicMock()
+        delete = MagicMock()
+        gone = MagicMock()
+        monkeypatch.setattr(orchestrate.k8s, "apply_raycluster", apply)
+        monkeypatch.setattr(orchestrate.k8s, "delete_raycluster", delete)
+        monkeypatch.setattr(orchestrate.k8s, "wait_for_raycluster_gone", gone)
+        monkeypatch.setattr(orchestrate.k8s, "wait_for_raycluster_ready", MagicMock())
+
+        orchestrate.ensure_cluster(
+            "training", loaded, log=log_fn, recreate=True
+        )
+
+        delete.assert_called_once_with("rc-train", "ns-a")
+        gone.assert_called_once()
+        apply.assert_called_once()
+
+
+# =============================================================================
+# go — idempotent run
+# =============================================================================
+
+
+class TestGo:
+    def test_skip_daemons_bypasses_daemon_submit(self, monkeypatch, log) -> None:
+        log_fn, lines = log
+        loaded = _loaded(gym_entrypoint="python gym.py --job-id run-q")
+
+        ensure = MagicMock(side_effect=lambda role, *a, **kw: f"rc-{role}")
+        daemon = MagicMock()
+        train = MagicMock(return_value="TRAIN_RESULT")
+        monkeypatch.setattr(orchestrate, "ensure_cluster", ensure)
+        monkeypatch.setattr(orchestrate, "submit_daemon", daemon)
+        monkeypatch.setattr(orchestrate, "submit_training", train)
+
+        out = orchestrate.go(
+            loaded, log=log_fn, repo_root=Path("/tmp"), skip_daemons=True
+        )
+
+        assert out == "TRAIN_RESULT"
+        # ensure_cluster called once per declared role.
+        roles_ensured = {c.args[0] for c in ensure.call_args_list}
+        assert roles_ensured == {"gym", "training"}
+        # Only training gets a submit_daemon call; gym is skipped.
+        roles_daemoned = [c.args[0] for c in daemon.call_args_list]
+        assert roles_daemoned == ["training"]
+        train.assert_called_once()
+
+    def test_recreate_flag_propagates(self, monkeypatch, log) -> None:
+        log_fn, _ = log
+        loaded = _loaded()
+
+        ensure = MagicMock(return_value="rc-train")
+        monkeypatch.setattr(orchestrate, "ensure_cluster", ensure)
+        monkeypatch.setattr(orchestrate, "submit_daemon", MagicMock())
+        monkeypatch.setattr(orchestrate, "submit_training", MagicMock())
+
+        orchestrate.go(
+            loaded, log=log_fn, repo_root=Path("/tmp"), recreate=True
+        )
+
+        assert ensure.call_args.kwargs["recreate"] is True
+
+
+# =============================================================================
 # _infer_disagg_job_id — regex over gym entrypoints
 # =============================================================================
 
