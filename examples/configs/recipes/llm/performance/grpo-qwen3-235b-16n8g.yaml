@@ -46,6 +46,8 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 16
       async_engine: true
+  sequence_packing:
+    fuse_loss: true
 logger:
   log_dir: logs/grpo-qwen3-235b-16n8g
   wandb_enabled: true
