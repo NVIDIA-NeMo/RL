@@ -110,6 +110,8 @@ def import_model_from_hf_name(
         model_provider.gradient_accumulation_fusion = megatron_config[
             "gradient_accumulation_fusion"
         ]
+        if megatron_config["context_parallel_size"] > 1:
+            model_provider.calculate_per_token_loss = True
     if transformer_layer_spec is not None:
         model_provider.transformer_layer_spec = transformer_layer_spec
     model_provider.finalize()
