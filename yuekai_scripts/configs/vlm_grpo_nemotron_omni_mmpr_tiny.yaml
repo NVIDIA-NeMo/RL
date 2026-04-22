@@ -3,8 +3,8 @@
 defaults: "../../examples/configs/vlm_grpo_3B.yaml"
 
 grpo:
-  num_prompts_per_step: 16
-  num_generations_per_prompt: 8
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
   val_at_start: true
   reward_shaping:
     overlong_buffer_length: 512
@@ -16,11 +16,11 @@ checkpointing:
 
 policy:
   model_name: /lustre/fs1/portfolios/coreai/users/aroshanghias/checkpoints/mpo-nanov3omni-mmpr-nanov2-filtered-conv3d-0303/step_400
-  train_global_batch_size: 128
+  train_global_batch_size: 32
   train_micro_batch_size: 1
   logprob_batch_size: 1
   logprob_chunk_size: 256
-  max_total_sequence_length: 8196
+  max_total_sequence_length: 10000
   dynamic_batching:
     enabled: false
   sequence_packing:
@@ -30,7 +30,7 @@ policy:
       lr: 3.0e-06
   dtensor_cfg:
     expert_parallel_size: 8
-    activation_checkpointing: false
+    activation_checkpointing: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
     automodel_kwargs:
@@ -44,7 +44,7 @@ policy:
         rope_fusion: false
         enable_hf_state_dict_adapter: true
   generation:
-    max_new_tokens: 4096
+    max_new_tokens: 8000
     bad_words: ["<image>", "<img>", "</img>", "<so_embedding>", "<so_start>", "<so_end>"]
     vllm_cfg:
       skip_tokenizer_init: false
@@ -85,7 +85,7 @@ logger:
   wandb_enabled: true
   wandb:
     project: grpo-vlm
-    name: nemotron-omni-grpo-mmpr-tiny
+    name: nemotron-omni-grpo-mmpr-tiny-single-node
 
 cluster:
   gpus_per_node: 8
