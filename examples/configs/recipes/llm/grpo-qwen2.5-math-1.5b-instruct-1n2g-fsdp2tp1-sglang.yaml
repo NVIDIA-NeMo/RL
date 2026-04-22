@@ -2,9 +2,10 @@ defaults: ../../grpo_math_1B.yaml
 
 grpo:
   max_num_steps: 450
+  val_batch_size: 128
 
 checkpointing:
-  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang
+  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n2g-fsdp2tp1-sglang
 
 policy:
   model_name: Qwen/Qwen2.5-Math-1.5B-Instruct
@@ -20,32 +21,39 @@ policy:
     max_new_tokens: 512
     sglang_cfg:
       model_path: ${policy.model_name}
-      gpus_per_server: 1
       dtype: ${policy.precision}
       context_length: 512
       allow_auto_truncate: true
-      enable_memory_saver: false
       dp_size: 1
       pp_size: 1
       ep_size: 1
+      random_seed: 42
       max_running_requests: null
-      mem_fraction_static: 0.5
+      mem_fraction_static: 0.6
       skip_server_warmup: true
-      # Piecewise CUDA graphs fail with CUBLAS_STATUS_EXECUTION_FAILED
-      # inside Ray worker forks. See unit test Err 4 for details.
+      # Piecewise CUDA graph currently crashes with "illegal memory access"
+      # (likely torch 2.10 + sglang incompatibility). Keep disabled until upstream fix.
       disable_piecewise_cuda_graph: true
+      disable_cuda_graph: true
+    sglang_server:
+      needs_offload: true
+      cpu_weight_backup: true
+      sglang_server_concurrency: 1024
+      num_gpus: 2
+      num_gpus_per_engine: 2
+    sglang_router: {}
 
 data:
   max_input_seq_length: 512
 
 logger:
-  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang
+  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n2g-fsdp2tp1-sglang
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang
+    name: grpo-qwen2.5-math-1.5b-instruct-1n2g-fsdp2tp1-sglang
 
 cluster:
-  gpus_per_node: 8
-
+  gpus_per_node: 2
+  num_nodes: 1

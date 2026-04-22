@@ -68,7 +68,8 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
-from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
+from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -438,6 +439,10 @@ def setup(
         )
         train_cluster = cluster
         inference_cluster = cluster
+        inference_cluster_cfg: ClusterConfig = {
+            "gpus_per_node": policy_gpus_per_node,
+            "num_nodes": policy_nodes,
+        }
         print(
             f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
             flush=True,
@@ -526,6 +531,10 @@ def setup(
             num_gpus_per_node=inference_gpus_per_node,
             max_colocated_worker_groups=1,
         )
+        inference_cluster_cfg: ClusterConfig = {
+            "gpus_per_node": inference_gpus_per_node,
+            "num_nodes": inference_nodes,
+        }
         print(
             f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
             flush=True,
@@ -578,7 +587,11 @@ def setup(
     def init_sglang():
         """Initialize SGLang generation workers."""
         t0 = time.perf_counter()
-        pg = SGLangGeneration(cluster=inference_cluster, config=generation_config)
+        pg = SGLangGeneration(
+            cluster=inference_cluster,
+            cluster_cfg=inference_cluster_cfg,
+            sglang_cfg=generation_config,
+        )
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
@@ -1139,15 +1152,11 @@ def refit_policy_generation(
                 )
 
             if isinstance(policy_generation, SGLangGeneration):
-                sglang_url_to_gpu_uuids = (
-                    policy_generation.get_sglang_url_to_gpu_uuids()
-                )
-                # Stream weights via HTTP
-                flush_success = policy_generation.invalidate_kv_cache()
-                if not flush_success:
-                    print("SGLang KV cache invalidation failed before weight update. ")
+                # Stream weights to colocated SGLang engines via CUDA IPC over HTTP.
+                # Engine-i owns global ranks [i*K, (i+1)*K) where K = num_gpus_per_engine.
                 futures_train = policy.stream_weights_via_http(
-                    sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+                    rollout_engines=policy_generation.rollout_engines,
+                    num_gpus_per_engine=policy_generation.num_gpus_per_engine,
                 )
                 # Wait for all workers to complete
                 ray.get(futures_train)

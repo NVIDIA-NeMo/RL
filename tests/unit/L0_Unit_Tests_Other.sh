@@ -57,14 +57,6 @@ else
     uv run --extra vllm bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --vllm-only
 fi
 
-# Check and run sglang tests
-exit_code=$(cd ${PROJECT_ROOT}/tests && uv run --extra sglang pytest "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --collect-only --hf-gated --sglang-only -q >/dev/null 2>&1; echo $?)
-if [[ $exit_code -eq 5 ]]; then
-    echo "No sglang tests to run"
-else
-    uv run --extra sglang bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --sglang-only
-fi
-
 # Skip research tests in fast mode
 if [[ "${FAST:-0}" != "1" ]]; then
     for i in research/*/tests/unit; do

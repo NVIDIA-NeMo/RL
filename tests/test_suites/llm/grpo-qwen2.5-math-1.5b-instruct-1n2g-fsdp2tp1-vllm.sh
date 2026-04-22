@@ -2,12 +2,14 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-6,7}
+
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
 STEPS_PER_RUN=450
 MAX_STEPS=450
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=150  # bumped from 120: ~13.7s/step without piecewise CUDA graphs
+NUM_MINUTES=150
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -32,7 +34,6 @@ uv run examples/run_grpo.py \
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
-# Using the same metrics thresholds as the vllm version to verify alignment
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
@@ -41,5 +42,3 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
 fi
-
-
