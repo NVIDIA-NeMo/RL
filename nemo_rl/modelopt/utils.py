@@ -14,46 +14,55 @@
 
 """Lightweight quantization config resolver usable by both Megatron and vLLM workers."""
 
-import importlib
-import importlib.util
-import os
+from typing import Any
 
 import modelopt.torch.quantization as mtq
+from modelopt.recipe import load_config
 
 
-def resolve_quant_cfg(quant_cfg):
-    """Resolves a quantization config from a built-in name or a Python file path.
+def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
+    """Resolve a quantization config string into a dict consumable by ``mtq.quantize``.
 
     Resolution order:
-    1. Built-in ModelOpt config name (e.g. "NVFP4_DEFAULT_CFG", "FP8_DEFAULT_CFG")
-    2. File path with variable name: "/path/to/config.py:VAR_NAME"
 
-    For custom configs, the target variable must be a dict with the ModelOpt
-    quantization config format. See examples/modelopt/quant_configs/ for examples.
+    1. Built-in ModelOpt config constant exposed on ``modelopt.torch.quantization``
+       (e.g. ``"NVFP4_DEFAULT_CFG"``, ``"FP8_DEFAULT_CFG"``).
+    2. A ModelOpt PTQ recipe — either the name of a built-in recipe shipped under
+       ``modelopt_recipes/`` (e.g. ``"general/ptq/nvfp4_default-fp8_kv"``; the
+       ``.yml`` / ``.yaml`` suffix is optional) or the path to a user-authored
+       YAML recipe. Resolution is performed by ``modelopt.recipe.load_config``,
+       which searches the filesystem first and then the built-in recipe library.
+
+    YAML recipes are expected to follow the standard ModelOpt PTQ recipe layout
+    with a top-level ``quantize:`` section in the
+    ``{"quant_cfg": [...], "algorithm": ...}`` shape that ``mtq.quantize``
+    expects. A bare ``{"quant_cfg": [...], "algorithm": ...}`` document (without
+    a wrapping ``quantize:`` key) is also accepted for convenience. The
+    extracted dict — not the full recipe — is returned.
+
+    See ``modelopt_recipes/general/ptq/`` in the TensorRT-Model-Optimizer repo
+    for the canonical format and ``examples/modelopt/quant_configs/`` for a
+    user-authored example.
     """
-    file_path, sep, attr_name = quant_cfg.rpartition(":")
-    if sep and file_path.endswith(".py"):
-        file_path = os.path.abspath(file_path)
-        if not os.path.isfile(file_path):
-            raise ValueError(f"quant_cfg file not found: '{file_path}'")
-        spec = importlib.util.spec_from_file_location("_custom_quant_cfg", file_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        cfg = getattr(module, attr_name, None)
-        if cfg is None:
-            raise ValueError(f"File '{file_path}' has no attribute '{attr_name}'.")
-        if not isinstance(cfg, dict):
-            raise ValueError(
-                f"quant_cfg '{attr_name}' in '{file_path}' is {type(cfg).__name__}, expected a dict."
-            )
-        return cfg
-
     builtin = getattr(mtq, quant_cfg, None)
     if builtin is not None:
         return builtin
 
-    raise ValueError(
-        f"Unknown quant_cfg '{quant_cfg}'. Must be a built-in ModelOpt config name "
-        f"(e.g. 'NVFP4_DEFAULT_CFG') or a file path with variable name "
-        f"(e.g. '/path/to/config.py:MY_CONFIG')."
-    )
+    try:
+        loaded = load_config(quant_cfg)
+    except (ValueError, FileNotFoundError) as e:
+        raise ValueError(
+            f"Unknown quant_cfg '{quant_cfg}'. Must be either a built-in "
+            f"ModelOpt config name (e.g. 'NVFP4_DEFAULT_CFG'), a built-in "
+            f"ModelOpt PTQ recipe name (e.g. "
+            f"'general/ptq/nvfp4_default-fp8_kv'), or a path to a YAML "
+            f"quantization recipe."
+        ) from e
+
+    quantize = loaded.get("quantize", loaded)
+    if not isinstance(quantize, dict) or "quant_cfg" not in quantize:
+        raise ValueError(
+            f"Quantization recipe '{quant_cfg}' must contain a 'quant_cfg' "
+            f"entry (optionally nested under a top-level 'quantize:' section)."
+        )
+    return quantize
