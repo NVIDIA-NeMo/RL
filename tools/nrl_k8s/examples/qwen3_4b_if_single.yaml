@@ -10,12 +10,12 @@
 defaults: ../../../examples/nemo_gym/grpo_qwen3_4b_instruct_k8s_base.yaml
 
 cluster:
-  gpus_per_node: 8
+  gpus_per_node: 4
   num_nodes: 1
 grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
-  max_num_steps: 200
+  max_num_steps: 500
   val_period: 50
   max_rollout_turns: 1
   async_grpo:
@@ -35,7 +35,7 @@ policy:
     colocated:
       enabled: true
       resources:
-        gpus_per_node: 8
+        gpus_per_node: 4
         num_nodes: 1
     vllm_cfg:
       gpu_memory_utilization: 0.45  # leave 55% for training state
