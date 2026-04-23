@@ -71,6 +71,7 @@ class SFTConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     seed: int
+    only_unmask_final: bool
 
 
 class MasterConfig(TypedDict):
@@ -267,6 +268,7 @@ def validate(
             add_loss_mask_to_message_log(
                 val_batch["message_log"],
                 roles_to_train_on=["assistant"],
+                only_unmask_final=master_config["sft"]["only_unmask_final"],
             )
 
             cat_and_padded, input_lengths = batched_message_log_to_flat_message(
@@ -430,6 +432,7 @@ def sft_train(
                     add_loss_mask_to_message_log(
                         batch["message_log"],
                         roles_to_train_on=["assistant"],
+                        only_unmask_final=master_config["sft"]["only_unmask_final"],
                     )
 
                     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
