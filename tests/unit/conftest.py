@@ -581,6 +581,37 @@ def tiny_llama_model_path():
 
 
 @pytest.fixture(scope="session")
+def tiny_llama_4layer_model_path():
+    """Fixture that returns a path to a tiny 4-layer llama model for VPP testing.
+
+    VPP with pp=2, vpp=2 requires num_hidden_layers divisible by pp*vpp=4.
+    """
+    import shutil
+
+    from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
+
+    model_path = os.path.join(
+        TEST_ASSETS_DIR, "tiny_4layer_llama_with_llama3.2_tokenizer"
+    )
+    config = LlamaConfig(
+        num_hidden_layers=4,
+        hidden_size=64,
+        intermediate_size=32,
+        num_attention_heads=2,
+        vocab_size=128256,
+        tie_word_embeddings=False,
+        num_key_value_heads=None,
+    )
+    model = LlamaForCausalLM(config=config)
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+    shutil.rmtree(model_path, ignore_errors=True)
+    model.save_pretrained(model_path)
+    tokenizer.save_pretrained(model_path)
+    del model, tokenizer
+    yield model_path
+
+
+@pytest.fixture(scope="session")
 def tiny_llama_tied_model_path():
     """Fixture that returns a path to a tiny llama model with a dummy tokenizer."""
     import shutil

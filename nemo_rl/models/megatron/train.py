@@ -15,6 +15,7 @@
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
+from itertools import tee
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -311,6 +312,15 @@ def megatron_forward_backward(
         use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
     )
     forward_backward_func = get_forward_backward_func()
+    # The interleaved pipeline schedule (VPP) requires data_iterator to be a list with
+    # one independent iterator per model chunk.  Each chunk processes ALL num_microbatches
+    # in sequence, so every iterator must be able to yield num_microbatches items
+    # independently.  We materialise the microbatches once and hand each chunk its own
+    # iterator over the same data.  The non-interleaved schedule accepts a length-1 list
+    # and unwraps it itself.
+    num_model_chunks = len(model) if isinstance(model, list) else 1
+    if num_model_chunks > 1:
+        data_iterator = list(tee(data_iterator, num_model_chunks))
     return forward_backward_func(
         forward_step_func=forward_step,
         data_iterator=data_iterator,

@@ -384,6 +384,15 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     ]
     model_cfg.sequence_parallel = config["megatron_cfg"]["sequence_parallel"]
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
+    model_cfg.virtual_pipeline_model_parallel_size = config["megatron_cfg"][
+        "virtual_pipeline_model_parallel_size"
+    ]
+    model_cfg.pipeline_model_parallel_layout = config["megatron_cfg"][
+        "pipeline_model_parallel_layout"
+    ]
+    model_cfg.microbatch_group_size_per_vp_stage = config["megatron_cfg"][
+        "pipeline_model_parallel_size"
+    ]
 
     if model_cfg.context_parallel_size > 1:
         assert config["sequence_packing"]["enabled"], (
@@ -938,9 +947,6 @@ def setup_model_and_optimizer(
         if len(model) == 1:
             param_sync_func = param_sync_func[0]
 
-    # Get the first model from the list
-    model = model[0]
-
     return ModelAndOptimizerState(
         state,
         model,
@@ -1090,16 +1096,19 @@ def setup_reference_model_state(
     reference_state_dict = {}
 
     if should_load_checkpoint or use_peft:
-        reference_model = reference_model[0]
-        reference_model.eval()
-        # Store reference state dict on CPU
-        for name, item in reference_model.state_dict().items():
-            if isinstance(item, torch.Tensor):
-                cpu_item = item.detach().to(device="cpu", non_blocking=True, copy=True)
-                del item
-            else:
-                cpu_item = item
-            reference_state_dict[name] = cpu_item
+        for chunk in reference_model:
+            chunk.eval()
+            chunk_state_dict = {}
+            for name, item in chunk.state_dict().items():
+                if isinstance(item, torch.Tensor):
+                    cpu_item = item.detach().to(
+                        device="cpu", non_blocking=True, copy=True
+                    )
+                    del item
+                else:
+                    cpu_item = item
+                chunk_state_dict[name] = cpu_item
+            reference_state_dict.update(chunk_state_dict)
         print("Reference model loaded")
     else:
         print("Reference model not loaded")
@@ -1121,7 +1130,7 @@ def finalize_megatron_setup(
         Tuple of (megatron_tokenizer, megatron_bridge, should_disable_forward_pre_hook, dp_size)
     """
     _update_model_config_funcs(
-        [model],
+        model,
         megatron_cfg.model,
         megatron_cfg.ddp,
         optimizer,
