@@ -1,0 +1,131 @@
+1000-step server validation for stochastic row-sampled Kondo
+
+Scope
+- Validate the current "groupfix" Kondo implementation against plain sync GRPO on a stable, already-tested recipe.
+- This is a server validation run, not a hyperparameter sweep.
+- Hold the recipe fixed and compare only:
+  - baseline GRPO
+  - stochastic Kondo ("groupfix")
+
+Why this exact recipe
+- Model: Qwen/Qwen2.5-1.5B-Instruct
+- Task/env: GSM8K train with GSM8K test evaluation
+- Runtime:
+  - sequence_packing=false
+  - dynamic_batching=true
+  - single-node, single-GPU learner path
+- This is the combo that has already been exercised repeatedly in this branch and avoids the unstable/unsupported paths we hit with sequence packing and worker-env rebuilds.
+
+Recommended server
+- Preferred: 1x A100 80GB
+- Acceptable: equivalent single-GPU server with enough VRAM to run the exact same recipe without changing batching or model length
+
+Required environment
+- Export:
+  - NEMO_RL_PY_EXECUTABLES_SYSTEM=1
+- Use the checked-in NeMo-RL worktree directly; do not mix with an older wheel or another patched copy.
+
+Run matrix
+- Minimum:
+  - seeds 42, 43, 44
+  - baseline + groupfix
+- Preferred:
+  - seeds 42, 43, 44, 45, 46, 47
+  - baseline + groupfix
+
+Fixed recipe
+- Steps: 1000
+- Validation period: 50
+- Validation at end: true
+- Max validation samples: 256
+- Prompts per step: 2
+- Generations per prompt: 4
+- Train global batch size: 8
+- Train micro batch size: 1
+- Logprob batch size: 1
+- Max total sequence length: 768
+- Generation max new tokens: 320
+- vLLM max model len: 768
+- Checkpointing: disabled for throughput unless the server harness requires it
+
+Baseline command pattern
+- Run from repo root.
+
+uv run python examples/run_grpo.py \
+  logger.log_dir=<LOG_DIR> \
+  checkpointing.checkpoint_dir=<CKPT_DIR> \
+  grpo.seed=<SEED> \
+  grpo.max_num_steps=1000 \
+  grpo.num_prompts_per_step=2 \
+  grpo.num_generations_per_prompt=4 \
+  grpo.val_period=50 \
+  grpo.val_at_end=true \
+  grpo.max_val_samples=256 \
+  grpo.val_batch_size=64 \
+  policy.train_global_batch_size=8 \
+  policy.train_micro_batch_size=1 \
+  policy.logprob_batch_size=1 \
+  policy.max_total_sequence_length=768 \
+  policy.sequence_packing.enabled=false \
+  policy.dynamic_batching.enabled=true \
+  policy.model_name=Qwen/Qwen2.5-1.5B-Instruct \
+  policy.tokenizer.name=Qwen/Qwen2.5-1.5B-Instruct \
+  policy.generation.max_new_tokens=320 \
+  policy.generation.vllm_cfg.max_model_len=768 \
+  policy.generation.vllm_cfg.enable_vllm_metrics_logger=false \
+  checkpointing.enabled=false \
+  checkpointing.keep_top_k=1 \
+  checkpointing.save_period=1000000 \
+  data.num_workers=1 \
+  env.math.num_workers=4 \
+  logger.tensorboard_enabled=true \
+  logger.wandb_enabled=false \
+  logger.mlflow_enabled=false \
+  logger.swanlab_enabled=false \
+  logger.monitor_gpus=true \
+  logger.num_val_samples_to_print=0 \
+  data.default.prompt_file=examples/prompts/cot.txt \
+  policy.dtensor_cfg._v2=false \
+  checkpointing.model_save_format=null \
+  loss_fn.dg_enabled=false \
+  loss_fn.reference_policy_kl_penalty=0.01 \
+  data.train.split_validation_size=0.0 \
+  data.train.dataset_name=gsm8k \
+  +data.train.split=train \
+  ++data.validation.dataset_name=gsm8k \
+  ++data.validation.split=test \
+  grpo.kondo.enabled=0
+
+Groupfix command delta
+- Same command as baseline, but replace the last line with:
+
+  grpo.kondo.enabled=1 \
+  grpo.kondo.mode=stochastic_response_rows \
+  grpo.kondo.target_backward_token_fraction=0.7 \
+  grpo.kondo.priority_mode=split_dual_tempered_delight \
+  grpo.kondo.surprisal_temperature=0.1 \
+  grpo.kondo.positive_keep_floor=0.95 \
+  grpo.kondo.negative_keep_floor=0.25 \
+  grpo.kondo.min_keep_probability=0.05 \
+  grpo.kondo.bypass_on_nonfinite=true
+
+What to archive
+- Full log dirs for every run
+- All train_data_step*.jsonl
+- All val_data_step*.jsonl
+- TensorBoard event files
+- Exact command.txt per run
+
+What to report back
+- Per-seed final GSM8K test reward_mean
+- Mean final reward_mean across seeds
+- Validation curves at every saved checkpoint
+- Mean policy_training wall time
+- Mean actual backward fraction for groupfix
+- Mean realized compute skip for groupfix
+- Win/loss count by seed
+- Whether the method still shows mid-horizon lead and any late-horizon fade
+
+Decision rule
+- This validation is a success only if groupfix keeps a real compute reduction and remains competitive at long horizon.
+- If it only works by drifting back toward dense training, reject it as a Kondo result.
