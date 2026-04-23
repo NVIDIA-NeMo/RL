@@ -30,6 +30,37 @@ Required environment
   - NEMO_RL_PY_EXECUTABLES_SYSTEM=1
 - Use the checked-in NeMo-RL worktree directly; do not mix with an older wheel or another patched copy.
 
+Repo and handoff context
+- Repository:
+  - NeMo-RL fork on branch `codex/kondo-v2-neomorl`
+- Suggested server worktree:
+  - clone or checkout this exact branch into a dedicated worktree
+- Do not run from:
+  - an older archived worktree
+  - a wheel install
+  - or an uncommitted scratch copy
+- Keep these files in sync with the tested branch state:
+  - `nemo_rl/algorithms/kondo.py`
+  - `nemo_rl/algorithms/grpo.py`
+  - `nemo_rl/algorithms/loss/loss_functions.py`
+  - `nemo_rl/utils/venvs.py`
+  - `examples/configs/grpo_math_1B.yaml`
+  - `tests/unit/algorithms/test_kondo.py`
+- Current hot-path modes are intentionally narrow:
+  - `off`
+  - `dense_reference`
+  - `stochastic_response_rows`
+- Do not reopen the old routed/oracle/block mode family during server validation.
+
+What the next agent should know
+- The current method under test is usually referred to as `groupfix`.
+- It is a prompt-group-atomic stochastic Kondo variant.
+- It is designed to preserve real row/group-level compute skip before `policy.train(...)`.
+- It is not a token-sparse executor inside kept rows.
+- The primary measured success criterion is:
+  - better long-horizon quality than baseline at roughly the same expected Kondo budget
+  - without giving back the compute savings
+
 Run matrix
 - Minimum:
   - seeds 42, 43, 44
@@ -120,6 +151,13 @@ What to archive
 - All val_data_step*.jsonl
 - TensorBoard event files
 - Exact command.txt per run
+- A short run manifest:
+  - repo commit
+  - branch
+  - server type
+  - GPU type/count
+  - seed list
+  - exact command template used
 
 What to report back
 - Per-seed final GSM8K test reward_mean
@@ -130,6 +168,47 @@ What to report back
 - Mean realized compute skip for groupfix
 - Win/loss count by seed
 - Whether the method still shows mid-horizon lead and any late-horizon fade
+- Exact git commit hash used on the server
+
+What to monitor during long runs
+- Training health:
+  - does the run continue to emit `train_data_step*.jsonl` and `val_data_step*.jsonl` on schedule
+  - does `policy_training` time stay in the expected band
+- Kondo budget behavior:
+  - mean actual backward fraction
+  - realized compute skip
+  - whether the budget silently drifts upward late
+- Horizon behavior:
+  - whether groupfix leads in the middle then fades late
+  - whether baseline shows its own late instability on any seed
+- Stability pathologies:
+  - all-zero-actor batches
+  - empty sparse selections
+  - any silent dense fail-open behavior
+  - whether zero-actor groups are being systematically dropped in mixed late-phase batches
+- Environment regressions:
+  - worker bootstrap failures
+  - uv/runtime-env resolution failures
+  - accidental re-enabling of sequence packing
+
+Known caveats in the current implementation
+- The proposer is teacher-coverage-shaped, but the stochastic executor still updates full kept rows.
+- Group sampling is atomic and budgeted in expectation, not exact-budget deterministic.
+- The sparse path still needs close scrutiny on:
+  - zero-actor prompt-group handling
+  - KL accounting on sparse steps
+  - late-horizon proposer bias
+- Server validation should measure these behaviors; it should not silently patch around them mid-run.
+
+What not to change during validation
+- Do not retune:
+  - `target_backward_token_fraction`
+  - `positive_keep_floor`
+  - `negative_keep_floor`
+  - `min_keep_probability`
+  - or the proposer mode
+- Do not switch model, dataset, or runtime path inside a comparison tranche.
+- If a run fails, fix the operational issue first and restart the same recipe; do not quietly alter the experiment.
 
 Decision rule
 - This validation is a success only if groupfix keeps a real compute reduction and remains competitive at long horizon.
