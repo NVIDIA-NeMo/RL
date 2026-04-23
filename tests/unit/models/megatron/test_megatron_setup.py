@@ -255,19 +255,18 @@ class TestValidateModelPaths:
         with pytest.raises(FileNotFoundError, match="run_config.yaml"):
             validate_model_paths(config)
 
-    def test_pretrained_checkpoint_megatron_lm_not_yet_converted(self, tmp_path):
-        """megatron_lm format: returns output_path and exists=False before conversion."""
+    def test_pretrained_checkpoint_megatron_lm_returns_path_directly(self, tmp_path):
+        """megatron_lm format: returns the provided path directly, always exists=True."""
         from nemo_rl.models.megatron.setup import validate_model_paths
 
-        mlm_iter_path = tmp_path / "my_mlm_ckpt" / "iter_0005000"
-        mlm_iter_path.mkdir(parents=True)
-        output_path = tmp_path / "bridge_ckpt"
+        mlm_root = tmp_path / "my_mlm_ckpt"
+        mlm_root.mkdir(parents=True)
+        (mlm_root / "iter_0005000").mkdir()
 
         config = {
             "model_name": "meta-llama/Llama-3.2-1B",
             "pretrained_checkpoint": {
-                "path": str(mlm_iter_path),
-                "output_path": str(output_path),
+                "path": str(mlm_root),
                 "format": "megatron_lm",
             },
         }
@@ -277,47 +276,47 @@ class TestValidateModelPaths:
         )
 
         assert hf_model_name == "meta-llama/Llama-3.2-1B"
-        assert pretrained_path == str(output_path)
-        assert pt_checkpoint_exists is False
-
-    def test_pretrained_checkpoint_megatron_lm_already_converted(self, tmp_path):
-        """megatron_lm format: returns exists=True when output_path/iter_0000000 exists."""
-        from nemo_rl.models.megatron.setup import validate_model_paths
-
-        mlm_iter_path = tmp_path / "my_mlm_ckpt" / "iter_0005000"
-        mlm_iter_path.mkdir(parents=True)
-        output_path = tmp_path / "bridge_ckpt"
-        (output_path / "iter_0000000").mkdir(parents=True)
-
-        config = {
-            "model_name": "meta-llama/Llama-3.2-1B",
-            "pretrained_checkpoint": {
-                "path": str(mlm_iter_path),
-                "output_path": str(output_path),
-                "format": "megatron_lm",
-            },
-        }
-
-        _, _, pt_checkpoint_exists = validate_model_paths(config)
-
+        assert pretrained_path == str(mlm_root)
         assert pt_checkpoint_exists is True
 
-    def test_pretrained_checkpoint_megatron_lm_missing_output_path_raises(self, tmp_path):
-        """megatron_lm format: raises ValueError when output_path is not provided."""
+    def test_pretrained_checkpoint_megatron_lm_iter_dir_returns_path_directly(
+        self, tmp_path
+    ):
+        """megatron_lm format: an explicit iter dir is returned as-is, exists=True."""
         from nemo_rl.models.megatron.setup import validate_model_paths
 
-        mlm_iter_path = tmp_path / "my_mlm_ckpt" / "iter_0005000"
-        mlm_iter_path.mkdir(parents=True)
+        mlm_iter = tmp_path / "my_mlm_ckpt" / "iter_0005000"
+        mlm_iter.mkdir(parents=True)
 
         config = {
             "model_name": "meta-llama/Llama-3.2-1B",
             "pretrained_checkpoint": {
-                "path": str(mlm_iter_path),
+                "path": str(mlm_iter),
                 "format": "megatron_lm",
             },
         }
 
-        with pytest.raises(ValueError, match="output_path is required"):
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        assert pretrained_path == str(mlm_iter)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_lm_missing_path_raises(self, tmp_path):
+        """megatron_lm format: raises FileNotFoundError when path does not exist."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(tmp_path / "nonexistent"),
+                "format": "megatron_lm",
+            },
+        }
+
+        with pytest.raises(FileNotFoundError):
             validate_model_paths(config)
 
     def test_pretrained_checkpoint_unknown_format_raises(self, tmp_path):
@@ -1630,80 +1629,3 @@ class TestDraftSetup:
         )
 
 
-@pytest.mark.mcore
-class TestImportModelFromMlm:
-    """Tests for import_model_from_mlm symlink logic."""
-
-    @patch("nemo_rl.models.megatron.community_import.AutoBridge")
-    @patch("nemo_rl.models.megatron.community_import._write_bridge_metadata")
-    @patch("transformers.AutoConfig.from_pretrained")
-    def test_root_dir_descends_into_latest_iter(
-        self, mock_auto_config, mock_write_meta, mock_auto_bridge, tmp_path
-    ):
-        """When path is a checkpoint root, the latest iter_* subdir is used for symlinking."""
-        from nemo_rl.models.megatron.community_import import import_model_from_mlm
-
-        # Build a fake MLM checkpoint root with two iteration dirs and a weight file
-        mlm_root = tmp_path / "mlm_ckpt"
-        iter_old = mlm_root / "iter_0000000"
-        iter_new = mlm_root / "iter_0005000"
-        for d in (iter_old, iter_new):
-            d.mkdir(parents=True)
-            (d / "tp_rank_00_pp_rank_00").mkdir()
-            (d / "tp_rank_00_pp_rank_00" / "model_optim_rng.pt").write_text("weight")
-        (mlm_root / "latest_checkpointed_iteration.txt").write_text("5000")
-
-        output_path = tmp_path / "bridge_ckpt"
-        mock_auto_bridge.from_hf_config.return_value.to_megatron_provider.return_value = (
-            MagicMock()
-        )
-
-        import_model_from_mlm(
-            hf_model_name="meta-llama/Llama-3.2-1B",
-            mlm_iter_path=str(mlm_root),
-            output_path=str(output_path),
-        )
-
-        dest_iter_dir = output_path / "iter_0000000"
-        assert dest_iter_dir.is_dir()
-        # The symlink should point into iter_0005000 (latest), not be a link to iter_0005000
-        rank_link = dest_iter_dir / "tp_rank_00_pp_rank_00"
-        assert rank_link.is_symlink()
-        assert os.path.realpath(str(rank_link)) == os.path.realpath(
-            str(iter_new / "tp_rank_00_pp_rank_00")
-        )
-        # No nested iter_* directory should exist inside dest_iter_dir
-        assert not (dest_iter_dir / "iter_0005000").exists()
-        assert not (dest_iter_dir / "iter_0000000").exists()
-
-    @patch("nemo_rl.models.megatron.community_import.AutoBridge")
-    @patch("nemo_rl.models.megatron.community_import._write_bridge_metadata")
-    @patch("transformers.AutoConfig.from_pretrained")
-    def test_iter_dir_used_directly(
-        self, mock_auto_config, mock_write_meta, mock_auto_bridge, tmp_path
-    ):
-        """When path is already an iteration directory, it is used directly."""
-        from nemo_rl.models.megatron.community_import import import_model_from_mlm
-
-        mlm_iter = tmp_path / "mlm_ckpt" / "iter_0005000"
-        mlm_iter.mkdir(parents=True)
-        (mlm_iter / "tp_rank_00_pp_rank_00").mkdir()
-        (mlm_iter / "tp_rank_00_pp_rank_00" / "model_optim_rng.pt").write_text("weight")
-
-        output_path = tmp_path / "bridge_ckpt"
-        mock_auto_bridge.from_hf_config.return_value.to_megatron_provider.return_value = (
-            MagicMock()
-        )
-
-        import_model_from_mlm(
-            hf_model_name="meta-llama/Llama-3.2-1B",
-            mlm_iter_path=str(mlm_iter),
-            output_path=str(output_path),
-        )
-
-        dest_iter_dir = output_path / "iter_0000000"
-        rank_link = dest_iter_dir / "tp_rank_00_pp_rank_00"
-        assert rank_link.is_symlink()
-        assert os.path.realpath(str(rank_link)) == os.path.realpath(
-            str(mlm_iter / "tp_rank_00_pp_rank_00")
-        )

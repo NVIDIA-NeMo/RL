@@ -13,80 +13,11 @@
 # limitations under the License.
 
 import os
-import shutil
 from typing import Any, Optional
 
 from megatron.bridge import AutoBridge
 
 from nemo_rl.models.policy import MegatronConfig
-
-# Bridge metadata filenames that live inside an iter_* directory alongside weights.
-# When symlinking weights we skip these so fresh metadata can be written in their place.
-_BRIDGE_METADATA_FILES = frozenset({"run_config.yaml", "train_state.pt"})
-
-
-def _write_bridge_metadata(
-    iter_dir: str,
-    root_dir: str,
-    model_provider,
-) -> None:
-    """Write bridge checkpoint metadata files without touching the weight shards.
-
-    Writes run_config.yaml and train_state.pt into iter_dir, and
-    latest_train_state.pt / latest_checkpointed_iteration.txt into root_dir.
-    """
-    import torch
-    from megatron.bridge.training.config import (
-        CheckpointConfig,
-        ConfigContainer,
-        LoggerConfig,
-    )
-    from megatron.bridge.training.state import GlobalState, TrainState
-    from megatron.bridge.training.utils.checkpoint_utils import (
-        TRACKER_PREFIX,
-        get_checkpoint_run_config_filename,
-        get_checkpoint_tracker_filename,
-        get_checkpoint_train_state_filename,
-    )
-    from megatron.core.optimizer import OptimizerConfig
-
-    state = GlobalState()
-    state.cfg = ConfigContainer(
-        model=model_provider,
-        train=None,
-        optimizer=OptimizerConfig(use_distributed_optimizer=False),
-        ddp=None,
-        scheduler=None,
-        dataset=None,
-        logger=LoggerConfig(),
-        tokenizer=None,
-        checkpoint=CheckpointConfig(
-            async_save=False,
-            save=str(root_dir),
-            save_optim=False,
-            save_rng=False,
-            ckpt_format="torch_dist",
-            dist_ckpt_optim_fully_reshardable=True,
-        ),
-        dist=None,
-    )
-
-    train_state = TrainState()
-    train_state_dict = train_state.state_dict()
-    train_state_dict["floating_point_operations_so_far"] = torch.tensor(
-        0, dtype=torch.float32
-    )
-
-    os.makedirs(iter_dir, exist_ok=True)
-    state.cfg.to_yaml(get_checkpoint_run_config_filename(iter_dir))
-    train_state_local = get_checkpoint_train_state_filename(iter_dir)
-    torch.save(train_state_dict, train_state_local)
-    shutil.copy(
-        train_state_local,
-        get_checkpoint_train_state_filename(root_dir, prefix=TRACKER_PREFIX),
-    )
-    with open(get_checkpoint_tracker_filename(root_dir), "w") as f:
-        f.write("0")
 
 
 def import_model_from_hf_name(
@@ -179,84 +110,6 @@ def import_model_from_hf_name(
     import megatron.core.rerun_state_machine
 
     megatron.core.rerun_state_machine.destroy_rerun_state_machine()
-
-
-def import_model_from_mlm(
-    hf_model_name: str,
-    mlm_iter_path: str,
-    output_path: str,
-    megatron_config: Optional[MegatronConfig] = None,
-) -> None:
-    """Import a Megatron-LM checkpoint into Megatron-Bridge format.
-
-    Creates ``output_path`` with symlinks to the source weight files and writes
-    the bridge metadata files (run_config.yaml, train_state.pt) needed by
-    NeMo-RL, without copying the weight shards.
-
-    Args:
-        hf_model_name: HuggingFace model ID or local path used to obtain the
-            model architecture config (e.g. ``'meta-llama/Llama-3.1-8B-Instruct'``).
-        mlm_iter_path: Path to a Megatron-LM checkpoint.  May be either the
-            checkpoint root directory (which contains ``iter_*`` subdirectories)
-            or a specific iteration directory (e.g. ``/checkpoints/iter_0005000/``).
-            When a root directory is supplied the latest ``iter_*`` subdirectory
-            is used automatically.
-        output_path: Directory to write the Megatron-Bridge checkpoint.
-        megatron_config: Optional megatron config used to override model provider
-            settings (parallelism, fusion flags, etc.) before writing run_config.yaml.
-    """
-    from transformers import AutoConfig
-
-    hf_cfg = AutoConfig.from_pretrained(hf_model_name, trust_remote_code=True)
-    bridge = AutoBridge.from_hf_config(hf_cfg)
-    model_provider = bridge.to_megatron_provider(load_weights=False)
-    if megatron_config is not None:
-        model_provider.tensor_model_parallel_size = megatron_config[
-            "tensor_model_parallel_size"
-        ]
-        model_provider.pipeline_model_parallel_size = megatron_config[
-            "pipeline_model_parallel_size"
-        ]
-        model_provider.context_parallel_size = megatron_config["context_parallel_size"]
-        model_provider.expert_model_parallel_size = megatron_config[
-            "expert_model_parallel_size"
-        ]
-        model_provider.expert_tensor_parallel_size = megatron_config[
-            "expert_tensor_parallel_size"
-        ]
-        model_provider.num_layers_in_first_pipeline_stage = megatron_config[
-            "num_layers_in_first_pipeline_stage"
-        ]
-        model_provider.num_layers_in_last_pipeline_stage = megatron_config[
-            "num_layers_in_last_pipeline_stage"
-        ]
-        model_provider.pipeline_dtype = megatron_config["pipeline_dtype"]
-        model_provider.sequence_parallel = megatron_config["sequence_parallel"]
-        model_provider.gradient_accumulation_fusion = megatron_config[
-            "gradient_accumulation_fusion"
-        ]
-    model_provider.finalize()
-
-    # If mlm_iter_path is a checkpoint root (contains iter_* subdirs) rather than
-    # an iteration directory, descend into the latest iteration automatically.
-    iter_subdirs = sorted(
-        d
-        for d in os.listdir(mlm_iter_path)
-        if d.startswith("iter_") and os.path.isdir(os.path.join(mlm_iter_path, d))
-    )
-    if iter_subdirs:
-        mlm_iter_path = os.path.join(mlm_iter_path, iter_subdirs[-1])
-
-    dest_iter_dir = os.path.join(output_path, "iter_0000000")
-    os.makedirs(dest_iter_dir, exist_ok=True)
-    for name in os.listdir(mlm_iter_path):
-        if name in _BRIDGE_METADATA_FILES:
-            continue
-        os.symlink(
-            os.path.abspath(os.path.join(mlm_iter_path, name)),
-            os.path.join(dest_iter_dir, name),
-        )
-    _write_bridge_metadata(dest_iter_dir, output_path, model_provider)
 
 
 def export_model_from_megatron(
