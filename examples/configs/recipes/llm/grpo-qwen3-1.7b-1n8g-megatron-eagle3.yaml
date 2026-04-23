@@ -14,6 +14,7 @@ policy:
   model_name: Qwen/Qwen3-1.7B
   tokenizer:
     name: Qwen/Qwen3-1.7B
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen3_1p7b_pretrain_config
   optimizer: null
   megatron_cfg:
     enabled: true

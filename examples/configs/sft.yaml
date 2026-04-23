@@ -95,7 +95,8 @@ policy:
       # and fused to False
       foreach: False
       fused: False
-    
+      
+  megatron_recipe: megatron.bridge.recipes.llama.llama32_1b_pretrain_config
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false

@@ -93,6 +93,7 @@ policy:
     custom_parallel_plan: null
     clear_cache_every_n_steps: null
 
+  megatron_recipe: megatron.bridge.recipes.nemotronh.nemotron_nano_9b_v2_pretrain_config
   megatron_cfg:
     enabled: true
     bias_activation_fusion: false

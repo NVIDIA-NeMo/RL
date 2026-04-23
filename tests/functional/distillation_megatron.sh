@@ -25,7 +25,9 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     $PROJECT_ROOT/examples/run_distillation.py \
     --config $PROJECT_ROOT/examples/configs/distillation_math_megatron.yaml \
     policy.model_name=Qwen/Qwen3-0.6B-Base \
+    policy.megatron_recipe=megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config \
     teacher.model_name=Qwen/Qwen3-0.6B \
+    teacher.megatron_recipe=megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config \
     cluster.gpus_per_node=2 \
     policy.train_global_batch_size=16 \
     policy.megatron_cfg.tensor_model_parallel_size=1 \

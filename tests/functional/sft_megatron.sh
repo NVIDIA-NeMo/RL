@@ -24,6 +24,7 @@ cd $PROJECT_ROOT
 uv run $PROJECT_ROOT/examples/run_sft.py \
     --config $PROJECT_ROOT/examples/configs/recipes/llm/sft-llama3.1-8b-1n8g-megatron.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
+    policy.megatron_recipe=megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config \
     policy.tokenizer.name=Qwen/Qwen3-0.6B \
     cluster.gpus_per_node=2 \
     sft.max_num_steps=3 \

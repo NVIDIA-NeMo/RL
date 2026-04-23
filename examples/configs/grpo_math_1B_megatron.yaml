@@ -76,6 +76,7 @@ policy:
 
   optimizer: null # remove default FSDP optimizer
 
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen25_1p5b_pretrain_config
   megatron_cfg:
     enabled: true
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face

@@ -24,6 +24,7 @@ cd $PROJECT_ROOT
 uv run $PROJECT_ROOT/examples/run_dpo.py \
     --config $PROJECT_ROOT/examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-megatron.v2.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
+    policy.megatron_recipe=megatron.bridge.recipes.qwen.qwen3_600m_pretrain_config \
     dpo.max_num_steps=3 \
     dpo.val_batches=1 \
     dpo.val_period=3 \

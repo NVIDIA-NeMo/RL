@@ -5,6 +5,7 @@ policy:
   dynamic_batching:
     enabled: false
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  megatron_recipe: megatron.bridge.recipes.qwen.qwen25_7b_pretrain_config
   megatron_cfg:
     enabled: true
     peft:

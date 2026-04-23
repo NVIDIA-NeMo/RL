@@ -330,6 +330,11 @@ class PolicyConfig(TypedDict):
     precision: str
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
+    # Fully qualified Python import path to a Megatron-Bridge recipe function.
+    # When set, the recipe is loaded at runtime to provide the base model configuration.
+    # When null/unset, configuration is loaded from the checkpoint's run_config.yaml.
+    # Example: "megatron.bridge.recipes.llama.llama31_8b_pretrain_config"
+    megatron_recipe: NotRequired[str | None]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
     draft: NotRequired[DraftConfig | DraftConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]

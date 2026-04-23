@@ -17,6 +17,7 @@ policy:
   make_sequence_length_divisible_by: 1
   dtensor_cfg:
     enabled: false
+  megatron_recipe: megatron.bridge.recipes.llama.llama31_8b_pretrain_config
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
@@ -52,3 +53,4 @@ logger:
 cluster:
   gpus_per_node: 8
   num_nodes: 2
+
