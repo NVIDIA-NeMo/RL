@@ -15,12 +15,12 @@
 #   launch.runMode      batch          — CLI returns after Ray accepts the job.
 #   launch.codeSource   image          — no working_dir upload.
 #   launch.codePath     /opt/nemo-rl   — RL repo served off the shared FSx
-#                                        Lustre PVC at subPath=hemild/rl-k8s.
+#                                        Lustre PVC at subPath=${user:}/rl-k8s.
 # Edits on Lustre take effect without rebuilding the image.
 #
 # Prereqs (onboarding §3–§5 already applied in `default`):
 #   - rl-workspace PVC bound (shared FSx Lustre, 2.4 TiB, RWX).
-#   - /mnt/rl-workspace/hemild/rl-k8s contains a git checkout of
+#   - /mnt/rl-workspace/${user:}/rl-k8s contains a git checkout of
 #     https://github.com/NVIDIA-NeMo/RL on branch hemil/k8s-infra-cp.
 #   - nvcr-secret, wandb-api-key, nemo-rl-endpoint-registry all present.
 #   - ResourceClaimTemplates compute-domain-qwen3-30b-math and
@@ -45,7 +45,7 @@ _shared:
   workerNodeSelector: &worker_node_selector
     nvidia.com/gpu.product: NVIDIA-GB300
   headEnv: &shared_head_env
-    - {name: HF_HOME,                        value: /mnt/rl-workspace/hemild/hf-cache}
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
     - {name: HF_HUB_OFFLINE,                 value: "1"}
     - {name: TRANSFORMERS_OFFLINE,           value: "1"}
     - {name: NCCL_DEBUG,                     value: WARN}
@@ -56,7 +56,7 @@ _shared:
           name: wandb-api-key
           key: WANDB_API_KEY
   workerEnv: &shared_worker_env
-    - {name: HF_HOME,                        value: /mnt/rl-workspace/hemild/hf-cache}
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
     - {name: HF_HUB_OFFLINE,                 value: "1"}
     - {name: TRANSFORMERS_OFFLINE,           value: "1"}
     - {name: NCCL_DEBUG,                     value: WARN}
@@ -83,11 +83,11 @@ _shared:
     - {containerPort: 6379,  name: gcs-server}
     - {containerPort: 8265,  name: dashboard}
     - {containerPort: 10001, name: client}
-  # Lustre PVC at /opt/nemo-rl (subPath hemild/rl-k8s) for code; at
+  # Lustre PVC at /opt/nemo-rl (subPath ${user:}/rl-k8s) for code; at
   # /mnt/rl-workspace (no subPath) for datasets, checkpoints, HF cache.
   codeMounts: &code_mounts
     - {mountPath: /dev/shm, name: dshm}
-    - {mountPath: /opt/nemo-rl, name: rl-workspace, subPath: hemild/rl-k8s}
+    - {mountPath: /opt/nemo-rl, name: rl-workspace, subPath: "${user:}/rl-k8s"}
     - {mountPath: /mnt/rl-workspace, name: rl-workspace}
   headVolumes: &head_volumes
     - name: dshm
