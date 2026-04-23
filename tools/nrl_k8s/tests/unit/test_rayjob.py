@@ -119,11 +119,11 @@ class TestLabels:
         got = build_rayjob_manifest(
             cluster, infra, entrypoint="x", extra_labels={"run-id": "r-1"}
         )
-        assert got["metadata"]["labels"] == {
-            "role": "training",
-            "team": "rl",
-            "run-id": "r-1",
-        }
+        labels = got["metadata"]["labels"]
+        assert labels["role"] == "training"
+        assert labels["team"] == "rl"
+        assert labels["run-id"] == "r-1"
+        assert labels["app.kubernetes.io/managed-by"] == "nrl-k8s"
 
     def test_extra_labels_win_on_collision(self) -> None:
         cluster = _make_cluster(labels={"team": "cluster"})
@@ -133,11 +133,11 @@ class TestLabels:
         )
         assert got["metadata"]["labels"]["team"] == "extra"
 
-    def test_no_labels_key_when_empty(self) -> None:
+    def test_managed_by_label_always_present(self) -> None:
         got = build_rayjob_manifest(
             _make_cluster(), _make_infra(), entrypoint="x"
         )
-        assert "labels" not in got["metadata"]
+        assert got["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "nrl-k8s"
 
 
 class TestImmutability:

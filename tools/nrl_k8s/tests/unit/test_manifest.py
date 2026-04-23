@@ -64,17 +64,20 @@ class TestEnvelope:
         cluster = _make_cluster(labels={"role": "training"})
         infra = _make_infra(labels={"team": "rl"})
         got = build_raycluster_manifest(cluster, infra)
-        assert got["metadata"]["labels"] == {"role": "training", "team": "rl"}
+        labels = got["metadata"]["labels"]
+        assert labels["role"] == "training"
+        assert labels["team"] == "rl"
+        assert labels["app.kubernetes.io/managed-by"] == "nrl-k8s"
 
     def test_cluster_labels_win_on_collision(self) -> None:
         cluster = _make_cluster(labels={"team": "override"})
         infra = _make_infra(labels={"team": "rl"})
         got = build_raycluster_manifest(cluster, infra)
-        assert got["metadata"]["labels"] == {"team": "override"}
+        assert got["metadata"]["labels"]["team"] == "override"
 
-    def test_no_labels_key_when_empty(self) -> None:
+    def test_managed_by_label_always_present(self) -> None:
         got = build_raycluster_manifest(_make_cluster(), _make_infra())
-        assert "labels" not in got["metadata"]
+        assert got["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "nrl-k8s"
 
 
 # =============================================================================

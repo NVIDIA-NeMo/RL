@@ -495,7 +495,11 @@ def create_or_update_secret(
     except ApiException as exc:
         if exc.status == 404:
             secret = client.V1Secret(
-                metadata=client.V1ObjectMeta(name=name, namespace=namespace),
+                metadata=client.V1ObjectMeta(
+                    name=name,
+                    namespace=namespace,
+                    labels={"app.kubernetes.io/managed-by": "nrl-k8s"},
+                ),
                 type="Opaque",
                 data=encoded,
             )

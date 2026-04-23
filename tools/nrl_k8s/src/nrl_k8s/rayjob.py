@@ -73,7 +73,9 @@ def build_rayjob_manifest(
         "name": job_name,
         "namespace": infra.namespace,
     }
-    merged_labels = {**infra.labels, **cluster.labels, **(extra_labels or {})}
+    from .manifest import _MANAGED_BY_LABEL
+
+    merged_labels = {**_MANAGED_BY_LABEL, **infra.labels, **cluster.labels, **(extra_labels or {})}
     if merged_labels:
         metadata["labels"] = merged_labels
     merged_annotations = {**infra.annotations, **cluster.annotations}

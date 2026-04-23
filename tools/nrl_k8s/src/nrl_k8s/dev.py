@@ -35,6 +35,7 @@ def build_dev_pod_manifest(
             "name": pod_name,
             "namespace": namespace,
             "labels": {
+                "app.kubernetes.io/managed-by": "nrl-k8s",
                 "nrl-k8s/owner": username,
                 "nrl-k8s/component": "dev-pod",
             },

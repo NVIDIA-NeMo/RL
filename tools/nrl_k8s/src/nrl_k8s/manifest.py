@@ -18,6 +18,11 @@ from typing import Any
 
 from .schema import ClusterSpec, InfraConfig
 
+# Every resource the CLI creates carries this label so admins can find
+# orphans not managed by the tool:
+#   kubectl get rayclusters -l '!app.kubernetes.io/managed-by'
+_MANAGED_BY_LABEL = {"app.kubernetes.io/managed-by": "nrl-k8s"}
+
 # =============================================================================
 # Public API
 # =============================================================================
@@ -60,7 +65,7 @@ def build_raycluster_manifest(
         "name": cluster.name,
         "namespace": infra.namespace,
     }
-    labels = {**infra.labels, **cluster.labels}
+    labels = {**_MANAGED_BY_LABEL, **infra.labels, **cluster.labels}
     annotations = {**infra.annotations, **cluster.annotations}
     if labels:
         metadata["labels"] = labels
@@ -168,7 +173,7 @@ def build_compute_domain_manifest(name: str, namespace: str) -> dict[str, Any]:
     return {
         "apiVersion": "resource.nvidia.com/v1beta1",
         "kind": "ComputeDomain",
-        "metadata": {"name": name, "namespace": namespace},
+        "metadata": {"name": name, "namespace": namespace, "labels": {**_MANAGED_BY_LABEL}},
         "spec": {
             "channel": {"resourceClaimTemplate": {"name": name}},
             "numNodes": 0,
@@ -181,7 +186,7 @@ def build_roce_template_manifest(name: str, namespace: str) -> dict[str, Any]:
     return {
         "apiVersion": "resource.k8s.io/v1",
         "kind": "ResourceClaimTemplate",
-        "metadata": {"name": name, "namespace": namespace},
+        "metadata": {"name": name, "namespace": namespace, "labels": {**_MANAGED_BY_LABEL}},
         "spec": {
             "spec": {
                 "devices": {
