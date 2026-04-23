@@ -282,24 +282,45 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
 
     if pretrained_ckpt is not None:
         fmt = pretrained_ckpt["format"]
-        hf_model_name = pretrained_ckpt["hf_model_name"]
+        hf_model_name = config["model_name"]
 
         if fmt == "megatron_bridge":
             path = pretrained_ckpt["path"]
-            # For megatron_bridge, path must be the specific iteration directory
-            # (e.g. /checkpoints/iter_0005000/).  We verify this by checking for
-            # run_config.yaml, which is the authoritative marker of a valid
-            # megatron-bridge checkpoint iteration directory.
+            # Check if path is already a valid iter dir (contains run_config.yaml).
             run_config = os.path.join(path, "run_config.yaml")
-            if not os.path.exists(run_config):
-                raise FileNotFoundError(
-                    f"pretrained_checkpoint.path={path!r} does not contain "
-                    f"run_config.yaml.  For megatron_bridge format, path must "
-                    f"point to a specific iteration directory "
-                    f"(e.g. /checkpoints/iter_0005000/), not the checkpoint root."
+            if os.path.exists(run_config):
+                return hf_model_name, path, True
+
+            # Not a direct iter dir — check if it's a checkpoint root that contains
+            # iter_* subdirectories and resolve to the latest one automatically.
+            try:
+                iter_subdirs = sorted(
+                    d
+                    for d in os.listdir(path)
+                    if d.startswith("iter_") and os.path.isdir(os.path.join(path, d))
                 )
-            # The checkpoint is already in the required format; nothing to convert.
-            return hf_model_name, path, True
+            except (FileNotFoundError, NotADirectoryError):
+                iter_subdirs = []
+
+            if iter_subdirs:
+                resolved = os.path.join(path, iter_subdirs[-1])
+                run_config = os.path.join(resolved, "run_config.yaml")
+                if not os.path.exists(run_config):
+                    raise FileNotFoundError(
+                        f"pretrained_checkpoint.path={path!r}: resolved to iteration "
+                        f"directory {resolved!r} but it does not contain "
+                        f"run_config.yaml.  This does not appear to be a valid "
+                        f"megatron-bridge checkpoint."
+                    )
+                return hf_model_name, resolved, True
+
+            raise FileNotFoundError(
+                f"pretrained_checkpoint.path={path!r} does not contain "
+                f"run_config.yaml and has no iter_* subdirectories.  For "
+                f"megatron_bridge format, path must point to either a specific "
+                f"iteration directory (e.g. /checkpoints/iter_0005000/) or a "
+                f"checkpoint root directory containing iter_* subdirectories."
+            )
 
         elif fmt == "megatron_lm":
             mlm_iter_path = pretrained_ckpt["path"]
@@ -307,7 +328,8 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
                 raise FileNotFoundError(
                     f"pretrained_checkpoint.path={mlm_iter_path!r} does not exist or "
                     f"is not a directory.  For megatron_lm format, path must point to "
-                    f"a specific iteration directory (e.g. /checkpoints/iter_0005000/)."
+                    f"either the checkpoint root directory (containing iter_* subdirs) "
+                    f"or a specific iteration directory (e.g. /checkpoints/iter_0005000/)."
                 )
             pretrained_path = pretrained_ckpt.get("output_path")
             if not pretrained_path:

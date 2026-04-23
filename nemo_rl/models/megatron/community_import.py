@@ -196,17 +196,56 @@ def import_model_from_mlm(
     Args:
         hf_model_name: HuggingFace model ID or local path used to obtain the
             model architecture config (e.g. ``'meta-llama/Llama-3.1-8B-Instruct'``).
-        mlm_iter_path: Path to a specific Megatron-LM checkpoint iteration
-            directory (e.g. ``/checkpoints/iter_0005000/``).
+        mlm_iter_path: Path to a Megatron-LM checkpoint.  May be either the
+            checkpoint root directory (which contains ``iter_*`` subdirectories)
+            or a specific iteration directory (e.g. ``/checkpoints/iter_0005000/``).
+            When a root directory is supplied the latest ``iter_*`` subdirectory
+            is used automatically.
         output_path: Directory to write the Megatron-Bridge checkpoint.
-        megatron_config: Unused.  Kept for API compatibility.
+        megatron_config: Optional megatron config used to override model provider
+            settings (parallelism, fusion flags, etc.) before writing run_config.yaml.
     """
     from transformers import AutoConfig
 
     hf_cfg = AutoConfig.from_pretrained(hf_model_name, trust_remote_code=True)
     bridge = AutoBridge.from_hf_config(hf_cfg)
     model_provider = bridge.to_megatron_provider(load_weights=False)
+    if megatron_config is not None:
+        model_provider.tensor_model_parallel_size = megatron_config[
+            "tensor_model_parallel_size"
+        ]
+        model_provider.pipeline_model_parallel_size = megatron_config[
+            "pipeline_model_parallel_size"
+        ]
+        model_provider.context_parallel_size = megatron_config["context_parallel_size"]
+        model_provider.expert_model_parallel_size = megatron_config[
+            "expert_model_parallel_size"
+        ]
+        model_provider.expert_tensor_parallel_size = megatron_config[
+            "expert_tensor_parallel_size"
+        ]
+        model_provider.num_layers_in_first_pipeline_stage = megatron_config[
+            "num_layers_in_first_pipeline_stage"
+        ]
+        model_provider.num_layers_in_last_pipeline_stage = megatron_config[
+            "num_layers_in_last_pipeline_stage"
+        ]
+        model_provider.pipeline_dtype = megatron_config["pipeline_dtype"]
+        model_provider.sequence_parallel = megatron_config["sequence_parallel"]
+        model_provider.gradient_accumulation_fusion = megatron_config[
+            "gradient_accumulation_fusion"
+        ]
     model_provider.finalize()
+
+    # If mlm_iter_path is a checkpoint root (contains iter_* subdirs) rather than
+    # an iteration directory, descend into the latest iteration automatically.
+    iter_subdirs = sorted(
+        d
+        for d in os.listdir(mlm_iter_path)
+        if d.startswith("iter_") and os.path.isdir(os.path.join(mlm_iter_path, d))
+    )
+    if iter_subdirs:
+        mlm_iter_path = os.path.join(mlm_iter_path, iter_subdirs[-1])
 
     dest_iter_dir = os.path.join(output_path, "iter_0000000")
     os.makedirs(dest_iter_dir, exist_ok=True)

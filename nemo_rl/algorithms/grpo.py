@@ -241,6 +241,11 @@ def setup(
 
     # Extract individual configs for easier access
     policy_config = master_config["policy"]
+    checkpointing_pretrained = master_config.get("checkpointing", {}).get(
+        "pretrained_checkpoint"
+    )
+    if checkpointing_pretrained is not None:
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
     generation_config = master_config["policy"]["generation"]
     env_configs = master_config["env"]
     loss_config = master_config["loss_fn"]

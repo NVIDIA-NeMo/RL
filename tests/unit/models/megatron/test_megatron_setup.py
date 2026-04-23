@@ -24,6 +24,7 @@ nemo_rl.models.megatron.setup, focusing on:
 - Model path validation
 """
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -146,7 +147,6 @@ class TestValidateModelPaths:
             "pretrained_checkpoint": {
                 "path": str(iter_dir),
                 "format": "megatron_bridge",
-                "hf_model_name": "meta-llama/Llama-3.2-1B",
             },
         }
 
@@ -159,8 +159,10 @@ class TestValidateModelPaths:
         assert pretrained_path == str(iter_dir)
         assert pt_checkpoint_exists is True
 
-    def test_pretrained_checkpoint_megatron_bridge_uses_hf_model_name(self, tmp_path):
-        """megatron_bridge format: hf_model_name from pretrained_checkpoint is returned."""
+    def test_pretrained_checkpoint_megatron_bridge_uses_policy_model_name(
+        self, tmp_path
+    ):
+        """megatron_bridge format: hf_model_name is inferred from policy.model_name."""
         from nemo_rl.models.megatron.setup import validate_model_paths
 
         iter_dir = tmp_path / "checkpoints" / "iter_0000000"
@@ -168,18 +170,69 @@ class TestValidateModelPaths:
         (iter_dir / "run_config.yaml").touch()
 
         config = {
-            "model_name": "some-other-name",
+            "model_name": "meta-llama/Llama-3.2-1B",
             "pretrained_checkpoint": {
                 "path": str(iter_dir),
                 "format": "megatron_bridge",
-                "hf_model_name": "meta-llama/Llama-3.2-1B",
             },
         }
 
         hf_model_name, _, _ = validate_model_paths(config)
 
-        # hf_model_name comes from pretrained_checkpoint, not model_name
+        # hf_model_name is inferred from policy.model_name
         assert hf_model_name == "meta-llama/Llama-3.2-1B"
+
+    def test_pretrained_checkpoint_megatron_bridge_root_dir_resolves_to_latest_iter(
+        self, tmp_path
+    ):
+        """megatron_bridge format: root dir with iter_* subdirs resolves to the latest iter."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        ckpt_root = tmp_path / "mbridge_ckpt"
+        iter_old = ckpt_root / "iter_0000000"
+        iter_new = ckpt_root / "iter_0010000"
+        for d in (iter_old, iter_new):
+            d.mkdir(parents=True)
+            (d / "run_config.yaml").touch()
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(ckpt_root),
+                "format": "megatron_bridge",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        # Should resolve to the latest iter dir, not the root
+        assert pretrained_path == str(iter_new)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_bridge_root_dir_missing_run_config_raises(
+        self, tmp_path
+    ):
+        """megatron_bridge format: root dir whose iter subdir lacks run_config.yaml raises."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        ckpt_root = tmp_path / "mbridge_ckpt"
+        iter_dir = ckpt_root / "iter_0005000"
+        iter_dir.mkdir(parents=True)
+        # No run_config.yaml inside iter_dir
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(ckpt_root),
+                "format": "megatron_bridge",
+            },
+        }
+
+        with pytest.raises(FileNotFoundError, match="run_config.yaml"):
+            validate_model_paths(config)
 
     def test_pretrained_checkpoint_megatron_bridge_missing_run_config_raises(
         self, tmp_path
@@ -187,7 +240,7 @@ class TestValidateModelPaths:
         """megatron_bridge format: raises FileNotFoundError when run_config.yaml is absent."""
         from nemo_rl.models.megatron.setup import validate_model_paths
 
-        # Directory exists but has no run_config.yaml
+        # Directory exists but has no run_config.yaml and no iter_* subdirs
         iter_dir = tmp_path / "iter_0001000"
         iter_dir.mkdir()
 
@@ -196,7 +249,6 @@ class TestValidateModelPaths:
             "pretrained_checkpoint": {
                 "path": str(iter_dir),
                 "format": "megatron_bridge",
-                "hf_model_name": "meta-llama/Llama-3.2-1B",
             },
         }
 
@@ -217,7 +269,6 @@ class TestValidateModelPaths:
                 "path": str(mlm_iter_path),
                 "output_path": str(output_path),
                 "format": "megatron_lm",
-                "hf_model_name": "meta-llama/Llama-3.2-1B",
             },
         }
 
@@ -244,7 +295,6 @@ class TestValidateModelPaths:
                 "path": str(mlm_iter_path),
                 "output_path": str(output_path),
                 "format": "megatron_lm",
-                "hf_model_name": "meta-llama/Llama-3.2-1B",
             },
         }
 
@@ -264,7 +314,6 @@ class TestValidateModelPaths:
             "pretrained_checkpoint": {
                 "path": str(mlm_iter_path),
                 "format": "megatron_lm",
-                "hf_model_name": "meta-llama/Llama-3.2-1B",
             },
         }
 
@@ -280,7 +329,6 @@ class TestValidateModelPaths:
             "pretrained_checkpoint": {
                 "path": str(tmp_path),
                 "format": "some_unknown_format",
-                "hf_model_name": "meta-llama/Llama-3.2-1B",
             },
         }
 
@@ -1579,4 +1627,83 @@ class TestDraftSetup:
         torch.testing.assert_close(
             restored_chunk.draft_model.weight,
             owner_chunk.draft_model.weight,
+        )
+
+
+@pytest.mark.mcore
+class TestImportModelFromMlm:
+    """Tests for import_model_from_mlm symlink logic."""
+
+    @patch("nemo_rl.models.megatron.community_import.AutoBridge")
+    @patch("nemo_rl.models.megatron.community_import._write_bridge_metadata")
+    @patch("transformers.AutoConfig.from_pretrained")
+    def test_root_dir_descends_into_latest_iter(
+        self, mock_auto_config, mock_write_meta, mock_auto_bridge, tmp_path
+    ):
+        """When path is a checkpoint root, the latest iter_* subdir is used for symlinking."""
+        from nemo_rl.models.megatron.community_import import import_model_from_mlm
+
+        # Build a fake MLM checkpoint root with two iteration dirs and a weight file
+        mlm_root = tmp_path / "mlm_ckpt"
+        iter_old = mlm_root / "iter_0000000"
+        iter_new = mlm_root / "iter_0005000"
+        for d in (iter_old, iter_new):
+            d.mkdir(parents=True)
+            (d / "tp_rank_00_pp_rank_00").mkdir()
+            (d / "tp_rank_00_pp_rank_00" / "model_optim_rng.pt").write_text("weight")
+        (mlm_root / "latest_checkpointed_iteration.txt").write_text("5000")
+
+        output_path = tmp_path / "bridge_ckpt"
+        mock_auto_bridge.from_hf_config.return_value.to_megatron_provider.return_value = (
+            MagicMock()
+        )
+
+        import_model_from_mlm(
+            hf_model_name="meta-llama/Llama-3.2-1B",
+            mlm_iter_path=str(mlm_root),
+            output_path=str(output_path),
+        )
+
+        dest_iter_dir = output_path / "iter_0000000"
+        assert dest_iter_dir.is_dir()
+        # The symlink should point into iter_0005000 (latest), not be a link to iter_0005000
+        rank_link = dest_iter_dir / "tp_rank_00_pp_rank_00"
+        assert rank_link.is_symlink()
+        assert os.path.realpath(str(rank_link)) == os.path.realpath(
+            str(iter_new / "tp_rank_00_pp_rank_00")
+        )
+        # No nested iter_* directory should exist inside dest_iter_dir
+        assert not (dest_iter_dir / "iter_0005000").exists()
+        assert not (dest_iter_dir / "iter_0000000").exists()
+
+    @patch("nemo_rl.models.megatron.community_import.AutoBridge")
+    @patch("nemo_rl.models.megatron.community_import._write_bridge_metadata")
+    @patch("transformers.AutoConfig.from_pretrained")
+    def test_iter_dir_used_directly(
+        self, mock_auto_config, mock_write_meta, mock_auto_bridge, tmp_path
+    ):
+        """When path is already an iteration directory, it is used directly."""
+        from nemo_rl.models.megatron.community_import import import_model_from_mlm
+
+        mlm_iter = tmp_path / "mlm_ckpt" / "iter_0005000"
+        mlm_iter.mkdir(parents=True)
+        (mlm_iter / "tp_rank_00_pp_rank_00").mkdir()
+        (mlm_iter / "tp_rank_00_pp_rank_00" / "model_optim_rng.pt").write_text("weight")
+
+        output_path = tmp_path / "bridge_ckpt"
+        mock_auto_bridge.from_hf_config.return_value.to_megatron_provider.return_value = (
+            MagicMock()
+        )
+
+        import_model_from_mlm(
+            hf_model_name="meta-llama/Llama-3.2-1B",
+            mlm_iter_path=str(mlm_iter),
+            output_path=str(output_path),
+        )
+
+        dest_iter_dir = output_path / "iter_0000000"
+        rank_link = dest_iter_dir / "tp_rank_00_pp_rank_00"
+        assert rank_link.is_symlink()
+        assert os.path.realpath(str(rank_link)) == os.path.realpath(
+            str(mlm_iter / "tp_rank_00_pp_rank_00")
         )

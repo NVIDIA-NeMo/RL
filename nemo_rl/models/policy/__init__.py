@@ -313,47 +313,6 @@ class DynamicBatchingConfig(TypedDict):
     sequence_length_round: int
 
 
-class PretrainedCheckpointConfig(TypedDict):
-    """Configuration for restoring initial weights from a pre-existing Megatron checkpoint.
-
-    When set, the policy will restore its initial weights from this checkpoint
-    instead of loading them from ``model_name``. Supported by the Megatron backend
-    only; DTensor backends continue to use HuggingFace weights via ``model_name``.
-
-    Attributes:
-        path: Filesystem path to the checkpoint to load.
-
-            * For ``"megatron_bridge"`` format: must point to a **specific
-              iteration directory** that contains a ``run_config.yaml`` file
-              (e.g. ``/checkpoints/iter_0005000/``).  Pointing to the parent
-              checkpoint root is not supported; choose the iteration explicitly
-              so there is no ambiguity about which step is loaded.
-            * For ``"megatron_lm"`` format: must point to a **specific
-              iteration directory** of the Megatron-LM checkpoint
-              (e.g. ``/mlm_checkpoints/iter_0005000/``).
-
-        output_path: For ``"megatron_lm"`` format only — directory where the
-            Megatron-Bridge checkpoint will be written.  A directory is created
-            there with symlinks to the source weight files and the bridge
-            metadata files (``run_config.yaml``, ``train_state.pt``).  If the
-            directory already exists, conversion is skipped.  Not used for
-            ``"megatron_bridge"`` format.
-
-        format: Checkpoint format.  Use ``"megatron_bridge"`` for checkpoints
-            saved by megatron-bridge (e.g. produced by a prior NeMo-RL run) and
-            ``"megatron_lm"`` for checkpoints saved by upstream Megatron-LM.
-
-        hf_model_name: HuggingFace model name or local path used for architecture
-            config resolution and tokenizer setup.  Required regardless of
-            format.
-    """
-
-    path: str
-    format: Literal["megatron_bridge", "megatron_lm"]
-    hf_model_name: str
-    output_path: NotRequired[str]
-
-
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
