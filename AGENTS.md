@@ -4,7 +4,7 @@ NeMo-RL is an RLHF training framework built on Ray and PyTorch (FSDP2 / Megatron
 
 ## Coding Guidelines
 
-Coding guidelines are organized as Claude skills in `.claude/skills/`. Each skill covers a specific topic (style, config conventions, error handling, testing, copyright, docs).
+Coding guidelines are organized as Claude skills in `skills/`. Each skill covers a specific topic (style, config conventions, error handling, testing, copyright, docs).
 
 ## Code Review
 
@@ -20,4 +20,4 @@ When reviewing code, follow these principles:
 
 ## Kubernetes / nrl-k8s
 
-For launching, monitoring, stopping, and debugging NeMo-RL recipes on Kubernetes, see the skill at `tools/nrl_k8s/.claude/skills/launch-nemo-rl/SKILL.md`.
+For launching, monitoring, stopping, and debugging NeMo-RL recipes on Kubernetes, see the skill at `skills/launch-nemo-rl/SKILL.md`.
