@@ -33,12 +33,14 @@ grpo:
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
   kondo:
     enabled: false
-    mode: "response_dense_rows_v2"
+    mode: "stochastic_response_rows"
     target_backward_token_fraction: 0.7
-    recall_floor: 1.0
-    priority_mode: "delight"
-    block_size: 8
-    min_selected_rows: 1
+    priority_mode: "split_dual_tempered_delight"
+    surprisal_temperature: 0.1
+    gate_temperature: 1.0
+    positive_keep_floor: 0.95
+    negative_keep_floor: 0.25
+    min_keep_probability: 0.05
     bypass_on_nonfinite: true
   reward_scaling:
     enabled: false

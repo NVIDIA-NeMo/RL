@@ -129,6 +129,7 @@ class ClippedPGLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     loss_token_mask: NotRequired[torch.Tensor]
     loss_normalizer: NotRequired[torch.Tensor]
+    sample_loss_weight: NotRequired[torch.Tensor]
     __extra__: Any
 
 
@@ -291,6 +292,11 @@ class ClippedPGLossFn(LossFunction):
             if self.loss_type != LossType.TOKEN_LEVEL:
                 raise ValueError("kl_normalizer is only supported for token-level PG")
             kl_normalizer = kl_normalizer.reshape(-1)[0].to(curr_logprobs.device)
+        sample_loss_weight = data.get("sample_loss_weight")
+        if sample_loss_weight is not None:
+            sample_loss_weight = (
+                sample_loss_weight.to(curr_logprobs.device).reshape(-1, 1)
+            )
 
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
@@ -389,7 +395,6 @@ class ClippedPGLossFn(LossFunction):
                     output_clamp_value=self.kl_output_clamp_value,
                 )
             )
-
             # Reduce KL loss
             if self.loss_type == LossType.TOKEN_LEVEL:
                 if kl_normalizer is None:
@@ -570,6 +575,11 @@ class ClippedPGLossFn(LossFunction):
             importance_weights_to_use = actor_importance_weights
         else:
             importance_weights_to_use = torch.ones_like(prev_logprobs)
+        if sample_loss_weight is not None:
+            # Row-level Kondo proposals are actor-shaped. Keep the inverse-propensity
+            # correction on the actor term only instead of amplifying KL with the
+            # same sampled-row weights.
+            importance_weights_to_use = importance_weights_to_use * sample_loss_weight
 
         if self.loss_type == LossType.TOKEN_LEVEL:
             if loss_normalizer is None:

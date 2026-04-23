@@ -11,7 +11,7 @@
 
 ## Research Preview
 
-This branch is a research preview for GRPO extensions based on Delightful Policy Gradient (DG) and Kondo-style compute skipping. It adds learner-side DG gating, dense-reference and row-compacted Kondo modes such as `response_dense_rows_v2`, GRPO diagnostics for the new metrics, and DTensor worker compatibility fixes needed to run these experiments on the current stack.
+This branch is a research preview for GRPO extensions based on Delightful Policy Gradient (DG) and Kondo-style compute skipping. The active Kondo surface is intentionally narrow: a dense-reference control and a stochastic row-sampling path that drops rows before `policy.train(...)` and applies inverse-propensity weighting. Legacy routed, oracle, and block-cover variants have been removed from the hot path to keep the branch focused on the only executor that currently delivers real compute skip on this stack.
 
 ## 📣 News
 * [04/06/2026] New Model Support

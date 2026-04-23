@@ -1681,6 +1681,11 @@ def grpo_train(
                     )
                     baseline = repeated_batch["baseline"]
                     std = repeated_batch["std"]
+                    prompt_group_std_for_kondo = None
+                    if master_config["grpo"].get("kondo", {}).get(
+                        "priority_mode"
+                    ) == "split_dual_tempered_delight":
+                        prompt_group_std_for_kondo = std.clone().to(torch.float32)
 
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
@@ -1753,8 +1758,19 @@ def grpo_train(
                             "generation_logprobs": flat_messages["generation_logprobs"],
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
+                            "prompt_group_id": (
+                                torch.arange(
+                                    flat_messages["token_ids"].shape[0],
+                                    dtype=torch.int64,
+                                )
+                                // master_config["grpo"][
+                                    "num_generations_per_prompt"
+                                ]
+                            ),
                         }
                     )
+                    if prompt_group_std_for_kondo is not None:
+                        train_data["prompt_group_std"] = prompt_group_std_for_kondo
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
@@ -1844,7 +1860,7 @@ def grpo_train(
                 if master_config["grpo"].get("kondo", {}).get(
                     "enabled", False
                 ) and master_config["grpo"].get("kondo", {}).get(
-                    "mode", "routed"
+                    "mode", "stochastic_response_rows"
                 ) != "off":
                     kondo_cfg, row_multiple = _prepare_kondo_configuration(
                         policy=policy,
@@ -2142,6 +2158,14 @@ def grpo_train(
                 if "kondo_row_selected" in train_data:
                     log_data["kondo_row_selected"] = train_data[
                         "kondo_row_selected"
+                    ].tolist()
+                if "kondo_row_keep_prob" in train_data:
+                    log_data["kondo_row_keep_prob"] = train_data[
+                        "kondo_row_keep_prob"
+                    ].tolist()
+                if "kondo_row_ht_weight" in train_data:
+                    log_data["kondo_row_ht_weight"] = train_data[
+                        "kondo_row_ht_weight"
                     ].tolist()
                 log_data["advantages"] = train_data["advantages"].tolist()
                 log_data["generation_logprobs"] = train_data[
@@ -2827,6 +2851,20 @@ def async_grpo_train(
                     del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
+                    prompt_group_std_for_kondo = None
+                    if master_config["grpo"].get("kondo", {}).get(
+                        "priority_mode"
+                    ) == "split_dual_tempered_delight":
+                        _, prompt_group_std_for_kondo = (
+                            calculate_baseline_and_std_per_prompt(
+                                prompt_ids_for_adv,
+                                rewards,
+                                torch.ones_like(rewards),
+                                leave_one_out_baseline=master_config["grpo"][
+                                    "use_leave_one_out_baseline"
+                                ],
+                            )
+                        )
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
@@ -2868,8 +2906,19 @@ def async_grpo_train(
                             "generation_logprobs": flat_messages["generation_logprobs"],
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
+                            "prompt_group_id": (
+                                torch.arange(
+                                    flat_messages["token_ids"].shape[0],
+                                    dtype=torch.int64,
+                                )
+                                // master_config["grpo"][
+                                    "num_generations_per_prompt"
+                                ]
+                            ),
                         }
                     )
+                    if prompt_group_std_for_kondo is not None:
+                        train_data["prompt_group_std"] = prompt_group_std_for_kondo
                     train_data.to("cpu")
 
                 # Training phase (same as sync version)
@@ -2935,7 +2984,7 @@ def async_grpo_train(
                 if master_config["grpo"].get("kondo", {}).get(
                     "enabled", False
                 ) and master_config["grpo"].get("kondo", {}).get(
-                    "mode", "routed"
+                    "mode", "stochastic_response_rows"
                 ) != "off":
                     kondo_cfg, row_multiple = _prepare_kondo_configuration(
                         policy=policy,
@@ -3222,6 +3271,14 @@ def async_grpo_train(
                 log_data["loss_token_mask"] = train_data["loss_token_mask"].tolist()
             if "kondo_row_selected" in train_data:
                 log_data["kondo_row_selected"] = train_data["kondo_row_selected"].tolist()
+            if "kondo_row_keep_prob" in train_data:
+                log_data["kondo_row_keep_prob"] = train_data[
+                    "kondo_row_keep_prob"
+                ].tolist()
+            if "kondo_row_ht_weight" in train_data:
+                log_data["kondo_row_ht_weight"] = train_data[
+                    "kondo_row_ht_weight"
+                ].tolist()
             log_data["advantages"] = train_data["advantages"].tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
