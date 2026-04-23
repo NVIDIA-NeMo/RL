@@ -1034,8 +1034,8 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
     grpo_mod.setup(master_config, tokenizer, dataset, None)
 
     assert (
-        master_config["policy"]["generation"]["sglang_cfg"]["model_path"]
-        == master_config["policy"]["model_name"]
+        master_config.policy["generation"]["sglang_cfg"]["model_path"]
+        == master_config.policy["model_name"]
     )
     assert logged["metrics"]["parallel_init_enabled"] == expected_parallel
 
@@ -1177,11 +1177,11 @@ def test_grpo_train_collects_generation_logger_metrics(
     )
 
     master_config = mock_grpo_components["master_config"]
-    master_config["grpo"]["max_num_steps"] = 1
-    master_config["grpo"]["max_num_epochs"] = 1
-    master_config["grpo"]["val_period"] = 0
-    master_config["grpo"]["val_at_start"] = False
-    master_config["grpo"]["use_dynamic_sampling"] = False
+    master_config.grpo["max_num_steps"] = 1
+    master_config.grpo["max_num_epochs"] = 1
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["val_at_start"] = False
+    master_config.grpo["use_dynamic_sampling"] = False
 
     grpo_mod.grpo_train(
         mock_grpo_components["policy"],

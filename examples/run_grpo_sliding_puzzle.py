@@ -209,7 +209,8 @@ def main():
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Print config
@@ -217,36 +218,36 @@ def main():
     pprint.pprint(config)
 
     # Get the next experiment directory with incremented ID
-    config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
-    print(f"📊 Using log directory: {config['logger']['log_dir']}")
-    if config["checkpointing"]["enabled"]:
+    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    if config.checkpointing["enabled"]:
         print(
-            f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
+            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
     init_ray()
 
-    set_seed(config["grpo"]["seed"])
+    set_seed(config.grpo["seed"])
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-    config["policy"]["generation"] = configure_generation_config(
-        config["policy"]["generation"], tokenizer
+    tokenizer = get_tokenizer(config.policy["tokenizer"])
+    config.policy["generation"] = configure_generation_config(
+        config.policy["generation"], tokenizer
     )
 
     # setup data & env map
     ds_length = (
-        config["grpo"]["num_prompts_per_step"]
-        * config["grpo"]["num_generations_per_prompt"]
-        * config["grpo"]["max_num_steps"]
+        config.grpo["num_prompts_per_step"]
+        * config.grpo["num_generations_per_prompt"]
+        * config.grpo["max_num_steps"]
     )
     dataset, val_dataset, task_to_env, val_task_to_env = setup_puzzle_data(
         tokenizer=tokenizer,
-        env_cfg=config["env"],
+        env_cfg=config.env,
         task_name="sliding_puzzle_game",
         length=ds_length,
-        val_length=config["grpo"]["max_val_samples"],
-        add_system_prompt=config["data"]["add_system_prompt"],
+        val_length=config.grpo["max_val_samples"],
+        add_system_prompt=config.data["add_system_prompt"],
     )
 
     (

@@ -281,8 +281,8 @@ class AsyncTrajectoryCollector:
         # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps
         # This value limits the parallelism of the generation requests.
         max_inflight = (
-            int(self.master_config["grpo"]["num_prompts_per_step"])
-            * int(self.master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"])
+            int(self.master_config.grpo["num_prompts_per_step"])
+            * int(self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"])
         ) or 1
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
@@ -452,7 +452,7 @@ class AsyncTrajectoryCollector:
         """Process a single batch and generate for one target weight."""
         try:
             generation_weight_version = self.current_weight_version
-            num_generations = self.master_config["grpo"]["num_generations_per_prompt"]
+            num_generations = self.master_config.grpo["num_generations_per_prompt"]
             num_prompts = batch.size
 
             # Get the next target weight that needs generation
@@ -650,7 +650,7 @@ class AsyncTrajectoryCollector:
             # Async engine supports concurrent generation; avoid locking
             # Check if we should use nemo_gym (similar to synchronous GRPO)
             if _should_use_nemo_gym(self.master_config):
-                generation_config = self.master_config["policy"]["generation"]
+                generation_config = self.master_config.policy["generation"]
                 env_cfg = self.master_config.get("env") or {}
                 nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                     policy_generation=self.policy_generation,
@@ -670,10 +670,8 @@ class AsyncTrajectoryCollector:
                     input_batch=repeated_batch,
                     tokenizer=self.tokenizer,
                     task_to_env=self.task_to_env,
-                    max_seq_len=self.master_config["policy"][
-                        "max_total_sequence_length"
-                    ],
-                    max_rollout_turns=self.master_config["grpo"]["max_rollout_turns"],
+                    max_seq_len=self.master_config.policy["max_total_sequence_length"],
+                    max_rollout_turns=self.master_config.grpo["max_rollout_turns"],
                     greedy=False,
                 )
 
