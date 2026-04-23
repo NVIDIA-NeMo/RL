@@ -90,7 +90,7 @@ between roles, no endpoint-registry rendezvous.
 nrl-k8s run \
     tools/nrl_k8s/examples/qwen3_4b_if_single.yaml \
     --infra tools/nrl_k8s/examples/qwen3_4b_if_single.infra.yaml \
-    --follow
+    --wait
 ```
 
 ### `qwen3_4b_if_gym_disagg` — gym on its own cluster
@@ -102,9 +102,10 @@ RayCluster runs the gym rollout server.
 nrl-k8s run \
     tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml \
     --infra tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.infra.yaml \
-    --follow
+    --raycluster --wait
 ```
 
+`--raycluster` is required for disaggregated runs (multiple clusters).
 `run` applies both RayCluster manifests in order, submits the gym daemon
 once its cluster is `Ready`, then submits the training Ray Job against the
 training cluster and tails its logs.
@@ -124,14 +125,14 @@ the standalone generation server, which lives on its own GPUs:
 nrl-k8s run \
     tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
     --infra tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml \
-    --follow
+    --raycluster --wait
 ```
 
-`run` walks the three roles in order: `generation` first (vLLM has to be
+`run --raycluster` walks the three roles in order: `generation` first (vLLM has to be
 serving before training opens sockets to it), then `gym` (publishes
 `gym_head_server` into the endpoint-registry ConfigMap), then `training`.
 Once the training Ray Job is submitted its auto-generated ID is printed and
-`--follow` tails its logs via a port-forward to the training dashboard.
+`--wait` tails its logs until the job reaches a terminal state.
 
 ```bash
 nrl-k8s status \
@@ -238,42 +239,24 @@ nrl-k8s cluster up \
     --role training --dry-run
 ```
 
-### `nrl-k8s launch`
-
-Submit a training Ray Job against an **already-up** training cluster. Does
-not bring up generation or gym. Use this when `nrl-k8s run` has already
-stood things up and you just want to rerun training after editing code.
-
-```bash
-nrl-k8s launch \
-    tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
-    --infra tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml \
-    --follow --replace
-```
-
-Flags: `--repo-root <path>` (defaults to `cwd`; the source tree Ray packages
-into `working_dir`), `--follow`, `--replace` (see below).
-
 ### `nrl-k8s run`
 
-Do the full sequence: apply each RayCluster, submit each role's daemon
-(for generation / gym), then submit the training Ray Job. Same flags as
-`launch`. Safe to re-run idempotently on healthy clusters — already-running
-daemons are skipped unless `--replace` is passed.
+Submit a recipe to the cluster. Defaults to ephemeral **RayJob mode**
+(`--rayjob`): KubeRay creates the RayCluster, submits the entrypoint,
+polls until terminal, then tears down the cluster automatically. DRA
+resources (ComputeDomain, RoCE ResourceClaimTemplate) are auto-created
+before the job and auto-deleted after it finishes.
 
-### `nrl-k8s cluster up --role <role>`
+Pass `--raycluster` for **long-lived mode**: idempotently bring up each
+declared RayCluster, submit daemons (generation / gym), then submit
+training. Clusters stay up for subsequent runs. Use `--replace` to stop
+running jobs before resubmitting, `--recreate` to delete + re-apply
+drifted clusters.
 
-Apply one RayCluster manifest and, once `Ready`, submit its daemon if the
-recipe has one.
-
-```bash
-nrl-k8s cluster up \
-    tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
-    --infra tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml \
-    --role gym
-```
-
-Flags: `--wait/--no-wait`, `--timeout <seconds>` (default 900).
+Flags: `--wait/--no-wait`, `--dry-run` (RayJob mode only),
+`--replace`, `--recreate`, `--skip-daemons` (long-lived mode only),
+`--run-id <tag>`, `--mode {interactive, batch}`,
+`--code-source {upload, image, lustre}`, `--code-path <path>`.
 
 ### `nrl-k8s cluster down`
 
@@ -336,15 +319,15 @@ auto-managed.
 Stop a Ray Job by submission id. Useful for clearing a stuck training job
 before a re-run (though `launch --replace` does this automatically).
 
-### `nrl-k8s dev` / `nrl-k8s dashboard` / `nrl-k8s doctor`
+### `nrl-k8s dev` / `nrl-k8s doctor`
 
 Not yet implemented — stubs print `not yet implemented (phase: ...)` and
 exit `2`.
 
 ## Modes: interactive vs batch
 
-`launch` and `run` both take `--mode {interactive, batch}`. The flag is a
-macro — it flips a coherent set of defaults that a researcher would
+`nrl-k8s run --raycluster` takes `--mode {interactive, batch}`. The flag is
+a macro — it flips a coherent set of defaults that a researcher would
 otherwise pick individually.
 
 | dimension | `--mode interactive` (default) | `--mode batch` |
@@ -389,7 +372,7 @@ nrl-k8s cluster up "$RECIPE" --infra "$INFRA" --role training
 
 # Researcher, per run — returns in seconds, laptop can close.
 RUN_ID=qwen3-4b-gym-disagg-$(date +%Y%m%d-%H%M%S)
-nrl-k8s launch "$RECIPE" --infra "$INFRA" --run-id "$RUN_ID"
+nrl-k8s run "$RECIPE" --infra "$INFRA" --raycluster --run-id "$RUN_ID"
 # run id:  qwen3-4b-gym-disagg-20260421-103012
 # kind:    exec
 # cluster: raycluster-gym-disagg-qwen3-4b  (ns=nemo-rl-testing)
@@ -406,7 +389,7 @@ nrl-k8s job stop "$RUN_ID" "$RECIPE" --infra "$INFRA" --role training
 The prod infra declares `submit.submitter: exec` + `launch.runMode:
 batch` + `launch.codeSource: image`, so `--mode batch` is implicit.
 The dev infra (`qwen3_4b_if_gym_disagg.infra.yaml`) keeps the
-port-forward + upload path, letting `launch` / `run` default to
+port-forward + upload path, letting `run --raycluster` default to
 foreground log tailing for dev iteration.
 
 The exec submitter writes a launcher script onto the head pod, runs it
@@ -511,8 +494,8 @@ etc.) — the CLI does not inject `cd` for you.
 
 ## `--replace` semantics
 
-Both `nrl-k8s launch` and `nrl-k8s run` accept `--replace`. It performs
-three idempotency-relevant actions before submitting:
+`nrl-k8s run --raycluster` accepts `--replace`. It performs three
+idempotency-relevant actions before submitting:
 
 1. **Endpoint registry reset.** The CLI parses the gym daemon's
    `--job-id` flag (see `tools/nrl_k8s/src/nrl_k8s/orchestrate.py:231`) and
@@ -544,8 +527,8 @@ Ray's Job SDK caps `working_dir` at 100 MiB. `infra.launch.rayUploadPaths`
 you ship. The disagg example lists individual files under
 `resources_servers/instruction_following/` so the 87 MiB `train.jsonl`
 isn't included (see `qwen3_4b_if_full_disagg.infra.yaml:229`). If uploads are slow,
-`nrl-k8s validate ... --show-recipe` won't help — instead `ls -lh` the
-staged tmpdir by running `nrl-k8s launch --follow` and inspecting the log
+`nrl-k8s check` won't help — instead `ls -lh` the
+staged tmpdir by running `nrl-k8s run --raycluster --wait` and inspecting the log
 line `[training] staging working_dir ...` (look at
 `tools/nrl_k8s/src/nrl_k8s/workdir.py` for defaults).
 
