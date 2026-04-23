@@ -424,7 +424,12 @@ class WandbLogger(LoggerInterface):
             step: Global step value
             name: Name of the metric
         """
-        self.run.log({name: wandb.Histogram(histogram)}, step=step)
+        try:
+            self.run.log({name: wandb.Histogram(histogram)}, step=step)
+        except ValueError:
+            # When all values are identical, numpy cannot create finite-sized bins.
+            # Log the scalar value instead.
+            self.run.log({name: histogram[0] if len(histogram) > 0 else 0}, step=step)
 
 
 class SwanlabLogger(LoggerInterface):
@@ -1174,7 +1179,10 @@ class Logger(LoggerInterface):
                 for key, value in sample.items():
                     if isinstance(value, torch.Tensor):
                         sample[key] = value.tolist()
-                f.write(json.dumps({**sample, "idx": i}) + "\n")
+                    elif isinstance(value, np.ndarray):
+                        sample[key] = value.tolist()
+                # default=str is a fallback for non-JSON-serializable types (e.g., datetime, custom objects)
+                f.write(json.dumps({**sample, "idx": i}, default=str) + "\n")
 
         print(f"Logged data to {filepath}")
 
