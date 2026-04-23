@@ -119,23 +119,27 @@ launch:
   # example don't apply here.
   #
   # Hydra overrides flip wandb on at runtime so the recipe on disk doesn't
-  # need to hardcode `logger.wandb_enabled=true`. RUN_ID is derived from the
-  # KubeRay submission id (RayJob mode) or NRL_K8S_RUN_ID (launch/run/go)
-  # so each submission gets a distinct wandb run name; falls back to a
-  # timestamp when neither is set. Backslashes escape OmegaConf
-  # interpolation so the `$VAR` text reaches the pod shell verbatim.
+  # need to hardcode `logger.wandb_enabled=true`.
   entrypoint: |
     set -eu
     cd /opt/nemo-rl
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted — is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
     export RAY_enable_infeasible_task_early_exit=true
     export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM
-    RUN_ID="\${RAY_JOB_SUBMISSION_ID:-\${NRL_K8S_RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}}"
+    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    LOG=\${LOG_DIR}/${user:}-raycluster-qwen3-30b-math-gb300-training-\${TIMESTAMP}.log
+    mkdir -p "\${LOG_DIR}"
 
     python -u examples/run_grpo.py \
       --config tools/nrl_k8s/examples/qwen3_30b_math_8n_4gpu.yaml \
       logger.wandb_enabled=true \
       logger.wandb.project=nemorl-single-k8s \
-      "logger.wandb.name=qwen3-30b-math-gb300-\${RUN_ID}"
+      logger.wandb.name=qwen3-30b-math-gb300 \
+      2>&1 | tee "\${LOG}"
 
 clusters:
   training:

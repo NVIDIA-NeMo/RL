@@ -107,6 +107,10 @@ launch:
   entrypoint: |
     set -eu
     cd /opt/nemo-rl
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted — is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
     # Full instruction-following dataset (~20K prompts) snapshotted from
     # huggingface.co/datasets/nvidia/Nemotron-RL-instruction_following onto the
     # shared Lustre workspace.
@@ -115,12 +119,16 @@ launch:
     export DISAGG_VALID_PATH=$IF_DATA
     export RAY_enable_infeasible_task_early_exit=true
     export PYTHONPATH=.:3rdparty/Gym-workspace/Gym:3rdparty/Megatron-LM-workspace/Megatron-LM
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    LOG=\${LOG_DIR}/${user:}-raycluster-single-qwen3-4b-gb300-prod-training-$(date -u +%Y%m%d-%H%M%S-%N).log
+    mkdir -p "\${LOG_DIR}"
 
     python -u examples/nemo_gym/run_grpo_nemo_gym.py \
       --config tools/nrl_k8s/examples/qwen3_4b_if_single.yaml \
       ++env.nemo_gym.config_paths='[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/instruction_following/configs/instruction_following.yaml]' \
       ~policy.optimizer.kwargs.foreach \
-      ~policy.optimizer.kwargs.fused
+      ~policy.optimizer.kwargs.fused \
+      2>&1 | tee "\${LOG}"
 
 clusters:
   training:
