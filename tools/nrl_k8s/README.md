@@ -1,5 +1,9 @@
 # nrl-k8s
 
+> [!WARNING]
+> These instructions are in active development and should not be relied on as stable yet.
+> APIs, manifests, and tooling may change without notice.
+
 A config-driven launcher that runs a NeMo-RL recipe on any Kubernetes cluster
 with the KubeRay operator installed. One YAML pair captures *what to train*
 (the recipe) and *where to run it* (the infra); the CLI brings up every
