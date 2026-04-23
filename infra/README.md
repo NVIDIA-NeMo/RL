@@ -35,7 +35,7 @@ stat -fc %T /sys/fs/cgroup/            # should show "cgroup2fs"
 
 ```sh
 # 1. Install tools
-cd infra/kind
+cd kind
 bash install-nvkind.sh
 bash get-kubectl.sh
 bash get-helm.sh
@@ -76,9 +76,9 @@ python examples/nemo_gym/run_grpo_nemo_gym.py +env.disagg_job_id=my-job logger.w
 ## Deploy on a real cluster
 
 ```sh
-cd infra/helm
+cd helm
 helmfile -e prod sync
-kubectl apply -f infra/examples/kai-queue-prod.yaml
+kubectl apply -f examples/kai-queue-prod.yaml
 ```
 
 This installs KAI scheduler, KubeRay, and JobSet. The cluster is expected to already have the GPU Operator (or equivalent GPU provisioning) installed.
