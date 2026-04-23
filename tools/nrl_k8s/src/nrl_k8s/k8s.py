@@ -425,22 +425,122 @@ def get_head_pod(cluster_name: str, namespace: str) -> Any:
     )
 
 
+def create_pod(manifest: dict[str, Any], namespace: str) -> dict[str, Any]:
+    """Create a pod. No-op on 409 (already exists)."""
+    load_kubeconfig()
+    core = client.CoreV1Api()
+    try:
+        return with_retries(
+            lambda: core.create_namespaced_pod(namespace=namespace, body=manifest)
+        )
+    except ApiException as exc:
+        if exc.status == 409:
+            return {}
+        raise
+
+
+def delete_pod(name: str, namespace: str, *, ignore_missing: bool = True) -> None:
+    load_kubeconfig()
+    core = client.CoreV1Api()
+    try:
+        with_retries(
+            lambda: core.delete_namespaced_pod(name=name, namespace=namespace)
+        )
+    except ApiException as exc:
+        if exc.status == 404 and ignore_missing:
+            return
+        raise
+
+
+def get_pod_phase(name: str, namespace: str) -> str | None:
+    """Return the pod phase (Pending/Running/Succeeded/Failed) or None if not found."""
+    load_kubeconfig()
+    core = client.CoreV1Api()
+    try:
+        pod = with_retries(
+            lambda: core.read_namespaced_pod(name=name, namespace=namespace)
+        )
+        return pod.status.phase if pod.status else None
+    except ApiException as exc:
+        if exc.status == 404:
+            return None
+        raise
+
+
+# =============================================================================
+# Secrets
+# =============================================================================
+
+
+def create_or_update_secret(
+    name: str, namespace: str, data: dict[str, str]
+) -> None:
+    """Create a Secret or merge new keys into an existing one."""
+    import base64
+
+    load_kubeconfig()
+    core = client.CoreV1Api()
+    encoded = {k: base64.b64encode(v.encode()).decode() for k, v in data.items()}
+
+    try:
+        existing = core.read_namespaced_secret(name=name, namespace=namespace)
+        merged = dict(existing.data or {})
+        merged.update(encoded)
+        existing.data = merged
+        with_retries(
+            lambda: core.replace_namespaced_secret(
+                name=name, namespace=namespace, body=existing
+            )
+        )
+    except ApiException as exc:
+        if exc.status == 404:
+            secret = client.V1Secret(
+                metadata=client.V1ObjectMeta(name=name, namespace=namespace),
+                type="Opaque",
+                data=encoded,
+            )
+            with_retries(
+                lambda: core.create_namespaced_secret(
+                    namespace=namespace, body=secret
+                )
+            )
+        else:
+            raise
+
+
+def secret_exists(name: str, namespace: str) -> bool:
+    load_kubeconfig()
+    core = client.CoreV1Api()
+    try:
+        core.read_namespaced_secret(name=name, namespace=namespace)
+        return True
+    except ApiException as exc:
+        if exc.status == 404:
+            return False
+        raise
+
+
 __all__ = [
     "apply_compute_domain",
     "apply_raycluster",
     "apply_rayjob",
     "apply_resource_claim_template",
+    "create_or_update_secret",
+    "create_pod",
     "custom_objects_api",
     "delete_compute_domain",
     "delete_configmap",
+    "delete_pod",
     "delete_raycluster",
     "delete_rayjob",
     "delete_resource_claim_template",
     "get_head_pod",
+    "get_pod_phase",
     "get_raycluster",
     "get_rayjob",
     "list_rayclusters",
     "load_kubeconfig",
+    "secret_exists",
     "wait_for_raycluster_gone",
     "wait_for_raycluster_ready",
     "wait_for_rayjob_terminal",

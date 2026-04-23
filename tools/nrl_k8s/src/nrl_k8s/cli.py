@@ -1161,6 +1161,160 @@ def job_stop(
 
 
 # =============================================================================
+# Dev pod
+# =============================================================================
+
+
+@main.group()
+def dev():
+    """Manage a lightweight dev pod on the cluster."""
+
+
+@dev.command("connect")
+@click.option(
+    "--image",
+    default="nvcr.io/nvidian/nemo-rl:nightly",
+    help="Container image for the dev pod.",
+)
+@click.option("--namespace", "-n", default=None, help="Kubernetes namespace.")
+def dev_connect(image: str, namespace: str | None) -> None:
+    """Create a dev pod (if needed) and exec into it."""
+    import subprocess
+    import time
+
+    from . import k8s
+    from .config import get_username
+    from .dev import build_dev_pod_manifest
+
+    user = get_username()
+    pod_name = f"{user}-dev-pod"
+    if namespace is None:
+        namespace = _infer_namespace()
+
+    phase = k8s.get_pod_phase(pod_name, namespace)
+    if phase is None:
+        click.echo(f"creating dev pod {pod_name} in {namespace} ...")
+        manifest = build_dev_pod_manifest(user, namespace, image)
+        k8s.create_pod(manifest, namespace)
+        phase = "Pending"
+
+    if phase != "Running":
+        click.echo(f"waiting for {pod_name} to be Running ...")
+        for _ in range(120):
+            time.sleep(2)
+            phase = k8s.get_pod_phase(pod_name, namespace)
+            if phase == "Running":
+                break
+            if phase in ("Failed", "Succeeded"):
+                _cli_error(f"dev pod reached phase {phase} — check `kubectl describe pod {pod_name} -n {namespace}`")
+        else:
+            _cli_error(f"dev pod did not reach Running after 240s (phase={phase})")
+
+    click.echo(f"connecting to {pod_name} ...")
+    subprocess.run(
+        ["kubectl", "exec", "-it", "-n", namespace, pod_name, "--", "bash"],
+    )
+    click.echo(f"\npod {pod_name} is still running — stop with: nrl-k8s dev stop")
+
+
+@dev.command("stop")
+@click.option("--namespace", "-n", default=None, help="Kubernetes namespace.")
+def dev_stop(namespace: str | None) -> None:
+    """Delete your dev pod."""
+    from . import k8s
+    from .config import get_username
+
+    user = get_username()
+    pod_name = f"{user}-dev-pod"
+    if namespace is None:
+        namespace = _infer_namespace()
+
+    phase = k8s.get_pod_phase(pod_name, namespace)
+    if phase is None:
+        click.echo(f"no dev pod {pod_name} found in {namespace}")
+        return
+
+    click.echo(f"deleting {pod_name} ...")
+    k8s.delete_pod(pod_name, namespace)
+    click.echo(f"{pod_name} deleted.")
+
+
+_REQUIRED_FIRST_TIME = ("HF_TOKEN", "WANDB_API_KEY")
+
+
+@dev.command("setup-secrets")
+@click.argument("kvs", nargs=-1)
+@click.option(
+    "--ssh-key",
+    type=click.Path(exists=True),
+    multiple=True,
+    help="Path to an SSH private key (repeatable).",
+)
+@click.option("--namespace", "-n", default=None, help="Kubernetes namespace.")
+def dev_setup_secrets(
+    kvs: tuple[str, ...], ssh_key: tuple[str, ...], namespace: str | None
+) -> None:
+    """Create or update your user secrets.
+
+    Pass token values as NAME=VAL positional args and SSH keys via --ssh-key.
+
+    First-time usage requires HF_TOKEN, WANDB_API_KEY, and --ssh-key:
+
+    \b
+      nrl-k8s dev setup-secrets \\
+        HF_TOKEN=hf_xxx WANDB_API_KEY=key_yyy \\
+        --ssh-key ~/.ssh/id_ed25519
+
+    Subsequent runs accept any subset to update individual keys.
+    """
+    from pathlib import Path
+
+    from . import k8s
+    from .config import get_username
+
+    user = get_username()
+    secret_name = f"{user}-secrets"
+    if namespace is None:
+        namespace = _infer_namespace()
+
+    data: dict[str, str] = {}
+    for kv in kvs:
+        if "=" not in kv:
+            _cli_error(f"invalid argument {kv!r} — expected NAME=VAL")
+        name, val = kv.split("=", 1)
+        data[name] = val
+
+    for key_path in ssh_key:
+        p = Path(key_path)
+        data["SSH_KEY_NAME"] = p.name
+        data["SSH_KEY_CONTENT"] = p.read_text()
+
+    is_new = not k8s.secret_exists(secret_name, namespace)
+    if is_new:
+        missing = [k for k in _REQUIRED_FIRST_TIME if k not in data]
+        if missing:
+            _cli_error(
+                f"first-time setup requires: {', '.join(missing)}",
+                hint=f"nrl-k8s dev setup-secrets {' '.join(f'{k}=<value>' for k in missing)} --ssh-key ~/.ssh/id_ed25519",
+            )
+        if not ssh_key:
+            _cli_error(
+                "first-time setup requires --ssh-key",
+                hint="nrl-k8s dev setup-secrets ... --ssh-key ~/.ssh/id_ed25519",
+            )
+
+    k8s.create_or_update_secret(secret_name, namespace, data)
+    action = "created" if is_new else "updated"
+    click.echo(f"{action} secret {secret_name} in {namespace} (keys: {', '.join(sorted(data))})")
+
+
+def _infer_namespace() -> str:
+    from .config import _infer_kube_namespace
+
+    return _infer_kube_namespace()
+
+
+# =============================================================================
 # Helpers
 # =============================================================================
 
