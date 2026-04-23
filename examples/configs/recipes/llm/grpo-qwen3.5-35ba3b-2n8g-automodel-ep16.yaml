@@ -7,17 +7,12 @@ policy:
   logprob_batch_size: 1
   max_total_sequence_length: 4096
   optimizer:
-    _override_: true
-    name: "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam"
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
-      lr: 5.0e-06
-      weight_decay: 0.01
-      betas: [0.9, 0.999]
-      eps: 1.0e-08
       master_weights: true
       store_param_remainders: true
-      exp_avg_dtype: "torch.bfloat16"
-      exp_avg_sq_dtype: "torch.bfloat16"
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
   dtensor_cfg:
     expert_parallel_size: 16
     activation_checkpointing: true
@@ -40,7 +35,6 @@ policy:
   generation:
     vllm_cfg:
       tensor_parallel_size: 8
-      # set to eager mode to mitigate https://github.com/vllm-project/vllm/issues/36237
       enforce_eager: true
 logger:
   wandb_enabled: true
