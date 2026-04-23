@@ -11,7 +11,7 @@ This guide explains how to use the Muon optimizer with NeMo RL for training larg
 Muon is only supported with the **Megatron backend**. Ensure you have:
 
 1. Megatron submodules initialized: `git submodule update --init --recursive`
-2. Megatron backend enabled in your configuration: `policy.megatron_cfg.enabled=True`
+2. Megatron backend enabled in your configuration: `policy.megatron_cfg.enabled=true`
 
 ## Basic Usage
 
@@ -24,15 +24,16 @@ uv run examples/run_sft.py \
     ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
     ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
     ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
-    ++policy.megatron_cfg.optimizer.muon_use_nesterov=False \
+    ++policy.megatron_cfg.optimizer.muon_nesterov=false \
     ++policy.megatron_cfg.optimizer.muon_extra_scale_factor=0.5 \
     policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false \
-    policy.megatron_cfg.optimizer.use_distributed_optimizer=false
+    policy.megatron_cfg.optimizer.use_distributed_optimizer=false \
+    policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=false \
 ```
 
-For a full list of Muon-related arguments and a description of each, please refer to the [Megatron documentation](https://github.com/terrykong/Megatron-LM/blob/25a62edf77b5130f888328ca8119d6a76117cf23/megatron/core/optimizer/optimizer_config.py#L128-L150). 
+For a full list of Muon-related arguments and a description of each, please refer to the [Megatron documentation](https://github.com/NVIDIA/Megatron-LM/blob/7928a84e86a79a783d70968660e067d2ab492f23/megatron/core/optimizer/optimizer_config.py#L259-L290). 
 
-_NOTE_: precision_aware_optimizer and distributed_optimizer are not supported with Muon and should be disabled.
+_NOTE_: precision_aware_optimizer, distributed_optimizer and overlap_param_gather are not supported with Muon and should be disabled.
 
 ## Example YAML Configuration
 
@@ -53,7 +54,7 @@ policy:
       
       # Muon-specific settings
       muon_momentum: 0.95
-      muon_use_nesterov: false
+      muon_nesterov: false
       muon_scale_mode: "spectral"
       muon_fp32_matmul_prec: "medium"
       muon_num_ns_steps: 5
@@ -74,6 +75,9 @@ policy:
       weight_decay_incr_style: "constant"
       start_weight_decay: 0.1
       end_weight_decay: 0.1
+    
+    distributed_data_parallel_config:
+      overlap_param_gather: false
 ```
 
 ## Experimental Results
@@ -96,28 +100,28 @@ uv run examples/run_sft.py \
   ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
   ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
   ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
-  ++policy.megatron_cfg.optimizer.muon_use_nesterov=False \
+  ++policy.megatron_cfg.optimizer.muon_nesterov=false \
   ++policy.megatron_cfg.optimizer.muon_extra_scale_factor=0.2 \
   policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false \
   ++policy.megatron_cfg.optimizer.lr=2e-5 \
-  policy.megatron_cfg.optimizer.use_distributed_optimizer=False \
-  cluster.num_nodes=4 \
+  policy.megatron_cfg.optimizer.use_distributed_optimizer=false \
+  policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=false \
+  cluster.num_nodes=16 \
   cluster.gpus_per_node=8 \
   policy.megatron_cfg.pipeline_model_parallel_size=8 \
-  policy.megatron_cfg.sequence_parallel=True \
+  policy.megatron_cfg.sequence_parallel=true \
   policy.megatron_cfg.expert_model_parallel_size=8 \
   policy.megatron_cfg.tensor_model_parallel_size=8 \
-  policy.sequence_packing.enabled=True \
+  policy.sequence_packing.enabled=true \
   policy.model_name=Qwen/Qwen3-235B-A22B \
   policy.tokenizer.name=Qwen/Qwen3-235B-A22B \
-  checkpointing.enabled=True \
-  cluster.num_nodes=16 \
+  checkpointing.enabled=true \
   policy.megatron_cfg.num_layers_in_first_pipeline_stage=11 \
   policy.megatron_cfg.num_layers_in_last_pipeline_stage=11
 ```
 
 
-Here is a comparison of Muon vs Adam for DAPO with Qwen3.5-7B:
+Here is a comparison of Muon vs Adam for DAPO with Qwen2.5-7B:
 
 <p align="center">
 <img src="../assets/muon-dapo-reward.png" alt="Muon vs Adam DAPO Train Reward" height="300">
@@ -134,11 +138,12 @@ uv run examples/run_grpo_math.py \
   ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
   ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
   ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
-  ++policy.megatron_cfg.optimizer.muon_use_nesterov=False \
+  ++policy.megatron_cfg.optimizer.muon_nesterov=false \
   ++policy.megatron_cfg.optimizer.muon_extra_scale_factor=0.5 \
   policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false \
-  policy.megatron_cfg.optimizer.use_distributed_optimizer=False \
+  policy.megatron_cfg.optimizer.use_distributed_optimizer=false \
+  policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=false \
   cluster.num_nodes=16 cluster.gpus_per_node=8 \
-  policy.sequence_packing.enabled=True \
+  policy.sequence_packing.enabled=true \
   ~checkpointing.model_save_format
 ```

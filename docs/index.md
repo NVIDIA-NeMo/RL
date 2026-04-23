@@ -114,11 +114,25 @@ Create custom reward environments and integrate them with NeMo RL training pipel
 Configure offline and online Eagle3 draft-model workflows to accelerate rollout generation with vLLM.
 :::
 
+:::{grid-item-card} {octicon}`unmute` Audio GRPO on AVQA
+:link: guides/grpo-audio
+:link-type: doc
+
+Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-AQA approach.
+:::
+
 :::{grid-item-card} {octicon}`plus-circle` Adding New Models
 :link: adding-new-models
 :link-type: doc
 
 Learn how to add support for new model architectures in NeMo RL.
+:::
+
+:::{grid-item-card} {octicon}`arrow-both` YaRN Long-Context Training
+:link: guides/yarn-long-context
+:link-type: doc
+
+Extend a model's context window with YaRN RoPE scaling on the Megatron backend for SFT, GRPO, and other workflows.
 :::
 
 ::::
@@ -220,6 +234,7 @@ guides/prorlv2.md
 guides/grpo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
+guides/grpo-audio.md
 guides/rm.md
 guides/environments.md
 guides/eval.md
@@ -227,6 +242,7 @@ guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
 guides/eagle3-speculative-decoding.md
+guides/yarn-long-context.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
 guides/ft-launcher-guide.md

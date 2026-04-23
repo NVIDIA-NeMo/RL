@@ -207,6 +207,7 @@ class VllmInternalWorkerExtension:
                 ipc_handle, list_keys, used_bytes = payload
                 buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
 
+                weight = None
                 weights = []
                 offset = 0
                 for key in list_keys:
@@ -258,7 +259,8 @@ class VllmInternalWorkerExtension:
                 # copied the data, Python may not garbage collect these view objects immediately.
                 # If sender reuses the buffer before GC runs, old views would read corrupted data.
                 # Explicit del ensures immediate cleanup before sending ACK.
-                del weights, policy_weights, draft_weights, buffer
+                del weight, weights, policy_weights, draft_weights, buffer
+                weight = None
                 weights = None
                 policy_weights = None
                 draft_weights = None
