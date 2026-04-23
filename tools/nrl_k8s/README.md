@@ -317,7 +317,7 @@ auto-managed.
 ### `nrl-k8s job stop <submission_id> --role <role>`
 
 Stop a Ray Job by submission id. Useful for clearing a stuck training job
-before a re-run (though `launch --replace` does this automatically).
+before a re-run (though `run --raycluster --replace` does this automatically).
 
 ### `nrl-k8s dev`
 

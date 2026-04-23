@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
@@ -563,6 +564,8 @@ def _run_rayjob(
 
     if not submit_mod.is_in_cluster():
         _preflight_or_exit(namespace)
+
+    _check_stale_rayjobs(loaded, namespace)
 
     orchestrate.ensure_dra_resources("training", loaded, log=click.echo)
     click.echo(f"[run --rayjob] applying RayJob {job_name} in {namespace}")
@@ -1317,6 +1320,78 @@ def _infer_namespace() -> str:
 # =============================================================================
 # Helpers
 # =============================================================================
+
+
+@dataclass
+class _StaleResource:
+    kind: str  # e.g. "rayjob", "raycluster", "pod"
+    name: str
+    status: str
+
+
+def _find_stale_resources(
+    checks: list[tuple[str, str, callable]],
+) -> list[_StaleResource]:
+    """Probe a list of ``(kind, name, getter)`` and return those that exist.
+
+    ``getter(name)`` should return a status string if the resource exists,
+    or ``None`` if it doesn't. Generic so callers can check any resource type.
+    """
+    stale: list[_StaleResource] = []
+    for kind, name, getter in checks:
+        status = getter(name)
+        if status is not None:
+            stale.append(_StaleResource(kind=kind, name=name, status=status))
+    return stale
+
+
+def _error_on_stale(stale: list[_StaleResource], namespace: str) -> None:
+    """If ``stale`` is non-empty, print all resources and their delete commands, then exit."""
+    if not stale:
+        return
+
+    lines = ["stale resources from a previous run exist:\n"]
+    for r in stale:
+        lines.append(f"  {r.kind}/{r.name} (status={r.status})")
+    lines.append("\ndelete them and resubmit:")
+    for r in stale:
+        lines.append(f"  kubectl delete {r.kind} {r.name} -n {namespace}")
+
+    _cli_error(
+        "\n".join(lines),
+        hint="once deleted, re-run the same nrl-k8s run command",
+    )
+
+
+def _check_stale_rayjobs(loaded: LoadedConfig, namespace: str) -> None:
+    """Check all roles for existing RayJobs upfront.
+
+    Reports every stale RayJob at once so the user can clean up in one pass
+    rather than hitting them one at a time in a loop.
+
+    Stale DRA resources (ComputeDomain, RoCE ResourceClaimTemplate) are not
+    checked — they are 1:1 with the RayJob by design (named after the
+    cluster + role), so deleting the RayJob and resubmitting will recreate
+    them idempotently. TODO: add DRA garbage collection to a future
+    ``nrl-k8s clean`` command.
+    """
+    from . import k8s
+    from .orchestrate import ALL_ROLES, _get_cluster
+
+    def _rayjob_status(name: str) -> str | None:
+        existing = k8s.get_rayjob(name, namespace)
+        if existing is None:
+            return None
+        return (existing.get("status") or {}).get("jobDeploymentStatus", "Pending")
+
+    checks = []
+    for role in ALL_ROLES:
+        cluster = _get_cluster(loaded.infra, role)
+        if cluster is None:
+            continue
+        checks.append(("rayjob", cluster.name, _rayjob_status))
+
+    _error_on_stale(_find_stale_resources(checks), namespace)
 
 
 def _preflight_or_exit(namespace: str) -> None:

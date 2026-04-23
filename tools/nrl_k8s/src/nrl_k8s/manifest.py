@@ -55,6 +55,7 @@ def build_raycluster_manifest(
     _patch_image_pull_secrets(spec, list(infra.imagePullSecrets))
     if infra.serviceAccount is not None:
         _patch_service_account(spec, infra.serviceAccount)
+    _patch_pod_labels(spec, {**_MANAGED_BY_LABEL, **infra.labels, **cluster.labels})
     # DRA resources are named {prefix}-{cluster_name}-{role} so that
     # disaggregated setups with multiple clusters get distinct
     # ComputeDomains and RoCE templates per role.
@@ -97,6 +98,20 @@ def _walk_pod_templates(raycluster_spec: dict) -> list[dict]:
         if isinstance(wg_spec, dict):
             specs.append(wg_spec)
     return specs
+
+
+def _patch_pod_labels(raycluster_spec: dict, labels: dict[str, str]) -> None:
+    """Merge ``labels`` into every pod template's metadata.labels."""
+    head = raycluster_spec.get("headGroupSpec") or {}
+    templates = [head.get("template")]
+    for wg in raycluster_spec.get("workerGroupSpecs") or []:
+        templates.append(wg.get("template"))
+    for tpl in templates:
+        if not isinstance(tpl, dict):
+            continue
+        meta = tpl.setdefault("metadata", {})
+        existing = meta.get("labels") or {}
+        meta["labels"] = {**labels, **existing}
 
 
 def _patch_images(raycluster_spec: dict, image: str) -> None:
