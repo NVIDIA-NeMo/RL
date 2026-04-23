@@ -524,10 +524,11 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     )
     if fine_grained_activation_offloading:
         offload_modules = config["megatron_cfg"].get("offload_modules", [])
-        if not offload_modules:
+        if not isinstance(offload_modules, list) or not offload_modules:
             raise ValueError(
                 "offload_modules must be a non-empty list when "
                 "fine_grained_activation_offloading is True."
+            )
             )
         model_cfg.fine_grained_activation_offloading = True
         model_cfg.offload_modules = offload_modules
