@@ -269,6 +269,7 @@ class SGLangGeneration(GenerationInterface):
         if self.needs_offload and dead_indices:
             new_engines = [self.all_engines[i] for i in dead_indices]
             ray.get([engine.release_memory_weights.remote() for engine in new_engines])
+            ray.get([engine.release_memory_kv_cache_and_cuda_graph.remote() for engine in new_engines])
             ray.get([engine.resume_memory_weights.remote() for engine in new_engines])
 
     # ------------------------------------------------------------------
@@ -287,6 +288,7 @@ class SGLangGeneration(GenerationInterface):
     def offload_weights(self):
         if not self.needs_offload:
             return
+        
         handles = [
             engine.release_memory_weights.remote()
             for engine in self.engines
@@ -296,6 +298,9 @@ class SGLangGeneration(GenerationInterface):
             ray.get(handles)
 
     def offload_kv(self):
+        if not self.needs_offload:
+            return
+
         handles = [
             engine.release_memory_kv_cache_and_cuda_graph.remote()
             for engine in self.engines
@@ -307,6 +312,7 @@ class SGLangGeneration(GenerationInterface):
     def onload_weights(self):
         if not self.needs_offload:
             return
+        
         handles = [
             engine.resume_memory_weights.remote()
             for engine in self.engines
@@ -316,6 +322,9 @@ class SGLangGeneration(GenerationInterface):
             ray.get(handles)
 
     def onload_kv(self):
+        if not self.needs_offload:
+            return
+        
         handles = [
             engine.resume_memory_kv_cache_and_cuda_graph.remote()
             for engine in self.engines
@@ -328,7 +337,10 @@ class SGLangGeneration(GenerationInterface):
         """Restart any dead rollout engines and update ``num_new_engines``
         for weight-update detection.
         """
+        self.health_monitoring_pause()
+
         self._recover()
+
         return (
             self.engines,
             self.rollout_engine_lock,
@@ -841,9 +853,13 @@ class SGLangGeneration(GenerationInterface):
                     self.onload_weights()
                 if "kv_cache" in tags:
                     self.onload_kv()
+                    
+        self.health_monitoring_resume()
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""
+        self.health_monitoring_pause()
+
         tags = kwargs.get("tags", None)
         if self.needs_offload:
             if tags is None:

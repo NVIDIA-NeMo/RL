@@ -12,37 +12,14 @@
 # limitations under the License.
 # ==============================================================================
 import io
-from typing import Callable, Union
-
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Callable, List, Tuple, Union
 
 import torch
 from torch.multiprocessing import reductions
 from multiprocessing.reduction import ForkingPickler
 import pybase64
 
-from packaging import version as pkg_version
-torch_release = pkg_version.parse(torch.__version__).release
-
-# /sgl-workspace/sglang/python/sglang/srt/utils/common.py
-# class SafeUnpickler(pickle.Unpickler):
-#     ALLOWED_MODULE_PREFIXES = {
-#         ...
-#         "sglang.srt.weight_sync.tensor_bucket.",
-#         "sglang.srt.model_executor.model_runner.",
-#         "sglang.srt.layers.",
-#         "sglang.srt.utils.",
-#         "torch_npu.",
-# +        "nemo_rl.models.policy.torch_reductions_utils.",
-#     }
-
-# Refer: https://github.com/sgl-project/sglang/blob/sglang-miles/python/sglang/srt/utils/weight_checker.py
-#     def _reset_tensors(self):
-#         for name, param in self._model_state():
-#             if "cos_sin_cache" in name or "freqs_cis" in name or "_weight_fp32" in name:
-#                 continue
-#             param.copy_(_random_like(param))
 
 class MultiprocessingSerializer:  # pragma: no cover
     """Serialize/deserialize Python objects using ForkingPickler for IPC.
@@ -143,42 +120,6 @@ def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:
 
 def _modify_tuple(t, index: int, modifier: Callable):
     return *t[:index], modifier(t[index]), *t[index + 1 :]
-
-
-def monkey_patch_torch_compile():
-    if torch_release < (2, 8):
-        # These things are cacheable by torch.compile. torch.compile just doesn't know it.
-        # This was fixed in PyTorch 2.8, but until then, we monkey patch.
-        import torch._higher_order_ops.auto_functionalize as af
-
-        af.auto_functionalized_v2._cacheable = True
-        af.auto_functionalized._cacheable = True
-
-
-def register_fake_if_exists(op_name):
-    """
-    Decorator factory to conditionally register a fake for a custom op if it exists.
-    Parses op_name (e.g., 'sgl_kernel::gptq_gemm'), checks if the op exists via hasattr
-    on the namespace attribute of torch.ops. Registers the fake if present; otherwise,
-    returns the function unchanged.
-    Args:
-        op_name (str): Full operator name (e.g., 'sgl_kernel::gptq_gemm').
-    Returns:
-        callable: Decorator for the fake function.
-    Example:
-        @register_fake_if_exists('sgl_kernel::gptq_gemm')
-        def fake_gptq_gemm(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit):
-            return a.new_empty((a.shape[0], b_q_weight.shape[-1]), dtype=a.dtype)
-    """
-
-    def decorator(func):
-        namespace, bare_op = op_name.split("::")
-        ops_namespace = getattr(torch.ops, namespace, None)
-        if ops_namespace and hasattr(ops_namespace, bare_op):
-            torch.library.register_fake(op_name, func)
-        return func
-
-    return decorator
 
 
 @dataclass
