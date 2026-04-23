@@ -432,6 +432,9 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
+    if "moe_grouped_gemm" in config["megatron_cfg"]:
+        model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
+
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
     if "mtp_num_layers" in config["megatron_cfg"]:

@@ -21,6 +21,7 @@ policy:
     pipeline_model_parallel_size: 1
     expert_model_parallel_size: 16
     sequence_parallel: false
+    moe_grouped_gemm: true
     optimizer:
       lr: 3.0e-07
       min_lr: 3.0e-08

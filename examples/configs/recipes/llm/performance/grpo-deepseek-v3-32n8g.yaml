@@ -24,6 +24,7 @@ policy:
     pipeline_model_parallel_size: 16
     expert_model_parallel_size: 16
     activation_checkpointing: true
+    moe_grouped_gemm: true
     num_layers_in_first_pipeline_stage: 3
     num_layers_in_last_pipeline_stage: 2
     apply_rope_fusion: false
