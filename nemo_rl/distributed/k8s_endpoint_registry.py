@@ -228,7 +228,7 @@ class K8sEndpointRegistry:
 
     def _build_owner_reference(
         self, raycluster_name: str
-    ) -> list[client.V1OwnerReference]:
+    ) -> list[client.V1OwnerReference] | None:
         """Look up the RayCluster's UID and build an ownerReference."""
         try:
             rc = self._custom.get_namespaced_custom_object(

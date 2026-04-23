@@ -513,7 +513,7 @@ def print_performance_metrics(
         else:
             per_worker_token_counts = None
 
-        if per_worker_token_counts is not None and len(per_worker_token_counts) > 0:
+        if per_worker_token_counts is not None:
             average_token_imbalance = visualize_per_worker_load(per_worker_token_counts)
             performance_metrics["average_token_imbalance"] = average_token_imbalance
 
@@ -565,7 +565,7 @@ def print_performance_metrics(
             f"    - Timeline (0: {zero_marker}, {', '.join(f'{1.0 if k == 0 else k * (max_value / len(marker))}-{(k + 1) * (max_value / len(marker))}: {marker[k]}' for k in marker.keys())}):"
         )
         for dp_idx, metric_values in metric_dict.items():
-            if int(dp_idx) > max_rows_to_print:
+            if dp_idx > max_rows_to_print:
                 break
             timeline = []
             length = len(metric_values)
@@ -589,10 +589,10 @@ def print_performance_metrics(
                 timeline.append(m)
             if timeline_interval is not None:
                 print(
-                    f"    - Generation Worker {int(dp_idx):3d}: {''.join(timeline)} (Active: {active:.2f} s, Idle: {idle:.2f} s)"
+                    f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)} (Active: {active:.2f} s, Idle: {idle:.2f} s)"
                 )
             else:
-                print(f"    - Generation Worker {int(dp_idx):3d}: {''.join(timeline)}")
+                print(f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)}")
 
     is_vllm_metrics_logger_enabled = master_config["policy"]["generation"].get(
         "vllm_cfg", {}
@@ -724,18 +724,16 @@ def print_performance_metrics(
         metrics["total_num_tokens"] / total_time / total_num_gpus
     )
     policy_training_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"]
-        / max(policy_training_time, 1e-6)
-        / training_num_gpus
+        metrics["total_num_tokens"] / policy_training_time / training_num_gpus
     )
     policy_and_reference_logprobs_tokens_per_sec_per_gpu = (
         metrics["total_num_tokens"]
-        / max(policy_and_reference_logprobs_time, 1e-6)
+        / policy_and_reference_logprobs_time
         / training_num_gpus
     )
     training_worker_group_tokens_per_sec_per_gpu = (
         metrics["total_num_tokens"]
-        / max(policy_training_time + policy_and_reference_logprobs_time, 1e-6)
+        / (policy_training_time + policy_and_reference_logprobs_time)
         / training_num_gpus
     )
     generation_tokens_per_sec_per_gpu = (
