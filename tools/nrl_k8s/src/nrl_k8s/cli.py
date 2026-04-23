@@ -1253,9 +1253,17 @@ _REQUIRED_FIRST_TIME = ("HF_TOKEN", "WANDB_API_KEY")
     multiple=True,
     help="Path to an SSH private key (repeatable).",
 )
+@click.option(
+    "--add-rclone",
+    is_flag=True,
+    help="Read ~/.config/rclone/rclone.conf and store it in the secret.",
+)
 @click.option("--namespace", "-n", default=None, help="Kubernetes namespace.")
 def dev_setup_secrets(
-    kvs: tuple[str, ...], ssh_key: tuple[str, ...], namespace: str | None
+    kvs: tuple[str, ...],
+    ssh_key: tuple[str, ...],
+    add_rclone: bool,
+    namespace: str | None,
 ) -> None:
     """Create or update your user secrets.
 
@@ -1266,7 +1274,7 @@ def dev_setup_secrets(
     \b
       nrl-k8s dev setup-secrets \\
         HF_TOKEN=hf_xxx WANDB_API_KEY=key_yyy \\
-        --ssh-key ~/.ssh/id_ed25519
+        --ssh-key ~/.ssh/id_ed25519 --add-rclone
 
     Subsequent runs accept any subset to update individual keys.
     """
@@ -1291,6 +1299,15 @@ def dev_setup_secrets(
         p = Path(key_path)
         data["SSH_KEY_NAME"] = p.name
         data["SSH_KEY_CONTENT"] = p.read_text()
+
+    if add_rclone:
+        rclone_conf = Path.home() / ".config" / "rclone" / "rclone.conf"
+        if not rclone_conf.exists():
+            _cli_error(
+                f"rclone config not found at {rclone_conf}",
+                hint="install rclone and run `rclone config` first",
+            )
+        data["RCLONE_CONF"] = rclone_conf.read_text()
 
     is_new = not k8s.secret_exists(secret_name, namespace)
     if is_new:

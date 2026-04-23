@@ -25,6 +25,13 @@ def build_dev_pod_manifest(
         'printf "%s\\n" "$SSH_KEY_CONTENT" > /root/.ssh/$SSH_KEY_NAME && '
         "chmod 600 /root/.ssh/$SSH_KEY_NAME; "
         "fi && "
+        'if [ -n "$RCLONE_CONF" ]; then '
+        "mkdir -p /root/.config/rclone && "
+        'printf "%s\\n" "$RCLONE_CONF" > /root/.config/rclone/rclone.conf && '
+        "if ! command -v rclone >/dev/null 2>&1; then "
+        "curl -sSf https://rclone.org/install.sh | bash; "
+        "fi; "
+        "fi && "
         "sleep infinity"
     )
 
