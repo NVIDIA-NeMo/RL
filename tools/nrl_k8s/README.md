@@ -319,10 +319,49 @@ auto-managed.
 Stop a Ray Job by submission id. Useful for clearing a stuck training job
 before a re-run (though `launch --replace` does this automatically).
 
-### `nrl-k8s dev` / `nrl-k8s doctor`
+### `nrl-k8s dev`
 
-Not yet implemented — stubs print `not yet implemented (phase: ...)` and
-exit `2`.
+Lightweight dev pod for setup tasks (cloning repos, downloading models,
+debugging). The pod runs on a CPU node with the shared workspace PVC
+mounted.
+
+#### `nrl-k8s dev setup-secrets`
+
+Create or update your user secrets (tokens + SSH key). Required before
+first `dev connect`:
+
+```bash
+nrl-k8s dev setup-secrets \
+    HF_TOKEN=hf_xxx WANDB_API_KEY=key_yyy \
+    --ssh-key ~/.ssh/id_ed25519
+```
+
+First-time usage requires `HF_TOKEN`, `WANDB_API_KEY`, and `--ssh-key`.
+Subsequent runs accept any subset to update individual keys.
+
+#### `nrl-k8s dev connect`
+
+Create the dev pod (if it doesn't exist) and exec into it:
+
+```bash
+nrl-k8s dev connect
+```
+
+Lands you in `/mnt/rl-workspace/<username>` with your tokens as env vars
+and SSH key at `/root/.ssh/`. The pod stays running after you exit — reconnect
+with `dev connect` again.
+
+#### `nrl-k8s dev stop`
+
+Delete the dev pod:
+
+```bash
+nrl-k8s dev stop
+```
+
+### `nrl-k8s doctor`
+
+Not yet implemented.
 
 ## Modes: interactive vs batch
 

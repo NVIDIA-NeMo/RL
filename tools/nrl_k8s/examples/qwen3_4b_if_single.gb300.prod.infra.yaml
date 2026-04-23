@@ -11,13 +11,13 @@
 #                                            head + worker pod, served off the
 #                                            shared FSx Lustre PVC via subPath.
 #
-# Because /opt/nemo-rl is the Lustre checkout at ${user:}/rl-k8s, edits on Lustre
+# Because /opt/nemo-rl is the Lustre checkout at ${user:}/nemo-rl, edits on Lustre
 # show up in the next submission without rebuilding the image. That's the whole
 # point of prod mode: iterate on code without churning the container.
 #
 # Prereqs (onboarding §3–§5 already applied in `default`):
 #   - rl-workspace PVC bound (shared FSx Lustre, 2.4 TiB, RWX)
-#   - /mnt/rl-workspace/${user:}/rl-k8s contains a git checkout of
+#   - /mnt/rl-workspace/${user:}/nemo-rl contains a git checkout of
 #     https://github.com/NVIDIA-NeMo/RL on branch hemil/k8s-infra-cp
 #   - nvcr-secret, wandb-api-key, nemo-rl-endpoint-registry all present
 #
@@ -62,12 +62,12 @@ _shared:
     - {containerPort: 6379,  name: gcs-server}
     - {containerPort: 8265,  name: dashboard}
     - {containerPort: 10001, name: client}
-  # Volumes. The Lustre PVC is mounted at /opt/nemo-rl (subPath ${user:}/rl-k8s)
+  # Volumes. The Lustre PVC is mounted at /opt/nemo-rl (subPath ${user:}/nemo-rl)
   # for code, and at /mnt/rl-workspace (no subPath) for run outputs, caches,
   # and checkpoints. dshm stays as an emptyDir for Ray's object store.
   codeMounts: &code_mounts
     - {mountPath: /dev/shm, name: dshm}
-    - {mountPath: /opt/nemo-rl, name: rl-workspace, subPath: "${user:}/rl-k8s"}
+    - {mountPath: /opt/nemo-rl, name: rl-workspace, subPath: "${user:}/nemo-rl"}
     - {mountPath: /mnt/rl-workspace, name: rl-workspace}
   headVolumes: &head_volumes
     - name: dshm
