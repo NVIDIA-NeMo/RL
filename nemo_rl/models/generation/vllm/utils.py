@@ -183,3 +183,25 @@ def compute_spec_decode_metrics(
                 )
 
     return spec_metrics
+
+
+# TODO: Replace this hard-coded map with a generic plugin-registration
+# hook on ``VllmGeneration`` (e.g. a ``worker_cls_overrides`` registry populated
+# by ``nemo_rl.modelopt`` on import) so core has no knowledge of ModelOpt-specific
+# worker classes.
+GENERATION_WORKER_OVERRIDES = {
+    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantGenerationWorker",
+    "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantAsyncGenerationWorker",
+}
+
+
+def resolve_generation_worker_cls(default_cls: str, config: dict) -> str:
+    """Return the quantized vLLM generation worker FQN if ``quant_cfg`` is set, else ``default_cls``.
+
+    Safe to call even when ModelOpt is not installed — returns ``default_cls``
+    unchanged whenever ``quant_cfg`` is ``None``, so the core generation path
+    stays import-free of ModelOpt.
+    """
+    if config.get("quant_cfg") is None:
+        return default_cls
+    return GENERATION_WORKER_OVERRIDES.get(default_cls, default_cls)
