@@ -68,13 +68,3 @@ def test_health_generate_returns_true(worker):
     """health_generate succeeds multiple times (idempotent)."""
     for _ in range(3):
         assert ray.get(worker.health_generate.remote()) is True
-
-
-def test_get_gpu_uuids(worker):
-    """get_gpu_uuids returns a non-empty list of GPU-* strings."""
-    uuids = ray.get(worker.get_gpu_uuids.remote())
-    assert isinstance(uuids, list)
-    assert len(uuids) >= 1
-    for uuid in uuids:
-        assert isinstance(uuid, str)
-        assert uuid.startswith("GPU-")

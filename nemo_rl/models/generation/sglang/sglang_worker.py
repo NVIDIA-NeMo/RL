@@ -593,28 +593,6 @@ class SGLangGenerationWorker:
             return None
         return f"http://{self.server_host}:{self.server_port}"
 
-    def get_gpu_uuids(self) -> list[str]:
-        """Return the GPU UUIDs this actor owns on its local node.
-
-        SGLang lays out GPUs contiguously starting at ``base_gpu_id``. Every
-        rank (including peer nodes in multi-node TP) reports its own
-        local-node slice of ``min(num_gpus_per_engine, gpus_per_node)`` GPUs;
-        the orchestrator concatenates the slices across peers to rebuild the
-        full UUID list for a logical engine.
-        """
-        from nemo_rl.utils.nvml import get_device_uuid
-
-        num_local_gpus = min(
-            self.num_gpus_per_engine,
-            self.cluster_cfg["gpus_per_node"],
-        )
-        # ``self.base_gpu_id`` stores the *physical* GPU id handed down by
-        # the orchestrator, but ``get_device_uuid`` indexes into
-        # ``CUDA_VISIBLE_DEVICES`` and therefore expects a *local* id — so
-        # remap before calling it.
-        local_base = _to_local_gpu_id(self.base_gpu_id)
-        return [get_device_uuid(local_base + i) for i in range(num_local_gpus)]
-
     def invalidate_kv_cache(self) -> bool:
         """Flush the cache of the server.
 

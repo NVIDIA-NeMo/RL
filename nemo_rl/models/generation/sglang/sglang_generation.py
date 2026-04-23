@@ -269,6 +269,7 @@ class SGLangGeneration(GenerationInterface):
         if self.needs_offload and dead_indices:
             new_engines = [self.all_engines[i] for i in dead_indices]
             ray.get([engine.release_memory_weights.remote() for engine in new_engines])
+            ray.get([engine.release_memory_kv_cache_and_cuda_graph.remote() for engine in new_engines])
             ray.get([engine.resume_memory_weights.remote() for engine in new_engines])
 
     # ------------------------------------------------------------------
@@ -287,6 +288,7 @@ class SGLangGeneration(GenerationInterface):
     def offload_weights(self):
         if not self.needs_offload:
             return
+        
         handles = [
             engine.release_memory_weights.remote()
             for engine in self.engines
@@ -296,6 +298,9 @@ class SGLangGeneration(GenerationInterface):
             ray.get(handles)
 
     def offload_kv(self):
+        if not self.needs_offload:
+            return
+
         handles = [
             engine.release_memory_kv_cache_and_cuda_graph.remote()
             for engine in self.engines
@@ -307,6 +312,7 @@ class SGLangGeneration(GenerationInterface):
     def onload_weights(self):
         if not self.needs_offload:
             return
+        
         handles = [
             engine.resume_memory_weights.remote()
             for engine in self.engines
@@ -316,6 +322,9 @@ class SGLangGeneration(GenerationInterface):
             ray.get(handles)
 
     def onload_kv(self):
+        if not self.needs_offload:
+            return
+        
         handles = [
             engine.resume_memory_kv_cache_and_cuda_graph.remote()
             for engine in self.engines
@@ -328,7 +337,10 @@ class SGLangGeneration(GenerationInterface):
         """Restart any dead rollout engines and update ``num_new_engines``
         for weight-update detection.
         """
+        self.health_monitoring_pause()
+
         self._recover()
+
         return (
             self.engines,
             self.rollout_engine_lock,
@@ -841,9 +853,13 @@ class SGLangGeneration(GenerationInterface):
                     self.onload_weights()
                 if "kv_cache" in tags:
                     self.onload_kv()
+                    
+        self.health_monitoring_resume()
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""
+        self.health_monitoring_pause()
+
         tags = kwargs.get("tags", None)
         if self.needs_offload:
             if tags is None:
@@ -880,76 +896,6 @@ class SGLangGeneration(GenerationInterface):
             )
         return success
 
-    def get_sglang_server_urls(self) -> list[str]:
-        """Return the base URLs of all SGLang servers (one per logical engine).
-
-        Returns:
-            List of base URLs, e.g. ``["http://host-a:30000", "http://host-b:30001"]``.
-        """
-        engines = [e for e in self.engines if e is not None]
-        if not engines:
-            raise RuntimeError("No rollout engines initialized")
-
-        urls = ray.get([e.get_base_url.remote() for e in engines])
-        return list({u for u in urls if u is not None})
-
-    def get_sglang_url_to_gpu_uuids(self) -> dict[str, list[str]]:
-        """Return a mapping of SGLang server URL to the GPU UUIDs it owns.
-
-        For multi-node TP, a single logical engine spans ``nodes_per_engine``
-        consecutive actors in ``all_engines``; we key by the node-0 URL and
-        concatenate the local-node UUID slices from every peer in the group.
-
-        Returns:
-            Dict mapping base URL to list of GPU UUIDs,
-            e.g. ``{"http://host-a:30000": ["GPU-aaa", "GPU-bbb"], ...}``.
-        """
-        if not any(e is not None for e in self.all_engines):
-            raise RuntimeError("No rollout engines initialized")
-
-        nodes_per_engine = self.nodes_per_engine
-
-        # Fan out to every actor (not just node-0) so peer ranks can report
-        # their own GPU slice. ``None`` slots mean the engine was killed by
-        # the health monitor and not yet recovered; skip them.
-        url_refs = [
-            e.get_base_url.remote() if e is not None else None
-            for e in self.all_engines
-        ]
-        uuid_refs = [
-            e.get_gpu_uuids.remote() if e is not None else None
-            for e in self.all_engines
-        ]
-        urls_live = ray.get([r for r in url_refs if r is not None])
-        uuids_live = ray.get([r for r in uuid_refs if r is not None])
-
-        # Re-key results back to their original slot index so gaps (None
-        # engines) stay aligned with ``all_engines``.
-        urls_by_slot: list[str | None] = []
-        uuids_by_slot: list[list[str] | None] = []
-        u_iter = iter(urls_live)
-        g_iter = iter(uuids_live)
-        for engine in self.all_engines:
-            if engine is None:
-                urls_by_slot.append(None)
-                uuids_by_slot.append(None)
-            else:
-                urls_by_slot.append(next(u_iter))
-                uuids_by_slot.append(next(g_iter))
-
-        url_to_uuids: dict[str, list[str]] = {}
-        for group_start in range(0, len(self.all_engines), nodes_per_engine):
-            node0_url = urls_by_slot[group_start]
-            if node0_url is None:
-                continue
-            aggregated: list[str] = []
-            for i in range(group_start, group_start + nodes_per_engine):
-                slot_uuids = uuids_by_slot[i]
-                if slot_uuids:
-                    aggregated.extend(slot_uuids)
-            if aggregated:
-                url_to_uuids[node0_url] = aggregated
-        return url_to_uuids
     
 # ---------------------------------------------------------------------------
 # Generate one sample helper
