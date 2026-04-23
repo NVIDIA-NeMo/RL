@@ -17,3 +17,7 @@ When reviewing code, follow these principles:
 - **High confidence only.** Only flag issues you are confident about. If unsure, skip it.
 - **Verify upstream API usage.** When code calls into megatron-bridge, megatron-lm, automodel, or gym APIs, look up the actual API to verify correct usage. Evaluate each such call with scrutiny — don't assume the author got the signature, return type, or semantics right.
 - It is perfectly acceptable to have nothing to comment on. Say "LGTM" if so.
+
+## Kubernetes / nrl-k8s
+
+For launching, monitoring, stopping, and debugging NeMo-RL recipes on Kubernetes, see the skill at `tools/nrl_k8s/.claude/skills/launch-nemo-rl/SKILL.md`.
