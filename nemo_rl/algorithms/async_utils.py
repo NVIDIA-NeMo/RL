@@ -32,6 +32,18 @@ from nemo_rl.models.generation.interfaces import GenerationInterface
 TokenizerType = PreTrainedTokenizerBase
 
 
+def _target_weight_window(
+    generation_weight_version: int, max_trajectory_age_steps: int
+) -> list[int]:
+    """Return training steps a generation weight version can validly target."""
+    return list(
+        range(
+            generation_weight_version,
+            generation_weight_version + max_trajectory_age_steps + 1,
+        )
+    )
+
+
 @ray.remote  # pragma: no cover
 class ReplayBuffer:
     """Replay buffer storing per-prompt groups.
@@ -129,7 +141,9 @@ class ReplayBuffer:
             from collections import Counter
 
             version_counts = Counter(self.trajectory_versions)
+            target_version_counts = Counter(self.target_weight_versions)
             print(f"   {version_counts=}")
+            print(f"   {target_version_counts=}")
 
             # Compute minimum valid version based on age window
             # max_age_steps=1 means trajectories from the last 1 step are valid
@@ -587,28 +601,19 @@ class AsyncTrajectoryCollector:
         max_trajectory_age_steps = 4
 
         Returns:
-            [11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 11, 12, 13, 14
+            [10, 11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 10 through 14
         """
         # Read async config strictly from grpo.async_grpo
         async_cfg = self.master_config.get("grpo", {}).get("async_grpo", {})
         max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-        if generation_weight_version == self.initial_weight_version:
-            return [
-                i
-                for i in range(
-                    self.initial_weight_version,
-                    self.initial_weight_version + max_trajectory_age + 1,
-                )
-            ]
-
-        return [generation_weight_version + i for i in range(1, max_trajectory_age + 1)]
+        return _target_weight_window(generation_weight_version, max_trajectory_age)
 
     def _get_next_target_for_generation(
         self, generation_weight_version: int
     ) -> Optional[int]:
         """Get the next target weight that needs generation (if any).
 
-        Checks all targets in the valid range (current weight version + 1 to max_age ahead)
+        Checks all targets in the valid range (current weight version to max_age ahead)
         and returns the first one that needs trajectories and isn't already being generated.
 
         This approach checks:
@@ -630,18 +635,7 @@ class AsyncTrajectoryCollector:
             earlier incomplete targets, while still preventing over-generation for consumed targets.
         """
         num_prompts = int(self.master_config["grpo"]["num_prompts_per_step"])
-        max_trajectory_age = int(
-            self.master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"]
-        )
-
-        # Special handling for initial step: include current step as a target
-        if generation_weight_version == self.initial_weight_version:
-            target_start = generation_weight_version
-            target_end = generation_weight_version + max_trajectory_age + 1
-        else:
-            # Check all targets from current+1 to current+max_age
-            target_start = generation_weight_version + 1
-            target_end = generation_weight_version + max_trajectory_age + 1
+        candidate_targets = self._calculate_target_weights(generation_weight_version)
 
         # Get the last target that training has consumed - skip anything at or below this
         last_consumed_target = ray.get(
@@ -649,7 +643,7 @@ class AsyncTrajectoryCollector:
         )
 
         with self._generation_check_lock:
-            for target_weight in range(target_start, target_end):
+            for target_weight in candidate_targets:
                 # Skip if training has already consumed this target's batch
                 if target_weight <= last_consumed_target:
                     continue
@@ -699,18 +693,9 @@ class AsyncTrajectoryCollector:
         """
         try:
             num_prompts = int(self.master_config["grpo"]["num_prompts_per_step"])
-            max_trajectory_age = int(
-                self.master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"]
+            candidate_targets = self._calculate_target_weights(
+                self.current_weight_version
             )
-
-            # Special handling for initial step: include current step as a target
-            if self.current_weight_version == self.initial_weight_version:
-                target_start = self.current_weight_version
-                target_end = self.current_weight_version + max_trajectory_age + 1
-            else:
-                # Check all targets from current+1 to current+max_age
-                target_start = self.current_weight_version + 1
-                target_end = self.current_weight_version + max_trajectory_age + 1
 
             # Get the last target that training has consumed
             last_consumed_target = ray.get(
@@ -718,7 +703,7 @@ class AsyncTrajectoryCollector:
             )
 
             with self._generation_check_lock:
-                for target_weight in range(target_start, target_end):
+                for target_weight in candidate_targets:
                     # Skip if training has already consumed this target
                     if target_weight <= last_consumed_target:
                         continue
@@ -737,7 +722,7 @@ class AsyncTrajectoryCollector:
                         return False  # Found a target that needs generation
 
             print(
-                f"⏸️ All targets [{target_start}, {target_end}) complete or in progress, pausing"
+                f"⏸️ All targets {candidate_targets} complete or in progress, pausing"
             )
             return True
         except Exception:
@@ -780,19 +765,10 @@ class AsyncTrajectoryCollector:
                         async_cfg = self.master_config.get("grpo", {}).get(
                             "async_grpo", {}
                         )
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-
-                        # Show the actual targets being checked (consistent with logic above)
-                        if self.current_weight_version == self.initial_weight_version:
-                            target_weights = list(range(
-                                self.current_weight_version,
-                                self.current_weight_version + max_trajectory_age + 1
-                            ))
-                        else:
-                            target_weights = list(range(
-                                self.current_weight_version + 1,
-                                self.current_weight_version + max_trajectory_age + 1
-                            ))
+                        target_weights = _target_weight_window(
+                            self.current_weight_version,
+                            async_cfg["max_trajectory_age_steps"],
+                        )
 
                         print(
                             f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
@@ -1007,6 +983,9 @@ class AsyncTrajectoryCollector:
                 invalidated = self.policy_generation.invalidate_kv_cache()
                 if invalidated:
                     print("✅ Invalidated vLLM prefix/KV caches after weight update")
+                    nemo_gym_actor = self.task_to_env.get("nemo_gym")
+                    if nemo_gym_actor is not None:
+                        ray.get(nemo_gym_actor.notify_kv_cache_invalidated.remote())
                 else:
                     print(
                         "⚠️ vLLM cache invalidation reported partial/unsuccessful on some workers"
