@@ -1,10 +1,36 @@
-"""Merge a Megatron LoRA adapter checkpoint with its base model and export to HuggingFace format.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-This is helpful when one wants to train the model using Megatron with LoRA adapter and then convert it to HuggingFace format
-for inference and evaluation.
+
+"""Export a Megatron LoRA adapter checkpoint to HuggingFace format.
+
+This script supports two workflows:
+
+1. Merge the base model and LoRA adapter, then export a standard HuggingFace model.
+2. Export only the LoRA adapter to a HuggingFace PEFT-compatible directory without merging.
 
 Usage (requires mcore extra):
 
+    # Export adapter only (recommended when you want PEFT format)
+    uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
+        --base-ckpt ~/.cache/huggingface/nemo_rl/zai-org/GLM-5/iter_0000000 \
+        --adapter-only \
+        --adapter-ckpt results/dpo_glm5/step_5/policy/weights/iter_0000000 \
+        --hf-model-name zai-org/GLM-5 \
+        --hf-ckpt-path ./hf_lora_adapter
+
+    # Merge base model + adapter and export a full HF checkpoint
     uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
         --base-ckpt ~/.cache/huggingface/nemo_rl/zai-org/GLM-5/iter_0000000 \
         --adapter-ckpt results/dpo_glm5/step_5/policy/weights/iter_0000000 \
@@ -18,6 +44,7 @@ import gc
 import logging
 import os
 import sys
+from contextlib import contextmanager
 
 import yaml
 
@@ -29,13 +56,13 @@ logger = logging.getLogger(__name__)
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Merge Megatron LoRA adapter with base model and export to HF"
+        description="Export Megatron LoRA checkpoint to HuggingFace format"
     )
     parser.add_argument(
         "--base-ckpt",
         type=str,
         required=True,
-        help="Path to base model Megatron checkpoint (iter_XXXXXXX directory)",
+        help="Path to base model Megatron checkpoint (iter_XXXXXXX directory). Required for both merged and adapter-only export.",
     )
     parser.add_argument(
         "--adapter-ckpt",
@@ -53,46 +80,37 @@ def parse_args():
         "--hf-ckpt-path",
         type=str,
         required=True,
-        help="Output path for merged HF checkpoint",
+        help="Output path for the exported HF checkpoint or adapter directory",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--adapter-only",
+        action="store_true",
+        help="Export only the LoRA adapter in HuggingFace PEFT format without merging into the base model.",
+    )
+    args = parser.parse_args()
+    return args
 
 
-def merge_lora_to_hf(
+@contextmanager
+def _build_megatron_model_with_lora(
     base_ckpt: str,
     adapter_ckpt: str,
     hf_model_name: str,
-    hf_ckpt_path: str,
-) -> str:
-    """Merge a Megatron LoRA adapter with its base model and export to HuggingFace format.
-
-    Args:
-        base_ckpt: Path to the base model Megatron checkpoint (iter_XXXXXXX directory).
-        adapter_ckpt: Path to the LoRA adapter Megatron checkpoint (iter_XXXXXXX directory).
-                      Must contain a ``run_config.yaml`` with a ``peft`` section.
-        hf_model_name: HuggingFace model identifier (e.g. ``zai-org/GLM-5``).
-        hf_ckpt_path: Output directory for the merged HuggingFace checkpoint.
-
-    Returns:
-        The *hf_ckpt_path* that was written to.
-
-    Raises:
-        FileExistsError: If *hf_ckpt_path* already exists.
-        ValueError: If the adapter's ``run_config.yaml`` has no ``peft`` section.
-    """
-    if os.path.exists(hf_ckpt_path):
-        raise FileExistsError(f"Output path already exists: {hf_ckpt_path}")
-
+):
+    """Build a single-rank Megatron model with LoRA weights loaded for export flows."""
     from megatron.bridge import AutoBridge
     from megatron.bridge.peft.lora import LoRA
     from megatron.bridge.training.checkpointing import (
+        _generate_model_state_dict,
         _load_model_weights_from_checkpoint,
+        apply_peft_adapter_filter_to_state_dict,
     )
     from megatron.bridge.training.model_load_save import (
         load_model_config,
         megatron_cpu_init_context,
         temporary_distributed_context,
     )
+    from megatron.core import dist_checkpointing
 
     bridge = AutoBridge.from_hf_pretrained(hf_model_name, trust_remote_code=True)
 
@@ -128,6 +146,7 @@ def merge_lora_to_hf(
         model_cfg.hierarchical_context_parallel_sizes = None
         model_cfg.fp8 = None
         model_cfg.fp8_param = False
+        model_cfg.gradient_accumulation_fusion = False
 
         peft = LoRA(
             target_modules=peft_section.get("target_modules", []),
@@ -140,9 +159,10 @@ def merge_lora_to_hf(
             lora_B_init_method=peft_section.get("lora_B_init_method", "zero"),
             a2a_experimental=peft_section.get("a2a_experimental", False),
         )
-        model_cfg.peft = peft
 
-        logger.info("Building model with LoRA wrappers on CPU...")
+        logger.info(
+            "Building base model on CPU (LoRA wrappers applied after base weights are loaded)..."
+        )
         if hasattr(model_cfg, "finalize"):
             model_cfg.finalize()
         with megatron_cpu_init_context(model_cfg):
@@ -159,10 +179,67 @@ def merge_lora_to_hf(
         _load_model_weights_from_checkpoint(base_ckpt, megatron_model, strict=False)
         gc.collect()
 
-        logger.info(f"Loading LoRA adapter from {adapter_ckpt}...")
-        _load_model_weights_from_checkpoint(adapter_ckpt, megatron_model, strict=False)
+        logger.info("Applying LoRA wrappers to model...")
+        megatron_model = peft(megatron_model, training=False)
         gc.collect()
 
+        logger.info(f"Loading LoRA adapter from {adapter_ckpt}...")
+        adapter_sharded_state_dict = _generate_model_state_dict(megatron_model, {})
+        adapter_sharded_state_dict = apply_peft_adapter_filter_to_state_dict(
+            adapter_sharded_state_dict, peft
+        )
+        loaded_adapter_state_dict = dist_checkpointing.load(
+            adapter_sharded_state_dict, adapter_ckpt
+        )
+        model_key = (
+            "model"
+            if "model" in loaded_adapter_state_dict
+            else next(k for k in loaded_adapter_state_dict if k.startswith("model"))
+        )
+        for m in megatron_model:
+            m.load_state_dict(loaded_adapter_state_dict[model_key], strict=False)
+        gc.collect()
+
+        try:
+            yield bridge, megatron_model, peft
+        finally:
+            del megatron_model
+            gc.collect()
+            logger.info("Freed model memory.")
+            sys.stderr.flush()
+            sys.stdout.flush()
+
+
+def merge_lora_to_hf(
+    base_ckpt: str,
+    adapter_ckpt: str,
+    hf_model_name: str,
+    hf_ckpt_path: str,
+) -> str:
+    """Merge a Megatron LoRA adapter with its base model and export to HuggingFace format.
+
+    Args:
+        base_ckpt: Path to the base model Megatron checkpoint (iter_XXXXXXX directory).
+        adapter_ckpt: Path to the LoRA adapter Megatron checkpoint (iter_XXXXXXX directory).
+                      Must contain a ``run_config.yaml`` with a ``peft`` section.
+        hf_model_name: HuggingFace model identifier (e.g. ``zai-org/GLM-5``).
+        hf_ckpt_path: Output directory for the merged HuggingFace checkpoint.
+
+    Returns:
+        The *hf_ckpt_path* that was written to.
+
+    Raises:
+        FileExistsError: If *hf_ckpt_path* already exists.
+        ValueError: If the adapter's ``run_config.yaml`` has no ``peft`` section.
+    """
+    if os.path.exists(hf_ckpt_path):
+        raise FileExistsError(f"Output path already exists: {hf_ckpt_path}")
+
+    with _build_megatron_model_with_lora(
+        base_ckpt=base_ckpt,
+        adapter_ckpt=adapter_ckpt,
+        hf_model_name=hf_model_name,
+    ) as (bridge, megatron_model, _):
         logger.info("Saving merged model in HuggingFace format...")
         bridge.save_hf_pretrained(
             megatron_model,
@@ -171,24 +248,68 @@ def merge_lora_to_hf(
             merge_adapter_weights=True,
         )
 
-        del megatron_model
-        gc.collect()
-        logger.info("Freed model memory.")
-        sys.stderr.flush()
-        sys.stdout.flush()
-
     logger.info(f"Done! Merged HF model saved to: {hf_ckpt_path}")
+    return hf_ckpt_path
+
+
+def export_lora_adapter_to_hf(
+    base_ckpt: str,
+    adapter_ckpt: str,
+    hf_model_name: str,
+    hf_ckpt_path: str,
+) -> str:
+    """Export a Megatron LoRA adapter to HuggingFace PEFT format.
+
+    Args:
+        base_ckpt: Path to the base model Megatron checkpoint (iter_XXXXXXX directory).
+        adapter_ckpt: Path to the LoRA adapter Megatron checkpoint (iter_XXXXXXX directory).
+                      Must contain a ``run_config.yaml`` with a ``peft`` section.
+        hf_model_name: HuggingFace model identifier (e.g. ``zai-org/GLM-5``).
+        hf_ckpt_path: Output directory for the HuggingFace PEFT adapter checkpoint.
+
+    Returns:
+        The *hf_ckpt_path* that was written to.
+
+    Raises:
+        FileExistsError: If *hf_ckpt_path* already exists.
+        ValueError: If the adapter's ``run_config.yaml`` has no ``peft`` section.
+    """
+    if os.path.exists(hf_ckpt_path):
+        raise FileExistsError(f"Output path already exists: {hf_ckpt_path}")
+
+    with _build_megatron_model_with_lora(
+        base_ckpt=base_ckpt,
+        adapter_ckpt=adapter_ckpt,
+        hf_model_name=hf_model_name,
+    ) as (bridge, megatron_model, peft):
+        logger.info("Saving LoRA adapter in HuggingFace PEFT format...")
+        bridge.save_hf_adapter(
+            megatron_model,
+            hf_ckpt_path,
+            peft_config=peft,
+            base_model_name_or_path=hf_model_name,
+        )
+
+    logger.info(f"Done! HF adapter saved to: {hf_ckpt_path}")
     return hf_ckpt_path
 
 
 def main():
     args = parse_args()
-    merge_lora_to_hf(
-        base_ckpt=args.base_ckpt,
-        adapter_ckpt=args.adapter_ckpt,
-        hf_model_name=args.hf_model_name,
-        hf_ckpt_path=args.hf_ckpt_path,
-    )
+    if args.adapter_only:
+        export_lora_adapter_to_hf(
+            base_ckpt=args.base_ckpt,
+            adapter_ckpt=args.adapter_ckpt,
+            hf_model_name=args.hf_model_name,
+            hf_ckpt_path=args.hf_ckpt_path,
+        )
+    else:
+        merge_lora_to_hf(
+            base_ckpt=args.base_ckpt,
+            adapter_ckpt=args.adapter_ckpt,
+            hf_model_name=args.hf_model_name,
+            hf_ckpt_path=args.hf_ckpt_path,
+        )
 
 
 if __name__ == "__main__":
