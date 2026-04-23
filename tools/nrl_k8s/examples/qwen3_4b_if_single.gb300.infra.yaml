@@ -55,10 +55,13 @@ image: nvcr.io/nvidian/nemo-rl:nightly
 imagePullSecrets: [nvcr-secret]
 serviceAccount: nemo-rl-endpoint-registry
 
+labels:
+  nrl-k8s/owner: ${user:}
+
 launch:
   mode: attach
   attach:
-    training: raycluster-single-qwen3-4b-gb300
+    training: ${user:}-raycluster-single-qwen3-4b-gb300
   peerWatcher: false
   entrypoint: |
     pip install kubernetes -q || true
@@ -98,7 +101,7 @@ launch:
 clusters:
   # ---------------- Training (GPU head + worker: generation + gym colocated) ----------------
   training:
-    name: raycluster-single-qwen3-4b-gb300
+    name: ${user:}-raycluster-single-qwen3-4b-gb300
     labels:
       disagg.nemo-rl/cluster: single-qwen3-4b-gb300
       disagg.nemo-rl/run: qwen3-4b-single-gb300

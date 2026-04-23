@@ -31,7 +31,7 @@ from omegaconf import OmegaConf
 from ray.job_submission import JobStatus, JobSubmissionClient
 
 from . import k8s, submit, workdir
-from .config import LoadedConfig
+from .config import LoadedConfig, get_username
 from .manifest import build_raycluster_manifest
 from .schema import ClusterSpec, CodeSource, InfraConfig, SubmitterMode
 from .submitters import SubmissionHandle, build_submitter, save_handle
@@ -111,6 +111,17 @@ def ensure_cluster(
     namespace = loaded.infra.namespace
 
     live = k8s.get_raycluster(name, namespace)
+    if live is not None:
+        live_owner = (live.get("metadata", {}).get("labels") or {}).get(
+            "nrl-k8s/owner"
+        )
+        me = get_username()
+        if live_owner and live_owner != me:
+            raise RuntimeError(
+                f"RayCluster {name} in namespace {namespace} is owned by "
+                f"'{live_owner}' (you are '{me}'). Use a different cluster "
+                f"name or ask {live_owner} to tear it down."
+            )
     if live is None:
         log(f"[{role}] applying RayCluster {name} in namespace {namespace}")
         k8s.apply_raycluster(manifest, namespace)

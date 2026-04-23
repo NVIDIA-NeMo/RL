@@ -67,10 +67,13 @@ image: nvcr.io/nvidian/nemo-rl:nightly
 imagePullSecrets: [nvidia-ngcuser-pull-secret, ngc-registry-secret]
 serviceAccount: nemo-rl-endpoint-registry
 
+labels:
+  nrl-k8s/owner: ${user:}
+
 launch:
   mode: attach
   attach:
-    training: raycluster-single-qwen3-4b
+    training: ${user:}-raycluster-single-qwen3-4b
   peerWatcher: false
   # Single-cluster: no remote_generation_url (colocated), no disagg_job_id
   # (no endpoint registry — gym is a local Ray actor).
@@ -115,7 +118,7 @@ launch:
 clusters:
   # ---------------- Training (GPU head + worker: generation + gym colocated) ----------------
   training:
-    name: raycluster-single-qwen3-4b
+    name: ${user:}-raycluster-single-qwen3-4b
     labels:
       disagg.nemo-rl/cluster: single-qwen3-4b
       disagg.nemo-rl/run: qwen3-4b-single

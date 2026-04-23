@@ -23,6 +23,7 @@ single-file recipe. Inheritance is not supported in fallback mode.
 
 from __future__ import annotations
 
+import getpass
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,17 @@ from pathlib import Path
 from omegaconf import DictConfig, OmegaConf
 
 from .schema import InfraConfig
+
+
+def get_username() -> str:
+    """Return the local OS username, sanitised for K8s resource names."""
+    raw = os.environ.get("NRL_K8S_USER") or getpass.getuser()
+    return raw.lower().replace("_", "-").replace(".", "-")
+
+
+def _register_nrl_resolvers() -> None:
+    if not OmegaConf.has_resolver("user"):
+        OmegaConf.register_new_resolver("user", lambda: get_username())
 
 _SHIPPED_DEFAULTS = Path(__file__).parent / "defaults" / "defaults.example.yaml"
 _USER_DEFAULTS = Path(
@@ -83,6 +95,7 @@ def load_recipe_with_infra(
     """
     overrides = overrides or []
     recipe_path = Path(recipe_path).resolve()
+    _register_nrl_resolvers()
 
     recipe_overrides, infra_overrides = _partition_overrides(overrides)
     recipe = _load_recipe(recipe_path, overrides=recipe_overrides)

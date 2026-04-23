@@ -80,6 +80,9 @@ image: nvcr.io/nvidian/nemo-rl:nightly
 imagePullSecrets: [nvidia-ngcuser-pull-secret, ngc-registry-secret]
 serviceAccount: nemo-rl-endpoint-registry
 
+labels:
+  nrl-k8s/owner: ${user:}
+
 submit:
   # Shell into the training head pod instead of port-forwarding the
   # dashboard to the laptop. Once `nohup` + `disown` fire the laptop is
@@ -97,8 +100,8 @@ launch:
   codeSource: image
   codePath: /opt/nemo-rl
   attach:
-    gym: raycluster-gym-disagg-gym-qwen3-4b
-    training: raycluster-gym-disagg-qwen3-4b
+    gym: ${user:}-raycluster-gym-disagg-gym-qwen3-4b
+    training: ${user:}-raycluster-gym-disagg-qwen3-4b
   peerWatcher: false
   env: {}
   # Entrypoint runs inside the training head pod under `nohup bash`.
@@ -131,7 +134,7 @@ clusters:
   # is paid once per `cluster up` and the researcher's `launch` never
   # touches it.
   gym:
-    name: raycluster-gym-disagg-gym-qwen3-4b
+    name: ${user:}-raycluster-gym-disagg-gym-qwen3-4b
     daemon:
       submissionId: qwen3-4b-gym-disagg-server-v5
       entrypoint: |
@@ -190,7 +193,7 @@ clusters:
 
   # ---------------- Training (GPU head + worker, generation colocated) ----------------
   training:
-    name: raycluster-gym-disagg-qwen3-4b
+    name: ${user:}-raycluster-gym-disagg-qwen3-4b
     labels:
       disagg.nemo-rl/cluster: gym-disagg-qwen3-4b
       disagg.nemo-rl/run: qwen3-4b-gym-disagg

@@ -84,12 +84,15 @@ image: nvcr.io/nvidian/nemo-rl:nightly
 imagePullSecrets: [nvidia-ngcuser-pull-secret, ngc-registry-secret]
 serviceAccount: nemo-rl-endpoint-registry
 
+labels:
+  nrl-k8s/owner: ${user:}
+
 launch:
   mode: attach
   attach:
-    generation: raycluster-generation-qwen3-4b
-    gym: raycluster-gym-qwen3-4b
-    training: raycluster-rl-qwen3-4b
+    generation: ${user:}-raycluster-generation-qwen3-4b
+    gym: ${user:}-raycluster-gym-qwen3-4b
+    training: ${user:}-raycluster-rl-qwen3-4b
   peerWatcher: false
   # Minimal upload set — Ray caps working_dir at 100 MiB. We include only
   # what this run needs: nemo_rl, examples, the nemo_gym subset, and the
@@ -165,7 +168,7 @@ clusters:
   # Generation — GPU head + worker, control-server on 8089.
   # -------------------------------------------------------------------------
   generation:
-    name: raycluster-generation-qwen3-4b
+    name: ${user:}-raycluster-generation-qwen3-4b
     labels:
       disagg.nemo-rl/cluster: generation-qwen3-4b
       disagg.nemo-rl/run: qwen3-4b-gym
@@ -247,7 +250,7 @@ clusters:
   # Gym — CPU-only head, gym-server on 9090.
   # -------------------------------------------------------------------------
   gym:
-    name: raycluster-gym-qwen3-4b
+    name: ${user:}-raycluster-gym-qwen3-4b
     daemon:
       submissionId: qwen3-4b-if-gym-server-v7
       # Ray runs entrypoints under /bin/dash. We stay POSIX here (no
@@ -324,7 +327,7 @@ clusters:
   # Training — GPU head + worker. Head has WANDB secret.
   # -------------------------------------------------------------------------
   training:
-    name: raycluster-rl-qwen3-4b
+    name: ${user:}-raycluster-rl-qwen3-4b
     labels:
       disagg.nemo-rl/cluster: rl-qwen3-4b
       disagg.nemo-rl/run: qwen3-4b-gym
