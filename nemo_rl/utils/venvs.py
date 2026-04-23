@@ -30,6 +30,26 @@ DEFAULT_VENV_DIR = os.path.join(git_root, "venvs")
 logger = logging.getLogger(__name__)
 
 
+def _resolve_uv_binary() -> str:
+    uv_bin = shutil.which("uv")
+    if uv_bin is not None:
+        return uv_bin
+
+    fallback_bins = (
+        "/root/.local/bin/uv",
+        "/usr/local/bin/uv",
+        "/usr/bin/uv",
+    )
+    for candidate in fallback_bins:
+        if os.path.exists(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        "uv not found on PATH and no fallback binary was present; "
+        "checked /root/.local/bin/uv, /usr/local/bin/uv, /usr/bin/uv"
+    )
+
+
 @lru_cache(maxsize=None)
 def create_local_venv(
     py_executable: str, venv_name: str, force_rebuild: bool = False
@@ -77,7 +97,8 @@ def create_local_venv(
     logger.info(f"Creating new venv at {venv_path}")
 
     # Create the virtual environment
-    uv_venv_cmd = ["uv", "venv", "--allow-existing", venv_path]
+    uv_bin = _resolve_uv_binary()
+    uv_venv_cmd = [uv_bin, "venv", "--allow-existing", venv_path]
     subprocess.run(uv_venv_cmd, check=True)
 
     # Execute the command with the virtual environment
@@ -94,7 +115,7 @@ def create_local_venv(
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
+    subprocess.run([uv_bin, "sync", "--directory", git_root], env=env, check=True)
     subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment
