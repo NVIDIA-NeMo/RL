@@ -244,7 +244,7 @@ def setup(
     policy_config = master_config.policy
     generation_config = master_config.policy["generation"]
     env_configs = master_config.env
-    loss_config = master_config.loss_fn
+    loss_config: ClippedPGLossConfig = master_config.loss_fn
     grpo_config = master_config.grpo
     data_config = master_config.data
     logger_config = master_config.logger
@@ -379,7 +379,7 @@ def setup(
     loss_fn = ClippedPGLossFn(loss_config)
 
     # Validate force_on_policy_ratio
-    if loss_config.get("force_on_policy_ratio", False):
+    if loss_config.force_on_policy_ratio:
         assert (
             grpo_config["num_prompts_per_step"]
             * grpo_config["num_generations_per_prompt"]
@@ -660,7 +660,7 @@ def setup(
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
         if generation_config["vllm_cfg"]["precision"] == "fp8":
-            assert loss_config["use_importance_sampling_correction"] is True, (
+            assert loss_config.use_importance_sampling_correction, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
         if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
