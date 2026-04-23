@@ -237,12 +237,15 @@ class MegatronConfig(TypedDict):
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
     # Offload specific module activations to CPU to reduce peak GPU memory.
-    # Works with MoE models (offloads MoE expert activations). Different from
+    # Works with both dense and MoE models. Different from
     # optimizer_cpu_offload which offloads optimizer states.
+    # Requires transformer_engine implementation.
     fine_grained_activation_offloading: NotRequired[bool]
     # Modules to offload when fine_grained_activation_offloading is True.
-    # Defaults to ["moe_act"] if not specified. Valid values include:
-    # "moe_act", "core_attn", "qkv_linear", "mlp_norm", "attn_norm".
+    # Required (no default). Valid values:
+    # "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm",
+    # "expert_fc1", "moe_act". Note: "attn_proj" requires "core_attn".
+    # See: https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L1440-L1448
     offload_modules: NotRequired[list[str]]
     peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
