@@ -66,18 +66,28 @@ def format_prompt_for_vllm_generation(
                 continue
             # init prompt dict
             prompt_dict = {"prompt": msg}
-            # add additional data if present
+            # collect multi_modal_data from images and audios
+            multi_modal_data = {}
             images = data.get("vllm_images", None)
-            if images is None or len(images[i]) == 0:
+            if images is not None and len(images[i]) > 0:
+                multi_modal_data["image"] = (
+                    images[i][0] if len(images[i]) == 1 else images[i]
+                )
+            audios = data.get("vllm_audios", None)
+            if audios is not None and len(audios[i]) > 0:
+                multi_modal_data["audio"] = (
+                    audios[i][0] if len(audios[i]) == 1 else audios[i]
+                )
+            if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
                 continue
-            else:
-                prompt_dict["multi_modal_data"] = {
-                    "image": images[i][0] if len(images[i]) == 1 else images[i]
-                }
+            prompt_dict["multi_modal_data"] = multi_modal_data
             prompts.append(prompt_dict)
     else:
-        # Regular LLM generation using token_ids
+        # Regular LLM generation using token_ids (pre-tokenized).
+        # Note: eval.py uses raw prompt strings instead of token IDs because its
+        # collate function produces message_log dicts, not tokenized tensors.
+        # Both are valid vLLM input formats but may tokenize slightly differently.
         for i in range(start_idx, end_idx):
             # Use input_lengths to get only valid tokens (not padding)
             prompts.append(_get_regular_prompt(i))

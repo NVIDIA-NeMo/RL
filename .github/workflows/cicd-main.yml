@@ -480,6 +480,24 @@ jobs:
           SUMMARY=$(echo $JOB_RESULTS | jq 'to_entries[] | .key + ": " + .value.result' | tr -d '"')
           echo '🤖: CICD Result for test level: ${{ needs.pre-flight.outputs.test_level }}' >> $GITHUB_STEP_SUMMARY
           echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$TEST_LEVEL" == "none" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **No tests were run.** This PR does not have a CI label." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "To trigger tests, add one of the following labels to your PR:" >> $GITHUB_STEP_SUMMARY
+            echo "| Label | What it runs |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------|-------------|" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:docs\` | Doc tests only |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:Lfast\` | Fast subset (reuses main container) |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:L0\` | Unit tests + docs + lint |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:L1\` | L0 + functional tests |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:L2\` | L1 + convergence tests |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "This check will remain failed until a CI label is added." >> $GITHUB_STEP_SUMMARY
+          fi
+
           test "$ALL_SUCCESS" = "true" || test "$CI_SKIP" = "true"
 
   notify-nightly-failure:
@@ -519,6 +537,11 @@ jobs:
       matrix:
         flag: [doc-test, unit-test, e2e]
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -564,6 +587,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
+          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
         if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, NotRequired, TypedDict
+from typing import Literal, NotRequired, TypedDict, Union
 
 
 class ResponseDatasetConfig(TypedDict):
@@ -166,12 +166,24 @@ class LocalMathEvalDataConfig(TypedDict):
     system_prompt_file: NotRequired[str | None]
 
 
+class MMAUEvalDataConfig(TypedDict):
+    """Config for MMAU (Massive Multitask Audio Understanding) datasets."""
+
+    max_input_seq_length: int
+    dataset_name: Literal["mmau", "TwinkStart/MMAU"]
+    split: NotRequired[str | None]
+    prompt_file: NotRequired[str | None]
+    system_prompt_file: NotRequired[str | None]
+    env_name: NotRequired[str]
+
+
 # Union type for all eval dataset configs
-EvalDataConfigType = (
-    MMLUEvalDataConfig
-    | MMLUProEvalDataConfig
-    | AIMEEvalDataConfig
-    | GPQAEvalDataConfig
-    | MathEvalDataConfig
-    | LocalMathEvalDataConfig
-)
+EvalDataConfigType = Union[
+    MMLUEvalDataConfig,
+    MMLUProEvalDataConfig,
+    AIMEEvalDataConfig,
+    GPQAEvalDataConfig,
+    MathEvalDataConfig,
+    MMAUEvalDataConfig,
+    LocalMathEvalDataConfig,
+]
