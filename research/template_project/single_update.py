@@ -63,7 +63,7 @@ ACTOR_ENVIRONMENT_REGISTRY[
 
 def main(config: MasterConfig) -> None:
     # 0) Config
-    policy_config = config["policy"]
+    policy_config = config.policy
     tokenizer = get_tokenizer(policy_config["tokenizer"])
     policy_config["generation"] = configure_generation_config(
         policy_config["generation"], tokenizer
@@ -124,7 +124,7 @@ def main(config: MasterConfig) -> None:
 
     # Create tiny numeric batch and train with NLLLossFn
     print("\n▶ Creating tiny numeric batch and training with NLLLossFn...")
-    train_sentences = ["a b c d e hello", "a d f world"] * config["policy"][
+    train_sentences = ["a b c d e hello", "a d f world"] * config.policy[
         "train_global_batch_size"
     ]
     generation_prompts = [

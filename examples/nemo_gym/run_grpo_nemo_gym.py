@@ -81,13 +81,13 @@ def collect_trajectories(
 ) -> None:
     """Run trajectory collection."""
     # common config/state items
-    colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_policy_generation(policy, policy_generation, colocated_inference)
 
     log_filename = "trajectory_collection.jsonl"
 
     print("\n🔍 Running trajectory collection...", flush=True)
-    generation_config = master_config["policy"]["generation"]
+    generation_config = master_config.policy["generation"]
     for val_batch in val_dataloader:
         nemo_gym_rollout_result = run_async_nemo_gym_rollout(
             policy_generation=policy_generation,
@@ -136,24 +136,25 @@ def main() -> None:
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
-    config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
-    print(f"📊 Using log directory: {config['logger']['log_dir']}")
-    if config["checkpointing"]["enabled"]:
+    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    if config.checkpointing["enabled"]:
         print(
-            f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
+            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-    assert config["policy"]["generation"] is not None, (
+    tokenizer = get_tokenizer(config.policy["tokenizer"])
+    assert config.policy["generation"] is not None, (
         "A generation config is required for GRPO"
     )
-    config["policy"]["generation"] = configure_generation_config(
-        config["policy"]["generation"], tokenizer
+    config.policy["generation"] = configure_generation_config(
+        config.policy["generation"], tokenizer
     )
 
     # NeMo-Gym specific config setup.
@@ -165,11 +166,11 @@ def main() -> None:
     # NeMo-Gym environment needs to get dp_openai_server_base_urls from policy_generation, so we don't setup env here.
     print("\n▶ Setting up data...")
     train_dataset, val_dataset = setup_response_data(
-        tokenizer, config["data"], env_configs=None
+        tokenizer, config.data, env_configs=None
     )
 
     # Validation dataset config setup.
-    if config["grpo"]["max_val_samples"] is not None:
+    if config.grpo["max_val_samples"] is not None:
         raise ValueError(
             """A non-null `grpo.max_val_samples` parameter is not supported.
 
@@ -182,8 +183,8 @@ The validation set you pass in will directly be used for validation with no addi
         print(
             f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
         )
-        config["grpo"]["max_val_samples"] = len(val_dataset)
-        config["grpo"]["val_batch_size"] = config["grpo"]["max_val_samples"]
+        config.grpo["max_val_samples"] = len(val_dataset)
+        config.grpo["val_batch_size"] = config.grpo["max_val_samples"]
 
     # Print config
     print("Final config:")
@@ -205,12 +206,12 @@ The validation set you pass in will directly be used for validation with no addi
     ) = setup(config, tokenizer, train_dataset, val_dataset)
 
     is_trajectory_collection = (
-        config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False
+        config.env["nemo_gym"].pop("is_trajectory_collection", False) or False
     )
     nemo_gym_config = NemoGymConfig(
         model_name=policy_generation.cfg["model_name"],
         base_urls=policy_generation.dp_openai_server_base_urls,
-        initial_global_config_dict=config["env"]["nemo_gym"],
+        initial_global_config_dict=config.env["nemo_gym"],
     )
     nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
     # Blocking wait for NeMo-Gym to spin up
@@ -232,7 +233,7 @@ The validation set you pass in will directly be used for validation with no addi
             master_config=master_config,
         )
     # Check if async mode is enabled
-    elif "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:
+    elif "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
         # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
         unsupported_features = [
             "use_dynamic_sampling",
@@ -241,22 +242,22 @@ The validation set you pass in will directly be used for validation with no addi
         ]
 
         for feature in unsupported_features:
-            if feature not in config["grpo"]:
+            if feature not in config.grpo:
                 continue
 
             if feature == "use_dynamic_sampling":
-                if config["grpo"][feature]:
+                if config.grpo[feature]:
                     raise NotImplementedError(
                         f"{feature} is not supported with async GRPO"
                     )
             else:
-                if config["grpo"][feature]["enabled"]:
+                if config.grpo[feature]["enabled"]:
                     raise NotImplementedError(
                         f"{feature} is not supported with async GRPO"
                     )
 
         # Async GRPO does not support multiple dataloaders
-        if config["data"]["use_multiple_dataloader"]:
+        if config.data["use_multiple_dataloader"]:
             raise NotImplementedError(
                 "use_multiple_dataloader is not supported with async GRPO"
             )
@@ -265,7 +266,7 @@ The validation set you pass in will directly be used for validation with no addi
 
         print("🚀 Running async GRPO training")
 
-        async_config = config["grpo"]["async_grpo"]
+        async_config = config.grpo["async_grpo"]
         # Run async GRPO training
         async_grpo_train(
             policy=policy,

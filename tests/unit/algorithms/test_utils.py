@@ -312,7 +312,7 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
 
 def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     master_config = _base_master_config(colocated=False)
-    master_config["async_grpo"] = {"enabled": True}
+    master_config.grpo["async_grpo"] = {"enabled": True}
 
     timing_metrics = {
         "policy_and_reference_logprobs": 2.0,

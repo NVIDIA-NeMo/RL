@@ -1277,7 +1277,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
             restore_config = deepcopy(initial_config)
 
             # Check if the optimizer exists in the checkpoint
-            # checkpointer = CheckpointManager(restore_config["checkpointing"])
+            # checkpointer = CheckpointManager(restore_config.checkpointing)
             weights_path, optimizer_path = CheckpointManager.get_resume_paths(
                 checkpoint_dir
             )

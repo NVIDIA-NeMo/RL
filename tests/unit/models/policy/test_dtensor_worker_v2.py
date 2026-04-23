@@ -126,7 +126,7 @@ def create_test_config(
     if automodel_kwargs is not None:
         config["dtensor_cfg"]["automodel_kwargs"] = automodel_kwargs
     if checkpointing is not None:
-        config["checkpointing"] = checkpointing
+        config.checkpointing = checkpointing
     return config
 
 

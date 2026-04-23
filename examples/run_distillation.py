@@ -60,18 +60,20 @@ def main() -> None:
     if overrides:
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
+    print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
-    config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
+    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
 
     init_ray()
 
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+    tokenizer = get_tokenizer(config.policy["tokenizer"])
 
-    if config["policy"]["generation"] is not None:
-        config["policy"]["generation"] = configure_generation_config(
-            config["policy"]["generation"], tokenizer
+    if config.policy["generation"] is not None:
+        config.policy["generation"] = configure_generation_config(
+            config.policy["generation"], tokenizer
         )
     else:
         print("  ⚠️ No generation config found, this may cause issues")
@@ -82,7 +84,7 @@ def main() -> None:
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_response_data(tokenizer, config["data"], config["env"])
+    ) = setup_response_data(tokenizer, config.data, config.env)
 
     (
         student_policy,
