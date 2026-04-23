@@ -183,7 +183,7 @@ class GenerationControlServer:
 
                 def _do():
                     state_dict_info = torch.load(
-                        io.BytesIO(body_bytes), weights_only=False
+                        io.BytesIO(body_bytes), weights_only=True
                     )
                     self.generation.prepare_refit_info(state_dict_info)
 

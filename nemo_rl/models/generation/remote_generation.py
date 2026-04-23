@@ -52,7 +52,7 @@ _HTTP_TIMEOUT = 600
 
 
 @ray.remote(num_cpus=0)
-def _http_call_blocking(url: str, json_body: dict | None = None, raw_body: bytes | None = None, timeout: int = _HTTP_TIMEOUT) -> dict:
+def _http_call_blocking(url: str, json_body: dict | None = None, raw_body: bytes | None = None, timeout: int = _HTTP_TIMEOUT) -> dict:  # pragma: no cover
     """Fire-and-forget HTTP POST wrapped in a Ray task.
 
     Returns the JSON response dict. Using a Ray remote function lets the
@@ -379,7 +379,7 @@ class RemoteGeneration(GenerationInterface):
 
         try:
             requests.post(f"{self.server_url}/clear_logger_metrics", timeout=30)
-        except Exception:
+        except requests.RequestException:
             pass
 
     def get_logger_metrics(self) -> dict[str, Any]:
@@ -390,7 +390,7 @@ class RemoteGeneration(GenerationInterface):
             resp = requests.get(f"{self.server_url}/get_logger_metrics", timeout=30)
             resp.raise_for_status()
             return resp.json()
-        except Exception:
+        except requests.RequestException:
             return {}
 
     def snapshot_step_metrics(self) -> None:
@@ -401,7 +401,7 @@ class RemoteGeneration(GenerationInterface):
 
         try:
             requests.post(f"{self.server_url}/snapshot_step_metrics", timeout=30)
-        except Exception:
+        except requests.RequestException:
             pass
 
     def get_step_metrics(self) -> dict[str, float]:
@@ -414,5 +414,5 @@ class RemoteGeneration(GenerationInterface):
             resp = requests.get(f"{self.server_url}/get_step_metrics", timeout=30)
             resp.raise_for_status()
             return resp.json()
-        except Exception:
+        except requests.RequestException:
             return {}
