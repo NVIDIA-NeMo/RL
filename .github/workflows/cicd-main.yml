@@ -537,6 +537,11 @@ jobs:
       matrix:
         flag: [doc-test, unit-test, e2e]
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -582,6 +587,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
+          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
         if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}

@@ -34,18 +34,24 @@ def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> N
         token_ids: List of token IDs
         tokenizer: Tokenizer
     """
-    if tokenizer.bos_token_id is not None:
+    # AutoProcessor wraps a tokenizer; unwrap if needed
+    if isinstance(tokenizer, PreTrainedTokenizerBase):
+        _tok = tokenizer
+    elif hasattr(tokenizer, "tokenizer"):
+        _tok = tokenizer.tokenizer
+    else:
+        raise TypeError(f"Unsupported tokenizer type: {type(tokenizer)}")
+
+    if _tok.bos_token_id is not None:
         token_ids_list = token_ids.tolist()
         if len(token_ids_list) > 1:
             assert not (
-                token_ids_list[0] == tokenizer.bos_token_id
-                and token_ids_list[1] == tokenizer.bos_token_id
+                token_ids_list[0] == _tok.bos_token_id
+                and token_ids_list[1] == _tok.bos_token_id
             ), "Found double BOS token in the first two positions of the message."
     else:
-        # `name_or_path` is not available for AutoProcessor, temp fix in get_tokenizer
-        print(
-            f"skip assert_start_single_bos since Tokenizer {tokenizer.name_or_path} has no BOS token"
-        )
+        name = getattr(_tok, "name_or_path", str(type(_tok).__name__))
+        print(f"skip assert_start_single_bos since Tokenizer {name} has no BOS token")
 
 
 def pil_to_base64(image: Image.Image, format: str = "PNG") -> str:

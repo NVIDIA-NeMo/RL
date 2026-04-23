@@ -1,22 +1,32 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
+# disable NVLS to avoid OOM issue
+export NCCL_NVLS_ENABLE=0
+
+# Use the DeepSeek-V3 checkpoint converted to BF16.
+if [[ -z "$NRL_DEEPSEEK_V3_BF16_CKPT" ]]; then
+    echo "Need to set NRL_DEEPSEEK_V3_BF16_CKPT to the path of DeepSeek-V3 checkpoint converted to BF16. See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/deepseek.md for more details."
+    exit 1
+fi
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=2
-STEPS_PER_RUN=20
-MAX_STEPS=20
+NUM_NODES=64
+STEPS_PER_RUN=10
+MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=120
+NUM_MINUTES=240
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_distillation.py \
+uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
-    distillation.max_num_steps=$MAX_STEPS \
+    grpo.max_num_steps=$MAX_STEPS \
+    policy.model_name=$NRL_DEEPSEEK_V3_BF16_CKPT \
+    policy.tokenizer.name=$NRL_DEEPSEEK_V3_BF16_CKPT \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
@@ -34,10 +44,8 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] < 1.5' \
-        'data["train/loss"]["20"] < 0.3' \
-        'data["validation/accuracy"]["20"] > 0.075' \
-        'mean(data["timing/train/total_step_time"], -6, -1) < 1000'
+        'median(data["train/token_mult_prob_error"]) < 1.1' \
+        'data["train/token_mult_prob_error"]["10"] < 1.1'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
