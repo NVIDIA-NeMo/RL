@@ -32,7 +32,12 @@ from ray.job_submission import JobStatus, JobSubmissionClient
 
 from . import k8s, submit, workdir
 from .config import LoadedConfig, get_username
-from .manifest import build_raycluster_manifest
+from .manifest import (
+    build_compute_domain_manifest,
+    build_raycluster_manifest,
+    build_roce_template_manifest,
+    dra_resources_for_cluster,
+)
 from .schema import ClusterSpec, CodeSource, InfraConfig, SubmitterMode
 from .submitters import SubmissionHandle, build_submitter, save_handle
 
@@ -74,10 +79,11 @@ def bring_up_cluster(
 ) -> str:
     """Apply the RayCluster for ``role`` and wait for it to be ready."""
     cluster = _require_cluster(loaded.infra, role)
-    manifest = build_raycluster_manifest(cluster, loaded.infra)
+    manifest = build_raycluster_manifest(cluster, loaded.infra, role=role)
     name = cluster.name
     namespace = loaded.infra.namespace
 
+    ensure_dra_resources(role, loaded, log=log)
     log(f"[{role}] applying RayCluster {name} in namespace {namespace}")
     k8s.apply_raycluster(manifest, namespace)
 
@@ -106,7 +112,7 @@ def ensure_cluster(
     and reuse anyway — pass ``recreate=True`` to delete + re-apply instead.
     """
     cluster = _require_cluster(loaded.infra, role)
-    manifest = build_raycluster_manifest(cluster, loaded.infra)
+    manifest = build_raycluster_manifest(cluster, loaded.infra, role=role)
     name = cluster.name
     namespace = loaded.infra.namespace
 
@@ -122,6 +128,7 @@ def ensure_cluster(
                 f"'{live_owner}' (you are '{me}'). Use a different cluster "
                 f"name or ask {live_owner} to tear it down."
             )
+    ensure_dra_resources(role, loaded, log=log)
     if live is None:
         log(f"[{role}] applying RayCluster {name} in namespace {namespace}")
         k8s.apply_raycluster(manifest, namespace)
@@ -179,6 +186,52 @@ def _strip_server_fields(obj):
     if isinstance(obj, list):
         return [_strip_server_fields(v) for v in obj]
     return obj
+
+
+def ensure_dra_resources(
+    role: Role,
+    loaded: LoadedConfig,
+    *,
+    log: callable,
+) -> None:
+    """Create ComputeDomain / RoCE ResourceClaimTemplate if the spec needs them."""
+    cluster = _get_cluster(loaded.infra, role)
+    if cluster is None:
+        return
+    namespace = loaded.infra.namespace
+    resources = dra_resources_for_cluster(cluster.name, role, cluster.spec)
+    for kind, name in resources:
+        if kind == "compute-domain":
+            log(f"[{role}] ensuring ComputeDomain {name}")
+            k8s.apply_compute_domain(
+                build_compute_domain_manifest(name, namespace), namespace
+            )
+        elif kind == "roce":
+            log(f"[{role}] ensuring RoCE ResourceClaimTemplate {name}")
+            k8s.apply_resource_claim_template(
+                build_roce_template_manifest(name, namespace), namespace
+            )
+
+
+def delete_dra_resources(
+    role: Role,
+    loaded: LoadedConfig,
+    *,
+    log: callable,
+) -> None:
+    """Delete DRA resources for a role."""
+    cluster = _get_cluster(loaded.infra, role)
+    if cluster is None:
+        return
+    namespace = loaded.infra.namespace
+    resources = dra_resources_for_cluster(cluster.name, role, cluster.spec)
+    for kind, name in reversed(resources):
+        if kind == "roce":
+            log(f"[{role}] deleting RoCE ResourceClaimTemplate {name}")
+            k8s.delete_resource_claim_template(name, namespace)
+        elif kind == "compute-domain":
+            log(f"[{role}] deleting ComputeDomain {name}")
+            k8s.delete_compute_domain(name, namespace)
 
 
 def submit_daemon(

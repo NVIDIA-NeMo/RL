@@ -24,7 +24,10 @@ from .schema import ClusterSpec, InfraConfig
 
 
 def build_raycluster_manifest(
-    cluster: ClusterSpec, infra: InfraConfig
+    cluster: ClusterSpec,
+    infra: InfraConfig,
+    *,
+    role: str | None = None,
 ) -> dict[str, Any]:
     """Build the full RayCluster dict for apply.
 
@@ -33,6 +36,10 @@ def build_raycluster_manifest(
         infra: top-level InfraConfig — supplies namespace, image, pull secrets,
             optional serviceAccount. These are patched into every container /
             pod template in the spec.
+        role: cluster role name (``training``, ``generation``, ``gym``). When
+            provided, DRA ``resourceClaimTemplateName`` references in worker
+            pods are rewritten to deterministic names derived from the cluster
+            name and role.
 
     Returns:
         A dict suitable for ``CustomObjectsApi.create_namespaced_custom_object``.
@@ -43,6 +50,11 @@ def build_raycluster_manifest(
     _patch_image_pull_secrets(spec, list(infra.imagePullSecrets))
     if infra.serviceAccount is not None:
         _patch_service_account(spec, infra.serviceAccount)
+    # DRA resources are named {prefix}-{cluster_name}-{role} so that
+    # disaggregated setups with multiple clusters get distinct
+    # ComputeDomains and RoCE templates per role.
+    if role is not None:
+        _rewrite_dra_template_names(spec, cluster.name, role)
 
     metadata: dict[str, Any] = {
         "name": cluster.name,
@@ -101,4 +113,96 @@ def _patch_service_account(raycluster_spec: dict, service_account: str) -> None:
         pod_spec["serviceAccountName"] = service_account
 
 
-__all__ = ["build_raycluster_manifest"]
+# =============================================================================
+# DRA: detect and rewrite resourceClaimTemplateName in worker pods
+# =============================================================================
+
+_DRA_CLAIM_PREFIX: dict[str, str] = {
+    "compute-domain-channel": "compute-domain-",
+    "roce-channel": "roce-",
+}
+
+
+def _rewrite_dra_template_names(
+    spec: dict, cluster_name: str, role: str
+) -> None:
+    """Rewrite ``resourceClaimTemplateName`` in worker pods to deterministic names."""
+    for wg in spec.get("workerGroupSpecs") or []:
+        pod_spec = wg.get("template", {}).get("spec")
+        if not isinstance(pod_spec, dict):
+            continue
+        for claim in pod_spec.get("resourceClaims") or []:
+            prefix = _DRA_CLAIM_PREFIX.get(claim.get("name", ""))
+            if prefix:
+                claim["resourceClaimTemplateName"] = (
+                    f"{prefix}{cluster_name}-{role}"
+                )
+
+
+def dra_resources_for_cluster(
+    cluster_name: str, role: str, spec: dict
+) -> list[tuple[str, str]]:
+    """Return ``[(kind, name), ...]`` for DRA resources a cluster spec needs.
+
+    ``kind`` is ``"compute-domain"`` or ``"roce"``. Scans every worker pod
+    template for well-known claim names.
+    """
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for wg in spec.get("workerGroupSpecs") or []:
+        pod_spec = wg.get("template", {}).get("spec")
+        if not isinstance(pod_spec, dict):
+            continue
+        for claim in pod_spec.get("resourceClaims") or []:
+            claim_name = claim.get("name", "")
+            prefix = _DRA_CLAIM_PREFIX.get(claim_name)
+            if prefix and claim_name not in seen:
+                seen.add(claim_name)
+                resource_name = f"{prefix}{cluster_name}-{role}"
+                kind = "compute-domain" if "compute-domain" in prefix else "roce"
+                found.append((kind, resource_name))
+    return found
+
+
+def build_compute_domain_manifest(name: str, namespace: str) -> dict[str, Any]:
+    return {
+        "apiVersion": "resource.nvidia.com/v1beta1",
+        "kind": "ComputeDomain",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {
+            "channel": {"resourceClaimTemplate": {"name": name}},
+            "numNodes": 0,
+        },
+    }
+
+
+def build_roce_template_manifest(name: str, namespace: str) -> dict[str, Any]:
+    # TODO: expose roce count via infra config — hardcoded to 8 for now
+    return {
+        "apiVersion": "resource.k8s.io/v1",
+        "kind": "ResourceClaimTemplate",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {
+            "spec": {
+                "devices": {
+                    "requests": [
+                        {
+                            "exactly": {
+                                "count": 8,
+                                "deviceClassName": "roce.networking.k8s.aws",
+                            },
+                            "name": "roce",
+                        }
+                    ],
+                },
+            },
+        },
+    }
+
+
+__all__ = [
+    "build_compute_domain_manifest",
+    "build_raycluster_manifest",
+    "build_roce_template_manifest",
+    "dra_resources_for_cluster",
+]

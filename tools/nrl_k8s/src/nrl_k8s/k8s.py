@@ -302,6 +302,104 @@ def delete_configmap(name: str, namespace: str, *, ignore_missing: bool = True) 
         raise
 
 
+# =============================================================================
+# DRA: ComputeDomain + ResourceClaimTemplate
+# =============================================================================
+
+COMPUTE_DOMAIN_GROUP = "resource.nvidia.com"
+COMPUTE_DOMAIN_VERSION = "v1beta1"
+COMPUTE_DOMAIN_PLURAL = "computedomains"
+
+RCT_GROUP = "resource.k8s.io"
+RCT_VERSION = "v1"
+RCT_PLURAL = "resourceclaimtemplates"
+
+
+def apply_compute_domain(manifest: dict[str, Any], namespace: str) -> dict[str, Any]:
+    """Create a ComputeDomain. No-op on 409 (already exists)."""
+    api = custom_objects_api()
+    try:
+        return with_retries(
+            lambda: api.create_namespaced_custom_object(
+                group=COMPUTE_DOMAIN_GROUP,
+                version=COMPUTE_DOMAIN_VERSION,
+                namespace=namespace,
+                plural=COMPUTE_DOMAIN_PLURAL,
+                body=manifest,
+            )
+        )
+    except ApiException as exc:
+        if exc.status == 409:
+            return {}
+        raise
+
+
+def delete_compute_domain(
+    name: str, namespace: str, *, ignore_missing: bool = True
+) -> None:
+    api = custom_objects_api()
+    try:
+        with_retries(
+            lambda: api.delete_namespaced_custom_object(
+                group=COMPUTE_DOMAIN_GROUP,
+                version=COMPUTE_DOMAIN_VERSION,
+                namespace=namespace,
+                plural=COMPUTE_DOMAIN_PLURAL,
+                name=name,
+            )
+        )
+    except ApiException as exc:
+        if exc.status == 404 and ignore_missing:
+            return
+        raise
+
+
+def apply_resource_claim_template(
+    manifest: dict[str, Any], namespace: str
+) -> dict[str, Any]:
+    """Create a ResourceClaimTemplate. No-op on 409 (already exists)."""
+    api = custom_objects_api()
+    try:
+        return with_retries(
+            lambda: api.create_namespaced_custom_object(
+                group=RCT_GROUP,
+                version=RCT_VERSION,
+                namespace=namespace,
+                plural=RCT_PLURAL,
+                body=manifest,
+            )
+        )
+    except ApiException as exc:
+        if exc.status == 409:
+            return {}
+        raise
+
+
+def delete_resource_claim_template(
+    name: str, namespace: str, *, ignore_missing: bool = True
+) -> None:
+    api = custom_objects_api()
+    try:
+        with_retries(
+            lambda: api.delete_namespaced_custom_object(
+                group=RCT_GROUP,
+                version=RCT_VERSION,
+                namespace=namespace,
+                plural=RCT_PLURAL,
+                name=name,
+            )
+        )
+    except ApiException as exc:
+        if exc.status == 404 and ignore_missing:
+            return
+        raise
+
+
+# =============================================================================
+# Pod helpers
+# =============================================================================
+
+
 def get_head_pod(cluster_name: str, namespace: str) -> Any:
     """Return the first ``Running`` head pod for a RayCluster.
 
@@ -328,12 +426,16 @@ def get_head_pod(cluster_name: str, namespace: str) -> Any:
 
 
 __all__ = [
+    "apply_compute_domain",
     "apply_raycluster",
     "apply_rayjob",
+    "apply_resource_claim_template",
     "custom_objects_api",
+    "delete_compute_domain",
     "delete_configmap",
     "delete_raycluster",
     "delete_rayjob",
+    "delete_resource_claim_template",
     "get_head_pod",
     "get_raycluster",
     "get_rayjob",

@@ -29,6 +29,7 @@ def build_rayjob_manifest(
     infra: InfraConfig,
     *,
     entrypoint: str,
+    role: str = "training",
     name: str | None = None,
     shutdown_after_finishes: bool = True,
     ttl_seconds_after_finished: int = DEFAULT_TTL_SECONDS,
@@ -64,7 +65,7 @@ def build_rayjob_manifest(
     # Reuse the RayCluster builder so image / imagePullSecrets / SA / labels
     # are patched the same way as the standalone cluster path. Then lift
     # the .spec out; RayJob nests it under rayClusterSpec.
-    cluster_manifest = build_raycluster_manifest(cluster, infra)
+    cluster_manifest = build_raycluster_manifest(cluster, infra, role=role)
     ray_cluster_spec = cluster_manifest["spec"]
 
     job_name = name or cluster.name

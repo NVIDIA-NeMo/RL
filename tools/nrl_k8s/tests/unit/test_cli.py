@@ -420,6 +420,7 @@ class TestRunCommand:
             [
                 "run",
                 str(recipe),
+                "--raycluster",
                 "--mode", "batch",
                 "--code-source", "image",
                 "--code-path", "/opt/nemo-rl",

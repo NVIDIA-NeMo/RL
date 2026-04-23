@@ -2,13 +2,9 @@
 #
 # Topology: 8 workers × 4 GPUs = 32 GPUs in a single RayCluster, scheduled by
 # KAI as one gang. NVLink/MNNVL spans all 32 GPUs via a ComputeDomain channel,
-# and NCCL rides 8× RoCE NICs per node — both are attached through Dynamic
-# Resource Allocation (DRA), so ResourceClaimTemplates must already exist:
-#
-#   compute-domain-qwen3-30b-math  — ComputeDomain channel (1 per pod),
-#                                    driver compute-domain.nvidia.com,
-#                                    allocationMode Single (shared across pods).
-#   roce-qwen3-30b-math            — 8× roce.networking.k8s.aws per pod.
+# and NCCL rides 8× RoCE NICs per node — both attached through DRA. The CLI
+# auto-creates and auto-deletes the ComputeDomain + RoCE ResourceClaimTemplate
+# based on the resourceClaims in the worker pod spec.
 #
 # Submission is prod-shaped (mirrors qwen3_4b_if_single.gb300.prod.infra.yaml):
 #   submit.submitter    portForward   — Ray Job SDK via kubectl port-forward.
@@ -23,8 +19,6 @@
 #   - /mnt/rl-workspace/${user:}/rl-k8s contains a git checkout of
 #     https://github.com/NVIDIA-NeMo/RL on branch hemil/k8s-infra-cp.
 #   - nvcr-secret, wandb-api-key, nemo-rl-endpoint-registry all present.
-#   - ResourceClaimTemplates compute-domain-qwen3-30b-math and
-#     roce-qwen3-30b-math exist in the `default` namespace.
 #   - KAI topology `gb300-topology` is registered and advertises
 #     nvidia.com/gpu.clique as a placement key.
 #

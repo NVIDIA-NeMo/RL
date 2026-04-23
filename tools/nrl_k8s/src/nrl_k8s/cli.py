@@ -213,7 +213,7 @@ def check(
         cluster = getattr(loaded.infra.clusters, role)
         if cluster is None:
             continue
-        manifests[role] = build_raycluster_manifest(cluster, loaded.infra)
+        manifests[role] = build_raycluster_manifest(cluster, loaded.infra, role=role)
 
     if output_path is not None:
         _dump_check_output(loaded, manifests, output_path, output_format)
@@ -374,12 +374,13 @@ def validate(ctx, recipe, overrides, infra_path) -> None:
     "submit training — skip daemons on gym/generation roles.",
 )
 @click.option(
-    "--rayjob",
+    "--rayjob/--raycluster",
     "as_rayjob",
-    is_flag=True,
-    help="Submit as an ephemeral KubeRay RayJob (auto-teardown) instead of "
-    "attaching to a long-lived RayCluster. Ignores --replace/--recreate/"
-    "--skip-daemons (they're not applicable).",
+    default=True,
+    help="--rayjob (default): submit as an ephemeral KubeRay RayJob that "
+    "auto-tears down the cluster when the job finishes. --raycluster: "
+    "attach to a long-lived RayCluster (supports --replace/--recreate/"
+    "--skip-daemons).",
 )
 @click.option(
     "--rayjob-name",
@@ -442,24 +443,24 @@ def run(
     cli_run_id: str | None,
     cli_wait: bool | None,
 ) -> None:
-    """Submit a recipe to the cluster. Long-lived by default, ephemeral with ``--rayjob``.
+    """Submit a recipe to the cluster. Ephemeral by default, long-lived with ``--raycluster``.
 
-    **Long-lived mode (default)** — idempotent: for each declared role,
-    reuse the live RayCluster when its spec matches the rendered manifest,
-    apply when it is absent, warn + reuse on drift (pass ``--recreate`` to
-    delete + re-apply). Then submit daemons and the training entrypoint.
-    Cluster stays up for subsequent ``nrl-k8s run`` invocations.
-    ``--mode interactive`` (default) uses port-forward + working_dir upload
-    and tails logs; ``--mode batch`` uses kubectl exec + in-image code and
-    returns as soon as the driver is running via nohup.
-
-    **Ephemeral mode (``--rayjob``)** — submits the recipe as a KubeRay
-    RayJob. KubeRay creates the RayCluster, submits
+    **Ephemeral mode (``--rayjob``, default)** — submits the recipe as a
+    KubeRay RayJob. KubeRay creates the RayCluster, submits
     ``infra.launch.entrypoint`` over the dashboard HTTP API, polls until
     the driver is terminal, then tears the cluster down.
     ``shutdownAfterJobFinishes=true`` by default. Pass ``--no-wait`` to
     return as soon as the RayJob is applied, ``--dry-run`` to render the
     manifest without applying.
+
+    **Long-lived mode (``--raycluster``)** — idempotent: for each declared
+    role, reuse the live RayCluster when its spec matches the rendered
+    manifest, apply when it is absent, warn + reuse on drift (pass
+    ``--recreate`` to delete + re-apply). Then submit daemons and the
+    training entrypoint. Cluster stays up for subsequent ``nrl-k8s run``
+    invocations. ``--mode interactive`` (default) uses port-forward +
+    working_dir upload and tails logs; ``--mode batch`` uses kubectl exec +
+    in-image code and returns as soon as the driver is running via nohup.
     """
     from . import orchestrate
     from . import submit as submit_mod
@@ -539,6 +540,7 @@ def _run_rayjob(
 ) -> None:
     """``nrl-k8s run --rayjob`` path. KubeRay owns the RayCluster lifecycle."""
     from . import k8s
+    from . import orchestrate
     from . import submit as submit_mod
     from .rayjob import build_rayjob_manifest
 
@@ -547,6 +549,7 @@ def _run_rayjob(
         cluster,
         loaded.infra,
         entrypoint=loaded.infra.launch.entrypoint,
+        role="training",
         name=name,
         shutdown_after_finishes=shutdown_after,
         ttl_seconds_after_finished=ttl_seconds,
@@ -561,6 +564,7 @@ def _run_rayjob(
     if not submit_mod.is_in_cluster():
         _preflight_or_exit(namespace)
 
+    orchestrate.ensure_dra_resources("training", loaded, log=click.echo)
     click.echo(f"[run --rayjob] applying RayJob {job_name} in {namespace}")
     try:
         k8s.apply_rayjob(manifest, namespace)
@@ -596,6 +600,7 @@ def _run_rayjob(
     click.echo(f"[run --rayjob] {job_name} finished: deployment={dep} job={job_status}")
     if message:
         click.echo(f"[run --rayjob] message: {message}")
+    orchestrate.delete_dra_resources("training", loaded, log=click.echo)
     sys.exit(0 if dep == "Complete" else 1)
 
 
@@ -756,7 +761,7 @@ def cluster_up(
     loaded = _load_or_exit(recipe, overrides, infra_path)
     cluster_spec = _pick_cluster_or_exit(loaded, role)
     if dry_run:
-        manifest = build_raycluster_manifest(cluster_spec, loaded.infra)
+        manifest = build_raycluster_manifest(cluster_spec, loaded.infra, role=role)
         click.echo(yaml.safe_dump(manifest, sort_keys=False).rstrip())
         return
 
@@ -835,6 +840,11 @@ def cluster_down(
     if wait:
         k8s.wait_for_raycluster_gone(target, namespace)
     click.echo(f"RayCluster {target} deleted.")
+
+    if role:
+        from . import orchestrate
+
+        orchestrate.delete_dra_resources(role, loaded, log=click.echo)
 
 
 @cluster.command("list")
