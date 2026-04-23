@@ -243,7 +243,7 @@ def setup(
     # Extract individual configs for easier access
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
-    loss_config = master_config.loss_fn
+    loss_config: ClippedPGLossConfig = master_config.loss_fn
     env_configs = master_config.env
     data_config = master_config.data
     grpo_config = master_config.grpo
@@ -384,7 +384,7 @@ def setup(
     loss_fn = ClippedPGLossFn(loss_config)
 
     # Validate force_on_policy_ratio
-    if loss_config.get("force_on_policy_ratio", False):
+    if loss_config.force_on_policy_ratio:
         assert (
             grpo_config["num_prompts_per_step"]
             * grpo_config["num_generations_per_prompt"]
@@ -689,7 +689,7 @@ def setup(
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
         if generation_config["vllm_cfg"]["precision"] == "fp8":
-            assert loss_config["use_importance_sampling_correction"] is True, (
+            assert loss_config.use_importance_sampling_correction, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
         if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
@@ -1750,7 +1750,7 @@ def grpo_train(
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
-                skip_prev_logprobs = master_config["loss_fn"].get(
+                skip_prev_logprobs = master_config.loss_fn.get(
                     "force_on_policy_ratio", False
                 )
                 if skip_prev_logprobs:
@@ -2454,7 +2454,7 @@ def async_grpo_train(
         "Async GRPO requires vLLM backend with vllm_cfg.async_engine=True. "
         "Set policy.generation.vllm_cfg.async_engine to true in your config."
     )
-    assert master_config.loss_fn["use_importance_sampling_correction"] is True, (
+    assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
 
@@ -2843,7 +2843,7 @@ def async_grpo_train(
 
                 # Training phase (same as sync version)
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
-                skip_prev_logprobs = master_config["loss_fn"].get(
+                skip_prev_logprobs = master_config.loss_fn.get(
                     "force_on_policy_ratio", False
                 )
                 if skip_prev_logprobs:

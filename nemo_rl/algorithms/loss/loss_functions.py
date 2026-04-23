@@ -15,6 +15,7 @@
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
@@ -79,39 +80,54 @@ class DraftCrossEntropyLossFn(LossFunction):
         )
 
 
-class ClippedPGLossConfig(TypedDict):
-    reference_policy_kl_penalty: float
-    reference_policy_kl_type: str
-    kl_input_clamp_value: float | None
-    kl_output_clamp_value: float | None
-    ratio_clip_min: float
-    ratio_clip_max: float
-    # Dual-clipping value (should be >1 if enabled; usually set to 3 empirically). None to disable.
-    ratio_clip_c: float | None
-    use_on_policy_kl_approximation: bool
-    use_importance_sampling_correction: bool
-    truncated_importance_sampling_ratio: float | None
-    # Type of truncated importance sampling:
-    #   "tis"          – clamp IS weights to max
-    #   "icepop"       – zero out tokens with IS weight outside [min, max]
-    #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
-    truncated_importance_sampling_type: NotRequired[str | None]
-    # Lower bound for ICE-POP / seq-mask-tis filtering
-    truncated_importance_sampling_ratio_min: NotRequired[float | None]
-    token_level_loss: bool
+class ClippedPGLossConfig(BaseModel, extra="allow"):
+    # --- Loss type ---
+    disable_ppo_ratio: bool = False
+    token_level_loss: bool = True
     # If True, apply the off-policy importance-sampling correction at the
     # sequence level (one weight per generated sample), as in GSPO.
     # If False (default), correction is applied at the token level as in the
     # original GRPO paper.
-    sequence_level_importance_ratios: NotRequired[bool]
-    disable_ppo_ratio: NotRequired[bool]
+    sequence_level_importance_ratios: bool = False
+
+    # --- Clipping ---
+    ratio_clip_min: float = 0.2
+    ratio_clip_max: float = 0.2
+    # Dual-clipping value (should be >1 if enabled; usually set to 3 empirically). None to disable.
+    ratio_clip_c: Optional[float] = None
+
+    # --- KL regularization ---
+    reference_policy_kl_penalty: float = 0.01
+    # Can be set to k1, k2, k3
+    # For more details, see http://joschu.net/blog/kl-approx.html
+    reference_policy_kl_type: str = "k3"
+    kl_input_clamp_value: Optional[float] = 20.0
+    kl_output_clamp_value: Optional[float] = 10.0
+    # If True, add KL penalty to reward instead of loss (used by Reinforce++)
+    use_kl_in_reward: bool = False
+
+    # --- Importance sampling correction ---
+    # Async GRPO requires importance sampling correction enabled
+    # Set to true when async_grpo.enabled is true
+    use_importance_sampling_correction: bool = False
+    # --- Truncated importance sampling ---
+    # Type of truncated importance sampling:
+    #   "tis"          – clamp IS weights to max
+    #   "icepop"       – zero out tokens with IS weight outside [min, max]
+    #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
+    truncated_importance_sampling_type: Optional[str] = "tis"
+    truncated_importance_sampling_ratio: Optional[float] = None
+    # Lower bound for ICE-POP / seq-mask-tis filtering
+    truncated_importance_sampling_ratio_min: Optional[float] = None
+
+    # --- On-policy ---
+    # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
+    use_on_policy_kl_approximation: bool = False
     # If True, force the ratio to 1.0 for truly on-policy behavior,
     # eliminating any importance sampling effects.
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
-    force_on_policy_ratio: NotRequired[bool]
-    # If True, add KL penalty to reward instead of loss (used by Reinforce++)
-    use_kl_in_reward: NotRequired[bool]
+    force_on_policy_ratio: bool = False
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -171,44 +187,37 @@ class ClippedPGLossFn(LossFunction):
     input_type = LossInputType.LOGPROB
 
     def __init__(self, cfg: ClippedPGLossConfig):
-        self.ratio_clip_min = cfg["ratio_clip_min"]
-        self.ratio_clip_max = cfg["ratio_clip_max"]
-        self.ratio_clip_c = cfg["ratio_clip_c"]  # set to None to disable dual-clipping
-        self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
-        self.reference_policy_kl_type = cfg["reference_policy_kl_type"]
-        self.kl_input_clamp_value = cfg["kl_input_clamp_value"]
-        self.kl_output_clamp_value = cfg["kl_output_clamp_value"]
-        self.disable_ppo_ratio = cfg.get("disable_ppo_ratio", False)
-        self.force_on_policy_ratio = cfg.get(
-            "force_on_policy_ratio", False
-        )  # Force ratio to 1.0
-        self.use_on_policy_kl_approximation = cfg["use_on_policy_kl_approximation"]
-        self.use_importance_sampling_correction = cfg[
-            "use_importance_sampling_correction"
-        ]
-        self.truncated_importance_sampling_ratio = cfg[
-            "truncated_importance_sampling_ratio"
-        ]
+        self.disable_ppo_ratio = cfg.disable_ppo_ratio
+        self.ratio_clip_min = cfg.ratio_clip_min
+        self.ratio_clip_max = cfg.ratio_clip_max
+        self.ratio_clip_c = cfg.ratio_clip_c  # set to None to disable dual-clipping
+        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
+        self.reference_policy_kl_type = cfg.reference_policy_kl_type
+        self.kl_input_clamp_value = cfg.kl_input_clamp_value
+        self.kl_output_clamp_value = cfg.kl_output_clamp_value
+        self.use_importance_sampling_correction = cfg.use_importance_sampling_correction
         # Type of truncated importance sampling: "tis" | "icepop" | "seq-mask-tis"
-        self.truncated_importance_sampling_type = cfg.get(
-            "truncated_importance_sampling_type"
+        self.truncated_importance_sampling_type = cfg.truncated_importance_sampling_type
+        self.truncated_importance_sampling_ratio = (
+            cfg.truncated_importance_sampling_ratio
         )
         # Lower bound for ICE-POP / seq-mask-tis filtering
-        self.truncated_importance_sampling_ratio_min = cfg.get(
-            "truncated_importance_sampling_ratio_min"
+        self.truncated_importance_sampling_ratio_min = (
+            cfg.truncated_importance_sampling_ratio_min
         )
+        self.use_on_policy_kl_approximation = cfg.use_on_policy_kl_approximation
+        self.force_on_policy_ratio = cfg.force_on_policy_ratio  # Force ratio to 1.0
+
         # Whether to compute importance weights per-sequence instead of per-token.
-        self.sequence_level_importance_ratios = cfg.get(
-            "sequence_level_importance_ratios",
-            False,
-        )
+        self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
         self.loss_type = (
-            LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
+            LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
         )
         if self.sequence_level_importance_ratios:
             assert self.loss_type == LossType.SEQUENCE_LEVEL, (
                 "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
             )
+
         if self.truncated_importance_sampling_ratio is not None:
             assert self.use_importance_sampling_correction, (
                 "truncated_importance_sampling_ratio is only supported when use_importance_sampling_correction is True"
@@ -232,9 +241,9 @@ class ClippedPGLossFn(LossFunction):
         else:
             # Warn user that TIS-related parameters are ignored when truncated_importance_sampling_ratio is not set
             ignored_params = []
-            if cfg.get("truncated_importance_sampling_type") is not None:
+            if self.truncated_importance_sampling_type is not None:
                 ignored_params.append("truncated_importance_sampling_type")
-            if cfg.get("truncated_importance_sampling_ratio_min") is not None:
+            if self.truncated_importance_sampling_ratio_min is not None:
                 ignored_params.append("truncated_importance_sampling_ratio_min")
             if ignored_params:
                 print(
