@@ -6,6 +6,8 @@ Scope
 - Hold the recipe fixed and compare only:
   - baseline GRPO
   - stochastic Kondo ("groupfix")
+- Treat GSM8K on the 1.5B model as the primary acceptance gate.
+- Treat AIME2024 and larger-model runs as secondary qualification tracks, not replacements for the primary gate.
 
 Why this exact recipe
 - Model: Qwen/Qwen2.5-1.5B-Instruct
@@ -19,6 +21,9 @@ Why this exact recipe
 Recommended server
 - Preferred: 1x A100 80GB
 - Acceptable: equivalent single-GPU server with enough VRAM to run the exact same recipe without changing batching or model length
+- For the optional larger-model track:
+  - Preferred: 1x H100 80GB
+  - Acceptable: 1x A100 80GB only if a 1-step smoke run fits without lowering sequence length or changing the batch recipe
 
 Required environment
 - Export:
@@ -129,3 +134,62 @@ What to report back
 Decision rule
 - This validation is a success only if groupfix keeps a real compute reduction and remains competitive at long horizon.
 - If it only works by drifting back toward dense training, reject it as a Kondo result.
+
+Secondary track: AIME2024 qualification
+- Purpose:
+  - Check whether the same method carries over to a harder math eval without changing the Kondo recipe.
+- Keep the Kondo settings identical.
+- Change only the dataset pair:
+  - train: OpenMathInstruct-2
+  - validation: AIME2024
+- Keep the same model first:
+  - Qwen/Qwen2.5-1.5B-Instruct
+- Recommended matrix:
+  - seeds 42, 43, 44
+  - baseline + groupfix
+- Recommended horizon:
+  - 500 steps minimum
+  - 1000 steps preferred if server time is available
+- Command delta relative to the GSM8K baseline:
+
+  data.train.dataset_name=OpenMathInstruct-2 \
+  ++data.validation.dataset_name=AIME2024
+
+- AIME is a qualification dataset, not the primary acceptance gate.
+- Because AIME2024 is small, report:
+  - full per-seed trajectories
+  - final mean
+  - and individual sample outputs for error inspection
+
+Secondary track: larger-model replication
+- Purpose:
+  - Check whether the fixed method scales beyond the smallest tested model without changing its behavior qualitatively.
+- Preferred model:
+  - Qwen/Qwen2.5-3B-Instruct
+- Do not jump to 7B as the first scaling test.
+- Keep the rest of the recipe fixed as much as possible:
+  - same datasets
+  - same Kondo settings
+  - same sequence length
+  - same dynamic batching / no sequence packing path
+- First run a mandatory 1-step smoke test.
+- Only proceed if the smoke test fits without:
+  - reducing max_total_sequence_length
+  - lowering generation max_new_tokens
+  - or materially changing train_global_batch_size
+- If the 3B track is stable, use:
+  - GSM8K 1000-step validation first
+  - then optionally the AIME2024 qualification track
+
+Suggested larger-model command delta
+- Replace only the model/tokenizer names:
+
+  policy.model_name=Qwen/Qwen2.5-3B-Instruct \
+  policy.tokenizer.name=Qwen/Qwen2.5-3B-Instruct
+
+What to compare across secondary tracks
+- Final mean reward_mean
+- Mid-horizon vs late-horizon behavior
+- Mean policy_training wall time
+- Mean realized compute skip
+- Whether the method still wins without giving back the expected Kondo savings
