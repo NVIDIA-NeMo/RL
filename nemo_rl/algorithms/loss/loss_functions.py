@@ -1612,7 +1612,27 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         teacher_topk_indices_ipc: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute cross-tokenizer chunk-averaged KL (+ optional CE)."""
+
         # --- 0. inputs & pre-conditions ---
+        # Under CP>1 the student post-processor runs ``prepare_data_for_cp``,
+        # which may return ``input_ids`` / ``token_mask`` / ``sample_mask`` as
+        # DTensors. Downstream ops combine these with already-unwrapped
+        # ``student_logits`` (see ``.full_tensor()`` below) and with scalar
+        # losses, so we unwrap everything once here to avoid "mixed
+        # torch.Tensor and DTensor" errors in CE auxiliary and DP rescale.
+        def _unwrap_dtensor(
+            t: Optional[torch.Tensor],
+        ) -> Optional[torch.Tensor]:
+            if isinstance(t, torch.distributed.tensor.DTensor):
+                return t.full_tensor()
+            return t
+
+        data = {
+            **data,
+            "input_ids": _unwrap_dtensor(data["input_ids"]),
+            "token_mask": _unwrap_dtensor(data.get("token_mask")),
+            "sample_mask": _unwrap_dtensor(data.get("sample_mask")),
+        }
         input_ids_student = data["input_ids"]
         batch_size = input_ids_student.shape[0]
 

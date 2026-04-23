@@ -23,6 +23,7 @@ Key differences from megatron approach:
 - automodel_forward_backward uses PyTorch autograd instead of Megatron's pipeline
 """
 
+import warnings
 from collections import defaultdict
 from functools import partial
 from typing import Any, Callable, Iterator, Optional, Tuple, Union
@@ -1012,17 +1013,309 @@ def aggregate_training_statistics(
 
 
 class XTokenStudentIPCLossPostProcessor(LossPostProcessor):
-    """Loss post-processor that injects teacher logits via CUDA IPC handles."""
+    """Loss post-processor that injects teacher logits via CUDA IPC handles.
+
+    Consumes records emitted by :class:`XTokenTeacherIPCExportPostProcessor`
+    (schema_version=1). The current microbatch handle is matched against the
+    worker's own ``(tp_rank, cp_rank)`` coordinates; payload is rebuilt from
+    ``handle["payload_ipc"]`` rather than the deprecated ``handle[rank]`` key.
+    """
 
     def __init__(
-        self, *args: Any, teacher_result: Optional[dict[str, Any]] = None, **kwargs: Any
+        self,
+        *args: Any,
+        teacher_result: Optional[dict[str, Any]] = None,
+        teacher_tp_group_results: Optional[list[dict[str, Any]]] = None,
+        **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
         self._teacher_result = teacher_result
+        # List of per-tp-rank teacher entries (ordered by tp_rank) for the
+        # current worker's TP group. Used only on the cross-tokenizer full-
+        # logits path to reconstruct the complete teacher vocab by concatenating
+        # each TP rank's IPC buffer along the vocab dim.
+        self._teacher_tp_group_results = teacher_tp_group_results
         self._microbatch_idx = 0
+        # Cache parallel coordinates for fast-path handle validation.
+        self.world_rank = torch.distributed.get_rank()
+        self.tp_group = self.tp_mesh.get_group()
+        self.tp_rank = torch.distributed.get_rank(self.tp_group)
+        self.tp_size = torch.distributed.get_world_size(self.tp_group)
+        if self.cp_size > 1 and self.cp_mesh is not None:
+            self.cp_group = self.cp_mesh.get_group()
+            self.cp_rank = torch.distributed.get_rank(self.cp_group)
+        else:
+            self.cp_group = None
+            self.cp_rank = 0
 
     def set_microbatch_index(self, mb_idx: int) -> None:
         self._microbatch_idx = mb_idx
+
+    def _get_current_microbatch_teacher_handle(self) -> Optional[dict[str, Any]]:
+        """Resolve the teacher handle for the current microbatch and validate.
+
+        Returns ``None`` when IPC teacher export is unavailable (e.g. no
+        ``_teacher_result`` was provided or the current microbatch index is
+        past the end of the exported handle list). Raises on structural
+        mismatches between teacher and student shard coordinates.
+        """
+        if self._teacher_result is None:
+            return None
+        handles = self._teacher_result.get("microbatch_handles")
+        if not handles:
+            return None
+        if self._microbatch_idx >= len(handles):
+            return None
+        handle = handles[self._microbatch_idx]
+
+        # Strict shard-to-shard matching: minimal-change plan assumes teacher
+        # and student worker topologies are aligned.
+        assert handle.get("tp_rank") == self.tp_rank, (
+            f"teacher handle tp_rank={handle.get('tp_rank')} != student "
+            f"tp_rank={self.tp_rank} (mb_idx={self._microbatch_idx})"
+        )
+        assert handle.get("cp_rank") == self.cp_rank, (
+            f"teacher handle cp_rank={handle.get('cp_rank')} != student "
+            f"cp_rank={self.cp_rank} (mb_idx={self._microbatch_idx})"
+        )
+        assert handle.get("tp_size") == self.tp_size, (
+            f"teacher handle tp_size={handle.get('tp_size')} != student "
+            f"tp_size={self.tp_size}"
+        )
+        assert handle.get("cp_size") == self.cp_size, (
+            f"teacher handle cp_size={handle.get('cp_size')} != student "
+            f"cp_size={self.cp_size}"
+        )
+        handle_world_rank = handle.get("world_rank")
+        if handle_world_rank != self.world_rank:
+            # Soft warning: worker-layer selection should already have matched
+            # by world_rank, but guard against silent misrouting.
+            warnings.warn(
+                "XToken teacher handle world_rank="
+                f"{handle_world_rank} does not match student world_rank="
+                f"{self.world_rank}",
+                stacklevel=2,
+            )
+        return handle
+
+    def _get_tp_group_handles_for_current_microbatch(
+        self,
+    ) -> Optional[list[dict[str, Any]]]:
+        """Return one schema-v1 handle per TP rank for the current microbatch.
+
+        Ordered by ``tp_rank`` (``0 .. tp_size-1``). Used by the full-logits
+        path to reconstruct the complete teacher vocab by concatenating each
+        TP rank's IPC payload along the vocab dim. Returns ``None`` when:
+
+            - ``tp_size == 1`` (nothing to gather),
+            - ``teacher_tp_group_results`` was not provided, or
+            - the current microbatch index is past the end of any sibling's
+              handle list (teacher produced fewer microbatches than expected).
+        """
+        if self.tp_size == 1 or self._teacher_tp_group_results is None:
+            return None
+        handles_per_tp: list[dict[str, Any]] = []
+        for tp_r, entry in enumerate(self._teacher_tp_group_results):
+            handles = (
+                entry.get("microbatch_handles") if isinstance(entry, dict) else None
+            )
+            if not handles or self._microbatch_idx >= len(handles):
+                return None
+            h = handles[self._microbatch_idx]
+            assert h.get("tp_rank") == tp_r, (
+                f"TP-group entry at index {tp_r} has handle tp_rank={h.get('tp_rank')}"
+            )
+            assert h.get("cp_rank") == self.cp_rank, (
+                f"TP sibling at tp_rank={tp_r} has cp_rank="
+                f"{h.get('cp_rank')} != student cp_rank={self.cp_rank}"
+            )
+            assert h.get("is_topk") is False, (
+                f"TP-group gather is only valid on the full-logits path; "
+                f"handle at tp_rank={tp_r} reports is_topk=True"
+            )
+            handles_per_tp.append(h)
+        return handles_per_tp
+
+    @staticmethod
+    def _rebuild_own_rank_payload(
+        handle: dict[str, Any], current_device_id: int
+    ) -> torch.Tensor:
+        """Open the own-rank IPC view and return a locally-owned tensor.
+
+        Slice is driven by ``handle["actual_shape"]`` so pre-allocated
+        buffers that are larger than the current microbatch don't leak
+        garbage dimensions into the student.
+        """
+        payload_ipc = handle.get("payload_ipc")
+        assert payload_ipc is not None, (
+            "teacher handle is missing payload_ipc (schema_version="
+            f"{handle.get('schema_version')})"
+        )
+        aB, aS, aK = handle["actual_shape"]
+        tensor = rebuild_cuda_tensor_from_ipc(payload_ipc, current_device_id).detach()
+        return tensor[:aB, :aS, :aK].clone()
+
+    @staticmethod
+    def _rebuild_topk_indices(
+        handle: dict[str, Any],
+        current_device_id: int,
+        expected_shape: torch.Size,
+    ) -> torch.Tensor:
+        """Open the top-k indices IPC view with schema validation.
+
+        The indices tensor must share its shape with the values tensor (same
+        batch/seq/K) and the handle must carry valid vocab bounds.
+        """
+        assert "topk_indices_ipc" in handle, (
+            "top-k teacher handle must include topk_indices_ipc"
+        )
+        vocab_start_index = handle.get("vocab_start_index")
+        vocab_end_index = handle.get("vocab_end_index")
+        assert (
+            vocab_start_index is not None
+            and vocab_end_index is not None
+            and vocab_start_index >= 0
+            and vocab_end_index > vocab_start_index
+        ), (
+            "top-k handle requires valid vocab_start_index / vocab_end_index "
+            f"(got {vocab_start_index}, {vocab_end_index})"
+        )
+        aB, aS, aK = handle["actual_shape"]
+        indices = rebuild_cuda_tensor_from_ipc(
+            handle["topk_indices_ipc"], current_device_id
+        ).detach()
+        indices = indices[:aB, :aS, :aK].clone()
+        assert indices.shape == expected_shape, (
+            f"teacher top-k indices shape {tuple(indices.shape)} does not "
+            f"match values shape {tuple(expected_shape)}"
+        )
+        return indices
+
+    def _reconstruct_full_teacher_vocab_across_tp(
+        self,
+        own_rank_tensor: torch.Tensor,
+        own_handle: dict[str, Any],
+        current_device_id: int,
+    ) -> torch.Tensor:
+        """Concatenate every TP rank's local vocab shard into a full vocab.
+
+        Own-rank tensor is reused as-is. Sibling ``tp_rank`` entries are
+        rebuilt from their IPC handles (which requires peer-to-peer CUDA
+        access between the student's GPU and each sibling's GPU on the same
+        node). No-op when ``tp_size == 1``.
+        """
+        if self.tp_size == 1:
+            return own_rank_tensor
+
+        tp_handles = self._get_tp_group_handles_for_current_microbatch()
+        assert tp_handles is not None, (
+            "tp_size > 1 requires teacher_tp_group_results to be provided "
+            "for cross-tokenizer full-logits path"
+        )
+        assert len(tp_handles) == self.tp_size
+
+        aB_own, aS_own, _ = own_handle["actual_shape"]
+        tp_shards: list[torch.Tensor] = []
+        for tp_r, sibling_handle in enumerate(tp_handles):
+            if tp_r == self.tp_rank:
+                tp_shards.append(own_rank_tensor)
+                continue
+            aB_s, aS_s, aV_s = sibling_handle["actual_shape"]
+            assert (aB_s, aS_s) == (aB_own, aS_own), (
+                f"TP sibling shape mismatch at tp_rank={tp_r}: "
+                f"(B={aB_s},S={aS_s}) vs own (B={aB_own},S={aS_own})"
+            )
+            sibling = rebuild_cuda_tensor_from_ipc(
+                sibling_handle["payload_ipc"], current_device_id
+            ).detach()
+            sibling = sibling[:aB_s, :aS_s, :aV_s].clone()
+            tp_shards.append(sibling)
+        return torch.cat(tp_shards, dim=-1)
+
+    def _reconstruct_full_teacher_sequence_across_cp(
+        self, teacher_logits_tensor: torch.Tensor
+    ) -> torch.Tensor:
+        """All-gather CP-sharded teacher sequence to reconstruct full ``(B, S, V)``.
+
+        Teacher forward ran with CP, so each rank's IPC payload is only its
+        local CP shard of the sequence — and, because NeMo-RL uses
+        load-balanced CP chunking, that shard is **non-contiguous** in the
+        global sequence (rank ``i`` holds chunks ``i`` and
+        ``2*cp_size-1-i``). ``allgather_cp_sharded_tensor`` handles both the
+        all-gather and the un-chunking to recover the global sequence order.
+
+        No-op when ``cp_size == 1``.
+        """
+        if self.cp_size == 1 or self.cp_group is None:
+            return teacher_logits_tensor
+        return allgather_cp_sharded_tensor(
+            teacher_logits_tensor, self.cp_group, seq_dim=1
+        )
+
+    def _inject_teacher_ipc_tensors(self, loss_kwargs: dict[str, Any]) -> None:
+        """Populate ``loss_kwargs`` with teacher tensors from IPC for this mb.
+
+        No-op when:
+            - sequence packing is enabled (IPC path currently does not support
+              sequence-packed microbatches),
+            - no teacher handle is available for the current microbatch index,
+            - teacher export wasn't set on this post-processor.
+
+        On the full-logits path, reconstructs the complete teacher tensor
+        ``(B, S_full, V_full)`` by concatenating TP shards along the vocab
+        dim (when ``tp_size > 1``) and then all-gathering across CP to
+        recover the full sequence (when ``cp_size > 1``). On the top-k path,
+        populates ``teacher_topk_indices_ipc``; top-k values are already
+        global across TP via ``distributed_vocab_topk`` in the teacher.
+        """
+        if self.enable_seq_packing:
+            return
+        handle = self._get_current_microbatch_teacher_handle()
+        if handle is None:
+            return
+
+        current_device_id = torch.cuda.current_device()
+        is_topk = bool(handle.get("is_topk", False))
+
+        teacher_logits_tensor = self._rebuild_own_rank_payload(
+            handle, current_device_id
+        )
+
+        if is_topk:
+            loss_kwargs["teacher_topk_indices_ipc"] = self._rebuild_topk_indices(
+                handle, current_device_id, teacher_logits_tensor.shape
+            )
+        else:
+            # Full-logits path: own-rank payload is a local vocab shard when
+            # tp_size > 1 and/or a local sequence shard when cp_size > 1.
+            # First concat sibling TP shards along vocab (yields full V at
+            # local CP seq-slice); then all-gather across CP to recover the
+            # global sequence. After both steps teacher_logits_tensor has
+            # shape (B, S_full, V_full).
+            _, _, aK = handle["actual_shape"]
+            assert aK > 0, f"full-logits handle has degenerate vocab dim aK={aK}"
+            if self.tp_size > 1 and not handle.get("vocab_sharded"):
+                warnings.warn(
+                    "tp_size > 1 but teacher full-logits handle reports "
+                    "vocab_sharded=False; cross-tokenizer loss may see only "
+                    "a partial vocab.",
+                    stacklevel=2,
+                )
+            if self.cp_size > 1 and not handle.get("sequence_sharded"):
+                warnings.warn(
+                    "cp_size > 1 but teacher full-logits handle reports "
+                    "sequence_sharded=False; cross-tokenizer loss may see "
+                    "only a partial sequence.",
+                    stacklevel=2,
+                )
+            teacher_logits_tensor = self._reconstruct_full_teacher_vocab_across_tp(
+                teacher_logits_tensor, handle, current_device_id
+            )
+            teacher_logits_tensor = self._reconstruct_full_teacher_sequence_across_cp(
+                teacher_logits_tensor
+            )
+
+        loss_kwargs["teacher_logits"] = teacher_logits_tensor
 
     def __call__(
         self,
@@ -1050,36 +1343,8 @@ class XTokenStudentIPCLossPostProcessor(LossPostProcessor):
         else:
             loss_fn_ = self.loss_fn
 
-        loss_kwargs = {}
-        if (
-            self._teacher_result is not None
-            and not self.enable_seq_packing
-            and "microbatch_handles" in self._teacher_result
-        ):
-            handles = self._teacher_result["microbatch_handles"]
-            if self._microbatch_idx < len(handles):
-                rank = torch.distributed.get_rank()
-                current_device_id = torch.cuda.current_device()
-                handle = handles[self._microbatch_idx]
-                aB, aS, aK = handle["actual_shape"]
-
-                teacher_logits_tensor = rebuild_cuda_tensor_from_ipc(
-                    handle[rank], current_device_id
-                ).detach()
-                teacher_logits_tensor = teacher_logits_tensor[:aB, :aS, :aK].clone()
-                loss_kwargs["teacher_logits"] = teacher_logits_tensor
-
-                is_topk = self._teacher_result.get("is_topk", False)
-                if is_topk and "topk_indices_ipc" in handle:
-                    teacher_topk_indices_tensor = rebuild_cuda_tensor_from_ipc(
-                        handle["topk_indices_ipc"], current_device_id
-                    ).detach()
-                    teacher_topk_indices_tensor = teacher_topk_indices_tensor[
-                        :aB, :aS, :aK
-                    ].clone()
-                    loss_kwargs["teacher_topk_indices_ipc"] = (
-                        teacher_topk_indices_tensor
-                    )
+        loss_kwargs: dict[str, Any] = {}
+        self._inject_teacher_ipc_tensors(loss_kwargs)
 
         loss, loss_metrics = loss_fn_(
             logits,
@@ -1092,7 +1357,27 @@ class XTokenStudentIPCLossPostProcessor(LossPostProcessor):
 
 
 class XTokenTeacherIPCExportPostProcessor(LossPostProcessor):
-    """Teacher-side post-processor that exports per-microbatch logits via CUDA IPC."""
+    """Teacher-side post-processor that exports per-microbatch logits via CUDA IPC.
+
+    XToken IPC microbatch handle schema (schema_version=1):
+        - schema_version (int): record format version.
+        - world_rank (int): global rank that produced this record.
+        - tp_rank, tp_size (int): tensor-parallel coordinates of the producer.
+        - cp_rank, cp_size (int): context-parallel coordinates of the producer.
+        - actual_shape (tuple): shape of the exported local shard (not the full
+          tensor); student must slice with these dims before clone.
+        - sequence_sharded (bool): True iff cp_size > 1 (sequence dim sharded).
+        - vocab_sharded (bool): True iff the exported tensor's vocab dim is a
+          local TP shard.
+        - vocab_start_index, vocab_end_index (int): global vocab column bounds
+          covered by this shard.
+        - is_topk (bool): whether payload_ipc carries top-k values (True) or
+          full local log-probs (False).
+        - payload_ipc (tuple): IPC handle for the payload buffer (top-k values
+          when is_topk=True, log-probs otherwise).
+        - topk_indices_ipc (tuple, top-k path only): IPC handle for the
+          top-k indices buffer. Indices are always in global vocab id space.
+    """
 
     def __init__(
         self,
@@ -1105,6 +1390,19 @@ class XTokenTeacherIPCExportPostProcessor(LossPostProcessor):
         # Keep explicit tp_mesh for local use and also forward it to base init.
         super().__init__(*args, tp_mesh=tp_mesh, **kwargs)
         self.tp_mesh = tp_mesh
+        # Cache TP/CP parallel metadata; reuse existing mesh wiring only.
+        self.tp_group = self.tp_mesh.get_group()
+        self.tp_rank = torch.distributed.get_rank(self.tp_group)
+        self.tp_size = torch.distributed.get_world_size(self.tp_group)
+        if self.cp_size > 1 and self.cp_mesh is not None:
+            self.cp_group = self.cp_mesh.get_group()
+            self.cp_rank = torch.distributed.get_rank(self.cp_group)
+        else:
+            self.cp_group = None
+            self.cp_rank = 0
+        assert self.tp_size >= 1, f"tp_size must be >= 1, got {self.tp_size}"
+        assert self.cp_size >= 1, f"cp_size must be >= 1, got {self.cp_size}"
+
         self.topk_logits = topk_logits
         self.is_mdlm = is_mdlm
         self.microbatch_handles: list[dict[str, Any]] = []
@@ -1184,6 +1482,188 @@ class XTokenTeacherIPCExportPostProcessor(LossPostProcessor):
             self._mb_logits_buffers[buf_idx] = buf
             self._mb_logits_ipcs[buf_idx] = get_handle_from_tensor(buf)
 
+    def _assert_logits_vocab_sharded_for_tp(self, logits: torch.Tensor) -> None:
+        """Assert that TP>1 logits really have a Shard(vocab) placement.
+
+        The downstream pipeline (``vocab_start_index`` /
+        ``_compute_distributed_log_softmax`` / ``distributed_vocab_topk``) is
+        only correct when logits are vocab-sharded across the TP group
+        whenever ``tp_size > 1``. A replicated DTensor with ``tp_size > 1``
+        would cause ``_compute_distributed_log_softmax`` to sum identical
+        exp-logits across ranks and silently produce wrong results.
+        """
+        if self.tp_size == 1:
+            return
+        if isinstance(logits, DTensor):
+            vocab_dim = logits.ndim - 1
+            placements_vocab_sharded = any(
+                isinstance(p, Shard) and p.dim == vocab_dim for p in logits.placements
+            )
+        else:
+            placements_vocab_sharded = False
+        assert placements_vocab_sharded, (
+            f"tp_size={self.tp_size} requires logits to be sharded along the "
+            f"vocab dim across TP, but the input is not. "
+            f"logits type={type(logits).__name__}, "
+            f"placements="
+            f"{logits.placements if isinstance(logits, DTensor) else 'N/A'}. "
+            f"_compute_distributed_log_softmax would produce incorrect results "
+            f"on replicated logits."
+        )
+
+    def _compute_local_log_probs(
+        self, logits: torch.Tensor
+    ) -> tuple[torch.Tensor, int, int]:
+        """Return ``(local_log_probs, vocab_start_index, vocab_end_index)``.
+
+        Unwraps a DTensor to its local shard if needed, computes the
+        TP-aware log-softmax (reducing across ``self.tp_group``), and applies
+        the MDLM shared-seq halving when enabled.
+        """
+        if isinstance(logits, DTensor):
+            mb_logits_local = logits.to_local()
+        else:
+            mb_logits_local = logits
+
+        V_local = int(mb_logits_local.shape[-1])
+        vocab_start_index = self.tp_rank * V_local
+        vocab_end_index = (self.tp_rank + 1) * V_local
+        assert vocab_end_index > vocab_start_index, (
+            f"vocab_end_index ({vocab_end_index}) must be > vocab_start_index "
+            f"({vocab_start_index})"
+        )
+
+        mb_logits_local = mb_logits_local.to(torch.float32)
+        mb_log_prob = _compute_distributed_log_softmax(
+            mb_logits_local, group=self.tp_group
+        )
+        del mb_logits_local
+        if isinstance(mb_log_prob, DTensor):
+            mb_log_prob = mb_log_prob.to_local()
+
+        if self.is_mdlm:
+            shared_seq_len = int(mb_log_prob.shape[1] / 2)
+            mb_log_prob = mb_log_prob[:, shared_seq_len:, :]
+
+        return mb_log_prob, vocab_start_index, vocab_end_index
+
+    def _base_handle_metadata(
+        self,
+        world_rank: int,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        sequence_sharded: bool,
+    ) -> dict[str, Any]:
+        """Return schema-v1 fields common to top-k and full-logits records.
+
+        The per-path builders fill in ``actual_shape``, ``is_topk``,
+        ``payload_ipc``, ``vocab_sharded`` (and ``topk_indices_ipc`` on the
+        top-k path) on top of this base.
+        """
+        return {
+            "schema_version": 1,
+            "world_rank": world_rank,
+            "tp_rank": self.tp_rank,
+            "tp_size": self.tp_size,
+            "cp_rank": self.cp_rank,
+            "cp_size": self.cp_size,
+            "sequence_sharded": sequence_sharded,
+            "vocab_start_index": vocab_start_index,
+            "vocab_end_index": vocab_end_index,
+        }
+
+    def _export_topk_handle(
+        self,
+        mb_log_prob: torch.Tensor,
+        buf_idx: int,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        sequence_sharded: bool,
+        world_rank: int,
+    ) -> dict[str, Any]:
+        """Run TP-aware top-k, stage values + indices in IPC, build handle."""
+        mb_topk_vals, mb_topk_idx = distributed_vocab_topk(
+            mb_log_prob,
+            k=self.topk_logits,
+            tp_group=self.tp_group,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+        )
+        B_mb, S_mb, K_mb = mb_topk_vals.shape
+        self._ensure_topk_buffer(
+            buf_idx,
+            B_mb,
+            S_mb,
+            K_mb,
+            mb_topk_vals.dtype,
+            mb_topk_idx.dtype,
+            mb_topk_vals.device,
+        )
+        self._mb_vals_buffers[buf_idx][:B_mb, :S_mb, :K_mb].copy_(mb_topk_vals)
+        self._mb_idx_buffers[buf_idx][:B_mb, :S_mb, :K_mb].copy_(mb_topk_idx)
+        del mb_topk_vals, mb_topk_idx
+
+        payload_ipc = self._mb_vals_ipcs[buf_idx]
+        topk_indices_ipc = self._mb_idx_ipcs[buf_idx]
+        assert payload_ipc is not None, "topk payload_ipc must be set"
+        assert topk_indices_ipc is not None, (
+            "topk_indices_ipc must be set on the top-k export path"
+        )
+
+        handle = self._base_handle_metadata(
+            world_rank, vocab_start_index, vocab_end_index, sequence_sharded
+        )
+        handle.update(
+            {
+                "actual_shape": (B_mb, S_mb, K_mb),
+                # Top-k values span the global vocab (indices are global), so
+                # the payload itself is not vocab-sharded even when tp_size > 1.
+                "vocab_sharded": False,
+                "is_topk": True,
+                "payload_ipc": payload_ipc,
+                "topk_indices_ipc": topk_indices_ipc,
+            }
+        )
+        return handle
+
+    def _export_full_logits_handle(
+        self,
+        mb_log_prob: torch.Tensor,
+        buf_idx: int,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        sequence_sharded: bool,
+        vocab_sharded: bool,
+        world_rank: int,
+    ) -> dict[str, Any]:
+        """Stage local log-probs in IPC, build handle."""
+        B_mb, S_mb, V_mb = mb_log_prob.shape
+        self._ensure_logits_buffer(
+            buf_idx,
+            B_mb,
+            S_mb,
+            V_mb,
+            mb_log_prob.dtype,
+            mb_log_prob.device,
+        )
+        self._mb_logits_buffers[buf_idx][:B_mb, :S_mb, :V_mb].copy_(mb_log_prob)
+
+        payload_ipc = self._mb_logits_ipcs[buf_idx]
+        assert payload_ipc is not None, "full-logits payload_ipc must be set"
+
+        handle = self._base_handle_metadata(
+            world_rank, vocab_start_index, vocab_end_index, sequence_sharded
+        )
+        handle.update(
+            {
+                "actual_shape": (B_mb, S_mb, V_mb),
+                "vocab_sharded": vocab_sharded,
+                "is_topk": False,
+                "payload_ipc": payload_ipc,
+            }
+        )
+        return handle
+
     def __call__(
         self,
         logits: torch.Tensor,
@@ -1193,78 +1673,41 @@ class XTokenTeacherIPCExportPostProcessor(LossPostProcessor):
         global_valid_toks: torch.Tensor,  # noqa: ARG002
         sequence_dim: int = 1,  # noqa: ARG002
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        if isinstance(logits, DTensor):
-            mb_logits_local = logits.to_local()
-        else:
-            mb_logits_local = logits
+        self._assert_logits_vocab_sharded_for_tp(logits)
 
-        tp_group = self.tp_mesh.get_group()
-        tp_rank = torch.distributed.get_rank(tp_group)
-        V_local = int(mb_logits_local.shape[-1])
-        vocab_start_index = tp_rank * V_local
-        vocab_end_index = (tp_rank + 1) * V_local
+        mb_log_prob, vocab_start_index, vocab_end_index = self._compute_local_log_probs(
+            logits
+        )
 
-        mb_logits_local = mb_logits_local.to(torch.float32)
-        mb_log_prob = _compute_distributed_log_softmax(mb_logits_local, group=tp_group)
-        del mb_logits_local
-
-        if isinstance(mb_log_prob, DTensor):
-            mb_log_prob = mb_log_prob.to_local()
-
-        if self.is_mdlm:
-            shared_seq_len = int(mb_log_prob.shape[1] / 2)
-            mb_log_prob = mb_log_prob[:, shared_seq_len:, :]
+        # Shared metadata for both topk and full-logits records.
+        # ``_assert_logits_vocab_sharded_for_tp`` guarantees
+        # ``tp_size > 1 => placements_vocab_sharded``, and ``tp_size == 1``
+        # means the "shard" is the full vocab (no sharding observable by
+        # the student), so we key purely on tp_size.
+        vocab_sharded = self.tp_size > 1
+        sequence_sharded = self.cp_size > 1
+        world_rank = torch.distributed.get_rank()
+        buf_idx = self._microbatch_idx
 
         if self.topk_logits is not None:
-            mb_topk_vals, mb_topk_idx = distributed_vocab_topk(
+            handle = self._export_topk_handle(
                 mb_log_prob,
-                k=self.topk_logits,
-                tp_group=tp_group,
-                vocab_start_index=vocab_start_index,
-                vocab_end_index=vocab_end_index,
-            )
-            del mb_log_prob
-
-            B_mb, S_mb, K_mb = mb_topk_vals.shape
-            buf_idx = self._microbatch_idx
-            self._ensure_topk_buffer(
                 buf_idx,
-                B_mb,
-                S_mb,
-                K_mb,
-                mb_topk_vals.dtype,
-                mb_topk_idx.dtype,
-                mb_topk_vals.device,
+                vocab_start_index,
+                vocab_end_index,
+                sequence_sharded,
+                world_rank,
             )
-            self._mb_vals_buffers[buf_idx][:B_mb, :S_mb, :K_mb].copy_(mb_topk_vals)
-            self._mb_idx_buffers[buf_idx][:B_mb, :S_mb, :K_mb].copy_(mb_topk_idx)
-            del mb_topk_vals, mb_topk_idx
-
-            rank = torch.distributed.get_rank()
-            handle = {
-                rank: self._mb_vals_ipcs[buf_idx],
-                "actual_shape": (B_mb, S_mb, K_mb),
-                "topk_indices_ipc": self._mb_idx_ipcs[buf_idx],
-            }
         else:
-            B_mb, S_mb, V_mb = mb_log_prob.shape
-            buf_idx = self._microbatch_idx
-            self._ensure_logits_buffer(
+            handle = self._export_full_logits_handle(
+                mb_log_prob,
                 buf_idx,
-                B_mb,
-                S_mb,
-                V_mb,
-                mb_log_prob.dtype,
-                mb_log_prob.device,
+                vocab_start_index,
+                vocab_end_index,
+                sequence_sharded,
+                vocab_sharded,
+                world_rank,
             )
-            self._mb_logits_buffers[buf_idx][:B_mb, :S_mb, :V_mb].copy_(mb_log_prob)
-            del mb_log_prob
-
-            rank = torch.distributed.get_rank()
-            handle = {
-                rank: self._mb_logits_ipcs[buf_idx],
-                "actual_shape": (B_mb, S_mb, V_mb),
-            }
 
         self.microbatch_handles.append(handle)
 

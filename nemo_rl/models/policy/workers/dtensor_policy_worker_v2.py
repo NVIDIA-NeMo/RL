@@ -708,6 +708,145 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         return on_microbatch_start
 
+    def _select_teacher_result_by_world_rank(
+        self, teacher_logits: Any
+    ) -> dict[str, Any]:
+        """Select this worker's teacher result by matching global ``world_rank``.
+
+        The upstream ``teacher_logits`` container is an ordered list returned by
+        the teacher worker group. The previous implementation indexed it with
+        ``torch.distributed.get_rank()`` directly, which assumes teacher and
+        student worker-group layouts are identical. This helper replaces that
+        with explicit matching on the schema-v1 top-level ``world_rank`` field,
+        and validates required per-handle schema fields on the matched entry.
+        """
+        current_world_rank = torch.distributed.get_rank()
+        available_ranks: list[Any] = []
+        for entry in teacher_logits:
+            if not isinstance(entry, dict):
+                continue
+            entry_world_rank = entry.get("world_rank")
+            available_ranks.append(entry_world_rank)
+            if entry_world_rank == current_world_rank:
+                handles = entry.get("microbatch_handles")
+                assert handles, (
+                    "teacher entry for world_rank="
+                    f"{current_world_rank} has no microbatch_handles"
+                )
+                # Validate required schema-v1 fields on the first per-handle
+                # record (per-handle fields are the authoritative source used
+                # downstream by the student post-processor).
+                first_handle = handles[0]
+                missing = [
+                    f
+                    for f in (
+                        "schema_version",
+                        "world_rank",
+                        "tp_rank",
+                        "cp_rank",
+                        "payload_ipc",
+                    )
+                    if f not in first_handle
+                ]
+                assert not missing, (
+                    f"teacher microbatch handle missing required fields "
+                    f"{missing} (world_rank={current_world_rank})"
+                )
+                return entry
+
+        raise RuntimeError(
+            "No teacher worker result matched current world_rank="
+            f"{current_world_rank}; available teacher world_ranks="
+            f"{available_ranks}. This typically indicates mismatched teacher "
+            "and student worker-group topologies."
+        )
+
+    def _select_teacher_results_for_tp_group(
+        self, teacher_logits: Any
+    ) -> list[dict[str, Any]]:
+        """Return teacher entries for every TP rank sharing (dp, cp, pp) coords.
+
+        Uses the student's TP process group to identify which global ranks are
+        in the same TP shard-set, then pulls one teacher entry per TP rank from
+        the broadcast ``teacher_logits`` list. The returned list is ordered by
+        ``tp_rank`` so consumers can concatenate per-rank local TP vocab shards
+        directly along the vocab dim to reconstruct the full teacher vocab.
+
+        Assumes teacher and student share the same mesh topology (enforced by
+        the strict shard-to-shard matching of the minimal-change IPC plan).
+        """
+        tp_group = self.tp_mesh.get_group()
+        tp_group_ranks = set(torch.distributed.get_process_group_ranks(tp_group))
+
+        matched: dict[int, dict[str, Any]] = {}
+        for entry in teacher_logits:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("world_rank") not in tp_group_ranks:
+                continue
+            handles = entry.get("microbatch_handles")
+            if not handles:
+                continue
+            tp_r = handles[0].get("tp_rank")
+            assert tp_r is not None and 0 <= tp_r < self.tp_size, (
+                f"teacher handle has invalid tp_rank={tp_r} (tp_size={self.tp_size})"
+            )
+            assert tp_r not in matched, (
+                f"duplicate teacher entries for tp_rank={tp_r} in my TP group "
+                f"(world_ranks={sorted(tp_group_ranks)})"
+            )
+            matched[tp_r] = entry
+
+        missing = [r for r in range(self.tp_size) if r not in matched]
+        assert not missing, (
+            f"teacher TP-group incomplete: missing tp_ranks={missing}; "
+            f"tp_group world_ranks={sorted(tp_group_ranks)}; got "
+            f"tp_ranks={sorted(matched.keys())}"
+        )
+        return [matched[r] for r in range(self.tp_size)]
+
+    def _get_or_create_teacher_ipc_post_processor(
+        self, topk_logits: Optional[int]
+    ) -> XTokenTeacherIPCExportPostProcessor:
+        """Return a worker-persistent teacher IPC export post-processor.
+
+        Rationale for persistence: its IPC buffers (and therefore the CUDA
+        IPC exports) are allocated once and reused every step. A fresh
+        post-processor per step would re-export fresh IPC handles each step;
+        under TP>1 the cross-device IPC mappings opened by student TP-siblings
+        keep those teacher buffers pinned after the post-processor goes out
+        of scope, so the old buffers never return to the caching allocator
+        and accumulate ~2.5 GB per step. Reusing the same post-processor
+        keeps the in-use teacher IPC memory bounded to a single step's worth.
+
+        The cached instance is re-created when the top-k mode changes across
+        calls (train vs. eval may differ) since that reshapes the IPC buffers.
+        Otherwise, per-step state (``microbatch_handles`` + microbatch index)
+        is reset and the cached buffers / IPC handles are kept.
+        """
+        cached = getattr(self, "_xtoken_teacher_ipc_post_processor", None)
+        if cached is None or cached.topk_logits != topk_logits:
+            teacher_post_processor = XTokenTeacherIPCExportPostProcessor(
+                loss_fn=None,
+                cfg=self.cfg,
+                device_mesh=self.device_mesh,
+                cp_mesh=self.cp_mesh,
+                tp_mesh=self.tp_mesh,
+                cp_size=self.cp_size,
+                dp_size=self.dp_size,
+                enable_seq_packing=self.enable_seq_packing,
+                sampling_params=None,
+                topk_logits=topk_logits,
+                is_mdlm=self.cfg.get("is_mdlm", False),
+            )
+            self._xtoken_teacher_ipc_post_processor = teacher_post_processor
+        else:
+            # Reset per-step state; keep cached buffers + IPC handles.
+            cached.microbatch_handles = []
+            cached.set_microbatch_index(0)
+            teacher_post_processor = cached
+        return teacher_post_processor
+
     def _run_teacher_ipc_export(
         self,
         data: BatchedDataDict[Any],
@@ -719,18 +858,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         ctx: AbstractContextManager[Any] = torch.no_grad()
         self.model.eval()
 
-        teacher_post_processor = XTokenTeacherIPCExportPostProcessor(
-            loss_fn=None,
-            cfg=self.cfg,
-            device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
-            tp_mesh=self.tp_mesh,
-            cp_size=self.cp_size,
-            dp_size=self.dp_size,
-            enable_seq_packing=self.enable_seq_packing,
-            sampling_params=None,
-            topk_logits=topk_logits,
-            is_mdlm=self.cfg.get("is_mdlm", False),
+        teacher_post_processor = self._get_or_create_teacher_ipc_post_processor(
+            topk_logits
         )
 
         on_microbatch_start = self._make_on_microbatch_start(
@@ -786,6 +915,12 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         self.teacher_logits = {
             "microbatch_handles": teacher_post_processor.microbatch_handles,
             "is_topk": topk_logits is not None,
+            # Top-level metadata mirrors per-microbatch schema-v1 fields so
+            # consumers can validate without scanning handles.
+            "schema_version": 1,
+            "world_rank": torch.distributed.get_rank(),
+            "tp_size": self.tp_size,
+            "cp_size": self.cp_size,
         }
         return self.teacher_logits
 
@@ -822,9 +957,15 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             self.model.train()
 
         teacher_worker_result = None
+        teacher_worker_tp_group_results = None
         if teacher_logits is not None:
-            rank = torch.distributed.get_rank()
-            teacher_worker_result = teacher_logits[rank]
+            teacher_worker_result = self._select_teacher_result_by_world_rank(
+                teacher_logits
+            )
+            if self.tp_size > 1:
+                teacher_worker_tp_group_results = (
+                    self._select_teacher_results_for_tp_group(teacher_logits)
+                )
 
         if use_teacher_ipc_loss_postprocessor and teacher_worker_result is not None:
             loss_post_processor = XTokenStudentIPCLossPostProcessor(
@@ -838,6 +979,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 enable_seq_packing=self.enable_seq_packing,
                 sampling_params=None,
                 teacher_result=teacher_worker_result,
+                teacher_tp_group_results=teacher_worker_tp_group_results,
             )
         else:
             loss_post_processor = LossPostProcessor(

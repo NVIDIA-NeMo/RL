@@ -702,24 +702,36 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     ) -> None:
         """Update per-step cross-tokenizer data on all workers' cached loss functions.
 
-        Shards the data so each worker only receives its slice, not the full batch.
+        Shards by the ``data_parallel`` axis so each DP group receives its own
+        slice, and replicates along ``tensor_parallel`` / ``context_parallel``
+        / ``pipeline_parallel`` so every worker in the same DP group sees the
+        same slice. Mirrors the axis layout used by
+        :meth:`train_off_policy_distillation`.
         """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         batch_size = teacher_input_ids.shape[0]
         shard_size = batch_size // dp_size
 
-        futures = self.worker_group.run_all_workers_multiple_data(
+        teacher_input_ids_shards = [
+            teacher_input_ids[i * shard_size : (i + 1) * shard_size]
+            for i in range(dp_size)
+        ]
+        aligned_pairs_shards = [
+            aligned_pairs[i * shard_size : (i + 1) * shard_size] for i in range(dp_size)
+        ]
+
+        multi_future = self.worker_group.run_all_workers_sharded_data(
             "update_cross_tokenizer_data",
-            teacher_input_ids=[
-                teacher_input_ids[i * shard_size : (i + 1) * shard_size]
-                for i in range(dp_size)
-            ],
-            aligned_pairs=[
-                aligned_pairs[i * shard_size : (i + 1) * shard_size]
-                for i in range(dp_size)
+            teacher_input_ids=teacher_input_ids_shards,
+            aligned_pairs=aligned_pairs_shards,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "tensor_parallel",
+                "context_parallel",
+                "pipeline_parallel",
             ],
         )
-        ray.get(futures)
+        self.worker_group.get_all_worker_results(multi_future)
 
     def train_off_policy_distillation(
         self,
@@ -786,8 +798,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         is_teacher = role == "teacher"
         if is_teacher:
+            # Keep CP in the returned list. Teacher compute is replicated
+            # across CP ranks (same inputs, same model, identical outputs by
+            # value), but each CP rank writes its IPC buffer to its *own* GPU
+            # memory. Student rank (dp=d, tp=t, cp=c) must read the teacher
+            # handle produced on the same GPU; cross-GPU IPC would require
+            # P2P and is unnecessary since teacher already ran on that rank.
+            # Deduplicating here would drop those handles and leave CP>0
+            # students without a match.
             output_replicated = [
-                "context_parallel",
                 "pipeline_parallel",
             ]
         else:
