@@ -90,24 +90,45 @@ class K8sEndpointRegistry:
             print(f"Created endpoint registry ConfigMap: {self.configmap_name}")
         except ApiException as e:
             if e.status == 409:
-                # Already exists — patch ownerReferences if we have them
-                # (handles race where Gym's set() created it before RL's create()).
+                # Already exists. Only one RayCluster may be ``controller: true``
+                # per object in Kubernetes — if a controller already owns this
+                # ConfigMap (gen usually registers first), skip the patch instead
+                # of appending a second controller (which yields 422).
                 if owner_references:
-                    self._v1.patch_namespaced_config_map(
-                        name=self.configmap_name,
-                        namespace=self.namespace,
-                        body=client.V1ConfigMap(
-                            metadata=client.V1ObjectMeta(
-                                owner_references=owner_references,
-                            )
-                        ),
-                    )
-                    print(
-                        f"Patched ownerReference on existing ConfigMap: {self.configmap_name}"
-                    )
+                    try:
+                        existing = self._v1.read_namespaced_config_map(
+                            name=self.configmap_name,
+                            namespace=self.namespace,
+                        )
+                        has_ctrl = any(
+                            getattr(r, "controller", False)
+                            for r in (existing.metadata.owner_references or [])
+                        )
+                    except ApiException:
+                        has_ctrl = False
+                    if has_ctrl:
+                        print(
+                            f"Endpoint registry ConfigMap already has a controller; "
+                            f"skipping ownerReference patch for {self.configmap_name}"
+                        )
+                    else:
+                        self._v1.patch_namespaced_config_map(
+                            name=self.configmap_name,
+                            namespace=self.namespace,
+                            body=client.V1ConfigMap(
+                                metadata=client.V1ObjectMeta(
+                                    owner_references=owner_references,
+                                )
+                            ),
+                        )
+                        print(
+                            f"Patched ownerReference on existing ConfigMap: "
+                            f"{self.configmap_name}"
+                        )
                 else:
                     print(
-                        f"Endpoint registry ConfigMap already exists: {self.configmap_name}"
+                        f"Endpoint registry ConfigMap already exists: "
+                        f"{self.configmap_name}"
                     )
             else:
                 raise

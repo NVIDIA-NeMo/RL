@@ -29,10 +29,11 @@ generation hot path.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import threading
 import traceback
-from typing import Any, Optional
+from typing import Optional
 
 import ray
 import torch
@@ -92,6 +93,7 @@ class GenerationControlServer:
         async def init_collective(request: Request):
             body = await request.json()
             try:
+
                 def _do():
                     futures = self.generation.init_collective(
                         ip=body["ip"],
@@ -100,11 +102,14 @@ class GenerationControlServer:
                         train_world_size=body["train_world_size"],
                     )
                     ray.get(futures)
+
                 await _run_blocking(_do)
                 return {"success": True}
             except Exception as e:
                 traceback.print_exc()
-                return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+                return JSONResponse(
+                    status_code=500, content={"success": False, "error": str(e)}
+                )
 
         @app.post("/reset_collective")
         async def reset_collective():
@@ -113,19 +118,24 @@ class GenerationControlServer:
             Idempotent — safe to call when no collective is currently held.
             """
             try:
+
                 def _do():
                     futures = self.generation.reset_collective()
                     if futures:
                         ray.get(futures)
+
                 await _run_blocking(_do)
                 return {"success": True}
             except Exception as e:
                 traceback.print_exc()
-                return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+                return JSONResponse(
+                    status_code=500, content={"success": False, "error": str(e)}
+                )
 
         @app.post("/update_weights_from_collective")
         async def update_weights_from_collective():
             try:
+
                 def _do():
                     futures = self.generation.update_weights_from_collective()
                     results = ray.get(futures)
@@ -135,11 +145,14 @@ class GenerationControlServer:
                             f"One or more workers failed to update weights. Results: {results}"
                         )
                     return success
+
                 success = await _run_blocking(_do)
                 return {"success": success}
             except Exception as e:
                 traceback.print_exc()
-                return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+                return JSONResponse(
+                    status_code=500, content={"success": False, "error": str(e)}
+                )
 
         @app.post("/prepare_for_generation")
         async def prepare_for_generation():
@@ -148,7 +161,9 @@ class GenerationControlServer:
                 return {"success": bool(result)}
             except Exception as e:
                 traceback.print_exc()
-                return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+                return JSONResponse(
+                    status_code=500, content={"success": False, "error": str(e)}
+                )
 
         @app.post("/finish_generation")
         async def finish_generation():
@@ -157,20 +172,28 @@ class GenerationControlServer:
                 return {"success": bool(result)}
             except Exception as e:
                 traceback.print_exc()
-                return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+                return JSONResponse(
+                    status_code=500, content={"success": False, "error": str(e)}
+                )
 
         @app.post("/prepare_refit_info")
         async def prepare_refit_info(request: Request):
             try:
                 body_bytes = await request.body()
+
                 def _do():
-                    state_dict_info = torch.load(io.BytesIO(body_bytes), weights_only=False)
+                    state_dict_info = torch.load(
+                        io.BytesIO(body_bytes), weights_only=False
+                    )
                     self.generation.prepare_refit_info(state_dict_info)
+
                 await _run_blocking(_do)
                 return {"success": True}
             except Exception as e:
                 traceback.print_exc()
-                return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+                return JSONResponse(
+                    status_code=500, content={"success": False, "error": str(e)}
+                )
 
         @app.post("/invalidate_kv_cache")
         async def invalidate_kv_cache():
@@ -179,7 +202,9 @@ class GenerationControlServer:
                 return {"success": bool(result)}
             except Exception as e:
                 traceback.print_exc()
-                return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+                return JSONResponse(
+                    status_code=500, content={"success": False, "error": str(e)}
+                )
 
         @app.post("/clear_logger_metrics")
         async def clear_logger_metrics():
@@ -212,7 +237,9 @@ class GenerationControlServer:
         """Start the server in a background thread."""
         import uvicorn
 
-        config = uvicorn.Config(self._app, host="0.0.0.0", port=self.port, timeout_keep_alive=120)
+        config = uvicorn.Config(
+            self._app, host="0.0.0.0", port=self.port, timeout_keep_alive=120
+        )
         server = uvicorn.Server(config)
         self._server_thread = threading.Thread(target=server.run, daemon=True)
         self._server_thread.start()

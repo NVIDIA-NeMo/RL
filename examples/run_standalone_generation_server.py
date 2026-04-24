@@ -34,18 +34,31 @@ import ray
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, _get_node_ip_local, init_ray
+from nemo_rl.distributed.virtual_cluster import (
+    RayVirtualCluster,
+    _get_node_ip_local,
+    init_ray,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.generation_control_server import GenerationControlServer
 from nemo_rl.models.generation.vllm import VllmGeneration
-from nemo_rl.utils.config import load_config, parse_hydra_overrides, register_omegaconf_resolvers
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Standalone vLLM generation server")
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML")
     parser.add_argument("--port", type=int, default=8089, help="Control server port")
-    parser.add_argument("--num-gpus", type=int, default=None, help="Number of GPUs to use (default: all available)")
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=None,
+        help="Number of GPUs to use (default: all available)",
+    )
     args, overrides = parser.parse_known_args()
     return args, overrides
 
@@ -135,7 +148,9 @@ def main():
     server.start()
 
     # Register in K8s endpoint registry if disagg_job_id is set
-    disagg_job_id = os.environ.get("DISAGG_JOB_ID") or generation_config.get("disagg_job_id")
+    disagg_job_id = os.environ.get("DISAGG_JOB_ID") or generation_config.get(
+        "disagg_job_id"
+    )
     if disagg_job_id:
         import json
 
@@ -148,6 +163,13 @@ def main():
         registry.set("generation_world_size", str(cluster.world_size()))
         registry.set(
             "dp_openai_server_base_urls",
+            json.dumps(generation.dp_openai_server_base_urls),
+        )
+        # Backward-compat alias: NemoGym's standalone_server reads
+        # `vllm_base_urls`. Keep publishing both keys until gym consumers
+        # migrate to the new name.
+        registry.set(
+            "vllm_base_urls",
             json.dumps(generation.dp_openai_server_base_urls),
         )
         print(f"Registered in K8sEndpointRegistry (job_id={disagg_job_id})")
