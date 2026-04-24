@@ -258,6 +258,7 @@ link-mode = "copy"
 # The nvidia-modelopt override is needed because mcore is still on 0.33
 override-dependencies = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@71bbefbf153418f943640df0f7373625dc93fa46",
+  "nvidia-cublas==13.3.0.5",
   "nvidia-cudnn-cu13==9.20.0.48",
   "opencv-python-headless>=4.11.0",
   "timm<=1.0.22",
