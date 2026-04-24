@@ -112,6 +112,10 @@ ENV UV_LINK_MODE=copy
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
+## CUDA 13 moved standard library headers under include/cccl; expose that path so
+## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
+ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
+
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
@@ -138,10 +142,6 @@ fi
 
 # The venv is symlinked to avoid bloating the layer size
 uv sync --link-mode symlink --locked --no-install-project
-
-# Fix DeepEP build on cuda 13 https://github.com/deepseek-ai/DeepEP/issues/568
-ln -s /usr/local/cuda/include/cccl/cuda /usr/local/cuda/include/cuda
-
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
     uv sync --link-mode symlink --locked --extra vllm --no-install-project
 fi
