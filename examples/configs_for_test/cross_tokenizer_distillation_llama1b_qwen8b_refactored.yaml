@@ -90,7 +90,8 @@ policy: &POLICY_BASE
         sequence_length_round: 64
 
     max_grad_norm: 1.0
-    make_sequence_length_divisible_by: ${mul:${mul:${.dtensor_cfg.tensor_parallel_size}, ${.dtensor_cfg.context_parallel_size}}, 2}
+    # make_sequence_length_divisible_by: ${mul:${mul:${.dtensor_cfg.tensor_parallel_size}, ${.dtensor_cfg.context_parallel_size}}, 2}
+    make_sequence_length_divisible_by: 1
 
     optimizer:
         name: "torch.optim.AdamW"
