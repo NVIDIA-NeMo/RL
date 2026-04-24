@@ -122,15 +122,20 @@ def main():
         loaded = OmegaConf.load(args.config_yaml)
         initial_global_config_dict = OmegaConf.to_container(loaded, resolve=False)
 
-        def _strip_interpolations(d):
+        def _strip_interpolations(d, path=""):
             if isinstance(d, dict):
-                return {
-                    k: _strip_interpolations(v)
-                    for k, v in d.items()
-                    if not (isinstance(v, str) and "${" in v)
-                }
+                result = {}
+                for k, v in d.items():
+                    key_path = f"{path}.{k}" if path else k
+                    if isinstance(v, str) and "${" in v:
+                        print(
+                            f"Dropping unresolvable interpolation: {key_path} = {v!r}"
+                        )
+                    else:
+                        result[k] = _strip_interpolations(v, key_path)
+                return result
             if isinstance(d, list):
-                return [_strip_interpolations(item) for item in d]
+                return [_strip_interpolations(item, f"{path}[]") for item in d]
             return d
 
         initial_global_config_dict = _strip_interpolations(initial_global_config_dict)

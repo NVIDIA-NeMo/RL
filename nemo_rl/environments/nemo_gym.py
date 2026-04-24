@@ -13,6 +13,7 @@
 # limitations under the License.
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, TypedDict
+from urllib.parse import urlparse
 
 import ray
 import torch
@@ -48,12 +49,14 @@ class NemoGym(EnvironmentInterface):
             # No local subprocesses are spawned.
             remote_url = cfg["remote_gym_url"]
             # Parse host:port from URL like "http://gym-service:8080" or "gym-service:8080"
-            url = remote_url.removeprefix("http://").removeprefix("https://")
-            if ":" in url:
-                host, port_str = url.rsplit(":", 1)
-                port = int(port_str.rstrip("/"))
-            else:
-                host, port = url.rstrip("/"), 8080
+            # Prefix with http:// if no scheme so urlparse handles it correctly.
+            parsed = urlparse(
+                remote_url
+                if remote_url.startswith(("http://", "https://"))
+                else f"http://{remote_url}"
+            )
+            host = parsed.hostname or "localhost"
+            port = parsed.port or 8080
             print(f"NemoGym remote mode: connecting to {host}:{port}")
 
             self.rh = None
@@ -61,8 +64,11 @@ class NemoGym(EnvironmentInterface):
             self.rch = RolloutCollectionHelper()
 
             initial_global_config_dict = cfg.get("initial_global_config_dict") or {}
-            self.rollout_max_attempts_to_avoid_lp_nan = initial_global_config_dict.pop(
+            self.rollout_max_attempts_to_avoid_lp_nan = initial_global_config_dict.get(
                 "rollout_max_attempts_to_avoid_lp_nan", 1
+            )
+            assert self.rollout_max_attempts_to_avoid_lp_nan >= 1, (
+                "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
             )
         else:
             # Colocated mode: spawn Gym subprocesses locally (original behavior).
