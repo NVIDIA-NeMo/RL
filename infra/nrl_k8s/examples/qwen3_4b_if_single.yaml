@@ -1,0 +1,50 @@
+# Qwen3-4B GRPO on instruction_following gym — **single RayCluster variant**.
+#
+# Training, colocated vLLM generation, AND gym all run inside a single
+# RayCluster. Gym is spawned as a local Ray actor by
+# examples/nemo_gym/run_grpo_nemo_gym.py (create_env(env_name="nemo_gym", ...))
+# because neither env.disagg_job_id nor env.remote_gym_url is set.
+#
+# Pair with qwen3_4b_if_single.infra.yaml (declares only the training cluster;
+# no separate gym or generation cluster).
+defaults: ../../../examples/nemo_gym/grpo_qwen3_4b_instruct_k8s_base.yaml
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_num_steps: 500
+  val_period: 50
+  max_rollout_turns: 1
+  async_grpo:
+    # NeMo-RL asserts non-colocated when async_grpo is enabled. Single-cluster runs
+    # colocated generation, so GRPO must remain synchronous.
+    enabled: false
+policy:
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # Colocated vLLM + backward on 4B takes too much GPU at 16K context;
+  # halving leaves headroom for vLLM's KV cache + activations + optimizer.
+  max_total_sequence_length: 8192
+  dtensor_cfg:
+    activation_checkpointing: true
+  generation:
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1
+    vllm_cfg:
+      gpu_memory_utilization: 0.45  # leave 55% for training state
+checkpointing:
+  save_period: 50
+logger:
+  wandb_enabled: true
+  wandb:
+    project: nemorl-single-k8s
+    name: single-if-qwen3-4b
+  tensorboard_enabled: true
+  monitor_gpus: true

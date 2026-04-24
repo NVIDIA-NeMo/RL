@@ -1,0 +1,169 @@
+# Infra for single-cluster Qwen3-4B colocated GRPO run.
+#
+# A single RayCluster hosting training + colocated vLLM generation + a local
+# Gym Ray actor. No separate gym or generation cluster — that's the whole
+# point of single-cluster: the training entrypoint calls
+#   create_env(env_name="nemo_gym", ...)
+# which pins the Gym actor to a non-head worker via NodeAffinityScheduling,
+# so we must size the GPU worker big enough to host *both* the vLLM engines
+# (8 GPU) and the Gym actor (~4 CPU). Namespace is auto-inferred from the
+# kube context (nemo-rl-testing).
+
+_shared:
+  nodeSelector: &shared_node_selector
+    gpu-wrangler.nvidia.com/lease: nemo-rl-testing
+  tolerations: &shared_tolerations
+    - {key: gpu-wrangler.nvidia.com/lease, operator: Equal, value: nemo-rl-testing, effect: NoSchedule}
+    - {key: platform.nvidia.com/gpu,       operator: Equal, value: "true",          effect: NoSchedule}
+  # Image ships aws-ofi + enp71s0 defaults; keep pod env minimal.
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                        value: /tmp/huggingface}
+    - {name: TRANSFORMERS_CACHE,             value: /tmp/huggingface}
+    - {name: NCCL_DEBUG,                     value: INFO}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                        value: /tmp/huggingface}
+    - {name: TRANSFORMERS_CACHE,             value: /tmp/huggingface}
+    - {name: NCCL_DEBUG,                     value: INFO}
+    - {name: GLOO_SOCKET_IFNAME,             value: enp71s0}
+    - {name: NCCL_SOCKET_IFNAME,             value: enp71s0}
+    - {name: FI_PROVIDER,                    value: efa}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+  headResources: &shared_head_resources
+    limits:   {cpu: "8", memory: "32Gi"}
+    requests: {cpu: "2", memory: "8Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    # Sized for the full p5.48xlarge (192 CPU / ~1957 GiB allocatable).
+    # Single-cluster needs the worker to host training + colocated vLLM +
+    # the Gym actor (~4 CPU). We claim 184 CPU / 1850 GiB (leaving ~8 CPU +
+    # ~100 GiB for the Ray head pod + k8s daemonsets: kube-proxy, aws-node,
+    # nvidia-device-plugin, node-exporter). 32 EFA devices = full NIC set.
+    limits:
+      cpu: "184"
+      memory: "1850Gi"
+      nvidia.com/gpu: "8"
+      vpc.amazonaws.com/efa: "32"
+    requests:
+      cpu: "184"
+      memory: "1850Gi"
+      nvidia.com/gpu: "8"
+      vpc.amazonaws.com/efa: "32"
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+  dshmMounts: &dshm_mounts
+    - {mountPath: /dev/shm, name: dshm}
+  dshm16: &dshm_16
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 16Gi}
+  dshm64: &dshm_64
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 64Gi}
+
+# namespace intentionally omitted — CLI auto-infers nemo-rl-testing from
+# the current kube context.
+image: nvcr.io/nvidian/nemo-rl:nightly
+imagePullSecrets: [nvidia-ngcuser-pull-secret, ngc-registry-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+launch:
+  mode: attach
+  attach:
+    training: ${user:}-raycluster-single-qwen3-4b
+  peerWatcher: false
+  # Single-cluster: no remote_generation_url (colocated), no disagg_job_id
+  # (no endpoint registry — gym is a local Ray actor).
+  entrypoint: |
+    pip install kubernetes -q || true
+    export GLOO_SOCKET_IFNAME=enp71s0
+    export NCCL_SOCKET_IFNAME=enp71s0
+    export FI_PROVIDER=efa
+    # Data files are pre-staged on the pods via kubectl cp.
+    export DISAGG_TRAIN_PATH=/tmp/train.jsonl
+    export DISAGG_VALID_PATH=/tmp/validation.jsonl
+    # NOTE: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is incompatible
+    # with colocated vLLM's CuMemAllocator (AssertionError at vLLM init).
+    export RAY_enable_infeasible_task_early_exit=true
+    export PYTHONPATH=.:3rdparty/Gym-workspace/Gym:3rdparty/Megatron-LM-workspace/Megatron-LM
+    python -u examples/nemo_gym/run_grpo_nemo_gym.py \
+      --config nrl_k8s_run.yaml \
+      ++env.nemo_gym.config_paths='[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/instruction_following/configs/instruction_following.yaml]' \
+      ~policy.optimizer.kwargs.foreach \
+      ~policy.optimizer.kwargs.fused
+  env: {}
+  rayUploadPaths:
+    - nemo_rl
+    - examples
+    - infra/examples
+    - tests/check_metrics.py
+    - tests/json_dump_tb_logs.py
+    - 3rdparty/Gym-workspace/Gym/nemo_gym
+    - 3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model
+    - 3rdparty/Gym-workspace/Gym/responses_api_agents/simple_agent
+    - 3rdparty/Gym-workspace/Gym/pyproject.toml
+    - 3rdparty/Gym-workspace/Gym/uv.lock
+    - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/app.py
+    - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/requirements.txt
+    - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/configs
+    - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/tests
+    - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/data/validation.jsonl
+    - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/data/example.jsonl
+    - 3rdparty/Gym-workspace/Gym/resources_servers/instruction_following/data/example_rollouts.jsonl
+    - 3rdparty/Megatron-LM-workspace/Megatron-LM/megatron
+
+clusters:
+  # ---------------- Training (GPU head + worker: generation + gym colocated) ----------------
+  training:
+    name: ${user:}-raycluster-single-qwen3-4b
+    labels:
+      disagg.nemo-rl/cluster: single-qwen3-4b
+      disagg.nemo-rl/run: qwen3-4b-single
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams: {dashboard-host: "0.0.0.0", num-gpus: "0", object-store-memory: "200000000"}
+        template:
+          spec:
+            schedulerName: default-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *shared_node_selector
+            tolerations: *shared_tolerations
+            containers:
+              - name: ray-head
+                env:
+                  - {name: HF_HOME,                        value: /tmp/huggingface}
+                  - {name: TRANSFORMERS_CACHE,             value: /tmp/huggingface}
+                  - {name: NCCL_DEBUG,                     value: INFO}
+                  - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+                  - name: WANDB_API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: wandb-api-key
+                        key: WANDB_API_KEY
+                resources: *shared_head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *dshm_mounts
+            volumes: *dshm_16
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 1
+          minReplicas: 1
+          maxReplicas: 1
+          rayStartParams: {num-gpus: "8", object-store-memory: "200000000"}
+          template:
+            spec:
+              schedulerName: default-scheduler
+              hostNetwork: true
+              dnsPolicy: ClusterFirstWithHostNet
+              nodeSelector: *shared_node_selector
+              tolerations: *shared_tolerations
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  resources: *gpu_worker_resources
+                  volumeMounts: *dshm_mounts
+              volumes: *dshm_64
