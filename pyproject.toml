@@ -113,6 +113,7 @@ nvrx = [
   "nvidia-resiliency-ext",
 ] # for ft_launcher (fault-tolerant training launcher)
 nemo_gym = ["nemo_gym"]
+k8s = ["kubernetes"]
 
 [dependency-groups]
 

@@ -112,40 +112,54 @@ class K8sEndpointRegistry:
             else:
                 raise
 
-    def set(self, key: str, value: str) -> None:
+    def set(self, key: str, value: str, _max_retries: int = 5) -> None:
         """Write a key-value pair to the ConfigMap. Creates the ConfigMap if needed."""
-        try:
-            cm = self._v1.read_namespaced_config_map(
-                name=self.configmap_name, namespace=self.namespace
-            )
-            if cm.data is None:
-                cm.data = {}
-            cm.data[key] = value
-            self._v1.patch_namespaced_config_map(
-                name=self.configmap_name, namespace=self.namespace, body=cm
-            )
-        except ApiException as e:
-            if e.status == 404:
-                # ConfigMap doesn't exist yet — create it with this key.
-                try:
-                    cm = client.V1ConfigMap(
-                        metadata=client.V1ObjectMeta(
-                            name=self.configmap_name, namespace=self.namespace
-                        ),
-                        data={key: value},
+        for attempt in range(_max_retries):
+            try:
+                cm = self._v1.read_namespaced_config_map(
+                    name=self.configmap_name, namespace=self.namespace
+                )
+                if cm.data is None:
+                    cm.data = {}
+                cm.data[key] = value
+                self._v1.patch_namespaced_config_map(
+                    name=self.configmap_name, namespace=self.namespace, body=cm
+                )
+            except ApiException as e:
+                if e.status == 409:
+                    # Conflict on patch — another writer updated concurrently. Retry.
+                    print(
+                        f"Conflict on patch (attempt {attempt + 1}/{_max_retries}), retrying..."
                     )
-                    self._v1.create_namespaced_config_map(
-                        namespace=self.namespace, body=cm
-                    )
-                except ApiException as create_err:
-                    if create_err.status == 409:
-                        # Another process created it between our read and create — retry patch.
-                        self.set(key, value)
-                        return
+                    continue
+                if e.status == 404:
+                    # ConfigMap doesn't exist yet — create it with this key.
+                    try:
+                        cm = client.V1ConfigMap(
+                            metadata=client.V1ObjectMeta(
+                                name=self.configmap_name, namespace=self.namespace
+                            ),
+                            data={key: value},
+                        )
+                        self._v1.create_namespaced_config_map(
+                            namespace=self.namespace, body=cm
+                        )
+                    except ApiException as create_err:
+                        if create_err.status == 409:
+                            # Another process created it between our read and create — retry.
+                            print(
+                                f"Conflict on create (attempt {attempt + 1}/{_max_retries}), retrying..."
+                            )
+                            continue
+                        raise
+                else:
                     raise
-            else:
-                raise
-        print(f"Registered endpoint: {key} = {value}")
+            print(f"Registered endpoint: {key} = {value}")
+            return
+        raise RuntimeError(
+            f"Failed to set key '{key}' in ConfigMap '{self.configmap_name}' "
+            f"after {_max_retries} attempts due to conflicts"
+        )
 
     def get(self, key: str, timeout: float = 600, poll_interval: float = 2) -> str:
         """Poll until a key appears in the ConfigMap, then return its value.
