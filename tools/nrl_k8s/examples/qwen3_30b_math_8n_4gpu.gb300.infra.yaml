@@ -1,4 +1,4 @@
-# Prod-mode infra for qwen3_30b_math_8n_4gpu.yaml on GB300 (p6e-gb300r.36xlarge).
+# Prod-mode infra for qwen3_30b_math_8n_4gpu.yaml on a GB300 NVL72 cluster.
 #
 # Topology: 8 workers × 4 GPUs = 32 GPUs in a single RayCluster, scheduled by
 # KAI as one gang. NVLink/MNNVL spans all 32 GPUs via a ComputeDomain channel,
@@ -17,7 +17,7 @@
 # Prereqs (onboarding §3–§5 already applied in `default`):
 #   - rl-workspace PVC bound (shared FSx Lustre, 2.4 TiB, RWX).
 #   - /mnt/rl-workspace/${user:}/nemo-rl contains a git checkout of
-#     https://github.com/NVIDIA-NeMo/RL on branch hemil/k8s-infra-cp.
+#     https://github.com/NVIDIA-NeMo/RL on branch main.
 #   - nvcr-secret, wandb-api-key, nemo-rl-endpoint-registry all present.
 #   - KAI topology `gb300-topology` is registered and advertises
 #     nvidia.com/gpu.clique as a placement key.
@@ -60,7 +60,7 @@ _shared:
     limits:   {cpu: "60", memory: "240Gi"}
     requests: {cpu: "48", memory: "200Gi"}
   gpuWorkerResources: &gpu_worker_resources
-    # p6e-gb300r.36xlarge allocatable: ~139.6 CPU / ~924 GiB / 4 GPUs.
+    # NVL72 GB300 node allocatable: ~140 CPU / ~924 GiB / 4 GPUs.
     # Claim 120/132 CPU + 850/900 GiB to leave headroom for dgxc/device-plugin.
     limits:
       cpu: "132"

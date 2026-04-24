@@ -46,7 +46,7 @@
 #    Allocates RoCE (RDMA) NICs per worker pod for inter-node communication.
 #    This is a separate DRA driver (dra.networking.k8s.aws) — you create it yourself.
 #    Adjust the count based on your node type:
-#      - GB300 (p6e-gb300r.36xlarge): count: 8 (8 RoCE NICs per node)
+#      - GB300 ( NVL72 GB300 node): count: 8 (8 RoCE NICs per node)
 #
 # Only GPU worker pods need these claims (referenced via resources.claims in the
 # container spec and resourceClaims in the pod spec).

@@ -64,7 +64,7 @@ spec:
         containers:
         # --- Ray head ---
         - name: ray-head
-          image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+          image: nvcr.io/nvidian/nemo-rl:nightly
           env:
           - name: RAY_CLUSTER_NAME
             value: raycluster-rl           # used by endpoint registry for ownerReference
@@ -173,7 +173,7 @@ spec:
         - name: nvcr-secret
         containers:
         - name: ray-worker
-          image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+          image: nvcr.io/nvidian/nemo-rl:nightly
           env:
           - name: NRL_FORCE_REBUILD_VENVS
             value: "true"
@@ -211,7 +211,7 @@ spec:
         containers:
         # --- Gym Ray head (runs standalone_gym_server) ---
         - name: ray-head
-          image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+          image: nvcr.io/nvidian/nemo-rl:nightly
           resources:
             limits:   { cpu: "4", memory: "16Gi" }
             requests: { cpu: "1", memory: "4Gi" }

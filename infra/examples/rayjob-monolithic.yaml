@@ -33,7 +33,7 @@ spec:
           - name: nvcr-secret
           containers:
           - name: ray-head
-            image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+            image: nvcr.io/nvidian/nemo-rl:nightly
             env:
             - name: NRL_FORCE_REBUILD_VENVS
               value: "true"
@@ -73,7 +73,7 @@ spec:
           - name: nvcr-secret
           containers:
           - name: ray-worker
-            image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+            image: nvcr.io/nvidian/nemo-rl:nightly
             env:
             - name: NRL_FORCE_REBUILD_VENVS
               value: "true"

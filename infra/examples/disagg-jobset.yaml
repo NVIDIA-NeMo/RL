@@ -90,7 +90,7 @@ spec:
             - name: nvcr-secret
             containers:
             - name: ray-head
-              image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+              image: nvcr.io/nvidian/nemo-rl:nightly
               command: ["/bin/bash", "-c"]
               args:
               - |
@@ -145,7 +145,7 @@ spec:
             - name: nvcr-secret
             initContainers:
             - name: wait-for-rl-head
-              image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+              image: nvcr.io/nvidian/nemo-rl:nightly
               command: ["/bin/bash", "-c"]
               args:
               - |
@@ -159,7 +159,7 @@ spec:
                 requests: { cpu: "200m", memory: "256Mi" }
             containers:
             - name: ray-worker
-              image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+              image: nvcr.io/nvidian/nemo-rl:nightly
               command: ["/bin/bash", "-c"]
               args:
               - |
@@ -205,7 +205,7 @@ spec:
             - name: nvcr-secret
             containers:
             - name: ray-head
-              image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+              image: nvcr.io/nvidian/nemo-rl:nightly
               command: ["/bin/bash", "-c"]
               args:
               - |
@@ -265,7 +265,7 @@ spec:
             - name: nvcr-secret
             initContainers:
             - name: wait-for-gym-head
-              image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+              image: nvcr.io/nvidian/nemo-rl:nightly
               command: ["/bin/bash", "-c"]
               args:
               - |
@@ -279,7 +279,7 @@ spec:
                 requests: { cpu: "200m", memory: "256Mi" }
             containers:
             - name: ray-worker
-              image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+              image: nvcr.io/nvidian/nemo-rl:nightly
               command: ["/bin/bash", "-c"]
               args:
               - |
@@ -322,7 +322,7 @@ spec:
             - name: nvcr-secret
             initContainers:
             - name: wait-for-rl-head
-              image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+              image: nvcr.io/nvidian/nemo-rl:nightly
               command: ["/bin/bash", "-c"]
               args:
               - |
@@ -336,7 +336,7 @@ spec:
                 requests: { cpu: "200m", memory: "256Mi" }
             containers:
             - name: driver
-              image: nvcr.io/nvidian/nemo-rl:e5a729c-47084432
+              image: nvcr.io/nvidian/nemo-rl:nightly
               command: ["/bin/bash", "-c"]
               args:
               - |
