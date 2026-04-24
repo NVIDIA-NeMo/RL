@@ -221,6 +221,8 @@ class MegatronConfig(TypedDict):
     apply_rope_fusion: bool
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: bool
+    # Requires APEX with --cpp_ext and --cuda_ext; typically False unless APEX is installed
+    gradient_accumulation_fusion: bool
     # Force reconvert from HF even if the checkpoint already exists (default: False)
     force_reconvert_from_hf: NotRequired[bool]
     # Attention backend available values:

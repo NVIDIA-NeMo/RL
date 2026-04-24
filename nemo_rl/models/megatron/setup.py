@@ -272,9 +272,11 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
         * ``pretrained_path`` is the path of the checkpoint that will be used
           as the pretrained starting point.  For ``megatron_bridge`` format this
           is resolved to the specific iteration directory containing
-          ``run_config.yaml``.  For ``megatron_lm`` format this is the path
-          exactly as provided in the config (root dir or iter dir).  For the
-          default HF path this is the Megatron-Bridge cache directory.
+          ``run_config.yaml``.  For ``megatron_lm`` format this is resolved to
+          the specific iteration directory (via ``latest_checkpointed_iteration.txt``
+          or by scanning ``iter_*`` subdirs if a root dir is provided, since the
+          bridge does not resolve iterations itself).  For the default HF path
+          this is the Megatron-Bridge cache directory.
         * ``pt_checkpoint_exists`` is ``True`` when the checkpoint at
           ``pretrained_path`` is already present and does not need to be
           created.
@@ -334,7 +336,37 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
                     f"iteration directory (e.g. /checkpoints/iter_0005000/).  The "
                     f"checkpoint must use torch_dist format (contain metadata.json)."
                 )
-            return hf_model_name, path, True
+            # If path is already a specific iter dir (contains metadata.json), use it
+            # directly.  Otherwise resolve the latest iteration from the tracker file
+            # or by scanning for iter_* subdirectories — the bridge does not read
+            # latest_checkpointed_iteration.txt itself and defaults to iter_0000000.
+            if os.path.exists(os.path.join(path, "metadata.json")):
+                resolved = path
+            else:
+                tracker = os.path.join(path, "latest_checkpointed_iteration.txt")
+                if os.path.exists(tracker):
+                    with open(tracker) as f:
+                        iteration = int(f.read().strip())
+                    resolved = os.path.join(path, f"iter_{iteration:07d}")
+                else:
+                    iter_subdirs = sorted(
+                        d
+                        for d in os.listdir(path)
+                        if d.startswith("iter_") and os.path.isdir(os.path.join(path, d))
+                    )
+                    if not iter_subdirs:
+                        raise FileNotFoundError(
+                            f"pretrained_checkpoint.path={path!r} does not contain "
+                            f"metadata.json, latest_checkpointed_iteration.txt, or any "
+                            f"iter_* subdirectories.  Cannot resolve a megatron_lm checkpoint."
+                        )
+                    resolved = os.path.join(path, iter_subdirs[-1])
+            if not os.path.exists(os.path.join(resolved, "metadata.json")):
+                raise FileNotFoundError(
+                    f"Resolved megatron_lm checkpoint directory {resolved!r} does not "
+                    f"contain metadata.json.  The checkpoint must use torch_dist format."
+                )
+            return hf_model_name, resolved, True
 
         else:
             raise ValueError(
@@ -375,10 +407,8 @@ def setup_model_config(
 
     if fmt == "megatron_lm":
         # For megatron_lm format: build the model config from the HF architecture.
-        # The bridge's _load_checkpoint_from_path falls back to
-        # _extract_megatron_lm_args_from_state_dict when run_config.yaml is absent,
-        # so no conversion step is needed — we pass pretrained_path directly to the
-        # bridge as the pretrained checkpoint directory.
+        # pretrained_path has already been resolved to a specific iter dir by
+        # validate_model_paths, so no conversion step is needed.
         from transformers import AutoConfig
 
         hf_cfg = AutoConfig.from_pretrained(hf_model_name, trust_remote_code=True)
@@ -590,6 +620,9 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # Fusion settings
     model_cfg.apply_rope_fusion = config["megatron_cfg"]["apply_rope_fusion"]
     model_cfg.bias_activation_fusion = config["megatron_cfg"]["bias_activation_fusion"]
+    model_cfg.gradient_accumulation_fusion = config["megatron_cfg"][
+        "gradient_accumulation_fusion"
+    ]
     # Optional explicit attention backend override for environments where
     # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")
