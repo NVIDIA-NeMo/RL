@@ -68,6 +68,7 @@ loss_fn:
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
   use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
+  disable_ppo_ratio: false
 
 checkpointing:
   enabled: true
