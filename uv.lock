@@ -92,7 +92,7 @@ constraints = [
     { name = "wheel", specifier = ">=0.46.2" },
 ]
 overrides = [
-    { name = "deep-ep", git = "https://github.com/deepseek-ai/DeepEP.git?rev=34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72" },
+    { name = "deep-ep", git = "https://github.com/chtruong814/DeepEP.git?rev=98f6709bce944c01126d3cd3b12c08ef786aaac9" },
     { name = "flashinfer-cubin", specifier = ">=0.5.0" },
     { name = "flashinfer-python", specifier = ">=0.5.0" },
     { name = "llguidance", specifier = ">=1.3.0,<1.4.0" },
@@ -1402,7 +1402,7 @@ wheels = [
 [[package]]
 name = "deep-ep"
 version = "1.2.1+bfded34"
-source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72#34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72" }
+source = { git = "https://github.com/chtruong814/DeepEP.git?rev=98f6709bce944c01126d3cd3b12c08ef786aaac9#98f6709bce944c01126d3cd3b12c08ef786aaac9" }
 dependencies = [
     { name = "ninja" },
     { name = "packaging" },
@@ -4341,9 +4341,9 @@ requires-dist = [
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
     { name = "decord2" },
-    { name = "deep-ep", marker = "extra == 'automodel'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72" },
-    { name = "deep-ep", marker = "extra == 'mcore'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72" },
-    { name = "deep-ep", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72" },
+    { name = "deep-ep", marker = "extra == 'automodel'", git = "https://github.com/chtruong814/DeepEP.git?rev=98f6709bce944c01126d3cd3b12c08ef786aaac9" },
+    { name = "deep-ep", marker = "extra == 'mcore'", git = "https://github.com/chtruong814/DeepEP.git?rev=98f6709bce944c01126d3cd3b12c08ef786aaac9" },
+    { name = "deep-ep", marker = "extra == 'vllm'", git = "https://github.com/chtruong814/DeepEP.git?rev=98f6709bce944c01126d3cd3b12c08ef786aaac9" },
     { name = "deep-gemm", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=c9f8b34dcdacc20aa746b786f983492c51072870" },
     { name = "emerging-optimizers", marker = "extra == 'mcore'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.2.0" },
     { name = "flash-attn", marker = "extra == 'automodel'", specifier = "==2.8.1" },
@@ -4370,7 +4370,7 @@ requires-dist = [
     { name = "nvidia-cudnn-cu13", specifier = "==9.20.0.48" },
     { name = "nvidia-cutlass-dsl", marker = "extra == 'vllm'", specifier = ">=4.4.0.dev1" },
     { name = "nvidia-ml-py" },
-    { name = "nvidia-nvshmem-cu13", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==3.4.5" },
+    { name = "nvidia-nvshmem-cu13", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'nvrx'" },
     { name = "nvtx" },
     { name = "omegaconf" },

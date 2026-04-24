@@ -138,6 +138,11 @@ fi
 
 # The venv is symlinked to avoid bloating the layer size
 uv sync --link-mode symlink --locked --no-install-project
+
+# Create symlink for libnvshmem_host.so (required for DeepEP fabric handle operations)
+NVSHMEM_LIB_PATH=$(uv pip show nvidia-nvshmem-cu13 | grep "Location:" | cut -d' ' -f2)/nvidia/nvshmem/lib
+ln -sf ${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3 ${NVSHMEM_LIB_PATH}/libnvshmem_host.so
+
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
     uv sync --link-mode symlink --locked --extra vllm --no-install-project
 fi
