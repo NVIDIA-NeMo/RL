@@ -25,7 +25,10 @@ from nemo_rl.algorithms.advantage_estimator import (
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
+    ROLLOUT_BUDGET_WARNING_TOKEN_THRESHOLD,
     _default_grpo_save_state,
+    _compute_rollout_budget_summary,
+    _get_rollout_budget_warnings,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
@@ -48,6 +51,90 @@ from tests.unit.algorithms.utils import (
 # ============================================================================
 # Stub classes for async GRPO testing (non-Ray versions for easy mocking)
 # ============================================================================
+
+
+def _make_rollout_budget_config(
+    *,
+    num_prompts_per_step=32,
+    num_generations_per_prompt=16,
+    max_new_tokens=1024,
+    generation_stop_strings=None,
+    env_stop_strings=None,
+    nested_env_stop_strings=None,
+    colocated_enabled=False,
+):
+    env_config = {"num_workers": 1}
+    if env_stop_strings is not None:
+        env_config["stop_strings"] = env_stop_strings
+    if nested_env_stop_strings is not None:
+        env_config["config"] = {"stop_strings": nested_env_stop_strings}
+
+    return {
+        "policy": {
+            "generation": {
+                "backend": "vllm",
+                "max_new_tokens": max_new_tokens,
+                "stop_strings": generation_stop_strings,
+                "vllm_cfg": {"async_engine": True},
+                "colocated": {
+                    "enabled": colocated_enabled,
+                    "resources": {"gpus_per_node": 4, "num_nodes": 1},
+                },
+            }
+        },
+        "grpo": {
+            "num_prompts_per_step": num_prompts_per_step,
+            "num_generations_per_prompt": num_generations_per_prompt,
+            "use_dynamic_sampling": False,
+            "batch_multiplier": 1,
+        },
+        "data": {
+            "train": {"env_name": "thai_reward_env"},
+            "default": None,
+        },
+        "env": {"thai_reward_env": env_config},
+        "cluster": {"num_nodes": 1, "gpus_per_node": 8},
+    }
+
+
+def test_compute_rollout_budget_summary_uses_effective_step_shape():
+    config = _make_rollout_budget_config()
+
+    summary = _compute_rollout_budget_summary(config)
+
+    assert summary["effective_num_prompts_per_step"] == 32
+    assert summary["num_generations_per_prompt"] == 16
+    assert summary["samples_per_step"] == 512
+    assert summary["configured_max_new_tokens"] == 1024
+    assert (
+        summary["theoretical_max_generated_tokens_per_step"]
+        == ROLLOUT_BUDGET_WARNING_TOKEN_THRESHOLD * 4
+    )
+    assert summary["async_generation_enabled"] is True
+    assert summary["colocated_generation_enabled"] is False
+
+
+def test_rollout_budget_warnings_flag_large_budget_without_stop_strings():
+    config = _make_rollout_budget_config()
+
+    warning_messages = _get_rollout_budget_warnings(config)
+
+    assert len(warning_messages) == 2
+    assert any(
+        "very large theoretical rollout budget" in msg for msg in warning_messages
+    )
+    assert any(
+        "without any obvious first-turn stop strings" in msg for msg in warning_messages
+    )
+
+
+def test_rollout_budget_warnings_accept_nested_env_stop_strings():
+    config = _make_rollout_budget_config(nested_env_stop_strings=["</s>"])
+
+    warning_messages = _get_rollout_budget_warnings(config)
+
+    assert len(warning_messages) == 1
+    assert "very large theoretical rollout budget" in warning_messages[0]
 
 
 class StubReplayBuffer:

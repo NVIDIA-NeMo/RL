@@ -26,6 +26,7 @@ sys.path.append("/".join(abspath.split("/")[:-4]))
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.datasets.utils import extract_necessary_env_names
 from nemo_rl.data.datasets.eval_datasets import (
     AIMEDataset,
     GPQADataset,
@@ -42,10 +43,14 @@ from nemo_rl.data.processors import (
     math_data_processor,
     math_hf_data_processor,
 )
+from nemo_rl.data.utils import get_default_stop_strings_from_env_config
 from nemo_rl.models.policy import TokenizerConfig
 
 
 class DummyTokenizer:
+    bos_token_id = None
+    name_or_path = "dummy-tokenizer"
+
     def apply_chat_template(
         self,
         messages,
@@ -67,6 +72,133 @@ class DummyTokenizer:
         if return_tensors == "pt":
             return {"input_ids": torch.tensor([encoded], dtype=torch.long)}
         return {"input_ids": encoded}
+
+    def text_to_ids(self, text):
+        return list(range(len(text)))
+
+
+def _processor_without_stop_strings(
+    datum_dict, task_data_spec, tokenizer, max_seq_length, idx
+):
+    message_log = []
+    for message in datum_dict["message_log"]:
+        message_log.append(
+            {
+                "role": message["role"],
+                "content": message["content"],
+                "token_ids": torch.tensor(message["token_ids"], dtype=torch.long),
+            }
+        )
+    return {
+        "message_log": message_log,
+        "length": len(message_log[0]["token_ids"]),
+        "extra_env_info": None,
+        "loss_multiplier": 1.0,
+        "idx": idx,
+        "task_name": datum_dict["task_name"],
+    }
+
+
+def _processor_with_explicit_stop_strings(
+    datum_dict, task_data_spec, tokenizer, max_seq_length, idx
+):
+    output = _processor_without_stop_strings(
+        datum_dict, task_data_spec, tokenizer, max_seq_length, idx
+    )
+    output["stop_strings"] = ["<explicit-stop>"]
+    return output
+
+
+def test_get_default_stop_strings_from_env_config_supports_direct_and_nested_keys():
+    assert get_default_stop_strings_from_env_config(
+        {"stop_strings": ["</s>", "<|end|>"]}
+    ) == ["</s>", "<|end|>"]
+    assert get_default_stop_strings_from_env_config(
+        {"config": {"stop_strings": ["<nested-stop>"]}}
+    ) == ["<nested-stop>"]
+    assert get_default_stop_strings_from_env_config({"config": {}}) is None
+    assert get_default_stop_strings_from_env_config(None) is None
+
+
+def test_extract_necessary_env_names_supports_list_configs():
+    data_config = {
+        "train": [
+            {"env_name": "env_a"},
+            {"env_name": "env_b"},
+        ],
+        "validation": [
+            {"env_name": "env_b"},
+            {"env_name": "env_c"},
+        ],
+        "default": {"env_name": "env_default"},
+    }
+
+    assert set(extract_necessary_env_names(data_config)) == {
+        "env_a",
+        "env_b",
+        "env_c",
+        "env_default",
+    }
+
+
+def test_processed_dataset_injects_task_default_stop_strings():
+    raw_dataset = Dataset.from_list(
+        [
+            {
+                "task_name": "thai_reward_env",
+                "message_log": [
+                    {
+                        "role": "user",
+                        "content": "Hi",
+                        "token_ids": torch.tensor([1, 2, 3], dtype=torch.long),
+                    }
+                ],
+            }
+        ]
+    )
+    task_spec = TaskDataSpec(
+        task_name="thai_reward_env",
+        default_stop_strings=["</s>", "<|end|>"],
+    )
+    dataset = AllTaskProcessedDataset(
+        dataset=raw_dataset,
+        tokenizer=DummyTokenizer(),
+        default_task_data_spec=task_spec,
+        task_data_processors=_processor_without_stop_strings,
+        max_seq_length=128,
+    )
+
+    assert dataset[0]["stop_strings"] == ["</s>", "<|end|>"]
+
+
+def test_processed_dataset_preserves_processor_stop_strings_over_task_defaults():
+    raw_dataset = Dataset.from_list(
+        [
+            {
+                "task_name": "thai_reward_env",
+                "message_log": [
+                    {
+                        "role": "user",
+                        "content": "Hi",
+                        "token_ids": torch.tensor([1, 2, 3], dtype=torch.long),
+                    }
+                ],
+            }
+        ]
+    )
+    task_spec = TaskDataSpec(
+        task_name="thai_reward_env",
+        default_stop_strings=["</s>", "<|end|>"],
+    )
+    dataset = AllTaskProcessedDataset(
+        dataset=raw_dataset,
+        tokenizer=DummyTokenizer(),
+        default_task_data_spec=task_spec,
+        task_data_processors=_processor_with_explicit_stop_strings,
+        max_seq_length=128,
+    )
+
+    assert dataset[0]["stop_strings"] == ["<explicit-stop>"]
 
 
 def test_math_data_processor():
