@@ -1,8 +1,8 @@
-# Prod-mode infra for qwen3_30b_math_8n_4gpu.yaml on a GB300 NVL72 cluster.
+# Prod-mode infra for qwen3_30b_math_4n_4gpu.yaml on a GB300 NVL72 cluster.
 #
-# Topology: 8 workers × 4 GPUs = 32 GPUs in a single RayCluster, scheduled by
-# KAI as one gang. NVLink/MNNVL spans all 32 GPUs via a ComputeDomain channel,
-# and NCCL rides 8× RoCE NICs per node — both attached through DRA. The CLI
+# Topology: 4 workers × 4 GPUs = 16 GPUs in a single RayCluster, scheduled by
+# KAI as one gang. NVLink/MNNVL spans all 16 GPUs via a ComputeDomain channel,
+# and NCCL rides 4× RoCE NICs per node — both attached through DRA. The CLI
 # auto-creates and auto-deletes the ComputeDomain + RoCE ResourceClaimTemplate
 # based on the resourceClaims in the worker pod spec.
 #
@@ -25,13 +25,13 @@
 # Usage:
 #   # Long-lived cluster — idempotent; reuses the live cluster if it
 #   # already matches, applies if absent. Submits training per invocation.
-#   nrl-k8s run tools/nrl_k8s/examples/qwen3_30b_math_8n_4gpu.yaml \
-#       --infra tools/nrl_k8s/examples/qwen3_30b_math_8n_4gpu.gb300.infra.yaml \
+#   nrl-k8s run tools/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.yaml \
+#       --infra tools/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.gb300.infra.yaml \
 #       --run-id qwen3-30b-math-$(date +%Y%m%d-%H%M%S)
 #
 #   # One-shot with auto-teardown (ephemeral RayCluster, no cleanup needed):
-#   nrl-k8s rayjob tools/nrl_k8s/examples/qwen3_30b_math_8n_4gpu.yaml \
-#       --infra tools/nrl_k8s/examples/qwen3_30b_math_8n_4gpu.gb300.infra.yaml
+#   nrl-k8s rayjob tools/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.yaml \
+#       --infra tools/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.gb300.infra.yaml
 
 _shared:
   headNodeSelector: &head_node_selector
@@ -135,7 +135,7 @@ launch:
     mkdir -p "\${LOG_DIR}"
 
     python -u examples/run_grpo.py \
-      --config tools/nrl_k8s/examples/qwen3_30b_math_8n_4gpu.yaml \
+      --config tools/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.yaml \
       logger.wandb_enabled=true \
       logger.wandb.project=nemorl-single-k8s \
       logger.wandb.name=qwen3-30b-math-gb300 \
@@ -170,9 +170,9 @@ clusters:
             volumes: *head_volumes
       workerGroupSpecs:
         - groupName: gpu-workers
-          replicas: 8
-          minReplicas: 8
-          maxReplicas: 8
+          replicas: 4
+          minReplicas: 4
+          maxReplicas: 4
           numOfHosts: 1
           rayStartParams:
             num-gpus: "4"
@@ -180,8 +180,8 @@ clusters:
           template:
             metadata:
               annotations:
-                # KAI co-schedules the 8 workers in a single gb300-topology
-                # domain so the ComputeDomain NVLink channel spans all 32 GPUs.
+                # KAI co-schedules the 4 workers in a single gb300-topology
+                # domain so the ComputeDomain NVLink channel spans all 16 GPUs.
                 kai.scheduler/topology: gb300-topology
                 kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
             spec:
