@@ -996,7 +996,7 @@ class TestTwoGPUCluster:
         # Test NLLLossFn and ClippedPGLossFn with mbs=1
         nll_loss_fn = NLLLossFn()
         pg_loss_fn = ClippedPGLossFn(
-            {
+            **{
                 "ratio_clip_min": 0.2,
                 "ratio_clip_max": 0.2,
                 "ratio_clip_c": None,
