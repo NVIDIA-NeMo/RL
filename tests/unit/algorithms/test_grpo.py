@@ -25,6 +25,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
+    MasterConfig,
     _default_grpo_save_state,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -32,7 +33,7 @@ from nemo_rl.algorithms.grpo import (
     grpo_train,
     validate,
 )
-from nemo_rl.algorithms.loss import ClippedPGLossFn
+from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
@@ -462,14 +463,16 @@ def test_dapo_dynamic_sampling_filters_nonzero_std():
     baseline = torch.tensor([0.67, 0.67, 0.67, 0.33, 0.33, 0.33])  # Mock baselines
 
     # Configuration for dynamic sampling
-    master_config = {
-        "grpo": {
-            "use_dynamic_sampling": True,
-            "num_prompts_per_step": 2,  # Want 2 prompts
-            "num_generations_per_prompt": 3,  # Each with 3 generations
-            "dynamic_sampling_max_gen_batches": 5,
+    master_config = MasterConfig.model_construct(
+        **{
+            "grpo": {
+                "use_dynamic_sampling": True,
+                "num_prompts_per_step": 2,  # Want 2 prompts
+                "num_generations_per_prompt": 3,  # Each with 3 generations
+                "dynamic_sampling_max_gen_batches": 5,
+            }
         }
-    }
+    )
 
     timer = Timer()
     dynamic_sampling_num_gen_batches = 1
@@ -528,14 +531,16 @@ def test_dapo_dynamic_sampling_filters_zero_std():
     )  # First prompt has zero std, second has non-zero
     baseline = torch.tensor([1.0, 1.0, 1.0, 0.33, 0.33, 0.33])
 
-    master_config = {
-        "grpo": {
-            "use_dynamic_sampling": True,
-            "num_prompts_per_step": 1,  # Want 1 prompt only
-            "num_generations_per_prompt": 3,
-            "dynamic_sampling_max_gen_batches": 5,
+    master_config = MasterConfig.model_construct(
+        **{
+            "grpo": {
+                "use_dynamic_sampling": True,
+                "num_prompts_per_step": 1,  # Want 1 prompt only
+                "num_generations_per_prompt": 3,
+                "dynamic_sampling_max_gen_batches": 5,
+            }
         }
-    }
+    )
 
     timer = Timer()
     dynamic_sampling_num_gen_batches = 1
@@ -602,14 +607,16 @@ def test_dapo_dynamic_sampling_batch_caching():
     std = torch.tensor([0.4, 0.4, 0.4])  # Only one prompt with non-zero std
     baseline = torch.tensor([0.5, 0.5, 0.5])
 
-    master_config = {
-        "grpo": {
-            "use_dynamic_sampling": True,
-            "num_prompts_per_step": 2,  # Need 2 prompts but only have 1
-            "num_generations_per_prompt": 3,
-            "dynamic_sampling_max_gen_batches": 5,
+    master_config = MasterConfig.model_construct(
+        **{
+            "grpo": {
+                "use_dynamic_sampling": True,
+                "num_prompts_per_step": 2,  # Need 2 prompts but only have 1
+                "num_generations_per_prompt": 3,
+                "dynamic_sampling_max_gen_batches": 5,
+            }
         }
-    }
+    )
 
     timer = Timer()
     dynamic_sampling_num_gen_batches = 1
@@ -682,14 +689,16 @@ def test_dapo_dynamic_sampling_disabled():
     baseline = torch.tensor([1.0, 1.0, 1.0, 0.33, 0.33, 0.33])
 
     # Disable dynamic sampling
-    master_config = {
-        "grpo": {
-            "use_dynamic_sampling": False,
-            "num_prompts_per_step": 2,
-            "num_generations_per_prompt": 3,
-            "dynamic_sampling_max_gen_batches": 5,
+    master_config = MasterConfig.model_construct(
+        **{
+            "grpo": {
+                "use_dynamic_sampling": False,
+                "num_prompts_per_step": 2,
+                "num_generations_per_prompt": 3,
+                "dynamic_sampling_max_gen_batches": 5,
+            }
         }
-    }
+    )
 
     timer = Timer()
     dynamic_sampling_num_gen_batches = 1
@@ -717,61 +726,65 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
     from nemo_rl.algorithms.grpo import setup
 
     # Create minimal config - only what's needed before the validation we're testing
-    master_config = {
-        "policy": {
-            "generation": {
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "top_k": None,
-                "backend": "vllm",
-                "colocated": {
-                    "enabled": False,  # Non-colocated
-                    "resources": {
-                        "gpus_per_node": None,  # This should trigger error
-                        "num_nodes": None,
+    master_config = MasterConfig.model_construct(
+        **{
+            "policy": {
+                "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
+                    "backend": "vllm",
+                    "colocated": {
+                        "enabled": False,  # Non-colocated
+                        "resources": {
+                            "gpus_per_node": None,  # This should trigger error
+                            "num_nodes": None,
+                        },
                     },
                 },
             },
-        },
-        "loss_fn": {
-            "ratio_clip_min": 0.2,
-            "ratio_clip_max": 0.2,
-            "ratio_clip_c": None,
-            "disable_ppo_ratio": False,
-            "reference_policy_kl_penalty": 0.0,
-            "reference_policy_kl_type": "k3",
-            "kl_input_clamp_value": 20.0,
-            "kl_output_clamp_value": 10.0,
-            "use_on_policy_kl_approximation": False,
-            "use_importance_sampling_correction": False,
-            "truncated_importance_sampling_ratio": None,
-            "sequence_level_importance_ratios": False,
-            "token_level_loss": True,
-            "force_on_policy_ratio": False,
-        },
-        "env": {},  # Config extraction requires this key
-        "grpo": {
-            "seed": 42,
-            "num_prompts_per_step": 1,
-            "val_period": 0,
-            "val_at_start": False,
-            "val_at_end": False,
-            "use_dynamic_sampling": False,
-            "batch_multiplier": 1,
-        },
-        "data": {
-            "shuffle": False,
-            "num_workers": 1,
-            "env_name": None,
-            "use_multiple_dataloader": False,
-        },
-        "logger": {},  # Config extraction requires this key
-        "checkpointing": {},  # Config extraction requires this key
-        "cluster": {
-            "num_nodes": 1,  # Single node, so policy_nodes=1
-            "gpus_per_node": 8,
-        },
-    }
+            "loss_fn": ClippedPGLossConfig(
+                **{
+                    "ratio_clip_min": 0.2,
+                    "ratio_clip_max": 0.2,
+                    "ratio_clip_c": None,
+                    "disable_ppo_ratio": False,
+                    "reference_policy_kl_penalty": 0.0,
+                    "reference_policy_kl_type": "k3",
+                    "kl_input_clamp_value": 20.0,
+                    "kl_output_clamp_value": 10.0,
+                    "use_on_policy_kl_approximation": False,
+                    "use_importance_sampling_correction": False,
+                    "truncated_importance_sampling_ratio": None,
+                    "sequence_level_importance_ratios": False,
+                    "token_level_loss": True,
+                    "force_on_policy_ratio": False,
+                }
+            ),
+            "env": {},  # Config extraction requires this key
+            "grpo": {
+                "seed": 42,
+                "num_prompts_per_step": 1,
+                "val_period": 0,
+                "val_at_start": False,
+                "val_at_end": False,
+                "use_dynamic_sampling": False,
+                "batch_multiplier": 1,
+            },
+            "data": {
+                "shuffle": False,
+                "num_workers": 1,
+                "env_name": None,
+                "use_multiple_dataloader": False,
+            },
+            "logger": {},  # Config extraction requires this key
+            "checkpointing": {},  # Config extraction requires this key
+            "cluster": {
+                "num_nodes": 1,  # Single node, so policy_nodes=1
+                "gpus_per_node": 8,
+            },
+        }
+    )
 
     tokenizer = MagicMock()
     dataset = MagicMock()
@@ -799,61 +812,65 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
     from nemo_rl.algorithms.grpo import setup
 
     # Create minimal config - only what's needed before the validation we're testing
-    master_config = {
-        "policy": {
-            "generation": {
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "top_k": None,
-                "backend": "vllm",
-                "colocated": {
-                    "enabled": False,  # Non-colocated
-                    "resources": {
-                        "gpus_per_node": None,  # This should trigger error
-                        "num_nodes": 1,  # Use 1 node for inference
+    master_config = MasterConfig.model_construct(
+        **{
+            "policy": {
+                "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
+                    "backend": "vllm",
+                    "colocated": {
+                        "enabled": False,  # Non-colocated
+                        "resources": {
+                            "gpus_per_node": None,  # This should trigger error
+                            "num_nodes": 1,  # Use 1 node for inference
+                        },
                     },
                 },
             },
-        },
-        "loss_fn": {
-            "ratio_clip_min": 0.2,
-            "ratio_clip_max": 0.2,
-            "ratio_clip_c": None,
-            "disable_ppo_ratio": False,
-            "reference_policy_kl_penalty": 0.0,
-            "reference_policy_kl_type": "k3",
-            "kl_input_clamp_value": 20.0,
-            "kl_output_clamp_value": 10.0,
-            "use_on_policy_kl_approximation": False,
-            "use_importance_sampling_correction": False,
-            "truncated_importance_sampling_ratio": None,
-            "sequence_level_importance_ratios": False,
-            "token_level_loss": True,
-            "force_on_policy_ratio": False,
-        },
-        "env": {},  # Config extraction requires this key
-        "grpo": {
-            "seed": 42,
-            "num_prompts_per_step": 1,
-            "val_period": 0,
-            "val_at_start": False,
-            "val_at_end": False,
-            "use_dynamic_sampling": False,
-            "batch_multiplier": 1,
-        },
-        "data": {
-            "shuffle": False,
-            "num_workers": 1,
-            "env_name": None,
-            "use_multiple_dataloader": False,
-        },
-        "logger": {},  # Config extraction requires this key
-        "checkpointing": {},  # Config extraction requires this key
-        "cluster": {
-            "num_nodes": 2,  # Multi-node, so policy_nodes=1 after subtracting inference
-            "gpus_per_node": 8,
-        },
-    }
+            "loss_fn": ClippedPGLossConfig(
+                **{
+                    "ratio_clip_min": 0.2,
+                    "ratio_clip_max": 0.2,
+                    "ratio_clip_c": None,
+                    "disable_ppo_ratio": False,
+                    "reference_policy_kl_penalty": 0.0,
+                    "reference_policy_kl_type": "k3",
+                    "kl_input_clamp_value": 20.0,
+                    "kl_output_clamp_value": 10.0,
+                    "use_on_policy_kl_approximation": False,
+                    "use_importance_sampling_correction": False,
+                    "truncated_importance_sampling_ratio": None,
+                    "sequence_level_importance_ratios": False,
+                    "token_level_loss": True,
+                    "force_on_policy_ratio": False,
+                }
+            ),
+            "env": {},  # Config extraction requires this key
+            "grpo": {
+                "seed": 42,
+                "num_prompts_per_step": 1,
+                "val_period": 0,
+                "val_at_start": False,
+                "val_at_end": False,
+                "use_dynamic_sampling": False,
+                "batch_multiplier": 1,
+            },
+            "data": {
+                "shuffle": False,
+                "num_workers": 1,
+                "env_name": None,
+                "use_multiple_dataloader": False,
+            },
+            "logger": {},  # Config extraction requires this key
+            "checkpointing": {},  # Config extraction requires this key
+            "cluster": {
+                "num_nodes": 2,  # Multi-node, so policy_nodes=1 after subtracting inference
+                "gpus_per_node": 8,
+            },
+        }
+    )
 
     tokenizer = MagicMock()
     dataset = MagicMock()
@@ -966,66 +983,70 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
     if colocated_inference:
         generation_resources = {"gpus_per_node": None, "num_nodes": None}
 
-    master_config = {
-        "policy": {
-            "model_name": "fake-model",
-            "train_global_batch_size": 1,
-            "train_micro_batch_size": 1,
-            "max_total_sequence_length": 8,
-            "make_sequence_length_divisible_by": 1,
-            "dtensor_cfg": {"enabled": False},
-            "megatron_cfg": {"enabled": False, "pipeline_model_parallel_size": 1},
-            "generation": {
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "top_k": None,
-                "backend": "sglang",
-                "colocated": {
-                    "enabled": colocated_inference,
-                    "resources": generation_resources,
-                },
-                "sglang_cfg": {
-                    "gpus_per_server": 1,
-                    "dp_size": 1,
-                    "pp_size": 1,
-                    "ep_size": 1,
+    master_config = MasterConfig.model_construct(
+        **{
+            "policy": {
+                "model_name": "fake-model",
+                "train_global_batch_size": 1,
+                "train_micro_batch_size": 1,
+                "max_total_sequence_length": 8,
+                "make_sequence_length_divisible_by": 1,
+                "dtensor_cfg": {"enabled": False},
+                "megatron_cfg": {"enabled": False, "pipeline_model_parallel_size": 1},
+                "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
+                    "backend": "sglang",
+                    "colocated": {
+                        "enabled": colocated_inference,
+                        "resources": generation_resources,
+                    },
+                    "sglang_cfg": {
+                        "gpus_per_server": 1,
+                        "dp_size": 1,
+                        "pp_size": 1,
+                        "ep_size": 1,
+                    },
                 },
             },
-        },
-        "loss_fn": {
-            "force_on_policy_ratio": False,
-            "use_importance_sampling_correction": False,
-        },
-        "env": {},
-        "grpo": {
-            "seed": 1,
-            "num_prompts_per_step": 1,
-            "num_generations_per_prompt": 1,
-            "max_num_steps": 1,
-            "max_num_epochs": 1,
-            "val_period": 0,
-            "val_batch_size": 1,
-            "val_at_start": False,
-            "val_at_end": False,
-            "max_val_samples": 1,
-            "use_dynamic_sampling": False,
-            "batch_multiplier": 1,
-            "normalize_rewards": False,
-            "use_leave_one_out_baseline": False,
-            "reward_scaling": {"enabled": False},
-            "reward_shaping": {"enabled": False},
-            "overlong_filtering": False,
-        },
-        "data": {
-            "shuffle": False,
-            "num_workers": 0,
-            "env_name": None,
-            "use_multiple_dataloader": False,
-        },
-        "logger": {"num_val_samples_to_print": 0},
-        "checkpointing": {"enabled": False},
-        "cluster": {"num_nodes": 1, "gpus_per_node": 4},
-    }
+            "loss_fn": ClippedPGLossConfig(
+                **{
+                    "force_on_policy_ratio": False,
+                    "use_importance_sampling_correction": False,
+                }
+            ),
+            "env": {},
+            "grpo": {
+                "seed": 1,
+                "num_prompts_per_step": 1,
+                "num_generations_per_prompt": 1,
+                "max_num_steps": 1,
+                "max_num_epochs": 1,
+                "val_period": 0,
+                "val_batch_size": 1,
+                "val_at_start": False,
+                "val_at_end": False,
+                "max_val_samples": 1,
+                "use_dynamic_sampling": False,
+                "batch_multiplier": 1,
+                "normalize_rewards": False,
+                "use_leave_one_out_baseline": False,
+                "reward_scaling": {"enabled": False},
+                "reward_shaping": {"enabled": False},
+                "overlong_filtering": False,
+            },
+            "data": {
+                "shuffle": False,
+                "num_workers": 0,
+                "env_name": None,
+                "use_multiple_dataloader": False,
+            },
+            "logger": {"num_val_samples_to_print": 0},
+            "checkpointing": {"enabled": False},
+            "cluster": {"num_nodes": 1, "gpus_per_node": 4},
+        }
+    )
 
     tokenizer = MagicMock()
     dataset = MagicMock()
@@ -1278,21 +1299,23 @@ def mock_grpo_components():
     tokenizer.pad_token_id = 0
 
     loss_fn = ClippedPGLossFn(
-        {
-            "reference_policy_kl_penalty": 0.01,
-            "reference_policy_kl_type": "k3",
-            "kl_input_clamp_value": 20.0,
-            "kl_output_clamp_value": 10.0,
-            "ratio_clip_min": 0.8,
-            "ratio_clip_max": 1.2,
-            "ratio_clip_c": 1.0,
-            "use_on_policy_kl_approximation": False,
-            "use_importance_sampling_correction": False,
-            "truncated_importance_sampling_ratio": None,
-            "sequence_level_importance_ratios": False,
-            "token_level_loss": True,
-            "force_on_policy_ratio": False,
-        }
+        ClippedPGLossConfig(
+            **{
+                "reference_policy_kl_penalty": 0.01,
+                "reference_policy_kl_type": "k3",
+                "kl_input_clamp_value": 20.0,
+                "kl_output_clamp_value": 10.0,
+                "ratio_clip_min": 0.8,
+                "ratio_clip_max": 1.2,
+                "ratio_clip_c": 1.0,
+                "use_on_policy_kl_approximation": False,
+                "use_importance_sampling_correction": False,
+                "truncated_importance_sampling_ratio": None,
+                "sequence_level_importance_ratios": False,
+                "token_level_loss": True,
+                "force_on_policy_ratio": False,
+            }
+        ),
     )
     logger = MagicMock()
     checkpointer = MagicMock()
@@ -1314,70 +1337,73 @@ def mock_grpo_components():
         env.global_post_process_and_metrics.return_value = (mock_batch, {})
 
     # Create mock master config
-    master_config = {
-        "grpo": {
-            "max_num_steps": 5,
-            "max_num_epochs": 2,
-            "num_prompts_per_step": 1,
-            "num_generations_per_prompt": 1,
-            "max_rollout_turns": 1,
-            "val_period": 100,
-            "val_batch_size": 1,
-            "val_at_start": False,
-            "val_at_end": False,
-            "max_val_samples": 10,
-            "seed": 42,
-            "advantage_normalization": "global",
-            "use_leave_one_out_baseline": False,
-            "normalize_rewards": False,
-            "overlong_filtering": False,
-            "reward_scaling": {"enabled": False},
-            "reward_shaping": {"enabled": False},
-            "use_dynamic_sampling": False,
-            "async_grpo": {
-                "enabled": False,
-                "max_trajectory_age_steps": 1,
-            },
-            "seq_logprob_error_threshold": None,
-            "adv_estimator": {
-                "name": "grpo",
+    master_config = MasterConfig.model_construct(
+        **{
+            "grpo": {
+                "max_num_steps": 5,
+                "max_num_epochs": 2,
+                "num_prompts_per_step": 1,
+                "num_generations_per_prompt": 1,
+                "max_rollout_turns": 1,
+                "val_period": 100,
+                "val_batch_size": 1,
+                "val_at_start": False,
+                "val_at_end": False,
+                "max_val_samples": 10,
+                "seed": 42,
+                "advantage_normalization": "global",
                 "use_leave_one_out_baseline": False,
-                "normalize_rewards": True,
+                "normalize_rewards": False,
+                "overlong_filtering": False,
+                "reward_scaling": {"enabled": False},
+                "reward_shaping": {"enabled": False},
+                "use_dynamic_sampling": False,
+                "async_grpo": {
+                    "enabled": False,
+                    "max_trajectory_age_steps": 1,
+                },
+                "seq_logprob_error_threshold": None,
+                "adv_estimator": {
+                    "name": "grpo",
+                    "use_leave_one_out_baseline": False,
+                    "normalize_rewards": True,
+                },
             },
-        },
-        "policy": {
-            "train_global_batch_size": 1,
-            "train_micro_batch_size": 1,
-            "max_total_sequence_length": 2048,
-            "make_sequence_length_divisible_by": 1,
-            "generation": {
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "top_k": None,
-                "backend": "vllm",
-                "colocated": {"enabled": True},
-                "vllm_cfg": {"async_engine": True},  # Support async mode
+            "policy": {
+                "train_global_batch_size": 1,
+                "train_micro_batch_size": 1,
+                "max_total_sequence_length": 2048,
+                "make_sequence_length_divisible_by": 1,
+                "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
+                    "backend": "vllm",
+                    "colocated": {"enabled": True},
+                    "vllm_cfg": {"async_engine": True},  # Support async mode
+                },
             },
-        },
-        "loss_fn": {
-            "use_importance_sampling_correction": True,  # Required for async mode
-        },
-        "checkpointing": {
-            "enabled": False,
-            "checkpoint_must_save_by": None,
-            "save_period": 10,
-        },
-        "cluster": {
-            "num_nodes": 1,
-            "gpus_per_node": 2,
-        },
-        "logger": {
-            "num_val_samples_to_print": 5,
-        },
-        "data": {
-            "use_multiple_dataloader": False,
-        },
-    }
+            "loss_fn": {
+                "use_importance_sampling_correction": True,  # Required for async mode
+            },
+            "checkpointing": {
+                "enabled": False,
+                "checkpoint_must_save_by": None,
+                "save_period": 10,
+            },
+            "cluster": {
+                "num_nodes": 1,
+                "gpus_per_node": 2,
+            },
+            "logger": {
+                "num_val_samples_to_print": 5,
+            },
+            "data": {
+                "use_multiple_dataloader": False,
+            },
+            "env": {},
+        }
+    )
 
     return {
         "policy": policy,
@@ -1397,12 +1423,12 @@ def mock_grpo_components():
 def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
     """Test that GRPO training loop exits when max_num_steps is reached"""
     # Set max steps to 12
-    mock_grpo_components["master_config"]["grpo"]["max_num_steps"] = 12
+    mock_grpo_components["master_config"].grpo["max_num_steps"] = 12
     grpo_save_state = _default_grpo_save_state()
 
     # Async GRPO requires non-colocated inference
     if train_func == async_grpo_train:
-        mock_grpo_components["master_config"]["policy"]["generation"]["colocated"][
+        mock_grpo_components["master_config"].policy["generation"]["colocated"][
             "enabled"
         ] = False
 
@@ -1470,8 +1496,8 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
 def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
     """Test that GRPO training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number
-    mock_grpo_components["master_config"]["grpo"]["max_num_epochs"] = 2
-    mock_grpo_components["master_config"]["grpo"]["max_num_steps"] = 100
+    mock_grpo_components["master_config"].grpo["max_num_epochs"] = 2
+    mock_grpo_components["master_config"].grpo["max_num_steps"] = 100
 
     grpo_save_state = _default_grpo_save_state()
 
@@ -1521,13 +1547,13 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
 def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
     """Test that GRPO training loop exits when timeout is reached"""
     # Set max steps and epochs to large numbers
-    mock_grpo_components["master_config"]["grpo"]["max_num_steps"] = 100
-    mock_grpo_components["master_config"]["grpo"]["max_num_epochs"] = 10
+    mock_grpo_components["master_config"].grpo["max_num_steps"] = 100
+    mock_grpo_components["master_config"].grpo["max_num_epochs"] = 10
     grpo_save_state = _default_grpo_save_state()
 
     # Async GRPO requires non-colocated inference
     if train_func == async_grpo_train:
-        mock_grpo_components["master_config"]["policy"]["generation"]["colocated"][
+        mock_grpo_components["master_config"].policy["generation"]["colocated"][
             "enabled"
         ] = False
 
@@ -1982,27 +2008,29 @@ class TestValidateFunction:
         mock_logger.log_batched_dict_as_jsonl = MagicMock(side_effect=capture_log)
 
         # Mock config
-        mock_config = {
-            "grpo": {
-                "max_val_samples": 10,
-                "val_batch_size": 2,
-                "max_rollout_turns": 1,
-            },
-            "policy": {
-                "max_total_sequence_length": 2048,
-                "generation": {
-                    "temperature": 1.0,
-                    "top_p": 1.0,
-                    "top_k": None,
-                    "backend": "vllm",
-                    "colocated": {"enabled": True},
-                    "vllm_cfg": {"async_engine": False},
+        mock_config = MasterConfig.model_construct(
+            **{
+                "grpo": {
+                    "max_val_samples": 10,
+                    "val_batch_size": 2,
+                    "max_rollout_turns": 1,
                 },
-            },
-            "logger": {
-                "num_val_samples_to_print": 2,
-            },
-        }
+                "policy": {
+                    "max_total_sequence_length": 2048,
+                    "generation": {
+                        "temperature": 1.0,
+                        "top_p": 1.0,
+                        "top_k": None,
+                        "backend": "vllm",
+                        "colocated": {"enabled": True},
+                        "vllm_cfg": {"async_engine": False},
+                    },
+                },
+                "logger": {
+                    "num_val_samples_to_print": 2,
+                },
+            }
+        )
 
         mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
 
@@ -2078,27 +2106,29 @@ class TestValidateFunction:
         mock_env.global_post_process_and_metrics.return_value = (mock_batch, {})
 
         # Mock config
-        mock_config = {
-            "grpo": {
-                "max_val_samples": 10,
-                "val_batch_size": 1,
-                "max_rollout_turns": 1,
-            },
-            "policy": {
-                "max_total_sequence_length": 2048,
-                "generation": {
-                    "temperature": 1.0,
-                    "top_p": 1.0,
-                    "top_k": None,
-                    "backend": "vllm",
-                    "colocated": {"enabled": True},
-                    "vllm_cfg": {"async_engine": False},
+        mock_config = MasterConfig.model_construct(
+            **{
+                "grpo": {
+                    "max_val_samples": 10,
+                    "val_batch_size": 1,
+                    "max_rollout_turns": 1,
                 },
-            },
-            "logger": {
-                "num_val_samples_to_print": 1,
-            },
-        }
+                "policy": {
+                    "max_total_sequence_length": 2048,
+                    "generation": {
+                        "temperature": 1.0,
+                        "top_p": 1.0,
+                        "top_k": None,
+                        "backend": "vllm",
+                        "colocated": {"enabled": True},
+                        "vllm_cfg": {"async_engine": False},
+                    },
+                },
+                "logger": {
+                    "num_val_samples_to_print": 1,
+                },
+            }
+        )
 
         mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
 
@@ -2132,9 +2162,11 @@ class TestValidateFunction:
         mock_policy_gen = MagicMock()
         mock_tokenizer = MagicMock()
 
-        mock_config = {
-            "dpo": {"val_period": 0},  # Required for the assertion
-        }
+        mock_config = MasterConfig.model_construct(
+            **{
+                "dpo": {"val_period": 0},  # Required for the assertion
+            }
+        )
 
         val_metrics, timing = validate(
             mock_policy_gen,

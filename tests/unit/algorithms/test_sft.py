@@ -19,7 +19,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.loss import NLLLossFn
-from nemo_rl.algorithms.sft import _default_sft_save_state, sft_train
+from nemo_rl.algorithms.sft import MasterConfig, _default_sft_save_state, sft_train
 
 
 @pytest.fixture
@@ -63,31 +63,33 @@ def mock_components():
     checkpointer = MagicMock()
 
     # Create mock master config
-    master_config = {
-        "sft": {
-            "max_num_steps": 5,
-            "max_num_epochs": 2,
-            "val_period": 100,
-            "val_batches": 1,
-            "val_global_batch_size": 1,
-            "val_micro_batch_size": 1,
-            "val_at_start": False,
-            "val_at_end": False,
-        },
-        "policy": {
-            "train_global_batch_size": 1,
-            "make_sequence_length_divisible_by": 8,
-        },
-        "checkpointing": {
-            "enabled": False,
-            "checkpoint_must_save_by": None,
-            "save_period": 10,
-        },
-        "cluster": {
-            "num_nodes": 1,
-            "gpus_per_node": 2,
-        },
-    }
+    master_config = MasterConfig.model_construct(
+        **{
+            "sft": {
+                "max_num_steps": 5,
+                "max_num_epochs": 2,
+                "val_period": 100,
+                "val_batches": 1,
+                "val_global_batch_size": 1,
+                "val_micro_batch_size": 1,
+                "val_at_start": False,
+                "val_at_end": False,
+            },
+            "policy": {
+                "train_global_batch_size": 1,
+                "make_sequence_length_divisible_by": 8,
+            },
+            "checkpointing": {
+                "enabled": False,
+                "checkpoint_must_save_by": None,
+                "save_period": 10,
+            },
+            "cluster": {
+                "num_nodes": 1,
+                "gpus_per_node": 2,
+            },
+        }
+    )
 
     return {
         "policy": policy,
@@ -104,7 +106,7 @@ def mock_components():
 def test_exit_on_max_steps(mock_components):
     """Test that training loop exits when max_num_steps is reached"""
     # Set max steps to 12, which is less than len(train_dataloader) * max_num_epochs
-    mock_components["master_config"]["sft"]["max_num_steps"] = 12
+    mock_components["master_config"].sft["max_num_steps"] = 12
 
     sft_save_state = _default_sft_save_state()
 
@@ -128,8 +130,8 @@ def test_exit_on_max_steps(mock_components):
 def test_exit_on_max_epochs(mock_components):
     """Test that training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number
-    mock_components["master_config"]["sft"]["max_num_epochs"] = 2
-    mock_components["master_config"]["sft"]["max_num_steps"] = 100
+    mock_components["master_config"].sft["max_num_epochs"] = 2
+    mock_components["master_config"].sft["max_num_steps"] = 100
 
     sft_save_state = _default_sft_save_state()
 
@@ -153,8 +155,8 @@ def test_exit_on_max_epochs(mock_components):
 def test_exit_on_timeout(mock_components, capsys):
     """Test that training loop exits when timeout is reached"""
     # Set max steps and epochs to large numbers
-    mock_components["master_config"]["sft"]["max_num_steps"] = 100
-    mock_components["master_config"]["sft"]["max_num_epochs"] = 10
+    mock_components["master_config"].sft["max_num_steps"] = 100
+    mock_components["master_config"].sft["max_num_epochs"] = 10
 
     sft_save_state = _default_sft_save_state()
 
@@ -205,9 +207,9 @@ def test_exit_on_timeout(mock_components, capsys):
 
 def test_training_with_disabled_validation(mock_components):
     """Test that training works when validation is disabled (val_dataloader=None, val_period<=0)"""
-    mock_components["master_config"]["sft"]["val_period"] = 0
-    mock_components["master_config"]["sft"]["max_num_steps"] = 5
-    mock_components["master_config"]["sft"]["max_num_epochs"] = 1
+    mock_components["master_config"].sft["val_period"] = 0
+    mock_components["master_config"].sft["max_num_steps"] = 5
+    mock_components["master_config"].sft["max_num_epochs"] = 1
 
     sft_save_state = _default_sft_save_state()
 
@@ -228,9 +230,9 @@ def test_training_with_disabled_validation(mock_components):
 
 def test_training_with_negative_val_period(mock_components):
     """Test that training works when val_period is negative (validation disabled)"""
-    mock_components["master_config"]["sft"]["val_period"] = -1
-    mock_components["master_config"]["sft"]["max_num_steps"] = 3
-    mock_components["master_config"]["sft"]["max_num_epochs"] = 1
+    mock_components["master_config"].sft["val_period"] = -1
+    mock_components["master_config"].sft["max_num_steps"] = 3
+    mock_components["master_config"].sft["max_num_epochs"] = 1
 
     sft_save_state = _default_sft_save_state()
 
