@@ -1,7 +1,7 @@
 # Prod-mode infra for qwen3_4b_if_single.yaml on GB300.
 #
 # Same topology as qwen3_4b_if_single.gb300.infra.yaml (1 node × 4 GPUs on
-# p6e-gb300r.36xlarge), but submission is prod-shaped:
+# NVL72 GB300 node), but submission is prod-shaped:
 #
 #   submit.submitter        portForward   — Ray Job SDK via kubectl port-forward.
 #   launch.runMode          batch          — CLI returns after Ray accepts the job.
@@ -18,7 +18,7 @@
 # Prereqs (onboarding §3–§5 already applied in `default`):
 #   - rl-workspace PVC bound (shared FSx Lustre, 2.4 TiB, RWX)
 #   - /mnt/rl-workspace/${user:}/nemo-rl contains a git checkout of
-#     https://github.com/NVIDIA-NeMo/RL on branch hemil/k8s-infra-cp
+#     https://github.com/NVIDIA-NeMo/RL on branch main
 #   - nvcr-secret, wandb-api-key, nemo-rl-endpoint-registry all present
 #
 # Usage:
@@ -49,7 +49,7 @@ _shared:
     limits:   {cpu: "8", memory: "32Gi"}
     requests: {cpu: "2", memory: "8Gi"}
   gpuWorkerResources: &gpu_worker_resources
-    # p6e-gb300r.36xlarge allocatable: ~139.6 CPU / ~924 GiB / 4 GPUs.
+    # NVL72 GB300 node allocatable: ~140 CPU / ~924 GiB / 4 GPUs.
     limits:
       cpu: "128"
       memory: "880Gi"
