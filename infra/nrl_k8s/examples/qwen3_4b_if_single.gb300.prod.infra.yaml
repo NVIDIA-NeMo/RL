@@ -1,0 +1,181 @@
+# Prod-mode infra for qwen3_4b_if_single.yaml on GB300.
+#
+# Same topology as qwen3_4b_if_single.gb300.infra.yaml (1 node × 4 GPUs on
+# p6e-gb300r.36xlarge), but submission is prod-shaped:
+#
+#   submit.submitter        portForward   — Ray Job SDK via kubectl port-forward.
+#   launch.runMode          batch          — CLI returns after Ray accepts the job.
+#   launch.codeSource       image          — no working_dir upload; code already
+#                                            on the pod's filesystem.
+#   launch.codePath         /opt/nemo-rl   — the RL repo lives here inside every
+#                                            head + worker pod, served off the
+#                                            shared FSx Lustre PVC via subPath.
+#
+# Because /opt/nemo-rl is the Lustre checkout at ${user:}/nemo-rl, edits on Lustre
+# show up in the next submission without rebuilding the image. That's the whole
+# point of prod mode: iterate on code without churning the container.
+#
+# Prereqs (onboarding §3–§5 already applied in `default`):
+#   - rl-workspace PVC bound (shared FSx Lustre, 2.4 TiB, RWX)
+#   - /mnt/rl-workspace/${user:}/nemo-rl contains a git checkout of
+#     https://github.com/NVIDIA-NeMo/RL on branch hemil/k8s-infra-cp
+#   - nvcr-secret, wandb-api-key, nemo-rl-endpoint-registry all present
+#
+# Usage:
+#   # Long-lived cluster — idempotent; reuses the live cluster if it
+#   # already matches, applies if absent. Submits training per invocation.
+#   nrl-k8s run tools/nrl_k8s/examples/qwen3_4b_if_single.yaml \
+#       --infra tools/nrl_k8s/examples/qwen3_4b_if_single.gb300.prod.infra.yaml \
+#       --run-id single-if-$(date +%Y%m%d-%H%M%S)
+#
+#   # One-shot with auto-teardown (ephemeral RayCluster):
+#   nrl-k8s rayjob tools/nrl_k8s/examples/qwen3_4b_if_single.yaml \
+#       --infra tools/nrl_k8s/examples/qwen3_4b_if_single.gb300.prod.infra.yaml
+
+_shared:
+  nodeSelector: &shared_node_selector
+    nvidia.com/gpu.product: NVIDIA-GB300
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                        value: /tmp/huggingface}
+    - {name: TRANSFORMERS_CACHE,             value: /tmp/huggingface}
+    - {name: NCCL_DEBUG,                     value: INFO}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                        value: /tmp/huggingface}
+    - {name: TRANSFORMERS_CACHE,             value: /tmp/huggingface}
+    - {name: NCCL_DEBUG,                     value: INFO}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+  headResources: &shared_head_resources
+    limits:   {cpu: "8", memory: "32Gi"}
+    requests: {cpu: "2", memory: "8Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    # p6e-gb300r.36xlarge allocatable: ~139.6 CPU / ~924 GiB / 4 GPUs.
+    limits:
+      cpu: "128"
+      memory: "880Gi"
+      nvidia.com/gpu: "4"
+    requests:
+      cpu: "128"
+      memory: "880Gi"
+      nvidia.com/gpu: "4"
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+  # Volumes. The Lustre PVC is mounted at /opt/nemo-rl (subPath ${user:}/nemo-rl)
+  # for code, and at /mnt/rl-workspace (no subPath) for run outputs, caches,
+  # and checkpoints. dshm stays as an emptyDir for Ray's object store.
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm, name: dshm}
+    - {mountPath: /opt/nemo-rl, name: rl-workspace, subPath: "${user:}/nemo-rl"}
+    - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 16Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+  workerVolumes: &worker_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 64Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+
+# namespace auto-inferred from kube context (default).
+image: nvcr.io/nvidian/nemo-rl:nightly
+imagePullSecrets: [nvcr-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+submit:
+  submitter: portForward
+
+launch:
+  mode: attach
+  runMode: batch
+  codeSource: image
+  codePath: /opt/nemo-rl
+  attach:
+    training: ${user:}-raycluster-single-qwen3-4b-gb300-prod
+  peerWatcher: false
+  env: {}
+  # Runs inside the training head pod under Ray's Job SDK. cwd inherits
+  # from the pod's default, so `cd /opt/nemo-rl` is explicit. The config
+  # path is repo-relative — load_config follows the recipe's `defaults:`
+  # up to grpo_qwen3_4b_instruct_k8s_base.yaml automatically.
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted — is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
+    # Full instruction-following dataset (~20K prompts) snapshotted from
+    # huggingface.co/datasets/nvidia/Nemotron-RL-instruction_following onto the
+    # shared Lustre workspace.
+    IF_DATA=/mnt/rl-workspace/${user:}/datasets/instruction_following/instruction_following.jsonl
+    export DISAGG_TRAIN_PATH=$IF_DATA
+    export DISAGG_VALID_PATH=$IF_DATA
+    export RAY_enable_infeasible_task_early_exit=true
+    export PYTHONPATH=.:3rdparty/Gym-workspace/Gym:3rdparty/Megatron-LM-workspace/Megatron-LM
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    LOG=\${LOG_DIR}/${user:}-raycluster-single-qwen3-4b-gb300-prod-training-$(date -u +%Y%m%d-%H%M%S-%N).log
+    mkdir -p "\${LOG_DIR}"
+
+    python -u examples/nemo_gym/run_grpo_nemo_gym.py \
+      --config tools/nrl_k8s/examples/qwen3_4b_if_single.yaml \
+      ++env.nemo_gym.config_paths='[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/instruction_following/configs/instruction_following.yaml]' \
+      ~policy.optimizer.kwargs.foreach \
+      ~policy.optimizer.kwargs.fused \
+      2>&1 | tee "\${LOG}"
+
+clusters:
+  training:
+    name: ${user:}-raycluster-single-qwen3-4b-gb300-prod
+    labels:
+      disagg.nemo-rl/cluster: single-qwen3-4b-gb300-prod
+      disagg.nemo-rl/run: qwen3-4b-single-gb300-prod
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams: {dashboard-host: "0.0.0.0", num-gpus: "0", object-store-memory: "200000000"}
+        template:
+          spec:
+            schedulerName: default-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *shared_node_selector
+            containers:
+              - name: ray-head
+                env:
+                  - {name: HF_HOME,                        value: /tmp/huggingface}
+                  - {name: TRANSFORMERS_CACHE,             value: /tmp/huggingface}
+                  - {name: NCCL_DEBUG,                     value: INFO}
+                  - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+                  - name: WANDB_API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: wandb-api-key
+                        key: WANDB_API_KEY
+                resources: *shared_head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 1
+          minReplicas: 1
+          maxReplicas: 1
+          rayStartParams: {num-gpus: "4", object-store-memory: "200000000"}
+          template:
+            spec:
+              schedulerName: default-scheduler
+              hostNetwork: true
+              dnsPolicy: ClusterFirstWithHostNet
+              nodeSelector: *shared_node_selector
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  resources: *gpu_worker_resources
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes
