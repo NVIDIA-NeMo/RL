@@ -743,24 +743,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
                     },
                 },
             },
-            "loss_fn": ClippedPGLossConfig(
-                **{
-                    "ratio_clip_min": 0.2,
-                    "ratio_clip_max": 0.2,
-                    "ratio_clip_c": None,
-                    "disable_ppo_ratio": False,
-                    "reference_policy_kl_penalty": 0.0,
-                    "reference_policy_kl_type": "k3",
-                    "kl_input_clamp_value": 20.0,
-                    "kl_output_clamp_value": 10.0,
-                    "use_on_policy_kl_approximation": False,
-                    "use_importance_sampling_correction": False,
-                    "truncated_importance_sampling_ratio": None,
-                    "sequence_level_importance_ratios": False,
-                    "token_level_loss": True,
-                    "force_on_policy_ratio": False,
-                }
-            ),
+            "loss_fn": ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
             "env": {},  # Config extraction requires this key
             "grpo": {
                 "seed": 42,
@@ -829,24 +812,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
                     },
                 },
             },
-            "loss_fn": ClippedPGLossConfig(
-                **{
-                    "ratio_clip_min": 0.2,
-                    "ratio_clip_max": 0.2,
-                    "ratio_clip_c": None,
-                    "disable_ppo_ratio": False,
-                    "reference_policy_kl_penalty": 0.0,
-                    "reference_policy_kl_type": "k3",
-                    "kl_input_clamp_value": 20.0,
-                    "kl_output_clamp_value": 10.0,
-                    "use_on_policy_kl_approximation": False,
-                    "use_importance_sampling_correction": False,
-                    "truncated_importance_sampling_ratio": None,
-                    "sequence_level_importance_ratios": False,
-                    "token_level_loss": True,
-                    "force_on_policy_ratio": False,
-                }
-            ),
+            "loss_fn": ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
             "env": {},  # Config extraction requires this key
             "grpo": {
                 "seed": 42,
@@ -1010,12 +976,7 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
                     },
                 },
             },
-            "loss_fn": ClippedPGLossConfig(
-                **{
-                    "force_on_policy_ratio": False,
-                    "use_importance_sampling_correction": False,
-                }
-            ),
+            "loss_fn": ClippedPGLossConfig(),
             "env": {},
             "grpo": {
                 "seed": 1,
@@ -1298,25 +1259,10 @@ def mock_grpo_components():
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
 
-    loss_fn = ClippedPGLossFn(
-        ClippedPGLossConfig(
-            **{
-                "reference_policy_kl_penalty": 0.01,
-                "reference_policy_kl_type": "k3",
-                "kl_input_clamp_value": 20.0,
-                "kl_output_clamp_value": 10.0,
-                "ratio_clip_min": 0.8,
-                "ratio_clip_max": 1.2,
-                "ratio_clip_c": 1.0,
-                "use_on_policy_kl_approximation": False,
-                "use_importance_sampling_correction": False,
-                "truncated_importance_sampling_ratio": None,
-                "sequence_level_importance_ratios": False,
-                "token_level_loss": True,
-                "force_on_policy_ratio": False,
-            }
-        ),
+    loss_config = ClippedPGLossConfig(
+        ratio_clip_min=0.8, ratio_clip_max=1.2, ratio_clip_c=1.0
     )
+    loss_fn = ClippedPGLossFn(loss_config)
     logger = MagicMock()
     checkpointer = MagicMock()
 
