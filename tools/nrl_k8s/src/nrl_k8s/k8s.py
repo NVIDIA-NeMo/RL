@@ -467,6 +467,22 @@ def get_pod_phase(name: str, namespace: str) -> str | None:
         raise
 
 
+def get_pod_image(name: str, namespace: str) -> str | None:
+    """Return the image of the first container in a pod, or None if not found."""
+    load_kubeconfig()
+    core = client.CoreV1Api()
+    try:
+        pod = with_retries(
+            lambda: core.read_namespaced_pod(name=name, namespace=namespace)
+        )
+        containers = pod.spec.containers or []
+        return containers[0].image if containers else None
+    except ApiException as exc:
+        if exc.status == 404:
+            return None
+        raise
+
+
 # =============================================================================
 # Secrets
 # =============================================================================

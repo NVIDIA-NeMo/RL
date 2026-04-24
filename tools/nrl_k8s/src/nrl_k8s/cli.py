@@ -1194,12 +1194,22 @@ def dev_connect(image: str, namespace: str | None) -> None:
     if namespace is None:
         namespace = _infer_namespace()
 
+    _check_dev_pod_rbac(namespace)
+
     phase = k8s.get_pod_phase(pod_name, namespace)
     if phase is None:
         click.echo(f"creating dev pod {pod_name} in {namespace} ...")
         manifest = build_dev_pod_manifest(user, namespace, image)
         k8s.create_pod(manifest, namespace)
         phase = "Pending"
+    else:
+        running_image = k8s.get_pod_image(pod_name, namespace)
+        if running_image and running_image != image:
+            click.echo(
+                f"warning: dev pod is using image {running_image}, "
+                f"not {image} — stop and reconnect to switch",
+                err=True,
+            )
 
     if phase != "Running":
         click.echo(f"waiting for {pod_name} to be Running ...")
@@ -1409,6 +1419,40 @@ def _check_stale_rayjobs(loaded: LoadedConfig, namespace: str) -> None:
         checks.append(("rayjob", cluster.name, _rayjob_status))
 
     _error_on_stale(_find_stale_resources(checks), namespace)
+
+
+def _check_dev_pod_rbac(namespace: str) -> None:
+    """Verify the default SA has edit access so kubectl works inside the dev pod."""
+    import subprocess
+
+    sa = f"system:serviceaccount:{namespace}:default"
+    result = subprocess.run(
+        ["kubectl", "auth", "can-i", "get", "pods",
+         f"--as={sa}", "-n", namespace],
+        capture_output=True, text=True,
+    )
+    if result.stdout.strip() == "yes":
+        return
+    rolebinding = (
+        f"apiVersion: rbac.authorization.k8s.io/v1\n"
+        f"kind: RoleBinding\n"
+        f"metadata:\n"
+        f"  name: default-sa-edit\n"
+        f"  namespace: {namespace}\n"
+        f"subjects:\n"
+        f"  - kind: ServiceAccount\n"
+        f"    name: default\n"
+        f"    namespace: {namespace}\n"
+        f"roleRef:\n"
+        f"  kind: ClusterRole\n"
+        f"  name: edit\n"
+        f"  apiGroup: rbac.authorization.k8s.io"
+    )
+    _cli_error(
+        f"the default service account in {namespace} lacks edit permissions — "
+        f"kubectl won't work inside the dev pod",
+        hint=f"apply this RoleBinding, then retry:\n\n{rolebinding}",
+    )
 
 
 def _preflight_or_exit(namespace: str) -> None:

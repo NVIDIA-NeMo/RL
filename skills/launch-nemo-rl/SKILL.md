@@ -222,7 +222,35 @@ Before reporting a launch as successful, verify:
 4. At least one `Processed prompts: 100%` line appears (confirms generation is wired).
 5. For `--rayjob` mode only: after `jobDeploymentStatus=Complete`, confirm `kubectl get raycluster | grep <name>` is empty (teardown worked).
 
-## 13. Where things live in the repo
+## 13. Dev pod
+
+`nrl-k8s dev` manages a lightweight CPU pod on the cluster for code syncing, debugging, and running `kubectl`/`nrl-k8s` from within the cluster.
+
+```bash
+# One-time: set up secrets (HF token, wandb, SSH key, rclone)
+nrl-k8s dev setup-secrets --ssh-key ~/.ssh/id_rsa --add-rclone
+
+# Create pod and exec in (idempotent — reuses existing pod)
+nrl-k8s dev connect
+
+# Switch image (must stop first — image change is warned but not auto-applied)
+nrl-k8s dev stop
+nrl-k8s dev connect --image nvcr.io/nvidian/nemo-rl:v0.7.0
+
+# Tear down
+nrl-k8s dev stop
+```
+
+The dev pod:
+- Runs on a CPU-only node (anti-affinity to GPU nodes)
+- Mounts the shared `rl-workspace` PVC at `/mnt/rl-workspace`
+- Sets `USER` env var to the `nrl-k8s` username (so `$USER` and `getpass.getuser()` work correctly despite running as root)
+- Installs `kubectl`, `rclone` (if configured) on first boot
+- Injects SSH keys and tokens via `envFrom` on a per-user K8s Secret
+
+The pod's `default` service account needs an `edit` RoleBinding in the namespace for `kubectl` to work inside. `dev connect` checks this and prints the required YAML if missing.
+
+## 14. Where things live in the repo
 
 - CLI code: `tools/nrl_k8s/src/nrl_k8s/` (`cli.py`, `orchestrate.py`, `manifest.py`, `rayjob.py`, `k8s.py`, `submitters/`, `schema.py`).
 - Tests: `tools/nrl_k8s/tests/unit/` — run with `uv run --extra test pytest -x -q` from `tools/nrl_k8s/`.

@@ -32,6 +32,11 @@ def build_dev_pod_manifest(
         "curl -sSf https://rclone.org/install.sh | bash; "
         "fi; "
         "fi && "
+        "if ! command -v kubectl >/dev/null 2>&1; then "
+        'ARCH=$(uname -m | sed "s/x86_64/amd64/;s/aarch64/arm64/") && '
+        'curl -sLo /usr/local/bin/kubectl "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl" && '
+        "chmod +x /usr/local/bin/kubectl; "
+        "fi && "
         "sleep infinity"
     )
 
@@ -72,6 +77,11 @@ def build_dev_pod_manifest(
                     "image": image,
                     "command": ["sh", "-c", command],
                     "workingDir": user_dir,
+                    # Set USER so getpass.getuser() / $USER returns the real
+                    # owner, not "root". We keep uid=0 so users can apt-install.
+                    # nrl-k8s jobs submitted from the dev pod use this to tag
+                    # ownership — without it every submitter shows up as "root".
+                    "env": [{"name": "USER", "value": username}],
                     "envFrom": [{"secretRef": {"name": secret_name, "optional": True}}],
                     "resources": {
                         "requests": {"cpu": "100m", "memory": "256Mi"},
