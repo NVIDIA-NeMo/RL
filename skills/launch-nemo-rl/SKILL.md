@@ -1,6 +1,6 @@
 ---
 name: launch-nemo-rl
-description: Playbook for launching, monitoring, stopping, and debugging NeMo-RL recipes on a Kubernetes cluster via the nrl-k8s CLI. Use when asked to run/launch/submit/test a recipe on k8s, bring up or tear down a RayCluster, choose between long-lived (default `nrl-k8s run`) and ephemeral (`nrl-k8s run --rayjob`, auto-teardown) modes, iterate on an existing run, debug a hung or failed training job, or structure a new recipe+infra pair for a new hardware profile.
+description: Playbook for launching, monitoring, stopping, and debugging NeMo-RL recipes on a Kubernetes cluster via the nrl-k8s CLI. Use when asked to run/launch/submit/test a recipe on k8s, bring up or tear down a RayCluster, choose between ephemeral (default `nrl-k8s run`, auto-teardown) and long-lived (`nrl-k8s run --raycluster`) modes, iterate on an existing run, debug a hung or failed training job, or structure a new recipe+infra pair for a new hardware profile.
 when_to_use: "run this recipe on k8s", "launch on the cluster", "submit a training job", "tear down the cluster", "resubmit as rayjob", "why is the run stuck", "how do I get logs for job X", "bring the cluster back up".
 allowed-tools: Bash Read Grep Glob Edit Write
 ---
@@ -15,10 +15,10 @@ There is a single top-level submission command: **`nrl-k8s run`**. It has two li
 
 | Mode               | Invocation        | When to use                                                                                                                                                                   | Cluster after? |
 | :----------------- | :---------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------- |
-| Long-lived (default) | `nrl-k8s run`     | Dev loop. Reuses a matching live cluster, applies if absent, warns + reuses on drift (pass `--recreate` to replace). Then submits daemons and training. First-choice for iteration. | Yes            |
-| Ephemeral            | `nrl-k8s run --rayjob` | One-shot. KubeRay applies a RayJob, runs, tears the cluster down. Best for paper / eval runs where you don't plan to resubmit.                                                  | No (auto)      |
+| Ephemeral (default)  | `nrl-k8s run`              | One-shot. KubeRay applies a RayJob, runs, tears the cluster down. Best for most runs.                                                                                          | No (auto)      |
+| Long-lived           | `nrl-k8s run --raycluster` | Dev loop. Reuses a matching live cluster, applies if absent, warns + reuses on drift (pass `--recreate` to replace). Then submits daemons and training. First-choice for iteration. | Yes            |
 
-Ask: *Do I need this cluster after the run?* If no, use `--rayjob`. If yes, plain `run`.
+Ask: *Do I need this cluster after the run?* If yes, use `--raycluster`. Otherwise use the default (ephemeral).
 
 The rest of the CLI is observability / stage-by-stage control:
 
@@ -103,20 +103,17 @@ Every infra YAML encodes a hardware/scheduler profile. The concrete examples in 
 - **Per-node GPUs** (e.g. 4 vs 8) — must match `cluster.gpus_per_node` in the recipe, otherwise workers stay `Pending`.
 - **Node selectors** — head pods usually land on a CPU-only node pool; GPU workers match on `nvidia.com/gpu.product` or a node-group label.
 - **Scheduler** — KAI (`schedulerName: kai-scheduler` + `kai.scheduler/queue` label) with topology annotations (`kai.scheduler/topology`, `kai.scheduler/topology-required-placement`) gang-schedules workers into one clique. Without it, pods may land on different racks and NVLink/RoCE won't span them.
-- **DRA claims** — ComputeDomain + RoCE are attached via `resourceClaims` referencing `ResourceClaimTemplate`s that must pre-exist in the namespace. Missing templates = `RayCluster` Pending forever.
+- **DRA claims** — ComputeDomain + RoCE are attached via `resourceClaims` referencing `ResourceClaimTemplate`s. The CLI auto-creates/deletes these when the worker pod spec contains DRA claim references — no manual setup needed.
 - **Secrets** — always via `secretKeyRef` (`wandb-api-key`, image pull secret). Never embed.
 - **Shared filesystem mounts** — typically a Lustre PVC mounted twice: once at the code path (e.g. `/opt/nemo-rl` with a user-scoped `subPath`) and once at a workspace root (e.g. `/mnt/rl-workspace`) for datasets, HF cache, and checkpoints.
 
 Before applying an infra, verify prereqs exist in the target namespace:
 
 ```bash
-kubectl get resourceclaimtemplate <compute-domain-template> <roce-template>
 kubectl get pvc <workspace-pvc>
 kubectl get secret <wandb-secret> <image-pull-secret>
 kubectl get sa <service-account>
 ```
-
-See `tools/nrl_k8s/docs/onboarding.md` for ComputeDomain CR + RoCE ResourceClaimTemplate shapes and the full onboarding checklist for a new namespace.
 
 ## 7. End-to-end workflows
 
@@ -228,7 +225,6 @@ Before reporting a launch as successful, verify:
 ## 13. Where things live in the repo
 
 - CLI code: `tools/nrl_k8s/src/nrl_k8s/` (`cli.py`, `orchestrate.py`, `manifest.py`, `rayjob.py`, `k8s.py`, `submitters/`, `schema.py`).
-- Tests: `tools/nrl_k8s/tests/unit/` — run with `uv run --active pytest tests/unit -x` from `tools/nrl_k8s/`.
+- Tests: `tools/nrl_k8s/tests/unit/` — run with `uv run --extra test pytest -x -q` from `tools/nrl_k8s/`.
 - Recipe + infra examples: `tools/nrl_k8s/examples/`.
-- Onboarding + recipes docs: `tools/nrl_k8s/docs/`.
 - Base recipes this tool wraps: `examples/configs/recipes/llm/…` and `examples/nemo_gym/…`.
