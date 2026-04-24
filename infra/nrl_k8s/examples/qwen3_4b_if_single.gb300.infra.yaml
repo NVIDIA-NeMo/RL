@@ -1,4 +1,4 @@
-# Infra for qwen3_4b_if_single.yaml on a GB300 (p6e-gb300r.36xlarge) EKS cluster.
+# Infra for qwen3_4b_if_single.yaml on a GB300 NVL72 EKS cluster.
 #
 # Per-node hardware: 4× NVIDIA-GB300, ~140 CPU, ~925 GiB memory, arm64. GB300
 # nodes advertise no taints on this cluster — plain nodeSelector is enough.
@@ -26,7 +26,7 @@ _shared:
     limits:   {cpu: "8", memory: "32Gi"}
     requests: {cpu: "2", memory: "8Gi"}
   gpuWorkerResources: &gpu_worker_resources
-    # p6e-gb300r.36xlarge allocatable: ~139.6 CPU, ~924 GiB, 4 GPUs.
+    # NVL72 GB300 node allocatable: ~140 CPU / ~924 GiB / 4 GPUs.
     # Claim 128 CPU / 880 GiB to leave headroom for the Ray head pod +
     # gpu-operator / device-plugin / dgxc daemonsets (~11 CPU, ~40 GiB).
     limits:
