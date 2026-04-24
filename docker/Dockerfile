@@ -16,7 +16,7 @@
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 
-ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.05-cuda12.9-devel-ubuntu24.04
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -146,71 +146,71 @@ if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
 fi
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --extra automodel --no-install-project
-uv sync --link-mode symlink --locked --all-groups --no-install-project
+# uv sync --link-mode symlink --locked --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 EOF
 
-ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
-ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
-# Point TE at the pip-installed cuDNN (nvidia-cudnn-cu12) instead of the system one.
-# The container's system cuDNN (/lib/x86_64-linux-gnu/libcudnn*.so.9) may be a different
-# version than what pip installed. TE prioritizes system libraries by default, causing a
-# version mismatch crash (e.g. system 9.10.1 vs pip 9.19.0). CUDNN_HOME makes TE's Python
-# code find the pip version first, and LD_LIBRARY_PATH makes the dynamic linker resolve
-# cuDNN sub-libraries from pip when loading libtransformer_engine.so.
-ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
-ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
-# Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
+# ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
+# ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+# # Point TE at the pip-installed cuDNN (nvidia-cudnn-cu12) instead of the system one.
+# # The container's system cuDNN (/lib/x86_64-linux-gnu/libcudnn*.so.9) may be a different
+# # version than what pip installed. TE prioritizes system libraries by default, causing a
+# # version mismatch crash (e.g. system 9.10.1 vs pip 9.19.0). CUDNN_HOME makes TE's Python
+# # code find the pip version first, and LD_LIBRARY_PATH makes the dynamic linker resolve
+# # cuDNN sub-libraries from pip when loading libtransformer_engine.so.
+# ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
+# ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
+# # Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 
-WORKDIR /opt/nemo-rl
+# WORKDIR /opt/nemo-rl
 
-FROM hermetic AS release
+# FROM hermetic AS release
 
-# Re-declare build args for this stage
-ARG SKIP_VLLM_BUILD
-ARG SKIP_SGLANG_BUILD
-ARG NEMO_RL_COMMIT
-ARG NVIDIA_BUILD_ID
-ARG NVIDIA_BUILD_REF
-ARG RC_DATE=00.00
-ARG TARGETARCH
-ENV NEMO_RL_COMMIT=${NEMO_RL_COMMIT:-<unknown>}
-ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
-ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
-LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
-LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
+# # Re-declare build args for this stage
+# ARG SKIP_VLLM_BUILD
+# ARG SKIP_SGLANG_BUILD
+# ARG NEMO_RL_COMMIT
+# ARG NVIDIA_BUILD_ID
+# ARG NVIDIA_BUILD_REF
+# ARG RC_DATE=00.00
+# ARG TARGETARCH
+# ENV NEMO_RL_COMMIT=${NEMO_RL_COMMIT:-<unknown>}
+# ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
+# ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
+# LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
+# LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
-ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+# ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
-# Copy in source from build context (defaults to cloned repo, can be overridden)
-# Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
-COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
-# Unshallow the repo to get the full history (in the case it was from the scratch layer).
-# Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
-# so do a quick check before trying to unshallow.
-RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN <<"EOF" bash -exu
-NEGATIVE_FILTERS=""
-if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
-    NEGATIVE_FILTERS="$NEGATIVE_FILTERS vllm"
-fi
-if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
-    NEGATIVE_FILTERS="$NEGATIVE_FILTERS sglang"
-fi
-if [[ -n "$NEGATIVE_FILTERS" ]]; then
-    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
-else
-    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
-fi
-EOF
+# # Copy in source from build context (defaults to cloned repo, can be overridden)
+# # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
+# COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
+# # Unshallow the repo to get the full history (in the case it was from the scratch layer).
+# # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
+# # so do a quick check before trying to unshallow.
+# RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
+# RUN <<"EOF" bash -exu
+# NEGATIVE_FILTERS=""
+# if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
+#     NEGATIVE_FILTERS="$NEGATIVE_FILTERS vllm"
+# fi
+# if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
+#     NEGATIVE_FILTERS="$NEGATIVE_FILTERS sglang"
+# fi
+# if [[ -n "$NEGATIVE_FILTERS" ]]; then
+#     UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
+# else
+#     UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+# fi
+# EOF
 
-# Generate container fingerprint for frozen environment support
-# Store outside /opt/nemo-rl to avoid being overwritten by user mounts
-RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
+# # Generate container fingerprint for frozen environment support
+# # Store outside /opt/nemo-rl to avoid being overwritten by user mounts
+# RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
 
-# NOTICES.txt file points to where the OSS source code is archived
-RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
-    echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
+# # NOTICES.txt file points to where the OSS source code is archived
+# RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
+#     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
