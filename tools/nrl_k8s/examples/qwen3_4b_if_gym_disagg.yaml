@@ -1,0 +1,49 @@
+# Qwen3-4B GRPO on instruction_following gym — **gym-disaggregated variant**.
+#
+# Differs from qwen3_4b_if.yaml in a single field: generation is colocated
+# with training (both run inside the same Ray cluster's GPU workers), so we
+# don't need a standalone generation RayCluster or its daemon.
+#
+# Pair with qwen3_4b_if_gym_disagg.infra.yaml (which declares only training +
+# gym clusters — no generation cluster).
+defaults: ../../../examples/nemo_gym/grpo_qwen3_4b_instruct_k8s_base.yaml
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_num_steps: 200
+  val_period: 50
+  max_rollout_turns: 1
+  async_grpo:
+    # NeMo-RL asserts non-colocated when async_grpo is enabled. Single-cluster
+    # runs colocated generation, so we keep GRPO synchronous here.
+    enabled: false
+policy:
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # Colocated vLLM + backward on 4B takes too much GPU at 16K context;
+  # halving leaves headroom for vLLM's 6 GiB + activations + optimizer.
+  max_total_sequence_length: 8192
+  dtensor_cfg:
+    activation_checkpointing: true
+  generation:
+    colocated:
+      enabled: true       # recipe-level difference from disagg
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+    vllm_cfg:
+      gpu_memory_utilization: 0.45  # leave 55% for training state
+checkpointing:
+  save_period: 50
+logger:
+  wandb_enabled: true
+  wandb:
+    project: nemorl-gym-disagg-k8s
+    name: gym-disagg-if-qwen3-4b
+  tensorboard_enabled: true
+  monitor_gpus: true
