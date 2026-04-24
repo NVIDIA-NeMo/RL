@@ -79,7 +79,12 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  "vllm==0.17.1",
+  # +cu130 wheels from GitHub match torch (pytorch-cu130). PyPI can resolve to +cu12
+  # binaries on Linux (e.g. libcudart.so.12 vs torch cu13). See v0.17.1 release assets:
+  # https://github.com/vllm-project/vllm/releases/tag/v0.17.1
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.17.1/vllm-0.17.1+cu130-cp38-abi3-manylinux_2_35_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.17.1/vllm-0.17.1+cu130-cp38-abi3-manylinux_2_35_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "vllm==0.17.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.4",
   "flashinfer-cubin==0.6.4",
