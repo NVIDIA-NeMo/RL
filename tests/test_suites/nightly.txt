@@ -162,3 +162,8 @@ tests/test_suites/llm/distillation-qwen3-32b-to-1.7b-base-1n8g-fsdp2tp1.v1.sh
 
 # Short megatron
 tests/test_suites/llm/distillation-qwen3-32b-to-1.7b-base-1n8g-megatron-tp2pp2cp2-pack.sh
+
+# Quantization-Aware Distillation (NVFP4) - low-cost signal that the QAT
+# integration (Megatron student + co-located vLLM both NVFP4-quantized) stays
+# healthy. Self-distill Qwen3-1.7B-Base, ~20 min on 1n8g.
+tests/test_suites/llm/distillation-qwen3-1.7b-1n8g-megatron-qa-nvfp4.sh

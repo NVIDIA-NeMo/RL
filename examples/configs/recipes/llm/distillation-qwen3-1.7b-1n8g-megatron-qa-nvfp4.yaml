@@ -1,0 +1,33 @@
+defaults: ../../../../examples/modelopt/qa_distillation_math_megatron.yaml
+distillation:
+  max_num_steps: 25
+  val_period: 1000
+policy:
+  max_total_sequence_length: 4096
+  quant_calib_size: 64
+  quant_sequence_length: 1024
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    scheduler:
+      lr_warmup_iters: 2
+  generation:
+    vllm_cfg:
+      max_model_len: 4096
+      gpu_memory_utilization: 0.3
+teacher:
+  model_name: Qwen/Qwen3-1.7B-Base
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+data:
+  max_input_seq_length: 4096
+logger:
+  log_dir: logs/distillation-qwen3-1.7b-1n8g-megatron-qa-nvfp4
+  wandb:
+    project: nemo-rl
+    name: distillation-qwen3-1.7b-1n8g-megatron-qa-nvfp4
+  tensorboard:
+    log_dir: tb_logs-distillation-qwen3-1.7b-1n8g-megatron-qa-nvfp4
