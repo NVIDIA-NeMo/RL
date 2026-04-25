@@ -549,12 +549,21 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           pattern: coverage-${{ matrix.flag }}-*
+          path: coverage-downloads
+
+      - name: Debug download layout
+        run: |
+          echo "Working directory: $(pwd)"
+          echo "--- coverage-downloads ---"
+          ls -laR coverage-downloads 2>/dev/null || echo "coverage-downloads/ does not exist"
+          echo "--- top-level coverage-* ---"
+          ls -la coverage-* 2>/dev/null || echo "No coverage-* entries in workspace"
 
       - name: Check if artifacts were downloaded
         id: check-artifacts
         run: |
-          # Check if any coverage directories were downloaded
-          if ls coverage-* 1> /dev/null 2>&1; then
+          # Check if any .coverage files were downloaded
+          if find coverage-downloads -name ".coverage" -type f 2>/dev/null | grep -q .; then
             echo "artifacts-found=true" >> $GITHUB_OUTPUT
             echo "Found coverage artifacts for ${{ matrix.flag }}"
           else
@@ -568,12 +577,10 @@ jobs:
         run: |
           pip install coverage
 
-          ls -al .
-          ls -al coverage-*/
-          coverage combine --keep $(ls coverage-*/.coverage)
+          find coverage-downloads -name ".coverage" -type f
+          coverage combine --keep $(find coverage-downloads -name ".coverage" -type f)
           coverage report -i --show-missing
-          rm -rf coverage-*
-          ls -al
+          rm -rf coverage-downloads
 
       - name: Skip coverage processing
         if: ${{ steps.check-artifacts.outputs.artifacts-found == 'false' }}
