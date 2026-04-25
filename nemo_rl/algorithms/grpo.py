@@ -592,6 +592,9 @@ def setup(
             cluster_cfg=inference_cluster_cfg,
             sglang_cfg=generation_config,
         )
+        if generation_config["sglang_server"].get("check_weight_update_equal", False):
+            pg.check_weights(action="snapshot")
+            pg.check_weights(action="reset")
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
@@ -760,6 +763,22 @@ def setup(
     state_dict_info = policy.prepare_refit_info()
     if policy_generation is not None:
         policy_generation.prepare_refit_info(state_dict_info)
+
+    if backend == "sglang" and isinstance(policy_generation, SGLangGeneration):
+        sglang_cfg_typed = cast(SGLangConfig, generation_config)
+        check_equal = sglang_cfg_typed["sglang_server"].get(
+            "check_weight_update_equal", False
+        )
+        if check_equal:
+            refit_policy_generation(
+                policy=policy,
+                policy_generation=policy_generation,
+                colocated_inference=colocated_inference,
+            )
+            policy_generation.check_weights(action="compare")
+            policy_generation.finish_generation()
+
+            policy.prepare_for_training()
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -1154,8 +1173,16 @@ def refit_policy_generation(
             if isinstance(policy_generation, SGLangGeneration):
                 # Stream weights to colocated SGLang engines via CUDA IPC over HTTP.
                 # Engine-i owns global ranks [i*K, (i+1)*K) where K = num_gpus_per_engine.
+                # Resolve node-0 engine HTTP URLs once on the driver so every
+                # FSDP rank doesn't redo the Ray RPC.
+                rollout_engine_urls = ray.get(
+                    [
+                        e.get_base_url.remote()
+                        for e in policy_generation.rollout_engines
+                    ]
+                )
                 futures_train = policy.stream_weights_via_http(
-                    rollout_engines=policy_generation.rollout_engines,
+                    rollout_engine_urls=rollout_engine_urls,
                     num_gpus_per_engine=policy_generation.num_gpus_per_engine,
                 )
                 # Wait for all workers to complete

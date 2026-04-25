@@ -106,9 +106,13 @@ class SGLangServer(TypedDict):
     sglang_server_concurrency: int
     # for pause/continue gen
     pause_generation_mode: NotRequired[str]
+    # When true, refit bookends every weight update with a check_weights
+    # snapshot + reset (pre-refit) and compare (post-refit) to assert that
+    # streamed weights actually land on the engine.
+    check_weight_update_equal: NotRequired[bool]
     # total num gpus for inference
     num_gpus: NotRequired[int]
-    num_gpus_per_engine: NotRequired[int] 
+    num_gpus_per_engine: NotRequired[int]
 
 class SGLangRouter(TypedDict):
     sglang_router_ip: NotRequired[str]

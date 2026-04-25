@@ -911,15 +911,17 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
     def stream_weights_via_http(
         self,
-        rollout_engines,
+        rollout_engine_urls,
         num_gpus_per_engine: int,
         buffer_size_bytes: int = 512 * 1024 * 1024,
     ) -> None:
         """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
 
         Args:
-            rollout_engines: Ray actor handles for SGLang generation workers,
-                one per engine on this node.
+            rollout_engine_urls: ``http://host:port`` base URLs of each
+                engine's ``node_rank=0`` SGLang HTTP server. The driver
+                resolves these once via ``engine.get_base_url`` and passes
+                them down so every FSDP rank doesn't redo the Ray RPC.
             num_gpus_per_engine: TP size per SGLang engine. Engine ``i`` is
                 assumed to own global ranks ``[i*K, (i+1)*K)``.
             buffer_size_bytes: Max bucket size in bytes before flushing.
@@ -934,8 +936,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             self._ipc_worker_state: dict = {}
 
         stream_weights_via_http_impl(
-            model=self.model,
-            rollout_engines=rollout_engines,
+            params_generator=dtensor_params_generator(self.model, self.dtype),
+            rollout_engine_urls=rollout_engine_urls,
             num_gpus_per_engine=num_gpus_per_engine,
             rank=self.rank,
             world_size=torch.distributed.get_world_size(),
