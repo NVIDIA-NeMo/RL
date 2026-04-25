@@ -10,8 +10,8 @@
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
-	url = https://github.com/NVIDIA-NeMo/Automodel.git
-	branch = main
+	url = https://github.com/khazic/Automodel_lao.git
+	branch = feat/deepseek-v4-flash
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
