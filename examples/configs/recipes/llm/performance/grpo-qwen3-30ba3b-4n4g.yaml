@@ -8,6 +8,7 @@ checkpointing:
 policy:
   model_name: Qwen/Qwen3-30B-A3B
   train_micro_batch_size: 1
+  logprob_batch_size: 2
   max_total_sequence_length: 4096
   dtensor_cfg:
     enabled: false
