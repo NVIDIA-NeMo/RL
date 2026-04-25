@@ -1,0 +1,349 @@
+# GRPO Algorithm Configuration for GenRM DWRL
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  num_val_generations_per_prompt: 1   # must be one for DWRL to work correctly
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: 1000000
+  normalize_rewards: false
+  use_leave_one_out_baseline: true
+  # Clipping bounds for normalized advantages to prevent extreme values from small std
+  # Set to null to disable clipping (default), or e.g. -100/100 to clip
+  advantage_clip_low: null
+  advantage_clip_high: null
+  val_period: 5
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  max_val_samples: null
+  val_batch_size: 32
+  seed: 42
+
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+
+  penalize_invalid_tool_call: false
+  invalid_tool_call_advantage: -5.0
+  penalize_malformed_thinking: false
+  malformed_thinking_advantage: -5.0
+
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+
+  dwrl:
+    bt_prompt: "Based on your evaluation, is the original response good? Answer with only a single word: yes or no"
+    score_token: "yes"
+    opposite_token: "no"
+
+  use_best_at_k: false
+  best_at_k_k: 8
+  best_at_k_m: 1000
+
+  use_combined_training: false
+  combined_training_weight_mode: "auto"
+  combined_training_best_at_k_weight: 0.2
+  combined_training_pass_at_1_weight: 1.0
+
+  dynamic_sampling_oversample_ratio: 1.0
+
+  seq_logprob_error_threshold: 2
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0  # for DWRL this should always be 0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+  ce_penalty: 0.001
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo_genrm_dwrl"
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  keep_top_k: 10000
+  save_period: 10
+  checkpoint_must_save_by: "00:03:30:00"
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+policy:
+  model_name: "Qwen/Qwen3-1.7B"  # Use base model, not instruct version
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  generation_batch_size: 32
+  logprob_batch_size: 4
+  max_total_sequence_length: 8192
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    _v2: false
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  
+  megatron_cfg:
+    enabled: false
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 2
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 4
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+    moe_shared_expert_overlap: false
+    apply_rope_fusion: True
+    bias_activation_fusion: False
+    defer_fp32_logits: True
+    track_moe_metrics: True
+    moe_per_layer_logging: True
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: true
+    mtp_num_layers: null
+    mtp_detach_heads: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 3.0e-6
+      min_lr: 3.0e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      sgd_momentum: 0.9
+
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3e-7
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
+
+    env_vars: null
+
+  # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
+  # for more details on dynamic batching and sequence packing.
+  dynamic_batching:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  # makes the training sequence length divisible by the tensor parallel size
+  # this is useful for sequence parallel training
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-6
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      # when using Dtensor, we need to set foreach
+      # and fused to False
+      foreach: False
+      fused: False
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 50
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [50]
+
+  generation:
+    port_range_low: 11001
+    port_range_high: 15000
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: False
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: false
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: false
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+        reasoning_parser_plugin: nemo_rl/utils/nano_v3_reasoning_parser.py
+
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: "float32"
+
+    colocated:
+      # true: generation shares training GPUs
+      # false: uses dedicated generation resources
+      enabled: true
+      # only relevant when enabled is false
+      resources:
+        gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+        num_nodes: null # Decides number of nodes to be dedicated to generation
+
+# Data configuration
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
+  prompt_file: null  # Optional prompt template file
+  system_prompt_file: null  # Optional system prompt file
+  shuffle: true
+  num_workers: 1
+  dataset_name: "genrm_dwrl"
+  train_data_path: "path/to/your/train.jsonl"  # Update with your data path
+  val_data_path: "path/to/your/val.jsonl"      # Optional validation data path
+
+env:
+  should_use_nemo_gym: false
+  use_genrm_compare: false
+  genrm_agent_names:
+    - "genrm_simple_agent"
+    - "genrm_simple_agent_reasoning_off"
+  genrm_compare_server_name: "genrm_compare"
+  genrm_dwrl:
+    reward_design: rb0
+
+# Logger configuration
+logger:
+  log_dir: "logs"  # Base directory for all logs
+  num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false  # Disable MLflow logging
+  monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  swanlab_enabled: false
+  wandb:
+    project: "grpo-genrm-dwrl"
+    name: "grpo-genrm-dwrl-logger"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "grpo-genrm-dwrl"
+    run_name: "grpo-genrm-dwrl-logger"
+  gpu_monitoring:
+    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
+    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+
+# uncomment to enable effort level training
+#effort_levels:
+#  low_string: "{reasoning effort: low}"
+#  low_weight: 0.1
+#  low_penalty: 1
+#  low_ub: 3000

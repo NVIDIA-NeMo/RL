@@ -26,6 +26,12 @@ test_assets/
 .nrl_remote_state.json
 # Test biproducts
 tests/functional/*/
+convert_dcp_to_hf.sh
+convert_megatron_to_hf.sh
+evaluate_genrm_all_steps.sh
+evaluate_genrm_all_steps_vllm.sh
+evaluate_genrm_one_step_dwrl.sh
+evaluate_genrm_one_step_vllm.sh
 
 # Cache
 uv_cache/

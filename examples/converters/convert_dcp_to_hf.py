@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import argparse
-
+import os
 import yaml
 
 from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf
@@ -56,7 +56,10 @@ def main():
     # We can expose a arg at the top level --tokenizer_path to plumb that through.
     # This is more stable than relying on the current NeMo-RL get_tokenizer() which can
     # change release to release.
-    tokenizer_name_or_path = config["policy"]["model_name"]
+    if os.path.exists(tokenizer_path := os.path.join(args.dcp_ckpt_path, "..", "tokenizer")):
+        tokenizer_name_or_path = tokenizer_path
+    else:
+        tokenizer_name_or_path = config["policy"]["model_name"]
     hf_overrides = config["policy"].get("hf_overrides", {}) or {}
 
     hf_ckpt = convert_dcp_to_hf(

@@ -234,6 +234,7 @@ def batched_message_log_to_flat_message(
     message_log_batch: list[LLMMessageLogType],
     pad_value_dict: Optional[dict[str, int]] = None,
     make_sequence_length_divisible_by: int = 1,
+    pad_side: str = "right",
 ) -> tuple[BatchedDataDict[FlatMessagesType], Tensor]:
     """Process and pad a batch of message logs for model input.
 
@@ -384,7 +385,7 @@ def batched_message_log_to_flat_message(
 
         # Pad and stack tensors (always right padding)
         pad_value = pad_value_dict.get(key, 0) if pad_value_dict else 0
-        padded = [_pad_tensor(t, max_len, "right", pad_value) for t in filled_values]
+        padded = [_pad_tensor(t, max_len, pad_side, pad_value) for t in filled_values]
         result[key] = torch.stack(padded)
 
     return result, input_lengths_tensor
@@ -448,6 +449,7 @@ def get_formatted_message_log(
     add_eos_token: bool = True,
     add_generation_prompt: bool = False,
     tools: Optional[list[dict[str, Any]]] = None,
+    **template_kwargs,
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -529,12 +531,15 @@ def get_formatted_message_log(
         # the assistant's generation prompt as part of the user message.
 
         # Only pass tools parameter if tools exist
-        template_kwargs = {
-            "add_generation_prompt": add_generation_prompt
-            and message["role"] in ["user", "tool"],
-            "tokenize": False,
-            "add_special_tokens": False,
-        }
+        #template_kwargs = {
+        #    "add_generation_prompt": add_generation_prompt
+        #    and message["role"] in ["user", "tool"],
+        #    "tokenize": False,
+        #    "add_special_tokens": False,
+        #}
+        template_kwargs["add_generation_prompt"] = add_generation_prompt and message["role"] in ["user", "tool"]
+        template_kwargs["tokenize"] = False
+        template_kwargs["add_special_tokens"] = False
         if tools is not None:
             template_kwargs["tools"] = tools
 

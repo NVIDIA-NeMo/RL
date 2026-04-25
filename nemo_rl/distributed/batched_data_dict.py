@@ -743,6 +743,29 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     deepcopy(item) for item in v for _ in range(num_repeats)
                 ]
         return repeated_batch
+    
+    def repeat_tile(self, num_repeats: int) -> Self:
+        """Repeats the batch num_repeats times.
+
+        Repeats the entire sequence num_repeats number of times (aka tile)
+        i.e:
+        {"key": torch.tensor([1, 2, 3]), "other_key": [1, 2, 3]} -> {"key": torch.tensor([1, 2, 3, 1, 2, 3]), "other_key": [1, 2, 3, 1, 2, 3]}
+        """
+        repeated_batch: Self = type(self)()
+        for k, v in self.data.items():
+            if torch.is_tensor(v):
+                # For tensors, use repeat to repeat each element
+                repeated_batch[k] = v.repeat(num_repeats)
+            elif isinstance(v, PackedTensor):
+                raise NotImplementedError(
+                    "PackedTensor does not currently support repeat_interleave"
+                )
+            else:
+                # For lists or other sequences, use a list comprehension to repeat each element
+                repeated_batch[k] = [
+                    deepcopy(item) for _ in range(num_repeats) for item in v
+                ]
+        return repeated_batch
 
     def truncate_tensors(self, dim: int, truncated_len: int):
         """Truncates tensors in this dict of a given dim to a given length."""

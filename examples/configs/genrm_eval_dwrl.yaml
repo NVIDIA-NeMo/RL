@@ -1,0 +1,186 @@
+# GenRM Evaluation Configuration
+eval:
+  dataset_name: "judgebench"  # Options: judgebench, rmbench, rewardbench
+  batch_size: 64
+  seed: 42
+  output_file: "results/genrm_dwrl_eval.json"
+
+  dwrl:
+    bt_prompt: "Based on your evaluation, is the original response good? Answer with only a single word: yes or no"
+    score_token: "yes"
+
+policy:
+  model_name: ${generation.model_name}
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  generation_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 16384  # Matching the script's max_length
+  precision: "bfloat16"
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  max_grad_norm: 1.0
+
+  dtensor_cfg:
+    _v2: false
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 8
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  megatron_cfg:
+    enabled: false
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+    moe_shared_expert_overlap: false
+    apply_rope_fusion: True
+    bias_activation_fusion: False
+    defer_fp32_logits: True
+    track_moe_metrics: True
+    moe_per_layer_logging: True
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: true
+    mtp_num_layers: null
+    mtp_detach_heads: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 3.0e-6
+      min_lr: 3.0e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      sgd_momentum: 0.9
+
+      use_distributed_optimizer: false
+      use_precision_aware_optimizer: false
+
+      clip_grad: ${policy.max_grad_norm}
+
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3e-7
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: true
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
+
+    env_vars: null
+
+  dynamic_batching:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+generation:
+  model_name: ???
+  port_range_low: 11001
+  port_range_high: 15000
+  backend: "vllm"
+  max_new_tokens: ${policy.max_total_sequence_length}
+  temperature: 1.0
+  top_p: 0.95
+  top_k: null
+  stop_token_ids: null
+  stop_strings: null
+  
+  vllm_cfg:
+    async_engine: false
+    precision: ${policy.precision}
+    kv_cache_dtype: "auto"
+    tensor_parallel_size: 8
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    gpu_memory_utilization: 0.5
+    max_model_len: ${policy.max_total_sequence_length}
+    enforce_eager: False
+    use_deep_gemm: False
+    num_last_layers_in_bf16: 0
+    num_first_layers_in_bf16: 0
+    enable_vllm_metrics_logger: false
+    vllm_metrics_logger_interval: 0.5
+    expose_http_server: false
+    http_server_serving_chat_kwargs:
+      enable_auto_tools: false
+      tool_parser: qwen3_coder
+      reasoning_parser: nano_v3
+      reasoning_parser_plugin: nemo_rl/utils/nano_v3_reasoning_parser.py
+
+  vllm_kwargs:
+    mamba_ssm_cache_dtype: "float32"
+
+  colocated:
+    # true: generation shares training GPUs
+    # false: uses dedicated generation resources
+    enabled: true
+    # only relevant when enabled is false
+    resources:
+      gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+      num_nodes: null # Decides number of nodes to be dedicated to generation
+
+    
+data:
+  eval_data_file: "/lustre/fsw/portfolios/llmservice/users/degert/data/helpsteer3/jiaqi_genrm/val_data_base.jsonl"
+  max_input_seq_length: 16384
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

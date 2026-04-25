@@ -390,6 +390,7 @@ def dtensor_from_parallel_logits_to_logprobs(
     inference_only: bool = False,
     seq_index: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
+    shift_logits: bool = True,
 ) -> torch.Tensor:
     """Get log probabilities from TP+CP sharded vocab logits.
 
@@ -428,13 +429,15 @@ def dtensor_from_parallel_logits_to_logprobs(
         _, sorted_indices = torch.sort(seq_index)
         # Recover the original order of the target
         target = target.full_tensor()[:, sorted_indices]
-        target = target.roll(shifts=-1, dims=-1)[:, seq_index]
+        if shift_logits:
+            target = target.roll(shifts=-1, dims=-1)[:, seq_index]
 
         # Reshard
         target = distribute_tensor(target, cp_mesh, cp_placements)
         target = target.to_local()
     else:
-        target = target.roll(shifts=-1, dims=-1)
+        if shift_logits:
+            target = target.roll(shifts=-1, dims=-1)
 
     if chunk_size is not None:
         logprobs: torch.Tensor = ChunkedDistributedLogprob.apply(  # type: ignore
@@ -463,7 +466,10 @@ def dtensor_from_parallel_logits_to_logprobs(
         logprobs = logprobs_dtensor.full_tensor()[:, sorted_indices]
         assert logprobs.shape == target_shape
 
-    return logprobs[:, :-1]
+    if shift_logits:
+        return logprobs[:, :-1]
+    else:
+        return logprobs
 
 
 def from_parallel_logits_to_logprobs(
@@ -475,6 +481,7 @@ def from_parallel_logits_to_logprobs(
     inference_only: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     chunk_size: Optional[int] = None,
+    shift_logits: bool = True,
 ) -> torch.Tensor:
     """Get log probabilities from TP+CP sharded vocab logits.
 
@@ -496,7 +503,8 @@ def from_parallel_logits_to_logprobs(
 
     Taken from: https://github.com/NVIDIA/NeMo-Aligner/blob/9faab404f21994a7eb1d6ed5890b76152b941636/nemo_aligner/utils/distributed.py#L354
     """
-    target = target.roll(shifts=-1, dims=-1)
+    if shift_logits:
+        target = target.roll(shifts=-1, dims=-1)
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
     pad_len = 0
     # if cp_size > 1:
@@ -538,7 +546,10 @@ def from_parallel_logits_to_logprobs(
     if pad_len > 0:
         logprobs = logprobs[:, :-pad_len]
 
-    return logprobs[:, :-1]
+    if shift_logits:
+        return logprobs[:, :-1]
+    else:
+        return logprobs
 
 
 def from_parallel_logits_to_logprobs_packed_sequences(
