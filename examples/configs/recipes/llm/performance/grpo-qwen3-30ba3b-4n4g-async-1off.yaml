@@ -12,13 +12,13 @@ policy:
   megatron_cfg:
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
-    expert_model_parallel_size: 16
+    expert_model_parallel_size: 8
     sequence_parallel: false
   generation:
     colocated:
       enabled: false
       resources:
-        num_nodes: 4
+        num_nodes: 2
         gpus_per_node: 4
     vllm_cfg:
       async_engine: true
@@ -30,4 +30,4 @@ logger:
     name: grpo-qwen3-30ba3b-8n4g-async-1off
 cluster:
   gpus_per_node: 4
-  num_nodes: 8
+  num_nodes: 4
