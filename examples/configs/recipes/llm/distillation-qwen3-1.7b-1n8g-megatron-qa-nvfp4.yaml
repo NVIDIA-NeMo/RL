@@ -1,7 +1,6 @@
 defaults: ../../../../examples/modelopt/qa_distillation_math_megatron.yaml
 distillation:
   max_num_steps: 25
-  val_period: 1000
 policy:
   max_total_sequence_length: 4096
   quant_calib_size: 64
