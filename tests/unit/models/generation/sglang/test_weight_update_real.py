@@ -115,6 +115,7 @@ class MockFSDPWorker:
 
         self.rank = rank
         self.gpu_index = gpu_index
+        self.dtype = torch.bfloat16
 
         torch.cuda.set_device(gpu_index)
         dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
@@ -123,7 +124,7 @@ class MockFSDPWorker:
 
         device = torch.device(f"cuda:{gpu_index}")
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
+            model_path, torch_dtype=self.dtype, trust_remote_code=True,
         ).to(device)
 
         from nemo_rl.utils.nvml import get_device_uuid
@@ -139,9 +140,17 @@ class MockFSDPWorker:
         if not hasattr(self, "_ipc_worker_state"):
             self._ipc_worker_state = {}
 
+        from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
+            dtensor_params_generator,
+        )
+
+        rollout_engine_urls = ray.get(
+            [e.get_base_url.remote() for e in rollout_engines]
+        )
+
         stream_weights_via_http_impl(
-            model=self.model,
-            rollout_engines=rollout_engines,
+            params_generator=dtensor_params_generator(self.model, self.dtype),
+            rollout_engine_urls=rollout_engine_urls,
             num_gpus_per_engine=num_gpus_per_engine,
             rank=self.rank,
             world_size=dist.get_world_size(),

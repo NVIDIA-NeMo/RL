@@ -884,19 +884,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
     def stream_weights_via_http(
         self,
-        rollout_engines,
+        rollout_engine_urls,
         num_gpus_per_engine: int,
     ) -> list[ray.ObjectRef]:
         """Send the weights to colocated SGLang engines via CUDA IPC over HTTP.
 
         Args:
-            rollout_engines: Ray actor handles for SGLang generation workers
-                (one per engine on this node).
+            rollout_engine_urls: ``http://host:port`` base URLs of each
+                engine's ``node_rank=0`` SGLang HTTP server. The caller
+                resolves these once (via ``engine.get_base_url``) and passes
+                them in, so every FSDP rank doesn't redo the Ray RPC.
             num_gpus_per_engine: TP size per SGLang engine.
         """
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_http",
-            rollout_engines=rollout_engines,
+            rollout_engine_urls=rollout_engine_urls,
             num_gpus_per_engine=num_gpus_per_engine,
         )
         return futures
