@@ -551,14 +551,6 @@ jobs:
           pattern: coverage-${{ matrix.flag }}-*
           path: coverage-downloads
 
-      - name: Debug download layout
-        run: |
-          echo "Working directory: $(pwd)"
-          echo "--- coverage-downloads ---"
-          ls -laR coverage-downloads 2>/dev/null || echo "coverage-downloads/ does not exist"
-          echo "--- top-level coverage-* ---"
-          ls -la coverage-* 2>/dev/null || echo "No coverage-* entries in workspace"
-
       - name: Check if artifacts were downloaded
         id: check-artifacts
         run: |
