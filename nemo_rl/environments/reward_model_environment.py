@@ -155,7 +155,7 @@ class RewardModelEnvironment(EnvironmentInterface):
             max_colocated_worker_groups=1,
         )
         print(
-            f"🔧 Virtual cluster created with {self.virtual_cluster.get_placement_groups()} "
+            f"🔧 Virtual cluster created with {self.virtual_cluster.get_unified_placement_group()} "
         )
         # Initialize reward model worker with proper resource management
         print("🔧 Setting up reward model worker...")

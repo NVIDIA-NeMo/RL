@@ -209,3 +209,7 @@ class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
     def prepare_for_lp_inference(self) -> None:
         pass
+
+    @abstractmethod
+    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+        pass

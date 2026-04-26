@@ -52,7 +52,7 @@ def test_env_max_retries_invalid_value():
     with patch.dict(os.environ, env_vars, clear=True):
         with pytest.raises(AssertionError):
             cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
-            cluster._init_placement_groups()
+            cluster._init_placement_group()
 
 
 def test_env_max_retries_non_integer():
@@ -64,7 +64,7 @@ def test_env_max_retries_non_integer():
     with patch.dict(os.environ, env_vars, clear=True):
         with pytest.raises(ValueError):
             cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
-            cluster._init_placement_groups()
+            cluster._init_placement_group()
 
 
 def test_env_max_retries_default_value():
@@ -74,7 +74,7 @@ def test_env_max_retries_default_value():
     with (
         patch.dict(os.environ, {}, clear=True),
         patch(
-            "nemo_rl.distributed.virtual_cluster.RayVirtualCluster._init_placement_groups"
+            "nemo_rl.distributed.virtual_cluster.RayVirtualCluster._init_placement_group"
         ) as mock_init,
     ):
         # Mock successful initialization
@@ -82,7 +82,7 @@ def test_env_max_retries_default_value():
 
         # Create cluster
         cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
-        cluster._init_placement_groups()
+        cluster._init_placement_group()
 
         # Default value should be 6 (as seen in the code)
         # We can't directly verify this, but we can check that initialization was attempted
@@ -99,19 +99,19 @@ def test_env_max_retries_exhausted():
     with (
         patch.dict(os.environ, env_vars, clear=True),
         patch(
-            "nemo_rl.distributed.virtual_cluster.RayVirtualCluster._create_placement_groups_internal"
+            "nemo_rl.distributed.virtual_cluster.RayVirtualCluster._create_placement_group_internal"
         ) as mock_init,
         patch("time.sleep") as mock_sleep,
     ):
-        # Make _init_placement_groups raise ResourceInsufficientError each time
+        # Make _init_placement_group raise ResourceInsufficientError each time
         mock_init.side_effect = ResourceInsufficientError("Not enough resources")
 
         # Create cluster - should retry retry_count times and then fail
         with pytest.raises(ResourceInsufficientError):
             cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
-            cluster._init_placement_groups()
+            cluster._init_placement_group()
 
-        # Verify _init_placement_groups was called exactly retry_count times
+        # Verify _init_placement_group was called exactly retry_count times
         assert mock_init.call_count == retry_count
 
         # Verify time.sleep was called with exponentially increasing values
@@ -231,18 +231,14 @@ def test_mcore_py_executable():
             assert "megatron-training is imported" in result.stdout
 
 
-def test_create_sorted_bundle_indices_for_unified_pg():
+def test_create_sorted_bundle_and_node_ids_for_unified_pg():
     """Test that sorted bundle indices are created for a unified placement group."""
     cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
-    cluster._init_placement_groups(strategy=None, use_unified_pg=True)
-    assert cluster._sorted_bundle_indices is not None
-    assert len(cluster._sorted_bundle_indices) == 2
-    assert 0 in cluster._sorted_bundle_indices
-    assert 1 in cluster._sorted_bundle_indices
-
-
-def test_not_create_sorted_bundle_indices_for_per_node_pg():
-    """Test that sorted bundle indices are not created for a per-node placement group."""
-    cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
-    cluster._init_placement_groups(strategy=None, use_unified_pg=False)
-    assert cluster._sorted_bundle_indices is None
+    cluster._init_placement_group()
+    assert cluster._bundle_ids_sorted_by_ip_and_gpu is not None
+    assert len(cluster._bundle_ids_sorted_by_ip_and_gpu) == 2
+    assert 0 in cluster._bundle_ids_sorted_by_ip_and_gpu
+    assert 1 in cluster._bundle_ids_sorted_by_ip_and_gpu
+    assert cluster._node_ids_sorted_by_node_id is not None
+    assert len(cluster._node_ids_sorted_by_node_id) == 2
+    assert cluster._node_ids_sorted_by_node_id == [0, 0]

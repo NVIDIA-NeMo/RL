@@ -15,6 +15,7 @@ import gc
 import traceback
 from typing import Any
 
+import ray
 import torch
 import zmq
 
@@ -358,3 +359,12 @@ class VllmInternalWorkerExtension:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+
+    def report_node_ip_and_gpu_id(self) -> tuple[str, int | str]:
+        """Report the node IP and GPU ID of the current worker."""
+        ip = ray._private.services.get_node_ip_address()
+        try:
+            gpu_id = int(ray.get_gpu_ids()[0])
+        except:
+            gpu_id = "Unknown"
+        return (ip, gpu_id)
