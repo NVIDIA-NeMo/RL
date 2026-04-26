@@ -1,4 +1,4 @@
-# Prod-mode infra for qwen3_30b_math_4n_4gpu.yaml on a GB300 NVL72 cluster.
+# Prod-mode infra for grpo-qwen3-30ba3b-4n4g-async-1off on a GB300 NVL72 cluster.
 #
 # Topology: 4 workers × 4 GPUs = 16 GPUs in a single RayCluster, scheduled by
 # KAI as one gang. NVLink/MNNVL spans all 16 GPUs via a ComputeDomain channel,
@@ -18,37 +18,37 @@
 #   - rl-workspace PVC bound (shared FSx Lustre, 2.4 TiB, RWX).
 #   - /mnt/rl-workspace/${user:}/nemo-rl contains a git checkout of
 #     https://github.com/NVIDIA-NeMo/RL on branch main.
-#   - nvcr-secret, wandb-api-key, nemo-rl-endpoint-registry all present.
+#   - nvcr-secret, ${user:}-secrets (via nrl-k8s dev setup-secrets),
+#     nemo-rl-endpoint-registry SA all present.
 #   - KAI topology `gb300-topology` is registered and advertises
 #     nvidia.com/gpu.clique as a placement key.
 #
 # Usage:
-#   # Long-lived cluster — idempotent; reuses the live cluster if it
-#   # already matches, applies if absent. Submits training per invocation.
-#   nrl-k8s run infra/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.yaml \
-#       --infra infra/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.gb300.infra.yaml \
-#       --run-id qwen3-30b-math-$(date +%Y%m%d-%H%M%S)
+#   RECIPE=examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off.yaml
+#   INFRA=infra/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.gb300.infra.yaml
 #
-#   # One-shot with auto-teardown (ephemeral RayCluster, no cleanup needed):
-#   nrl-k8s rayjob infra/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.yaml \
-#       --infra infra/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.gb300.infra.yaml
+#   # One-shot with auto-teardown (default):
+#   nrl-k8s run $RECIPE --infra $INFRA --wait
+#
+#   # Long-lived cluster for iterating:
+#   nrl-k8s cluster up $RECIPE --infra $INFRA --role training --wait
+#   nrl-k8s run $RECIPE --infra $INFRA --raycluster --wait
 
 _shared:
   headNodeSelector: &head_node_selector
     nodeGroup: customer-cpu
   workerNodeSelector: &worker_node_selector
     nvidia.com/gpu.product: NVIDIA-GB300
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
   headEnv: &shared_head_env
     - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
     - {name: HF_HUB_OFFLINE,                 value: "1"}
     - {name: TRANSFORMERS_OFFLINE,           value: "1"}
     - {name: NCCL_DEBUG,                     value: WARN}
     - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
-    - name: WANDB_API_KEY
-      valueFrom:
-        secretKeyRef:
-          name: wandb-api-key
-          key: WANDB_API_KEY
   workerEnv: &shared_worker_env
     - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
     - {name: HF_HUB_OFFLINE,                 value: "1"}
@@ -135,8 +135,13 @@ launch:
     mkdir -p "\${LOG_DIR}"
 
     python -u examples/run_grpo.py \
-      --config infra/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.yaml \
+      --config examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off.yaml \
+      grpo.max_num_steps=500 \
+      grpo.val_period=50 \
+      checkpointing.save_period=50 \
       logger.wandb_enabled=true \
+      logger.tensorboard_enabled=true \
+      logger.monitor_gpus=true \
       logger.wandb.project=nemorl-single-k8s \
       logger.wandb.name=qwen3-30b-math-gb300 \
       2>&1 | tee "\${LOG}"
@@ -164,6 +169,7 @@ clusters:
             containers:
               - name: ray-head
                 env: *shared_head_env
+                envFrom: *user_secret_env_from
                 resources: *head_resources
                 ports: *gpu_head_ports
                 volumeMounts: *code_mounts
@@ -198,6 +204,7 @@ clusters:
               containers:
                 - name: ray-worker
                   env: *shared_worker_env
+                  envFrom: *user_secret_env_from
                   resources: *gpu_worker_resources
                   securityContext:
                     capabilities:
