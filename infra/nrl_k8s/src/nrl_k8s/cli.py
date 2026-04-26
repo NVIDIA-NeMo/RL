@@ -523,6 +523,12 @@ def run(
         err=True,
     )
 
+    namespace = loaded.infra.namespace
+    for _role in ALL_ROLES:
+        _cl = getattr(loaded.infra.clusters, _role, None)
+        if _cl is not None:
+            _check_head_svc_collision(_cl.name, namespace, creating="raycluster")
+
     try:
         result = orchestrate.run(
             loaded,
@@ -579,6 +585,7 @@ def _run_rayjob(
         _preflight_or_exit(namespace)
 
     _check_stale_rayjobs(loaded, namespace)
+    _check_head_svc_collision(job_name, namespace, creating="rayjob")
 
     orchestrate.ensure_dra_resources("training", loaded, log=click.echo)
     click.echo(f"[run --rayjob] applying RayJob {job_name} in {namespace}")
@@ -781,6 +788,8 @@ def cluster_up(
         manifest = build_raycluster_manifest(cluster_spec, loaded.infra, role=role)
         click.echo(yaml.safe_dump(manifest, sort_keys=False).rstrip())
         return
+
+    _check_head_svc_collision(cluster_spec.name, loaded.infra.namespace, creating="raycluster")
 
     try:
         name = orchestrate.bring_up_cluster(
@@ -1400,6 +1409,41 @@ def _error_on_stale(stale: list[_StaleResource], namespace: str) -> None:
     _cli_error(
         "\n".join(lines),
         hint="once deleted, re-run the same nrl-k8s run command",
+    )
+
+
+def _check_head_svc_collision(
+    name: str,
+    namespace: str,
+    *,
+    creating: str,
+) -> None:
+    """Fail if creating this resource would collide with an existing one's head-svc.
+
+    KubeRay derives the head Service name as ``{name}-head-svc`` for both
+    RayJobs and RayClusters. When both exist with the same metadata name the
+    second resource can never create its Service and silently hangs.
+    """
+    from . import k8s
+
+    if creating == "rayjob":
+        existing = k8s.get_raycluster(name, namespace)
+        other_kind = "raycluster"
+    else:
+        existing = k8s.get_rayjob(name, namespace)
+        other_kind = "rayjob"
+
+    if existing is None:
+        return
+
+    _cli_error(
+        f"a {other_kind} named '{name}' already exists in namespace {namespace}. "
+        f"KubeRay names the head Service '{name}-head-svc' for both resource types; "
+        f"creating this {creating} with the same name will collide on the Service "
+        f"and the new resource will hang indefinitely.",
+        hint=f"either delete the existing resource:\n"
+        f"  kubectl delete {other_kind} {name} -n {namespace}\n"
+        f"or use a different name for the {creating}",
     )
 
 
