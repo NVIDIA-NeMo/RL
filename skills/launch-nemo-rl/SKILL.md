@@ -7,7 +7,7 @@ allowed-tools: Bash Read Grep Glob Edit Write
 
 # launch-nemo-rl — running NeMo-RL recipes on Kubernetes via nrl-k8s
 
-This is the playbook for the `nrl-k8s` CLI at `tools/nrl_k8s/`. Follow it when the user asks to launch / iterate / debug a NeMo-RL recipe on a Kubernetes cluster. Verify current state (`kubectl`, `git log`, the recipe + infra files) before acting — the cluster is shared and the cost of a wrong action is high.
+This is the playbook for the `nrl-k8s` CLI at `infra/nrl_k8s/`. Follow it when the user asks to launch / iterate / debug a NeMo-RL recipe on a Kubernetes cluster. Verify current state (`kubectl`, `git log`, the recipe + infra files) before acting — the cluster is shared and the cost of a wrong action is high.
 
 ## 1. One command, two modes
 
@@ -35,14 +35,14 @@ The rest of the CLI is observability / stage-by-stage control:
 Every launch takes two files. Pass the infra with `--infra`, not merged inline:
 
 ```
-nrl-k8s run tools/nrl_k8s/examples/<recipe>.yaml \
-  --infra tools/nrl_k8s/examples/<recipe>.<profile>.infra.yaml
+nrl-k8s run infra/nrl_k8s/examples/<recipe>.yaml \
+  --infra infra/nrl_k8s/examples/<recipe>.<profile>.infra.yaml
 ```
 
 - **Recipe** (e.g. `qwen3_30b_math_8n_4gpu.yaml`) — NeMo-RL config: model, GRPO/SFT knobs, `cluster.{gpus_per_node,num_nodes}`. Uses `defaults:` to inherit from `examples/configs/recipes/llm/...`.
 - **Infra** (e.g. `*.<profile>.infra.yaml`) — K8s/Ray shape: namespace, image, service account, RayCluster spec, `submit.submitter`, `launch.{mode,codeSource,codePath,entrypoint}`. Pair names follow `<recipe>.<profile>[.prod].infra.yaml` where `<profile>` names the hardware target (e.g. `gb300`).
 
-Example pairs in `tools/nrl_k8s/examples/` — read the neighbouring files to see the current conventions for the target profile.
+Example pairs in `infra/nrl_k8s/examples/` — read the neighbouring files to see the current conventions for the target profile.
 
 ## 3. Long-lived mode flags
 
@@ -88,7 +88,7 @@ entrypoint: |
   cd /opt/nemo-rl
   RUN_ID="\${RAY_JOB_SUBMISSION_ID:-\${NRL_K8S_RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}}"
   python -u examples/run_grpo.py \
-    --config tools/nrl_k8s/examples/<recipe>.yaml \
+    --config infra/nrl_k8s/examples/<recipe>.yaml \
     logger.wandb_enabled=true \
     logger.wandb.project=<project> \
     "logger.wandb.name=<run-name>-\${RUN_ID}"
@@ -98,7 +98,7 @@ entrypoint: |
 
 ## 6. Per-profile concerns (hardware + scheduler + DRA)
 
-Every infra YAML encodes a hardware/scheduler profile. The concrete examples in `tools/nrl_k8s/examples/` are authoritative for the profiles they target — read the neighbouring infra file before writing a new one. Things that commonly vary:
+Every infra YAML encodes a hardware/scheduler profile. The concrete examples in `infra/nrl_k8s/examples/` are authoritative for the profiles they target — read the neighbouring infra file before writing a new one. Things that commonly vary:
 
 - **Per-node GPUs** (e.g. 4 vs 8) — must match `cluster.gpus_per_node` in the recipe, otherwise workers stay `Pending`.
 - **Node selectors** — head pods usually land on a CPU-only node pool; GPU workers match on `nvidia.com/gpu.product` or a node-group label.
@@ -252,7 +252,7 @@ The pod's `default` service account needs an `edit` RoleBinding in the namespace
 
 ## 14. Where things live in the repo
 
-- CLI code: `tools/nrl_k8s/src/nrl_k8s/` (`cli.py`, `orchestrate.py`, `manifest.py`, `rayjob.py`, `k8s.py`, `submitters/`, `schema.py`).
-- Tests: `tools/nrl_k8s/tests/unit/` — run with `uv run --extra test pytest -x -q` from `tools/nrl_k8s/`.
-- Recipe + infra examples: `tools/nrl_k8s/examples/`.
+- CLI code: `infra/nrl_k8s/src/nrl_k8s/` (`cli.py`, `orchestrate.py`, `manifest.py`, `rayjob.py`, `k8s.py`, `submitters/`, `schema.py`).
+- Tests: `infra/nrl_k8s/tests/unit/` — run with `uv run --extra test pytest -x -q` from `infra/nrl_k8s/`.
+- Recipe + infra examples: `infra/nrl_k8s/examples/`.
 - Base recipes this tool wraps: `examples/configs/recipes/llm/…` and `examples/nemo_gym/…`.

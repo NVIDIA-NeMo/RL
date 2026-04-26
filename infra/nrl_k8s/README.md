@@ -35,20 +35,20 @@ for both setup and development — it's what the project is tested with.
 ### End-user install (global `nrl-k8s` binary)
 
 ```bash
-uv tool install ./tools/nrl_k8s
+uv tool install ./infra/nrl_k8s
 nrl-k8s --version
 ```
 
 `uv tool install` drops the CLI in `~/.local/bin` (on `PATH`) inside its
 own isolated environment, so it never clashes with whatever your project
 venv has pinned. Upgrade with `uv tool upgrade nrl-k8s` after a git pull,
-or `uv tool install --reinstall ./tools/nrl_k8s`.
+or `uv tool install --reinstall ./infra/nrl_k8s`.
 
 ### Development (editable install + tests)
 
 ```bash
 # from the repo root
-cd tools/nrl_k8s
+cd infra/nrl_k8s
 uv venv                                 # creates .venv/
 source .venv/bin/activate
 uv pip install -e ".[test]"             # editable install + test extras
@@ -58,8 +58,8 @@ pytest                                  # 9 test modules, ~100 tests
 Or run commands without activating the venv:
 
 ```bash
-uv run --directory tools/nrl_k8s -- pytest
-uv run --directory tools/nrl_k8s -- nrl-k8s --help
+uv run --directory infra/nrl_k8s -- pytest
+uv run --directory infra/nrl_k8s -- nrl-k8s --help
 ```
 
 The package depends on `click`, `omegaconf`, `pydantic`, `kubernetes`,
@@ -70,7 +70,7 @@ Ray's Job SDK and runs the training entrypoint inside the cluster image.
 ## Quick start
 
 Three canonical flows ship with working recipes under
-`tools/nrl_k8s/examples/`. All three train Qwen3-4B with GRPO on the
+`infra/nrl_k8s/examples/`. All three train Qwen3-4B with GRPO on the
 `instruction_following` gym; they differ in how many RayClusters the run
 occupies and where generation/gym live.
 
@@ -88,8 +88,8 @@ between roles, no endpoint-registry rendezvous.
 
 ```bash
 nrl-k8s run \
-    tools/nrl_k8s/examples/qwen3_4b_if_single.yaml \
-    --infra tools/nrl_k8s/examples/qwen3_4b_if_single.infra.yaml \
+    infra/nrl_k8s/examples/qwen3_4b_if_single.yaml \
+    --infra infra/nrl_k8s/examples/qwen3_4b_if_single.infra.yaml \
     --wait
 ```
 
@@ -100,8 +100,8 @@ RayCluster runs the gym rollout server.
 
 ```bash
 nrl-k8s run \
-    tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml \
-    --infra tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.infra.yaml \
+    infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml \
+    --infra infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.infra.yaml \
     --raycluster --wait
 ```
 
@@ -112,8 +112,8 @@ training cluster and tails its logs.
 
 ```bash
 nrl-k8s status \
-    tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml \
-    --infra tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.infra.yaml
+    infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml \
+    --infra infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.infra.yaml
 ```
 
 ### `qwen3_4b_if_full_disagg` — generation + gym + training on separate clusters
@@ -123,8 +123,8 @@ the standalone generation server, which lives on its own GPUs:
 
 ```bash
 nrl-k8s run \
-    tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
-    --infra tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml \
+    infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
+    --infra infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml \
     --raycluster --wait
 ```
 
@@ -136,8 +136,8 @@ Once the training Ray Job is submitted its auto-generated ID is printed and
 
 ```bash
 nrl-k8s status \
-    tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
-    --infra tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml
+    infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
+    --infra infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml
 ```
 
 `DAEMON` is populated for `generation` and `gym`; `training` shows `—`
@@ -156,7 +156,7 @@ Each run is two files: a recipe and an infra.
 - **`<recipe>.infra.yaml`** — K8s-only. Namespace, container image, the
   inline RayCluster spec for each role, daemon entrypoints, the training
   entrypoint, and where Ray should upload code from. Validated against
-  `nrl_k8s.schema.InfraConfig` (see `tools/nrl_k8s/src/nrl_k8s/schema.py`).
+  `nrl_k8s.schema.InfraConfig` (see `infra/nrl_k8s/src/nrl_k8s/schema.py`).
 
 You can also bundle the two in one file — put an `infra:` top-level key on
 the recipe and omit `--infra`. The split is preferred for anything you plan
@@ -168,7 +168,7 @@ Recipes support a `defaults:` field (same semantics as NeMo-RL's own
 loader). Point it at a parent recipe path relative to the file itself:
 
 ```yaml
-# tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml
+# infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml
 defaults: ../../../examples/nemo_gym/grpo_qwen3_4b_instruct_k8s_base.yaml
 
 grpo:
@@ -177,7 +177,7 @@ grpo:
 
 The parent is loaded first; the child's keys are then merged on top. Chains
 work — the parent can itself have a `defaults:`. See
-`tools/nrl_k8s/src/nrl_k8s/config.py:165` for the walker.
+`infra/nrl_k8s/src/nrl_k8s/config.py:165` for the walker.
 
 Infra files also honour `defaults:` (via the same walker), so a team can
 keep a `defaults.infra.yaml` with shared node selectors, image, and
@@ -187,7 +187,7 @@ namespace and point each per-run infra at it.
 
 Four layers stack low-to-high (last wins):
 
-1. Shipped defaults: `tools/nrl_k8s/src/nrl_k8s/defaults/defaults.example.yaml`
+1. Shipped defaults: `infra/nrl_k8s/src/nrl_k8s/defaults/defaults.example.yaml`
 2. User defaults: `~/.config/nrl-k8s/defaults.yaml` (optional; can be
    repointed with `NRL_K8S_DEFAULTS=/path/to/file.yaml`)
 3. The infra file (via `--infra`) *or* the recipe's `infra:` block. Not both.
@@ -195,7 +195,7 @@ Four layers stack low-to-high (last wins):
    `grpo.max_num_steps=10`.
 
 `infra.*` overrides target the infra layer; everything else targets the
-recipe. See `tools/nrl_k8s/src/nrl_k8s/config.py:102` for the partition
+recipe. See `infra/nrl_k8s/src/nrl_k8s/config.py:102` for the partition
 logic.
 
 ## Command reference
@@ -214,8 +214,8 @@ the format picks up from the extension (`.yaml` / `.json`).
 ```bash
 # summary
 nrl-k8s check \
-    tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
-    --infra tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml
+    infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
+    --infra infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml
 
 # full bundle for diffs / kubectl apply --dry-run piping
 nrl-k8s check ... -o /tmp/bundle.yaml
@@ -234,8 +234,8 @@ manifest that would be applied and exits without hitting the API server:
 
 ```bash
 nrl-k8s cluster up \
-    tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
-    --infra tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml \
+    infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
+    --infra infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml \
     --role training --dry-run
 ```
 
@@ -264,8 +264,8 @@ Delete a RayCluster by role (resolved from the recipe) or by name.
 
 ```bash
 nrl-k8s cluster down \
-    tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
-    --infra tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml \
+    infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
+    --infra infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml \
     --role gym
 ```
 
@@ -292,8 +292,8 @@ daemon's Ray Job when the role has one, else the head pod's container
 logs. Override with `--source {daemon,head,worker}`.
 
 ```bash
-nrl-k8s logs tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
-    --infra tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml \
+nrl-k8s logs infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
+    --infra infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml \
     --role generation -f --tail 500
 ```
 
@@ -303,8 +303,8 @@ List Ray Jobs currently on the role's RayCluster (via its dashboard).
 
 ```bash
 nrl-k8s job list \
-    tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
-    --infra tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml \
+    infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
+    --infra infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml \
     --role training
 ```
 
@@ -402,8 +402,8 @@ submission goes through `kubectl exec` and code comes from
 `/opt/nemo-rl` inside the container instead of a laptop upload.
 
 ```bash
-RECIPE=tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml
-INFRA=tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.prod.infra.yaml
+RECIPE=infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml
+INFRA=infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.prod.infra.yaml
 
 # Admin, once: bring up the two RayClusters.
 nrl-k8s cluster up "$RECIPE" --infra "$INFRA" --role gym
@@ -537,7 +537,7 @@ etc.) — the CLI does not inject `cd` for you.
 idempotency-relevant actions before submitting:
 
 1. **Endpoint registry reset.** The CLI parses the gym daemon's
-   `--job-id` flag (see `tools/nrl_k8s/src/nrl_k8s/orchestrate.py:231`) and
+   `--job-id` flag (see `infra/nrl_k8s/src/nrl_k8s/orchestrate.py:231`) and
    deletes the `nemo-rl-endpoints-<job-id>` ConfigMap. Without this the new
    gym or training publishes alongside stale keys from a prior failed run,
    and the rendezvous picks up stragglers. See the recipes guide for the
@@ -569,7 +569,7 @@ isn't included (see `qwen3_4b_if_full_disagg.infra.yaml:229`). If uploads are sl
 `nrl-k8s check` won't help — instead `ls -lh` the
 staged tmpdir by running `nrl-k8s run --raycluster --wait` and inspecting the log
 line `[training] staging working_dir ...` (look at
-`tools/nrl_k8s/src/nrl_k8s/workdir.py` for defaults).
+`infra/nrl_k8s/src/nrl_k8s/workdir.py` for defaults).
 
 ### "expired token" / Kubernetes SSO errors
 

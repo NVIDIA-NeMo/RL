@@ -25,13 +25,13 @@
 # Usage:
 #   # Long-lived cluster — idempotent; reuses the live cluster if it
 #   # already matches, applies if absent. Submits training per invocation.
-#   nrl-k8s run tools/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.yaml \
-#       --infra tools/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.gb300.infra.yaml \
+#   nrl-k8s run infra/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.yaml \
+#       --infra infra/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.gb300.infra.yaml \
 #       --run-id qwen3-30b-math-$(date +%Y%m%d-%H%M%S)
 #
 #   # One-shot with auto-teardown (ephemeral RayCluster, no cleanup needed):
-#   nrl-k8s rayjob tools/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.yaml \
-#       --infra tools/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.gb300.infra.yaml
+#   nrl-k8s rayjob infra/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.yaml \
+#       --infra infra/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.gb300.infra.yaml
 
 _shared:
   headNodeSelector: &head_node_selector
@@ -135,7 +135,7 @@ launch:
     mkdir -p "\${LOG_DIR}"
 
     python -u examples/run_grpo.py \
-      --config tools/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.yaml \
+      --config infra/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.yaml \
       logger.wandb_enabled=true \
       logger.wandb.project=nemorl-single-k8s \
       logger.wandb.name=qwen3-30b-math-gb300 \

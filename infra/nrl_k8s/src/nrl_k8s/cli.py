@@ -323,7 +323,7 @@ def _dump_check_output(
 # =============================================================================
 # Deprecated aliases — kept only where scripts/docs still reference them.
 # Unimplemented stub commands (doctor/dashboard/dev) were removed; see
-# tools/nrl_k8s/docs/roadmap.md for the planned work.
+# infra/nrl_k8s/docs/roadmap.md for the planned work.
 # =============================================================================
 
 
