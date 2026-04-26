@@ -24,13 +24,13 @@
 # Usage:
 #   # Long-lived cluster — idempotent; reuses the live cluster if it
 #   # already matches, applies if absent. Submits training per invocation.
-#   nrl-k8s run tools/nrl_k8s/examples/qwen3_4b_if_single.yaml \
-#       --infra tools/nrl_k8s/examples/qwen3_4b_if_single.gb300.prod.infra.yaml \
+#   nrl-k8s run infra/nrl_k8s/examples/qwen3_4b_if_single.yaml \
+#       --infra infra/nrl_k8s/examples/qwen3_4b_if_single.gb300.prod.infra.yaml \
 #       --run-id single-if-$(date +%Y%m%d-%H%M%S)
 #
 #   # One-shot with auto-teardown (ephemeral RayCluster):
-#   nrl-k8s rayjob tools/nrl_k8s/examples/qwen3_4b_if_single.yaml \
-#       --infra tools/nrl_k8s/examples/qwen3_4b_if_single.gb300.prod.infra.yaml
+#   nrl-k8s rayjob infra/nrl_k8s/examples/qwen3_4b_if_single.yaml \
+#       --infra infra/nrl_k8s/examples/qwen3_4b_if_single.gb300.prod.infra.yaml
 
 _shared:
   nodeSelector: &shared_node_selector
@@ -124,7 +124,7 @@ launch:
     mkdir -p "\${LOG_DIR}"
 
     python -u examples/nemo_gym/run_grpo_nemo_gym.py \
-      --config tools/nrl_k8s/examples/qwen3_4b_if_single.yaml \
+      --config infra/nrl_k8s/examples/qwen3_4b_if_single.yaml \
       ++env.nemo_gym.config_paths='[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/instruction_following/configs/instruction_following.yaml]' \
       ~policy.optimizer.kwargs.foreach \
       ~policy.optimizer.kwargs.fused \

@@ -1,8 +1,8 @@
 # Infra for the Qwen3-4B full-disaggregated run — paired with qwen3_4b_if_full_disagg.yaml.
 #
 # Usage:
-#   nrl-k8s run tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
-#     --infra tools/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml
+#   nrl-k8s run infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.yaml \
+#     --infra infra/nrl_k8s/examples/qwen3_4b_if_full_disagg.infra.yaml
 #
 # Everything K8s-specific lives here so the recipe stays cluster-agnostic.
 # Shared YAML anchors below keep the three cluster specs from repeating.
