@@ -387,10 +387,13 @@ def submit_training(
         )
 
     # `--replace` semantics: stop any running job on the training cluster
-    # so the new one can claim GPUs. Only applies to the Ray path; exec
-    # runs are keyed by run_id (unique per submission) so replace is a
-    # no-op there.
-    if replace and not is_exec:
+    # so the new one can claim GPUs.
+    if replace and is_exec:
+        from .submitters.exec_ import ExecSubmitter
+        ExecSubmitter(exec_tmp_dir=infra.submit.execTmpDir).stop_all_running(
+            name, infra.namespace, log=log,
+        )
+    elif replace:
         with submit.dashboard_url(name, infra.namespace) as dash:
             client = JobSubmissionClient(dash)
             for job in client.list_jobs():

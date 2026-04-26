@@ -265,6 +265,45 @@ class ExecSubmitter:
         _run(["kubectl", "exec", "-n", handle.namespace, pod, "--",
               "bash", "-c", kill])
 
+    def stop_all_running(
+        self,
+        cluster_name: str,
+        namespace: str,
+        *,
+        log: callable = lambda _: None,
+    ) -> None:
+        """Kill every live exec run on the head pod.
+
+        Scans ``<tmp_root>/nrl-*/pid`` for processes still alive (``kill -0``)
+        and sends SIGTERM. Used by ``--replace`` to free resources before
+        submitting a new run.
+        """
+        pod = k8s.get_head_pod(cluster_name, namespace)
+        pod_name = pod.metadata.name
+        script = (
+            f'for pidfile in {self._tmp_root}/nrl-*/pid; do '
+            f'  [ -f "$pidfile" ] || continue; '
+            f'  pid=$(cat "$pidfile"); '
+            f'  if kill -0 "$pid" 2>/dev/null; then '
+            f'    run_dir=$(dirname "$pidfile"); '
+            f'    run_id=$(basename "$run_dir" | sed "s/^nrl-//"); '
+            f'    echo "stopping $run_id (pid $pid)"; '
+            f'    kill -s TERM "$pid" 2>/dev/null || true; '
+            f'  fi; '
+            f'done'
+        )
+        try:
+            out = _run(
+                ["kubectl", "exec", "-n", namespace, pod_name, "--",
+                 "bash", "-c", script],
+                capture=True,
+            )
+            for line in out.strip().splitlines():
+                if line:
+                    log(f"[training] --replace: {line}")
+        except (subprocess.CalledProcessError, _ExecFailed):
+            log("[training] --replace: warning: could not scan for running exec jobs")
+
 
 # =============================================================================
 # Internals
