@@ -259,7 +259,13 @@ class ExecSubmitter:
         sig = "KILL" if force else "TERM"
         kill = (
             f'if [ -f {shlex.quote(tmp)}/pid ]; then '
-            f'  kill -s {sig} "$(cat {shlex.quote(tmp)}/pid)" 2>/dev/null || true; '
+            f'  pid=$(cat {shlex.quote(tmp)}/pid); '
+            f'  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d " "); '
+            f'  if [ -n "$pgid" ]; then '
+            f'    kill -s {sig} -"$pgid" 2>/dev/null || true; '
+            f'  else '
+            f'    kill -s {sig} "$pid" 2>/dev/null || true; '
+            f'  fi; '
             f'fi'
         )
         _run(["kubectl", "exec", "-n", handle.namespace, pod, "--",
@@ -287,8 +293,14 @@ class ExecSubmitter:
             f'  if kill -0 "$pid" 2>/dev/null; then '
             f'    run_dir=$(dirname "$pidfile"); '
             f'    run_id=$(basename "$run_dir" | sed "s/^nrl-//"); '
-            f'    echo "stopping $run_id (pid $pid)"; '
-            f'    kill -s TERM "$pid" 2>/dev/null || true; '
+            f'    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d " "); '
+            f'    if [ -n "$pgid" ]; then '
+            f'      echo "stopping $run_id (pgid $pgid)"; '
+            f'      kill -s TERM -"$pgid" 2>/dev/null || true; '
+            f'    else '
+            f'      echo "stopping $run_id (pid $pid)"; '
+            f'      kill -s TERM "$pid" 2>/dev/null || true; '
+            f'    fi; '
             f'  fi; '
             f'done'
         )
