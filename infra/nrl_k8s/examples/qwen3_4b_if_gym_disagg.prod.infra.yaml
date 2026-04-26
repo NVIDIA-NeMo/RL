@@ -8,25 +8,25 @@
 #
 # Usage:
 #   # Admins, once: bring up the two RayClusters.
-#   nrl-k8s cluster up tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml \
-#       --infra tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.prod.infra.yaml \
+#   nrl-k8s cluster up infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml \
+#       --infra infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.prod.infra.yaml \
 #       --role gym
-#   nrl-k8s cluster up tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml \
-#       --infra tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.prod.infra.yaml \
+#   nrl-k8s cluster up infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml \
+#       --infra infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.prod.infra.yaml \
 #       --role training
 #
 #   # Researcher, per run — idempotent; reuses live clusters if matching,
 #   # submits training against the training cluster. Returns in seconds,
 #   # laptop disconnectable. Use --skip-daemons after first bring-up if
 #   # gym/generation are already healthy.
-#   nrl-k8s run tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml \
-#       --infra tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.prod.infra.yaml \
+#   nrl-k8s run infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml \
+#       --infra infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.prod.infra.yaml \
 #       --run-id qwen3-4b-gym-disagg-$(date +%Y%m%d-%H%M%S)
 #
 #   # Observe from anywhere; handle is cached on disk.
 #   nrl-k8s job logs <run-id> \
-#       tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml \
-#       --infra tools/nrl_k8s/examples/qwen3_4b_if_gym_disagg.prod.infra.yaml \
+#       infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.yaml \
+#       --infra infra/nrl_k8s/examples/qwen3_4b_if_gym_disagg.prod.infra.yaml \
 #       --role training -f
 
 _shared:
