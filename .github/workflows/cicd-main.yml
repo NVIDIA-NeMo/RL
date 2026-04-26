@@ -341,9 +341,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - script: L0_Unit_Tests_Generation
+          - script: L0_Unit_Tests_Vllm
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
-          - script: L0_Unit_Tests_Policy
+          - script: L0_Unit_Tests_Sglang
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L0_Unit_Tests_Mcore
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L0_Unit_Tests_Automodel
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L0_Unit_Tests_Models
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L0_Unit_Tests_Environments
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L0_Unit_Tests_Nemo_Gym
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L0_Unit_Tests_Algorithms
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
           - script: L0_Unit_Tests_Other
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
