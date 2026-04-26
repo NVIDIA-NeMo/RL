@@ -277,16 +277,23 @@ class ExecSubmitter:
         namespace: str,
         *,
         log: callable = lambda _: None,
+        wait_s: int = 10,
     ) -> None:
         """Kill every live exec run on the head pod.
 
-        Scans ``<tmp_root>/nrl-*/pid`` for processes still alive (``kill -0``)
-        and sends SIGTERM. Used by ``--replace`` to free resources before
-        submitting a new run.
+        Scans ``<tmp_root>/nrl-*/pid`` for processes still alive, looks up
+        their process group, and sends SIGTERM to the entire group. This
+        ensures child processes (python driver, tee, etc.) are killed too —
+        once the python driver dies, Ray GCs the actors it owned on workers.
+
+        After signalling, waits up to *wait_s* seconds for all processes to
+        exit so Ray has time to reclaim worker resources before the new run
+        starts.
         """
         pod = k8s.get_head_pod(cluster_name, namespace)
         pod_name = pod.metadata.name
-        script = (
+        kill_script = (
+            f'killed=0; '
             f'for pidfile in {self._tmp_root}/nrl-*/pid; do '
             f'  [ -f "$pidfile" ] || continue; '
             f'  pid=$(cat "$pidfile"); '
@@ -301,20 +308,55 @@ class ExecSubmitter:
             f'      echo "stopping $run_id (pid $pid)"; '
             f'      kill -s TERM "$pid" 2>/dev/null || true; '
             f'    fi; '
+            f'    killed=1; '
             f'  fi; '
-            f'done'
+            f'done; '
+            f'echo "KILLED=$killed"'
+        )
+        killed = False
+        try:
+            out = _run(
+                ["kubectl", "exec", "-n", namespace, pod_name, "--",
+                 "bash", "-c", kill_script],
+                capture=True,
+            )
+            for line in out.strip().splitlines():
+                if line.startswith("KILLED="):
+                    killed = line == "KILLED=1"
+                elif line:
+                    log(f"[training] --replace: {line}")
+        except (subprocess.CalledProcessError, _ExecFailed):
+            log("[training] --replace: warning: could not scan for running exec jobs")
+            return
+
+        if not killed:
+            return
+
+        log(f"[training] --replace: waiting up to {wait_s}s for processes to exit")
+        wait_script = (
+            f'for i in $(seq 1 {wait_s}); do '
+            f'  alive=0; '
+            f'  for pidfile in {self._tmp_root}/nrl-*/pid; do '
+            f'    [ -f "$pidfile" ] || continue; '
+            f'    pid=$(cat "$pidfile"); '
+            f'    kill -0 "$pid" 2>/dev/null && alive=1 && break; '
+            f'  done; '
+            f'  [ "$alive" = "0" ] && echo "all processes exited" && exit 0; '
+            f'  sleep 1; '
+            f'done; '
+            f'echo "timeout: some processes still running"'
         )
         try:
             out = _run(
                 ["kubectl", "exec", "-n", namespace, pod_name, "--",
-                 "bash", "-c", script],
+                 "bash", "-c", wait_script],
                 capture=True,
             )
             for line in out.strip().splitlines():
                 if line:
                     log(f"[training] --replace: {line}")
         except (subprocess.CalledProcessError, _ExecFailed):
-            log("[training] --replace: warning: could not scan for running exec jobs")
+            pass
 
 
 # =============================================================================

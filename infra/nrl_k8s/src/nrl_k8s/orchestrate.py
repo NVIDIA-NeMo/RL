@@ -387,7 +387,15 @@ def submit_training(
         )
 
     # `--replace` semantics: stop any running job on the training cluster
-    # so the new one can claim GPUs.
+    # so the new one can claim GPUs and worker actors are cleaned up.
+    #
+    # Exec path: kill the driver process *group* on the head pod. The
+    # python driver owns all Ray actors via ray.init(); when the driver
+    # dies, Ray GCs those actors (including vLLM engines on workers).
+    # Killing just the PID left python alive → actors orphaned.
+    #
+    # Port-forward path: use the Ray Job SDK to stop jobs, which handles
+    # actor cleanup on the Ray side.
     if replace and is_exec:
         from .submitters.exec_ import ExecSubmitter
         ExecSubmitter(exec_tmp_dir=infra.submit.execTmpDir).stop_all_running(
