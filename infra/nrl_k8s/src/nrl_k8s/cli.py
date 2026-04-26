@@ -1446,7 +1446,29 @@ def _check_dev_pod_rbac(namespace: str) -> None:
     )
     if result.stdout.strip() == "yes":
         return
-    rolebinding = (
+    heredoc = (
+        f"kubectl apply -f - <<'EOF'\n"
+        f"apiVersion: rbac.authorization.k8s.io/v1\n"
+        f"kind: ClusterRole\n"
+        f"metadata:\n"
+        f"  name: edit-with-ray\n"
+        f"aggregationRule:\n"
+        f"  clusterRoleSelectors:\n"
+        f"    - matchLabels:\n"
+        f"        rbac.authorization.k8s.io/aggregate-to-edit: \"true\"\n"
+        f"rules: []  # auto-filled by aggregation\n"
+        f"---\n"
+        f"apiVersion: rbac.authorization.k8s.io/v1\n"
+        f"kind: ClusterRole\n"
+        f"metadata:\n"
+        f"  name: ray-edit\n"
+        f"  labels:\n"
+        f"    rbac.authorization.k8s.io/aggregate-to-edit: \"true\"\n"
+        f"rules:\n"
+        f"  - apiGroups: [ray.io]\n"
+        f"    resources: [rayjobs, rayclusters]\n"
+        f"    verbs: [get, list, watch, create, update, patch, delete]\n"
+        f"---\n"
         f"apiVersion: rbac.authorization.k8s.io/v1\n"
         f"kind: RoleBinding\n"
         f"metadata:\n"
@@ -1458,13 +1480,14 @@ def _check_dev_pod_rbac(namespace: str) -> None:
         f"    namespace: {namespace}\n"
         f"roleRef:\n"
         f"  kind: ClusterRole\n"
-        f"  name: edit\n"
-        f"  apiGroup: rbac.authorization.k8s.io"
+        f"  name: edit-with-ray\n"
+        f"  apiGroup: rbac.authorization.k8s.io\n"
+        f"EOF"
     )
     _cli_error(
         f"the default service account in {namespace} lacks edit permissions — "
         f"kubectl won't work inside the dev pod",
-        hint=f"apply this RoleBinding, then retry:\n\n{rolebinding}",
+        hint=f"run this, then retry:\n\n{heredoc}",
     )
 
 
