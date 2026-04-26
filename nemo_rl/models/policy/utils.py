@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import gc
+import io
 import os
+import pickle
 import traceback
 from enum import Enum
 from typing import Any, Dict, Optional, cast
@@ -248,7 +250,12 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
 
 
 def stream_weights_via_ipc_zmq_impl(
-    params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
+    params_generator,
+    buffer_size_bytes: int,
+    zmq_socket,
+    rank: int,
+    worker_name: str,
+    model_update_transport: str = "cuda_ipc",
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
@@ -261,22 +268,51 @@ def stream_weights_via_ipc_zmq_impl(
         zmq_socket: ZMQ socket for communication
         rank: Worker rank for logging
         worker_name: Name of the worker for logging
+        model_update_transport: Transport method for weight transfer.
+            "cuda_ipc" (default) uses CUDA IPC handles via ZMQ.
+            "cpu_serialize" uses torch.save/load over CPU pinned memory,
+            which does not require CAP_SYS_PTRACE / --ipc=host.
     """
+    if model_update_transport not in ("cuda_ipc", "cpu_serialize"):
+        raise ValueError(
+            f"Unsupported model_update_transport: {model_update_transport!r}. "
+            f"Expected 'cuda_ipc' or 'cpu_serialize'."
+        )
+
     # Divide total buffer size by 2 because we use two individual buffers (ping-pong) for overlapping communication.
     buffer_size_bytes = buffer_size_bytes // 2
 
     def send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv) -> bool:
         """Send a group of parameters and return new pending_recv state."""
-        # Synchronize before getting IPC handle to ensure data is ready
-        torch.cuda.current_stream().synchronize()
-        cuda_ipc_handle = get_handle_from_tensor(buffer)
+        if model_update_transport == "cpu_serialize":
+            # Bucket-level pinned DMA: ~10x faster than per-tensor pageable .cpu()
+            # (270ms vs 2.7s at 3.4GB on PCIe 4.0, per ROLL benchmarks).
+            torch.cuda.current_stream().synchronize()
+            bucket = buffer[:used_bytes].contiguous()
+            pinned = torch.empty_like(bucket, device="cpu").pin_memory()
+            pinned.copy_(bucket, non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+            buf = io.BytesIO()
+            torch.save({"bucket": pinned}, buf)
+            serialized = buf.getvalue()  # bytes object
+        else:  # cuda_ipc
+            # Synchronize before getting IPC handle to ensure data is ready
+            torch.cuda.current_stream().synchronize()
+            serialized = get_handle_from_tensor(buffer)  # tuple
 
         if await_recv:
             zmq_socket.recv()
 
-        # Payload tuple: (cuda_ipc_handle, param_names, used_bytes)
-        payload = (cuda_ipc_handle, param_names, used_bytes)
-        zmq_socket.send_pyobj(payload)
+        if model_update_transport == "cpu_serialize":
+            metadata = pickle.dumps(
+                (param_names, used_bytes), protocol=pickle.HIGHEST_PROTOCOL
+            )
+            zmq_socket.send_multipart(
+                [b"cpu_serialize", metadata, memoryview(serialized)], copy=False
+            )
+        else:
+            payload = (serialized, param_names, used_bytes)
+            zmq_socket.send_pyobj(payload)
         return True  # pending_recv = True
 
     def allocate_buffer(device):

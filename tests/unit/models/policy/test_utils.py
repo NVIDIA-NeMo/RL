@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import multiprocessing
 import os
+import pickle
 import sys
 import time
 import traceback
@@ -125,6 +127,7 @@ def server_process(
     known_tensors: list[tuple[str, torch.Tensor]],
     buffer_size_bytes: int,
     ready_queue: multiprocessing.Queue,
+    model_update_transport: str = "cuda_ipc",
 ) -> None:
     """Server process that streams tensors via IPC ZMQ."""
     try:
@@ -144,6 +147,7 @@ def server_process(
             socket,
             rank=0,
             worker_name="test_server",
+            model_update_transport=model_update_transport,
         )
     except Exception as e:
         import sys
@@ -184,13 +188,31 @@ def client_process(
 
         # Receive and validate loop
         while True:
-            payload = socket.recv_pyobj()
-            if payload == IPCProtocol.COMPLETE:
-                socket.send(IPCProtocol.ACK.value.encode())
-                break
+            frames = socket.recv_multipart(copy=False)
+            if len(frames) == 1:
+                payload = pickle.loads(frames[0].buffer)
+                if payload == IPCProtocol.COMPLETE:
+                    socket.send(IPCProtocol.ACK.value.encode())
+                    break
 
-            ipc_handle, list_keys, used_bytes = payload
-            buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, device.index)
+                ipc_handle_or_bytes, list_keys, used_bytes = payload
+                buffer = rebuild_cuda_tensor_from_ipc(
+                    ipc_handle_or_bytes, device.index
+                )
+            elif len(frames) == 3 and bytes(frames[0].buffer) == b"cpu_serialize":
+                list_keys, used_bytes = pickle.loads(frames[1].buffer)
+                bucket_data = torch.load(
+                    io.BytesIO(frames[2].buffer), weights_only=True
+                )
+                buffer = bucket_data["bucket"]
+                if not buffer.is_pinned():
+                    buffer = buffer.pin_memory()
+                buffer = buffer.to(device=device, non_blocking=True)
+                torch.cuda.current_stream().synchronize()
+            else:
+                raise RuntimeError(
+                    f"Unexpected ZMQ frame format in client_process: {len(frames)} frame(s)"
+                )
 
             offset = 0
             for key in list_keys:
@@ -256,6 +278,7 @@ class TestStreamWeightsViaIPC:
 
     TIMEOUT = 30  # 30 second timeout for additional overhead when running with coverage
 
+    @pytest.mark.parametrize("model_update_transport", ["cuda_ipc", "cpu_serialize"])
     @pytest.mark.parametrize(
         "test_case,tensor_specs,buffer_size_bytes,test_description",
         [
@@ -285,7 +308,12 @@ class TestStreamWeightsViaIPC:
         ],
     )
     def test_stream_weights_via_ipc_zmq_impl(
-        self, test_case, tensor_specs, buffer_size_bytes, test_description
+        self,
+        test_case,
+        tensor_specs,
+        buffer_size_bytes,
+        test_description,
+        model_update_transport,
     ):
         """Test streaming weights via IPC ZMQ between server and client processes."""
         # Generate test tensors
@@ -298,7 +326,7 @@ class TestStreamWeightsViaIPC:
         ]
 
         # Create unique socket path and queues
-        socket_path = f"/tmp/test_ipc_zmq_{test_case}_{os.getpid()}_{time.time()}"
+        socket_path = f"/tmp/test_ipc_zmq_{test_case}_{model_update_transport}_{os.getpid()}_{time.time()}"
         zmq_addr = f"ipc://{socket_path}"
 
         mp_context = multiprocessing.get_context("spawn")
@@ -308,7 +336,7 @@ class TestStreamWeightsViaIPC:
         # Start server and client
         server_proc = mp_context.Process(
             target=server_process,
-            args=(zmq_addr, known_tensors, buffer_size_bytes, ready_queue),
+            args=(zmq_addr, known_tensors, buffer_size_bytes, ready_queue, model_update_transport),
         )
         server_proc.start()
 
@@ -343,3 +371,30 @@ class TestStreamWeightsViaIPC:
 
             if os.path.exists(socket_path):
                 os.unlink(socket_path)
+
+    def test_stream_weights_invalid_transport(self):
+        """Invalid model_update_transport should raise ValueError before any ZMQ I/O."""
+
+        class _DummySocket:
+            def send_pyobj(self, *a, **k):
+                raise AssertionError("should not reach ZMQ send")
+
+            def recv(self, *a, **k):
+                raise AssertionError("should not reach ZMQ recv")
+
+            def getsockopt(self, *a, **k):
+                return 0
+
+        def _empty_gen():
+            if False:
+                yield None  # pragma: no cover
+
+        with pytest.raises(ValueError, match="Unsupported model_update_transport"):
+            stream_weights_via_ipc_zmq_impl(
+                params_generator=_empty_gen(),
+                buffer_size_bytes=1024,
+                zmq_socket=_DummySocket(),
+                rank=0,
+                worker_name="test",
+                model_update_transport="not_a_real_transport",
+            )

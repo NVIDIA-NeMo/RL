@@ -1154,8 +1154,12 @@ def refit_policy_generation(
                 update_success = True
             else:
                 # Original ZMQ IPC path for vLLM
+                model_update_transport = os.environ.get(
+                    "NRL_MODEL_UPDATE_TRANSPORT", "cuda_ipc"
+                )
                 futures_train = policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes
+                    buffer_size_bytes=buffer_size_bytes,
+                    model_update_transport=model_update_transport,
                 )
                 futures_inference = policy_generation.update_weights_via_ipc_zmq()
                 # wait for all futures to complete
