@@ -1,0 +1,382 @@
+# RL-414: Validate kai-scheduler + kuberay autoscaling with topology constraints
+#
+# Tests whether kuberay's autoscaler can dynamically scale worker groups that
+# have kai-scheduler topology constraints (gb300-topology at nvidia.com/gpu.clique).
+#
+# Test design:
+#   clique-a: 4 workers (replicas=4, minReplicas=0) — starts full, tests scale DOWN
+#   clique-b: 4 workers (replicas=4, minReplicas=0) — baseline
+#   clique-c: 0 workers (replicas=0, minReplicas=0) — tests scale UP (0->4)
+#
+# The kai-scheduler ray-grouper EXCLUDES PodGroup subgroups where both
+# minReplicas=0 AND replicas=0 (clique-c). This test validates whether new pods
+# created by the autoscaler still get topology-aware scheduling.
+#
+# Usage:
+#   kubectl apply -f k8s/rl-414-topology-autoscale-test.yaml --context aws-cmh
+#   kubectl logs -f -l ray.io/node-type=head -c ray-head --context aws-cmh
+#   # Clean up:
+#   kubectl delete rayjob rl-414-autoscale-topology-test --context aws-cmh
+#   kubectl delete configmap rl-414-driver-script --context aws-cmh
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rl-414-driver-script
+data:
+  driver.py: |
+    import ray
+    import time
+    import os
+    import json
+    import socket
+    import sys
+    from ray.util.placement_group import placement_group, remove_placement_group
+
+
+    def log(msg):
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+    @ray.remote(num_cpus=0)
+    def get_node_info():
+        return {
+            "hostname": socket.gethostname(),
+            "node_name": os.environ.get("NODE_NAME", "unknown"),
+            "node_ip": ray.util.get_node_ip_address(),
+        }
+
+
+    def collect_pg_nodes(pg, num_bundles, label):
+        tasks = [
+            get_node_info.options(
+                placement_group=pg,
+                placement_group_bundle_index=i,
+                num_gpus=4,
+            ).remote()
+            for i in range(num_bundles)
+        ]
+        nodes = ray.get(tasks, timeout=120)
+        log(f"{label} nodes:")
+        for i, n in enumerate(nodes):
+            log(f"  bundle[{i}]: node={n['node_name']}, host={n['hostname']}, ip={n['node_ip']}")
+        return nodes
+
+
+    def wait_for_pg(pg, label, timeout=600):
+        start = time.time()
+        while True:
+            remaining = timeout - (time.time() - start)
+            if remaining <= 0:
+                return False
+            ready = pg.wait(timeout_seconds=min(30, remaining))
+            if ready:
+                log(f"{label} ready ({int(time.time() - start)}s)")
+                return True
+            elapsed = int(time.time() - start)
+            res = ray.cluster_resources()
+            avail = ray.available_resources()
+            log(
+                f"{label} pending ({elapsed}s)"
+                f" | cluster GPU={res.get('GPU', 0)}"
+                f" avail GPU={avail.get('GPU', 0)}"
+            )
+
+
+    def main():
+        ray.init()
+        results = {}
+
+        log("=" * 70)
+        log("RL-414: Topology-Aware Autoscaling Validation")
+        log("=" * 70)
+        log(f"Cluster resources: {json.dumps(dict(ray.cluster_resources()), indent=2)}")
+
+        # ── PHASE 1: Verify initial topology placement ──
+        log("\n" + "=" * 70)
+        log("PHASE 1: Verify initial topology placement")
+        log("=" * 70)
+
+        log("Creating PG1 (clique-a): 4 bundles x 4 GPUs")
+        pg1 = placement_group(
+            [{"GPU": 4, "clique_a": 0.001} for _ in range(4)],
+            strategy="STRICT_SPREAD",
+            name="pg-clique-a",
+        )
+        if not wait_for_pg(pg1, "PG1", timeout=300):
+            log("FAIL: PG1 timed out")
+            sys.exit(1)
+
+        log("Creating PG2 (clique-b): 4 bundles x 4 GPUs")
+        pg2 = placement_group(
+            [{"GPU": 4, "clique_b": 0.001} for _ in range(4)],
+            strategy="STRICT_SPREAD",
+            name="pg-clique-b",
+        )
+        if not wait_for_pg(pg2, "PG2", timeout=300):
+            log("FAIL: PG2 timed out")
+            sys.exit(1)
+
+        pg1_nodes = collect_pg_nodes(pg1, 4, "PG1 (clique-a)")
+        pg2_nodes = collect_pg_nodes(pg2, 4, "PG2 (clique-b)")
+
+        pg1_names = {n["node_name"] for n in pg1_nodes}
+        pg2_names = {n["node_name"] for n in pg2_nodes}
+        if pg1_names & pg2_names:
+            log(f"WARNING: PG1/PG2 share nodes: {pg1_names & pg2_names}")
+            results["phase1"] = "WARN"
+        else:
+            log("PASS: PG1 and PG2 on disjoint nodes")
+            results["phase1"] = "PASS"
+
+        # ── PHASE 2: Autoscale UP (clique-c: 0 -> 4) ──
+        log("\n" + "=" * 70)
+        log("PHASE 2: Autoscale UP (clique-c: 0 -> 4 workers)")
+        log("=" * 70)
+        log("clique-c has replicas=0/minReplicas=0 => NOT in PodGroup subgroups")
+
+        log("Creating PG3 (clique-c): 4 bundles x 4 GPUs")
+        pg3 = placement_group(
+            [{"GPU": 4, "clique_c": 0.001} for _ in range(4)],
+            strategy="STRICT_SPREAD",
+            name="pg-clique-c",
+        )
+
+        pg3_ready = wait_for_pg(pg3, "PG3", timeout=600)
+        pg3_nodes = None
+        if not pg3_ready:
+            log("FAIL: PG3 timed out")
+            log("Autoscaling with topology likely does not work for 0-replica groups")
+            results["phase2"] = "FAIL"
+        else:
+            pg3_nodes = collect_pg_nodes(pg3, 4, "PG3 (clique-c)")
+            pg3_names = {n["node_name"] for n in pg3_nodes}
+            if pg3_names & pg1_names or pg3_names & pg2_names:
+                log("WARNING: PG3 shares nodes with other PGs")
+                results["phase2"] = "WARN"
+            else:
+                log("PASS: Autoscale UP succeeded, PG3 on disjoint nodes")
+                results["phase2"] = "PASS"
+
+        # ── PHASE 3: Autoscale DOWN (remove PG1, clique-a: 4 -> 0) ──
+        log("\n" + "=" * 70)
+        log("PHASE 3: Autoscale DOWN (clique-a: 4 -> 0 after removing PG1)")
+        log("=" * 70)
+
+        remove_placement_group(pg1)
+        log("PG1 removed. Monitoring clique-a scale-down...")
+
+        initial_ca = ray.cluster_resources().get("clique_a", 0)
+        scaled_down = False
+        for i in range(10):
+            time.sleep(30)
+            elapsed = (i + 1) * 30
+            res = ray.cluster_resources()
+            ca = res.get("clique_a", 0)
+            log(f"[{elapsed}s] clique_a={ca}, GPU={res.get('GPU', 0)}")
+            if ca < initial_ca:
+                scaled_down = True
+            if ca == 0:
+                log(f"PASS: clique-a fully scaled down after {elapsed}s")
+                break
+
+        results["phase3"] = "PASS" if scaled_down else "FAIL"
+        if not scaled_down:
+            log("clique-a did not scale down within 5 minutes")
+
+        # ── SUMMARY ──
+        log("\n" + "=" * 70)
+        log("SUMMARY")
+        log("=" * 70)
+        for phase, result in sorted(results.items()):
+            log(f"  {phase}: {result}")
+        log(f"\nPG1 nodes: {json.dumps([n['node_name'] for n in pg1_nodes])}")
+        log(f"PG2 nodes: {json.dumps([n['node_name'] for n in pg2_nodes])}")
+        if pg3_nodes:
+            log(f"PG3 nodes: {json.dumps([n['node_name'] for n in pg3_nodes])}")
+
+        log("\nVerify topology externally:")
+        log(
+            "  kubectl get nodes -l nvidia.com/gpu.clique"
+            " -o custom-columns="
+            "\"NAME:.metadata.name,CLIQUE:.metadata.labels.nvidia\\\\.com/gpu\\\\.clique\""
+        )
+
+        # Cleanup
+        log("\nCleaning up...")
+        remove_placement_group(pg2)
+        if pg3_ready:
+            remove_placement_group(pg3)
+        log("Done")
+
+        if any(v == "FAIL" for v in results.values()):
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: rl-414-autoscale-topology-test
+  labels:
+    kai.scheduler/queue: default-queue
+spec:
+  entrypoint: python /opt/driver/driver.py
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 3600
+  rayClusterSpec:
+    rayVersion: '2.54.0'
+    enableInTreeAutoscaling: true
+    autoscalerOptions:
+      upscalingMode: Default
+      idleTimeoutSeconds: 60
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "1"
+          memory: "1Gi"
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: '0.0.0.0'
+        block: 'true'
+      template:
+        spec:
+          # Adjust nodeSelector if your cluster uses different labels for CPU nodes
+          nodeSelector:
+            nodeGroup: customer-cpu
+          schedulerName: kai-scheduler
+          containers:
+          - name: ray-head
+            image: rayproject/ray:2.54.0
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+              limits:
+                cpu: "4"
+                memory: "8Gi"
+            env:
+            - name: RAY_memory_monitor_refresh_ms
+              value: "0"
+            volumeMounts:
+            - name: driver-script
+              mountPath: /opt/driver
+          volumes:
+          - name: driver-script
+            configMap:
+              name: rl-414-driver-script
+    workerGroupSpecs:
+    - groupName: clique-a
+      replicas: 4
+      minReplicas: 0
+      maxReplicas: 4
+      rayStartParams:
+        block: 'true'
+        num-gpus: "4"
+        resources: '{"clique_a": 1}'
+      template:
+        metadata:
+          annotations:
+            kai.scheduler/topology: gb300-topology
+            kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+        spec:
+          schedulerName: kai-scheduler
+          tolerations:
+          - operator: Exists
+          containers:
+          - name: ray-worker
+            image: rayproject/ray:2.54.0
+            resources:
+              requests:
+                nvidia.com/gpu: 4
+                cpu: "4"
+                memory: "16Gi"
+              limits:
+                nvidia.com/gpu: 4
+                cpu: "4"
+                memory: "16Gi"
+            env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: RAY_memory_monitor_refresh_ms
+              value: "0"
+    - groupName: clique-b
+      replicas: 4
+      minReplicas: 0
+      maxReplicas: 4
+      rayStartParams:
+        block: 'true'
+        num-gpus: "4"
+        resources: '{"clique_b": 1}'
+      template:
+        metadata:
+          annotations:
+            kai.scheduler/topology: gb300-topology
+            kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+        spec:
+          schedulerName: kai-scheduler
+          tolerations:
+          - operator: Exists
+          containers:
+          - name: ray-worker
+            image: rayproject/ray:2.54.0
+            resources:
+              requests:
+                nvidia.com/gpu: 4
+                cpu: "4"
+                memory: "16Gi"
+              limits:
+                nvidia.com/gpu: 4
+                cpu: "4"
+                memory: "16Gi"
+            env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: RAY_memory_monitor_refresh_ms
+              value: "0"
+    # This group is EXCLUDED from the PodGroup (replicas=0 AND minReplicas=0).
+    # Testing whether autoscaler-created pods still get topology constraints.
+    - groupName: clique-c
+      replicas: 0
+      minReplicas: 0
+      maxReplicas: 4
+      rayStartParams:
+        block: 'true'
+        num-gpus: "4"
+        resources: '{"clique_c": 1}'
+      template:
+        metadata:
+          annotations:
+            kai.scheduler/topology: gb300-topology
+            kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+        spec:
+          schedulerName: kai-scheduler
+          tolerations:
+          - operator: Exists
+          containers:
+          - name: ray-worker
+            image: rayproject/ray:2.54.0
+            resources:
+              requests:
+                nvidia.com/gpu: 4
+                cpu: "4"
+                memory: "16Gi"
+              limits:
+                nvidia.com/gpu: 4
+                cpu: "4"
+                memory: "16Gi"
+            env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: RAY_memory_monitor_refresh_ms
+              value: "0"
