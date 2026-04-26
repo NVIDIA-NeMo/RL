@@ -2127,6 +2127,100 @@ class TestValidateFunction:
         assert "accuracy" in val_metrics
         assert "avg_length" in val_metrics
 
+    def test_validate_uses_batched_async_generation_helper(self):
+        """Async validation should use the batched async-generation rollout helper."""
+        mock_policy_gen = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token_id = 0
+
+        mock_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [
+                        {
+                            "role": "user",
+                            "content": "test1",
+                            "token_ids": torch.tensor([1, 2, 3]),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "response1",
+                            "token_ids": torch.tensor([4, 5, 6]),
+                        },
+                    ]
+                ],
+                "task_name": ["math"],
+                "extra_env_info": [{}],
+                "loss_multiplier": torch.tensor([1.0]),
+                "idx": torch.tensor([0]),
+                "length": torch.tensor([6]),
+                "total_reward": torch.tensor([1.0]),
+            }
+        )
+
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+
+        mock_env = MagicMock(spec=EnvironmentInterface)
+        mock_env.global_post_process_and_metrics.return_value = (mock_batch, {})
+
+        mock_config = {
+            "grpo": {
+                "max_val_samples": 10,
+                "val_batch_size": 1,
+                "max_rollout_turns": 1,
+            },
+            "policy": {
+                "max_total_sequence_length": 2048,
+                "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
+                    "backend": "vllm",
+                    "colocated": {"enabled": True},
+                    "vllm_cfg": {"async_engine": True},
+                },
+            },
+            "logger": {
+                "num_val_samples_to_print": 1,
+            },
+        }
+
+        mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
+
+        with patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout_async_generation"
+        ) as mock_async_validation_rollout:
+            mock_async_validation_rollout.return_value = (
+                mock_batch,
+                mock_rollout_metrics,
+            )
+            with patch(
+                "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+                side_effect=AssertionError(
+                    "Validation should not use run_async_multi_turn_rollout"
+                ),
+            ):
+                with patch(
+                    "nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False
+                ):
+                    with patch(
+                        "nemo_rl.algorithms.grpo._should_use_async_rollouts",
+                        return_value=True,
+                    ):
+                        with patch("nemo_rl.algorithms.grpo.print_message_log_samples"):
+                            validate(
+                                mock_policy_gen,
+                                mock_dataloader,
+                                mock_tokenizer,
+                                {"math": mock_env},
+                                step=5,
+                                master_config=mock_config,
+                                logger=None,
+                            )
+
+        mock_async_validation_rollout.assert_called_once()
+
     def test_validate_returns_empty_when_no_dataloader(self):
         """Test that validate returns empty dicts when no dataloader is provided."""
         mock_policy_gen = MagicMock()

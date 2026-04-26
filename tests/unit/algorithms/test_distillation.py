@@ -294,6 +294,40 @@ def test_validate_function(mock_components):
     # Note: validate() function itself doesn't call logger.log_metrics - that's done by the caller
 
 
+def test_validate_function_uses_batched_async_generation_helper(mock_components):
+    """Async distillation validation should use the batched async-generation helper."""
+    mock_components["master_config"]["policy"]["generation"]["backend"] = "vllm"
+    mock_components["master_config"]["policy"]["generation"]["vllm_cfg"] = {
+        "async_engine": True
+    }
+    mock_components["student_generation"] = MagicMock()
+
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 1.0}
+    with patch(
+        "nemo_rl.algorithms.distillation.run_multi_turn_rollout_async_generation"
+    ) as mock_async_validation_rollout:
+        mock_async_validation_rollout.return_value = (
+            next(iter(mock_components["val_dataloader"])),
+            mock_rollout_metrics,
+        )
+        with patch(
+            "nemo_rl.algorithms.distillation.run_async_multi_turn_rollout",
+            side_effect=AssertionError(
+                "Validation should not use run_async_multi_turn_rollout"
+            ),
+        ):
+            validate(
+                mock_components["student_generation"],
+                mock_components["val_dataloader"],
+                mock_components["tokenizer"],
+                mock_components["val_task_to_env"],
+                step=0,
+                master_config=mock_components["master_config"],
+            )
+
+    mock_async_validation_rollout.assert_called_once()
+
+
 def test_check_vocab_equality_pass(monkeypatch):
     student_tokenizer = MagicMock()
     student_tokenizer.get_vocab.return_value = {"a": 0, "b": 1}
