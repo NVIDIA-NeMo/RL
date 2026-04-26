@@ -24,9 +24,14 @@ policy:
   logprob_chunk_size: 4096
   offload_optimizer_for_logprob: true
   optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
       lr: 1.0e-06
       weight_decay: 0.1
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
