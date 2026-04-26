@@ -95,7 +95,7 @@ _shared:
       persistentVolumeClaim: {claimName: rl-workspace}
 
 # namespace auto-inferred from kube context (default).
-image: nvcr.io/nvidian/nemo-rl:nightly
+image: nvcr.io/nvidian/nemo-rl:664d29c-49528955
 imagePullSecrets: [nvcr-secret]
 serviceAccount: nemo-rl-endpoint-registry
 
