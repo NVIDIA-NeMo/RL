@@ -1,3 +1,16 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """One-shot orchestration for a disaggregated run.
 
 ``nrl-k8s run <recipe>`` delegates here. The flow:
@@ -20,6 +33,7 @@ hardcoded cluster assumptions.
 from __future__ import annotations
 
 import re
+import shutil
 import time
 import urllib.error
 import urllib.request
@@ -296,13 +310,16 @@ def submit_daemon(
         wd = workdir.stage_workdir(repo_root, include_paths=upload_paths)
 
         log(f"[{role}] submitting daemon via {dash}")
-        job_id = submit.submit_ray_job(
-            dash,
-            entrypoint=daemon.entrypoint,
-            working_dir=wd,
-            env_vars=daemon.env,
-            submission_id=submission_id,
-        )
+        try:
+            job_id = submit.submit_ray_job(
+                dash,
+                entrypoint=daemon.entrypoint,
+                working_dir=wd,
+                env_vars=daemon.env,
+                submission_id=submission_id,
+            )
+        finally:
+            shutil.rmtree(wd, ignore_errors=True)
         log(f"[{role}] daemon submitted as job {job_id}")
         if daemon.healthCheckUrl:
             _wait_for_http(daemon.healthCheckUrl, daemon.healthCheckTimeoutS, log, role)
@@ -403,14 +420,18 @@ def submit_training(
     if run_id:
         env_vars.setdefault("NRL_K8S_RUN_ID", run_id)
 
-    handle = submitter.submit(
-        name,
-        infra.namespace,
-        entrypoint=launch.entrypoint,
-        run_id=run_id or "",
-        env_vars=env_vars,
-        working_dir=wd,
-    )
+    try:
+        handle = submitter.submit(
+            name,
+            infra.namespace,
+            entrypoint=launch.entrypoint,
+            run_id=run_id or "",
+            env_vars=env_vars,
+            working_dir=wd,
+        )
+    finally:
+        if wd is not None:
+            shutil.rmtree(wd, ignore_errors=True)
     save_handle(handle)
     log(f"[training] training run handle: kind={handle.kind} id={handle.run_id}")
     return RunResult(

@@ -1,3 +1,16 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """``nrl-k8s`` command-line entry point.
 
 Hydra-style overrides (``infra.scheduler.queue=x``) are collected via
@@ -1260,8 +1273,7 @@ _REQUIRED_FIRST_TIME = ("HF_TOKEN", "WANDB_API_KEY")
 @click.option(
     "--ssh-key",
     type=click.Path(exists=True),
-    multiple=True,
-    help="Path to an SSH private key (repeatable).",
+    help="Path to an SSH private key.",
 )
 @click.option(
     "--add-rclone",
@@ -1271,7 +1283,7 @@ _REQUIRED_FIRST_TIME = ("HF_TOKEN", "WANDB_API_KEY")
 @click.option("--namespace", "-n", default=None, help="Kubernetes namespace.")
 def dev_setup_secrets(
     kvs: tuple[str, ...],
-    ssh_key: tuple[str, ...],
+    ssh_key: str | None,
     add_rclone: bool,
     namespace: str | None,
 ) -> None:
@@ -1305,8 +1317,8 @@ def dev_setup_secrets(
         name, val = kv.split("=", 1)
         data[name] = val
 
-    for key_path in ssh_key:
-        p = Path(key_path)
+    if ssh_key:
+        p = Path(ssh_key)
         data["SSH_KEY_NAME"] = p.name
         data["SSH_KEY_CONTENT"] = p.read_text()
 
