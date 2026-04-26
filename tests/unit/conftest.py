@@ -57,6 +57,18 @@ def pytest_addoption(parser):
         default=False,
         help="Run ONLY vllm tests",
     )
+    parser.addoption(
+        "--sglang-only",
+        action="store_true",
+        default=False,
+        help="Run ONLY sglang tests",
+    )
+    parser.addoption(
+        "--nemo-gym-only",
+        action="store_true",
+        default=False,
+        help="Run ONLY nemo_gym tests",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -65,12 +77,20 @@ def pytest_collection_modifyitems(config, items):
     run_mcore_only = config.getoption("--mcore-only")
     run_automodel_only = config.getoption("--automodel-only")
     run_vllm_only = config.getoption("--vllm-only")
+    run_sglang_only = config.getoption("--sglang-only")
+    run_nemo_gym_only = config.getoption("--nemo-gym-only")
 
     # Check for mutually exclusive options
-    exclusive_options = [run_mcore_only, run_automodel_only, run_vllm_only]
+    exclusive_options = [
+        run_mcore_only,
+        run_automodel_only,
+        run_vllm_only,
+        run_sglang_only,
+        run_nemo_gym_only,
+    ]
     if sum(exclusive_options) > 1:
         raise ValueError(
-            "--mcore-only, --automodel-only, and --vllm-only are mutually exclusive"
+            "--mcore-only, --automodel-only, --vllm-only, --sglang-only, and --nemo-gym-only are mutually exclusive"
         )
 
     marker_expr = config.getoption("-m", default="")
@@ -139,6 +159,42 @@ def pytest_collection_modifyitems(config, items):
     else:
         # Exclude vllm tests by default
         new_items = [item for item in new_items if not item.get_closest_marker("vllm")]
+
+    # Filter by sglang marker
+    if run_sglang_only:
+        # Validate that sglang is available
+        try:
+            import sglang  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "Cannot run sglang tests: sglang is not available.\n"
+                "Please run tests with: uv run --extra sglang --group test pytest ..."
+            )
+        # Include only sglang tests
+        new_items = [item for item in new_items if item.get_closest_marker("sglang")]
+    else:
+        # Exclude sglang tests by default
+        new_items = [
+            item for item in new_items if not item.get_closest_marker("sglang")
+        ]
+
+    # Filter by nemo_gym marker
+    if run_nemo_gym_only:
+        # Validate that nemo_gym is available
+        try:
+            from nemo_gym import config_types  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "Cannot run nemo_gym tests: nemo_gym is not available.\n"
+                "Please run tests with: uv run --extra nemo_gym --group test pytest ..."
+            )
+        # Include only nemo_gym tests
+        new_items = [item for item in new_items if item.get_closest_marker("nemo_gym")]
+    else:
+        # Exclude nemo_gym tests by default
+        new_items = [
+            item for item in new_items if not item.get_closest_marker("nemo_gym")
+        ]
 
     # Ensure run_first tests are prioritized
     new_items.sort(key=lambda item: 0 if item.get_closest_marker("run_first") else 1)

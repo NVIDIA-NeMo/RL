@@ -16,9 +16,11 @@ import gc
 import os
 import traceback
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
+import requests
 import torch
+import torch.distributed as dist
 import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 from transformers import (
@@ -29,7 +31,7 @@ from transformers import (
 
 # Try to import nemo_automodel classes, fallback to None if not available
 try:
-    from nemo_automodel.components._transformers.auto_model import (
+    from nemo_automodel._transformers.auto_model import (
         NeMoAutoModelForCausalLM,
         NeMoAutoModelForImageTextToText,
         NeMoAutoModelForTextToWaveform,
@@ -48,9 +50,19 @@ from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_
 # an automodel factory for loading the huggingface models from correct class
 
 AUTOMODEL_FACTORY: Dict[str, Any] = {
+    # Add an entry here when a model (1) uses HF's standard loading path
+    # (no custom NeMo automodel impl) AND (2) its architecture isn't
+    # loadable via AutoModelForCausalLM (e.g. VLMs using
+    # ForConditionalGeneration / ForImageTextToText). Models with a
+    # custom NeMo automodel impl (e.g. qwen3_5_moe) don't need an entry
+    # — the custom impl intercepts from_pretrained regardless of the
+    # parent AutoModel class. Check MODEL_ARCH_MAPPING in the NeMo
+    # automodel registry to see which architectures have custom impls:
+    # https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
     "qwen2_5_vl": AutoModelForImageTextToText,
     "qwen2_vl": AutoModelForImageTextToText,
     "qwen2_5_omni": AutoModelForTextToWaveform,
+    "qwen3_5": AutoModelForImageTextToText,
     "llava": AutoModelForImageTextToText,
     "internvl": AutoModelForImageTextToText,
     "gemma3": AutoModelForImageTextToText,
@@ -61,9 +73,12 @@ AUTOMODEL_FACTORY: Dict[str, Any] = {
 
 if NEMO_AUTOMODEL_AVAILABLE:
     AUTOMODEL_FACTORY = {
+        # NeMo wrappers — keep in sync with the vanilla HF dict above.
+        # See comment above for when to add entries.
         "qwen2_5_vl": NeMoAutoModelForImageTextToText,
         "qwen2_vl": NeMoAutoModelForImageTextToText,
         "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
+        "qwen3_5": NeMoAutoModelForImageTextToText,
         "llava": NeMoAutoModelForImageTextToText,
         "internvl": NeMoAutoModelForImageTextToText,
         "gemma3": NeMoAutoModelForImageTextToText,
@@ -78,102 +93,6 @@ class IPCProtocol(Enum):
 
     COMPLETE = "complete"
     ACK = "ack"
-
-
-def apply_top_k_top_p(
-    logits: torch.Tensor,
-    top_k: Optional[int] = None,
-    top_p: Optional[float] = None,
-) -> torch.Tensor:
-    """Apply top-k and top-p masks to the logits.
-
-    Simplified version of VLLM's implementation for scalar parameters.
-
-    Based on VLLM's implementation:
-    https://github.com/vllm-project/vllm/blob/34a20c49b3f81f64133428b3a0d62309db1256f9/vllm/v1/sample/ops/topk_topp_sampler.py
-    SPDX-License-Identifier: Apache-2.0
-    Copyright contributors to the vLLM project
-
-    Args:
-        logits: Input logits tensor of shape [batch_size, seq_len, vocab_size]
-        top_k: Top-k sampling parameter. Set to -1 to consider all tokens.
-        top_p: Top-p (nucleus) sampling parameter. Must be in (0, 1]. Set to 1 to consider all tokens.
-
-    Returns:
-        Filtered logits with sampling parameters applied
-    """
-    if top_p is None or top_p == 1.0:
-        if top_k is None or top_k == -1:
-            return logits
-        # Avoid sorting vocab for top-k only case
-        return apply_top_k_only(logits, top_k)
-
-    # Apply top-p (requires sorting)
-    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
-
-    if top_k is not None and top_k != -1:
-        # Apply top-k first
-        top_k_index = logits_sort.size(-1) - top_k
-        # Get all the top_k values - need to broadcast the index across all dimensions
-        index_tensor = torch.full(
-            logits_sort.shape[:-1],
-            top_k_index,
-            device=logits_sort.device,
-            dtype=torch.long,
-        )
-        top_k_threshold = logits_sort.gather(-1, index_tensor.unsqueeze(-1))
-        top_k_mask = logits_sort < top_k_threshold
-        logits_sort.masked_fill_(top_k_mask, -float("inf"))
-
-    # Apply top-p
-    probs_sort = logits_sort.softmax(dim=-1)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    top_p_mask = probs_sum <= 1 - top_p
-    # at least one
-    top_p_mask[..., -1] = False
-    logits_sort.masked_fill_(top_p_mask, -float("inf"))
-
-    # Re-sort the probabilities
-    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
-    return logits
-
-
-def apply_top_k_only(
-    logits: torch.Tensor,
-    top_k: int,
-) -> torch.Tensor:
-    """Apply top-k mask to the logits.
-
-    Simplified version of VLLM's implementation for scalar parameters.
-    This implementation doesn't involve sorting the entire vocab.
-
-    Based on VLLM's implementation:
-    https://github.com/vllm-project/vllm/blob/34a20c49b3f81f64133428b3a0d62309db1256f9/vllm/v1/sample/ops/topk_topp_sampler.py
-    SPDX-License-Identifier: Apache-2.0
-    Copyright contributors to the vLLM project
-
-    Args:
-        logits: Input logits tensor of shape [batch_size, seq_len, vocab_size]
-        top_k: Top-k sampling parameter.
-
-    Returns:
-        Filtered logits with top-k applied
-    """
-    if top_k >= logits.shape[-1] or top_k == -1:
-        return logits
-
-    # Get top-k values and create mask
-    top_k_values, _ = torch.topk(logits, top_k, dim=-1)
-    threshold = top_k_values[..., -1:].expand_as(logits)
-    mask = logits >= threshold
-
-    # Apply mask: keep top-k values, set others to -inf
-    logits = torch.where(
-        mask,
-        logits,
-        torch.tensor(-float("inf"), device=logits.device, dtype=logits.dtype),
-    )
-    return logits
 
 
 def resolve_model_class(model_name: str) -> Any:
@@ -473,3 +392,260 @@ def rebuild_cuda_tensor_from_ipc(
     list_args = list(args)
     list_args[6] = device_id
     return func(*list_args)
+
+
+def stream_weights_via_http_impl(
+    params_generator,
+    sglang_url_to_gpu_uuids: dict[str, list[str]],
+    rank: int,
+    worker_name: str,
+    current_device_uuid: str,
+) -> None:
+    """Stream weights to SGLang servers via HTTP API (update_weights_from_tensor).
+
+    Flow: Each rank creates IPC handler → gather handlers in rank order → send list → SGLang matches by tp_rank index
+
+    Key points:
+    - Each rank creates handler on its own GPU
+    - Handlers are gathered in rank order: [rank0_handler, rank1_handler, ...]
+    - List index = rank = GPU ID
+    - SGLang automatically matches: handler = serialized_handlers[tp_rank]
+
+    Args:
+        params_generator: Generator yielding (name, tensor) pairs
+        sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+        rank: Worker rank for logging
+        worker_name: Name of the worker for logging
+        current_device_uuid: UUID of the current training worker's GPU
+    """
+    from nemo_rl.models.generation.sglang.sglang_copied_utils import (
+        MultiprocessingSerializer,
+    )
+
+    print("[sglang refit details] entering stream_weights_via_http_impl")
+
+    target_urls = [
+        url
+        for url, uuids in sglang_url_to_gpu_uuids.items()
+        if current_device_uuid in uuids
+    ]
+
+    if not target_urls:
+        raise RuntimeError(
+            f"{worker_name} (rank {rank}): No matching SGLang server found for GPU UUID {current_device_uuid}. "
+            f"Available servers: {list(sglang_url_to_gpu_uuids.keys())}"
+        )
+
+    if len(target_urls) > 1:
+        print(
+            f"[WARNING] {worker_name} (rank {rank}): GPU UUID {current_device_uuid} matches multiple SGLang servers: {target_urls}. "
+            f"Using the first one: {target_urls[0]}"
+        )
+        target_urls = [target_urls[0]]
+
+    base_url = target_urls[0]
+    url = f"{base_url}/update_weights_from_tensor"
+    sglang_gpu_uuids = sglang_url_to_gpu_uuids[base_url]
+
+    ipc_gather_group, ipc_gather_src, matching_ranks = _setup_ipc_gather_group(
+        rank, current_device_uuid, sglang_gpu_uuids, sglang_url_to_gpu_uuids
+    )
+    print(
+        f"[sglang refit] {worker_name} (rank {rank}): ipc_gather_group={ipc_gather_group}, ipc_gather_src={ipc_gather_src}, matching_ranks={matching_ranks}"
+    )
+    tensor_count = 0
+
+    try:
+        tensor_list = list(params_generator)
+        total_tensors = len(tensor_list)
+
+        if rank == ipc_gather_src:
+            print(
+                f"[sglang refit details] {worker_name}: Starting weight update - "
+                f"Total parameters to update: {total_tensors}",
+                flush=True,
+            )
+
+        for idx, (name, tensor) in enumerate(tensor_list):
+            torch.cuda.current_stream().synchronize()
+            tensor = tensor.contiguous().cuda()
+
+            named_tensors = [(name, tensor)]
+            serialized_handler = MultiprocessingSerializer.serialize(
+                named_tensors, output_str=True
+            )
+            # output_str=True ensures the return type is str
+            serialized_handler_str = cast(str, serialized_handler)
+
+            gathered_handlers = _gather_ipc_handlers(
+                serialized_handler_str,
+                ipc_gather_group,
+                ipc_gather_src,
+                rank,
+                matching_ranks,
+            )
+
+            if rank == ipc_gather_src and gathered_handlers is not None:
+                _send_tensor_to_sglang(
+                    url,
+                    name,
+                    gathered_handlers,
+                    tensor.shape,
+                    str(tensor.dtype),
+                    flush_cache=False,
+                )
+                tensor_count += 1
+
+            del tensor, serialized_handler
+            if rank == ipc_gather_src:
+                del gathered_handlers
+            torch.cuda.empty_cache()
+
+        if rank == ipc_gather_src:
+            print(
+                f"[sglang refit details] {worker_name}: Weight update completed - "
+                f"Successfully updated {tensor_count}/{total_tensors} parameters to SGLang server: {base_url}",
+                flush=True,
+            )
+            if tensor_count != total_tensors:
+                print(
+                    f"[sglang refit details] {worker_name}: WARNING - Expected {total_tensors} tensors, "
+                    f"but only sent {tensor_count}",
+                    flush=True,
+                )
+
+    except Exception as e:
+        print(
+            f"{worker_name} (rank {rank}): Error during HTTP weight streaming: {e}.\n"
+            f"{traceback.format_exc()}"
+        )
+        raise
+
+    finally:
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def _setup_ipc_gather_group(
+    rank: int,
+    current_device_uuid: str,
+    sglang_gpu_uuids: list[str],
+    sglang_url_to_gpu_uuids: dict[str, list[str]],
+) -> tuple[Optional[dist.ProcessGroup], Optional[int], Optional[list[int]]]:
+    """Setup gather configuration for IPC handlers.
+
+    Returns:
+        Tuple of (gather_group, gather_src_rank, matching_ranks)
+        - gather_group: None (use default FSDP group)
+        - gather_src_rank: The rank that will collect and send to SGLang server
+        - matching_ranks: List of ranks that belong to the same SGLang server
+    """
+    if not dist.is_initialized():
+        return None, None, None
+
+    world_size = dist.get_world_size()
+    my_rank = dist.get_rank()
+
+    all_ranks_uuids = [None] * world_size
+    dist.all_gather_object(all_ranks_uuids, current_device_uuid)
+
+    matching_ranks = [
+        r for r, uuid in enumerate(all_ranks_uuids) if uuid in sglang_gpu_uuids
+    ]
+
+    if len(matching_ranks) == 0:
+        return None, None, None
+
+    matching_ranks = sorted(matching_ranks)
+    gather_src = matching_ranks[0]
+
+    return None, gather_src, matching_ranks
+
+
+def _gather_ipc_handlers(
+    serialized_handler: str,
+    gather_group: Optional[dist.ProcessGroup],
+    gather_src: Optional[int],
+    rank: int,
+    matching_ranks: Optional[list[int]] = None,
+) -> Optional[list[str]]:
+    """Gather IPC handlers from all ranks in the default FSDP group, then filter by server.
+
+    Args:
+        serialized_handler: Serialized IPC handler from this rank
+        gather_group: Process group (None means use default FSDP group)
+        gather_src: Rank that will collect and filter handlers
+        rank: Current rank
+        matching_ranks: List of ranks that belong to the same SGLang server
+
+    Returns:
+        List of serialized handlers in rank order (only on gather_src rank), None otherwise
+        The list contains handlers from matching_ranks only, in rank order
+    """
+    if gather_src is None:
+        return None
+
+    if not dist.is_initialized():
+        return None
+
+    world_size = dist.get_world_size()
+
+    all_handlers: list[Optional[str]] = [None for _ in range(world_size)]
+    dist.all_gather_object(all_handlers, serialized_handler)
+    all_handlers_str = cast(list[str], all_handlers)
+
+    if rank == gather_src and matching_ranks is not None:
+        filtered_handlers: list[str] = [all_handlers_str[r] for r in matching_ranks]
+        return filtered_handlers
+    else:
+        return None
+
+
+def _send_tensor_to_sglang(
+    url: str,
+    tensor_name: str,
+    gathered_handlers: list[str],
+    shape: torch.Size,
+    dtype: str,
+    flush_cache: bool = False,
+) -> None:
+    """Send gathered IPC handlers to SGLang server via HTTP.
+
+    Key: gathered_handlers are in rank order [rank0, rank1, ...]
+    SGLang will automatically match: handler = serialized_handlers[tp_rank]
+
+    Args:
+        url: SGLang server URL
+        tensor_name: Name of the tensor
+        gathered_handlers: List of serialized IPC handlers in rank order
+        shape: Tensor shape
+        dtype: Tensor dtype
+        flush_cache: Whether to flush cache after this tensor (for last tensor)
+    """
+    payload = {
+        "serialized_named_tensors": gathered_handlers,
+        "flush_cache": flush_cache,
+    }
+
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=120,
+        )
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        error_msg = f"Failed to send tensor '{tensor_name}' to {url}: {e}"
+        try:
+            error_detail = response.text
+            error_msg += f"\nResponse status: {response.status_code}"
+            error_msg += f"\nResponse body: {error_detail[:500]}"
+        except:
+            pass
+        print(f"[sglang refit] {error_msg}", flush=True)
+        raise RuntimeError(error_msg) from e
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to send tensor '{tensor_name}' to {url}: {e}"
+        ) from e

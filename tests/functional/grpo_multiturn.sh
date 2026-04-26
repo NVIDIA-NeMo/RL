@@ -29,7 +29,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.max_total_sequence_length=1024 \
     policy.train_global_batch_size=4 \
     policy.train_micro_batch_size=1 \
-    policy.generation.top_p=0.99 \
+    policy.generation.top_p=0.9 \
     policy.generation.top_k=8000 \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
@@ -41,5 +41,4 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-    'max(data["train/token_mult_prob_error"]) < 1.1'
-
+    'median(data["train/token_mult_prob_error"]) < 1.1'

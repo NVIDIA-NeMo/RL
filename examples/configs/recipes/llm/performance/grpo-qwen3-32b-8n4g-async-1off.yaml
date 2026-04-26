@@ -1,0 +1,33 @@
+defaults: ./grpo-qwen3-32b-4n4g.yaml
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-32b-8n4g-async-1off
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    sequence_parallel: true
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 4
+        gpus_per_node: 4
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.8
+logger:
+  log_dir: logs/grpo-qwen3-32b-8n4g-async-1off
+  wandb:
+    name: grpo-qwen3-32b-8n4g-async-1off
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
+

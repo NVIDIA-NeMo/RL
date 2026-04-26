@@ -40,4 +40,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'data["train/loss"]["50"] < 0.38' \
         'max(data["ray/node.0.gpu.0.mem_gb"]) < 70' \
         'mean(data["timing/train/total_step_time"], 2) < 32'
+
+    # Clean up checkpoint directory after successful run to save space.
+    rm -rf "$CKPT_DIR"
 fi

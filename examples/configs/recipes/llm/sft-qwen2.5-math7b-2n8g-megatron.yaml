@@ -17,7 +17,10 @@ policy:
     freeze_moe_router: true
     moe_router_dtype: fp64
     moe_router_bias_update_rate: 0.0
-    moe_permute_fusion: true
+    # overlap_param_gather requires use_distributed_optimizer=true in mcore.
+    # Without it, start_param_sync tries to use layerwise params that were never set.
+    distributed_data_parallel_config:
+      overlap_param_gather: false
     optimizer:
       lr: 1.0e-06
       min_lr: 1.0e-06
@@ -33,12 +36,17 @@ policy:
     enabled: true
   make_sequence_length_divisible_by: 32
 data:
-  dataset_name: openmathinstruct2
-  prompt_file: examples/prompts/math.txt
-  split: train_1M
   add_generation_prompt: true
-  output_key: generated_solution
   num_workers: 8
+  train:
+    dataset_name: OpenMathInstruct-2
+    output_key: generated_solution
+    split: train_1M
+    split_validation_size: 0.05
+    seed: ${sft.seed}
+  validation: null
+  default:
+    prompt_file: examples/prompts/math.txt
 logger:
   wandb:
     project: nemo-rl

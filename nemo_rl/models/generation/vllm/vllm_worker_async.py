@@ -18,6 +18,7 @@ import gc
 import threading
 import time
 import uuid
+import warnings
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -106,6 +107,19 @@ def _replace_prefix_tokens(
         if model_prefix_token_ids[-1] == eos_token_id:
             model_cut_end -= 1
 
+    # Assert here to prepare for the logic below
+    assert len(template_token_ids) > len(
+        template_prefix_token_ids
+    ), f"""Found possibly non-monotonically increasing trajectory!
+Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
+
+Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
+
+Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
+
+Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
+"""
+
     # We take everything starting with the EOS token ID.
     template_cut_start = -1
     for pos in reversed(range(len(template_prefix_token_ids))):
@@ -114,9 +128,16 @@ def _replace_prefix_tokens(
             break
 
     # This should never be the case, but
-    assert template_cut_start >= 0, (
-        "No EOS token ID found in the chat-templated messages!"
-    )
+    assert (
+        template_cut_start >= 0
+    ), f"""No EOS token ID found in the chat-templated messages!
+Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
+
+Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
+
+Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
+
+Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
 
     return (
         model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
@@ -133,11 +154,26 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.metrics.loggers import PrometheusStatLogger
 
-        # (TODO: zhiyul) Remove this workaround after upgrading vLLM where the compilation_config passing issue is resolved.
+        # Workaround: convert compilation_config dict to CompilationConfig object
+        # since AsyncEngineArgs doesn't handle the dict-to-pydantic conversion.
         if llm_kwargs.get("compilation_config", None):
-            llm_kwargs["compilation_config"] = CompilationConfig(
-                **llm_kwargs["compilation_config"]
-            )
+            compilation_config = dict(llm_kwargs["compilation_config"])
+            # use_inductor was removed in vLLM v0.12+ (https://github.com/vllm-project/vllm/pull/29323)
+            # and replaced by the `backend` field: use_inductor=True -> backend="" (inductor),
+            # use_inductor=False -> backend="eager".
+            if "use_inductor" in compilation_config:
+                use_inductor = compilation_config.pop("use_inductor")
+                if "backend" not in compilation_config:
+                    compilation_config["backend"] = "" if use_inductor else "eager"
+                warnings.warn(
+                    "compilation_config.use_inductor is deprecated in vLLM v0.12+. "
+                    "Use compilation_config.backend instead: "
+                    "use_inductor=True -> backend='inductor', "
+                    "use_inductor=False -> backend='eager'.",
+                    DeprecationWarning,
+                    stacklevel=1,
+                )
+            llm_kwargs["compilation_config"] = CompilationConfig(**compilation_config)
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.stat_loggers = (
@@ -269,21 +305,30 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
-        from vllm.entrypoints.openai.api_server import (
-            BaseModelPath,
-            OpenAIServingChat,
-            OpenAIServingModels,
-            OpenAIServingTokenization,
-        )
-        from vllm.entrypoints.openai.protocol import (
+        from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
             ChatCompletionResponse,
-            ErrorResponse,
+        )
+        from vllm.entrypoints.openai.chat_completion.serving import (
+            OpenAIServingChat,
+        )
+        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+        from vllm.entrypoints.openai.models.protocol import BaseModelPath
+        from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+        from vllm.entrypoints.serve.tokenize.protocol import (
             TokenizeChatRequest,
             TokenizeCompletionRequest,
             TokenizeResponse,
         )
+        from vllm.entrypoints.serve.tokenize.serving import (
+            OpenAIServingTokenization,
+        )
+        from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
+
+        maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
+        if maybe_tool_parser_plugin:
+            ToolParserManager.import_tool_parser(maybe_tool_parser_plugin)
 
         engine_client = self.llm
         model_config = self.llm_async_engine_args.create_model_config()
@@ -294,12 +339,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             BaseModelPath(name=model_config.model, model_path=model_config.model),
         ]
 
-        openai_serving_models = OpenAIServingModels(
+        openai_serving_models_kwargs = dict(
             engine_client=engine_client,
-            model_config=model_config,
             base_model_paths=base_model_paths,
             lora_modules=None,
         )
+        openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
 
         class NeMoRLOpenAIChatRequestMixin:
             def model_post_init(self, context):
@@ -318,18 +363,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         class NeMoRLOpenAIServingMixin:
             async def _preprocess_chat(
                 self,
-                request: NeMoRLOpenAIChatRequestMixin,
-                tokenizer,
+                request,
                 messages,
-                chat_template,
-                chat_template_content_format,
-                add_generation_prompt=True,
-                continue_final_message=False,
+                default_template,
+                default_template_content_format,
+                default_template_kwargs,
                 tool_dicts=None,
-                documents=None,
-                chat_template_kwargs=None,
                 tool_parser=None,
-                add_special_tokens=False,
             ):
                 # Materialize the message tool calls so we can deepcopy below.
                 for message in messages:
@@ -339,21 +379,27 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 # Deepcopy messages here since _preprocess_chat may be destructive.
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
-                # res is conversation, [request_prompt], [engine_prompt]
-                res = await super()._preprocess_chat(
-                    request,
-                    tokenizer,
-                    messages,
-                    chat_template,
-                    chat_template_content_format,
-                    add_generation_prompt,
-                    continue_final_message,
-                    tool_dicts,
-                    documents,
-                    chat_template_kwargs,
-                    tool_parser,
-                    add_special_tokens,
-                )
+                # res is (conversation, [engine_prompt])
+                try:
+                    res = await super()._preprocess_chat(
+                        request=request,
+                        messages=messages,
+                        default_template=default_template,
+                        default_template_content_format=default_template_content_format,
+                        default_template_kwargs=default_template_kwargs,
+                        tool_dicts=tool_dicts,
+                        tool_parser=tool_parser,
+                    )
+                except ValueError as e:
+                    if "maximum context length" in str(e):
+                        import logging
+
+                        # Print a clean one-liner warning that max model length has been exceeded
+                        # The exception is still raised, but later filtered out by the MaxContextLengthFilter
+                        logging.getLogger(__name__).warning(
+                            "Prompt exceeds max_model_len: %s", e
+                        )
+                    raise
 
                 if request.required_prefix_token_ids is None:
                     return res
@@ -378,31 +424,34 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                         ]
                     )
 
+                # For the prefix token calculation, we need add_generation_prompt=False
+                # to get tokens up to (and including) the last assistant message only.
+                # add_generation_prompt is a field on the request that gets embedded
+                # into ChatParams via build_chat_params().
+                modified_request = request.model_copy(
+                    update={"add_generation_prompt": False}
+                )
+
                 # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
                 corresponding_res = await super()._preprocess_chat(
-                    request,
-                    tokenizer,
-                    messages_to_last_assistant_message,
-                    chat_template,
-                    chat_template_content_format,
-                    add_generation_prompt=False,
-                    continue_final_message=False,
+                    request=modified_request,
+                    messages=messages_to_last_assistant_message,
+                    default_template=default_template,
+                    default_template_content_format=default_template_content_format,
+                    default_template_kwargs=default_template_kwargs,
                     tool_dicts=tool_dicts,
-                    documents=documents,
-                    chat_template_kwargs=chat_template_kwargs,
                     tool_parser=tool_parser,
-                    add_special_tokens=add_special_tokens,
                 )
-                actual_corresponding_token_ids = corresponding_res[2][0][
+                actual_corresponding_token_ids = corresponding_res[1][0][
                     "prompt_token_ids"
                 ]
 
-                engine_prompt = res[2][
+                engine_prompt = res[1][
                     0
                 ]  # We need to modify engine_prompt.prompt_token_ids
 
                 final_prompt_token_ids = _replace_prefix_tokens(
-                    tokenizer=tokenizer,
+                    tokenizer=self.renderer.tokenizer,
                     model_prefix_token_ids=request.required_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
@@ -435,13 +484,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
-        openai_serving_chat = NeMoRLOpenAIServingChat(
-            engine_client,
-            model_config,
-            openai_serving_models,
-            return_tokens_as_token_ids=True,
-            **serving_chat_kwargs,
+        serving_chat_kwargs.update(
+            dict(
+                engine_client=engine_client,
+                models=openai_serving_models,
+                return_tokens_as_token_ids=True,
+            )
         )
+        openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
 
         generation_config = self.cfg
 
@@ -496,15 +546,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         ):
             pass
 
-        openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
-            engine_client,
-            model_config,
-            openai_serving_models,
+        serving_tokenization_kwargs = dict(
             request_logger=serving_chat_kwargs["request_logger"],
             chat_template=serving_chat_kwargs["chat_template"],
             chat_template_content_format=serving_chat_kwargs[
                 "chat_template_content_format"
             ],
+            engine_client=serving_chat_kwargs["engine_client"],
+            models=serving_chat_kwargs["models"],
+        )
+        openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
+            **serving_tokenization_kwargs
         )
 
         @app.post("/tokenize")
@@ -524,15 +576,41 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         # Logging
         ########################################
         print(
-            "Adding a vLLM logging filter so that the logs aren't spammed with `Added request ...` messages. This is to help errors pop up better and filter out noise."
+            "Adding a vLLM logging filter so that the logs aren't spammed with not useful messages like `Added request ...`. This is to help errors pop up better and filter out noise."
         )
 
-        class NoAddedRequestFilter(LoggingFilter):
+        class CleanLoggingFilter(LoggingFilter):
             def filter(self, record: LogRecord) -> bool:
                 msg = record.getMessage()
-                return "Added request" not in msg
 
-        vllm_async_llm_logger.addFilter(NoAddedRequestFilter())
+                # vLLM does not accept `strict` tool definitions and reporting it to the user is not useful either.
+                return (
+                    "Added request" not in msg
+                    and "The following fields were present in the request but ignored: {'strict'}"
+                    not in msg
+                )
+
+        vllm_async_llm_logger.addFilter(CleanLoggingFilter())
+
+        from logging import getLogger as _getLogger
+
+        _getLogger("vllm.entrypoints.openai.engine.protocol").addFilter(
+            CleanLoggingFilter()
+        )
+
+        # Suppress the noisy vLLM traceback when a prompt exceeds max_model_len.
+        # This is expected during multi-turn rollouts; we log a clean one-line
+        # warning from _preprocess_chat instead.
+        class MaxContextLengthFilter(LoggingFilter):
+            def filter(self, record: LogRecord) -> bool:
+                if record.exc_info and record.exc_info[1]:
+                    if "maximum context length" in str(record.exc_info[1]):
+                        return False
+                return True
+
+        _getLogger("vllm.entrypoints.openai.serving_chat").addFilter(
+            MaxContextLengthFilter()
+        )
 
         return app
 
@@ -564,6 +642,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             app,
             host="0.0.0.0",
             port=free_port,
+            timeout_keep_alive=120,  # Keep connections alive longer (default is 5s), fix for this error: Hit an exception while making a request (try 1): <class 'aiohttp.client_exceptions.ClientOSError'>: [Errno 104] Connection reset by peer
         )
         server = uvicorn.Server(config=config)
 
@@ -689,12 +768,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     device=input_ids_single_row.device,
                 )
 
+                # Not truncated since no generation was attempted (length constraint)
+                truncated_tensor = torch.tensor(
+                    [False], dtype=torch.bool, device=input_ids_single_row.device
+                )
+
                 result_batch = BatchedDataDict[GenerationOutputSpec](
                     {
                         "output_ids": output_ids_single_item_batched,
                         "logprobs": logprobs_single_item,
                         "generation_lengths": generation_lengths_tensor,
                         "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                        "truncated": truncated_tensor,
                     }
                 )
 
@@ -794,12 +879,21 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 device=original_input_ids_single_row.device,
             )
 
+            # Check if response was truncated (hit max_tokens length limit)
+            is_truncated = generation_details.finish_reason == "length"
+            truncated_tensor = torch.tensor(
+                [is_truncated],
+                dtype=torch.bool,
+                device=original_input_ids_single_row.device,
+            )
+
             result_batch = BatchedDataDict[GenerationOutputSpec](
                 {
                     "output_ids": output_ids_single_item_batched,
                     "logprobs": logprobs_single_item,
                     "generation_lengths": generation_lengths_tensor,
                     "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                    "truncated": truncated_tensor,
                 }
             )
 
@@ -1051,6 +1145,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
         await self.llm.reset_prefix_cache()
+        # Reset the multimodal processor cache (sender side) so it stays in
+        # sync with the receiver cache that vLLM clears internally during
+        # sleep.  Without this, the sender thinks images are already cached on
+        # the receiver and sends data=None, causing an assertion error.
+        if hasattr(self.llm, "reset_mm_cache"):
+            await self.llm.reset_mm_cache()
         await self.llm.sleep(level=1)
 
         gc.collect()

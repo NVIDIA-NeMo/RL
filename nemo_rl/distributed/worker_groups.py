@@ -16,7 +16,7 @@ import os
 import time
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import ray
 from ray.util.placement_group import PlacementGroup
@@ -356,7 +356,6 @@ class RayWorkerGroup:
             cluster_gpu_offset_each_node=cluster_gpu_offset_each_node,
         )
 
-
         # Create workers based on the bundle_indices_list
         self._create_workers_from_bundle_indices(
             remote_worker_builder,
@@ -427,13 +426,17 @@ class RayWorkerGroup:
         # Get available address and port for each worker
         available_addresses = []
         available_ports = []
-        for group_idx, (node_idx, local_bundle_indices) in enumerate(bundle_indices_list):
+        for group_idx, (node_idx, local_bundle_indices) in enumerate(
+            bundle_indices_list
+        ):
             for local_rank, bundle_idx in enumerate(local_bundle_indices):
                 addr, port = self.cluster.get_available_address_and_port(bundle_idx)
                 available_addresses.append(addr)
                 available_ports.append(port)
 
-        for group_idx, (node_idx, local_bundle_indices) in enumerate(bundle_indices_list):
+        for group_idx, (node_idx, local_bundle_indices) in enumerate(
+            bundle_indices_list
+        ):
             current_group = []
 
             is_parallel_group = len(local_bundle_indices) > 1
@@ -487,8 +490,11 @@ class RayWorkerGroup:
                     "env_vars": worker_env_vars,
                     "py_executable": py_executable,
                 }
-                runtime_env["env_vars"]["VIRTUAL_ENV"] = py_executable
-                runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_executable
+                py_venv = os.path.dirname(
+                    os.path.dirname(py_executable)
+                )  # to remove the "bin/python" suffix
+                runtime_env["env_vars"]["VIRTUAL_ENV"] = py_venv
+                runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_venv
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 
@@ -608,7 +614,13 @@ class RayWorkerGroup:
         )
 
         worker = self.workers[worker_idx]
-        method = getattr(worker, method_name)
+        try:
+            method = getattr(worker, method_name)
+        except AttributeError as e:
+            print(
+                f"Supported methods: {list(worker._method_shells.keys())}", flush=True
+            )
+            raise e
         return method.remote(*args, **kwargs)
 
     def run_all_workers_multiple_data(
@@ -693,7 +705,14 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
+                try:
+                    method = getattr(worker, method_name)
+                except AttributeError as e:
+                    print(
+                        f"Supported methods: {list(worker._method_shells.keys())}",
+                        flush=True,
+                    )
+                    raise e
                 worker_args = [arg[data_idx] for arg in args]
                 worker_kwargs = {key: value[data_idx] for key, value in kwargs.items()}
                 futures.append(
@@ -749,7 +768,14 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
+                try:
+                    method = getattr(worker, method_name)
+                except AttributeError as e:
+                    print(
+                        f"Supported methods: {list(worker._method_shells.keys())}",
+                        flush=True,
+                    )
+                    raise e
                 futures.append(method.remote(*args, **kwargs))
 
         return futures
@@ -952,10 +978,11 @@ class RayWorkerGroup:
                 print(
                     f"Error during graceful shutdown: {e}. Falling back to force termination."
                 )
-                force = True
 
-        # Force kill any remaining workers
-        if force or cleanup_method is None:
+        # Always kill actors to release named actor registrations and resources.
+        # Even after successful graceful cleanup, actors remain alive in Ray's registry
+        # which prevents creating new actors with the same name.
+        if True:
             initializers_to_kill = []
             for worker in self._workers:
                 if hasattr(worker, "_RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC"):

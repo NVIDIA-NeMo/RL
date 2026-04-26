@@ -25,7 +25,10 @@ from nemo_rl.data.interfaces import (
 )
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
+    get_dim_to_pack_along,
+    get_multimodal_default_settings_from_processor,
     get_multimodal_keys_from_processor,
+    load_media_from_message,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -422,24 +425,6 @@ def get_first_index_that_differs(str1: str, str2: str) -> int:
     return min(len(str1), len(str2))
 
 
-def get_images_from_message(message: dict[str, Any]) -> list[Any]:
-    """Get all images from a message log item."""
-    # Handle None or missing content (e.g., assistant messages with only tool_calls)
-    if message.get("content") is None:
-        return []
-    # Handle string content (no images)
-    if isinstance(message["content"], str):
-        return []
-    # iterate over the content list
-    images = []
-    for item in message["content"]:
-        if item["type"] == "image":
-            images.extend(list(item["image"])) if isinstance(
-                item["image"], (list, tuple)
-            ) else images.append(item["image"])
-    return images
-
-
 def get_formatted_message_log(
     message_log: LLMMessageLogType,
     tokenizer: TokenizerType,
@@ -448,6 +433,7 @@ def get_formatted_message_log(
     add_eos_token: bool = True,
     add_generation_prompt: bool = False,
     tools: Optional[list[dict[str, Any]]] = None,
+    debug: bool = False,
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -459,6 +445,7 @@ def get_formatted_message_log(
         add_eos_token: Whether to add eos token to last message if it is not already present. Default: True
         add_generation_prompt: Whether to include assistant's generation prompt in user messages. Default: False
         tools: Optional list of tool/function definitions to pass to the chat template. Default: None
+        debug: Whether to print debug information showing each message turn. Default: False
     Returns:
         The message log with updated 'token_ids' and 'content' fields.
     """
@@ -469,6 +456,7 @@ def get_formatted_message_log(
     )  # we just use the str:str parts here
 
     multimodal_keys = get_multimodal_keys_from_processor(tokenizer)
+    multimodal_load_kwargs = get_multimodal_default_settings_from_processor(tokenizer)
 
     def _format_content_helper(
         content: Union[str, list[dict[str, Any]]],
@@ -551,8 +539,8 @@ def get_formatted_message_log(
         ## pull out the chunk corresponding to the current message
         message_chunk = formatted_message[prev_message_len_no_eos:]
 
-        # Debug: Print each message turn separately (only once for the first sample)
-        if not hasattr(get_formatted_message_log, "_debug_printed"):
+        # Debug: Print each message turn separately
+        if debug:
             if i == 0:
                 # Print header only at the start of first message
                 print("\n" + "=" * 80)
@@ -568,8 +556,6 @@ def get_formatted_message_log(
             print("-" * 40)
 
             if i == len(message_log_strs) - 1:
-                # Mark as printed after processing all turns of the first sample
-                get_formatted_message_log._debug_printed = True
                 print("\n" + "=" * 80)
                 print("DEBUG: Complete formatted conversation:")
                 print("-" * 80)
@@ -606,28 +592,48 @@ def get_formatted_message_log(
                     message_chunk += tokenizer.eos_token
 
         # get images too (extend this for other modalities)
-        images_cur_message = get_images_from_message(message)
+        media_cur_message = load_media_from_message(
+            message, multimodal_load_kwargs=multimodal_load_kwargs
+        )
 
         new_message = message.copy()
         # extend this if statement to check for all(len(modality)) == 0 when adding other modalities
-        if len(images_cur_message) == 0:
+        if len(media_cur_message) == 0:
             new_message["token_ids"] = tokenizer(
                 text=message_chunk, return_tensors="pt", add_special_tokens=False
             )["input_ids"][0]
         else:
             # extend the else statement to add other modalities (in this case, tokenizer will be a processor)
+            media_kwargs = {}
+            if "image" in media_cur_message:
+                media_kwargs["images"] = media_cur_message["image"]
+            if "audio" in media_cur_message:
+                media_kwargs["audio"] = media_cur_message["audio"]
+            if "video" in media_cur_message:
+                media_kwargs["videos"] = media_cur_message["video"]
+
             processed_chunk = tokenizer(
                 text=[message_chunk],
-                images=images_cur_message,
                 return_tensors="pt",
                 add_special_tokens=False,
+                **media_kwargs,
             )
             new_message["token_ids"] = processed_chunk["input_ids"][0]
 
             # add all vlm keys to the message
             for key in multimodal_keys:
                 if key in processed_chunk:
-                    new_message[key] = PackedTensor(processed_chunk[key], dim_to_pack=0)
+                    # token_type_ids and mm_token_type_ids are sequence-length tensors
+                    # (one label per token), not visual patch tensors. They must be
+                    # stored as plain tensors and padded like input_ids rather than
+                    # packed as multimodal data. This mirrors processors.py behavior.
+                    if key in ("token_type_ids", "mm_token_type_ids"):
+                        new_message[key] = processed_chunk[key][0]
+                    else:
+                        new_message[key] = PackedTensor(
+                            processed_chunk[key],
+                            dim_to_pack=get_dim_to_pack_along(tokenizer, key),
+                        )
 
         if len(new_message["token_ids"]) == 0:
             # if there is an empty message, the empty `token_ids` tensor ends up being in fp32,

@@ -32,8 +32,14 @@ uv run examples/run_dpo.py \
 
 ## Datasets
 
-Each DPO dataset class is expected to have the following attributes:
-1. `formatted_ds`: The dictionary of formatted datasets, where each dataset should be formatted like
+DPO datasets in NeMo RL are encapsulated using classes. Each DPO data class is expected to have the following attributes:
+  1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
+  2. `task_name`: A string identifier that uniquely identifies the dataset.
+
+If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. An example implementation can be found in [preference_datasets/tulu3.py](../../nemo_rl/data/datasets/preference_datasets/tulu3.py).
+
+**Note:** The `task_name` field is required in each formatted example.
+
 ```json
 {
   "context": [], // list of dicts - The prompt message (including previous turns, if any)
@@ -46,10 +52,10 @@ Each DPO dataset class is expected to have the following attributes:
       "rank": 1, // int — The rank of the completion (lower rank is preferred)
       "completion": [] // list of dicts — The completion message(s)
     }
-  ]
+  ],
+  "task_name": "task_name" // identifier for the task
 }
 ```
-2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
 
 DPO training supports only two completions (where the lowest rank is preferred and the highest one is rejected), with each completion being a single response. For example:
 ```json
@@ -87,7 +93,8 @@ DPO training supports only two completions (where the lowest rank is preferred a
                 }
             ]
         }
-    ]
+    ],
+    "task_name": "task_name"
 }
 ```
 
@@ -96,27 +103,80 @@ By default, NeMo RL has support for [HelpSteer3](../../nemo_rl/data/datasets/pre
 We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) class that is compatible with jsonl-formatted preference datasets for loading datasets from local path or HuggingFace. You can modify your config as follows to use such a custom preference dataset:
 ```yaml
 data:
-  dataset_name: PreferenceDataset
-  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  # multiple validation sets is supported
+  # other data settings, see `examples/configs/dpo.yaml` for more details
+  ...
+  # dataset settings
+  train:
+    # this dataset will override prompt_key and use the default values for other vars
+    data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+    subset: null  # used for HuggingFace datasets
+    split: train  # used for HuggingFace datasets
+  validation:
+    # this dataset will use the default values for other vars except data_path
+    data_path: /path/to/local/val_dataset.jsonl
+  default:
+    # will use below vars as default values if dataset doesn't specify it
+    dataset_name: PreferenceDataset
+    prompt_file: null
+    system_prompt_file: null
+  # multiple validation sets is supported by using val_data_paths
+  # this will be removed after refactor
   val_data_paths:
-    <NameOfValidationDataset>: <PathToValidationDataset1>
-    <NameOfValidationDataset2>: <PathToValidationDataset2>
-  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+    <NameOfValidationDataset1>: /path/to/local/val_dataset_1.jsonl
+    <NameOfValidationDataset2>: /path/to/local/val_dataset_2.jsonl
+```
+
+Your JSONL files should contain one JSON object per line with the following structure:
+
+```json
+{
+  "context": [{"role": "user", "content": "What is 2+2?"}], // list of dicts - The prompt message (including previous turns, if any)
+  "completions": [ // list of dicts — The list of completions
+    {
+      "rank": 0, // int — The rank of the completion (lower rank is preferred)
+      "completion": [{"role": "assistant", "content": "The answer is 4."}] // list of dicts — The completion message(s)
+    },
+    {
+      "rank": 1, // int — The rank of the completion (lower rank is preferred)
+      "completion": [{"role": "assistant", "content": "I don't know."}] // list of dicts — The completion message(s)
+    }
+  ]
+}
 ```
 
 We also provide a [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/binary_preference_dataset.py) class, which is a simplified version of PreferenceDataset for pairwise ranked preference with single turn completions. You can use `prompt_key`, `chosen_key` and `rejected_key` to specify which fields in your data correspond to the question, chosen answer and rejected answer respectively. Here's an example configuration:
 ```yaml
 data:
-  dataset_name: BinaryPreferenceDataset
-  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  val_data_path: <PathToValidationDataset>
-  prompt_key: <PromptKey>, default is "prompt"
-  chosen_key: <ChosenKey>, default is "chosen"
-  rejected_key: <RejectedKey>, default is "rejected"
-  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  # other data settings, see `examples/configs/dpo.yaml` for more details
+  ...
+  # dataset settings
+  train:
+    # this dataset will override prompt_key and use the default values for other vars
+    data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+    prompt_key: context
+    subset: null  # used for HuggingFace datasets
+    split: train  # used for HuggingFace datasets
+  validation:
+    # this dataset will use the default values for other vars except data_path
+    data_path: /path/to/local/val_dataset.jsonl
+  default:
+    # will use below vars as default values if dataset doesn't specify it
+    dataset_name: BinaryPreferenceDataset
+    prompt_key: prompt
+    chosen_key: chosen
+    rejected_key: rejected
+    prompt_file: null
+    system_prompt_file: null
+```
+
+Your JSONL files should contain one JSON object per line with the following structure:
+
+```json
+{
+  "prompt": "What is 2+2?",     // <prompt_key>: <prompt_content>
+  "chosen": "The answer is 4.", // <chosen_key>: <chosen_content>
+  "rejected": "I don't know."   // <rejected_key>: <rejected_content>
+}
 ```
 
 Please note:
@@ -134,6 +194,36 @@ The DPO implementation in NeMo RL supports several key parameters that can be ad
 - `dpo.sft_average_log_probs`: Whether to average log probabilities over tokens in the SFT loss term
 
 These parameters can be adjusted in the config file or via command-line overrides to optimize training for your specific use case.
+
+## Optimizations
+
+### Chunked Linear Cross-Entropy Fusion Loss
+
+During standard DPO training the model materializes a full logit tensor of shape `[batch_size, seq_length, vocab_size]` for both the policy forward-backward pass and the reference model logprob computation. This can cause out-of-memory (OOM) errors for long sequences or large vocabularies. The **chunked linear cross-entropy fusion loss** avoids this by computing log probabilities directly from the hidden states: it chunks the sequence dimension, projects each chunk to logits on the fly, gathers per-token log probabilities, and discards the logits before moving to the next chunk.
+
+**Benefits:**
+
+- Extends the maximum trainable sequence length significantly by eliminating the large logit tensor from GPU memory.
+- Applies to both the training forward-backward pass and the reference model logprob computation.
+- Produces numerically equivalent loss values to the standard path.
+
+**How to enable:**
+
+Add the following to your Megatron config in your YAML file:
+
+```yaml
+policy:
+  megatron_cfg:
+    enabled: true
+    use_linear_ce_fusion_loss: true
+    linear_ce_fusion_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
+```
+
+**Notes:**
+
+- Context parallelism is not supported when linear CE fusion is enabled.
+- Sequence packing is not supported with DPO regardless of this setting (see [#719](https://github.com/NVIDIA-NeMo/RL/issues/719)).
+- The `linear_ce_fusion_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
 
 ## Evaluate the Trained Model
 

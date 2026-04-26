@@ -49,6 +49,9 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and vllm.
     VLLM = f"uv run --locked --extra vllm --directory {git_root}"
 
+    # Use NeMo-RL direct dependencies and fsdp.
+    FSDP = f"uv run --locked --extra fsdp --directory {git_root}"
+
     # Use NeMo-RL direct dependencies and nemo-automodel.
     AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
 
@@ -57,6 +60,9 @@ class PY_EXECUTABLES:
 
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
+
+    # Use NeMo-RL direct dependencies and SGLang.
+    SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
 
 @ray.remote  # pragma: no cover

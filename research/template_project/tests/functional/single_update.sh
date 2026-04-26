@@ -20,9 +20,9 @@ cd $PROJECT_ROOT
 SINGLE_UPDATE_ITERS=1 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     single_update.py \
     --config $PROJECT_ROOT/configs/grpo_math_1B.yaml \
-    cluster.gpus_per_node=1 \
+    cluster.gpus_per_node=2 \
     cluster.num_nodes=1 \
-    policy.train_global_batch_size=1 \
+    policy.train_global_batch_size=2 \
     policy.train_micro_batch_size=1 \
     $@ \
     2>&1 | tee $RUN_LOG

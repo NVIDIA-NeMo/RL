@@ -16,8 +16,6 @@ policy:
   max_total_sequence_length: 8192
   dtensor_cfg:
     enabled: false
-  sequence_packing:
-    algorithm: modified_ffd
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   optimizer: null
   megatron_cfg:
@@ -30,9 +28,6 @@ policy:
     apply_rope_fusion: false
     fp8_cfg:
       enabled: true
-      fp8: e4m3
-      fp8_recipe: blockwise
-      fp8_param: false
     optimizer:
       lr: 1.0e-06
       use_precision_aware_optimizer: false
@@ -45,11 +40,9 @@ policy:
       precision: fp8
       use_deep_gemm: true
       gpu_memory_utilization: 0.5
-      expert_parallel_size: 4
-      quantization_ignored_layer_kws: [
-        a_proj,
-        b_proj
-      ]
+      quantization_ignored_layer_kws:
+      - a_proj
+      - b_proj
 logger:
   monitor_gpus: false
   wandb:

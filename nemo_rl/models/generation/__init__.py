@@ -23,7 +23,10 @@ TokenizerType = PreTrainedTokenizerBase
 
 
 def configure_generation_config(
-    config: GenerationConfig, tokenizer: TokenizerType, is_eval=False
+    config: GenerationConfig,
+    tokenizer: TokenizerType,
+    is_eval: bool = False,
+    has_refit_draft_weights: bool = False,
 ) -> GenerationConfig:
     """Apply specific configurations to generation config."""
     # tokenizer setting
@@ -42,11 +45,26 @@ def configure_generation_config(
         config = cast(VllmConfig, config)
         # set load_format
         config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
+        speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
+        if speculative_config:
+            # Speculative decoding needs real startup weights unless the draft
+            # weights will be pushed into vLLM during the initial refit.
+            if not is_eval and not has_refit_draft_weights:
+                warnings.warn(
+                    "Speculative decoding is enabled without draft refit sync. "
+                    "Setting vllm_cfg['load_format'] to 'auto' so the drafter does "
+                    "not start from dummy weights."
+                )
+                config["vllm_cfg"]["load_format"] = "auto"
 
         # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
         if "skip_tokenizer_init" not in config["vllm_cfg"]:
             # set skip_tokenizer_init
-            if is_eval or config["stop_strings"] is not None:
+            if (
+                is_eval
+                or config["stop_strings"] is not None
+                or config["vllm_cfg"].get("expose_http_server", None)
+            ):
                 config["vllm_cfg"]["skip_tokenizer_init"] = False
             else:
                 config["vllm_cfg"]["skip_tokenizer_init"] = True

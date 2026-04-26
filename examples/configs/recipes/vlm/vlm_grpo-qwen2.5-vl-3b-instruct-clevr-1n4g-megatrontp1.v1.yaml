@@ -1,0 +1,10 @@
+defaults: ./vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-megatrontp2.v1.yaml
+policy:
+  make_sequence_length_divisible_by: 1
+checkpointing:
+  checkpoint_dir: results/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n4g-megatrontp1
+logger:
+  wandb:
+    name: vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n4g-megatrontp1
+cluster:
+  gpus_per_node: 4

@@ -5,7 +5,7 @@ When launching examples locally with `uv`, {py:class}`init_ray() <nemo_rl.distri
 To launch a job outside of a container, simply run:
 
 ```sh
-uv run examples/run_grpo_math.py
+uv run examples/run_grpo.py
 ```
 
 In the logs, you will see that Ray has started a local cluster instance, along with details on the resources made available to it:
@@ -19,7 +19,7 @@ To have more precise control over the GPUs Ray uses locally, please use `CUDA_VI
 
 ```sh
 # Use the 0th and 3rd indexed GPU (for a total of 2 GPUs)
-CUDA_VISIBLE_DEVICES=0,3 uv run examples/run_grpo_math.py
+CUDA_VISIBLE_DEVICES=0,3 uv run examples/run_grpo.py
 ```
 
 We also allow multiple colocated local clusters, which are uniquely identified by the values in
@@ -27,9 +27,9 @@ We also allow multiple colocated local clusters, which are uniquely identified b
 
 ```sh
 # (1) Start a fresh cluster on GPU=0
-CUDA_VISIBLE_DEVICES=0 uv run examples/run_grpo_math.py
+CUDA_VISIBLE_DEVICES=0 uv run examples/run_grpo.py
 
 # (2) While (1) is running, this will start a new cluster using GPUs 1 and 2 without interferring with (1)
 # Ensure that the CUDA_VISIBLE_DEVICES do not overlap already running jobs.
-CUDA_VISIBLE_DEVICES=1,2 uv run examples/run_grpo_math.py
+CUDA_VISIBLE_DEVICES=1,2 uv run examples/run_grpo.py
 ```

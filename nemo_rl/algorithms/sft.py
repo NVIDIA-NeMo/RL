@@ -13,7 +13,6 @@
 # limitations under the License.
 import os
 import warnings
-from pathlib import Path
 from typing import NotRequired, Optional, TypedDict, cast
 
 import numpy as np
@@ -21,14 +20,11 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.loss_functions import (
-    NLLLoss,
-)
+from nemo_rl.algorithms.loss.loss_functions import NLLLossFn
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
@@ -71,6 +67,9 @@ class SFTConfig(TypedDict):
     val_global_batch_size: int
     val_micro_batch_size: int
     val_at_start: bool
+    # Whether to run validation on the last training step. Setting this to True ensures the
+    # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
+    val_at_end: bool
     seed: int
 
 
@@ -90,13 +89,13 @@ def setup(
     master_config: MasterConfig,
     tokenizer: AutoTokenizer,
     train_dataset: AllTaskProcessedDataset,
-    val_dataset: AllTaskProcessedDataset,
+    val_dataset: Optional[AllTaskProcessedDataset],
 ) -> tuple[
     Policy,
     RayVirtualCluster,
     StatefulDataLoader,
-    StatefulDataLoader,
-    NLLLoss,
+    Optional[StatefulDataLoader],
+    NLLLossFn,
     Logger,
     CheckpointManager,
     SFTSaveState,
@@ -149,14 +148,17 @@ def setup(
         )
         train_dataloader.load_state_dict(dataloader_state_dict)
 
-    val_dataloader = StatefulDataLoader(
-        val_dataset,
-        batch_size=sft_config["val_global_batch_size"],
-        shuffle=False,
-        collate_fn=rl_collate_fn,
-        drop_last=False,
-        num_workers=data_config["num_workers"],
-    )
+    if val_dataset is not None:
+        val_dataloader = StatefulDataLoader(
+            val_dataset,
+            batch_size=sft_config["val_global_batch_size"],
+            shuffle=False,
+            collate_fn=rl_collate_fn,
+            drop_last=False,
+            num_workers=data_config["num_workers"],
+        )
+    else:
+        val_dataloader = None
 
     # ==========================
     #          Cluster
@@ -188,24 +190,25 @@ def setup(
         processor = tokenizer
         tokenizer = processor.tokenizer
 
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+
     policy = Policy(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
         processor=processor,
-        weights_path=Path(last_checkpoint_path) / "policy" / "weights"
-        if last_checkpoint_path
-        else None,
-        optimizer_path=Path(last_checkpoint_path) / "policy" / "optimizer"
-        if last_checkpoint_path
-        else None,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=False,
     )
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = NLLLoss()
+    loss_fn = NLLLossFn(
+        use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
+        and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"]
+    )
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
@@ -230,23 +233,22 @@ def setup(
 # =======================================================
 def validate(
     policy: PolicyInterface,
-    val_dataloader: StatefulDataLoader,
+    val_dataloader: Optional[StatefulDataLoader],
     tokenizer,
     loss_fn,
     step: int,
     master_config: MasterConfig,
-    sft_task_spec: TaskDataSpec,
     val_batches: int,
     val_batch_size: int,
     val_mbs: int,
 ):
     """Run validation on the validation dataset."""
     if val_dataloader is None:
-        assert val_dataloader is not None or master_config["dpo"]["val_period"] == 0, (
-            "val_dataloader is None, so dpo.val_period must be 0"
+        assert master_config["sft"]["val_period"] <= 0, (
+            "val_dataloader is None, so sft.val_period must be <= 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation")
-        return
+        return {}, {}
 
     timer = Timer()
 
@@ -355,7 +357,6 @@ def sft_train(
     loss_fn,
     master_config,
     logger,
-    sft_task_spec,
     checkpointer,
     sft_save_state: SFTSaveState,
 ) -> None:
@@ -385,6 +386,7 @@ def sft_train(
     # Validation configuration
     val_period = sft_config["val_period"]
     val_at_start = sft_config["val_at_start"]
+    val_at_end = sft_config["val_at_end"]
     max_num_epochs = sft_config["max_num_epochs"]
 
     # Run validation at the start if configured
@@ -397,7 +399,6 @@ def sft_train(
             loss_fn,
             step=0,
             master_config=master_config,
-            sft_task_spec=sft_task_spec,
             val_batches=sft_config["val_batches"],
             val_batch_size=sft_config["val_global_batch_size"],
             val_mbs=sft_config["val_micro_batch_size"],
@@ -453,7 +454,11 @@ def sft_train(
 
                 print("▶ Taking a training step...")
                 with timer.time("policy_training"):
-                    train_results = policy.train(train_data, loss_fn)
+                    train_results = policy.train(
+                        train_data,
+                        loss_fn,
+                        timer=timer,
+                    )
 
                 is_last_step = total_steps + 1 >= master_config["sft"][
                     "max_num_steps"
@@ -462,8 +467,10 @@ def sft_train(
                     and current_step + 1 == len(train_dataloader)
                 )
 
-                # Run validation if it's a validation step
-                if val_period > 0 and (total_steps + 1) % val_period == 0:
+                # Run validation if it's a validation step or last step with val_at_end
+                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
                     val_metrics, validation_timings = validate(
                         policy,
                         val_dataloader,
@@ -471,7 +478,6 @@ def sft_train(
                         loss_fn,
                         step=total_steps + 1,
                         master_config=master_config,
-                        sft_task_spec=sft_task_spec,
                         val_batches=sft_config["val_batches"],
                         val_batch_size=sft_config["val_global_batch_size"],
                         val_mbs=sft_config["val_micro_batch_size"],
@@ -496,7 +502,7 @@ def sft_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
-                total_valid_tokens += metrics["global_valid_toks"]
+                total_valid_tokens += metrics.get("global_valid_toks", 0)
 
                 ## Checkpointing
                 sft_save_state["consumed_samples"] += master_config["policy"][
@@ -554,14 +560,15 @@ def sft_train(
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             total_steps + 1, sft_save_state, master_config
                         )
-
                         policy.save_checkpoint(
                             weights_path=os.path.join(
                                 checkpoint_path, "policy", "weights"
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            ),
+                            )
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
@@ -610,9 +617,12 @@ def sft_train(
                 master_config["cluster"]["num_nodes"]
                 * master_config["cluster"]["gpus_per_node"]
             )
-            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                metrics["global_valid_toks"] / total_time / total_num_gpus
-            )
+            if total_time > 0:
+                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                    metrics.get("global_valid_toks", 0) / total_time / total_num_gpus
+                )
+            else:
+                timing_metrics["valid_tokens_per_sec_per_gpu"] = 0.0
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
 

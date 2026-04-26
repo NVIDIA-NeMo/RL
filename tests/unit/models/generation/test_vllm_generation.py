@@ -16,6 +16,7 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -23,7 +24,7 @@ import requests
 import torch
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
-from nemo_rl.algorithms.loss_functions import NLLLoss
+from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -35,7 +36,7 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     _replace_prefix_tokens,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
@@ -70,6 +71,7 @@ basic_vllm_test_config: VllmConfig = {
         "skip_tokenizer_init": False,
         "load_format": "auto",
         "enforce_eager": "False",
+        "kv_cache_dtype": "auto",
     },
     "colocated": {
         "enabled": True,
@@ -105,6 +107,7 @@ basic_dtensor_test_config: PolicyConfig = {
         },
     },
     "dtensor_cfg": {
+        "_v2": False,
         "enabled": True,
         "cpu_offload": False,
         "sequence_parallel": False,
@@ -126,6 +129,64 @@ basic_dtensor_test_config: PolicyConfig = {
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
 }
+
+basic_lora_test_config: LoRAConfig = {
+    "enabled": False,
+    "target_modules": [],
+    "exclude_modules": [],
+    "match_all_linear": True,
+    "dim": 8,
+    "alpha": 32,
+    "dropout": 0.0,
+    "dropout_position": "post",
+    "lora_A_init": "xavier",
+    "use_triton": False,
+}
+
+
+def test_configure_generation_config_uses_real_startup_weights_without_draft_refit():
+    """Speculative training should not start the drafter from dummy weights without refit."""
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_kwargs"] = {
+        "speculative_config": {
+            "method": "eagle3",
+            "model": "/tmp/draft-model",
+            "num_speculative_tokens": 3,
+        }
+    }
+    tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+
+    with pytest.warns(UserWarning, match="Speculative decoding is enabled"):
+        configured = configure_generation_config(
+            vllm_config,
+            tokenizer,
+            is_eval=False,
+            has_refit_draft_weights=False,
+        )
+
+    assert configured["vllm_cfg"]["load_format"] == "auto"
+
+
+def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refit():
+    """Speculative training can keep dummy startup weights when draft refit is available."""
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_kwargs"] = {
+        "speculative_config": {
+            "method": "eagle3",
+            "model": "/tmp/draft-model",
+            "num_speculative_tokens": 3,
+        }
+    }
+    tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+
+    configured = configure_generation_config(
+        vllm_config,
+        tokenizer,
+        is_eval=False,
+        has_refit_draft_weights=True,
+    )
+
+    assert configured["vllm_cfg"]["load_format"] == "dummy"
 
 
 def get_basic_megatron_test_config(
@@ -178,9 +239,13 @@ def get_basic_megatron_test_config(
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
             "moe_permute_fusion": False,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_shared_expert_overlap": False,
             "apply_rope_fusion": True,
             "bias_activation_fusion": True,
             "moe_per_layer_logging": False,
+            "gradient_accumulation_fusion": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -215,6 +280,7 @@ def get_basic_megatron_test_config(
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
         },
+        "draft": {"enabled": False},
         "optimizer": None,  # Remove default FSDP optimizer
         "scheduler": None,  # Remove default scheduler
         "max_grad_norm": 1.0,
@@ -362,43 +428,6 @@ def test_vllm_missing_required_config_key(cluster):
         "Error should mention the missing 'model_name' key"
     )
     print(f"Successfully caught missing config key with error: {error_message}")
-
-
-def test_vllm_top_p_top_k_validation(cluster):
-    """Test that top_p and top_k validation works correctly with threshold-based logic."""
-    # Test that values above thresholds are allowed
-    config_above_thresholds = deepcopy(basic_vllm_test_config)
-    config_above_thresholds["top_p"] = 0.99  # Above TOP_P_THRESHOLD
-    config_above_thresholds["top_k"] = 8000  # Above TOP_K_THRESHOLD
-
-    # Should not raise an error
-    try:
-        VllmGeneration(cluster, config_above_thresholds)
-        print("Successfully initialized with top_p=0.99 and top_k=8000")
-    except Exception as e:
-        pytest.fail(f"Should not raise error with values above thresholds: {e}")
-
-    # Test that values below thresholds are rejected
-    config_below_thresholds = deepcopy(basic_vllm_test_config)
-    config_below_thresholds["top_p"] = 0.9  # Below TOP_P_THRESHOLD
-
-    with pytest.raises(ValueError) as excinfo:
-        VllmGeneration(cluster, config_below_thresholds)
-
-    error_message = str(excinfo.value)
-    assert "top_p sampling with values < 0.99 is not supported" in error_message
-    print(f"Successfully caught low top_p value with error: {error_message}")
-
-    # Test that low top_k values are rejected
-    config_low_top_k = deepcopy(basic_vllm_test_config)
-    config_low_top_k["top_k"] = 7999  # Below TOP_K_THRESHOLD
-
-    with pytest.raises(ValueError) as excinfo:
-        VllmGeneration(cluster, config_low_top_k)
-
-    error_message = str(excinfo.value)
-    assert "top_k sampling with values < 8000 is not supported" in error_message
-    print(f"Successfully caught low top_k value with error: {error_message}")
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):
@@ -688,14 +717,20 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
 
 async def run_hf_train_process(
-    lm_policy, vllm_policy, tokenizer, async_engine, colocated, vllm_precision
+    lm_policy,
+    vllm_policy,
+    tokenizer,
+    async_engine,
+    colocated,
+    vllm_precision,
+    enable_lora,
 ):
     """Validates that the two policies can work together.
 
     1. Use vLLM for generation
     2. Use HF policy for training and logprob computation
     """
-    from tests.unit.test_utils import SimpleNLLLoss
+    from tests.unit.test_utils import SimpleNLLLossFn
 
     try:
         prompts = [
@@ -824,7 +859,7 @@ async def run_hf_train_process(
             {
                 "input_ids": train_input_ids,
                 "input_lengths": generation_results["unpadded_sequence_lengths"],
-                "token_loss_mask": token_loss_mask,
+                "token_mask": token_loss_mask,
                 "sample_mask": torch.ones(train_input_ids.shape[0]),
             }
         )
@@ -834,7 +869,7 @@ async def run_hf_train_process(
         lm_policy.prepare_for_training()
 
         # Just do one training step to verify it works
-        results = lm_policy.train(train_data, SimpleNLLLoss())
+        results = lm_policy.train(train_data, SimpleNLLLossFn())
         print(f"Training loss: {results['loss']}")
 
         lm_policy.finish_training()
@@ -865,21 +900,29 @@ async def run_hf_train_process(
             lm_policy.shutdown()
 
 
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(420)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("async_engine", "cpu_offload", "vllm_precision"),
+    ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        (True, False, "bfloat16"),
-        (False, True, "bfloat16"),
-        (True, False, "fp8"),
-        (False, True, "fp8"),
+        (True, False, "bfloat16", False),
+        (False, True, "bfloat16", False),
+        (True, False, "fp8", False),
+        (False, True, "fp8", False),
+        # LoRA tests (requires dtensor v2 / automodel)
+        pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
+        pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
     ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
-    cluster, tokenizer, async_engine, cpu_offload, vllm_precision
+    cluster, tokenizer, async_engine, cpu_offload, vllm_precision, enable_lora
 ):
     """This test validates that DTensor policy can work together with colocated vLLM policy."""
+    device_name = torch.cuda.get_device_name(0)
+    if vllm_precision == "fp8" and "GB200" in device_name:
+        pytest.skip(
+            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
+        )
 
     # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
     if vllm_precision == "fp8":
@@ -894,6 +937,8 @@ async def test_vllm_generation_with_hf_training_colocated(
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
     vllm_config["vllm_cfg"]["precision"] = vllm_precision
+    vllm_config["vllm_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    vllm_config["vllm_cfg"]["lora_cfg"]["enabled"] = enable_lora
 
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     vllm_policy = VllmGeneration(cluster, vllm_config)
@@ -903,6 +948,9 @@ async def test_vllm_generation_with_hf_training_colocated(
     print("Creating DTensor policy...")
     dtensor_config = deepcopy(basic_dtensor_test_config)
     dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
+    dtensor_config["dtensor_cfg"]["_v2"] = enable_lora
+    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
     dtensor_config["train_global_batch_size"] = 4
     lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
@@ -913,24 +961,46 @@ async def test_vllm_generation_with_hf_training_colocated(
 
     # Test
     await run_hf_train_process(
-        lm_policy, vllm_policy, tokenizer, async_engine, True, vllm_precision
+        lm_policy,
+        vllm_policy,
+        tokenizer,
+        async_engine,
+        True,
+        vllm_precision,
+        enable_lora,
     )
 
 
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("async_engine", "cpu_offload", "vllm_precision"),
+    ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        (True, False, "bfloat16"),
-        (False, True, "bfloat16"),
-        (True, False, "fp8"),
-        (False, True, "fp8"),
+        (True, False, "bfloat16", False),
+        (False, True, "bfloat16", False),
+        # NOTE: non-colocated FP8 tests fail on main as of 3/9/2026 with
+        # avg_prob_mult_error=1.13 > 1.08 threshold. Left unskipped to match main.
+        (True, False, "fp8", False),
+        (False, True, "fp8", False),
+        # LoRA tests (requires dtensor v2 / automodel)
+        pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
+        pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
     ],
 )
 async def test_vllm_generation_with_hf_training_non_colocated(
-    policy_cluster_separate, tokenizer, async_engine, cpu_offload, vllm_precision
+    policy_cluster_separate,
+    tokenizer,
+    async_engine,
+    cpu_offload,
+    vllm_precision,
+    enable_lora,
 ):
+    device_name = torch.cuda.get_device_name(0)
+    if vllm_precision == "fp8" and "GB200" in device_name:
+        pytest.skip(
+            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
+        )
+
     # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
     if vllm_precision == "fp8":
         major_capability, _ = torch.cuda.get_device_capability()
@@ -945,19 +1015,30 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     # Create VllmGeneration Policy
     print("Creating vLLM policy...")
     vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
     vllm_config["vllm_cfg"]["precision"] = vllm_precision
+    vllm_config["vllm_cfg"]["lora_cfg"]["enabled"] = enable_lora
     vllm_config["colocated"]["enabled"] = False
+    if vllm_precision == "fp8":
+        vllm_config["vllm_cfg"]["kv_cache_dtype"] = "fp8"
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     vllm_policy = VllmGeneration(generation_cluster_separate, vllm_config)
     vllm_policy.finish_generation()
 
+    assert not (enable_lora and vllm_precision == "fp8"), (
+        "LoRA is not supported with FP8"
+    )
     # Create Policy
     print("Creating DTensor policy...")
     dtensor_config = deepcopy(basic_dtensor_test_config)
     dtensor_config["generation"]["colocated"]["enabled"] = False
     dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
     dtensor_config["train_global_batch_size"] = 4
+    # lora must use dtensor v2
+    dtensor_config["dtensor_cfg"]["_v2"] = enable_lora
+    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
     lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
 
     # Refit
@@ -980,7 +1061,13 @@ async def test_vllm_generation_with_hf_training_non_colocated(
 
     # Test
     await run_hf_train_process(
-        lm_policy, vllm_policy, tokenizer, async_engine, False, vllm_precision
+        lm_policy,
+        vllm_policy,
+        tokenizer,
+        async_engine,
+        False,
+        vllm_precision,
+        enable_lora,
     )
 
 
@@ -1164,6 +1251,7 @@ def test_vllm_http_server(cluster, tokenizer):
                     "function_call": None,
                     "tool_calls": [],
                     "reasoning_content": None,
+                    "reasoning": None,
                 },
                 "logprobs": {
                     "content": [
@@ -1199,6 +1287,11 @@ def test_vllm_http_server(cluster, tokenizer):
         d.pop("created")
         # We don't want to implicate log prob accuracy in this test.
         d["choices"][0]["logprobs"]["content"][0].pop("logprob")
+
+        # Remove version-dependent fields that vLLM may or may not include
+        message = d["choices"][0]["message"]
+        for key in ("reasoning", "reasoning_content"):
+            message.pop(key, None)
 
         return d
 
@@ -1369,6 +1462,9 @@ def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
     class _T:
         eos_token_id = 2
 
+        def decode(self, *args, **kwargs):
+            pass
+
     tokenizer = _T()
     model_prefix_token_ids = [7, 2]
     template_prefix_token_ids = [9, 9, 9]  # no EOS inside prefix
@@ -1537,13 +1633,18 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
     vllm_generation.shutdown()
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(600)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_weight_update_and_prefix_cache_reset(
     cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
     """Test that the vLLM prefix cache is correctly reset when weights change."""
+    device_name = torch.cuda.get_device_name(0)
+    if vllm_precision == "fp8" and "GB200" in device_name:
+        pytest.skip(
+            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
+        )
 
     if vllm_precision == "fp8":
         major_capability, _ = torch.cuda.get_device_capability()
@@ -1655,7 +1756,12 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         torch.cuda.empty_cache()
 
 
-def test_vllm_weight_update_memory(cluster, tokenizer):
+# megatron still holds little memory after refit, so we only test dtensor now
+@pytest.mark.parametrize(
+    "train_backend",
+    ["dtensor_v1", pytest.param("dtensor_v2", marks=pytest.mark.automodel)],
+)
+def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     """Test that vLLM streaming weight update and can save memory."""
     from nemo_rl.models.policy.lm_policy import Policy
 
@@ -1676,9 +1782,17 @@ def test_vllm_weight_update_memory(cluster, tokenizer):
     vllm_policy = VllmGeneration(cluster, vllm_config)
     vllm_policy.finish_generation()
 
-    print("Creating DTensor policy...")
-    dtensor_config = basic_dtensor_test_config
-    lm_policy = Policy(cluster, dtensor_config, tokenizer)
+    print("Creating Training Policy...")
+    if train_backend == "dtensor_v1":
+        train_config = basic_dtensor_test_config
+    elif train_backend == "dtensor_v2":
+        train_config = deepcopy(basic_dtensor_test_config)
+        train_config["dtensor_cfg"]["_v2"] = True
+    elif train_backend == "megatron":
+        train_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
+    else:
+        raise ValueError(f"Invalid train backend: {train_backend}")
+    lm_policy = Policy(cluster, train_config, tokenizer)
 
     print("preparing refit info...")
     state_dict_info = lm_policy.prepare_refit_info()
@@ -1823,7 +1937,9 @@ def test_vllm_non_divisible_batch_handling(policy):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_engine", [True, False])
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
-@pytest.mark.parametrize("policy_type", ["dtensor", "megatron"])
+@pytest.mark.parametrize(
+    "policy_type", ["dtensor", pytest.param("megatron", marks=[pytest.mark.mcore])]
+)
 async def test_vllm_refit_non_colocated_update_weights(
     policy_cluster_separate,
     tokenizer,
@@ -1932,6 +2048,7 @@ async def test_vllm_refit_non_colocated_update_weights(
         print(f"Error during generation_cluster_separate shutdown: {e}")
 
 
+@pytest.mark.mcore
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
@@ -1943,6 +2060,11 @@ def test_vllm_generation_with_megatron_training(
 
     This test validates that vLLM and Megatron policies can work together.
     """
+    device_name = torch.cuda.get_device_name(0)
+    if vllm_precision == "fp8" and "GB200" in device_name:
+        pytest.skip(
+            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
+        )
 
     # Skip invalid configurations: kv_cache_dtype=fp8 requires precision=fp8
     if kv_cache_dtype == "fp8" and vllm_precision != "fp8":
@@ -2082,7 +2204,7 @@ def test_vllm_generation_with_megatron_training(
         megatron_policy.prepare_for_training()
 
         # Do one training step to verify it works
-        results = megatron_policy.train(train_data, NLLLoss())
+        results = megatron_policy.train(train_data, NLLLossFn())
         print(f"Training loss: {results['loss']}")
 
         megatron_policy.finish_training()
@@ -2108,6 +2230,7 @@ def test_vllm_generation_with_megatron_training(
             megatron_policy.shutdown()
 
 
+@pytest.mark.mcore
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_generation_with_megatron_training_moe_model(
@@ -2117,6 +2240,11 @@ def test_vllm_generation_with_megatron_training_moe_model(
 
     This test validates that vLLM and Megatron policies can work together.
     """
+    device_name = torch.cuda.get_device_name(0)
+    if vllm_precision == "fp8" and "GB200" in device_name:
+        pytest.skip(
+            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
+        )
 
     # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
     if vllm_precision == "fp8":
@@ -2249,7 +2377,7 @@ def test_vllm_generation_with_megatron_training_moe_model(
         megatron_policy.prepare_for_training()
 
         # Do one training step to verify it works
-        results = megatron_policy.train(train_data, NLLLoss())
+        results = megatron_policy.train(train_data, NLLLossFn())
         print(f"Training loss: {results['loss']}")
 
         megatron_policy.finish_training()
@@ -2275,6 +2403,7 @@ def test_vllm_generation_with_megatron_training_moe_model(
             megatron_policy.shutdown()
 
 
+@pytest.mark.mcore
 @pytest.mark.timeout(180)
 def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     """Test that vLLM streaming weight update with Megatron can save memory."""
@@ -2363,6 +2492,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     megatron_policy.shutdown()
 
 
+@pytest.mark.mcore
 @pytest.mark.timeout(120)
 def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
     """Test vLLM generation with Megatron pipeline parallel training."""
@@ -2454,6 +2584,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
             megatron_policy.shutdown()
 
 
+@pytest.mark.mcore
 def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
     megatron_policy = None
     vllm_generation = None

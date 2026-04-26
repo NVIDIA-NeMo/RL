@@ -17,6 +17,7 @@ dist/
 *.vscode/
 release_run*
 ckpts/
+mlruns/
 
 # Test
 coverage.json
@@ -24,6 +25,7 @@ coverage.json
 unit_results.json
 unit_results/
 test_assets/
+actual_test_nemo_gym_sanity.json
 .nrl_remote_map.json
 .nrl_remote_state.json
 
@@ -46,3 +48,6 @@ code_snapshots*/
 # Runtime env
 *runtime_env.yaml
 !default_runtime_env.yaml
+
+# Claude Code review memory (local only)
+.claude/review-memory/

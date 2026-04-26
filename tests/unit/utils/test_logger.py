@@ -128,6 +128,101 @@ class TestTensorboardLogger:
             "model.hidden_size": 128,
         }
 
+    @patch("nemo_rl.utils.logger.SummaryWriter")
+    def test_coerce_to_scalar_python_primitives(self, mock_summary_writer, temp_dir):
+        """Test that Python primitives pass through unchanged."""
+        cfg = {"log_dir": temp_dir}
+        logger = TensorboardLogger(cfg, log_dir=temp_dir)
+
+        assert logger._coerce_to_scalar(42) == 42
+        assert logger._coerce_to_scalar(3.14) == 3.14
+        assert logger._coerce_to_scalar(True) is True
+        assert logger._coerce_to_scalar("hello") == "hello"
+
+    @patch("nemo_rl.utils.logger.SummaryWriter")
+    def test_coerce_to_scalar_numpy_types(self, mock_summary_writer, temp_dir):
+        """Test that numpy scalar types are coerced to Python primitives."""
+        import numpy as np
+
+        cfg = {"log_dir": temp_dir}
+        logger = TensorboardLogger(cfg, log_dir=temp_dir)
+
+        # numpy scalar types
+        assert logger._coerce_to_scalar(np.float32(1.5)) == 1.5
+        assert logger._coerce_to_scalar(np.float64(2.5)) == 2.5
+        assert logger._coerce_to_scalar(np.int32(10)) == 10
+        assert logger._coerce_to_scalar(np.int64(20)) == 20
+        assert logger._coerce_to_scalar(np.bool_(True)) is True
+
+        # 0-d numpy arrays
+        assert logger._coerce_to_scalar(np.array(3.14)) == 3.14
+        # 1-element numpy arrays
+        assert logger._coerce_to_scalar(np.array([42])) == 42
+
+        # Multi-element arrays should return None
+        assert logger._coerce_to_scalar(np.array([1, 2, 3])) is None
+
+    @patch("nemo_rl.utils.logger.SummaryWriter")
+    def test_coerce_to_scalar_torch_tensors(self, mock_summary_writer, temp_dir):
+        """Test that torch scalar tensors are coerced to Python primitives."""
+        cfg = {"log_dir": temp_dir}
+        logger = TensorboardLogger(cfg, log_dir=temp_dir)
+
+        # 0-d tensors
+        assert logger._coerce_to_scalar(torch.tensor(3.14)) == pytest.approx(3.14)
+        assert logger._coerce_to_scalar(torch.tensor(42)) == 42
+
+        # 1-element tensors
+        assert logger._coerce_to_scalar(torch.tensor([99])) == 99
+
+        # Multi-element tensors should return None
+        assert logger._coerce_to_scalar(torch.tensor([1, 2, 3])) is None
+
+    @patch("nemo_rl.utils.logger.SummaryWriter")
+    def test_coerce_to_scalar_incompatible_types(self, mock_summary_writer, temp_dir):
+        """Test that incompatible types return None."""
+        cfg = {"log_dir": temp_dir}
+        logger = TensorboardLogger(cfg, log_dir=temp_dir)
+
+        assert logger._coerce_to_scalar({"key": "value"}) is None
+        assert logger._coerce_to_scalar([1, 2, 3]) is None
+        assert logger._coerce_to_scalar(None) is None
+        assert logger._coerce_to_scalar(object()) is None
+
+    @patch("nemo_rl.utils.logger.SummaryWriter")
+    def test_log_metrics_coerces_numpy_and_torch(self, mock_summary_writer, temp_dir):
+        """Test that log_metrics correctly logs numpy/torch scalars."""
+        import numpy as np
+
+        cfg = {"log_dir": temp_dir}
+        logger = TensorboardLogger(cfg, log_dir=temp_dir)
+
+        metrics = {
+            "python_float": 1.0,
+            "numpy_float32": np.float32(2.0),
+            "numpy_float64": np.float64(3.0),
+            "torch_scalar": torch.tensor(4.0),
+            "numpy_0d": np.array(5.0),
+            "torch_1elem": torch.tensor([6.0]),
+            "skip_list": [1, 2, 3],
+            "skip_dict": {"a": 1},
+            "skip_multi_tensor": torch.tensor([1.0, 2.0]),
+        }
+        logger.log_metrics(metrics, step=1)
+
+        mock_writer = mock_summary_writer.return_value
+        # Should log 6 scalars, skip 3 incompatible
+        assert mock_writer.add_scalar.call_count == 6
+
+        # Verify each scalar was logged with correct value
+        calls = {c[0][0]: c[0][1] for c in mock_writer.add_scalar.call_args_list}
+        assert calls["python_float"] == 1.0
+        assert calls["numpy_float32"] == pytest.approx(2.0)
+        assert calls["numpy_float64"] == pytest.approx(3.0)
+        assert calls["torch_scalar"] == pytest.approx(4.0)
+        assert calls["numpy_0d"] == pytest.approx(5.0)
+        assert calls["torch_1elem"] == pytest.approx(6.0)
+
 
 class TestWandbLogger:
     """Test the WandbLogger class."""
@@ -262,7 +357,7 @@ class TestWandbLogger:
 
         # Check that config.update was called with params
         mock_run = mock_wandb.init.return_value
-        mock_run.config.update.assert_called_once_with(params)
+        mock_run.config.update.assert_called_once_with(params, allow_val_change=True)
 
 
 class TestSwanlabLogger:
@@ -381,7 +476,7 @@ class TestSwanlabLogger:
 
         # Check that config.update was called with params
         mock_run = mock_swanlab.init.return_value
-        mock_run.config.update.assert_called_once_with(params)
+        mock_run.config.update.assert_called_once_with(params, allow_val_change=True)
 
 
 class TestMLflowLogger:
@@ -397,6 +492,9 @@ class TestMLflowLogger:
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_basic_config(self, mock_mlflow, temp_dir):
         """Test initialization of MLflowLogger with basic config."""
+        # Ensure active_run returns None so initialization logic runs
+        mock_mlflow.active_run.return_value = None
+
         cfg = {
             "experiment_name": "test-experiment",
             "run_name": "test-run",
@@ -410,6 +508,11 @@ class TestMLflowLogger:
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_full_config(self, mock_mlflow, temp_dir):
         """Test initialization of MLflowLogger with full config."""
+        # Ensure active_run returns None so initialization logic runs
+        mock_mlflow.active_run.return_value = None
+        # Mock is_tracking_uri_set to return False so set_tracking_uri is called
+        mock_mlflow.is_tracking_uri_set.return_value = False
+
         cfg = {
             "experiment_name": "test-experiment",
             "run_name": "test-run",
@@ -436,9 +539,10 @@ class TestMLflowLogger:
         logger.log_metrics(metrics, step)
 
         # Check that log_metric was called for each metric
-        assert mock_mlflow.log_metric.call_count == 2
-        mock_mlflow.log_metric.assert_any_call("loss", 0.5, step=10)
-        mock_mlflow.log_metric.assert_any_call("accuracy", 0.8, step=10)
+        assert mock_mlflow.log_metrics.call_count == 1
+        mock_mlflow.log_metrics.assert_any_call(
+            {"loss": 0.5, "accuracy": 0.8}, step=10, run_id=logger.run_id
+        )
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_log_metrics_with_prefix(self, mock_mlflow, temp_dir):
@@ -456,9 +560,10 @@ class TestMLflowLogger:
         logger.log_metrics(metrics, step, prefix)
 
         # Check that log_metric was called for each metric with prefix
-        assert mock_mlflow.log_metric.call_count == 2
-        mock_mlflow.log_metric.assert_any_call("train/loss", 0.5, step=10)
-        mock_mlflow.log_metric.assert_any_call("train/accuracy", 0.8, step=10)
+        assert mock_mlflow.log_metrics.call_count == 1
+        mock_mlflow.log_metrics.assert_any_call(
+            {"train/loss": 0.5, "train/accuracy": 0.8}, step=10, run_id=logger.run_id
+        )
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_log_hyperparams(self, mock_mlflow, temp_dir):
@@ -479,16 +584,14 @@ class TestMLflowLogger:
                 "lr": 0.001,
                 "batch_size": 32,
                 "model.hidden_size": 128,
-            }
+            },
+            run_id=logger.run_id,
         )
 
     @patch("nemo_rl.utils.logger.mlflow")
     @patch("nemo_rl.utils.logger.plt")
-    @patch("nemo_rl.utils.logger.os")
-    def test_log_plot(self, mock_os, mock_plt, mock_mlflow, temp_dir):
+    def test_log_plot(self, mock_plt, mock_mlflow, temp_dir):
         """Test logging plots to MLflowLogger."""
-        import tempfile
-
         cfg = {
             "experiment_name": "test-experiment",
             "run_name": "test-run",
@@ -499,21 +602,12 @@ class TestMLflowLogger:
         # Mock the figure
         mock_figure = mock_plt.Figure.return_value
 
-        # Mock tempfile.NamedTemporaryFile
-        mock_temp_file = type("MockTempFile", (), {"name": "/tmp/test.png"})()
-        with patch.object(tempfile, "NamedTemporaryFile") as mock_tempfile:
-            mock_tempfile.return_value.__enter__.return_value = mock_temp_file
-            mock_tempfile.return_value.__exit__.return_value = None
+        logger.log_plot(mock_figure, step=10, name="test_plot")
 
-            logger.log_plot(mock_figure, step=10, name="test_plot")
-
-            # Check that figure was saved and logged as artifact
-            mock_figure.savefig.assert_called_once_with(
-                "/tmp/test.png", format="png", bbox_inches="tight"
-            )
-            mock_mlflow.log_artifact.assert_called_once_with(
-                "/tmp/test.png", "plots/test_plot"
-            )
+        # Check that log_figure was called
+        mock_mlflow.log_figure.assert_called_once_with(
+            mock_figure, "plots/test_plot.png", save_kwargs={"bbox_inches": "tight"}
+        )
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_cleanup(self, mock_mlflow, temp_dir):
@@ -525,6 +619,9 @@ class TestMLflowLogger:
         }
         logger = MLflowLogger(cfg, log_dir=temp_dir)
 
+        # Reset mocks to avoid counting calls from init
+        mock_mlflow.end_run.reset_mock()
+
         # Trigger cleanup
         logger.__del__()
 
@@ -534,6 +631,9 @@ class TestMLflowLogger:
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_with_none_log_dir(self, mock_mlflow):
         """Test initialization with None log_dir uses server default artifact location."""
+        # Ensure active_run returns None so initialization logic runs
+        mock_mlflow.active_run.return_value = None
+
         cfg = {
             "experiment_name": "test-experiment",
             "run_name": "test-run",
@@ -544,12 +644,17 @@ class TestMLflowLogger:
         MLflowLogger(cfg, log_dir=None)
 
         # Verify create_experiment was called without artifact_location
-        mock_mlflow.create_experiment.assert_called_once_with(name="test-experiment")
+        mock_mlflow.create_experiment.assert_called_once_with(
+            name="test-experiment", artifact_location=None
+        )
         mock_mlflow.start_run.assert_called_once_with(run_name="test-run")
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_with_custom_log_dir(self, mock_mlflow):
         """Test initialization with custom log_dir sets artifact_location."""
+        # Ensure active_run returns None so initialization logic runs
+        mock_mlflow.active_run.return_value = None
+
         cfg = {
             "experiment_name": "test-experiment",
             "run_name": "test-run",
@@ -568,6 +673,11 @@ class TestMLflowLogger:
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_with_artifact_location_in_config(self, mock_mlflow):
         """Test initialization with artifact_location in config takes precedence over log_dir."""
+        # Ensure active_run returns None so initialization logic runs
+        mock_mlflow.active_run.return_value = None
+        # Mock is_tracking_uri_set to return False so set_tracking_uri is called
+        mock_mlflow.is_tracking_uri_set.return_value = False
+
         cfg = {
             "experiment_name": "test-experiment",
             "run_name": "test-run",
@@ -587,7 +697,12 @@ class TestMLflowLogger:
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_with_artifact_location_none_in_config(self, mock_mlflow):
-        """Test initialization with artifact_location=None in config uses server default."""
+        """Test initialization with artifact_location=None in config uses log_dir."""
+        # Ensure active_run returns None so initialization logic runs
+        mock_mlflow.active_run.return_value = None
+        # Mock is_tracking_uri_set to return False so set_tracking_uri is called
+        mock_mlflow.is_tracking_uri_set.return_value = False
+
         cfg = {
             "experiment_name": "test-experiment",
             "run_name": "test-run",
@@ -598,10 +713,9 @@ class TestMLflowLogger:
 
         MLflowLogger(cfg, log_dir="/fallback/path")
 
-        # Verify create_experiment was called without artifact_location
-        # (None is explicitly set, so we don't pass it to MLflow)
+        # Verify create_experiment was called with log_dir since config is None
         mock_mlflow.create_experiment.assert_called_once_with(
-            name=cfg["experiment_name"], artifact_location=cfg["artifact_location"]
+            name=cfg["experiment_name"], artifact_location="/fallback/path"
         )
         mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
         mock_mlflow.start_run.assert_called_once_with(run_name=cfg["run_name"])
@@ -609,6 +723,11 @@ class TestMLflowLogger:
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_without_artifact_location_uses_log_dir(self, mock_mlflow):
         """Test initialization without artifact_location in config uses log_dir."""
+        # Ensure active_run returns None so initialization logic runs
+        mock_mlflow.active_run.return_value = None
+        # Mock is_tracking_uri_set to return False so set_tracking_uri is called
+        mock_mlflow.is_tracking_uri_set.return_value = False
+
         cfg = {
             "experiment_name": "test-experiment",
             "run_name": "test-run",
@@ -1398,8 +1517,12 @@ class TestLogger:
         logger.log_metrics(metrics, step)
 
         # Check that log_metrics was called on both loggers
-        mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
-        mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
+        mock_wandb_instance.log_metrics.assert_called_once_with(
+            metrics, step, "", None, False
+        )
+        mock_tb_instance.log_metrics.assert_called_once_with(
+            metrics, step, "", None, False
+        )
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
@@ -1508,10 +1631,10 @@ class TestLogger:
 
         # Check that log_metrics was called on both loggers with correct parameters
         mock_wandb_instance.log_metrics.assert_called_once_with(
-            metrics, step, prefix, step_metric
+            metrics, step, prefix, step_metric, False
         )
         mock_tb_instance.log_metrics.assert_called_once_with(
-            metrics, step, prefix, step_metric
+            metrics, step, prefix, step_metric, False
         )
 
     @patch("nemo_rl.utils.logger.WandbLogger")
@@ -1573,7 +1696,10 @@ class TestLogger:
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
-    def test_init_mlflow_only(self, mock_tb_logger, mock_wandb_logger, temp_dir):
+    @patch("nemo_rl.utils.logger.MLflowLogger")
+    def test_init_mlflow_only(
+        self, mock_mlflow_logger, mock_tb_logger, mock_wandb_logger, temp_dir
+    ):
         """Test initialization with only MLflowLogger enabled."""
         cfg = {
             "wandb_enabled": False,
@@ -1593,6 +1719,7 @@ class TestLogger:
         assert len(logger.loggers) == 1
         mock_wandb_logger.assert_not_called()
         mock_tb_logger.assert_not_called()
+        mock_mlflow_logger.assert_called_once()
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
@@ -1673,13 +1800,17 @@ class TestLogger:
         logger.log_metrics(metrics, step)
 
         # Check that log_metrics was called on all loggers
-        mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
-        mock_swanlab_instance.log_metrics.assert_called_once_with(
-            metrics, step, "", None
+        mock_wandb_instance.log_metrics.assert_called_once_with(
+            metrics, step, "", None, False
         )
-        mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
+        mock_swanlab_instance.log_metrics.assert_called_once_with(
+            metrics, step, "", None, False
+        )
+        mock_tb_instance.log_metrics.assert_called_once_with(
+            metrics, step, "", None, False
+        )
         mock_mlflow_instance.log_metrics.assert_called_once_with(
-            metrics, step, "", None
+            metrics, step, "", None, False
         )
 
     @patch("nemo_rl.utils.logger.WandbLogger")

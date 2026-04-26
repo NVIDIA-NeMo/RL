@@ -71,16 +71,35 @@ uv venv
 > Please do not use `-p/--python` and instead allow `uv venv` to read it from `.python-version`.
 > This ensures that the version of python used is always what we prescribe.
 
+## Configure cuDNN for Transformer Engine (Bare Metal Only)
+
+> [!IMPORTANT]
+> **Skip this section if you are using the NeMo RL container** — these environment variables are already set in the Dockerfile.
+>
+> When running on bare metal (outside a container), your system may have a different cuDNN version than the pip-installed `nvidia-cudnn-cu12` package. Transformer Engine (TE) prioritizes system libraries by default, which can cause version mismatch crashes or force fallback to slower attention backends (UnfusedDotProductAttention instead of FusedAttention).
+>
+> Set these environment variables before running any commands:
+>
+> ```sh
+> # Point TE at the pip-installed cuDNN (adjust path if UV_PROJECT_ENVIRONMENT is set)
+> export CUDNN_HOME=.venv/lib/python3.13/site-packages/nvidia/cudnn
+> export LD_LIBRARY_PATH=".venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
+>
+> # Verify TE picks up the correct cuDNN version (TE is in the mcore extra).
+> # The version should match nvidia-cudnn-cu12 pinned in pyproject.toml (currently 9.19.0).
+> uv run --extra mcore python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
+> ```
+
 ## Using UV to Run Commands
 
 Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file.
 
 ```sh
 # Example: Run GRPO with DTensor backend
-uv run python examples/run_grpo_math.py
+uv run python examples/run_grpo.py
 
 # Example: Run GRPO with Megatron backend
-uv run python examples/run_grpo_math.py --config examples/configs/grpo_math_1B_megatron.yaml
+uv run python examples/run_grpo.py --config examples/configs/grpo_math_1B_megatron.yaml
 ```
 
 > [!NOTE]

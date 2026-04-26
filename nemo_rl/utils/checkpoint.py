@@ -49,6 +49,7 @@ class CheckpointingConfig(TypedDict):
     model_cache_dir (str): Directory for model cache (for safetensors format).
     model_repo_id (str): Repository ID for the model (for safetensors format).
     is_peft (bool): Whether the model uses PEFT.
+    save_optimizer (bool): Whether to save optimizer state with checkpoints.
     """
 
     enabled: bool
@@ -58,6 +59,7 @@ class CheckpointingConfig(TypedDict):
     save_period: int
     keep_top_k: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
+    save_optimizer: NotRequired[bool]  # Default: True
     # New nemo-automodel integration fields
     model_save_format: NotRequired[str | None]  # Default: "safetensors"
     save_consolidated: NotRequired[bool]  # Default: False
@@ -65,6 +67,7 @@ class CheckpointingConfig(TypedDict):
     model_repo_id: NotRequired[str]  # Default: ""
     is_peft: NotRequired[bool]  # Default: False
     peft_config: NotRequired[Any]  # Default: None
+    is_async: NotRequired[bool]  # Default: False
 
 
 class CheckpointManager:
@@ -98,6 +101,7 @@ class CheckpointManager:
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
+        self.save_optimizer = config["save_optimizer"]
 
         # Store nemo-automodel specific config options
         self.model_save_format = config.get("model_save_format", "safetensors")
@@ -105,6 +109,47 @@ class CheckpointManager:
         self.model_cache_dir = config.get("model_cache_dir", "")
         self.model_repo_id = config.get("model_repo_id", "")
         self.is_peft = config.get("is_peft", False)
+
+    @staticmethod
+    def get_resume_paths(
+        last_checkpoint_path: Optional[PathLike],
+    ) -> tuple[Optional[Path], Optional[Path]]:
+        """Get weights and optimizer paths for resuming from a checkpoint.
+
+        Args:
+            last_checkpoint_path: Path to the last checkpoint, or None if starting fresh.
+
+        Returns:
+            Tuple of (weights_path, optimizer_path). Both are None if no checkpoint.
+            optimizer_path is None if checkpoint exists but optimizer state was not saved.
+        """
+        if last_checkpoint_path:
+            weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+            optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+
+            # DTensor path
+            if optimizer_path.exists():
+                return weights_path, optimizer_path
+
+            # Megatron path
+            common_pt_path = weights_path / "iter_0000000" / "common.pt"
+            if common_pt_path.exists():
+                common_pt_obj = torch.load(common_pt_path, map_location="cpu")
+                if "optimizer" in common_pt_obj:
+                    # In Megatron, optimizer_path is only a flag to indicate that the optimizer
+                    # state is embedded in the weights_path. We will actually load the optimizer
+                    # state from the weights_path.
+                    return weights_path, optimizer_path
+
+            warnings.warn(
+                f"Optimizer state not found at {optimizer_path} (DTensor path), and no embedded "
+                f"optimizer state detected under {weights_path} (Megatron path). "
+                "Optimizer will be freshly initialized.",
+                stacklevel=2,
+            )
+            optimizer_path = None
+            return weights_path, optimizer_path
+        return None, None
 
     def init_tmp_checkpoint(
         self,
@@ -230,25 +275,41 @@ class CheckpointManager:
         """Get the path to the best checkpoint based on the metric.
 
         Returns the path to the checkpoint with the best metric value. If no checkpoints
-        exist, returns None. If the metric isn't found, we warn and return the latest checkpoint.
+        exist, returns None. If some checkpoints are missing the metric, they are filtered
+        out with a warning. If no checkpoints have the metric, returns the latest checkpoint.
 
         Returns:
-            Optional[str]: Path to the best checkpoint, or None if no valid checkpoints exist.
+            Optional[str]: Path to the best checkpoint, or None if no checkpoints exist.
         """
         checkpoint_history = _load_checkpoint_history(self.checkpoint_dir)
         if len(checkpoint_history) == 0:
             return None
-        # sort by metric value
-        if self.metric_name not in checkpoint_history[0][2]:
+
+        # Filter checkpoints that have the metric
+        valid_checkpoints = [c for c in checkpoint_history if self.metric_name in c[2]]
+        ignored_count = len(checkpoint_history) - len(valid_checkpoints)
+
+        if ignored_count > 0:
+            ignored_steps = [
+                c[0] for c in checkpoint_history if self.metric_name not in c[2]
+            ]
             warnings.warn(
-                f"Metric {self.metric_name} not found in checkpoint history. Returning last"
+                f"Ignoring {ignored_count} checkpoint(s) at step(s) {ignored_steps} that do not have "
+                f"metric '{self.metric_name}'. Consider enabling val_at_end or adjusting val_period "
+                f"to align with max_steps."
+            )
+
+        if len(valid_checkpoints) == 0:
+            warnings.warn(
+                f"No checkpoints contain metric '{self.metric_name}'. Returning latest checkpoint. "
+                f"Consider enabling val_at_end or adjusting val_period to align with max_steps."
             )
             return self.get_latest_checkpoint_path()
 
-        checkpoint_history.sort(
+        valid_checkpoints.sort(
             key=lambda x: x[2][self.metric_name], reverse=self.higher_is_better
         )
-        return str(checkpoint_history[0][1])
+        return str(valid_checkpoints[0][1])
 
     def get_latest_checkpoint_path(self) -> Optional[str]:
         """Get the path to the latest checkpoint.

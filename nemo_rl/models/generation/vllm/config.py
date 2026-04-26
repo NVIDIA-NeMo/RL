@@ -36,6 +36,9 @@ class VllmSpecificArgs(TypedDict):
     expose_http_server: NotRequired[bool]
     # These kwargs are passed to the vllm.LLM HTTP server Chat Completions endpoint config. Typically this will include things like tool parser, chat template, etc
     http_server_serving_chat_kwargs: NotRequired[dict[str, Any]]
+    # Miscellaneous top level vLLM HTTP server arguments.
+    # A filepath that can be imported to register a vLLM tool parser
+    tool_parser_plugin: NotRequired[str]
 
 
 class VllmConfig(GenerationConfig):

@@ -128,7 +128,7 @@ Example with `max_trajectory_age_steps: 1`:
 
 The following sequence diagram illustrates the interactions between the three main components:
 
-```
+```mermaid
 sequenceDiagram
     participant Training as Training Loop
     participant Collector as Trajectory Collector

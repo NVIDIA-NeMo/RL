@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import defaultdict
 from typing import Any, Optional
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -65,20 +66,130 @@ def format_prompt_for_vllm_generation(
                 continue
             # init prompt dict
             prompt_dict = {"prompt": msg}
-            # add additional data if present
+            # collect multi_modal_data from images and audios
+            multi_modal_data = {}
             images = data.get("vllm_images", None)
-            if images is None or len(images[i]) == 0:
+            if images is not None and len(images[i]) > 0:
+                multi_modal_data["image"] = (
+                    images[i][0] if len(images[i]) == 1 else images[i]
+                )
+            audios = data.get("vllm_audios", None)
+            if audios is not None and len(audios[i]) > 0:
+                multi_modal_data["audio"] = (
+                    audios[i][0] if len(audios[i]) == 1 else audios[i]
+                )
+            if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
                 continue
-            else:
-                prompt_dict["multi_modal_data"] = {
-                    "image": images[i][0] if len(images[i]) == 1 else images[i]
-                }
+            prompt_dict["multi_modal_data"] = multi_modal_data
             prompts.append(prompt_dict)
     else:
-        # Regular LLM generation using token_ids
+        # Regular LLM generation using token_ids (pre-tokenized).
+        # Note: eval.py uses raw prompt strings instead of token IDs because its
+        # collate function produces message_log dicts, not tokenized tensors.
+        # Both are valid vLLM input formats but may tokenize slightly differently.
         for i in range(start_idx, end_idx):
             # Use input_lengths to get only valid tokens (not padding)
             prompts.append(_get_regular_prompt(i))
 
     return prompts if return_all else prompts[0]
+
+
+def aggregate_spec_decode_counters(
+    worker_metrics: list[dict[str, float | list[float]]],
+) -> dict[str | tuple[str, int], float]:
+    """Aggregate speculative decoding counters from multiple workers.
+
+    Combines spec decode metrics collected from DP leader workers into
+    a single aggregated counter dictionary.
+
+    Args:
+        worker_metrics: List of metric dictionaries from each worker.
+            Each dict maps metric names to float values or lists of floats
+            (for per-position metrics).
+
+    Returns:
+        Dictionary mapping metric names to their aggregated float values.
+        Per-position metrics use (name, position) tuples as keys.
+
+    Example:
+        >>> metrics_from_workers = policy_generation.get_metrics()
+        >>> counters = aggregate_spec_decode_counters(metrics_from_workers)
+        >>> print(counters.get("vllm:spec_decode_num_drafts", 0))
+        1234.0
+    """
+    counters: dict[str | tuple[str, int], float] = defaultdict(float)
+
+    for report in worker_metrics:
+        for metric_name, value in report.items():
+            if "spec_decode" in metric_name:
+                if isinstance(value, list):
+                    # Per-position metrics (e.g., acceptance counts at each draft position)
+                    for position, pos_value in enumerate(value, 1):
+                        counters[metric_name, position] += pos_value
+                else:
+                    counters[metric_name] += value
+
+    return dict(counters)
+
+
+def compute_spec_decode_metrics(
+    start_counters: dict[str | tuple[str, int], float],
+    end_counters: dict[str | tuple[str, int], float],
+) -> dict[str, float]:
+    """Compute delta and derived metrics for speculative decoding.
+
+    Calculates the difference between two counter snapshots and derives
+    acceptance rate and acceptance length metrics for logging.
+
+    Args:
+        start_counters: Counter snapshot taken before generation.
+        end_counters: Counter snapshot taken after generation.
+
+    Returns:
+        Dictionary of metrics suitable for logging to wandb/tensorboard.
+        Keys are prefixed with "vllm/" for namespace consistency.
+        Includes:
+            - vllm/spec_num_drafts: Total number of draft batches
+            - vllm/spec_num_draft_tokens: Total draft tokens generated
+            - vllm/spec_num_accepted_tokens: Total tokens accepted
+            - vllm/spec_acceptance_length: Average accepted tokens per draft + 1
+            - vllm/spec_acceptance_rate: Ratio of accepted to draft tokens
+            - vllm/{metric}-{position}: Per-position acceptance counts
+            - vllm/spec_acceptance_rate-pos-{position}: Per-position acceptance rates
+    """
+    keys = set(start_counters) | set(end_counters)
+    delta = {k: end_counters.get(k, 0.0) - start_counters.get(k, 0.0) for k in keys}
+
+    num_drafts = delta.get("vllm:spec_decode_num_drafts", 0.0)
+    num_draft_tokens = delta.get("vllm:spec_decode_num_draft_tokens", 0.0)
+    num_accepted_tokens = delta.get("vllm:spec_decode_num_accepted_tokens", 0.0)
+
+    # acceptance_length = 1 + (accepted / drafts) represents average tokens
+    # generated per draft batch (1 target model token + accepted draft tokens)
+    acceptance_length = (
+        1.0 + (num_accepted_tokens / num_drafts) if num_drafts > 0 else 1.0
+    )
+    acceptance_rate = (
+        num_accepted_tokens / num_draft_tokens if num_draft_tokens > 0 else 0.0
+    )
+
+    spec_metrics: dict[str, float] = {
+        "vllm/spec_num_drafts": num_drafts,
+        "vllm/spec_num_draft_tokens": num_draft_tokens,
+        "vllm/spec_num_accepted_tokens": num_accepted_tokens,
+        "vllm/spec_acceptance_length": acceptance_length,
+        "vllm/spec_acceptance_rate": acceptance_rate,
+    }
+
+    # Add per-position metrics for detailed analysis
+    for key, value in delta.items():
+        if isinstance(key, tuple):
+            metric_name, position = key
+            spec_metrics[f"vllm/{metric_name}-{position}"] = value
+            if num_drafts > 0:
+                spec_metrics[f"vllm/spec_acceptance_rate-pos-{position}"] = (
+                    value / num_drafts
+                )
+
+    return spec_metrics

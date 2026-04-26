@@ -1,0 +1,14 @@
+defaults: ./grpo-llama3.1-8b-instruct-2n8g-fsdp2tp1-noncolocated.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n4g-fsdp2tp1-noncolocated
+logger:
+  log_dir: logs/grpo-llama3.1-8b-instruct-2n4g-fsdp2tp1-noncolocated
+  wandb:
+    name: grpo-llama3.1-8b-instruct-2n4g-fsdp2tp1-noncolocated
+cluster:
+  gpus_per_node: 4
+policy:
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 4

@@ -11,6 +11,10 @@ This module provides a suite of tools to enable FP8 quantization for large langu
 - Uses **TransformerEngine** for linear layer implementation.
 - Supports both **Deepseek-style sub-channel scaling** and **per-tensor scaling**.
 
+### Recommended recipe
+- For Hopper GPUs we recommend to use FP8 (Deepseek-style) precision for both generation and training for best convergence and speedup
+- For Blackwell GPUs, FP8 (deepseek-style) with FP32 scaling factor is not supported in training. Currently we recommend to use FP8 precision for generation and BF16 for training. We are actively exploring other recipes for better performance.
+
 ## Integration with NeMo RL
 
 NeMo RL applies monkey patches to several core `vLLM` components to enable FP8 generation for reinforcement learning.  
@@ -89,4 +93,4 @@ The above results are from Llama-3.1-8B-Instruct GRPO experiments. You can run t
 * For FP8: `examples/configs/grpo_math_8B_megatron_fp8.yaml`
 
 In the experiment in this figure, enabling FP8 rollout and training gives 15%-25% decrease in step time, and the validation accuracy curves match up to 1000 steps.
-Efforts are ongoing to performs longer runs and further optimize performance.
+Efforts are ongoing to perform longer runs and further optimize performance.

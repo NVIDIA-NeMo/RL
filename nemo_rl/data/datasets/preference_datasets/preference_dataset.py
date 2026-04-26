@@ -13,49 +13,52 @@
 # limitations under the License.
 from typing import Optional
 
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import load_dataset_from_path
-from nemo_rl.data.interfaces import TaskDataSpec
 
 
-class PreferenceDataset:
+class PreferenceDataset(RawDataset):
     """Dataset class for preference data which can be loaded from a JSON file.
 
     This class handles loading of preference data for DPO and RM training.
     The input JSONL files should contain valid JSON objects formatted like this:
     {
-        "context": list of dicts, # The prompt message (including previous turns, if any)
-        "completions": list of dicts, # The list of completions
+        "context": list[dict],              # The prompt message (including previous turns, if any)
+        "completions": [                    # The list of completions
             {
-                "rank": int, # The rank of the completion (lower rank is preferred)
-                "completion": list of dicts, # The completion message(s)
-            }
+                "rank": 0,                  # The rank of the completion (lower rank is preferred)
+                "completion": list[dict],   # The completion message(s)
+            },
+            {
+                "rank": 1,                  # The rank of the completion (lower rank is preferred)
+                "completion": list[dict],   # The completion message(s)
+            },
+            ...                             # More completions can be added if needed
+        ]
     }
+    Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/dpo.md#datasets for more details.
 
     Args:
-        train_data_path: Path to the JSON file containing training data
-        val_data_path: Path to the JSON file containing validation data
-        train_split: Split name for the training data, used for HuggingFace datasets, default is None
-        val_split: Split name for the validation data, used for HuggingFace datasets, default is None
+        data_path: Path to the dataset JSON file
+        subset: Optional subset name for the dataset, used for HuggingFace datasets
+        split: Optional split name for the dataset, used for HuggingFace datasets
     """
 
     def __init__(
         self,
-        train_data_path: str,
-        val_data_path: Optional[str] = None,
-        train_split: Optional[str] = None,
-        val_split: Optional[str] = None,
+        data_path: str,
+        subset: Optional[str] = None,
+        split: Optional[str] = None,
+        **kwargs,
     ):
-        # load from json file or huggingface
-        train_ds = load_dataset_from_path(train_data_path, train_split)
-        if val_data_path:
-            val_ds = load_dataset_from_path(val_data_path, val_split)
-        else:
-            val_ds = None
+        self.task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
+        if self.task_name[0] == "-":
+            self.task_name = self.task_name[1:]
 
-        # store the formatted dataset
-        self.formatted_ds = {
-            "train": train_ds,
-            "validation": val_ds,
-        }
+        # load from local or huggingface
+        self.dataset = load_dataset_from_path(data_path, subset, split)
 
-        self.task_spec = TaskDataSpec(task_name="PreferenceDataset")
+        # format the dataset
+        self.dataset = self.dataset.add_column(
+            "task_name", [self.task_name] * len(self.dataset)
+        )

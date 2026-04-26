@@ -14,6 +14,7 @@
 import os
 import warnings
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -22,7 +23,7 @@ import torch
 from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -51,6 +52,7 @@ from nemo_rl.utils.flops_tracker import (
     get_default_hf_config,
     get_theoretical_tflops,
 )
+from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
 
@@ -71,26 +73,41 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         optimizer_path: Optional[PathLike] = None,
         init_reference_model: bool = True,
         processor: Optional[AutoProcessor] = None,
+        worker_extension_cls_fqn: Optional[str] = None,
     ):
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:
             optimizer_path = os.path.abspath(optimizer_path)
 
-        worker_builder_cls: str
+        worker_builder_cls_fqn: str
         tp_size = 1
         pp_size = 1
         cp_size = 1
+        use_v2 = False
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
+        draft_enabled = bool(config.get("draft", {}).get("enabled", False))
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
+        if draft_enabled and not megatron_enable:
+            raise ValueError(
+                "policy.draft.enabled=true is only supported with the Megatron backend. "
+                "Set policy.megatron_cfg.enabled=true or disable policy.draft."
+            )
+        if draft_enabled and bool(
+            config.get("sequence_packing", {}).get("enabled", False)
+        ):
+            raise ValueError(
+                "policy.draft.enabled=true does not support sequence packing yet. "
+                "Disable policy.sequence_packing.enabled or policy.draft."
+            )
         if megatron_enable:
-            worker_builder_cls = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
+            worker_builder_cls_fqn = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
@@ -113,24 +130,56 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
             use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
             if use_v2:
-                worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+                worker_builder_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+
+                if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+                    warnings.warn(
+                        "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorPolicyWorker V2. This variable is set in our container, but "
+                        "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
+                    )
             else:
                 assert (
                     config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
                     is False
                 ), "LoRA is not supported for DTensorPolicyWorker V1"
-                worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+                worker_builder_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
 
+        # If a worker extension class is provided, use it instead of the default worker builder class
+        if worker_extension_cls_fqn is not None:
+            print(
+                f"Using worker extension class: {worker_extension_cls_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
+            )
+            worker_builder_cls_fqn = worker_extension_cls_fqn
+
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
         num_nodes = num_nodes or cluster.node_count()
         workers_per_node = workers_per_node or cluster.workers_per_node()
         actual_world_size = num_nodes * workers_per_node
+
+        if (
+            not bool(os.environ.get("NRL_IGNORE_TP_ACCURACY_CHECK"))
+            and "logprob_batch_size" in config
+            and tp_size >= 4
+        ):
+            sep_line = "\n" + ("-" * 80)
+            assert config["train_micro_batch_size"] == config["logprob_batch_size"], (
+                f"{sep_line}\n"
+                "There is a known batch-variant accuracy issue with TP>=4 for both DTensor and Megatron backend.\n"
+                "See https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause for more details.\n"
+                "\n"
+                "Please choose either of the following solutions to avoid this issue:\n"
+                "1. Set tp_size to 1 or 2. (tensor_parallel_size for DTensor, or tensor_model_parallel_size for Megatron)\n"
+                "2. Set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value.\n"
+                "3. Set loss_fn.force_on_policy_ratio=true to force ratio=1.0, this requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt.\n"
+                "4. Set NRL_IGNORE_TP_ACCURACY_CHECK=1 to bypass this check. (not recommended)"
+                f"{sep_line}\n"
+            )
 
         if actual_world_size < model_parallel_size:
             raise ValueError(
@@ -165,17 +214,28 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
 
         pre_init_queue = RayQueue()
-        worker_builder = RayWorkerBuilder(
-            worker_builder_cls,
-            config,
-            tokenizer=tokenizer,
-            processor=processor,
+
+        worker_kwargs = dict(
             init_optimizer=init_optimizer,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_reference_model=init_reference_model,
             worker_sharding_annotations=self.sharding_annotations,
             pre_init_communication_queue=pre_init_queue,
+        )
+
+        if use_v2:
+            # DTensor v2 workers reconstruct tokenizer/processor locally to avoid
+            # pickling across incompatible transformers versions (v4 head → v5 worker).
+            config["tokenizer"]["use_processor"] = processor is not None
+        else:
+            worker_kwargs["tokenizer"] = tokenizer
+            worker_kwargs["processor"] = processor
+
+        worker_builder = RayWorkerBuilder(
+            worker_builder_cls_fqn,
+            config,
+            **worker_kwargs,
         )
 
         self.worker_group = RayWorkerGroup(
@@ -220,9 +280,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         if config["sequence_packing"]["enabled"]:
             self.use_sequence_packing = True
-            sequence_length_pad_multiple = (
-                cp_size * 2 * tp_size if cp_size > 1 else tp_size
-            )
+            sequence_length_pad_multiple = config["make_sequence_length_divisible_by"]
             self.sequence_packing_args: SequencePackingArgs = {
                 "algorithm": config["sequence_packing"]["algorithm"],
                 "input_key": "input_ids",
@@ -236,6 +294,44 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.use_sequence_packing = False
 
         self.cfg = config
+
+    def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:
+        """Run a method on all workers in parallel with the same data.
+
+        Mainly used for worker extension classes.
+
+        Args:
+            method_name: The name of the method to run.
+            *args: The positional arguments to pass to the method.
+            **kwargs: The keyword arguments to pass to the method.
+
+        Returns:
+            The results of the method run on all workers.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name, *args, **kwargs
+        )
+        results = ray.get(futures)
+        return results
+
+    def run_all_workers_multiple_data(self, method_name: str, *args, **kwargs) -> Any:
+        """Run a method on all workers in parallel with different data.
+
+        Mainly used for worker extension classes.
+
+        Args:
+            method_name: The name of the method to run.
+            *args: The positional arguments to pass to the method.
+            **kwargs: The keyword arguments to pass to the method.
+
+        Returns:
+            The results of the method run on all workers.
+        """
+        futures = self.worker_group.run_all_workers_multiple_data(
+            method_name, *args, **kwargs
+        )
+        results = ray.get(futures)
+        return results
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
@@ -252,7 +348,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return futures
 
     def get_logprobs(
-        self, data: BatchedDataDict[GenerationDatumSpec]
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        timer: Optional[Timer] = None,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a data dict.
 
@@ -265,46 +363,52 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
 
-        if self.use_dynamic_batches:
-            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
-                "dynamic_batching"
-            ]["logprob_mb_tokens"]
-            sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
-                dp_size,
-                batch_size=None,
-                dynamic_batching_args=self.dynamic_batching_args,
-            )
-        elif self.use_sequence_packing:
-            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
-                "sequence_packing"
-            ]["logprob_mb_tokens"]
-            # we just shard into DP shards here as Sequence packing allows for CP.
-            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
-                dp_size,
-                batch_size=None,
-                sequence_packing_args=self.sequence_packing_args,
-            )
-        else:
-            sharded_data = data.shard_by_batch_size(  # type: ignore
-                dp_size,
-                batch_size=None,
-            )
+        with timer.time("get_logprobs/shard_data") if timer else nullcontext():
+            if self.use_dynamic_batches:
+                self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                    "dynamic_batching"
+                ]["logprob_mb_tokens"]
+                sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
+                    dp_size,
+                    batch_size=None,
+                    dynamic_batching_args=self.dynamic_batching_args,
+                )
+            elif self.use_sequence_packing:
+                self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                    "sequence_packing"
+                ]["logprob_mb_tokens"]
+                # we just shard into DP shards here as Sequence packing allows for CP.
+                sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                    dp_size,
+                    batch_size=None,
+                    sequence_packing_args=self.sequence_packing_args,
+                )
+            else:
+                sharded_data = data.shard_by_batch_size(  # type: ignore
+                    dp_size,
+                    batch_size=None,
+                )
 
-        futures = self.worker_group.run_all_workers_sharded_data(
-            "get_logprobs",
-            data=sharded_data,
-            in_sharded_axes=["data_parallel"],
-            replicate_on_axes=[
-                "context_parallel",
-                "tensor_parallel",
-                "pipeline_parallel",
-            ],
-            output_is_replicated=[
-                "context_parallel",
-                "tensor_parallel",
-                "pipeline_parallel",
-            ],
-        )
+        with (
+            timer.time("get_logprobs/submit_logprob_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_logprobs",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+            )
         logprobs: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(
             self.worker_group.get_all_worker_results(futures)
         )
@@ -320,6 +424,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
         """Get the logprobs of the reference policy for a data dict.
 
@@ -328,46 +433,58 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
-        if self.use_dynamic_batches:
-            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
-                "dynamic_batching"
-            ]["logprob_mb_tokens"]
-            sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
-                dp_size,
-                batch_size=None,
-                dynamic_batching_args=self.dynamic_batching_args,
-            )
-        elif self.use_sequence_packing:
-            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
-                "sequence_packing"
-            ]["logprob_mb_tokens"]
-            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
-                dp_size,
-                batch_size=None,
-                sequence_packing_args=self.sequence_packing_args,
-            )
-        else:
-            sharded_data = data.shard_by_batch_size(  # type: ignore
-                dp_size,
-                batch_size=None,
-            )
+        with (
+            timer.time("get_reference_policy_logprobs/shard_data")
+            if timer
+            else nullcontext()
+        ):
+            if self.use_dynamic_batches:
+                self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                    "dynamic_batching"
+                ]["logprob_mb_tokens"]
+                sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
+                    dp_size,
+                    batch_size=None,
+                    dynamic_batching_args=self.dynamic_batching_args,
+                )
+            elif self.use_sequence_packing:
+                self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                    "sequence_packing"
+                ]["logprob_mb_tokens"]
+                sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                    dp_size,
+                    batch_size=None,
+                    sequence_packing_args=self.sequence_packing_args,
+                )
+            else:
+                sharded_data = data.shard_by_batch_size(  # type: ignore
+                    dp_size,
+                    batch_size=None,
+                )
 
-        futures = self.worker_group.run_all_workers_sharded_data(
-            "get_reference_policy_logprobs",
-            data=sharded_data,
-            in_sharded_axes=["data_parallel"],
-            replicate_on_axes=[
-                "context_parallel",
-                "tensor_parallel",
-                "pipeline_parallel",
-            ],
-            output_is_replicated=[
-                "context_parallel",
-                "tensor_parallel",
-                "pipeline_parallel",
-            ],
-            common_kwargs={"micro_batch_size": micro_batch_size},
-        )
+        with (
+            timer.time(
+                "get_reference_policy_logprobs/submit_reference_policy_logprob_futures"
+            )
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_reference_policy_logprobs",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={"micro_batch_size": micro_batch_size},
+            )
         logprobs: BatchedDataDict[ReferenceLogprobOutputSpec] = (
             BatchedDataDict.from_batches(
                 self.worker_group.get_all_worker_results(futures)
@@ -386,52 +503,59 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         data: BatchedDataDict[GenerationDatumSpec],
         k: int,
         micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
-        if self.use_dynamic_batches:
-            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
-                "dynamic_batching"
-            ]["logprob_mb_tokens"]
-            sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
-                dp_size,
-                batch_size=None,
-                dynamic_batching_args=self.dynamic_batching_args,
-            )
-        elif self.use_sequence_packing:
-            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
-                "sequence_packing"
-            ]["logprob_mb_tokens"]
-            # we just shard into DP shards here as Sequence packing allows for CP.
-            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
-                dp_size,
-                batch_size=None,
-                sequence_packing_args=self.sequence_packing_args,
-            )
-        else:
-            sharded_data = data.shard_by_batch_size(  # type: ignore
-                dp_size,
-                batch_size=None,
-            )
+        with timer.time("get_topk_logits/shard_data") if timer else nullcontext():
+            if self.use_dynamic_batches:
+                self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                    "dynamic_batching"
+                ]["logprob_mb_tokens"]
+                sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
+                    dp_size,
+                    batch_size=None,
+                    dynamic_batching_args=self.dynamic_batching_args,
+                )
+            elif self.use_sequence_packing:
+                self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                    "sequence_packing"
+                ]["logprob_mb_tokens"]
+                # we just shard into DP shards here as Sequence packing allows for CP.
+                sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                    dp_size,
+                    batch_size=None,
+                    sequence_packing_args=self.sequence_packing_args,
+                )
+            else:
+                sharded_data = data.shard_by_batch_size(  # type: ignore
+                    dp_size,
+                    batch_size=None,
+                )
 
-        futures = self.worker_group.run_all_workers_sharded_data(
-            "get_topk_logits",
-            data=sharded_data,
-            in_sharded_axes=["data_parallel"],
-            replicate_on_axes=[
-                "context_parallel",
-                "tensor_parallel",
-                "pipeline_parallel",
-            ],
-            output_is_replicated=[
-                "context_parallel",
-                "tensor_parallel",
-                "pipeline_parallel",
-            ],
-            common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
-        )
+        with (
+            timer.time("get_topk_logits/submit_topk_logits_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_topk_logits",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+            )
 
         # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
         worker_batches = self.worker_group.get_all_worker_results(futures)
@@ -454,35 +578,37 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        timer: Optional[Timer] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        if self.use_dynamic_batches:
-            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
-                "dynamic_batching"
-            ]["train_mb_tokens"]
-            sharded_data, _ = data.shard_by_batch_size(
-                dp_size,
-                batch_size=batch_size,
-                dynamic_batching_args=self.dynamic_batching_args,
-            )
-        elif self.use_sequence_packing:
-            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
-                "sequence_packing"
-            ]["train_mb_tokens"]
-            sharded_data, _ = data.shard_by_batch_size(
-                dp_size,
-                batch_size=batch_size,
-                sequence_packing_args=self.sequence_packing_args,
-            )
-        else:
-            sharded_data = data.shard_by_batch_size(
-                dp_size,
-                batch_size=batch_size,
-            )
+        with timer.time("policy_training/sharding_data") if timer else nullcontext():
+            if self.use_dynamic_batches:
+                self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                    "dynamic_batching"
+                ]["train_mb_tokens"]
+                sharded_data, _ = data.shard_by_batch_size(
+                    dp_size,
+                    batch_size=batch_size,
+                    dynamic_batching_args=self.dynamic_batching_args,
+                )
+            elif self.use_sequence_packing:
+                self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                    "sequence_packing"
+                ]["train_mb_tokens"]
+                sharded_data, _ = data.shard_by_batch_size(
+                    dp_size,
+                    batch_size=batch_size,
+                    sequence_packing_args=self.sequence_packing_args,
+                )
+            else:
+                sharded_data = data.shard_by_batch_size(
+                    dp_size,
+                    batch_size=batch_size,
+                )
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
@@ -491,27 +617,32 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 self.flops_tracker.track_batch(input_lengths.tolist())
 
         # Train each shard in parallel
-        futures = self.worker_group.run_all_workers_sharded_data(
-            "train",
-            data=sharded_data,
-            in_sharded_axes=["data_parallel"],
-            replicate_on_axes=[
-                "context_parallel",
-                "tensor_parallel",
-                "pipeline_parallel",
-            ],
-            output_is_replicated=[
-                "context_parallel",
-                "tensor_parallel",
-                "pipeline_parallel",
-            ],
-            common_kwargs={
-                "loss_fn": loss_fn,
-                "eval_mode": eval_mode,
-                "gbs": batch_size,
-                "mbs": micro_batch_size,
-            },
-        )
+        with (
+            timer.time("policy_training/submit_training_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "train",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={
+                    "loss_fn": loss_fn,
+                    "eval_mode": eval_mode,
+                    "gbs": batch_size,
+                    "mbs": micro_batch_size,
+                },
+            )
         results = self.worker_group.get_all_worker_results(futures)
 
         # Aggregate the results
@@ -748,6 +879,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "stream_weights_via_ipc_zmq",
             buffer_size_bytes=buffer_size_bytes,
             kv_scales=kv_scales,
+        )
+        return futures
+
+    def stream_weights_via_http(
+        self, sglang_url_to_gpu_uuids: dict[str, list[str]]
+    ) -> list[ray.ObjectRef]:
+        """Send the weights to SGLang servers via HTTP API.
+
+        Args:
+            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "stream_weights_via_http",
+            sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
         )
         return futures
 

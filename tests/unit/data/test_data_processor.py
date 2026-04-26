@@ -146,7 +146,7 @@ def test_math_hf_data_processor(tokenizer_name, dataset_cls):
     task_data_processors[task_name] = (math_task_spec, math_hf_data_processor)
 
     dataset = AllTaskProcessedDataset(
-        dataset=data.formatted_ds["train"],
+        dataset=data.dataset,
         tokenizer=tokenizer,
         default_task_data_spec=math_task_spec,
         task_data_processors=task_data_processors,
@@ -189,6 +189,46 @@ def test_math_hf_data_processor_without_prompt():
     assert len(result["message_log"]) == 1
     assert result["message_log"][0]["role"] == "user"
     assert "Solve 1+1." in result["message_log"][0]["content"]
+
+
+def test_math_hf_data_processor_with_system_prompt():
+    datum_dict = {
+        "messages": [
+            {"role": "user", "content": "Solve 1+1."},
+            {"role": "assistant", "content": "2"},
+        ],
+        "task_name": "math",
+    }
+    tokenizer = DummyTokenizer()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write("You are a math expert.")
+        system_prompt_file = f.name
+
+    try:
+        math_task_spec = TaskDataSpec(
+            task_name="math",
+            prompt_file=None,
+            system_prompt_file=system_prompt_file,
+        )
+
+        result = math_hf_data_processor(
+            datum_dict=datum_dict,
+            task_data_spec=math_task_spec,
+            tokenizer=tokenizer,
+            max_seq_length=512,
+            idx=0,
+        )
+
+        assert result["extra_env_info"]["ground_truth"] == "2"
+        assert result["loss_multiplier"] == 1.0
+        assert len(result["message_log"]) == 1
+        assert result["message_log"][0]["role"] == "user"
+        # System prompt should be included in the rendered content
+        assert "You are a math expert." in result["message_log"][0]["content"]
+        assert "Solve 1+1." in result["message_log"][0]["content"]
+    finally:
+        os.unlink(system_prompt_file)
 
 
 @pytest.fixture

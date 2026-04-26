@@ -1,0 +1,3 @@
+fault_tolerance:
+  initial_rank_heartbeat_timeout: 360
+  restart_policy: any-failed

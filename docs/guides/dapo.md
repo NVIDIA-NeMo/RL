@@ -16,7 +16,7 @@ This document focuses on DAPO-specific features: Dynamic Sampling and Overlong R
 To get started quickly, use the example configuration [examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml](../../examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml). You can launch this using the same script as GRPO:
 
 ```bash
-uv run examples/run_grpo_math.py --config examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml {overrides}
+uv run examples/run_grpo.py --config examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml {overrides}
 ```
 
 **Reminder**: Don't forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for LLaMA models.

@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import lru_cache
+from functools import lru_cache, partial
 from types import FunctionType
 from typing import Callable, Optional, Union, cast
 
 import torch
 from hydra.utils import get_class
+from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
@@ -106,6 +107,66 @@ class RotaryEmbedParallel(SequenceParallel):
         return type(outputs)([o.to_local() if use_local_output else o for o in outputs])
 
 
+class ColwiseParallelWithGather(ColwiseParallel):
+    """Custom ColwiseParallel class for gathering output.
+
+    Taken and modified from:
+        https://github.com/pytorch/pytorch/blob/648a664f5aa16ff262248308d2baabba76953380/torch/distributed/tensor/parallel/style.py#L45
+        https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/tensor_parallel.py#L683
+    """
+
+    def __init__(self, gather_output: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.gather_output = gather_output
+
+    @staticmethod
+    def _prepare_output_fn(  # type: ignore
+        output_layouts, use_local_output, gather_output, mod, outputs, device_mesh
+    ):
+        from transformers.integrations.tensor_parallel import all_gather
+
+        # all-gather
+        if gather_output:
+            # Convert DTensor to local tensor before all_gather
+            if isinstance(outputs, DTensor):
+                outputs = outputs.to_local()
+            return all_gather(outputs, device_mesh)
+        # outputs is a shard on last dimension DTensor, i.e. Shard(-1)
+        if outputs.placements != output_layouts:
+            outputs = outputs.redistribute(placements=output_layouts, async_op=True)
+        # back to local tensor
+        return outputs.to_local() if use_local_output else outputs
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        from torch.distributed.tensor import distribute_module
+
+        if isinstance(module, nn.Linear):
+            partition_fn = self._partition_linear_fn
+        elif isinstance(module, nn.Embedding):
+            partition_fn = self._partition_embedding_fn
+        else:
+            raise NotImplementedError(
+                "ColwiseParallel currently only support nn.Linear and nn.Embedding!"
+            )
+
+        return distribute_module(
+            module,
+            device_mesh,
+            partition_fn,
+            partial(
+                self._prepare_input_fn,  # type: ignore
+                self.input_layouts,
+                self.desired_input_layouts,
+            ),
+            partial(
+                self._prepare_output_fn,
+                self.output_layouts,
+                self.use_local_output,
+                self.gather_output,
+            ),
+        )
+
+
 def _parallelize_gemma3(
     model: Union[Gemma3ForCausalLM, Gemma3ForConditionalGeneration],
     sequence_parallel: bool = False,
@@ -133,7 +194,6 @@ def _parallelize_gemma3(
             input_layouts=Replicate(), output_layouts=Shard(1)
         ),
         f"{model_prefix}.rotary_emb": RotaryEmbedParallel(use_local_output=True),
-        f"{model_prefix}.rotary_emb_local": RotaryEmbedParallel(use_local_output=True),
         f"{model_prefix}.layers.*.input_layernorm": SequenceParallel(),
         f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(
             output_layouts=Shard(1)
@@ -296,6 +356,8 @@ def translate_parallel_style(style: str):
         return ColwiseParallel(output_layouts=Replicate())
     elif style == "rowwise_rep":
         return RowwiseParallel(input_layouts=Replicate())
+    elif style == "colwise_gather_output":
+        return ColwiseParallelWithGather(gather_output=True)
     elif style == "sequence_parallel":
         return SequenceParallel()
     else:
@@ -427,19 +489,19 @@ def _parallelize_nm5_h(
         "mixer.down_proj": RowwiseParallel(),
     }
 
-    layers: torch.nn.ModuleList = model.backbone.layers
+    # NemotronH uses .backbone (trust_remote_code) or .model (native transformers >= 5.3.0)
+    inner_model = getattr(model, "backbone", model.model)
+    layers: torch.nn.ModuleList = inner_model.layers
+
     parallelize_module(model, tp_mesh, model_tp_plan)
 
-    for layer in model.backbone.layers:
+    for layer in inner_model.layers:
         if layer.block_type == "mlp":
             parallelize_module(layer, tp_mesh, mlp_tp_plan)
 
     if activation_checkpointing:
         for i in range(len(layers)):
-            if layers[i].block_type == "mlp":
-                layers[i] = checkpoint_wrapper(layers[i])
-
-            if layers[i].block_type == "mamba":
+            if layers[i].block_type in ("mlp", "mamba"):
                 layers[i] = checkpoint_wrapper(layers[i])
 
     mp_policy = MixedPrecisionPolicy(
@@ -461,13 +523,21 @@ def _parallelize_nm5_h(
 
     # do not reshard after forward for root model
     # because its parameters will be used in backward immediately
-    return fully_shard(
+    result = fully_shard(
         model,
         mesh=dp_mesh,
         mp_policy=mp_policy,
         offload_policy=offload_policy,
         reshard_after_forward=False,
     )
+
+    # Register .model so the native transformers forward() (self.model(...)) resolves
+    # correctly after FSDP2 wrapping, regardless of whether the class uses .backbone
+    # (trust_remote_code) or .model (native transformers). kernel_patches.py wraps
+    # the native forward which always calls self.model(...).
+    result.register_module("model", inner_model)
+
+    return result
 
 
 def _parallelize_model(
@@ -511,14 +581,7 @@ def _parallelize_model(
 
     # Handle different model structures
     if model_cls == Gemma3ForConditionalGeneration:
-        # layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
-        layers: list = []
-        for layer in model.language_model.layers:
-            layers.append(layer)
-        # siglip encoder also has the same structure as clip encoder (being the same model after all)
-        for layer in model.vision_tower.vision_model.encoder.layers:
-            layers.append(layer)
-        layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
+        layers: torch.nn.ModuleList = model.model.language_model.layers  # type: ignore
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
 
@@ -541,7 +604,7 @@ def _parallelize_model(
         Qwen2VLForConditionalGeneration,
     ]:
         # VL models have the language model at model.language_model
-        layers: list = []
+        layers: list = []  # type: ignore
         # append language model layers
         for layer in model.language_model.layers:
             layers.append(layer)
@@ -553,7 +616,7 @@ def _parallelize_model(
         num_key_value_heads = model.language_model.config.num_key_value_heads
 
     elif model_cls == SmolVLMForConditionalGeneration:
-        layers: list = []
+        layers: list = []  # type: ignore
         for layer in model.model.text_model.layers:
             layers.append(layer)
         for layer in model.model.vision_model.encoder.layers:
@@ -567,7 +630,7 @@ def _parallelize_model(
         LlavaNextVideoForConditionalGeneration,
         LlavaOnevisionForConditionalGeneration,
     ]:
-        layers: list = []
+        layers: list = []  # type: ignore
         for layer in model.model.language_model.layers:
             layers.append(layer)
         for layer in model.vision_tower.vision_model.encoder.layers:
@@ -576,7 +639,7 @@ def _parallelize_model(
         num_key_value_heads = model.language_model.config.num_key_value_heads
 
     elif model_cls == Mistral3ForConditionalGeneration:
-        layers: list = []
+        layers: list = []  # type: ignore
         for layer in model.model.language_model.layers:
             layers.append(layer)
         for layer in model.model.vision_tower.transformer.layers:
@@ -585,7 +648,7 @@ def _parallelize_model(
         num_key_value_heads = model.model.language_model.config.num_key_value_heads
 
     elif model_cls == Llama4ForConditionalGeneration:
-        layers: list = []
+        layers: list = []  # type: ignore
         for layer in model.language_model.model.layers:
             layers.append(layer)
         for layer in model.vision_model.model.layers:

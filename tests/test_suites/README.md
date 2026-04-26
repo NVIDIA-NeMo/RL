@@ -1,5 +1,16 @@
 # Recipes
 
+## Test Suites
+
+Test suites are defined in `.txt` files that list the test scripts to run:
+
+- `nightly.txt` - H100 tests for nightly CI (8 GPUs per node)
+- `release.txt` - H100 tests for release CI (8 GPUs per node)
+- `nightly_gb200.txt` - GB200 tests for nightly CI (4 GPUs per node)
+- `release_gb200.txt` - GB200 tests for release CI (4 GPUs per node)
+- `performance_h100.txt` - Performance benchmarks for H100 (8 GPUs per node)
+- `performance_gb200.txt` - Performance benchmarks for GB200 (4 GPUs per node)
+
 ## Naming
 
 Base pattern (LLM):
@@ -57,6 +68,26 @@ ls -lh llm/sft-llama3.2-1b-1n8g-fsdp2tp1/
 # -rw-r--r-- 1 terryk dip 142K Apr 23 18:23 metrics.json
 # -rw-r--r-- 1 terryk dip  94K Apr 23 18:23 run.log
 ```
+
+## GB200 Variants
+
+For GB200 systems with 4 GPUs per node, test scripts should include `GPUS_PER_NODE=4` in the CONFIG section. This ensures the launch script uses the correct GPU count for slurm allocation and GPU hour calculations:
+
+```sh
+# ===== BEGIN CONFIG =====
+NUM_NODES=1
+GPUS_PER_NODE=4    # 4 for GB200, 8 for H100 (default)
+STEPS_PER_RUN=450
+MAX_STEPS=450
+NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
+NUM_MINUTES=120
+# ===== END CONFIG =====
+```
+
+GB200 YAML configs should inherit from their 8g counterparts and override:
+- `cluster.gpus_per_node: 4`
+- Any parallelism settings that need to change (e.g., halving `tensor_parallel_size`)
+- Directory/name references updated to reflect the 4g naming
 
 ## Launching with code snapshots
 

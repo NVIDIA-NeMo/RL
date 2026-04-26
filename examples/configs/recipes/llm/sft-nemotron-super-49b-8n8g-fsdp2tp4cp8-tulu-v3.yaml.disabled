@@ -44,9 +44,12 @@ policy:
   - milestones:
     - 10
 data:
-  dataset_name: tulu3_sft_mixture
   num_workers: 20
-  test_size: 0.05
+  train:
+    dataset_name: tulu3_sft_mixture
+    split_validation_size: 0.05
+    seed: ${sft.seed}
+  validation: null
 logger:
   tensorboard_enabled: false
   monitor_gpus: false

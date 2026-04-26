@@ -16,7 +16,7 @@ from typing import Any, Union
 import torch
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
-from nemo_rl.data.interfaces import DatumSpec, DPODatumSpec
+from nemo_rl.data.interfaces import DatumSpec, PreferenceDatumSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
@@ -55,9 +55,11 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         ]
         vllm_images = [datum_spec.get("vllm_images", []) for datum_spec in data_batch]
         vllm_videos = [datum_spec.get("vllm_videos", []) for datum_spec in data_batch]
+        vllm_audios = [datum_spec.get("vllm_audios", []) for datum_spec in data_batch]
         extra_args["vllm_content"] = vllm_content
         extra_args["vllm_images"] = vllm_images
         extra_args["vllm_videos"] = vllm_videos
+        extra_args["vllm_audios"] = vllm_audios
 
     output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
@@ -116,16 +118,32 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     extra_env_info = [datum_spec["extra_env_info"] for datum_spec in data_batch]
     idx = [datum_spec["idx"] for datum_spec in data_batch]
 
+    # Check if any of the data batch has vllm content (multimodal data)
+    extra_args = {}
+    if any(
+        datum_spec.get("vllm_content", None) is not None for datum_spec in data_batch
+    ):
+        extra_args["vllm_content"] = [
+            datum_spec.get("vllm_content", None) for datum_spec in data_batch
+        ]
+        extra_args["vllm_images"] = [
+            datum_spec.get("vllm_images", []) for datum_spec in data_batch
+        ]
+        extra_args["vllm_audios"] = [
+            datum_spec.get("vllm_audios", []) for datum_spec in data_batch
+        ]
+
     output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
         extra_env_info=extra_env_info,
         idx=idx,
+        **extra_args,
     )
     return output
 
 
 def preference_collate_fn(
-    data_batch: list[DPODatumSpec],
+    data_batch: list[PreferenceDatumSpec],
     tokenizer: TokenizerType,
     make_sequence_length_divisible_by: int,
     add_loss_mask: bool,

@@ -12,35 +12,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, NotRequired, TypedDict
+from typing import Literal, NotRequired, TypedDict, Union
 
 
-# TODO: split this typed dict up so it can be PreferenceDataConfig | ResponseDataConfig | etc
-#       so that we can type check the configs more rigorously as opposed to saying everything
-#       is not required.
-class DataConfig(TypedDict):
-    max_input_seq_length: int
+class ResponseDatasetConfig(TypedDict):
+    dataset_name: NotRequired[str]
+    data_path: NotRequired[str]
+    input_key: NotRequired[str]
+    output_key: NotRequired[str]
+    subset: NotRequired[str | None]
+    split: NotRequired[str]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
-    dataset_name: str
-    val_dataset_name: NotRequired[str]
+    env_name: NotRequired[str]
+    processor: NotRequired[str]  # remove once processor is refactored
+    download_dir: NotRequired[str]
+    # Size of the validation data
+    split_validation_size: NotRequired[float]
+    # Seed for train/validation split when split_validation_size > 0
+    seed: NotRequired[int]
+
+
+class PreferenceDatasetConfig(TypedDict):
+    dataset_name: NotRequired[str]
+    data_path: NotRequired[str]
+    prompt_key: NotRequired[str]
+    chosen_key: NotRequired[str]
+    rejected_key: NotRequired[str]
+    subset: NotRequired[str | None]
+    split: NotRequired[str]
+    prompt_file: NotRequired[str | None]
+    system_prompt_file: NotRequired[str | None]
+
+
+class DataConfig(TypedDict):
+    max_input_seq_length: int | None
     add_bos: NotRequired[bool]
     add_eos: NotRequired[bool]
-    input_key: NotRequired[str]
-    output_key: NotRequired[str | None]
     add_generation_prompt: NotRequired[bool]
     add_system_prompt: NotRequired[bool]
-    split: NotRequired[str | None]
     shuffle: bool
-    seed: NotRequired[int | None]
-    download_dir: NotRequired[str]
-    train_data_path: NotRequired[str]
-    val_data_paths: NotRequired[dict[str, str]]
     # Number of data loader workers.
     # Set to 8 or 10 for large batches to improve loading speed.
     # This saturates CPU threads without consuming too much memory
     # However, setting it too high might cause memory issues for long seqlens.
     num_workers: NotRequired[int]
+    # multiple dataloader configs
+    # currently only supported for GRPO
+    use_multiple_dataloader: NotRequired[bool]
+    num_prompts_per_dataloader: NotRequired[int]
+    custom_dataloader: NotRequired[str]
+    # dataset configs
+    train: ResponseDatasetConfig | PreferenceDatasetConfig | list[ResponseDatasetConfig]
+    validation: NotRequired[
+        ResponseDatasetConfig
+        | PreferenceDatasetConfig
+        | list[ResponseDatasetConfig]
+        | None
+    ]
+    # default settings for all datasets, will be overridden by dataset-specific settings
+    default: NotRequired[ResponseDatasetConfig | PreferenceDatasetConfig | None]
 
 
 # ===============================================================================
@@ -135,12 +166,24 @@ class LocalMathEvalDataConfig(TypedDict):
     system_prompt_file: NotRequired[str | None]
 
 
+class MMAUEvalDataConfig(TypedDict):
+    """Config for MMAU (Massive Multitask Audio Understanding) datasets."""
+
+    max_input_seq_length: int
+    dataset_name: Literal["mmau", "TwinkStart/MMAU"]
+    split: NotRequired[str | None]
+    prompt_file: NotRequired[str | None]
+    system_prompt_file: NotRequired[str | None]
+    env_name: NotRequired[str]
+
+
 # Union type for all eval dataset configs
-EvalDataConfigType = (
-    MMLUEvalDataConfig
-    | MMLUProEvalDataConfig
-    | AIMEEvalDataConfig
-    | GPQAEvalDataConfig
-    | MathEvalDataConfig
-    | LocalMathEvalDataConfig
-)
+EvalDataConfigType = Union[
+    MMLUEvalDataConfig,
+    MMLUProEvalDataConfig,
+    AIMEEvalDataConfig,
+    GPQAEvalDataConfig,
+    MathEvalDataConfig,
+    MMAUEvalDataConfig,
+    LocalMathEvalDataConfig,
+]

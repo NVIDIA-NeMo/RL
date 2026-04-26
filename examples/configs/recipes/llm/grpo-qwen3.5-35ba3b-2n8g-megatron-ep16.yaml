@@ -1,0 +1,33 @@
+defaults: ../../grpo_math_1B.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16
+policy:
+  model_name: Qwen/Qwen3.5-35B-A3B-Base
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  dtensor_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    expert_model_parallel_size: 16
+    moe_token_dispatcher_type: allgather
+    apply_rope_fusion: false
+    activation_checkpointing: true
+    defer_fp32_logits: true
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 8
+      # set to eager mode to mitigate https://github.com/vllm-project/vllm/issues/36237
+      enforce_eager: true
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3.5-35ba3b-2n8g-megatron-ep16
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2

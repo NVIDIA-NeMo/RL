@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional
+from typing import Any
 
 from datasets import load_dataset
 
@@ -52,68 +52,38 @@ def format_clevr_cogent_dataset(
     ret = {
         "messages": [
             {"role": "user", "content": user_content},
-            {
-                "role": "assistant",
-                "content": assistant_content,
-            },
+            {"role": "assistant", "content": assistant_content},
         ],
-        "task_name": "clevr-cogent",
+        "task_name": example["task_name"],
     }
     return ret
 
 
-# contain different variants of the CLEVR dataset
-def prepare_clevr_cogent_dataset(
-    split: str = "trainA", task_name: Optional[str] = None
-):
-    if task_name is None:
-        task_name = "clevr-cogent"
-
-    if split == "trainA":
-        tr_dataset = load_dataset("MMInstruction/Clevr_CoGenT_TrainA_70K_Complex")[
-            "train"
-        ]
-        val_dataset = load_dataset("MMInstruction/Clevr_CoGenT_ValA")["train"]
-    elif split == "trainB":
-        tr_dataset = load_dataset("MMInstruction/Clevr_CoGenT_TrainA_70K_Complex")[
-            "train"
-        ]
-        val_dataset = load_dataset("MMInstruction/Clevr_CoGenT_ValB")["train"]
-    elif split == "valA":
-        tr_dataset = load_dataset("MMInstruction/Clevr_CoGenT_ValA")["train"]
-        val_dataset = load_dataset("MMInstruction/Clevr_CoGenT_ValA")["train"]
-    elif split == "valB":
-        tr_dataset = load_dataset("MMInstruction/Clevr_CoGenT_ValB")["train"]
-        val_dataset = load_dataset("MMInstruction/Clevr_CoGenT_ValB")["train"]
-
-    # format - disable features to avoid schema conflicts
-    tr_dataset = tr_dataset.add_column("task_name", [task_name] * len(tr_dataset))
-    val_dataset = val_dataset.add_column("task_name", [task_name] * len(val_dataset))
-
-    return {
-        "train": tr_dataset,
-        "validation": val_dataset,
-    }
-
-
 class CLEVRCoGenTDataset(RawDataset):
-    def __init__(
-        self,
-        split: str = "trainA",
-        prompt_file: Optional[str] = None,
-    ):
-        """Simple wrapper around the CLEVR-CoGenT dataset.
+    """Simple wrapper around the CLEVR-CoGenT dataset.
 
-        Args:
-            split: The split of the dataset to use.
-            prompt_file: The file containing the prompt for the dataset.
-        """
-        if split not in ["trainA", "trainB", "valA", "valB"]:
+    Args:
+        split: Split name for the dataset, default is "train"
+    """
+
+    def __init__(self, split: str = "train", **kwargs):
+        # train, valA, and valB are supported splits.
+        SPLIT_TO_HF_NAME = {
+            "train": "MMInstruction/Clevr_CoGenT_TrainA_70K_Complex",
+            "valA": "MMInstruction/Clevr_CoGenT_ValA",
+            "valB": "MMInstruction/Clevr_CoGenT_ValB",
+        }
+        if split not in SPLIT_TO_HF_NAME:
             raise ValueError(
-                f"Invalid split: {split}. Please use 'trainA', 'trainB', 'valA', or 'valB'."
+                f"Invalid split: {split}. Please use 'train', 'valA', or 'valB'."
             )
+
         self.task_name = "clevr-cogent"
 
-        self.formatted_ds = prepare_clevr_cogent_dataset(
-            split=split, task_name=self.task_name
+        # this dataset will process the image during training using `format_clevr_cogent_dataset`
+        self.dataset = load_dataset(SPLIT_TO_HF_NAME[split])["train"]
+
+        # format - disable features to avoid schema conflicts
+        self.dataset = self.dataset.add_column(
+            "task_name", [self.task_name] * len(self.dataset)
         )

@@ -21,7 +21,7 @@ import pytest
 tests_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(tests_dir))
 
-from check_metrics import evaluate_check, max, mean, min, ratio_above
+from check_metrics import evaluate_check, max, mean, median, min, ratio_above
 
 
 class TestMeanFunction:
@@ -405,3 +405,121 @@ class TestRealWorldScenarios:
         # Check that exactly 5% are above threshold
         ratio = ratio_above(data["metric"], 5.0)
         assert ratio == 0.05
+
+
+class TestMedianFunction:
+    """Test the median function with various scenarios."""
+
+    def test_basic_median_odd_count(self):
+        """Test basic median calculation with odd number of values."""
+        data = {"1": 1.0, "2": 2.0, "3": 3.0, "4": 4.0, "5": 5.0}
+        result = median(data)
+        assert result == 3.0
+
+    def test_basic_median_even_count(self):
+        """Test basic median calculation with even number of values."""
+        data = {"1": 1.0, "2": 2.0, "3": 3.0, "4": 4.0}
+        result = median(data)
+        assert result == 2.5  # (2+3)/2
+
+    def test_median_with_outliers(self):
+        """Test that median is robust to outliers (unlike mean)."""
+        # Data with one severe outlier
+        data = {"1": 1.0, "2": 2.0, "3": 3.0, "4": 4.0, "5": 100.0}
+
+        # Median should be unaffected by the outlier
+        result = median(data)
+        assert result == 3.0  # Middle value, ignores the outlier
+
+        # Compare with mean which would be 22.0
+        result_mean = mean(data)
+        assert result_mean == 22.0
+
+    def test_median_with_range(self):
+        """Test median with range_start and range_end."""
+        data = {str(i): float(i) for i in range(1, 11)}  # 1-10
+
+        # Get median of steps 3-7 (values 3, 4, 5, 6)
+        result = median(data, range_start=3, range_end=7)
+        assert result == 4.5  # (4+5)/2
+
+    def test_median_with_offset(self):
+        """Test median calculation with step offset (from checkpoint resume)."""
+        # Simulate a checkpoint resume scenario
+        # Steps 101-105 (resumed from step 100)
+        data = {"101": 1.0, "102": 2.0, "103": 3.0, "104": 4.0, "105": 5.0}
+        result = median(data)
+        assert result == 3.0
+
+    def test_median_with_negative_range(self):
+        """Test median with negative range indices."""
+        data = {str(i): float(i) for i in range(1, 11)}  # 1-10
+
+        # Last 3 values (8, 9, 10)
+        result = median(data, range_start=-3, range_end=0)
+        assert result == 9.0
+
+    def test_median_with_floats_and_strings(self):
+        """Test that string values are properly converted to floats."""
+        data = {"1": "1.5", "2": "2.5", "3": "3.5"}
+        result = median(data)
+        assert result == 2.5
+
+    def test_median_single_value(self):
+        """Test median with single value."""
+        data = {"1": 42.0}
+        result = median(data)
+        assert result == 42.0
+
+    def test_median_two_values(self):
+        """Test median with two values."""
+        data = {"1": 1.0, "2": 10.0}
+        result = median(data)
+        assert result == 5.5  # (1+10)/2
+
+    def test_median_all_same_values(self):
+        """Test median with all same values."""
+        data = {str(i): 5.0 for i in range(1, 11)}
+        result = median(data)
+        assert result == 5.0
+
+    def test_median_vs_mean_outlier_robustness(self):
+        """Demonstrate why median is preferred for outlier-prone data."""
+        # Simulate token_mult_prob_error with outliers
+        data = {str(i): 1.0 for i in range(1, 20)}
+        data["20"] = 100.0  # Large outlier
+
+        # Median is robust
+        median_result = median(data)
+        assert median_result == 1.0
+
+        # Mean is affected
+        mean_result = mean(data)
+        assert mean_result == 5.95  # (19 * 1.0 + 100) / 20
+
+    def test_evaluate_check_with_median(self):
+        """Test evaluate_check with median function."""
+        data = {"accuracy": {"1": 0.8, "2": 0.9, "3": 0.95, "4": 0.85, "5": 100.0}}
+
+        # Median should be robust to the outlier
+        passed, _, value = evaluate_check(data, "median(data['accuracy']) < 1.0")
+        assert passed is True
+        assert value == 0.9  # Middle value
+
+    def test_median_token_mult_prob_error_scenario(self):
+        """Test the exact scenario for which median is being used."""
+        # Simulate token_mult_prob_error with some outliers
+        data = {
+            "train/token_mult_prob_error": {
+                str(i): 1.0 + (i % 3) * 0.01 for i in range(1, 20)
+            }
+        }
+        # Add outlier
+        data["train/token_mult_prob_error"]["20"] = 5.0
+
+        # Median should pass the check even with the outlier
+        passed, _, value = evaluate_check(
+            data, 'median(data["train/token_mult_prob_error"]) < 1.05'
+        )
+        assert passed is True
+        assert value < 1.05

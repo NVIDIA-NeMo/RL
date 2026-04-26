@@ -63,7 +63,7 @@ def create_dataloader(
     task_data_processors[task_name] = (math_task_spec, math_hf_data_processor)
 
     dataset = AllTaskProcessedDataset(
-        dataset=data.formatted_ds["train"].select(range(1000)),
+        dataset=data.dataset.select(range(1000)),
         tokenizer=tokenizer,
         default_task_data_spec=math_task_spec,
         task_data_processors=task_data_processors,

@@ -1,19 +1,9 @@
-# Makefile for building documentation with isolated UV environment
+# Makefile for building documentation with UV
 
 .DEFAULT_GOAL := help
 
-# Cross-platform venv paths
-ifeq ($(OS),Windows_NT)
-    VENV_DIR = .venv/Scripts
-    PYTHON = $(VENV_DIR)/python.exe
-    ACTIVATE_CMD = .venv\Scripts\activate
-    RM = if exist _build rmdir /s /q _build
-else
-    VENV_DIR = .venv/bin
-    PYTHON = $(VENV_DIR)/python
-    ACTIVATE_CMD = source .venv/bin/activate
-    RM = rm -rf _build
-endif
+# UV run command with docs dependencies
+UV_RUN = uv run --project ../pyproject.toml --group docs
 
 # ------------------------------
 # Help
@@ -29,55 +19,41 @@ help:
 	@echo "  make docs-publish   Build docs (fail on warnings)"
 	@echo "  make docs-clean     Clean built documentation"
 	@echo ""
-	@echo "The environment is automatically set up on first run."
-	@echo "To manually activate the docs environment, run:"
-	@echo "  $(ACTIVATE_CMD)"
-	@echo ""
 
 # ------------------------------
-# Ensure UV and isolated docs environment
+# Check UV is installed
 # ------------------------------
-ensure-docs-env:
+check-uv:
 	@command -v uv >/dev/null 2>&1 || ( \
 		echo ""; \
 		echo "❌ uv is not installed. See https://docs.astral.sh/uv/getting-started/installation/"; \
 		exit 1 \
 	)
-	@if [ ! -x "$(PYTHON)" ]; then \
-		echo "📦 Creating isolated docs environment..."; \
-		uv venv .venv; \
-		uv sync --project ../pyproject.toml --group docs; \
-		echo "✅ Docs environment ready."; \
-		echo "📝 To activate it: $(ACTIVATE_CMD)"; \
-	fi
 
 # ------------------------------
 # Build HTML docs
 # ------------------------------
-docs-html: ensure-docs-env
+docs-html: check-uv
 	@echo "Building HTML documentation..."
-	$(PYTHON) -m sphinx -b html . _build/html
+	$(UV_RUN) sphinx-build -b html . _build/html
 
 # ------------------------------
 # Build docs for publication (fail on warnings)
 # ------------------------------
-docs-publish: ensure-docs-env
+docs-publish: check-uv
 	@echo "Building HTML documentation (fail on warnings)..."
-	$(PYTHON) -m sphinx --fail-on-warning -b html . _build/html
+	$(UV_RUN) sphinx-build --fail-on-warning -b html . _build/html
 
 # ------------------------------
 # Start live-reload server
 # ------------------------------
-docs-live: ensure-docs-env
+docs-live: check-uv
 	@echo "Starting live-reload server..."
-	$(PYTHON) -m sphinx_autobuild . _build/html --port 8001
-	@echo ""
-	@echo "📝 To manually activate the docs environment in a shell:"
-	@echo "  $(ACTIVATE_CMD)"
+	$(UV_RUN) sphinx-autobuild . _build/html --port 8001
 
 # ------------------------------
 # Clean built docs
 # ------------------------------
 docs-clean:
 	@echo "Cleaning built documentation..."
-	$(RM)
+	rm -rf _build

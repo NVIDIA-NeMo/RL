@@ -21,6 +21,73 @@ env_config = {
 
 math_env = MathEnvironment.remote(env_config)
 ```
+### Multi-reward support
+To enable GDPO support, the math environment need to return each reward separately as: 
+```python
+rewards = torch.tensor(results).T.cpu()  ## Shape Batch_size, Number of rewards
+
+return EnvironmentReturn(
+    observations=observations,
+    metadata=metadata,
+    next_stop_strings=next_stop_strings,
+    rewards=rewards,
+    terminateds=done,
+    answers=extracted_answers,
+)
+```
+Therefore, the return batch of `run_multi_turn_rollout` in rollouts.py would have extra entries to store each reward separately as: 
+
+```python
+# Add total rewards to the final batch
+current_batch["total_reward"] = total_rewards
+current_batch["truncated"] = sample_truncated
+# Expose per-component rewards (reward1, reward2, ...) for multi-reward envs only; GRPO uses total_reward
+if multi_rewards is not None:
+    num_reward_components = multi_rewards.shape[1]
+    for i in range(num_reward_components):
+        current_batch[f"reward{i + 1}"] = multi_rewards[:, i].clone()
+```
+
+### Multi-reward support (GDPO)
+
+Environments can expose a **single reward** (standard GRPO) or **multiple reward components** (for GDPO).
+
+- **Single-reward**: Your env’s `step` returns `rewards` with shape `(batch_size,)`. The rollout stores only `total_reward`. Use `grpo.adv_estimator.name: "grpo"` (default).
+- **Multi-reward**: Your env’s `step` returns `rewards` with shape `(batch_size, num_components)` (e.g. one column per objective). The rollout stores `total_reward` (sum across components) and per-component keys `reward1`, `reward2`, … so GDPO can compute per-component baselines and combine advantages.
+
+**Returning multi-reward from the environment**
+
+Return a 2D tensor of shape `(batch_size, num_reward_components)`:
+
+```python
+# rewards: shape (batch_size, num_reward_components), e.g. (N, 3) for three objectives
+rewards = torch.tensor(results).T.cpu()
+
+return EnvironmentReturn(
+    observations=observations,
+    metadata=metadata,
+    next_stop_strings=next_stop_strings,
+    rewards=rewards,
+    terminateds=done,
+    answers=extracted_answers,
+)
+```
+
+**How the rollout uses it**
+
+When the environment returns 2D rewards, `run_multi_turn_rollout` in `rollouts.py` keeps `total_reward` and also exposes each component as `reward1`, `reward2`, … in the batch. Single-reward envs do not get `reward1` keys; only `total_reward` is stored:
+
+```python
+# Add total rewards to the final batch
+current_batch["total_reward"] = total_rewards
+current_batch["truncated"] = sample_truncated
+# Expose per-component rewards (reward1, reward2, ...) for multi-reward envs only; GRPO uses total_reward
+if multi_rewards is not None:
+    num_reward_components = multi_rewards.shape[1]
+    for i in range(num_reward_components):
+        current_batch[f"reward{i + 1}"] = multi_rewards[:, i].clone()
+```
+For instance, when running `examples/configs/gdpo_math_1B.yaml`, `reward1` maps to `correctness_reward`, `reward2` to `int_reward`, and `reward3` to `format_reward`. More details can be found in `HFMultiRewardVerifyWorker`. Users can also implement their own environments that support multi-reward GDPO training by following this example.
 
 ## Code Environment
 
@@ -137,12 +204,11 @@ In the future, the resource control part will be refactored to enable fine-grain
 
 ### Complete GRPO Training with Reward Model Environments
 
-See [examples/run_grpo_rm.py](../../examples/run_grpo_rm.py) for a complete example of using the reward model environment with GRPO training.
+See [examples/run_grpo.py](../../examples/run_grpo.py) with [examples/configs/grpo_rm_1B.yaml](../../examples/configs/grpo_rm_1B.yaml) for a complete example of using the reward model environment with GRPO training.
 
-### Configuration Examples
-
-See [examples/configs/grpo_rm_1B.yaml](../../examples/configs/grpo_rm_1B.yaml) for a complete configuration example.
-
+```bash
+uv run examples/run_grpo.py --config examples/configs/grpo_rm_1B.yaml
+```
 
 ## Registering Custom Environments
 

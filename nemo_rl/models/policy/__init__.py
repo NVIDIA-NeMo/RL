@@ -34,22 +34,83 @@ class LoRAConfig(TypedDict):
     use_triton: NotRequired[bool]
 
 
+class AutomodelBackendConfig(TypedDict):
+    """Configuration for custom MoE implementation backend in Automodel.
+
+    Used when setting the backend in automodel_kwargs in your config.
+    Alternatively, pass `force_hf: true` in automodel_kwargs to fall back
+    to the HuggingFace implementation.
+    """
+
+    # Hydra target class path (e.g., "nemo_automodel.components.models.common.utils.BackendConfig")
+    _target_: str
+    # Attention implementation: "te" (Transformer Engine), "flex" (FlexAttention), etc.
+    attn: NotRequired[str]
+    # Linear layer implementation: "te" (Transformer Engine), etc.
+    linear: NotRequired[str]
+    # RMSNorm implementation: "te" (Transformer Engine), etc.
+    rms_norm: NotRequired[str]
+    # Enable DeepEP (Deep Expert Parallelism) for MoE models
+    enable_deepep: NotRequired[bool]
+    # Use fake balanced gate for testing/debugging MoE
+    fake_balanced_gate: NotRequired[bool]
+    # Enable HuggingFace state dict adapter for checkpoint saving/loading plus refit support for RL
+    # This should almost always be set to True when using a custom MoE implementation. Set to False only for specific use cases like debugging or performance testing.
+    enable_hf_state_dict_adapter: NotRequired[bool]
+    # Enable FSDP-specific optimizations
+    enable_fsdp_optimizations: NotRequired[bool]
+    # Precision for the MoE gate computation (e.g., "float64", "float32")
+    gate_precision: NotRequired[str]
+
+
+class AutomodelKwargs(TypedDict):
+    # Whether to use Liger kernel optimizations (default: false)
+    use_liger_kernel: NotRequired[bool]
+    # Backend configuration for MoE models
+    backend: NotRequired[AutomodelBackendConfig]
+    # Force the HuggingFace model implementation instead of the custom one.
+    # Set to true if the custom model's state_dict_adapter doesn't implement
+    # convert_single_tensor_to_hf (required for weight syncing). This is
+    # auto-detected and set at runtime if not explicitly configured.
+    # See: https://github.com/NVIDIA-NeMo/RL/issues/2072
+    force_hf: NotRequired[bool]
+
+
 class DTensorConfigDisabled(TypedDict):
     enabled: Literal[False]
+
+
+class MoEParallelizerOptions(TypedDict):
+    """MoE parallelizer config options (mirrors Automodel's MoEParallelizerConfig)."""
+
+    ignore_router_for_ac: NotRequired[bool]
+    reshard_after_forward: NotRequired[bool]
+    lm_head_precision: NotRequired[str | None]
+    wrap_outer_model: NotRequired[bool]
 
 
 class DTensorConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
     _v2: NotRequired[bool]
-    cpu_offload: bool
-    sequence_parallel: bool
-    activation_checkpointing: bool
+    # Distributed parallelism sizes
+    # data_parallel_size is derived from world_size / (tp * cp * ep)
     tensor_parallel_size: int
     context_parallel_size: int
-    custom_parallel_plan: str | None
-    clear_cache_every_n_steps: NotRequired[int | None]
+    expert_parallel_size: NotRequired[int]
+    # Distributed config options (mirrors Automodel's FSDP2Config)
+    sequence_parallel: bool
+    activation_checkpointing: bool
+    cpu_offload: bool
+    custom_parallel_plan: NotRequired[str | None]
+    defer_fsdp_grad_sync: NotRequired[bool]
+    # MoE parallelizer config
+    moe_parallelizer: NotRequired[MoEParallelizerOptions]
+    # Model config
     lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
+    automodel_kwargs: NotRequired[AutomodelKwargs]
+    # Runtime
+    clear_cache_every_n_steps: NotRequired[int | None]
 
 
 class SequencePackingConfigDisabled(TypedDict):
@@ -67,6 +128,24 @@ class SequencePackingConfig(TypedDict):
 class RewardModelConfig(TypedDict):
     enabled: bool
     reward_model_type: str
+
+
+class MegatronPeftConfigDisabled(TypedDict):
+    enabled: Literal[False]
+
+
+class MegatronPeftConfig(TypedDict):
+    enabled: Literal[True]
+    target_modules: list[str]
+    exclude_modules: list[str]
+    dim: int
+    alpha: int
+    dropout: float
+    dropout_position: Literal["pre", "post"]
+    lora_A_init_method: str
+    lora_B_init_method: str
+    a2a_experimental: bool
+    lora_dtype: str | None
 
 
 class MegatronOptimizerConfig(TypedDict):
@@ -141,12 +220,53 @@ class MegatronConfig(TypedDict):
     apply_rope_fusion: bool
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: bool
-    # Force overwrite of the initial checkpoint even if it exists (default: False)
-    force_overwrite_initial_ckpt: NotRequired[bool]
+    # Force reconvert from HF even if the checkpoint already exists (default: False)
+    force_reconvert_from_hf: NotRequired[bool]
+    # Attention backend available values:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/enums.py#L60
+    attention_backend: NotRequired[str]
     moe_per_layer_logging: bool
+    # Set to true to enable DeepEP for expert parallel communication
+    # Must set moe_token_dispatcher_type to 'flex'
+    # Must set moe_shared_expert_overlap to False
+    moe_enable_deepep: bool
+    # The type of token dispatcher to use. The default is 'alltoall'.
+    # Options are 'allgather','alltoall' and 'flex'
+    # Use 'flex' when using DeepEP
+    moe_token_dispatcher_type: str
+    # Can be used only with 'alltoall' token dispatcher
+    moe_shared_expert_overlap: bool
+    peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
+    # When True, uses chunked linear cross-entropy fusion loss to compute loss
+    # directly from hidden states, avoiding materialization of the full
+    # [batch, seq_len, vocab_size] logit tensor. This significantly reduces peak
+    # GPU memory, extending the maximum trainable sequence length (e.g. from <65K
+    # to >100K tokens). Only applicable to SFT with NLLLoss.
+    use_linear_ce_fusion_loss: NotRequired[bool]
+    # Number of tokens per chunk when computing the fused linear CE loss.
+    # Smaller values reduce peak memory further but may decrease throughput.
+    linear_ce_fusion_chunk_size: NotRequired[int]
+    # When mtp_num_layers=0, Multi-Token Prediction is disabled.
+    mtp_num_layers: NotRequired[int]
+
+
+class DraftConfigDisabled(TypedDict):
+    """Configuration shape for the disabled draft-model training path."""
+
+    enabled: Literal[False]
+
+
+class DraftConfig(TypedDict):
+    """Configuration for Eagle draft-model training alongside the policy model."""
+
+    enabled: Literal[True]
+    model_name: NotRequired[str | None]
+    loss_weight: NotRequired[float]
+    num_layers: NotRequired[int | None]
+    aux_layer_indices: NotRequired[list[int] | None]
 
 
 class TokenizerConfig(TypedDict):
@@ -154,6 +274,10 @@ class TokenizerConfig(TypedDict):
     chat_template: NotRequired[str]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]
+    # Multimodal configs
+    audio: NotRequired[dict[str, Any]]
+    video: NotRequired[dict[str, Any]]
+    use_processor: NotRequired[bool]
 
 
 class PytorchOptimizerConfig(TypedDict):
@@ -207,6 +331,7 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
+    draft: NotRequired[DraftConfig | DraftConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
