@@ -138,9 +138,9 @@ launch:
 
     python -u examples/run_grpo.py \
       --config examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off.yaml \
-      grpo.max_num_steps=500 \
-      grpo.val_period=50 \
-      checkpointing.save_period=50 \
+      grpo.max_num_steps=5 \
+      grpo.val_period=5 \
+      checkpointing.save_period=5 \
       logger.wandb_enabled=true \
       logger.tensorboard_enabled=true \
       logger.monitor_gpus=true \
