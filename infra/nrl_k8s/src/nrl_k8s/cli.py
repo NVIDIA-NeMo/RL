@@ -589,9 +589,10 @@ def _run_rayjob(
     except Exception as exc:  # noqa: BLE001
         _explain_and_exit(exc, context=f"rayjob {job_name} apply failed")
 
+    job_id_cmd = f"$(kubectl get rayjob {job_name} -n {namespace} -o jsonpath='{{.status.jobId}}')"
     click.echo(
         f"follow:  kubectl get rayjob {job_name} -n {namespace} -w\n"
-        f"logs:    nrl-k8s job logs <submission-id> {recipe} --role training -f",
+        f"logs:    nrl-k8s job logs {job_id_cmd} {recipe} --infra <infra> --role training -f",
     )
     # Default is wait unless user passed --no-wait.
     if cli_wait is False:
@@ -1542,6 +1543,7 @@ def _tail(dashboard: str, job_id: str) -> None:
 
 def _tail_daemon(cluster_name: str, namespace: str, submission_id: str) -> None:
     """Open a dashboard port-forward and tail a Ray Job by submission_id."""
+    from . import inspect as ins
     from . import submit as submit_mod
 
     try:
@@ -1551,7 +1553,38 @@ def _tail_daemon(cluster_name: str, namespace: str, submission_id: str) -> None:
     except KeyboardInterrupt:
         click.echo("\n(interrupted — job continues running)", err=True)
     except Exception as exc:  # noqa: BLE001
+        hint = _diagnose_port_forward_failure(cluster_name, namespace)
+        if hint:
+            _cli_error(f"tailing {cluster_name} failed: {exc}", hint=hint)
         _explain_and_exit(exc, context=f"tailing {submission_id} failed")
+
+
+def _diagnose_port_forward_failure(cluster_name: str, namespace: str) -> str | None:
+    """Check head pod state to produce a more helpful error message."""
+    from . import k8s
+
+    try:
+        head_pod = f"{cluster_name}-head"
+        pods = k8s.list_pods_by_label(
+            f"ray.io/cluster={cluster_name},ray.io/node-type=head", namespace
+        )
+        if not pods:
+            return (
+                f"no head pod found for {cluster_name} — "
+                f"the cluster may still be provisioning. "
+                f"check: kubectl get pods -l ray.io/cluster={cluster_name} -n {namespace}"
+            )
+        pod = pods[0]
+        phase = pod.status.phase if pod.status else "Unknown"
+        if phase != "Running":
+            return (
+                f"head pod is {phase}, not Running yet — "
+                f"wait for the cluster to be ready and retry. "
+                f"check: kubectl get pods -l ray.io/cluster={cluster_name} -n {namespace}"
+            )
+    except Exception:
+        pass
+    return None
 
 
 def _emit_handle(handle) -> None:  # type: ignore[no-untyped-def]

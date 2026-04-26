@@ -312,12 +312,16 @@ def _wait_for_tcp(
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            # Process is gone — the drain thread may have already consumed
-            # stdout, so we can only surface the bare exit code here.
-            raise RuntimeError(
-                f"kubectl port-forward exited early (rc={proc.returncode}); "
-                "is the RayCluster head service reachable?"
-            )
+            stderr = ""
+            if proc.stderr:
+                try:
+                    stderr = proc.stderr.read().decode(errors="replace").strip()
+                except Exception:
+                    pass
+            msg = f"kubectl port-forward exited early (rc={proc.returncode})"
+            if stderr:
+                msg += f": {stderr}"
+            raise RuntimeError(msg)
         try:
             with socket.create_connection((host, port), timeout=1):
                 return

@@ -465,6 +465,16 @@ def delete_pod(name: str, namespace: str, *, ignore_missing: bool = True) -> Non
         raise
 
 
+def list_pods_by_label(label_selector: str, namespace: str) -> list:
+    """Return pods matching a label selector."""
+    load_kubeconfig()
+    core = client.CoreV1Api()
+    result = with_retries(
+        lambda: core.list_namespaced_pod(namespace=namespace, label_selector=label_selector)
+    )
+    return result.items or []
+
+
 def get_pod_phase(name: str, namespace: str) -> str | None:
     """Return the pod phase (Pending/Running/Succeeded/Failed) or None if not found."""
     load_kubeconfig()

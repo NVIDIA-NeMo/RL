@@ -45,14 +45,16 @@ _shared:
         optional: true
   headEnv: &shared_head_env
     - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
-    - {name: HF_HUB_OFFLINE,                 value: "1"}
-    - {name: TRANSFORMERS_OFFLINE,           value: "1"}
+    # Uncomment to force offline mode once all HF assets are pre-cached.
+    # Without the cached assets, these will cause download errors.
+    # - {name: HF_HUB_OFFLINE,                 value: "1"}
+    # - {name: TRANSFORMERS_OFFLINE,           value: "1"}
     - {name: NCCL_DEBUG,                     value: WARN}
     - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
   workerEnv: &shared_worker_env
     - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
-    - {name: HF_HUB_OFFLINE,                 value: "1"}
-    - {name: TRANSFORMERS_OFFLINE,           value: "1"}
+    # - {name: HF_HUB_OFFLINE,                 value: "1"}
+    # - {name: TRANSFORMERS_OFFLINE,           value: "1"}
     - {name: NCCL_DEBUG,                     value: WARN}
     - {name: NCCL_MNNVL_ENABLE,              value: "1"}
     - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
