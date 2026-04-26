@@ -28,9 +28,7 @@ from transformers import (
 )
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
-from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy import TokenizerConfig
-from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.logger import Logger
 
 
@@ -829,13 +827,16 @@ def print_performance_metrics(
     return performance_metrics
 
 
-def print_ip_and_gpu_id_of_workers(
-    policy: ColocatablePolicyInterface, policy_generation: Optional[GenerationInterface]
-) -> None:
+def print_ip_and_gpu_id_of_workers(policy, policy_generation) -> None:
     """Print the node IP and GPU ID of the policy and generation workers."""
 
+    def _ip_sort_key_func(ip: str):
+        return tuple([int(x) for x in ip.split(".")])
+
     def _print_in_table(results: list[tuple[str, int]], table_title: str) -> None:
-        all_node_ips = sorted(set([result[0] for result in results]))
+        all_node_ips = sorted(
+            set([result[0] for result in results]), key=_ip_sort_key_func
+        )
         all_gpu_ids = sorted(set([result[1] for result in results]))
 
         worker_id_list = [
