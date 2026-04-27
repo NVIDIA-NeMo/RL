@@ -551,43 +551,21 @@ class TestTwoGPUCluster:
     @pytest.fixture(
         params=[
             # model_fixture_name        tp cp  sp     cpu    act
-            ("tiny_llama_model_path", 1, 1, False, False, False),
-            ("tiny_llama_model_path", 1, 1, True, False, False),
-            ("tiny_llama_model_path", 1, 1, False, True, False),
-            ("tiny_llama_model_path", 1, 1, False, False, True),
-            ("tiny_llama_model_path", 1, 2, False, False, False),
-            ("tiny_qwen2_model_path", 1, 1, True, True, False),
-            ("tiny_qwen2_model_path", 1, 1, True, False, True),
-            ("tiny_qwen2_model_path", 1, 1, False, True, True),
-            ("tiny_qwen2_model_path", 1, 1, True, True, True),
-            ("tiny_qwen2_model_path", 1, 2, False, False, False),
-            ("tiny_qwen3_model_path", 1, 1, True, True, False),
-            ("tiny_qwen3_model_path", 1, 1, True, False, True),
-            ("tiny_qwen3_model_path", 1, 1, False, True, True),
-            ("tiny_qwen3_model_path", 1, 1, True, True, True),
-            ("tiny_qwen3_model_path", 1, 2, False, False, False),
-            (
-                "tiny_gemma3_model_path",
-                1,
-                1,
-                True,
-                True,
-                False,
-            ),  # gemma3 doesn't support spda
-            ("tiny_gemma3_model_path", 1, 1, True, False, True),
-            ("tiny_gemma3_model_path", 1, 1, False, True, True),
-            ("tiny_gemma3_model_path", 1, 1, True, True, True),
-            # CP doesn't support gemma3 due to spda input has attent_mask != None.
-            # Nemotron-H doesn't support SP https://github.com/NVIDIA-NeMo/RL/issues/881
-            # ("tiny_nemotron5_h_model_path", 1, 1, True, True, False),
-            # ("tiny_nemotron5_h_model_path", 1, 1, True, False, True),
-            # ("tiny_nemotron5_h_model_path", 1, 1, True, True, True),
-            ("tiny_nemotron5_h_model_path", 1, 1, False, False, False),
-            ("tiny_nemotron5_h_model_path", 1, 1, False, True, True),
-            # nemotron5_h doesn't support cp
+            # Model-specific variants removed — assertions are model-agnostic
+            # (no NaN/Inf, loss decreases). Qwen/Gemma/Nemotron model compatibility
+            # is covered by functional tests (grpo.sh, grpo_fsdp2.sh, dpo.sh, sft.sh).
+            # Feature combinations tested with llama only:
+            ("tiny_llama_model_path", 1, 1, False, False, False),  # base
+            ("tiny_llama_model_path", 1, 1, True, False, False),  # sp
+            ("tiny_llama_model_path", 1, 1, False, True, False),  # cpu_offload
+            ("tiny_llama_model_path", 1, 1, False, False, True),  # act_ckpt
+            ("tiny_llama_model_path", 1, 2, False, False, False),  # cp=2
+            ("tiny_llama_model_path", 1, 1, True, True, False),  # sp + cpu
+            ("tiny_llama_model_path", 1, 1, True, False, True),  # sp + act
+            ("tiny_llama_model_path", 1, 1, False, True, True),  # cpu + act
+            ("tiny_llama_model_path", 1, 1, True, True, True),  # sp + cpu + act
             # TP2, SP=True
             ("tiny_llama_model_path", 2, 1, True, False, False),
-            ("tiny_qwen2_model_path", 2, 1, True, False, False),
         ]
     )
     def training_setup(self, request, two_gpu_cluster):
