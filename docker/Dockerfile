@@ -147,7 +147,7 @@ if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
 fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
     CMAKE_BUILD_PARALLEL_LEVEL=1 \
-    NVCC_THREADS=1 \
+    CUDAFLAGS="--threads 1 -Xptxas -O1" \
     CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1 -DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
     uv sync --link-mode symlink --locked --extra sglang --no-install-project
 fi
