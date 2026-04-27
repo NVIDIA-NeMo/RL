@@ -347,6 +347,7 @@ class BaseMathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
     def __init__(self, cfg: MathEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
+        self._worker_assigned_index = 0
         verifier_type = cfg.get("verifier_type", "math")
         assert isinstance(verifier_type, str), (
             f"{verifier_type=} must be a string but was {type(verifier_type)}"
@@ -406,7 +407,9 @@ class BaseMathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         return batch, metrics
 
 
-@ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
+@ray.remote(
+    max_restarts=-1, max_task_retries=-1, max_concurrency=1000
+)  # pragma: no cover
 class MathEnvironment(BaseMathEnvironment):
     # TODO: split out this environment since it's doing more than just math
     WORKER_CLASS_DICT = {
@@ -453,9 +456,15 @@ class MathEnvironment(BaseMathEnvironment):
         )
         chunked_ground_truths = chunk_list_to_workers(ground_truths, self.num_workers)
 
+        # Round-robin the starting worker index.
+        # Without the rotation, all the requests will be sent to workers[0] if this function
+        # is called per-sample.
+        worker_index = self._worker_assigned_index % self.num_workers
+        self._worker_assigned_index = worker_index + 1
+
         # Process each chunk in parallel
         futures = [
-            self.workers[i].verify.remote(
+            self.workers[(worker_index + i) % self.num_workers].verify.remote(
                 chunk,
                 ground_truth_chunk,
                 return_extracted_answer,
@@ -506,7 +515,9 @@ class MathEnvironment(BaseMathEnvironment):
         )
 
 
-@ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
+@ray.remote(
+    max_restarts=-1, max_task_retries=-1, max_concurrency=1000
+)  # pragma: no cover
 class MathMultiRewardEnvironment(BaseMathEnvironment):
     WORKER_CLASS_DICT = {
         "math": HFMultiRewardVerifyWorker,
@@ -550,9 +561,15 @@ class MathMultiRewardEnvironment(BaseMathEnvironment):
         )
         chunked_ground_truths = chunk_list_to_workers(ground_truths, self.num_workers)
 
+        # Round-robin the starting worker index.
+        # Without the rotation, all the requests will be sent to workers[0] if this function
+        # is called per-sample.
+        worker_index = self._worker_assigned_index % self.num_workers
+        self._worker_assigned_index = worker_index + 1
+
         # Process each chunk in parallel
         futures = [
-            self.workers[i].verify.remote(
+            self.workers[(worker_index + i) % self.num_workers].verify.remote(
                 chunk,
                 ground_truth_chunk,
                 return_extracted_answer,
