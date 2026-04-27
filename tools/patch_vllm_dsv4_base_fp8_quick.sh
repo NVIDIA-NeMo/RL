@@ -157,53 +157,14 @@ patch_file(
             "        return isinstance(layer, FusedMoE) and not _is_dsv4_base_fp8_enabled()\n",
         ),
         (
-            # Anchor for the post-#40860 main wheel structure (load_weights now
-            # captures the result and calls finalize_mega_moe_weights() before
-            # returning, so we hook the assignment line). The earlier internal
-            # builds (g306b63f67 / g62d441ee8) had a single `return loader...`
-            # line that this anchor will not match — for those wheels, replace
-            # with the prior anchor:
-            #   "        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)\n"
-            #   -> "        mapper = (...)\n        return loader.load_weights(weights, mapper=mapper)\n"
-            "        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)\n",
+            "        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)\n",
             (
                 "        mapper = (\n"
                 "            self.hf_to_vllm_mapper_base_fp8\n"
                 "            if _is_dsv4_base_fp8_enabled()\n"
                 "            else self.hf_to_vllm_mapper\n"
                 "        )\n"
-                "        loaded_params = loader.load_weights(weights, mapper=mapper)\n"
-            ),
-        ),
-        (
-            # Force use_mega_moe = False under VLLM_DSV4_BASE_FP8. Base routes
-            # routed experts through Fp8MoEMethod (FusedMoE), not the
-            # DeepseekV4MegaMoEExperts class. Without this, the post-load call
-            # `self.model.finalize_mega_moe_weights()` would invoke
-            # `experts.finalize_weights()` on a non-MegaMoE layer (no such
-            # attr) and crash. Keeping this gating self-contained inside the
-            # patch means users only need to set the env var; recipe-level
-            # `moe_backend` overrides are not also required.
-            (
-                "        if vllm_config.parallel_config.enable_expert_parallel:\n"
-                "            self.use_mega_moe = (\n"
-                "                vllm_config.kernel_config.moe_backend == \"deep_gemm_mega_moe\"\n"
-                "            )\n"
-                "        else:\n"
-                "            self.use_mega_moe = False\n"
-            ),
-            (
-                "        if _is_dsv4_base_fp8_enabled():\n"
-                "            # Base FP8 routes routed experts through Fp8MoEMethod,\n"
-                "            # not DeepseekV4MegaMoEExperts. Force the MegaMoE finalize\n"
-                "            # path off so finalize_mega_moe_weights() is a no-op.\n"
-                "            self.use_mega_moe = False\n"
-                "        elif vllm_config.parallel_config.enable_expert_parallel:\n"
-                "            self.use_mega_moe = (\n"
-                "                vllm_config.kernel_config.moe_backend == \"deep_gemm_mega_moe\"\n"
-                "            )\n"
-                "        else:\n"
-                "            self.use_mega_moe = False\n"
+                "        return loader.load_weights(weights, mapper=mapper)\n"
             ),
         ),
     ],
