@@ -361,6 +361,10 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
           - script: L0_Unit_Tests_Algorithms
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L0_Unit_Tests_Data
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L0_Unit_Tests_Distributed
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
           - script: L0_Unit_Tests_Other
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
     needs: [pre-flight, build-container, cicd-doc-tests, org-member-pre-flight]

@@ -14,7 +14,7 @@
 
 #!/bin/bash
 # Shard: Catch-all for everything not in other shards
-# Covers: distributed, data, experience (base), utils, tools, evals, rewards, root-level tests
+# Covers: experience (base), utils, tools, evals, rewards, root-level tests
 # Extra-marked tests are picked up by their respective shards (Mcore, Automodel, etc.)
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
@@ -23,6 +23,8 @@ IGNORE=(
     "--ignore=unit/models/"
     "--ignore=unit/environments/"
     "--ignore=unit/algorithms/"
+    "--ignore=unit/data/"
+    "--ignore=unit/distributed/"
 )
 
 uv run --no-sync bash -x ./tests/run_unit.sh "unit/" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
