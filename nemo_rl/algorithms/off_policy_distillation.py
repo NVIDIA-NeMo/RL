@@ -270,6 +270,8 @@ def setup(
     CheckpointManager,
     OffPolicyDistillationSaveState,
     OffPolicyMasterConfig,
+    list[Any],  # token_aligners (per-teacher, with None for same-tokenizer teachers)
+    list[Optional[PreTrainedTokenizerBase]],  # teacher_tokenizers
 ]:
     """Setup for off-policy distillation algorithm.
     
@@ -639,6 +641,8 @@ def setup(
         checkpointer,
         distillation_save_state,
         master_config,
+        token_aligners,
+        teacher_tokenizers,
     )
 
 
@@ -769,13 +773,24 @@ def validate(
             if not bool(master_config["distillation"].get("keep_models_resident", False)):
                 teacher_policy.offload_after_refit()
 
-            # Compute student validation loss (eval mode, no gradient updates)
+            # Compute student validation loss (eval mode, no gradient updates).
+            # When the run uses cross-tokenizer KD (loss_fn is a
+            # MultiTeacherLossAggregator), the loss state lives on each
+            # worker as ``_cached_loss_fn`` and was populated during the
+            # preceding training step's update_cross_tokenizer_data fan-out.
+            # Pass loss_fn=None so workers reuse that cached fn instead of
+            # the driver-side instance (which was never given CT data).
             student_policy.prepare_for_training()
+            val_loss_fn = (
+                None
+                if isinstance(loss_fn, MultiTeacherLossAggregator)
+                else loss_fn
+            )
             if use_ipc:
                 val_results = student_policy.train_off_policy_distillation(
                     val_data,
                     teacher_logits=teacher_logits,
-                    loss_fn=loss_fn,
+                    loss_fn=val_loss_fn,
                     eval_mode=True,
                     gbs=val_data.size,
                     mbs=val_mbs,

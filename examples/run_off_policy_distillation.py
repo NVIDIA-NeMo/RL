@@ -74,12 +74,18 @@ def main() -> None:
 
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
 
-    (
-        dataset,
-        val_dataset,
-        _task_to_env,
-        _val_task_to_env,
-    ) = setup_response_data(tokenizer, config["data"], config.get("env", {}))
+    env_configs = config.get("env") or None
+    if env_configs is None:
+        dataset, val_dataset = setup_response_data(
+            tokenizer, config["data"], None
+        )
+    else:
+        (
+            dataset,
+            val_dataset,
+            _task_to_env,
+            _val_task_to_env,
+        ) = setup_response_data(tokenizer, config["data"], env_configs)
 
     (
         student_policy,
@@ -91,6 +97,8 @@ def main() -> None:
         checkpointer,
         save_state,
         master_config,
+        token_aligners,
+        teacher_tokenizers,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
     off_policy_distillation_train(
@@ -104,6 +112,8 @@ def main() -> None:
         checkpointer,
         save_state,
         master_config,
+        token_aligners=token_aligners,
+        teacher_tokenizers=teacher_tokenizers,
     )
 
 
