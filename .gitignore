@@ -25,6 +25,7 @@ mlruns/
 # Test
 coverage.json
 .coverage*
+.testmondata*
 unit_results.json
 unit_results/
 test_assets/

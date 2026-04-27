@@ -474,6 +474,8 @@ def vlm_hf_data_processor(
         datum_dict = format_geometry3k_dataset(datum_dict)
     elif datum_dict["task_name"] == "avqa":
         pass  # AVQA data is already formatted by AVQADataset.format_data
+    elif datum_dict["task_name"] == "audiomcq":
+        pass  # AudioMCQ data is already formatted by AudioMCQDataset.format_data
     elif datum_dict["task_name"] == "mmau":
         pass  # MMAU data is already formatted by MMAUDataset.format_data
     else:
