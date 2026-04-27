@@ -304,6 +304,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             self.autocast_enabled,
         ) = model_and_optimizer_state
 
+        self._fix_phi_rope_meta_buffers()
+
         # Initialize reference model if requested
         self.reference_model_state_dict = None
         if init_reference_model:
@@ -325,6 +327,83 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
+
+    def _fix_phi_rope_meta_buffers(self) -> None:
+        """Repair Phi RoPE inv_freq buffers when loaded from meta init.
+
+        Some Phi-4 / Phi-3 ``trust_remote_code`` revisions register
+        ``inv_freq`` (and ``original_inv_freq``) as buffers that get left
+        on the ``meta`` device after FSDP/DTensor materialization. Their
+        forward later calls ``.to(device)`` on those buffers and crashes
+        with ``NotImplementedError: Cannot copy out of meta tensor``. We
+        re-run each module's ``rope_init_fn`` against CUDA to produce a
+        healthy buffer and overwrite the meta one in place.
+
+        Scoped to Phi-style models via the model_name / architecture
+        string so other model families short-circuit immediately.
+        """
+        model_name = str(self.cfg.get("model_name", "")).lower()
+        architectures = getattr(
+            getattr(self, "model_config", None), "architectures", []
+        )
+        arch_blob = " ".join(
+            a.lower() for a in architectures if isinstance(a, str)
+        )
+        if (
+            "phi-4" not in model_name
+            and "phi4" not in model_name
+            and "phi3" not in arch_blob
+        ):
+            return
+
+        fixed_count = 0
+        for module in self.model.modules():
+            if not hasattr(module, "inv_freq"):
+                continue
+            inv_freq = getattr(module, "inv_freq")
+            original_inv_freq = getattr(module, "original_inv_freq", None)
+
+            inv_needs_repair = torch.is_tensor(inv_freq) and (
+                getattr(inv_freq, "is_meta", False)
+                or (not torch.isfinite(inv_freq).all())
+            )
+            original_needs_repair = torch.is_tensor(original_inv_freq) and (
+                getattr(original_inv_freq, "is_meta", False)
+                or (not torch.isfinite(original_inv_freq).all())
+            )
+
+            if not inv_needs_repair and not original_needs_repair:
+                continue
+
+            if not (hasattr(module, "rope_init_fn") and hasattr(module, "config")):
+                continue
+
+            try:
+                repaired_inv_freq, _ = module.rope_init_fn(
+                    module.config, torch.device("cuda")
+                )
+            except (TypeError, RuntimeError, AttributeError) as exc:
+                if self.rank == 0:
+                    print(
+                        f"[Phi RoPE repair] skipping module "
+                        f"{type(module).__name__}: rope_init_fn raised "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                continue
+
+            if hasattr(module, "_buffers") and "inv_freq" in module._buffers:
+                module._buffers["inv_freq"] = repaired_inv_freq
+            else:
+                module.inv_freq = repaired_inv_freq
+            if hasattr(module, "original_inv_freq"):
+                module.original_inv_freq = repaired_inv_freq.detach().clone()
+            fixed_count += 1
+
+        if fixed_count > 0 and self.rank == 0:
+            print(
+                f"[Phi RoPE repair] re-materialized {fixed_count} meta "
+                f"buffer(s) after model setup."
+            )
 
     def init_cross_tokenizer_loss_fn(
         self,
@@ -645,24 +724,13 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         teacher_worker_result = None
         if teacher_logits is not None:
+            # Both shapes pre-shard the per-rank payload before reaching here:
+            #   - single teacher: ``list[rank]`` of per-rank dicts
+            #   - multi-teacher:  ``dict[rank, list[T_payloads]]`` (built by
+            #     ``_group_teacher_logits_by_rank``)
+            # Indexing by rank yields the right per-rank entry in both cases.
             rank = torch.distributed.get_rank()
-            teacher_worker_result = (
-                teacher_logits[rank]
-                if not isinstance(teacher_logits, list)
-                or (
-                    isinstance(teacher_logits, list)
-                    and teacher_logits
-                    and isinstance(teacher_logits[0], dict)
-                    and "microbatch_handles" not in teacher_logits[0]
-                )
-                else teacher_logits
-            )
-            if isinstance(teacher_worker_result, list):
-                # Multi-teacher: each entry is a per-teacher dict; index per rank.
-                teacher_worker_result = [
-                    t[rank] if isinstance(t, list) else t
-                    for t in teacher_worker_result
-                ]
+            teacher_worker_result = teacher_logits[rank]
 
         def train_context_fn(processed_inputs):
             return get_train_context(
