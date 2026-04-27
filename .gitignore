@@ -4,6 +4,7 @@
 .codex
 .codex/
 .humanize/
+.claude/
 *.out
 *.log
 *.tar
