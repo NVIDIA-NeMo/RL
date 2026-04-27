@@ -1,0 +1,141 @@
+defaults: "grpo_workplace_assistant_nemotron_nano_v2_9b.yaml"
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1
+  val_period: 5
+  val_at_start: true
+
+policy:
+  is_vlm: true
+  model_name: "Qwen/Qwen3-VL-2B-Instruct"
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 4
+  max_total_sequence_length: 4096
+  precision: "bfloat16"
+  offload_optimizer_for_logprob: false
+  make_sequence_length_divisible_by: 1
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  megatron_cfg:
+    enabled: false
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5e-7
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 50
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [50]
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: 1024
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      kv_cache_dtype: "auto"
+      skip_tokenizer_init: false
+      expose_http_server: true
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+    vllm_kwargs:
+      compilation_config:
+        use_inductor: false
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+data:
+  max_input_seq_length: null
+  shuffle: true
+  num_workers: 0
+
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/data/circle_click/train.jsonl
+  validation:
+    data_path: 3rdparty/Gym-workspace/Gym/data/circle_click/validation.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    rollout_max_attempts_to_avoid_lp_nan: 1
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/circle_click/configs/circle_click.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
+
+logger:
+  log_dir: "logs/grpo-circle-click-qwen3vl2b"
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "grpo-circle-click"
+    name: "qwen3-vl-2b-circle-click"
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-circle-click-qwen3vl2b"
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 5
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
