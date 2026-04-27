@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import json
+import os
 from typing import Any
-from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -104,6 +104,34 @@ class TestAudioMCQRegistry:
         with pytest.raises(ValueError, match="Invalid split"):
             AudioMCQDataset(split="test")
 
+    def test_load_response_dataset_round_trip(self, monkeypatch, tmp_path):
+        rows = [_row(i) for i in range(3)]
+        snapshot_root = _build_fixture_snapshot(tmp_path, rows)
+        _patch_snapshot(monkeypatch, snapshot_root)
+
+        from nemo_rl.data.datasets import load_response_dataset
+
+        wrapper = load_response_dataset(
+            {
+                "dataset_name": "audiomcq",
+                "split": "train",
+                "max_samples": 2,
+                "processor": "vlm_hf_data_processor",
+            }
+        )
+        assert wrapper.task_name == "audiomcq"
+        assert wrapper.preprocessor is not None
+        assert len(wrapper.dataset) == 2
+        sample = wrapper.preprocessor(wrapper.dataset[0])
+        assert sample["task_name"] == "audiomcq"
+        assert "messages" in sample
+
+    def test_unsupported_dataset_name_raises(self):
+        from nemo_rl.data.datasets import load_response_dataset
+
+        with pytest.raises(ValueError, match="Unsupported"):
+            load_response_dataset({"dataset_name": "audiomcq_strong", "split": "train"})
+
 
 class TestAudioMCQConstruction:
     def test_minimal_load_succeeds(self, monkeypatch, tmp_path):
@@ -147,6 +175,27 @@ class TestAudioMCQConstruction:
         kept_ids = sorted(r["id"] for r in dataset.dataset)
         assert kept_ids == ["0", "2"]
 
+    def test_max_samples_applied_after_defensive_filter(self, monkeypatch, tmp_path):
+        # 5 strong rows, 5 weak rows. With max_samples=4 and the filter
+        # applied AFTER, we'd see at most 4 strong rows (never weak). With
+        # max_samples applied BEFORE, the truncated set could contain weak
+        # rows that the filter would then drop, leaving fewer than 4.
+        rows = []
+        for i in range(5):
+            rows.append(_row(i, extras={"audio-contribution": "strong"}))
+        for i in range(5, 10):
+            rows.append(_row(i, extras={"audio-contribution": "weak"}))
+        snapshot_root = _build_fixture_snapshot(tmp_path, rows)
+        _patch_snapshot(monkeypatch, snapshot_root)
+
+        dataset = AudioMCQDataset(split="train", max_samples=4, seed=1)
+        ids = [r["id"] for r in dataset.dataset]
+        assert len(ids) == 4
+        assert all(int(i) < 5 for i in ids), (
+            "weak rows leaked through; max_samples must be applied AFTER the "
+            f"audio-contribution filter. Got ids={ids}"
+        )
+
     def test_eager_probe_raises_when_head_audio_missing(self, monkeypatch, tmp_path):
         rows = [_row(0), _row(1)]
         snapshot_root = _build_fixture_snapshot(tmp_path, rows, write_audio_for=[])
@@ -185,6 +234,26 @@ class TestAudioMCQConstruction:
         assert dataset.val_dataset is not None
         assert len(dataset.val_dataset) > 0
         assert len(dataset.dataset) > 0
+
+    def test_validation_split_is_seed_reproducible(self, monkeypatch, tmp_path):
+        rows = [_row(i) for i in range(20)]
+        snapshot_root = _build_fixture_snapshot(tmp_path, rows)
+        _patch_snapshot(monkeypatch, snapshot_root)
+
+        ds_a = AudioMCQDataset(split="train", split_validation_size=0.4, seed=99)
+        ds_b = AudioMCQDataset(split="train", split_validation_size=0.4, seed=99)
+        ds_c = AudioMCQDataset(split="train", split_validation_size=0.4, seed=200)
+
+        train_ids_a = sorted(r["id"] for r in ds_a.dataset)
+        train_ids_b = sorted(r["id"] for r in ds_b.dataset)
+        train_ids_c = sorted(r["id"] for r in ds_c.dataset)
+        val_ids_a = sorted(r["id"] for r in ds_a.val_dataset)
+        val_ids_b = sorted(r["id"] for r in ds_b.val_dataset)
+
+        assert train_ids_a == train_ids_b
+        assert val_ids_a == val_ids_b
+        # Different seed should produce a materially different split.
+        assert train_ids_a != train_ids_c
 
 
 class TestAudioMCQFormatData:
@@ -255,11 +324,46 @@ class TestAudioMCQFormatData:
         target = next(r for r in dataset.dataset if r["source_dataset"] == "Tacos")
         with pytest.raises(FileNotFoundError) as excinfo:
             dataset.preprocessor(target)
-        assert "Tacos" in str(excinfo.value)
+        msg = str(excinfo.value)
+        assert "Tacos" in msg
+        # The error message must include the resolved on-disk path so the
+        # user can immediately identify which file is missing.
+        expected_resolved = os.path.join(snapshot_root, target["audio_path"])
+        assert expected_resolved in msg, (
+            f"FileNotFoundError must include the resolved path "
+            f"{expected_resolved!r}; got: {msg!r}"
+        )
+
+
+class _FakeFeatureExtractor:
+    sampling_rate = 16000
+    model_input_names: list[str] = []
+
+
+class _FakeTokenizer:
+    bos_token_id = None
+    model_input_names = ["input_ids"]
+
+
+class _FakeProcessor:
+    """Minimal AutoProcessor stand-in for vlm_hf_data_processor."""
+
+    feature_extractor = _FakeFeatureExtractor()
+    tokenizer = _FakeTokenizer()
+    model_input_names = ["input_ids"]
+
+    def apply_chat_template(self, messages, tokenize=False, **kwargs):
+        if tokenize:
+            import torch as _torch
+
+            return {"input_ids": _torch.tensor([[1, 2, 3, 4]])}
+        return "<chat>fake</chat>"
 
 
 class TestAudioMCQProcessor:
-    def test_vlm_hf_data_processor_accepts_audiomcq(self, monkeypatch, tmp_path):
+    def test_vlm_hf_data_processor_returns_audiomcq_datum_spec(
+        self, monkeypatch, tmp_path
+    ):
         rows = [_row(0)]
         snapshot_root = _build_fixture_snapshot(tmp_path, rows)
         _patch_snapshot(monkeypatch, snapshot_root)
@@ -270,30 +374,35 @@ class TestAudioMCQProcessor:
         from nemo_rl.data.interfaces import TaskDataSpec
         from nemo_rl.data.processors import vlm_hf_data_processor
 
-        # Stub AutoProcessor with the minimum surface used by the VLM branch.
-        processor = MagicMock()
-        processor.feature_extractor.sampling_rate = 16000
-        processor.tokenizer.bos_token_id = None
-        processor.return_value = {"input_ids": np.array([[1, 2, 3]])}
+        result = vlm_hf_data_processor(
+            datum_dict=formatted,
+            task_data_spec=TaskDataSpec(task_name="audiomcq"),
+            processor=_FakeProcessor(),
+            max_seq_length=4096,
+            idx=0,
+        )
+        assert result["task_name"] == "audiomcq"
+        assert "message_log" in result
+        assert "extra_env_info" in result
+        assert result["extra_env_info"]["ground_truth"] == rows[0]["answer"]
+        assert result["extra_env_info"]["choices"] == rows[0]["choices"]
 
-        # The processor calls processor(...) and expects an object with
-        # certain key shapes; the processor branch we added is a `pass` so
-        # the rejection path is the only thing this test really exercises.
-        # Verify the dispatcher does NOT raise the "No data processor" error
-        # for our task name:
-        try:
+    def test_dispatcher_rejects_unknown_task_name(self):
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        bogus_datum = {
+            "task_name": "definitely-not-a-task",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "assistant", "content": "hello"},
+            ],
+        }
+        with pytest.raises(ValueError, match="No data processor for task"):
             vlm_hf_data_processor(
-                datum_dict=formatted,
-                task_data_spec=TaskDataSpec(task_name="audiomcq"),
-                processor=processor,
-                max_seq_length=128,
+                datum_dict=bogus_datum,
+                task_data_spec=TaskDataSpec(task_name="definitely-not-a-task"),
+                processor=_FakeProcessor(),
+                max_seq_length=4096,
                 idx=0,
             )
-        except ValueError as e:
-            if "No data processor for task" in str(e):
-                pytest.fail(f"Dispatcher rejected audiomcq task_name: {e}")
-            # other ValueErrors from downstream multimodal stubbing are fine
-        except Exception:
-            # downstream chat-template / image utility failures are not the
-            # point of this dispatch-acceptance test
-            pass
