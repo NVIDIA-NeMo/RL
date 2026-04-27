@@ -582,6 +582,69 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return stacked
 
+    def init_cross_tokenizer_loss_fn(
+        self, loss_config: Any, token_aligner_config: Any
+    ) -> None:
+        """Have each worker build its own cross-tokenizer loss function.
+
+        Each worker materializes a ``MultiTeacherLossAggregator`` (with
+        ``N=1`` for the single-teacher case) from ``loss_config`` plus
+        the shared filesystem (projection matrices, embeddings) and
+        caches it as ``self._cached_loss_fn`` so the per-step
+        ``update_cross_tokenizer_data`` and the training forward path
+        can find it.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "init_cross_tokenizer_loss_fn",
+            loss_config=loss_config,
+            token_aligner_config=token_aligner_config,
+        )
+        ray.get(futures)
+
+    def update_cross_tokenizer_data(
+        self,
+        teacher_input_ids: torch.Tensor,
+        aligned_pairs: Any,
+        teacher_idx: Optional[int] = None,
+        chunk_indices: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Push per-step cross-tokenizer data to all workers' cached loss functions.
+
+        Shards ``teacher_input_ids``, ``aligned_pairs``, and the optional
+        ``chunk_indices`` along the DP axis so each worker only receives
+        its own slice. ``chunk_indices`` carries the per-sample COO chunk
+        masks precomputed by ``CrossTokenizerCollator``.
+        """
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        batch_size = teacher_input_ids.shape[0]
+        shard_size = batch_size // dp_size
+
+        if chunk_indices is not None:
+            chunk_indices_shards: list[Optional[dict[str, Any]]] = [
+                {
+                    k: chunk_indices[k][i * shard_size : (i + 1) * shard_size]
+                    for k in chunk_indices
+                }
+                for i in range(dp_size)
+            ]
+        else:
+            chunk_indices_shards = [None for _ in range(dp_size)]
+
+        futures = self.worker_group.run_all_workers_multiple_data(
+            "update_cross_tokenizer_data",
+            teacher_input_ids=[
+                teacher_input_ids[i * shard_size : (i + 1) * shard_size]
+                for i in range(dp_size)
+            ],
+            aligned_pairs=[
+                aligned_pairs[i * shard_size : (i + 1) * shard_size]
+                for i in range(dp_size)
+            ],
+            teacher_idx=[teacher_idx for _ in range(dp_size)],
+            chunk_indices=chunk_indices_shards,
+        )
+        ray.get(futures)
+
     def train(
         self,
         data: BatchedDataDict[Any],
