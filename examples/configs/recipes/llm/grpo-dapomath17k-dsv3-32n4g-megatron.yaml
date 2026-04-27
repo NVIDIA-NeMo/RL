@@ -8,7 +8,7 @@ policy:
     moe_token_dispatcher_type: "alltoall"
   generation:
     vllm_cfg:
-      gpu_memory_utilization: 0.5
+      gpu_memory_utilization: 0.3
 checkpointing:
   checkpoint_dir: results/grpo-dapomath17k-dsv3-32n4g-megatron
 logger:
