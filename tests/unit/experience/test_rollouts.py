@@ -917,7 +917,9 @@ def test_run_async_nemo_gym_rollout(
         final_batch["length"] = final_batch["length"].tolist()
         # truncated depends on exact generation output which is not reproducible,
         # so just verify each value is a bool rather than checking exact values
-        assert all(isinstance(v, (bool, int)) for v in final_batch["truncated"].tolist())
+        assert all(
+            isinstance(v, (bool, int)) for v in final_batch["truncated"].tolist()
+        )
         final_batch.pop("truncated", None)
 
         for key in d["rollout_metrics"]:
