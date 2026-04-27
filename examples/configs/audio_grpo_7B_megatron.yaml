@@ -63,7 +63,15 @@ data:
   train:
     dataset_name: audiomcq
     split: train
-  validation: null
+    # ~506/19480 rows held out for validation; identical seed across train
+    # and validation entries so both loaders see the same partition.
+    split_validation_size: 0.026
+    seed: 42
+  validation:
+    dataset_name: audiomcq
+    split: validation
+    split_validation_size: 0.026
+    seed: 42
   default:
     prompt_file: null
     system_prompt_file: null
