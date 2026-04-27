@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, NotRequired, TypedDict
+from urllib.parse import urlparse
 
 import ray
 import torch
@@ -27,6 +28,9 @@ class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+    remote_gym_url: NotRequired[
+        str
+    ]  # If set, connects to a remote Gym service instead of spawning local subprocesses
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -35,27 +39,60 @@ class NemoGym(EnvironmentInterface):
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        self._remote_mode = bool(cfg.get("remote_gym_url"))
 
-        self.node_ip = _get_node_ip_local()
-        self.head_server_port = _get_free_port_local()
+        from nemo_gym.rollout_collection import RolloutCollectionHelper
+        from nemo_gym.server_utils import BaseServerConfig
 
+        if self._remote_mode:
+            # Remote mode: connect to an external Gym HTTP service.
+            # No local subprocesses are spawned.
+            remote_url = cfg["remote_gym_url"]
+            # Parse host:port from URL like "http://gym-service:8080" or "gym-service:8080"
+            # Prefix with http:// if no scheme so urlparse handles it correctly.
+            parsed = urlparse(
+                remote_url
+                if remote_url.startswith(("http://", "https://"))
+                else f"http://{remote_url}"
+            )
+            host = parsed.hostname or "localhost"
+            port = parsed.port or 8080
+            print(f"NemoGym remote mode: connecting to {host}:{port}")
+
+            self.rh = None
+            self.head_server_config = BaseServerConfig(host=host, port=port)
+            self.rch = RolloutCollectionHelper()
+
+            initial_global_config_dict = cfg.get("initial_global_config_dict") or {}
+            self.rollout_max_attempts_to_avoid_lp_nan = initial_global_config_dict.get(
+                "rollout_max_attempts_to_avoid_lp_nan", 1
+            )
+            assert self.rollout_max_attempts_to_avoid_lp_nan >= 1, (
+                "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
+            )
+        else:
+            # Colocated mode: spawn Gym subprocesses locally (original behavior).
+            self._init_colocated(cfg)
+
+    def _init_colocated(self, cfg: NemoGymConfig):
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
         from omegaconf import DictConfig
 
+        self.node_ip = _get_node_ip_local()
+        self.head_server_port = _get_free_port_local()
+
         RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
         assert __file__.endswith(RELATIVE_PATH)
 
-        initial_global_config_dict = (
-            self.cfg.get("initial_global_config_dict") or dict()
-        )
+        initial_global_config_dict = cfg.get("initial_global_config_dict") or dict()
         # Policy information
-        initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
+        initial_global_config_dict["policy_model_name"] = cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
             "dummy_key"  # No key necessary for training.
         )
-        initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
+        initial_global_config_dict["policy_base_url"] = cfg["base_urls"]
 
         initial_global_config_dict.setdefault(
             "global_aiohttp_connector_limit_per_host", 16_384
@@ -253,7 +290,8 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
         }
 
     def shutdown(self) -> None:
-        self.rh.shutdown()
+        if self.rh is not None:
+            self.rh.shutdown()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.

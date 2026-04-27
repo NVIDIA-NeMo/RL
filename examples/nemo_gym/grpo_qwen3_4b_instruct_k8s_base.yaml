@@ -1,0 +1,94 @@
+defaults: ../configs/grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 2
+  max_num_steps: 10
+  val_period: 5
+  max_val_samples: null
+  val_batch_size: null
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0
+  use_importance_sampling_correction: true
+
+checkpointing:
+  checkpoint_dir: results/disagg-qwen3-4b-k8s
+  save_period: 5
+
+policy:
+  model_name: Qwen/Qwen3-4B-Instruct-2507
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 512
+  logprob_chunk_size: null
+  dtensor_cfg:
+    enabled: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: false
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      expose_http_server: true
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 0
+  train:
+    data_path: ${oc.env:DISAGG_TRAIN_PATH}
+    dataset_name: NemoGymDataset
+    split_validation_size: 0
+  validation:
+    data_path: ${oc.env:DISAGG_VALID_PATH}
+    dataset_name: NemoGymDataset
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+
+logger:
+  log_dir: logs/disagg-qwen3-4b-k8s
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: nemo-rl
+    name: disagg-gym-qwen3-4b-k8s
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1

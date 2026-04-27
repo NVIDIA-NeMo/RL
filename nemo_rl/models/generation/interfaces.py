@@ -127,6 +127,11 @@ class GenerationConfig(TypedDict):
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
     colocated: NotRequired[ColocationConfig]
+    # Setting `remote_generation_url` with `colocated.enabled=false` enables
+    # disaggregated HTTP mode: the training cluster sends generation requests
+    # (via OpenAI /v1/completions) to a separate cluster running the
+    # GenerationControlServer at this URL.
+    remote_generation_url: NotRequired[str]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
 
