@@ -14,6 +14,7 @@
 
 
 import glob
+import io
 import json
 import logging
 import os
@@ -53,6 +54,23 @@ class WandbConfig(TypedDict):
     entity: NotRequired[str]
 
 
+class TrackioConfig(TypedDict):
+    project: NotRequired[str]
+    name: NotRequired[str | None]
+    group: NotRequired[str | None]
+    space_id: NotRequired[str | None]
+    server_url: NotRequired[str | None]
+    bucket_id: NotRequired[str | None]
+    resume: NotRequired[str]
+    private: NotRequired[bool | None]
+    embed: NotRequired[bool]
+    auto_log_gpu: NotRequired[bool]
+    gpu_log_interval: NotRequired[int | float]
+    webhook_url: NotRequired[str | None]
+    webhook_min_level: NotRequired[str | None]
+    dir: NotRequired[str | None]
+
+
 class SwanlabConfig(TypedDict):
     project: NotRequired[str]
     name: NotRequired[str]
@@ -78,10 +96,12 @@ class GPUMonitoringConfig(TypedDict):
 class LoggerConfig(TypedDict):
     log_dir: str
     wandb_enabled: bool
+    trackio_enabled: NotRequired[bool]
     swanlab_enabled: bool
     tensorboard_enabled: bool
     mlflow_enabled: bool
     wandb: WandbConfig
+    trackio: NotRequired[TrackioConfig]
     tensorboard: NotRequired[TensorboardConfig]
     swanlab: NotRequired[SwanlabConfig]
     mlflow: NotRequired[MLflowConfig]
@@ -217,9 +237,7 @@ class WandbLogger(LoggerInterface):
 
         self._log_code()
         self._log_diffs()
-        print(
-            f"Initialized WandbLogger for project {cfg.get('project')}, run {cfg.get('name')} at {log_dir}"
-        )
+        print(f"Initialized WandbLogger for project {cfg.get('project')}, run {cfg.get('name')} at {log_dir}")
 
     def _log_diffs(self):
         """Log git diffs to wandb.
@@ -239,20 +257,14 @@ class WandbLogger(LoggerInterface):
             )
             current_branch = branch_result.stdout.strip()
 
-            diff_artifact = wandb.Artifact(
-                name=f"git-diffs-{self.run.project}-{self.run.id}", type="git-diffs"
-            )
+            diff_artifact = wandb.Artifact(name=f"git-diffs-{self.run.project}-{self.run.id}", type="git-diffs")
 
             # 1. Log uncommitted changes (working tree diff)
-            uncommitted_result = subprocess.run(
-                ["git", "diff", "HEAD"], capture_output=True, text=True, check=True
-            )
+            uncommitted_result = subprocess.run(["git", "diff", "HEAD"], capture_output=True, text=True, check=True)
             uncommitted_diff = uncommitted_result.stdout
 
             if uncommitted_diff:
-                diff_path = os.path.join(
-                    wandb.run.dir if wandb.run else ".", "uncommitted_changes_diff.txt"
-                )
+                diff_path = os.path.join(wandb.run.dir if wandb.run else ".", "uncommitted_changes_diff.txt")
                 with open(diff_path, "w") as f:
                     f.write(uncommitted_diff)
 
@@ -272,9 +284,7 @@ class WandbLogger(LoggerInterface):
 
                 if working_diff:
                     # Save diff to a temporary file
-                    diff_path = os.path.join(
-                        wandb.run.dir if wandb.run else ".", "main_diff.txt"
-                    )
+                    diff_path = os.path.join(wandb.run.dir if wandb.run else ".", "main_diff.txt")
                     with open(diff_path, "w") as f:
                         f.write(working_diff)
 
@@ -298,21 +308,15 @@ class WandbLogger(LoggerInterface):
         and manually uploads them to the current wandb run as an artifact.
         """
         try:
-            result = subprocess.run(
-                ["git", "ls-files"], capture_output=True, text=True, check=True
-            )
+            result = subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True)
 
             tracked_files = result.stdout.strip().split("\n")
 
             if not tracked_files:
-                print(
-                    "Warning: No git repository found. Wandb logs will not track code changes for reproducibility."
-                )
+                print("Warning: No git repository found. Wandb logs will not track code changes for reproducibility.")
                 return
 
-            code_artifact = wandb.Artifact(
-                name=f"source-code-{self.run.project}", type="code"
-            )
+            code_artifact = wandb.Artifact(name=f"source-code-{self.run.project}", type="code")
 
             for file_path in tracked_files:
                 if os.path.isfile(file_path):
@@ -360,10 +364,7 @@ class WandbLogger(LoggerInterface):
                          of the provided step value
         """
         if prefix:
-            metrics = {
-                f"{prefix}/{k}" if k != step_metric else k: v
-                for k, v in metrics.items()
-            }
+            metrics = {f"{prefix}/{k}" if k != step_metric else k: v for k, v in metrics.items()}
 
         # If step_metric is provided, use the corresponding value from metrics as step
         if step_metric and step_metric in metrics:
@@ -404,6 +405,105 @@ class WandbLogger(LoggerInterface):
         self.run.log({name: wandb.Histogram(histogram)}, step=step)
 
 
+class TrackioLogger(LoggerInterface):
+    """Trackio logger backend."""
+
+    _INIT_KEYS = {
+        "project",
+        "name",
+        "group",
+        "space_id",
+        "server_url",
+        "bucket_id",
+        "resume",
+        "private",
+        "embed",
+        "auto_log_gpu",
+        "gpu_log_interval",
+        "webhook_url",
+        "webhook_min_level",
+    }
+
+    def __init__(self, cfg: TrackioConfig, log_dir: Optional[str] = None):
+        trackio_dir = cfg.get("dir")
+        if trackio_dir:
+            os.makedirs(trackio_dir, exist_ok=True)
+            os.environ["TRACKIO_DIR"] = trackio_dir
+
+        self._trackio = self._import_trackio()
+        self._closed = False
+
+        init_kwargs = {key: value for key, value in cfg.items() if key in self._INIT_KEYS and value is not None}
+        if "project" not in init_kwargs:
+            raise ValueError("Trackio logging requires logger.trackio.project")
+
+        self.run = self._trackio.init(**init_kwargs)
+        print(
+            f"Initialized TrackioLogger for project {cfg.get('project')}, run {cfg.get('name')} at {trackio_dir or log_dir}"
+        )
+
+    @staticmethod
+    def _import_trackio() -> Any:
+        try:
+            import trackio
+        except ImportError as e:
+            raise ImportError(
+                "Trackio logging requires the optional Trackio dependency. "
+                "Install it with `uv sync --extra trackio` or run with `uv run --extra trackio ...`."
+            ) from e
+        return trackio
+
+    def log_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: Optional[str] = "",
+        step_metric: Optional[str] = None,
+        step_finished: bool = False,
+    ) -> None:
+        """Log metrics to Trackio."""
+        if prefix:
+            metrics = {f"{prefix}/{k}" if k != step_metric else k: v for k, v in metrics.items()}
+
+        if step_metric and step_metric in metrics:
+            step = int(metrics[step_metric])
+
+        self.run.log(metrics, step=step)
+
+    def log_hyperparams(self, params: Mapping[str, Any]) -> None:
+        """Attach hyperparameters to the Trackio run config."""
+        if hasattr(self.run, "config") and isinstance(self.run.config, dict):
+            self.run.config.update(params)
+
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a matplotlib figure to Trackio as an image."""
+        from PIL import Image
+
+        image_buffer = io.BytesIO()
+        figure.savefig(image_buffer, format="png", bbox_inches="tight")
+        image_buffer.seek(0)
+        image = Image.open(image_buffer).copy()
+        self.run.log({name: self._trackio.Image(image)}, step=step)
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log histogram metrics to Trackio."""
+        self.run.log({name: self._trackio.Histogram(histogram)}, step=step)
+
+    def close(self) -> None:
+        """Finish the Trackio run and flush queued logs."""
+        if self._closed:
+            return
+        self._closed = True
+        self.run.finish()
+
+    def __del__(self) -> None:
+        """Clean up resources when the logger is destroyed."""
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 class SwanlabLogger(LoggerInterface):
     """SwanLab logger backend."""
 
@@ -436,10 +536,7 @@ class SwanlabLogger(LoggerInterface):
             step_metric (Optional[str]): Name of a metric that should be excluded from prefixing.
         """
         if prefix:
-            metrics = {
-                f"{prefix}/{k}" if k != step_metric else k: v
-                for k, v in metrics.items()
-            }
+            metrics = {f"{prefix}/{k}" if k != step_metric else k: v for k, v in metrics.items()}
 
         self.run.log(metrics, step=step)
 
@@ -494,9 +591,7 @@ class RayGpuMonitorLogger:
         self.metric_prefix = metric_prefix
         self.step_metric = step_metric
         self.parent_logger = parent_logger
-        self.metrics_buffer: list[
-            GpuMetricSnapshot
-        ] = []  # Store metrics with timestamps
+        self.metrics_buffer: list[GpuMetricSnapshot] = []  # Store metrics with timestamps
         self.last_flush_time = time.time()
         self.is_running = False
         self.collection_thread: Optional[threading.Thread] = None
@@ -547,9 +642,7 @@ class RayGpuMonitorLogger:
                     with self.lock:
                         self.metrics_buffer.append(
                             {
-                                "step": int(
-                                    relative_time
-                                ),  # Store the relative time as step
+                                "step": int(relative_time),  # Store the relative time as step
                                 "metrics": metrics,
                             }
                         )
@@ -562,9 +655,7 @@ class RayGpuMonitorLogger:
 
                 time.sleep(self.collection_interval)
             except Exception as e:
-                print(
-                    f"Error in GPU monitoring collection loop or stopped abruptly: {e}"
-                )
+                print(f"Error in GPU monitoring collection loop or stopped abruptly: {e}")
                 time.sleep(self.collection_interval)  # Continue despite errors
 
     def _parse_metric(self, sample: Sample, node_idx: int) -> dict[str, Any]:
@@ -621,10 +712,7 @@ class RayGpuMonitorLogger:
 
         metric_name = sample.name
         # Only return SKU if the metric is one of these which publish these metrics
-        if (
-            metric_name != "ray_node_gpus_utilization"
-            and metric_name != "ray_node_gram_used"
-        ):
+        if metric_name != "ray_node_gpus_utilization" and metric_name != "ray_node_gram_used":
             # Skip unexpected metrics
             return {}
 
@@ -662,9 +750,7 @@ class RayGpuMonitorLogger:
         Returns:
             Dictionary of collected metrics
         """
-        assert metrics ^ sku, (
-            f"Must collect either metrics or sku, not both: {metrics=}, {sku=}"
-        )
+        assert metrics ^ sku, f"Must collect either metrics or sku, not both: {metrics=}, {sku=}"
         parser_fn = self._parse_metric if metrics else self._parse_gpu_sku
 
         if not ray.is_initialized():
@@ -690,9 +776,7 @@ class RayGpuMonitorLogger:
             # Process each node's metrics
             collected_metrics: dict[str, Any] = {}
             for node_idx, metric_address in enumerate(unique_metric_addresses):
-                metrics = self._fetch_and_parse_metrics(
-                    node_idx, metric_address, parser_fn
-                )
+                metrics = self._fetch_and_parse_metrics(node_idx, metric_address, parser_fn)
                 collected_metrics.update(metrics)
 
             return collected_metrics
@@ -701,9 +785,7 @@ class RayGpuMonitorLogger:
             print(f"Error collecting GPU metrics: {e}")
             return {}
 
-    def _fetch_and_parse_metrics(
-        self, node_idx: int, metric_address: str, parser_fn: Callable
-    ):
+    def _fetch_and_parse_metrics(self, node_idx: int, metric_address: str, parser_fn: Callable):
         """Fetch metrics from a node and parse GPU metrics.
 
         Args:
@@ -778,9 +860,7 @@ class MLflowLogger(LoggerInterface):
             mlflow.set_tracking_uri(tracking_uri)
 
         run_id = cfg.get("run_id") or os.getenv("MLFLOW_RUN_ID")
-        experiment_name = cfg.get("experiment_name") or os.getenv(
-            "MLFLOW_EXPERIMENT_NAME"
-        )
+        experiment_name = cfg.get("experiment_name") or os.getenv("MLFLOW_EXPERIMENT_NAME")
         run_name = cfg.get("run_name") or os.getenv("MLFLOW_RUN_NAME")
 
         run = mlflow.active_run()
@@ -817,9 +897,7 @@ class MLflowLogger(LoggerInterface):
 
         self.run = run
         self.run_id = run.info.run_id
-        print(
-            f"Initialized MLflowLogger for experiment {experiment_name}, run {run_name}"
-        )
+        print(f"Initialized MLflowLogger for experiment {experiment_name}, run {run_name}")
 
     def log_metrics(
         self,
@@ -864,9 +942,7 @@ class MLflowLogger(LoggerInterface):
             name: Name of the plot
         """
         # Use bbox_inches="tight" to remove extra whitespace/padding around the plot
-        mlflow.log_figure(
-            figure, f"plots/{name}.png", save_kwargs={"bbox_inches": "tight"}
-        )
+        mlflow.log_figure(figure, f"plots/{name}.png", save_kwargs={"bbox_inches": "tight"})
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to MLflow."""
@@ -890,14 +966,17 @@ class Logger(LoggerInterface):
         Parameters:
             cfg (LoggerConfig): Configuration mapping. Expected keys include:
                 - "log_dir": base directory for backend logs.
-                - "wandb_enabled", "swanlab_enabled", "tensorboard_enabled", "mlflow_enabled": booleans to enable backends.
-                - "wandb", "swanlab", "tensorboard", "mlflow": per-backend configuration dicts.
+                - "wandb_enabled", "trackio_enabled", "swanlab_enabled", "tensorboard_enabled", "mlflow_enabled": booleans to enable backends.
+                - "wandb", "trackio", "swanlab", "tensorboard", "mlflow": per-backend configuration dicts.
                 - "monitor_gpus": boolean to enable Ray GPU monitoring.
                 - "gpu_monitoring": dict with "collection_interval" and "flush_interval" when GPU monitoring is enabled.
         """
         self.loggers: list[LoggerInterface] = []
         self.wandb_logger = None
+        self.trackio_logger = None
         self.swanlab_logger = None
+        self.gpu_monitor = None
+        self._closed = False
 
         self.base_log_dir = cfg["log_dir"]
         os.makedirs(self.base_log_dir, exist_ok=True)
@@ -908,6 +987,12 @@ class Logger(LoggerInterface):
             self.wandb_logger = WandbLogger(cfg["wandb"], log_dir=wandb_log_dir)
             self.loggers.append(self.wandb_logger)
 
+        if cfg.get("trackio_enabled", False):
+            trackio_log_dir = os.path.join(self.base_log_dir, "trackio")
+            os.makedirs(trackio_log_dir, exist_ok=True)
+            self.trackio_logger = TrackioLogger(cfg.get("trackio", {}), log_dir=trackio_log_dir)
+            self.loggers.append(self.trackio_logger)
+
         if cfg["swanlab_enabled"]:
             swanlab_log_dir = os.path.join(self.base_log_dir, "swanlab")
             os.makedirs(swanlab_log_dir, exist_ok=True)
@@ -917,9 +1002,7 @@ class Logger(LoggerInterface):
         if cfg["tensorboard_enabled"]:
             tensorboard_log_dir = os.path.join(self.base_log_dir, "tensorboard")
             os.makedirs(tensorboard_log_dir, exist_ok=True)
-            tensorboard_logger = TensorboardLogger(
-                cfg["tensorboard"], log_dir=tensorboard_log_dir
-            )
+            tensorboard_logger = TensorboardLogger(cfg["tensorboard"], log_dir=tensorboard_log_dir)
             self.loggers.append(tensorboard_logger)
 
         if cfg["mlflow_enabled"]:
@@ -931,14 +1014,11 @@ class Logger(LoggerInterface):
             self.loggers.append(mlflow_logger)
 
         # Initialize GPU monitoring if requested
-        self.gpu_monitor = None
         if cfg["monitor_gpus"]:
             metric_prefix = "ray"
             step_metric = f"{metric_prefix}/ray_step"
             if cfg["wandb_enabled"] and self.wandb_logger:
-                self.wandb_logger.define_metric(
-                    f"{metric_prefix}/*", step_metric=step_metric
-                )
+                self.wandb_logger.define_metric(f"{metric_prefix}/*", step_metric=step_metric)
 
             self.gpu_monitor = RayGpuMonitorLogger(
                 collection_interval=cfg["gpu_monitoring"]["collection_interval"],
@@ -981,9 +1061,7 @@ class Logger(LoggerInterface):
         for logger in self.loggers:
             logger.log_hyperparams(params)
 
-    def log_batched_dict_as_jsonl(
-        self, to_log: BatchedDataDict[Any] | dict[str, Any], filename: str
-    ) -> None:
+    def log_batched_dict_as_jsonl(self, to_log: BatchedDataDict[Any] | dict[str, Any], filename: str) -> None:
         """Log a list of dictionaries to a JSONL file.
 
         Args:
@@ -1044,15 +1122,11 @@ class Logger(LoggerInterface):
             timeline_interval: Interval between timeline points (in seconds)
         """
         if not metrics:
-            print(
-                f"Skipping {name} per-worker timeline logging because no metrics were provided."
-            )
+            print(f"Skipping {name} per-worker timeline logging because no metrics were provided.")
             return
 
         if timeline_interval <= 0:
-            raise ValueError(
-                f"timeline_interval must be positive; received {timeline_interval}"
-            )
+            raise ValueError(f"timeline_interval must be positive; received {timeline_interval}")
 
         # Plot the per-worker timeline metrics
         x_series: list[list[float]] = []
@@ -1060,9 +1134,7 @@ class Logger(LoggerInterface):
         series_labels: list[str] = []
 
         if not any(metrics.values()):
-            print(
-                f"Skipping {name} per-worker timeline logging because all series were empty."
-            )
+            print(f"Skipping {name} per-worker timeline logging because all series were empty.")
             return
 
         for worker_id in sorted(metrics.keys()):
@@ -1126,9 +1198,7 @@ class Logger(LoggerInterface):
         for logger in self.loggers:
             logger.log_plot(figure, step, name)
 
-    def log_plot_token_mult_prob_error(
-        self, data: dict[str, Any], step: int, name: str
-    ) -> None:
+    def log_plot_token_mult_prob_error(self, data: dict[str, Any], step: int, name: str) -> None:
         """Log a plot of log probability errors in samples.
 
         This function logs & plots the per-token log-probabilities and errors over the sequence
@@ -1167,13 +1237,9 @@ class Logger(LoggerInterface):
             )
             return
 
-        generation_logprob = generation_logprobs[
-            sample_idx, int(generation_start_idx) : int(generation_end_idx)
-        ]
+        generation_logprob = generation_logprobs[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
         prev_logprob = (
-            prev_logprobs[
-                sample_idx, int(generation_start_idx) : int(generation_end_idx)
-            ]
+            prev_logprobs[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
             * mask[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
         )
         diff_i = diff[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
@@ -1227,8 +1293,25 @@ class Logger(LoggerInterface):
 
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        """Close logger backends and flush any buffered logs."""
+        if self._closed:
+            return
+        self._closed = True
+
         if self.gpu_monitor:
             self.gpu_monitor.stop()
+            self.gpu_monitor = None
+
+        for logger in self.loggers:
+            close = getattr(logger, "close", None)
+            if callable(close):
+                close()
 
 
 def flatten_dict(d: Mapping[str, Any], sep: str = ".") -> dict[str, Any]:
@@ -1286,9 +1369,7 @@ Functions for setting up rich console logging and visualizing model outputs.
 """
 
 
-def configure_rich_logging(
-    level: str = "INFO", show_time: bool = True, show_path: bool = True
-) -> None:
+def configure_rich_logging(level: str = "INFO", show_time: bool = True, show_path: bool = True) -> None:
     """Configure rich logging for more visually appealing log output.
 
     Args:
@@ -1345,9 +1426,7 @@ def print_message_log_samples(
         print("⚠️ No valid message logs to display")
         return
 
-    assert len(message_logs) == len(rewards), (
-        "Message logs and rewards must have the same length"
-    )
+    assert len(message_logs) == len(rewards), "Message logs and rewards must have the same length"
 
     # Sample up to num_samples (or all if less)
     num_to_show = min(num_samples, len(message_logs))
@@ -1419,9 +1498,7 @@ def print_message_log_samples(
 
         bar = f"[{color}]{bar_char * bar_len}[/]"
         # Format with color based on reward value
-        discrete_lines.append(
-            f"{emoji} Reward [bold {color}]{reward:.4f}[/]: {bar} ({count} samples)"
-        )
+        discrete_lines.append(f"{emoji} Reward [bold {color}]{reward:.4f}[/]: {bar} ({count} samples)")
 
     # Create a summary panel
     avg_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0

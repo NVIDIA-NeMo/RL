@@ -110,6 +110,7 @@ mcore = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
 ]
 nemo_gym = ["nemo_gym"]
+trackio = ["trackio==0.25.1"]
 
 [dependency-groups]
 

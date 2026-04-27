@@ -61,6 +61,7 @@ logger:
   log_dir: "logs"  # Base directory for all logs
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb_enabled: false
+  trackio_enabled: false # Install with `uv sync --extra trackio` before enabling
   tensorboard_enabled: false
   mlflow_enabled: false
   swanlab_enabled: false # Disable SwanLab logging
@@ -68,6 +69,21 @@ logger:
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-sliding_puzzle"
+  trackio:
+    project: "grpo-dev"
+    name: "grpo-dev-sliding_puzzle"
+    group: null
+    space_id: null
+    server_url: null
+    bucket_id: null
+    resume: "never"
+    private: null
+    embed: false
+    auto_log_gpu: false
+    gpu_log_interval: 10.0
+    webhook_url: null
+    webhook_min_level: null
+    dir: null
   swanlab:
     project: "grpo-dev"
     name: "grpo-dev-sliding_puzzle"

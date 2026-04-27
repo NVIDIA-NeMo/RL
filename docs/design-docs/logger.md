@@ -1,6 +1,6 @@
 # Logger
 
-The logger is designed to track key training metrics (including distributed metrics with reductions and timing), as well as providing integration with logging backends like WandB, Tensorboard, MLflow and Swanlab.
+The logger is designed to track key training metrics (including distributed metrics with reductions and timing), as well as providing integration with logging backends like WandB, Trackio, Tensorboard, MLflow and Swanlab.
 
 ## Requirements
 
@@ -8,6 +8,7 @@ The logger is designed to track key training metrics (including distributed metr
 * Tracking distributed timing with (usually) 'max' reduction across ranks
 * Logging:
    * WandB
+   * Trackio
    * Tensorboard
    * MLflow
    * Swanlab
@@ -16,7 +17,7 @@ The logger is designed to track key training metrics (including distributed metr
 
 Since there is a single controller, the single process running the main training loop will gather the metrics and do the logging.
 
-To handle multiple logger backends, we will have a {py:class}`LoggerInterface <nemo_rl.utils.logger.LoggerInterface>` interface that the {py:class}`TensorboardLogger <nemo_rl.utils.logger.TensorboardLogger>`, {py:class}`WandbLogger <nemo_rl.utils.logger.WandbLogger>`, {py:class}`MLflowLogger <nemo_rl.utils.logger.MLflowLogger>` and {py:class}`SwanlabLogger <nemo_rl.utils.logger.SwanlabLogger>` will implement:
+To handle multiple logger backends, we will have a {py:class}`LoggerInterface <nemo_rl.utils.logger.LoggerInterface>` interface that the {py:class}`TensorboardLogger <nemo_rl.utils.logger.TensorboardLogger>`, {py:class}`WandbLogger <nemo_rl.utils.logger.WandbLogger>`, {py:class}`TrackioLogger <nemo_rl.utils.logger.TrackioLogger>`, {py:class}`MLflowLogger <nemo_rl.utils.logger.MLflowLogger>` and {py:class}`SwanlabLogger <nemo_rl.utils.logger.SwanlabLogger>` will implement:
 
 ```python
 class LoggerInterface(ABC):
@@ -36,15 +37,27 @@ class LoggerInterface(ABC):
 A {py:class}`Logger <nemo_rl.utils.logger.Logger>` wrapper class will also implement {py:class}`LoggerInterface <nemo_rl.utils.logger.LoggerInterface>` and maintain a list of loggers to which it delegates writing logs. This will be the main class the user uses in the training loop. Usage example:
 
 ```python
-# Initialize logger with wandb, tensorboard, mlflow and swanlab enabled
+# Initialize logger with wandb, trackio, tensorboard, mlflow and swanlab enabled
 logging_config = {
     "wandb_enabled": True,
+    "trackio_enabled": False,
     "tensorboard_enabled": False,
     "mlflow_enabled": True,
 
     "wandb": {
         "project": "grpo-dev",
         "name": "grpo-dev-logging",
+    },
+    "trackio": {
+        "project": "grpo-dev",
+        "name": "grpo-dev-logging",
+        "space_id": None,
+        "server_url": None,
+        "bucket_id": None,
+        "resume": "never",
+        "embed": False,
+        "auto_log_gpu": False,
+        "dir": None,
     },
     "swanlab": {
         "project": "nemo-rl",
@@ -71,13 +84,63 @@ logger.log_metrics({
 
 ## Supported Logging Backends
 
-The logger supports three main logging backends:
+The logger supports five logging backends:
 
 ### WandB (Weights & Biases)
 - Provides cloud-based experiment tracking
 - Supports custom step metrics for better visualization
 - Includes built-in hyperparameter logging
 - Offers rich visualization and collaboration features
+
+### Trackio
+- Local-first experiment tracking with optional Hugging Face Spaces or self-hosted server logging
+- Uses an optional dependency extra and can be enabled independently of WandB
+- Supports scalar metrics, hyperparameters, matplotlib figures as images, and histograms
+
+#### Trackio Configuration
+
+Trackio is an optional dependency. Install it before enabling the backend:
+
+```bash
+uv sync --extra trackio
+```
+
+Then enable it in a run:
+
+```bash
+uv run --extra trackio examples/run_grpo.py \
+  logger.trackio_enabled=true \
+  logger.trackio.project=nemo-rl \
+  logger.trackio.name=grpo-trackio
+```
+
+Trackio can be configured with the following parameters:
+
+```python
+trackio:
+  project: "nemo-rl"
+  name: "grpo-trackio"
+  group: null
+  space_id: null       # Optional Hugging Face Space, e.g. "username/space"
+  server_url: null     # Optional self-hosted Trackio server URL
+  bucket_id: null      # Optional Hugging Face Bucket for Space persistence
+  resume: "never"
+  private: null
+  embed: false
+  auto_log_gpu: false  # Keep false when using NeMo RL's Ray GPU monitor
+  gpu_log_interval: 10.0
+  webhook_url: null
+  webhook_min_level: null
+  dir: null            # Optional TRACKIO_DIR override
+```
+
+For local runs, view results with:
+
+```bash
+trackio show --project nemo-rl
+```
+
+By default, local Trackio project databases are stored under `TRACKIO_DIR`, which defaults to `~/.cache/huggingface/trackio`. Set `logger.trackio.dir` to use a run-specific local storage directory.
 
 ### Swanlab
 - Training visualization (Android, iOS, Wechat public account and Web)
@@ -159,6 +222,7 @@ The logger supports pretty-formatted logging of validation samples to help visua
 ```python
 logger:
   wandb_enabled: false
+  trackio_enabled: false
   swanlab_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false
@@ -179,7 +243,7 @@ When enabled, the pretty logging will generate formatted text similar to:
 
 ## GPU Metric Logging
 
-NeMo RL monitors GPU memory and utilization through [system metrics](https://docs.ray.io/en/latest/ray-observability/reference/system-metrics.html#system-metrics) exposed by Ray nodes. While Ray makes these metrics available for tools like Prometheus, NeMo RL directly polls GPU memory and utilization data and logs them to TensorBoard, WandB, MLflow and/or SwanLab.
+NeMo RL monitors GPU memory and utilization through [system metrics](https://docs.ray.io/en/latest/ray-observability/reference/system-metrics.html#system-metrics) exposed by Ray nodes. While Ray makes these metrics available for tools like Prometheus, NeMo RL directly polls GPU memory and utilization data and logs them to TensorBoard, WandB, Trackio, MLflow and/or SwanLab.
 
 This approach allows us to offer the same GPU metric tracking on all loggers and simplifies the implementation greatly.
 
@@ -188,6 +252,7 @@ This feature is enabled with the `monitor_gpus` configuration parameter. The fre
 ```python
 logger:
   wandb_enabled: false
+  trackio_enabled: false
   swanlab_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false
@@ -202,7 +267,7 @@ logger:
 > * Logs sent back to the driver do not introduce significant overhead.
 > * Metrics remain clear and interpretable, avoiding issues like double counting caused by colocated workers.
 > * Workers can gracefully flush their logs in case of failure.
-> * Logging behaves consistently across TensorBoard, WandB, MLflow and Swanlab.
+> * Logging behaves consistently across TensorBoard, WandB, Trackio, MLflow and Swanlab.
 > * Workers that spawn other workers accurately report the total resource usage of any grandchild workers.
 >
 > Due to these complexities, we opted for a simpler approach: collecting metrics exposed by the Ray metrics server from the driver.

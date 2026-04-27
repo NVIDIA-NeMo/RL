@@ -241,6 +241,7 @@ logger:
     log_dir: "logs/distillation"
     num_val_samples_to_print: 5
     wandb_enabled: true
+    trackio_enabled: false # Install with `uv sync --extra trackio` before enabling
     tensorboard_enabled: true
     mlflow_enabled: false
     swanlab_enabled: false
@@ -248,6 +249,21 @@ logger:
     wandb:
         project: "nemo-distillation"
         name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    trackio:
+        project: "nemo-distillation"
+        name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        group: null
+        space_id: null
+        server_url: null
+        bucket_id: null
+        resume: "never"
+        private: null
+        embed: false
+        auto_log_gpu: false
+        gpu_log_interval: 10.0
+        webhook_url: null
+        webhook_min_level: null
+        dir: null
     swanlab:
         project: "nemo-distillation"
         name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"

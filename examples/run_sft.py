@@ -41,9 +41,7 @@ from nemo_rl.utils.logger import get_next_experiment_dir
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run SFT training with configuration")
-    parser.add_argument(
-        "--config", type=str, default=None, help="Path to YAML config file"
-    )
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file")
 
     # Parse known args for the script
     args, overrides = parser.parse_known_args()
@@ -113,9 +111,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             task_name = data.task_name
             val_task_data_processors[task_name] = task_data_processors[task_name]
             if task_name in task_data_preprocessors:
-                val_task_data_preprocessors[task_name] = task_data_preprocessors[
-                    task_name
-                ]
+                val_task_data_preprocessors[task_name] = task_data_preprocessors[task_name]
 
     # validation dataset from config
     if "validation" in data_config and data_config["validation"] is not None:
@@ -184,9 +180,7 @@ def main(is_vlm: bool = False):
     config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
     print(f"📊 Using log directory: {config['logger']['log_dir']}")
     if config["checkpointing"]["enabled"]:
-        print(
-            f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
-        )
+        print(f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}")
 
     init_ray()
 
@@ -196,29 +190,34 @@ def main(is_vlm: bool = False):
     # setup data
     dataset, val_dataset = setup_data(tokenizer, config["data"])
 
-    (
-        policy,
-        cluster,
-        train_dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        sft_save_state,
-        master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+    logger = None
+    try:
+        (
+            policy,
+            cluster,
+            train_dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            sft_save_state,
+            master_config,
+        ) = setup(config, tokenizer, dataset, val_dataset)
 
-    sft_train(
-        policy,
-        train_dataloader,
-        val_dataloader,
-        tokenizer,
-        loss_fn,
-        master_config,
-        logger,
-        checkpointer,
-        sft_save_state,
-    )
+        sft_train(
+            policy,
+            train_dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            master_config,
+            logger,
+            checkpointer,
+            sft_save_state,
+        )
+    finally:
+        if logger is not None:
+            logger.close()
 
 
 if __name__ == "__main__":

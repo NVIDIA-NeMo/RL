@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import shutil
+import sys
 import tempfile
 from unittest.mock import MagicMock, call, patch
 
@@ -25,6 +26,7 @@ from nemo_rl.utils.logger import (
     RayGpuMonitorLogger,
     SwanlabLogger,
     TensorboardLogger,
+    TrackioLogger,
     WandbLogger,
     flatten_dict,
     print_message_log_samples,
@@ -342,9 +344,7 @@ class TestWandbLogger:
 
         # Check that define_metric was called
         mock_run = mock_wandb.init.return_value
-        mock_run.define_metric.assert_called_once_with(
-            "ray/*", step_metric="ray/ray_step"
-        )
+        mock_run.define_metric.assert_called_once_with("ray/*", step_metric="ray/ray_step")
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_hyperparams(self, mock_wandb):
@@ -358,6 +358,159 @@ class TestWandbLogger:
         # Check that config.update was called with params
         mock_run = mock_wandb.init.return_value
         mock_run.config.update.assert_called_once_with(params, allow_val_change=True)
+
+
+class TestTrackioLogger:
+    """Test the TrackioLogger class."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        """Create a temporary directory for logs."""
+        temp_dir = tempfile.mkdtemp()
+        yield temp_dir
+        shutil.rmtree(temp_dir)
+
+    def _mock_trackio(self):
+        mock_trackio = MagicMock()
+        mock_run = MagicMock()
+        mock_run.config = {}
+        mock_trackio.init.return_value = mock_run
+        return mock_trackio, mock_run
+
+    def test_init_custom_config(self, temp_dir):
+        """Test initialization of TrackioLogger with custom config."""
+        mock_trackio, _ = self._mock_trackio()
+        cfg = {
+            "project": "custom-project",
+            "name": "custom-run",
+            "group": "custom-group",
+            "space_id": "org/space",
+            "server_url": "http://localhost:7860",
+            "bucket_id": "org/bucket",
+            "resume": "allow",
+            "private": True,
+            "embed": False,
+            "auto_log_gpu": False,
+            "gpu_log_interval": 5.0,
+            "webhook_url": "http://hooks.example",
+            "webhook_min_level": "warn",
+            "dir": temp_dir,
+        }
+
+        with patch.dict(sys.modules, {"trackio": mock_trackio}):
+            with patch.dict("os.environ", {}, clear=False):
+                TrackioLogger(cfg, log_dir=temp_dir)
+
+        mock_trackio.init.assert_called_once_with(
+            project="custom-project",
+            name="custom-run",
+            group="custom-group",
+            space_id="org/space",
+            server_url="http://localhost:7860",
+            bucket_id="org/bucket",
+            resume="allow",
+            private=True,
+            embed=False,
+            auto_log_gpu=False,
+            gpu_log_interval=5.0,
+            webhook_url="http://hooks.example",
+            webhook_min_level="warn",
+        )
+
+    def test_init_missing_dependency(self):
+        """Test a helpful error when Trackio is not installed."""
+        original_import = __import__
+
+        def import_side_effect(name, *args, **kwargs):
+            if name == "trackio":
+                raise ImportError("No module named trackio")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=import_side_effect):
+            with pytest.raises(ImportError, match="uv sync --extra trackio"):
+                TrackioLogger({"project": "test-project"})
+
+    def test_init_requires_project(self):
+        """Test Trackio project validation."""
+        mock_trackio, _ = self._mock_trackio()
+
+        with patch.dict(sys.modules, {"trackio": mock_trackio}):
+            with pytest.raises(ValueError, match="logger.trackio.project"):
+                TrackioLogger({})
+
+    def test_log_metrics(self):
+        """Test logging metrics to TrackioLogger."""
+        mock_trackio, mock_run = self._mock_trackio()
+        with patch.dict(sys.modules, {"trackio": mock_trackio}):
+            logger = TrackioLogger({"project": "test-project"})
+
+        metrics = {"loss": 0.5, "accuracy": 0.8}
+        logger.log_metrics(metrics, step=10)
+
+        mock_run.log.assert_called_once_with(metrics, step=10)
+
+    def test_log_metrics_with_prefix_and_step_metric(self):
+        """Test logging prefixed metrics to TrackioLogger."""
+        mock_trackio, mock_run = self._mock_trackio()
+        with patch.dict(sys.modules, {"trackio": mock_trackio}):
+            logger = TrackioLogger({"project": "test-project"})
+
+        metrics = {"loss": 0.5, "iteration": 15}
+        logger.log_metrics(metrics, step=10, prefix="train", step_metric="train/iteration")
+
+        mock_run.log.assert_called_once_with({"train/loss": 0.5, "train/iteration": 15}, step=15)
+
+    def test_log_hyperparams(self):
+        """Test logging hyperparameters to TrackioLogger."""
+        mock_trackio, mock_run = self._mock_trackio()
+        with patch.dict(sys.modules, {"trackio": mock_trackio}):
+            logger = TrackioLogger({"project": "test-project"})
+
+        params = {"lr": 0.001, "model": {"hidden_size": 128}}
+        logger.log_hyperparams(params)
+
+        assert mock_run.config == params
+
+    def test_log_plot(self):
+        """Test logging plots to TrackioLogger."""
+        from matplotlib import pyplot as plt
+
+        mock_trackio, mock_run = self._mock_trackio()
+        mock_trackio.Image.return_value = "trackio-image"
+        with patch.dict(sys.modules, {"trackio": mock_trackio}):
+            logger = TrackioLogger({"project": "test-project"})
+
+        fig, ax = plt.subplots()
+        ax.plot([1, 2], [3, 4])
+        logger.log_plot(fig, step=10, name="test_plot")
+        plt.close(fig)
+
+        mock_trackio.Image.assert_called_once()
+        mock_run.log.assert_called_once_with({"test_plot": "trackio-image"}, step=10)
+
+    def test_log_histogram(self):
+        """Test logging histograms to TrackioLogger."""
+        mock_trackio, mock_run = self._mock_trackio()
+        mock_trackio.Histogram.return_value = "trackio-histogram"
+        with patch.dict(sys.modules, {"trackio": mock_trackio}):
+            logger = TrackioLogger({"project": "test-project"})
+
+        histogram = [1, 2, 3]
+        logger.log_histogram(histogram, step=10, name="values")
+
+        mock_trackio.Histogram.assert_called_once_with(histogram)
+        mock_run.log.assert_called_once_with({"values": "trackio-histogram"}, step=10)
+
+    def test_close_is_idempotent(self):
+        """Test Trackio run finish is called once."""
+        mock_trackio, mock_run = self._mock_trackio()
+        with patch.dict(sys.modules, {"trackio": mock_trackio}):
+            logger = TrackioLogger({"project": "test-project"})
+
+        logger.close()
+        logger.close()
+
+        mock_run.finish.assert_called_once()
 
 
 class TestSwanlabLogger:
@@ -540,9 +693,7 @@ class TestMLflowLogger:
 
         # Check that log_metric was called for each metric
         assert mock_mlflow.log_metrics.call_count == 1
-        mock_mlflow.log_metrics.assert_any_call(
-            {"loss": 0.5, "accuracy": 0.8}, step=10, run_id=logger.run_id
-        )
+        mock_mlflow.log_metrics.assert_any_call({"loss": 0.5, "accuracy": 0.8}, step=10, run_id=logger.run_id)
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_log_metrics_with_prefix(self, mock_mlflow, temp_dir):
@@ -644,9 +795,7 @@ class TestMLflowLogger:
         MLflowLogger(cfg, log_dir=None)
 
         # Verify create_experiment was called without artifact_location
-        mock_mlflow.create_experiment.assert_called_once_with(
-            name="test-experiment", artifact_location=None
-        )
+        mock_mlflow.create_experiment.assert_called_once_with(name="test-experiment", artifact_location=None)
         mock_mlflow.start_run.assert_called_once_with(run_name="test-run")
 
     @patch("nemo_rl.utils.logger.mlflow")
@@ -665,9 +814,7 @@ class TestMLflowLogger:
         MLflowLogger(cfg, log_dir="/custom/path")
 
         # Verify create_experiment was called with artifact_location
-        mock_mlflow.create_experiment.assert_called_once_with(
-            name="test-experiment", artifact_location="/custom/path"
-        )
+        mock_mlflow.create_experiment.assert_called_once_with(name="test-experiment", artifact_location="/custom/path")
         mock_mlflow.start_run.assert_called_once_with(run_name="test-run")
 
     @patch("nemo_rl.utils.logger.mlflow")
@@ -739,9 +886,7 @@ class TestMLflowLogger:
         MLflowLogger(cfg, log_dir=log_dir)
 
         # Verify create_experiment was called with log_dir as artifact_location
-        mock_mlflow.create_experiment.assert_called_once_with(
-            name=cfg["experiment_name"], artifact_location=log_dir
-        )
+        mock_mlflow.create_experiment.assert_called_once_with(name=cfg["experiment_name"], artifact_location=log_dir)
         mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
         mock_mlflow.start_run.assert_called_once_with(run_name=cfg["run_name"])
 
@@ -1012,9 +1157,7 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
             )
 
             # Verify request was made correctly
-            mock_get.assert_called_once_with(
-                "http://test_ip:test_port/metrics", timeout=5.0
-            )
+            mock_get.assert_called_once_with("http://test_ip:test_port/metrics", timeout=5.0)
 
             # Verify parsing was done for both metrics
             assert mock_parse.call_count == 2
@@ -1232,12 +1375,8 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
 
                 # Verify monitor.metrics_buffer has the collected metrics
                 assert len(monitor.metrics_buffer) == 1
-                assert (
-                    monitor.metrics_buffer[0]["step"] == 10
-                )  # relative time (110 - 100)
-                assert monitor.metrics_buffer[0]["metrics"] == {
-                    "node.0.gpu.0.util": 75.5
-                }
+                assert monitor.metrics_buffer[0]["step"] == 10  # relative time (110 - 100)
+                assert monitor.metrics_buffer[0]["metrics"] == {"node.0.gpu.0.util": 75.5}
 
                 # Verify flush was called (flush_interval elapsed)
                 mock_flush.assert_called_once()
@@ -1245,9 +1384,7 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     @patch("nemo_rl.utils.logger.RayGpuMonitorLogger")
-    def test_init_with_gpu_monitoring(
-        self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir
-    ):
+    def test_init_with_gpu_monitoring(self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test initialization with GPU monitoring enabled."""
         cfg = {
             "wandb_enabled": True,
@@ -1285,16 +1422,12 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
 
         # Check that wandb metrics are defined with the step metric
         mock_wandb_instance = mock_wandb_logger.return_value
-        mock_wandb_instance.define_metric.assert_called_once_with(
-            "ray/*", step_metric="ray/ray_step"
-        )
+        mock_wandb_instance.define_metric.assert_called_once_with("ray/*", step_metric="ray/ray_step")
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     @patch("nemo_rl.utils.logger.RayGpuMonitorLogger")
-    def test_gpu_monitoring_without_wandb(
-        self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir
-    ):
+    def test_gpu_monitoring_without_wandb(self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test GPU monitoring initialization when wandb is disabled."""
         cfg = {
             "wandb_enabled": False,
@@ -1332,9 +1465,7 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     @patch("nemo_rl.utils.logger.RayGpuMonitorLogger")
-    def test_gpu_monitoring_no_main_loggers(
-        self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir
-    ):
+    def test_gpu_monitoring_no_main_loggers(self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test GPU monitoring initialization when no main loggers (wandb/tensorboard) are enabled."""
         cfg = {
             "wandb_enabled": False,
@@ -1422,6 +1553,53 @@ class TestLogger:
         mock_wandb_logger.assert_called_once()
         wandb_cfg = mock_wandb_logger.call_args[0][0]
         assert wandb_cfg == {"project": "test-project"}
+        mock_tb_logger.assert_not_called()
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TrackioLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
+    def test_init_trackio_only(self, mock_tb_logger, mock_trackio_logger, mock_wandb_logger, temp_dir):
+        """Test initialization with only TrackioLogger enabled."""
+        cfg = {
+            "wandb_enabled": False,
+            "trackio_enabled": True,
+            "tensorboard_enabled": False,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "trackio": {"project": "test-project"},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        assert len(logger.loggers) == 1
+        mock_trackio_logger.assert_called_once()
+        trackio_cfg = mock_trackio_logger.call_args[0][0]
+        assert trackio_cfg == {"project": "test-project"}
+        mock_wandb_logger.assert_not_called()
+        mock_tb_logger.assert_not_called()
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TrackioLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
+    def test_init_wandb_and_trackio(self, mock_tb_logger, mock_trackio_logger, mock_wandb_logger, temp_dir):
+        """Test initialization with WandbLogger and TrackioLogger enabled."""
+        cfg = {
+            "wandb_enabled": True,
+            "trackio_enabled": True,
+            "tensorboard_enabled": False,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "wandb": {"project": "wandb-project"},
+            "trackio": {"project": "trackio-project"},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        assert len(logger.loggers) == 2
+        mock_wandb_logger.assert_called_once()
+        mock_trackio_logger.assert_called_once()
         mock_tb_logger.assert_not_called()
 
     @patch("nemo_rl.utils.logger.WandbLogger")
@@ -1517,12 +1695,8 @@ class TestLogger:
         logger.log_metrics(metrics, step)
 
         # Check that log_metrics was called on both loggers
-        mock_wandb_instance.log_metrics.assert_called_once_with(
-            metrics, step, "", None, False
-        )
-        mock_tb_instance.log_metrics.assert_called_once_with(
-            metrics, step, "", None, False
-        )
+        mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None, False)
+        mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, "", None, False)
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
@@ -1554,9 +1728,7 @@ class TestLogger:
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     @patch("nemo_rl.utils.logger.RayGpuMonitorLogger")
-    def test_init_with_gpu_monitoring(
-        self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir
-    ):
+    def test_init_with_gpu_monitoring(self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test initialization with GPU monitoring enabled."""
         cfg = {
             "wandb_enabled": True,
@@ -1594,15 +1766,11 @@ class TestLogger:
 
         # Check that wandb metrics are defined with the step metric
         mock_wandb_instance = mock_wandb_logger.return_value
-        mock_wandb_instance.define_metric.assert_called_once_with(
-            "ray/*", step_metric="ray/ray_step"
-        )
+        mock_wandb_instance.define_metric.assert_called_once_with("ray/*", step_metric="ray/ray_step")
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
-    def test_log_metrics_with_prefix_and_step_metric(
-        self, mock_tb_logger, mock_wandb_logger, temp_dir
-    ):
+    def test_log_metrics_with_prefix_and_step_metric(self, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test logging metrics with prefix and step_metric."""
         cfg = {
             "wandb_enabled": True,
@@ -1630,18 +1798,12 @@ class TestLogger:
         logger.log_metrics(metrics, step, prefix=prefix, step_metric=step_metric)
 
         # Check that log_metrics was called on both loggers with correct parameters
-        mock_wandb_instance.log_metrics.assert_called_once_with(
-            metrics, step, prefix, step_metric, False
-        )
-        mock_tb_instance.log_metrics.assert_called_once_with(
-            metrics, step, prefix, step_metric, False
-        )
+        mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, prefix, step_metric, False)
+        mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, prefix, step_metric, False)
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
-    def test_log_plot_token_mult_prob_error(
-        self, mock_tb_logger, mock_wandb_logger, temp_dir
-    ):
+    def test_log_plot_token_mult_prob_error(self, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test logging token probability error plots."""
         cfg = {
             "wandb_enabled": True,
@@ -1697,9 +1859,7 @@ class TestLogger:
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     @patch("nemo_rl.utils.logger.MLflowLogger")
-    def test_init_mlflow_only(
-        self, mock_mlflow_logger, mock_tb_logger, mock_wandb_logger, temp_dir
-    ):
+    def test_init_mlflow_only(self, mock_mlflow_logger, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test initialization with only MLflowLogger enabled."""
         cfg = {
             "wandb_enabled": False,
@@ -1800,18 +1960,10 @@ class TestLogger:
         logger.log_metrics(metrics, step)
 
         # Check that log_metrics was called on all loggers
-        mock_wandb_instance.log_metrics.assert_called_once_with(
-            metrics, step, "", None, False
-        )
-        mock_swanlab_instance.log_metrics.assert_called_once_with(
-            metrics, step, "", None, False
-        )
-        mock_tb_instance.log_metrics.assert_called_once_with(
-            metrics, step, "", None, False
-        )
-        mock_mlflow_instance.log_metrics.assert_called_once_with(
-            metrics, step, "", None, False
-        )
+        mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None, False)
+        mock_swanlab_instance.log_metrics.assert_called_once_with(metrics, step, "", None, False)
+        mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, "", None, False)
+        mock_mlflow_instance.log_metrics.assert_called_once_with(metrics, step, "", None, False)
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")

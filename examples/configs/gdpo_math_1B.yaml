@@ -54,6 +54,9 @@ logger:
   wandb:
     project: "gdpo-dev"
     name: "gdpo-dev-logger"
+  trackio:
+    project: "gdpo-dev"
+    name: "gdpo-dev-logger"
   swanlab:
     project: "gdpo-dev"
     name: "gdpo-dev-logger"

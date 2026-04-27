@@ -269,6 +269,7 @@ data:
 logger:
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: false # Make sure you do a ``wandb login [Your API key]'' before running
+  trackio_enabled: false # Install with `uv sync --extra trackio` before enabling
 
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging
@@ -278,6 +279,21 @@ logger:
   wandb:
     project: "dpo-dev"
     name: "dpo"
+  trackio:
+    project: "dpo-dev"
+    name: "dpo"
+    group: null
+    space_id: null
+    server_url: null
+    bucket_id: null
+    resume: "never"
+    private: null
+    embed: false
+    auto_log_gpu: false
+    gpu_log_interval: 10.0
+    webhook_url: null
+    webhook_min_level: null
+    dir: null
   swanlab:
     project: "dpo-dev"
     name: "dpo"

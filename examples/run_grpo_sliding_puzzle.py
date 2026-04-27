@@ -45,9 +45,7 @@ from nemo_rl.utils.logger import get_next_experiment_dir
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run GRPO training with configuration")
-    parser.add_argument(
-        "--config", type=str, default=None, help="Path to YAML config file"
-    )
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file")
     args, overrides = parser.parse_known_args()
     return args, overrides
 
@@ -94,9 +92,7 @@ def generate_puzzle_datum(
         add_generation_prompt=True,
         add_special_tokens=False,
     ).strip()
-    tokenized_prompt = tokenizer(
-        initial_prompt_content, return_tensors="pt", add_special_tokens=False
-    )["input_ids"][0]
+    tokenized_prompt = tokenizer(initial_prompt_content, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
     message_log: LLMMessageLogType = [
         {
             "role": "user",
@@ -104,9 +100,7 @@ def generate_puzzle_datum(
             "token_ids": tokenized_prompt,
         }
     ]
-    metadata = SlidingPuzzleMetadata(
-        game_state=initial_game_state, num_moves=0, max_moves=max_moves
-    )
+    metadata = SlidingPuzzleMetadata(game_state=initial_game_state, num_moves=0, max_moves=max_moves)
     datum: DatumSpec = {
         "message_log": message_log,
         "length": len(tokenized_prompt),
@@ -122,9 +116,7 @@ def generate_puzzle_datum(
 class IterablePuzzleDataset(IterableDataset):
     """An IterableDataset that generates sliding puzzle data indefinitely."""
 
-    def __init__(
-        self, tokenizer, game_config, max_moves, task_name, add_system_prompt, length
-    ):
+    def __init__(self, tokenizer, game_config, max_moves, task_name, add_system_prompt, length):
         super().__init__()
         self.tokenizer = tokenizer
         self.game_config = game_config
@@ -198,9 +190,7 @@ def main():
     args, overrides = parse_args()
 
     if not args.config:
-        args.config = os.path.join(
-            os.path.dirname(__file__), "configs", "grpo_sliding_puzzle.yaml"
-        )
+        args.config = os.path.join(os.path.dirname(__file__), "configs", "grpo_sliding_puzzle.yaml")
 
     config = load_config(args.config)
     print(f"Loaded configuration from: {args.config}")
@@ -220,9 +210,7 @@ def main():
     config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
     print(f"📊 Using log directory: {config['logger']['log_dir']}")
     if config["checkpointing"]["enabled"]:
-        print(
-            f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
-        )
+        print(f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}")
 
     init_ray()
 
@@ -230,9 +218,7 @@ def main():
 
     # setup tokenizer
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-    config["policy"]["generation"] = configure_generation_config(
-        config["policy"]["generation"], tokenizer
-    )
+    config["policy"]["generation"] = configure_generation_config(config["policy"]["generation"], tokenizer)
 
     # setup data & env map
     ds_length = (
@@ -249,33 +235,38 @@ def main():
         add_system_prompt=config["data"]["add_system_prompt"],
     )
 
-    (
-        policy,
-        policy_generation,
-        cluster,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+    logger = None
+    try:
+        (
+            policy,
+            policy_generation,
+            cluster,
+            dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+        ) = setup(config, tokenizer, dataset, val_dataset)
 
-    grpo_train(
-        policy,
-        policy_generation,
-        dataloader,
-        val_dataloader,
-        tokenizer,
-        loss_fn,
-        task_to_env,
-        val_task_to_env,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-    )
+        grpo_train(
+            policy,
+            policy_generation,
+            dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+        )
+    finally:
+        if logger is not None:
+            logger.close()
 
 
 if __name__ == "__main__":

@@ -32,12 +32,8 @@ from nemo_rl.utils.logger import get_next_experiment_dir
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Run distillation training with configuration"
-    )
-    parser.add_argument(
-        "--config", type=str, default=None, help="Path to YAML config file"
-    )
+    parser = argparse.ArgumentParser(description="Run distillation training with configuration")
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file")
 
     # Parse known args for the script
     args, overrides = parser.parse_known_args()
@@ -52,9 +48,7 @@ def main() -> None:
     args, overrides = parse_args()
 
     if not args.config:
-        args.config = os.path.join(
-            os.path.dirname(__file__), "configs", "distillation_math.yaml"
-        )
+        args.config = os.path.join(os.path.dirname(__file__), "configs", "distillation_math.yaml")
 
     config = load_config(args.config)
     if overrides:
@@ -70,9 +64,7 @@ def main() -> None:
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
 
     if config["policy"]["generation"] is not None:
-        config["policy"]["generation"] = configure_generation_config(
-            config["policy"]["generation"], tokenizer
-        )
+        config["policy"]["generation"] = configure_generation_config(config["policy"]["generation"], tokenizer)
     else:
         print("  ⚠️ No generation config found, this may cause issues")
 
@@ -84,34 +76,39 @@ def main() -> None:
         val_task_to_env,
     ) = setup_response_data(tokenizer, config["data"], config["env"])
 
-    (
-        student_policy,
-        teacher_policy,
-        student_generation,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        distillation_state,
-        master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+    logger = None
+    try:
+        (
+            student_policy,
+            teacher_policy,
+            student_generation,
+            dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            distillation_state,
+            master_config,
+        ) = setup(config, tokenizer, dataset, val_dataset)
 
-    distillation_train(
-        student_policy,
-        teacher_policy,
-        student_generation,
-        dataloader,
-        val_dataloader,
-        tokenizer,  # pass tokenizer parameter
-        loss_fn,
-        task_to_env,
-        val_task_to_env,
-        logger,
-        checkpointer,
-        distillation_state,
-        master_config,
-    )
+        distillation_train(
+            student_policy,
+            teacher_policy,
+            student_generation,
+            dataloader,
+            val_dataloader,
+            tokenizer,  # pass tokenizer parameter
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            distillation_state,
+            master_config,
+        )
+    finally:
+        if logger is not None:
+            logger.close()
 
 
 if __name__ == "__main__":
