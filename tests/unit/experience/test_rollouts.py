@@ -836,7 +836,6 @@ def test_run_async_nemo_gym_rollout(
             "length": torch.tensor([3080, 3048]),
             "loss_multiplier": torch.tensor([1.0, 1.0]),
             "total_reward": torch.tensor([0.0, 0.0]),
-            "truncated": torch.tensor([False, False]),
         },
         "rollout_metrics": {
             # core metrics
@@ -916,7 +915,10 @@ def test_run_async_nemo_gym_rollout(
         final_batch["total_reward"] = final_batch["total_reward"].tolist()
         final_batch["loss_multiplier"] = final_batch["loss_multiplier"].tolist()
         final_batch["length"] = final_batch["length"].tolist()
-        final_batch["truncated"] = final_batch["truncated"].tolist()
+        # truncated depends on exact generation output which is not reproducible,
+        # so just verify each value is a bool rather than checking exact values
+        assert all(isinstance(v, (bool, int)) for v in final_batch["truncated"].tolist())
+        final_batch.pop("truncated", None)
 
         for key in d["rollout_metrics"]:
             # We remove these fields from comparison since we cannot guarantee exact generation reproducibility
