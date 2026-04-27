@@ -22,7 +22,10 @@ policy:
   train_global_batch_size: 16
   train_micro_batch_size: 1
   generation_batch_size: 16
-  logprob_batch_size: 2
+  # Megatron TP>=4 requires train_micro_batch_size == logprob_batch_size
+  # to avoid the batch-variant accuracy issue. See
+  # https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html
+  logprob_batch_size: 1
   max_total_sequence_length: 2048
 
   sequence_packing:
