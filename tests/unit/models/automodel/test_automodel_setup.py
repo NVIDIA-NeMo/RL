@@ -1135,8 +1135,8 @@ class TestSetupModelAndOptimizer:
             init_optimizer=False,
         )
 
-        assert result.optimizer is None
-        assert result.scheduler is None
+        assert result.optimizers is None
+        assert result.schedulers is None
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
@@ -1267,7 +1267,7 @@ class TestSetupModelAndOptimizer:
             checkpoint_manager=mock_checkpoint_manager,
         )
 
-        assert result.scheduler is not None
+        assert result.schedulers is not None
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.SequentialLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
@@ -1321,7 +1321,7 @@ class TestSetupModelAndOptimizer:
             checkpoint_manager=mock_checkpoint_manager,
         )
 
-        assert result.scheduler is not None
+        assert result.schedulers is not None
         mock_sequential_lr.assert_called_once()
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
