@@ -542,8 +542,7 @@ exclude = '''
 '''
 
 [tool.pytest.ini_options]
-addopts = "--testmon --durations=100 -s -rA -x"
-#addopts = "--durations=100 -s -rA -x"
+addopts = "--durations=100 -s -rA -x"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
