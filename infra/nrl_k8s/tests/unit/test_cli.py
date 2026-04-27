@@ -140,10 +140,11 @@ class TestCheck:
         assert containers[0]["image"] == "img:new"
 
     def test_reports_validation_error_cleanly(self, tmp_path) -> None:
-        """Missing a required field surfaces as a user-facing ``error:`` line,
-        not a Python traceback, and exits non-zero. ``image`` is the only
-        truly-required string — ``namespace`` auto-fills from the kube
-        context if omitted, so we trigger validation by omitting ``image``.
+        """Missing a required field surfaces as a user-facing error, not a traceback.
+
+        ``image`` is the only truly-required string — ``namespace`` auto-fills
+        from the kube context if omitted, so we trigger validation by omitting
+        ``image``.
         """
         recipe = _write_recipe(tmp_path, {"infra": {"namespace": "ns-a"}})
         runner = CliRunner()
@@ -159,8 +160,9 @@ class TestCheck:
 
 class TestInfraCliOption:
     def test_both_sources_rejected(self, tmp_path) -> None:
-        """Passing ``--infra infra.yaml`` while the recipe also has ``infra:``
-        errors out instead of silently preferring one.
+        """Passing ``--infra`` while the recipe also has ``infra:`` errors out.
+
+        Must not silently prefer one source over the other.
         """
         infra = tmp_path / "infra.yaml"
         infra.write_text(yaml.safe_dump({"namespace": "ns-file", "image": "img:file"}))
@@ -178,15 +180,25 @@ class TestInfraCliOption:
 # cluster down
 # =============================================================================
 
+
 class TestClusterDashboard:
-    """`nrl-k8s cluster dashboard <name>` wraps port-forward + browser
-    open, with an optional symlink-fix pre-step. No recipe/infra needed
+    """`nrl-k8s cluster dashboard <name>` wraps port-forward + browser open.
+
+    Includes an optional symlink-fix pre-step. No recipe/infra needed
     — the cluster name is a positional argument, namespace comes from
-    --namespace or the active kube context."""
+    --namespace or the active kube context.
+    """
 
     @staticmethod
-    def _stub_env(monkeypatch, browser_opens, pf_started, fix_called,
-                  *, pf_cls_args=None, ns="ns-ctx"):
+    def _stub_env(
+        monkeypatch,
+        browser_opens,
+        pf_started,
+        fix_called,
+        *,
+        pf_cls_args=None,
+        ns="ns-ctx",
+    ):
         class _FakePF:
             def __init__(self, cluster_name, namespace, port):
                 if pf_cls_args is not None:
@@ -206,9 +218,7 @@ class TestClusterDashboard:
         monkeypatch.setattr("nrl_k8s.submit._PortForward", _FakePF)
         monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
         monkeypatch.setattr("nrl_k8s.config._infer_kube_namespace", lambda: ns)
-        monkeypatch.setattr(
-            "webbrowser.open", lambda url: browser_opens.append(url)
-        )
+        monkeypatch.setattr("webbrowser.open", lambda url: browser_opens.append(url))
         monkeypatch.setattr(
             "nrl_k8s.cli._reinstall_ray_if_symlinked",
             lambda cluster, ns: fix_called.append([cluster, ns]),
@@ -220,14 +230,16 @@ class TestClusterDashboard:
         fix_called: list[list[str]] = []
         pf_args: list[tuple[str, str, int]] = []
         self._stub_env(
-            monkeypatch, browser_opens, pf_started, fix_called,
-            pf_cls_args=pf_args, ns="nemo-rl-testing",
+            monkeypatch,
+            browser_opens,
+            pf_started,
+            fix_called,
+            pf_cls_args=pf_args,
+            ns="nemo-rl-testing",
         )
 
         runner = CliRunner()
-        result = runner.invoke(
-            cli.main, ["cluster", "dashboard", "raycluster-foo"]
-        )
+        result = runner.invoke(cli.main, ["cluster", "dashboard", "raycluster-foo"])
         assert result.exit_code == 0, result.output
         assert pf_started == [True]
         assert fix_called == [["raycluster-foo", "nemo-rl-testing"]]
@@ -240,8 +252,12 @@ class TestClusterDashboard:
         fix_called: list[list[str]] = []
         pf_args: list[tuple[str, str, int]] = []
         self._stub_env(
-            monkeypatch, browser_opens, pf_started, fix_called,
-            pf_cls_args=pf_args, ns="wrong-ns",
+            monkeypatch,
+            browser_opens,
+            pf_started,
+            fix_called,
+            pf_cls_args=pf_args,
+            ns="wrong-ns",
         )
 
         runner = CliRunner()
@@ -345,9 +361,7 @@ class TestRayJob:
 
     def test_failed_job_exits_non_zero(self, tmp_path, monkeypatch):
         recipe = self._recipe_with_training(tmp_path, "echo")
-        monkeypatch.setattr(
-            "nrl_k8s.k8s.apply_rayjob", lambda m, ns: m
-        )
+        monkeypatch.setattr("nrl_k8s.k8s.apply_rayjob", lambda m, ns: m)
         monkeypatch.setattr(
             "nrl_k8s.k8s.wait_for_rayjob_terminal",
             lambda *a, **kw: {
@@ -418,7 +432,9 @@ class TestRunCommand:
         class _FakeResult:
             handle = _FakeHandle()
 
-        def _fake_run(loaded, *, log, repo_root, replace, run_id, skip_daemons, recreate):
+        def _fake_run(
+            loaded, *, log, repo_root, replace, run_id, skip_daemons, recreate
+        ):
             captured["skip_daemons"] = skip_daemons
             captured["recreate"] = recreate
             captured["replace"] = replace
@@ -435,10 +451,14 @@ class TestRunCommand:
                 "run",
                 str(recipe),
                 "--raycluster",
-                "--mode", "batch",
-                "--code-source", "image",
-                "--code-path", "/opt/nemo-rl",
-                "--run-id", "run-x",
+                "--mode",
+                "batch",
+                "--code-source",
+                "image",
+                "--code-path",
+                "/opt/nemo-rl",
+                "--run-id",
+                "run-x",
                 "--skip-daemons",
                 "--recreate",
                 "--no-wait",
@@ -468,6 +488,7 @@ class TestClusterDown:
 # =============================================================================
 # --mode resolution (interactive vs batch)
 # =============================================================================
+
 
 class TestModeResolution:
     def test_interactive_defaults(self) -> None:
@@ -532,7 +553,9 @@ class TestModeResolution:
         """`--mode batch --wait` should keep exec + image but follow logs."""
         _, _, _, no_wait = cli._resolve_mode_defaults(
             cli_mode="batch",
-            infra_mode=__import__("nrl_k8s.schema", fromlist=["RunMode"]).RunMode.INTERACTIVE,
+            infra_mode=__import__(
+                "nrl_k8s.schema", fromlist=["RunMode"]
+            ).RunMode.INTERACTIVE,
             cli_submitter=None,
             cli_code_source=None,
             cli_wait=True,
@@ -540,8 +563,11 @@ class TestModeResolution:
         assert no_wait is False
 
     def test_infra_run_mode_used_without_cli_flag(self) -> None:
-        """`runMode: batch` in the infra YAML flips defaults even when
-        --mode isn't on the command line."""
+        """`runMode: batch` in the infra YAML flips defaults without --mode.
+
+        The run mode from infra YAML is applied even when --mode isn't
+        on the command line.
+        """
         from nrl_k8s.schema import CodeSource, RunMode, SubmitterMode
 
         mode, sub, code, no_wait = cli._resolve_mode_defaults(

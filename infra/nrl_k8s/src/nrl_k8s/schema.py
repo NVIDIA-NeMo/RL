@@ -331,8 +331,10 @@ class LaunchSpec(_StrictModel):
 
     @model_validator(mode="after")
     def _code_path_required_for_non_upload(self) -> "LaunchSpec":
-        if self.codeSource in (CodeSource.IMAGE, CodeSource.LUSTRE) \
-                and not self.codePath:
+        if (
+            self.codeSource in (CodeSource.IMAGE, CodeSource.LUSTRE)
+            and not self.codePath
+        ):
             raise ValueError(
                 f"infra.launch.codePath is required when codeSource="
                 f"{self.codeSource.value}"

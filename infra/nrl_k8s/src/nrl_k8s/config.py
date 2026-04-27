@@ -56,6 +56,7 @@ def _register_nrl_resolvers() -> None:
     if not OmegaConf.has_resolver("user"):
         OmegaConf.register_new_resolver("user", lambda: get_username())
 
+
 _SHIPPED_DEFAULTS = Path(__file__).parent / "defaults" / "defaults.example.yaml"
 _USER_DEFAULTS = Path(
     os.environ.get(

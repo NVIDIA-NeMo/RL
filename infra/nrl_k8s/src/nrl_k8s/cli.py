@@ -55,7 +55,7 @@ _CODE_SOURCE_CHOICE = click.Choice([m.value for m in CodeSource])
 # --wait/--no-wait flags win over both.
 _MODE_DEFAULTS: dict[RunMode, tuple[SubmitterMode, CodeSource, bool]] = {
     RunMode.INTERACTIVE: (SubmitterMode.PORT_FORWARD, CodeSource.UPLOAD, False),
-    RunMode.BATCH:       (SubmitterMode.EXEC,         CodeSource.IMAGE,  True),
+    RunMode.BATCH: (SubmitterMode.EXEC, CodeSource.IMAGE, True),
 }
 
 
@@ -105,7 +105,10 @@ def _apply_mode_overrides(
         infra.launch.codePath = code_path
     # Re-run the validator manually so codePath-required rule fires with
     # the effective values.
-    if code_source in (CodeSource.IMAGE, CodeSource.LUSTRE) and not infra.launch.codePath:
+    if (
+        code_source in (CodeSource.IMAGE, CodeSource.LUSTRE)
+        and not infra.launch.codePath
+    ):
         _cli_error(
             f"--code-source {code_source.value} requires --code-path (or infra.launch.codePath)",
             hint="pass --code-path /opt/nemo-rl (image default) or a Lustre mount path",
@@ -209,9 +212,10 @@ def check(
     output_path: Path | None,
     output_format: str | None,
 ) -> None:
-    """Load + validate a recipe/infra pair and print a one-line summary per
-    role (or dump the fully-resolved config + rendered RayCluster manifests
-    to a file with ``-o``). Replaces the former ``validate`` + ``plan``.
+    """Load + validate a recipe/infra pair and print a one-line summary per role.
+
+    Dumps the fully-resolved config + rendered RayCluster manifests
+    to a file with ``-o``. Replaces the former ``validate`` + ``plan``.
     """
     from .manifest import build_raycluster_manifest
 
@@ -401,8 +405,7 @@ def validate(ctx, recipe, overrides, infra_path) -> None:
     "rayjob_name",
     type=str,
     default=None,
-    help="[--rayjob only] RayJob metadata name. Defaults to the training "
-    "cluster name.",
+    help="[--rayjob only] RayJob metadata name. Defaults to the training cluster name.",
 )
 @click.option(
     "--shutdown/--no-shutdown",
@@ -515,7 +518,9 @@ def run(
         cli_code_source=cli_code_source,
         cli_wait=cli_wait,
     )
-    _apply_mode_overrides(loaded, submitter=submitter, code_source=code_src, code_path=cli_code_path)
+    _apply_mode_overrides(
+        loaded, submitter=submitter, code_source=code_src, code_path=cli_code_path
+    )
     click.echo(
         f"[run] mode={mode.value} submitter={submitter.value} "
         f"code_source={code_src.value} no_wait={no_wait} "
@@ -559,8 +564,7 @@ def _run_rayjob(
     cli_wait: bool | None,
 ) -> None:
     """``nrl-k8s run --rayjob`` path. KubeRay owns the RayCluster lifecycle."""
-    from . import k8s
-    from . import orchestrate
+    from . import k8s, orchestrate
     from . import submit as submit_mod
     from .rayjob import build_rayjob_manifest
 
@@ -789,7 +793,9 @@ def cluster_up(
         click.echo(yaml.safe_dump(manifest, sort_keys=False).rstrip())
         return
 
-    _check_head_svc_collision(cluster_spec.name, loaded.infra.namespace, creating="raycluster")
+    _check_head_svc_collision(
+        cluster_spec.name, loaded.infra.namespace, creating="raycluster"
+    )
 
     try:
         name = orchestrate.bring_up_cluster(
@@ -958,6 +964,7 @@ def cluster_dashboard(
     """
     import time
     import webbrowser
+
     from . import submit as submit_mod
     from .config import _infer_kube_namespace
 
@@ -1020,8 +1027,15 @@ def _reinstall_ray_if_symlinked(cluster_name: str, namespace: str) -> None:
         'echo "[dashboard] reinstall complete."\n'
     )
     cmd = [
-        "kubectl", "exec", "-n", namespace, pod.metadata.name, "--",
-        "bash", "-c", script,
+        "kubectl",
+        "exec",
+        "-n",
+        namespace,
+        pod.metadata.name,
+        "--",
+        "bash",
+        "-c",
+        script,
     ]
     try:
         res = _sp.run(cmd, check=False, capture_output=True, text=True, timeout=180)
@@ -1094,9 +1108,7 @@ def job_list(
     required=True,
     help="Which cluster hosts the job.",
 )
-@click.option(
-    "-f", "--follow", is_flag=True, help="Stream new output until Ctrl+C."
-)
+@click.option("-f", "--follow", is_flag=True, help="Stream new output until Ctrl+C.")
 def job_logs(
     submission_id: str,
     recipe: Path,
@@ -1242,7 +1254,9 @@ def dev_connect(image: str, namespace: str | None) -> None:
             if phase == "Running":
                 break
             if phase in ("Failed", "Succeeded"):
-                _cli_error(f"dev pod reached phase {phase} — check `kubectl describe pod {pod_name} -n {namespace}`")
+                _cli_error(
+                    f"dev pod reached phase {phase} — check `kubectl describe pod {pod_name} -n {namespace}`"
+                )
         else:
             _cli_error(f"dev pod did not reach Running after 240s (phase={phase})")
 
@@ -1297,7 +1311,7 @@ def dev_setup_secrets(
     add_rclone: bool,
     namespace: str | None,
 ) -> None:
-    """Create or update your user secrets.
+    r"""Create or update your user secrets.
 
     Pass token values as NAME=VAL positional args and SSH keys via --ssh-key.
 
@@ -1357,7 +1371,9 @@ def dev_setup_secrets(
 
     k8s.create_or_update_secret(secret_name, namespace, data)
     action = "created" if is_new else "updated"
-    click.echo(f"{action} secret {secret_name} in {namespace} (keys: {', '.join(sorted(data))})")
+    click.echo(
+        f"{action} secret {secret_name} in {namespace} (keys: {', '.join(sorted(data))})"
+    )
 
 
 def _infer_namespace() -> str:
@@ -1484,9 +1500,9 @@ def _check_dev_pod_rbac(namespace: str) -> None:
 
     sa = f"system:serviceaccount:{namespace}:default"
     result = subprocess.run(
-        ["kubectl", "auth", "can-i", "get", "pods",
-         f"--as={sa}", "-n", namespace],
-        capture_output=True, text=True,
+        ["kubectl", "auth", "can-i", "get", "pods", f"--as={sa}", "-n", namespace],
+        capture_output=True,
+        text=True,
     )
     if result.stdout.strip() == "yes":
         return
@@ -1499,7 +1515,7 @@ def _check_dev_pod_rbac(namespace: str) -> None:
         f"aggregationRule:\n"
         f"  clusterRoleSelectors:\n"
         f"    - matchLabels:\n"
-        f"        rbac.authorization.k8s.io/aggregate-to-edit: \"true\"\n"
+        f'        rbac.authorization.k8s.io/aggregate-to-edit: "true"\n'
         f"rules: []  # auto-filled by aggregation\n"
         f"---\n"
         f"apiVersion: rbac.authorization.k8s.io/v1\n"
@@ -1507,7 +1523,7 @@ def _check_dev_pod_rbac(namespace: str) -> None:
         f"metadata:\n"
         f"  name: ray-edit\n"
         f"  labels:\n"
-        f"    rbac.authorization.k8s.io/aggregate-to-edit: \"true\"\n"
+        f'    rbac.authorization.k8s.io/aggregate-to-edit: "true"\n'
         f"rules:\n"
         f"  - apiGroups: [ray.io]\n"
         f"    resources: [rayjobs, rayclusters]\n"
@@ -1672,25 +1688,27 @@ def _emit_handle(handle) -> None:  # type: ignore[no-untyped-def]
     if handle.kind == "exec":
         click.echo(f"pod:     {handle.pod}")
         click.echo(f"tmp:     {handle.tmp_dir}")
-    click.echo(
-        f"follow:  nrl-k8s job logs {handle.run_id} "
-        f"<recipe> --role training -f"
-    )
-    click.echo(
-        f"stop:    nrl-k8s job stop {handle.run_id} "
-        f"<recipe> --role training"
-    )
+    click.echo(f"follow:  nrl-k8s job logs {handle.run_id} <recipe> --role training -f")
+    click.echo(f"stop:    nrl-k8s job stop {handle.run_id} <recipe> --role training")
 
 
 def _follow_handle(handle) -> None:  # type: ignore[no-untyped-def]
     """Stream logs for a handle using whichever transport submitted it."""
-    from .submitters import build_submitter
     from .schema import SubmitterMode
+    from .submitters import build_submitter
 
     class _Stub:  # minimal infra shim so build_submitter picks the right transport
         class submit:
-            submitter = SubmitterMode.EXEC if handle.kind == "exec" else SubmitterMode.PORT_FORWARD
-            execTmpDir = handle.tmp_dir.rsplit("/", 1)[0] if (handle.kind == "exec" and handle.tmp_dir) else "/tmp"
+            submitter = (
+                SubmitterMode.EXEC
+                if handle.kind == "exec"
+                else SubmitterMode.PORT_FORWARD
+            )
+            execTmpDir = (
+                handle.tmp_dir.rsplit("/", 1)[0]
+                if (handle.kind == "exec" and handle.tmp_dir)
+                else "/tmp"
+            )
 
     submitter = build_submitter(_Stub)  # type: ignore[arg-type]
     try:

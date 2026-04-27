@@ -88,7 +88,12 @@ def build_rayjob_manifest(
     }
     from .manifest import _MANAGED_BY_LABEL
 
-    merged_labels = {**_MANAGED_BY_LABEL, **infra.labels, **cluster.labels, **(extra_labels or {})}
+    merged_labels = {
+        **_MANAGED_BY_LABEL,
+        **infra.labels,
+        **cluster.labels,
+        **(extra_labels or {}),
+    }
     if merged_labels:
         metadata["labels"] = merged_labels
     merged_annotations = {**infra.annotations, **cluster.annotations}

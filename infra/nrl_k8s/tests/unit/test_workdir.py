@@ -86,8 +86,9 @@ class TestStageWorkdir:
             shutil.rmtree(dest, ignore_errors=True)
 
     def test_strips_gitignore_and_pycache(self, fake_repo: Path) -> None:
-        """``.gitignore`` and ``__pycache__`` are scrubbed from the staged copy
-        because Ray's packager honours ``.gitignore`` and would drop data files.
+        """``.gitignore`` and ``__pycache__`` are scrubbed from the staged copy.
+
+        Ray's packager honours ``.gitignore`` and would drop data files.
         """
         dest = stage_workdir(fake_repo, include_paths=["nemo_rl"])
         try:

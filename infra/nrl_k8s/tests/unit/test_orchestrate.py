@@ -363,9 +363,7 @@ class TestEnsureCluster:
         monkeypatch.setattr(orchestrate.k8s, "wait_for_raycluster_gone", gone)
         monkeypatch.setattr(orchestrate.k8s, "wait_for_raycluster_ready", MagicMock())
 
-        orchestrate.ensure_cluster(
-            "training", loaded, log=log_fn, recreate=True
-        )
+        orchestrate.ensure_cluster("training", loaded, log=log_fn, recreate=True)
 
         delete.assert_called_once_with("rc-train", "ns-a")
         gone.assert_called_once()
@@ -411,9 +409,7 @@ class TestRun:
         monkeypatch.setattr(orchestrate, "submit_daemon", MagicMock())
         monkeypatch.setattr(orchestrate, "submit_training", MagicMock())
 
-        orchestrate.run(
-            loaded, log=log_fn, repo_root=Path("/tmp"), recreate=True
-        )
+        orchestrate.run(loaded, log=log_fn, repo_root=Path("/tmp"), recreate=True)
 
         assert ensure.call_args.kwargs["recreate"] is True
 

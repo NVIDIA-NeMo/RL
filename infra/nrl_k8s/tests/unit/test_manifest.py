@@ -146,9 +146,9 @@ class TestPatching:
 
 class TestImmutability:
     def test_input_spec_not_mutated(self) -> None:
-        """Patching writes into a deep copy so the recipe-parsed ClusterSpec
-        isn't mutated between calls (important when the same spec underlies
-        multiple renders).
+        """Patching writes into a deep copy so the ClusterSpec isn't mutated.
+
+        Important when the same spec underlies multiple renders.
         """
         spec = _base_spec()
         original = spec["headGroupSpec"]["template"]["spec"]["containers"][0]["image"]
@@ -160,9 +160,10 @@ class TestImmutability:
         )
 
     def test_two_builds_see_same_input(self) -> None:
-        """Two successive build calls against the same ClusterSpec produce
-        identical manifests — i.e. the first call didn't leave any mutation
-        behind on the ClusterSpec's inner ``spec`` dict.
+        """Two successive builds against the same ClusterSpec produce identical manifests.
+
+        Verifies the first call didn't leave any mutation behind on the
+        ClusterSpec's inner ``spec`` dict.
         """
         cluster = _make_cluster()
         infra = _make_infra()
@@ -204,8 +205,9 @@ class TestLabelsAnnotationsMerge:
 
 class TestServiceAccountOverride:
     def test_service_account_overrides_existing_on_head_and_worker(self) -> None:
-        """When ``infra.serviceAccount`` is set it overwrites any existing
-        ``serviceAccountName`` on every pod template (head + all workers).
+        """``infra.serviceAccount`` overwrites ``serviceAccountName`` on all pod templates.
+
+        Applies to every pod template — head and all workers.
         """
         spec = _base_spec()
         spec["headGroupSpec"]["template"]["spec"]["serviceAccountName"] = "old-head"

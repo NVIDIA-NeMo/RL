@@ -156,9 +156,7 @@ _DRA_CLAIM_PREFIX: dict[str, str] = {
 }
 
 
-def _rewrite_dra_template_names(
-    spec: dict, cluster_name: str, role: str
-) -> None:
+def _rewrite_dra_template_names(spec: dict, cluster_name: str, role: str) -> None:
     """Rewrite ``resourceClaimTemplateName`` in worker pods to deterministic names."""
     for wg in spec.get("workerGroupSpecs") or []:
         pod_spec = wg.get("template", {}).get("spec")
@@ -167,9 +165,7 @@ def _rewrite_dra_template_names(
         for claim in pod_spec.get("resourceClaims") or []:
             prefix = _DRA_CLAIM_PREFIX.get(claim.get("name", ""))
             if prefix:
-                claim["resourceClaimTemplateName"] = (
-                    f"{prefix}{cluster_name}-{role}"
-                )
+                claim["resourceClaimTemplateName"] = f"{prefix}{cluster_name}-{role}"
 
 
 def dra_resources_for_cluster(
@@ -201,7 +197,11 @@ def build_compute_domain_manifest(name: str, namespace: str) -> dict[str, Any]:
     return {
         "apiVersion": "resource.nvidia.com/v1beta1",
         "kind": "ComputeDomain",
-        "metadata": {"name": name, "namespace": namespace, "labels": {**_MANAGED_BY_LABEL}},
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {**_MANAGED_BY_LABEL},
+        },
         "spec": {
             "channel": {"resourceClaimTemplate": {"name": name}},
             "numNodes": 0,
@@ -214,7 +214,11 @@ def build_roce_template_manifest(name: str, namespace: str) -> dict[str, Any]:
     return {
         "apiVersion": "resource.k8s.io/v1",
         "kind": "ResourceClaimTemplate",
-        "metadata": {"name": name, "namespace": namespace, "labels": {**_MANAGED_BY_LABEL}},
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {**_MANAGED_BY_LABEL},
+        },
         "spec": {
             "spec": {
                 "devices": {

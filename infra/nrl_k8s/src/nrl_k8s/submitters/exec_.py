@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``kubectl exec`` submitter — runs the training entrypoint as a raw
-backgrounded process on the training head pod.
+"""``kubectl exec`` submitter — runs the training entrypoint on the head pod.
 
+Runs as a raw backgrounded process on the training head pod.
 Same shape as a Slurm driver on a login node. The user's entrypoint
 (``python -u run_grpo.py …``) is wrapped into a launcher script that
 ``source``s env vars the user declared, runs the command under
@@ -45,7 +45,6 @@ from typing import Iterator
 
 from .. import k8s
 from . import JobStatusStr, SubmissionHandle
-
 
 _VALID_ID = re.compile(r"^[a-zA-Z0-9_.-]+$")
 # Upper bound for how long we wait for the pidfile to appear on the pod
@@ -103,18 +102,22 @@ class ExecSubmitter:
         # mkdir + cp happen as two separate exec calls because `kubectl cp`
         # uses `tar` under the hood which fails if the destination
         # directory doesn't exist on the pod side.
-        _run(["kubectl", "exec", "-n", namespace, pod_name, "--",
-              "mkdir", "-p", tmp_dir])
+        _run(
+            ["kubectl", "exec", "-n", namespace, pod_name, "--", "mkdir", "-p", tmp_dir]
+        )
 
         with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
             f.write(launcher)
             local_entry = Path(f.name)
         try:
-            _run([
-                "kubectl", "cp",
-                str(local_entry),
-                f"{namespace}/{pod_name}:{entry_path}",
-            ])
+            _run(
+                [
+                    "kubectl",
+                    "cp",
+                    str(local_entry),
+                    f"{namespace}/{pod_name}:{entry_path}",
+                ]
+            )
         finally:
             local_entry.unlink(missing_ok=True)
 
@@ -137,8 +140,17 @@ class ExecSubmitter:
             f"disown; "
             f"exit 0"
         )
-        exec_cmd = ["kubectl", "exec", "-n", namespace, pod_name, "--",
-                    "bash", "-c", bg]
+        exec_cmd = [
+            "kubectl",
+            "exec",
+            "-n",
+            namespace,
+            pod_name,
+            "--",
+            "bash",
+            "-c",
+            bg,
+        ]
         exec_proc = subprocess.Popen(
             exec_cmd,
             stdin=subprocess.DEVNULL,
@@ -157,9 +169,18 @@ class ExecSubmitter:
         while time.monotonic() < deadline:
             try:
                 pid = _run(
-                    ["kubectl", "exec", "-n", namespace, pod_name, "--",
-                     "cat", pid_path],
-                    capture=True, capture_stderr=True,
+                    [
+                        "kubectl",
+                        "exec",
+                        "-n",
+                        namespace,
+                        pod_name,
+                        "--",
+                        "cat",
+                        pid_path,
+                    ],
+                    capture=True,
+                    capture_stderr=True,
                 ).strip()
             except _ExecFailed:
                 time.sleep(0.5)
@@ -204,8 +225,17 @@ class ExecSubmitter:
     def follow(self, handle: SubmissionHandle) -> Iterator[str]:
         tmp = _require_tmp(handle)
         cmd = [
-            "kubectl", "exec", "-n", handle.namespace, _require_pod(handle), "--",
-            "tail", "-F", "-n", "500", f"{tmp}/stdout.log",
+            "kubectl",
+            "exec",
+            "-n",
+            handle.namespace,
+            _require_pod(handle),
+            "--",
+            "tail",
+            "-F",
+            "-n",
+            "500",
+            f"{tmp}/stdout.log",
         ]
         proc = subprocess.Popen(
             cmd,
@@ -236,40 +266,51 @@ class ExecSubmitter:
         #   - kill -0 fail + no exitcode → stopped (killed externally / pod restarted)
         probe = (
             f'if [ -f {shlex.quote(tmp)}/pid ] && kill -0 "$(cat {shlex.quote(tmp)}/pid)" 2>/dev/null; then '
-            f'  echo running; '
-            f'elif [ -f {shlex.quote(tmp)}/exitcode ]; then '
-            f'  ec=$(cat {shlex.quote(tmp)}/exitcode); '
+            f"  echo running; "
+            f"elif [ -f {shlex.quote(tmp)}/exitcode ]; then "
+            f"  ec=$(cat {shlex.quote(tmp)}/exitcode); "
             f'  if [ "$ec" = "0" ]; then echo succeeded; else echo failed; fi; '
-            f'else '
-            f'  echo stopped; '
-            f'fi'
+            f"else "
+            f"  echo stopped; "
+            f"fi"
         )
         try:
             out = _run(
-                ["kubectl", "exec", "-n", handle.namespace, pod, "--", "bash", "-c", probe],
+                [
+                    "kubectl",
+                    "exec",
+                    "-n",
+                    handle.namespace,
+                    pod,
+                    "--",
+                    "bash",
+                    "-c",
+                    probe,
+                ],
                 capture=True,
             ).strip()
         except subprocess.CalledProcessError:
             return "unknown"
-        return out if out in ("running", "succeeded", "failed", "stopped") else "unknown"
+        return (
+            out if out in ("running", "succeeded", "failed", "stopped") else "unknown"
+        )
 
     def stop(self, handle: SubmissionHandle, *, force: bool = False) -> None:
         tmp = _require_tmp(handle)
         pod = _require_pod(handle)
         sig = "KILL" if force else "TERM"
         kill = (
-            f'if [ -f {shlex.quote(tmp)}/pid ]; then '
-            f'  pid=$(cat {shlex.quote(tmp)}/pid); '
+            f"if [ -f {shlex.quote(tmp)}/pid ]; then "
+            f"  pid=$(cat {shlex.quote(tmp)}/pid); "
             f'  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d " "); '
             f'  if [ -n "$pgid" ]; then '
             f'    kill -s {sig} -"$pgid" 2>/dev/null || true; '
-            f'  else '
+            f"  else "
             f'    kill -s {sig} "$pid" 2>/dev/null || true; '
-            f'  fi; '
-            f'fi'
+            f"  fi; "
+            f"fi"
         )
-        _run(["kubectl", "exec", "-n", handle.namespace, pod, "--",
-              "bash", "-c", kill])
+        _run(["kubectl", "exec", "-n", handle.namespace, pod, "--", "bash", "-c", kill])
 
     def stop_all_running(
         self,
@@ -293,8 +334,8 @@ class ExecSubmitter:
         pod = k8s.get_head_pod(cluster_name, namespace)
         pod_name = pod.metadata.name
         kill_script = (
-            f'killed=0; '
-            f'for pidfile in {self._tmp_root}/nrl-*/pid; do '
+            f"killed=0; "
+            f"for pidfile in {self._tmp_root}/nrl-*/pid; do "
             f'  [ -f "$pidfile" ] || continue; '
             f'  pid=$(cat "$pidfile"); '
             f'  if kill -0 "$pid" 2>/dev/null; then '
@@ -304,20 +345,29 @@ class ExecSubmitter:
             f'    if [ -n "$pgid" ]; then '
             f'      echo "stopping $run_id (pgid $pgid)"; '
             f'      kill -s TERM -"$pgid" 2>/dev/null || true; '
-            f'    else '
+            f"    else "
             f'      echo "stopping $run_id (pid $pid)"; '
             f'      kill -s TERM "$pid" 2>/dev/null || true; '
-            f'    fi; '
-            f'    killed=1; '
-            f'  fi; '
-            f'done; '
+            f"    fi; "
+            f"    killed=1; "
+            f"  fi; "
+            f"done; "
             f'echo "KILLED=$killed"'
         )
         killed = False
         try:
             out = _run(
-                ["kubectl", "exec", "-n", namespace, pod_name, "--",
-                 "bash", "-c", kill_script],
+                [
+                    "kubectl",
+                    "exec",
+                    "-n",
+                    namespace,
+                    pod_name,
+                    "--",
+                    "bash",
+                    "-c",
+                    kill_script,
+                ],
                 capture=True,
             )
             for line in out.strip().splitlines():
@@ -334,22 +384,31 @@ class ExecSubmitter:
 
         log(f"[training] --replace: waiting up to {wait_s}s for processes to exit")
         wait_script = (
-            f'for i in $(seq 1 {wait_s}); do '
-            f'  alive=0; '
-            f'  for pidfile in {self._tmp_root}/nrl-*/pid; do '
+            f"for i in $(seq 1 {wait_s}); do "
+            f"  alive=0; "
+            f"  for pidfile in {self._tmp_root}/nrl-*/pid; do "
             f'    [ -f "$pidfile" ] || continue; '
             f'    pid=$(cat "$pidfile"); '
             f'    kill -0 "$pid" 2>/dev/null && alive=1 && break; '
-            f'  done; '
+            f"  done; "
             f'  [ "$alive" = "0" ] && echo "all processes exited" && exit 0; '
-            f'  sleep 1; '
-            f'done; '
+            f"  sleep 1; "
+            f"done; "
             f'echo "timeout: some processes still running"'
         )
         try:
             out = _run(
-                ["kubectl", "exec", "-n", namespace, pod_name, "--",
-                 "bash", "-c", wait_script],
+                [
+                    "kubectl",
+                    "exec",
+                    "-n",
+                    namespace,
+                    pod_name,
+                    "--",
+                    "bash",
+                    "-c",
+                    wait_script,
+                ],
                 capture=True,
             )
             for line in out.strip().splitlines():
@@ -362,6 +421,7 @@ class ExecSubmitter:
 # =============================================================================
 # Internals
 # =============================================================================
+
 
 def _validate_run_id(run_id: str) -> None:
     if not run_id:

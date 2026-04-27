@@ -132,9 +132,7 @@ def ensure_cluster(
 
     live = k8s.get_raycluster(name, namespace)
     if live is not None:
-        live_owner = (live.get("metadata", {}).get("labels") or {}).get(
-            "nrl-k8s/owner"
-        )
+        live_owner = (live.get("metadata", {}).get("labels") or {}).get("nrl-k8s/owner")
         me = get_username()
         if live_owner and live_owner != me:
             raise RuntimeError(
@@ -355,7 +353,9 @@ def submit_training(
     infra = loaded.infra
     launch = infra.launch
     if not launch.entrypoint:
-        raise ValueError("infra.launch.entrypoint must be set for `nrl-k8s run` / `rayjob`")
+        raise ValueError(
+            "infra.launch.entrypoint must be set for `nrl-k8s run` / `rayjob`"
+        )
 
     if replace:
         _reset_endpoint_registry(loaded, log=log)
@@ -397,8 +397,11 @@ def submit_training(
     if replace:
         if is_exec:
             from .submitters.exec_ import ExecSubmitter
+
             ExecSubmitter(exec_tmp_dir=infra.submit.execTmpDir).stop_all_running(
-                name, infra.namespace, log=log,
+                name,
+                infra.namespace,
+                log=log,
             )
         with submit.dashboard_url(name, infra.namespace) as dash:
             client = JobSubmissionClient(dash)
@@ -513,8 +516,10 @@ def _infer_disagg_job_id(infra: InfraConfig) -> str | None:
 
 
 def _reset_endpoint_registry(loaded: LoadedConfig, *, log: callable) -> None:
-    """Delete the endpoint-registry ConfigMap so gym + training rendezvous
-    on fresh URLs instead of caching stragglers from a prior failed run.
+    """Delete the endpoint-registry ConfigMap for a fresh rendezvous.
+
+    Ensures gym + training discover fresh URLs instead of caching
+    stragglers from a prior failed run.
     """
     job_id = _infer_disagg_job_id(loaded.infra)
     if not job_id:

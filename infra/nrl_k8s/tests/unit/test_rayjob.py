@@ -109,9 +109,7 @@ class TestSpec:
         assert got["spec"]["ttlSecondsAfterFinished"] == 60
 
     def test_ray_cluster_spec_carries_cluster_body(self) -> None:
-        got = build_rayjob_manifest(
-            _make_cluster(), _make_infra(), entrypoint="x"
-        )
+        got = build_rayjob_manifest(_make_cluster(), _make_infra(), entrypoint="x")
         rcs = got["spec"]["rayClusterSpec"]
         head = rcs["headGroupSpec"]["template"]["spec"]["containers"][0]
         worker = rcs["workerGroupSpecs"][0]["template"]["spec"]["containers"][0]
@@ -148,16 +146,16 @@ class TestLabels:
         assert got["metadata"]["labels"]["team"] == "extra"
 
     def test_managed_by_label_always_present(self) -> None:
-        got = build_rayjob_manifest(
-            _make_cluster(), _make_infra(), entrypoint="x"
-        )
+        got = build_rayjob_manifest(_make_cluster(), _make_infra(), entrypoint="x")
         assert got["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "nrl-k8s"
 
 
 class TestImmutability:
     def test_input_spec_not_mutated(self) -> None:
         spec = _base_spec()
-        original_image = spec["headGroupSpec"]["template"]["spec"]["containers"][0]["image"]
+        original_image = spec["headGroupSpec"]["template"]["spec"]["containers"][0][
+            "image"
+        ]
         cluster = _make_cluster(spec=spec)
         build_rayjob_manifest(cluster, _make_infra(), entrypoint="x")
         assert (

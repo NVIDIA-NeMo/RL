@@ -49,8 +49,9 @@ class TestIsInCluster:
 
 class TestDashboardUrlInCluster:
     def test_returns_dns_url_without_spawning(self, monkeypatch) -> None:
-        """In-cluster path returns the head-svc DNS URL and must not touch
-        ``subprocess.Popen``.
+        """In-cluster path returns the head-svc DNS URL without spawning.
+
+        Must not touch ``subprocess.Popen``.
         """
         monkeypatch.setattr(submit, "is_in_cluster", lambda: True)
 
@@ -106,8 +107,9 @@ class TestDashboardUrlLaptop:
 
 class TestTailJobLogs:
     def test_bridges_async_iterator_to_generator(self, monkeypatch) -> None:
-        """``tail_job_logs`` must yield each line produced by the async Ray
-        iterator, then stop cleanly when the iterator is exhausted.
+        """``tail_job_logs`` bridges the async Ray iterator to a sync generator.
+
+        Must yield each line then stop cleanly when the iterator is exhausted.
         """
         fake_lines = ["line one\n", "line two\n", "done\n"]
 

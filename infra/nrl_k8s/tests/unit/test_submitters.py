@@ -22,25 +22,21 @@ Covers:
 
 from __future__ import annotations
 
-import json
 import types
 from pathlib import Path
-from typing import Any
 
 import pytest
-
 from nrl_k8s.submitters import (
     SubmissionHandle,
     build_submitter,
-    handle_path,
     load_handle,
     save_handle,
 )
 
-
 # =============================================================================
 # Fixtures
 # =============================================================================
+
 
 @pytest.fixture(autouse=True)
 def _tmp_cache_dir(tmp_path, monkeypatch):
@@ -67,6 +63,7 @@ def fake_head_pod(monkeypatch):
 # =============================================================================
 # SubmissionHandle + cache
 # =============================================================================
+
 
 class TestSubmissionHandle:
     def test_roundtrip_ray(self, tmp_path):
@@ -102,13 +99,12 @@ class TestSubmissionHandle:
 # Factory
 # =============================================================================
 
+
 class TestBuildSubmitter:
     def test_port_forward_default(self):
         from nrl_k8s.schema import InfraConfig
 
-        infra = InfraConfig.model_validate(
-            {"namespace": "ns", "image": "img:tag"}
-        )
+        infra = InfraConfig.model_validate({"namespace": "ns", "image": "img:tag"})
         sub = build_submitter(infra)
         from nrl_k8s.submitters.portforward import PortForwardSubmitter
 
@@ -136,6 +132,7 @@ class TestBuildSubmitter:
 # ExecSubmitter — launcher script composition
 # =============================================================================
 
+
 def _capture_runs(monkeypatch):
     """Replace the helpers that shell out so we can inspect the cmdlines.
 
@@ -159,8 +156,12 @@ def _capture_runs(monkeypatch):
                 captured["launcher"] = local.read_text()
                 captured["dest"] = cmd[3]
         # pidfile-cat probe -> return a PID so the poll loop succeeds.
-        if len(cmd) >= 7 and cmd[0] == "kubectl" and cmd[1] == "exec" \
-                and cmd[-2] == "cat":
+        if (
+            len(cmd) >= 7
+            and cmd[0] == "kubectl"
+            and cmd[1] == "exec"
+            and cmd[-2] == "cat"
+        ):
             return "12345\n"
         return ""
 
@@ -200,7 +201,8 @@ class TestExecSubmitterLauncher:
         from nrl_k8s.submitters.exec_ import ExecSubmitter
 
         ExecSubmitter(exec_tmp_dir="/tmp").submit(
-            "rc-train", "ns",
+            "rc-train",
+            "ns",
             entrypoint="python run_grpo.py",
             run_id="rid-1",
             env_vars={"FOO": "bar"},
@@ -212,14 +214,13 @@ class TestExecSubmitterLauncher:
         # The detached launch goes through Popen, not _run.
         assert any("nohup" in " ".join(c) for c in captured["popen_calls"])
 
-    def test_launcher_contains_nohup_disown_and_pid(
-        self, fake_head_pod, monkeypatch
-    ):
+    def test_launcher_contains_nohup_disown_and_pid(self, fake_head_pod, monkeypatch):
         calls, captured = _capture_runs(monkeypatch)
         from nrl_k8s.submitters.exec_ import ExecSubmitter
 
         ExecSubmitter(exec_tmp_dir="/tmp").submit(
-            "rc-train", "ns",
+            "rc-train",
+            "ns",
             entrypoint="python run_grpo.py",
             run_id="rid-2",
         )
@@ -241,7 +242,8 @@ class TestExecSubmitterLauncher:
         from nrl_k8s.submitters.exec_ import ExecSubmitter
 
         ExecSubmitter(exec_tmp_dir="/tmp").submit(
-            "rc-train", "ns",
+            "rc-train",
+            "ns",
             entrypoint="echo hi",
             run_id="rid-3",
             env_vars={
@@ -264,7 +266,8 @@ class TestExecSubmitterLauncher:
         from nrl_k8s.submitters.exec_ import ExecSubmitter
 
         ExecSubmitter(exec_tmp_dir="/tmp").submit(
-            "rc-train", "ns",
+            "rc-train",
+            "ns",
             entrypoint="python run_grpo.py",
             run_id="rid-4",
         )
@@ -279,7 +282,8 @@ class TestExecSubmitterLauncher:
 
         with pytest.raises(ValueError, match="working_dir upload"):
             ExecSubmitter().submit(
-                "rc-train", "ns",
+                "rc-train",
+                "ns",
                 entrypoint="echo",
                 run_id="rid-5",
                 working_dir=Path("/some/dir"),
@@ -291,7 +295,8 @@ class TestExecSubmitterLauncher:
 
         with pytest.raises(ValueError, match="run_id"):
             ExecSubmitter().submit(
-                "rc-train", "ns",
+                "rc-train",
+                "ns",
                 entrypoint="echo",
                 run_id="has spaces",
             )
@@ -301,7 +306,8 @@ class TestExecSubmitterLauncher:
         from nrl_k8s.submitters.exec_ import ExecSubmitter
 
         handle = ExecSubmitter(exec_tmp_dir="/scratch").submit(
-            "rc-train", "ns",
+            "rc-train",
+            "ns",
             entrypoint="echo",
             run_id="rid-7",
         )
@@ -317,9 +323,10 @@ class TestExecSubmitterLauncher:
 # ExecSubmitter.follow / status / stop
 # =============================================================================
 
+
 class TestExecSubmitterObservability:
     def test_follow_uses_tail_F(self, monkeypatch):
-        """tail -F (capital) survives log rotation; tail -f does not."""
+        """Tail -F (capital) survives log rotation; tail -f does not."""
         from nrl_k8s.submitters.exec_ import ExecSubmitter
 
         captured_cmd: list[list[str]] = []
@@ -345,8 +352,12 @@ class TestExecSubmitterObservability:
         monkeypatch.setattr("nrl_k8s.submitters.exec_.subprocess.Popen", FakePopen)
 
         handle = SubmissionHandle(
-            kind="exec", run_id="r", cluster_name="rc", namespace="ns",
-            pod="head-1", tmp_dir="/tmp/nrl-r",
+            kind="exec",
+            run_id="r",
+            cluster_name="rc",
+            namespace="ns",
+            pod="head-1",
+            tmp_dir="/tmp/nrl-r",
         )
         list(ExecSubmitter().follow(handle))
         cmd = captured_cmd[0]
@@ -370,8 +381,12 @@ class TestExecSubmitterObservability:
                 lambda cmd, *, capture=False, out=probe_out: out + "\n",
             )
             handle = SubmissionHandle(
-                kind="exec", run_id="r", cluster_name="rc", namespace="ns",
-                pod="head-1", tmp_dir="/tmp/nrl-r",
+                kind="exec",
+                run_id="r",
+                cluster_name="rc",
+                namespace="ns",
+                pod="head-1",
+                tmp_dir="/tmp/nrl-r",
             )
             assert ExecSubmitter().status(handle) == expected
 
@@ -384,8 +399,12 @@ class TestExecSubmitterObservability:
             lambda cmd, *, capture=False: calls.append(list(cmd)) or "",
         )
         handle = SubmissionHandle(
-            kind="exec", run_id="r", cluster_name="rc", namespace="ns",
-            pod="head-1", tmp_dir="/tmp/nrl-r",
+            kind="exec",
+            run_id="r",
+            cluster_name="rc",
+            namespace="ns",
+            pod="head-1",
+            tmp_dir="/tmp/nrl-r",
         )
         ExecSubmitter().stop(handle)
         ExecSubmitter().stop(handle, force=True)
@@ -398,14 +417,14 @@ class TestExecSubmitterObservability:
 # Head-pod lookup failure
 # =============================================================================
 
+
 class TestHeadPodLookup:
     def test_no_running_head_pod_surfaces_cluster_and_ns(self, monkeypatch):
         from nrl_k8s import k8s
 
         def raise_(*a, **kw):
             raise RuntimeError(
-                "no Running head pod found for RayCluster 'rc-train' in "
-                "namespace 'ns'"
+                "no Running head pod found for RayCluster 'rc-train' in namespace 'ns'"
             )
 
         monkeypatch.setattr(k8s, "get_head_pod", raise_)
@@ -414,7 +433,10 @@ class TestHeadPodLookup:
 
         with pytest.raises(RuntimeError) as excinfo:
             ExecSubmitter().submit(
-                "rc-train", "ns", entrypoint="echo", run_id="r",
+                "rc-train",
+                "ns",
+                entrypoint="echo",
+                run_id="r",
             )
         assert "rc-train" in str(excinfo.value)
         assert "ns" in str(excinfo.value)

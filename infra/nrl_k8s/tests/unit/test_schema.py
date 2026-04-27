@@ -225,7 +225,9 @@ class TestSubmitterMode:
         assert SubmitSpec().execTmpDir == "/tmp"
 
     def test_exec_tmp_dir_override(self) -> None:
-        spec = SubmitSpec.model_validate({"submitter": "exec", "execTmpDir": "/workspace/tmp"})
+        spec = SubmitSpec.model_validate(
+            {"submitter": "exec", "execTmpDir": "/workspace/tmp"}
+        )
         assert spec.submitter is SubmitterMode.EXEC
         assert spec.execTmpDir == "/workspace/tmp"
 

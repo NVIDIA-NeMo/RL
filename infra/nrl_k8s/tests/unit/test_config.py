@@ -42,8 +42,10 @@ from nrl_k8s.schema import InfraConfig, SchedulerKind, WorkspaceKind
 
 @pytest.fixture(autouse=True)
 def _no_user_defaults(monkeypatch, tmp_path):
-    """Point ``_USER_DEFAULTS`` at a non-existent file so user-level config
-    never bleeds into tests from whatever laptop this runs on.
+    """Point ``_USER_DEFAULTS`` at a non-existent file.
+
+    Prevents user-level config from bleeding into tests from whatever
+    laptop this runs on.
     """
     monkeypatch.setattr(cfg_mod, "_USER_DEFAULTS", tmp_path / "no-such.yaml")
 
@@ -180,8 +182,9 @@ class TestPrecedence:
 
 class TestRecipeBody:
     def test_infra_is_peeled_off(self, tmp_path) -> None:
-        """The returned recipe must not contain `infra:` — the NeMo-RL
-        entrypoint is never supposed to see it.
+        """The returned recipe must not contain ``infra:``.
+
+        The NeMo-RL entrypoint is never supposed to see it.
         """
         recipe = _write_yaml(
             tmp_path / "recipe.yaml",

@@ -28,7 +28,6 @@ from typing import Any, Iterator
 from .. import submit as _submit
 from . import JobStatusStr, SubmissionHandle
 
-
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -88,7 +87,7 @@ class PortForwardSubmitter:
             yield from _submit.tail_job_logs(dash, handle.run_id)
 
     def status(self, handle: SubmissionHandle) -> JobStatusStr:
-        from ray.job_submission import JobStatus, JobSubmissionClient
+        from ray.job_submission import JobSubmissionClient
 
         with _submit.dashboard_url(handle.cluster_name, handle.namespace) as dash:
             try:

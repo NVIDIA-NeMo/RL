@@ -98,20 +98,24 @@ class JobSubmitter(Protocol):
 # Factory
 # =============================================================================
 
+
 def build_submitter(infra: InfraConfig) -> JobSubmitter:
     """Pick a submitter based on the resolved infra config."""
     # Local imports to avoid cycles — the two submitters import back to get
     # the dataclasses + Protocol defined above.
     if infra.submit.submitter is SubmitterMode.EXEC:
         from .exec_ import ExecSubmitter
+
         return ExecSubmitter(exec_tmp_dir=infra.submit.execTmpDir)
     from .portforward import PortForwardSubmitter
+
     return PortForwardSubmitter()
 
 
 # =============================================================================
 # Handle cache
 # =============================================================================
+
 
 def _cache_root() -> Path:
     """Resolve the handle cache dir at call time.

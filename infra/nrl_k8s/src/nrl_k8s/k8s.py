@@ -222,9 +222,7 @@ def apply_rayjob(manifest: dict[str, Any], namespace: str) -> dict[str, Any]:
         raise
 
 
-def delete_rayjob(
-    name: str, namespace: str, *, ignore_missing: bool = True
-) -> None:
+def delete_rayjob(name: str, namespace: str, *, ignore_missing: bool = True) -> None:
     api = custom_objects_api()
     try:
         with_retries(
@@ -456,9 +454,7 @@ def delete_pod(name: str, namespace: str, *, ignore_missing: bool = True) -> Non
     load_kubeconfig()
     core = client.CoreV1Api()
     try:
-        with_retries(
-            lambda: core.delete_namespaced_pod(name=name, namespace=namespace)
-        )
+        with_retries(lambda: core.delete_namespaced_pod(name=name, namespace=namespace))
     except ApiException as exc:
         if exc.status == 404 and ignore_missing:
             return
@@ -470,7 +466,9 @@ def list_pods_by_label(label_selector: str, namespace: str) -> list:
     load_kubeconfig()
     core = client.CoreV1Api()
     result = with_retries(
-        lambda: core.list_namespaced_pod(namespace=namespace, label_selector=label_selector)
+        lambda: core.list_namespaced_pod(
+            namespace=namespace, label_selector=label_selector
+        )
     )
     return result.items or []
 
@@ -511,9 +509,7 @@ def get_pod_image(name: str, namespace: str) -> str | None:
 # =============================================================================
 
 
-def create_or_update_secret(
-    name: str, namespace: str, data: dict[str, str]
-) -> None:
+def create_or_update_secret(name: str, namespace: str, data: dict[str, str]) -> None:
     """Create a Secret or merge new keys into an existing one."""
     import base64
 
@@ -543,9 +539,7 @@ def create_or_update_secret(
                 data=encoded,
             )
             with_retries(
-                lambda: core.create_namespaced_secret(
-                    namespace=namespace, body=secret
-                )
+                lambda: core.create_namespaced_secret(namespace=namespace, body=secret)
             )
         else:
             raise

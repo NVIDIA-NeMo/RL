@@ -103,8 +103,9 @@ def _patch_dashboard(monkeypatch):
 
 class TestLatestDaemonJob:
     def test_prefers_most_recent_suffixed(self, monkeypatch) -> None:
-        """When both the base id and a suffixed variant exist, pick the
-        most recent by start_time.
+        """When both the base id and a suffixed variant exist, pick the most recent.
+
+        Selection is based on start_time.
         """
         _patch_dashboard(monkeypatch)
 
@@ -140,8 +141,10 @@ class TestLatestDaemonJob:
         assert status is None
 
     def test_any_error_returns_base_and_none(self, monkeypatch) -> None:
-        """Dashboard failures must not crash ``status`` — we fall back to a
-        'unknown' row so the CLI can keep rendering the other clusters.
+        """Dashboard failures must not crash ``status``.
+
+        We fall back to an 'unknown' row so the CLI can keep rendering
+        the other clusters.
         """
 
         @contextlib.contextmanager

@@ -114,9 +114,11 @@ def list_cluster_pods(cluster_name: str, namespace: str) -> RayClusterPods:
 def _latest_daemon_job(
     cluster_name: str, namespace: str, base_submission_id: str
 ) -> tuple[str | None, str | None]:
-    """Find the most recent Ray Job whose submission_id matches the base id
-    or a ``--replace``-suffixed variant (``<base>-<timestamp>``), and return
-    its (submission_id, status) pair. Returns (None, None) on any error.
+    """Find the most recent Ray Job matching the base or replace-suffixed id.
+
+    Matches ``base_submission_id`` or a ``--replace``-suffixed variant
+    (``<base>-<timestamp>``) and returns (submission_id, status).
+    Returns (None, None) on any error.
     """
     try:
         from ray.job_submission import JobSubmissionClient
