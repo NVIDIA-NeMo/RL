@@ -53,15 +53,15 @@ The performance data includes:
 
 | Algorithm | Model     |On/Off policy|T-Max Sequence Length|G-Average Seq len|#-GPUs|G-GBS|T-GBS|Generation [TP,PP]|Training [TP,CP,EP,PP,VPP]|Tokens / sec / GPU|Total Step time(s)|
 |---------  |-------    |--------     |-----                |-----            |------|---- |---- |----              |----                      |---               |---|
-| GRPO      |DeepSeek V3|On policy    |1,536                |706              |256   |512  |512  |[32,1]            |[1,1,16,16,n/a]           |12.1              | 135|
-| GRPO      |DeepSeek V3|On policy    |1,536                |706              |512   |512  |512  |[32,1]            |[1,1,16,16,n/a]           |7.0              | 116|
-| GRPO      |DeepSeek V3|1-step Off   |1,536                |705              |512   |512  |512  |[32,1]            |[1,1,16,16,n/a]           |12.0              | 68.4|
-| GRPO      |Qwen3-235B |On policy    |8,192                |5,729            |128   |512  |512  |[16,1]            |[2,2,16,8,n/a]            |54.6              | 429|
-| GRPO      |Qwen3-235B |On policy    |8,192                |5,718            |256   |512  |512  |[16,1]            |[2,2,16,8,n/a]            |35.1              | 333|
-| GRPO      |Qwen3-235B |1-step Off   |8,192                |5,692            |256   |512  |512  |[8,1]             |[4,1,16,8,n/a]            |59.4              | 218|
-| GRPO      |Qwen3-30B3A|On policy    |4,096                |3,197            |32    |2,048|512  |[2,1]             |[1,1,8,1,n/a]             |1088               | 194|
-| GRPO      |Qwen3-30B3A|1-step Off   |4,096                |3,201            |32    |2,048|512  |[2,1]             |[1,1,8,2,n/a]             |1443               | 150|
-| GRPO      |Qwen3-30B3A|8-step Off   |4,096                |3,203            |192   |2,048|512  |[2,1]             |[1,1,8,1,n/a]             |1036               | 34.0|
+| GRPO      |DeepSeek V3|On policy    |1,536                |701              |256   |512  |512  |[32,1]            |[1,1,16,16,n/a]           |12.1              | 134|
+| GRPO      |DeepSeek V3|On policy    |1,536                |697              |512   |512  |512  |[32,1]            |[1,1,16,16,n/a]           |7.24              | 111|
+| GRPO      |DeepSeek V3|1-step Off   |1,536                |710              |512   |512  |512  |[32,1]            |[1,1,16,16,n/a]           |12.8              | 64.1|
+| GRPO      |Qwen3-235B |On policy    |8,192                |5,698            |128   |512  |512  |[16,1]            |[2,2,16,8,n/a]            |58.9              | 395|
+| GRPO      |Qwen3-235B |On policy    |8,192                |5,713            |256   |512  |512  |[16,1]            |[2,2,16,8,n/a]            |37.4              | 312|
+| GRPO      |Qwen3-235B |1-step Off   |8,192                |5,721            |256   |512  |512  |[8,1]             |[4,1,16,8,n/a]            |58.7              | 231|
+| GRPO      |Qwen3-30B3A|On policy    |4,096                |3,203            |32    |2,048|512  |[2,1]             |[1,1,8,1,n/a]             |1102               | 192|
+| GRPO      |Qwen3-30B3A|1-step Off   |4,096                |3,201            |32    |2,048|512  |[2,1]             |[1,1,8,2,n/a]             |1414               | 152|
+| GRPO      |Qwen3-30B3A|8-step Off   |4,096                |3,206            |192   |2,048|512  |[2,1]             |[1,1,8,1,n/a]             |1025               | 34.5|
 
 ### H100 FP8 Benchmarks
 * GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2)
@@ -71,7 +71,7 @@ The performance data includes:
 
 | Algorithm | Model     |On/Off policy|T-Max Sequence Length|G-Average Seq len|#-GPUs|G-GBS|T-GBS|Generation [TP,PP]|Training [TP,CP,EP,PP,VPP]|Tokens / sec / GPU|Total Step time(s)|
 |---------  |-------    |--------     |-----                |-----            |------|---- |---- |----              |----                      |---               |---|
-| GRPO      |DeepSeek V3|1-step Off   |1,536                |730              |512   |512  |512  |[16,1]            |[1,1,16,16,n/a]           |14.6              | 57.48|
+| GRPO      |DeepSeek V3|1-step Off   |1,536                |721              |512   |512  |512  |[16,1]            |[1,1,16,16,n/a]           |14.1              | 59.2|
 
 ### GB200 BF16 Benchmarks
 * GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2)
@@ -82,13 +82,13 @@ The performance data includes:
 | Algorithm | Model     |On/Off policy|T-Max Sequence Length|G-Average Seq len|#-GPUs|G-GBS|T-GBS|Generation [TP,PP]|Training [TP,CP,EP,PP,VPP]|Tokens / sec / GPU|Total Step time(s)|
 |---------  |-------    |--------     |-----                |-----            |------|---- |---- |----              |----                      |---               |---|
 | GRPO      |DeepSeek V3|On policy    |1,536                |711              |128   |512  |512  |[32,1]            |[1,1,16,8,n/a]            |30.2              | 108|
-| GRPO      |DeepSeek V3|On policy    |1,536                |674              |256   |512  |512  |[32,1]            |[1,1,16,8,n/a]            |17.4              | 92.2|
+| GRPO      |DeepSeek V3|On policy    |1,536                |700              |256   |512  |512  |[32,1]            |[1,1,16,8,n/a]            |16.4              | 98.7|
 | GRPO      |DeepSeek V3|1-step Off   |1,536                |708              |256   |512  |512  |[16,1]            |[1,1,16,8,n/a]            |26.7              | 61.7|
-| GRPO      |Qwen3-235B |On policy    |8,192                |5,688            |64    |512  |512  |[8,1]            |[2,2,16,4,n/a]            |164              | 284|
-| GRPO      |Qwen3-235B |On policy    |8,192                |5,700            |128   |512  |512  |[8,1]            |[2,2,16,4,n/a]            |69.2              | 337|
-| GRPO      |Qwen3-235B |1-step Off   |8,192                |5,719            |128   |512  |512  |[8,1]             |[4,1,16,4,n/a]            |85.8              | 277|
-| GRPO      |Qwen3-30B3A|On policy    |4,096                |3,199            |16    |2,048|512  |[1,1]             |[1,1,16,1,n/a]             |1,934               | 219|
-| GRPO      |Qwen3-30B3A|1-step Off   |4,096                |3,202            |16    |2,048|512  |[1,1]             |[1,1,16,1,n/a]             |1,415               | 299|
+| GRPO      |Qwen3-235B |On policy    |8,192                |5,709            |64    |512  |512  |[8,1]            |[2,2,16,4,n/a]            |163              | 286|
+| GRPO      |Qwen3-235B |On policy    |8,192                |5,693            |128   |512  |512  |[8,1]            |[2,2,16,4,n/a]            |67.4              | 345|
+| GRPO      |Qwen3-235B |1-step Off   |8,192                |5,705            |128   |512  |512  |[8,1]             |[4,1,16,4,n/a]            |85.5              | 278|
+| GRPO      |Qwen3-30B3A|On policy    |4,096                |3,199            |16    |2,048|512  |[1,1]             |[1,1,16,1,n/a]             |1,910               | 221|
+| GRPO      |Qwen3-30B3A|1-step Off   |4,096                |3,197            |16    |2,048|512  |[1,1]             |[1,1,16,1,n/a]             |1,406               | 301|
 | SWE       |Nemotron-3-Nano-30B-A3B|1-step Off   |131,072  |31,599           |128   |512  |512  |[8,1]             |[8,8,8,1,n/a]             |37.5               | 430|
 
 Note:
