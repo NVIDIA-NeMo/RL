@@ -1,0 +1,31 @@
+#!/bin/bash
+#SBATCH --account=coreai_dlalgo_nemorl
+#SBATCH --partition=batch
+#SBATCH --time=3:55:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:8
+#SBATCH --job-name=dsv4-bake-vllm-c0879d-base-20260427
+#SBATCH --output=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/src/NeMo-RL/nemo-rl-deepseek-v4/slurm_jobs/dsv4-bake-20260427_%j.out
+#SBATCH --error=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/src/NeMo-RL/nemo-rl-deepseek-v4/slurm_jobs/dsv4-bake-20260427_%j.err
+
+set -e
+
+REPO=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/src/NeMo-RL/nemo-rl-deepseek-v4
+BASE_SQSH=/lustre/fsw/portfolios/coreai/users/shuangy/images/nemo-rl-dsv4-pr2039-ab2d7a-tf55-vllm15833-2026-04-26.sqsh
+NEW_SQSH=/lustre/fsw/portfolios/coreai/users/shuangy/images/nemo-rl-dsv4-vllm-c0879d-base-torch210-2026-04-27.sqsh
+
+MOUNTS="/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy:/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy,/lustre/fsw/portfolios/coreai/users/shuangy:/lustre/fsw/portfolios/coreai/users/shuangy,/lustre/fsw/portfolios/coreai/users/larkz:/lustre/fsw/portfolios/coreai/users/larkz"
+
+echo "=== Bake start: $(date) ==="
+echo "  base : $BASE_SQSH"
+echo "  out  : $NEW_SQSH"
+
+srun --no-container-mount-home --container-writable \
+    --container-image="$BASE_SQSH" \
+    --container-mounts="$MOUNTS" \
+    --container-save="$NEW_SQSH" \
+    bash "$REPO/env_refresh_dsv4.sh"
+
+echo "=== Bake complete: $(date) ==="
+ls -la "$NEW_SQSH"

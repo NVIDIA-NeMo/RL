@@ -1,0 +1,65 @@
+[
+  {
+    "repo": "vllm-project/vllm",
+    "type": "pulls",
+    "number": 40760,
+    "label": "vllm DSv4 support",
+    "unblocks": "Standard release path. Our wheel is built off this PR's commit 306b63f67. Watch for rebase + Base FP8-block-quant fix."
+  },
+  {
+    "repo": "huggingface/transformers",
+    "type": "pulls",
+    "number": 45643,
+    "label": "transformers DSv4 (ArthurZucker)",
+    "unblocks": "Native modeling code. Simplifies automodel pass-through. Supersedes closed #45616."
+  },
+  {
+    "repo": "huggingface/transformers",
+    "type": "pulls",
+    "number": 45616,
+    "label": "transformers DSv4 (superseded)",
+    "unblocks": "Closed; tracked for historical context."
+  },
+  {
+    "repo": "NVIDIA-NeMo/Automodel",
+    "type": "pulls",
+    "number": 2039,
+    "label": "automodel DSv4 Flash (khazic)",
+    "unblocks": "NeMo-RL policy worker init. Community-request, awaiting maintainer review."
+  },
+  {
+    "repo": "NVIDIA-NeMo/Automodel",
+    "type": "issues",
+    "number": 2034,
+    "label": "automodel DSv4 tracking issue",
+    "unblocks": "DSv4 Automodel support meta-tracker."
+  },
+  {
+    "repo": "NVIDIA/Megatron-LM",
+    "type": "issues",
+    "number": 4468,
+    "label": "megatron-lm DSv4 training tracker",
+    "unblocks": "Megatron path: hybrid attn, mHC, routing, Muon, FP4 QAT, 1M context."
+  },
+  {
+    "repo": "NVIDIA/Megatron-LM",
+    "type": "pulls",
+    "number": 4458,
+    "label": "megatron-lm DSv4 hybrid attn (Part 1)",
+    "unblocks": "CSA + HCA hybrid attention impl."
+  },
+  {
+    "repo": "NVIDIA/Megatron-LM",
+    "type": "pulls",
+    "number": 3828,
+    "label": "megatron-lm mHC kernel fusion",
+    "unblocks": "Manifold hyper-connection kernel fusion (foundational; merged Mar 2026)."
+  },
+  {
+    "type": "docker_image",
+    "repo": "vllm/vllm-openai",
+    "tag": "deepseekv4-cu129",
+    "label": "vllm DSv4 prebuilt wheel image",
+    "unblocks": "Source of our extracted vllm wheel (vllm-0.1.dev15826+g306b63f67). Watch for rebuilds with newer PR #40760 commits — a new digest means a fresh wheel is available to extract."
+  }
+]

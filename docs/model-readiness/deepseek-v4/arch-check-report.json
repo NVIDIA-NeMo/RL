@@ -1,0 +1,181 @@
+{
+  "skill": "arch-check",
+  "schema_version": 1,
+  "model_path": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/models/deepseek-ai/DeepSeek-V4-Flash-Base",
+  "model_id_hint": "deepseek-ai/DeepSeek-V4-Flash-Base",
+  "family_detected": "deepseek-v4",
+  "size_bucket": "flash-base (moe, ~500B-class by parameter count inference; 43 layers, 256 routed experts, 6 per token, 1 shared expert, 4096 hidden, FP8 weights)",
+  "run_context": {
+    "branch": "deepseek-v4-support",
+    "repo_root": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/src/NeMo-RL/nemo-rl-deepseek-v4",
+    "recipe": null,
+    "include_history": false,
+    "phase": "new-model Phase 1.2 (arch-check before recipe + env build)"
+  },
+  "attrs": {
+    "architecture_raw_extractor": [],
+    "architecture_extractor_gap": "DeepSeek uses n_routed_experts / n_shared_experts (not num_local_experts / num_experts). extract_attrs.py heuristic does not recognize this MoE naming convention — augmented manually below.",
+    "architecture_effective": [
+      "moe",
+      "ep_sharded_experts"
+    ],
+    "architecture_absent_confirmed": [
+      "shared_kv (no num_kv_shared_layers in config)",
+      "tied_embeddings (tie_word_embeddings=false explicit)",
+      "for_conditional_generation (arch=DeepseekV4ForCausalLM)",
+      "mamba_hybrid (no layer_types; not model_type qwen3_next)",
+      "vlm / multimodal (no vision_config / audio_config)"
+    ],
+    "architecture_requires_modeling_file_inspection": [
+      "gated_router_with_rmsnorm (DeepSeek V3/V4 routers commonly use noaux_tc with scoring_func sqrtsoftplus; whether the gate applies an internal RMSNorm on its input is not readable from config.json)",
+      "rmsnorm_gated (Mamba-style RMSNormGated; no evidence in config but cannot be fully ruled out without inspecting modeling_deepseek_v4.py)"
+    ],
+    "config": {},
+    "config_note": "No recipe supplied (Phase 1.2 runs before recipe creation). All entries with config triggers are evaluated as insufficient-info and treated as skipped for firing but must be re-checked once a recipe exists.",
+    "deps": {
+      "transformers": "==5.3.0",
+      "automodel": "92635e74",
+      "megatron": "d30c3ae5",
+      "vllm": null
+    },
+    "deps_note": "vllm submodule not present under 3rdparty/ — branch deepseek-v4-support has no vllm checkout. VLM-path ledger entries evaluated with vllm=unknown.",
+    "noteworthy_config_fields": {
+      "n_routed_experts": 256,
+      "n_shared_experts": 1,
+      "num_experts_per_tok": 6,
+      "num_hidden_layers": 43,
+      "num_nextn_predict_layers": 1,
+      "num_attention_heads": 64,
+      "num_key_value_heads": 1,
+      "head_dim": 512,
+      "q_lora_rank": 1024,
+      "o_lora_rank": 1024,
+      "qk_rope_head_dim": 64,
+      "hidden_size": 4096,
+      "sliding_window": 128,
+      "quantization_config": {
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "scale_fmt": "ue8m0",
+        "weight_block_size": [128, 128],
+        "activation_scheme": "dynamic"
+      },
+      "rope_scaling": {"type": "yarn", "factor": 16, "original_max_position_embeddings": 65536},
+      "max_position_embeddings": 1048576,
+      "topk_method": "noaux_tc",
+      "scoring_func": "sqrtsoftplus",
+      "hc_mult": 4,
+      "hc_sinkhorn_iters": 20,
+      "index_head_dim": 128,
+      "index_n_heads": 64,
+      "index_topk": 512,
+      "num_hash_layers": 3,
+      "compress_ratios_nonzero": true,
+      "swiglu_limit": 10.0
+    },
+    "novel_config_fields_not_in_ledger_vocabulary": [
+      "hc_eps / hc_mult / hc_sinkhorn_iters (hash-clustered routing? Sinkhorn-iteration signal is unique to DeepSeek V4)",
+      "index_head_dim / index_n_heads / index_topk (indexer / sparse-attention layer, unfamiliar shape)",
+      "num_hash_layers=3 (likely hash-based dispatch layers)",
+      "compress_ratios (43-entry per-layer list mixing 0, 4, 128 — suggests per-layer KV-compression or layer-specific sparse attention)",
+      "compress_rope_theta=160000 (second RoPE base alongside rope_theta=10000)",
+      "q_lora_rank / o_lora_rank (MLA-style low-rank Q and O projections; V3 only had q/kv lora, this adds o_lora)",
+      "o_groups=8 (grouped output projection)",
+      "num_nextn_predict_layers=1 (MTP head; DeepSeek V3 had this too — in NeMo-RL it needs to be dropped or frozen during bring-up)",
+      "quantization_config.fmt=e4m3 with scale_fmt=ue8m0 and block size 128x128 (FP8 block-quantized weights on disk — requires dequant or native FP8 support during load)",
+      "sliding_window=128 (new vs. V3 which was pure full-attention; suggests hybrid attention per layer)"
+    ]
+  },
+  "results": {
+    "must_handle": [],
+    "verify": [],
+    "inspect": [
+      {
+        "ledger_id": "gemma4-moe-double-norm-gate",
+        "question": "Does the DeepSeek V4 decoder layer send a pre-normed residual (post_attention_layernorm / pre_feedforward_layernorm) into a MoE.forward() whose internal gate also applies its own RMSNorm on the same input tensor?",
+        "hint": "Read modeling_deepseek_v4.py (or HF remote code cache under the model dir). Trace decoder forward -> moe(x) -> gate(x). If gate.norm is an nn.Module that runs before scoring, check whether x is the raw residual or the pre-normed residual. A double-norm on the gate input mis-routes experts while still training, producing elevated gen_kl_error (~0.1 class) without a hard error — exactly the Gemma4 26B-A4B pattern.",
+        "why_it_applies": "DeepSeek V4 is MoE with 256 routed experts, scoring_func=sqrtsoftplus, topk_method=noaux_tc. The scoring_func suggests a custom router; the ledger entry fires on the shape 'gated_router_with_rmsnorm' which is not extractable from config.json. Must be answered before trusting KL metrics."
+      },
+      {
+        "ledger_id": "gemma4-moe-expert-dtype-fsdp2-moduledict",
+        "question": "Does the automodel implementation of DeepseekV4 expose experts via nn.ModuleDict (or nn.ModuleList wrapped by ModuleDict), and is there a registered ParallelizationStrategy that casts expert DTensors with fully_shard_by_dtype?",
+        "hint": "grep automodel (3rdparty/Automodel-workspace/Automodel) for DeepseekV4 model class and its ParallelizationStrategy registration. The Gemma4 failure mode is: automodel 2013a4dd added ModuleDict handling but Gemma4's MoE uses a different EP mesh than the DP MixedPrecisionPolicy mesh, so expert weights stay float32. DeepSeek V4 MoE on a 256-expert EP mesh is structurally similar and may inherit the same trap.",
+        "why_it_applies": "automodel HEAD (92635e74) is past 2013a4dd (the commit that introduced the ModuleDict handling). MoE + ep_sharded_experts are present. The only unmet piece is the ModuleDict-vs-custom-strategy check."
+      },
+      {
+        "ledger_id": "vllm-rmsnormgated-missing-activation-enforce-eager",
+        "question": "Does DeepSeek V4's attention or MoE path invoke vLLM's RMSNormGated (as opposed to plain RMSNorm)?",
+        "hint": "RMSNormGated is typically bound to Mamba or gated-linear-unit blocks. DeepSeek V4 has swiglu_limit=10.0 and no mamba_hybrid signal, but sliding_window=128 + compress_ratios suggests a custom attention variant. Quickly inspect modeling_deepseek_v4.py for RMSNormGated; if absent, dismiss this entry.",
+        "why_it_applies": "Cannot be ruled out from config.json alone; vLLM submodule is not checked out on this branch so the current sha is unknown, and NeMo-RL runs with enforce_eager=true by default."
+      }
+    ],
+    "info": [
+      {
+        "ledger_id": "gemma4-kv-sharing-use-cache-false",
+        "reason_not_fired": "architecture atom shared_kv absent (no num_kv_shared_layers)"
+      },
+      {
+        "ledger_id": "gemma4-kv-sharing-actckpt-silent-corruption",
+        "reason_not_fired": "architecture atom shared_kv absent"
+      },
+      {
+        "ledger_id": "zero-grad-params-ckpt-resume",
+        "reason_not_fired": "any_of {shared_kv, vlm, multimodal} — none present",
+        "caller_note": "Still worth remembering: DeepSeek V4 has num_nextn_predict_layers=1 (MTP head) which may be frozen / unused during RL and could trigger a similar 'missing optim state for frozen param' failure on ckpt resume even though the ledger trigger does not explicitly match. Re-evaluate once the recipe decides how to handle the MTP head."
+      },
+      {
+        "ledger_id": "transformers-tie-weights-meta-tensor",
+        "reason_not_fired": "tie_word_embeddings=false"
+      },
+      {
+        "ledger_id": "vllm-skip-tokenizer-init-for-conditional-generation",
+        "reason_not_fired": "architectures=[DeepseekV4ForCausalLM], not ForConditionalGeneration"
+      },
+      {
+        "ledger_id": "vllm-mamba-causalconv1d-low-tp-cache",
+        "reason_not_fired": "mamba_hybrid not present"
+      },
+      {
+        "ledger_id": "qwen35-seq-packing-high-gen-kl",
+        "reason_not_fired": "family qwen3.5 only; DeepSeek-V4 is not in scope"
+      },
+      {
+        "ledger_id": "mamba-hybrid-dcp-optim-resume-pickle",
+        "reason_not_fired": "mamba_hybrid not present"
+      }
+    ],
+    "skipped_insufficient_info": [
+      {
+        "reason": "no recipe supplied",
+        "entries_deferred_until_recipe": [
+          "gemma4-kv-sharing-use-cache-false (needs config.use_cache)",
+          "gemma4-kv-sharing-actckpt-silent-corruption (needs config.activation_checkpointing)",
+          "transformers-tie-weights-meta-tensor (needs world_size, though tied_embeddings already disqualifies)",
+          "vllm-rmsnormgated-missing-activation-enforce-eager (needs config.enforce_eager)",
+          "vllm-mamba-causalconv1d-low-tp-cache (needs config.tensor_parallel)",
+          "qwen35-seq-packing-high-gen-kl (needs config.sequence_packing)"
+        ],
+        "note": "Re-run arch-check with recipe=<yaml> after Phase 3."
+      }
+    ]
+  },
+  "caller_decision": {
+    "status": "no-blocker-yet",
+    "action_required": [
+      "Resolve the three INSPECT items by reading the DeepSeek V4 modeling file before Phase 3 recipe creation:",
+      "  1) gemma4-moe-double-norm-gate — trace decoder -> moe.forward -> gate to verify no double-norm on gate input.",
+      "  2) gemma4-moe-expert-dtype-fsdp2-moduledict — check whether automodel DeepseekV4 path uses ModuleDict for experts and whether fully_shard_by_dtype is registered.",
+      "  3) vllm-rmsnormgated-missing-activation-enforce-eager — confirm RMSNormGated is not on the DeepSeek V4 code path.",
+      "After recipe YAML exists, re-run: python .claude/skills/arch-check/extract_attrs.py --model ... --recipe <yaml> ..."
+    ],
+    "novel_risks_not_in_ledger": [
+      "FP8 block-quantized checkpoint (e4m3 weights, ue8m0 scales, 128x128 block). NeMo-RL's automodel path has historically loaded bf16/fp16; block-FP8 load + upcast or native FP8 kernel availability is an open question and should be validated in env-profile / smoke-test.",
+      "Per-layer compress_ratios array mixing {0, 4, 128} over 43 layers suggests hybrid KV compression (some layers full, some 4x, some 128x). Any parallelism (TP/PP) plan must respect per-layer differences.",
+      "Dual RoPE bases (rope_theta=10000 main, compress_rope_theta=160000 for compressed path) plus YaRN factor=16 with original_max_position_embeddings=65536 (effective 1048576) — verify that automodel + vLLM handle the dual-theta config correctly; only one rope_theta is typically plumbed through.",
+      "sqrtsoftplus scoring function with noaux_tc topk — this is not a standard softmax-topk MoE router. Expert routing diff vs HF reference may need a standalone-logit-diff check in smoke-test.",
+      "num_hash_layers=3 and hc_* (hash-clustered / Sinkhorn) parameters are entirely new vocabulary. Consider filing a new ledger entry once the pattern is understood.",
+      "num_nextn_predict_layers=1 (MTP) — DeepSeek V3 also had this; typically dropped at load time for NeMo-RL. Confirm automodel drops or isolates the MTP head so its params do not participate in the optimizer and break ckpt resume."
+    ]
+  },
+  "report_path": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/src/NeMo-RL/nemo-rl-deepseek-v4/docs/model-readiness/deepseek-v4/arch-check-report.json"
+}
