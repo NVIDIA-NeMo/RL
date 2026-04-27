@@ -57,6 +57,10 @@ class DataConfig(TypedDict):
     # This saturates CPU threads without consuming too much memory
     # However, setting it too high might cause memory issues for long seqlens.
     num_workers: NotRequired[int]
+    # PyTorch DataLoader prefetch_factor: number of batches each worker pre-fetches.
+    # Combined with num_workers, controls how much cross-tokenizer alignment work
+    # is run ahead of the training step in dataloader processes.
+    prefetch_factor: NotRequired[int]
     # multiple dataloader configs
     # currently only supported for GRPO
     use_multiple_dataloader: NotRequired[bool]
