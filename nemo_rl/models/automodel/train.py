@@ -45,7 +45,12 @@ from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_inp
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.ipc_utils import (
+    get_handle_from_tensor,
+    rebuild_cuda_tensor_from_ipc,
+)
 from nemo_rl.distributed.model_utils import (
+    _compute_distributed_log_softmax,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
@@ -59,6 +64,8 @@ PostProcessingFunction = Union[
     "LogprobsPostProcessor",
     "TopkLogitsPostProcessor",
     "ScorePostProcessor",
+    "XTokenTeacherIPCLossPostProcessor",
+    "XTokenTeacherIPCExportPostProcessor",
 ]
 
 
@@ -586,6 +593,307 @@ class LossPostProcessor:
             )
 
         return loss, loss_metrics
+
+
+
+
+class XTokenTeacherIPCLossPostProcessor(LossPostProcessor):
+    """Loss post-processor that injects teacher logits via CUDA IPC handles."""
+
+    def __init__(
+        self, *args: Any, teacher_result: Optional[dict[str, Any]] = None, **kwargs: Any
+    ):
+        super().__init__(*args, **kwargs)
+        self._teacher_result = teacher_result
+        self._microbatch_idx = 0
+
+    def set_microbatch_index(self, mb_idx: int) -> None:
+        self._microbatch_idx = mb_idx
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        data_dict: BatchedDataDict[Any],
+        processed_inputs: ProcessedInputs,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        sequence_dim: int = 1,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if self.cp_size > 1:
+            _, data_dict = prepare_data_for_cp(
+                data_dict, processed_inputs, self.cp_mesh, sequence_dim
+            )
+            logits = redistribute_logits_for_cp(
+                logits, self.device_mesh, self.cp_mesh, sequence_dim
+            )
+
+        if self.enable_seq_packing:
+            loss_fn_ = SequencePackingLossWrapper(
+                loss_fn=self.loss_fn,
+                cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
+                cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
+            )
+        else:
+            loss_fn_ = self.loss_fn
+
+        def _extract_teacher_ipc_payload(teacher_result_obj: dict[str, Any]) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+            if "microbatch_handles" not in teacher_result_obj:
+                return None, None
+            handles = teacher_result_obj["microbatch_handles"]
+            if self._microbatch_idx >= len(handles):
+                return None, None
+            rank = torch.distributed.get_rank()
+            current_device_id = torch.cuda.current_device()
+            handle = handles[self._microbatch_idx]
+            aB, aS, aK = handle["actual_shape"]
+
+            # View into the teacher's pre-allocated IPC buffer — no clone.
+            # The teacher's per-microbatch buffer slot is only reused on the
+            # next step's teacher forward, which is strictly ordered AFTER
+            # this student forward+backward by the driver-side ray.get
+            # sequencing. Teacher tensor is detached and doesn't require
+            # grad, so autograd never captures it past the loss op. Avoids a
+            # full-vocab fp32-or-bf16 memcpy per microbatch (~3.3 GiB at
+            # mbs=2, V≈200K, bf16 — was the dominant peak after fix A).
+            teacher_logits_tensor = rebuild_cuda_tensor_from_ipc(
+                handle[rank], current_device_id
+            ).detach()[:aB, :aS, :aK]
+
+            teacher_topk_indices_tensor = None
+            is_topk = teacher_result_obj.get("is_topk", False)
+            if is_topk and "topk_indices_ipc" in handle:
+                teacher_topk_indices_tensor = rebuild_cuda_tensor_from_ipc(
+                    handle["topk_indices_ipc"], current_device_id
+                ).detach()[:aB, :aS, :aK]
+            return teacher_logits_tensor, teacher_topk_indices_tensor
+
+        loss_kwargs = {}
+        if self._teacher_result is not None and not self.enable_seq_packing:
+            if isinstance(self._teacher_result, list):
+                teacher_logits_list: list[torch.Tensor] = []
+                teacher_topk_indices_list: list[Optional[torch.Tensor]] = []
+                for teacher_result_obj in self._teacher_result:
+                    t_logits, t_topk = _extract_teacher_ipc_payload(teacher_result_obj)
+                    if t_logits is None:
+                        continue
+                    teacher_logits_list.append(t_logits)
+                    teacher_topk_indices_list.append(t_topk)
+                if teacher_logits_list:
+                    loss_kwargs["teacher_logits_list"] = teacher_logits_list
+                    loss_kwargs["teacher_topk_indices_list"] = teacher_topk_indices_list
+            else:
+                t_logits, t_topk = _extract_teacher_ipc_payload(self._teacher_result)
+                if t_logits is not None:
+                    loss_kwargs["teacher_logits"] = t_logits
+                if t_topk is not None:
+                    loss_kwargs["teacher_topk_indices_ipc"] = t_topk
+
+        loss, loss_metrics = loss_fn_(
+            logits,
+            data_dict,
+            global_valid_seqs,
+            global_valid_toks,
+            **loss_kwargs,
+        )
+        return loss, loss_metrics
+
+
+class XTokenTeacherIPCExportPostProcessor(LossPostProcessor):
+    """Teacher-side post-processor that exports per-microbatch logits via CUDA IPC."""
+
+    def __init__(
+        self,
+        *args: Any,
+        tp_mesh: Any,
+        topk_logits: Optional[int],
+        is_mdlm: bool = False,
+        **kwargs: Any,
+    ):
+        # Keep explicit tp_mesh for local use and also forward it to base init.
+        super().__init__(*args, tp_mesh=tp_mesh, **kwargs)
+        self.tp_mesh = tp_mesh
+        self.topk_logits = topk_logits
+        self.is_mdlm = is_mdlm
+        self.microbatch_handles: list[dict[str, Any]] = []
+        self._microbatch_idx = 0
+        self._mb_vals_buffers: list[torch.Tensor] = []
+        self._mb_vals_ipcs: list[tuple[Any]] = []
+        self._mb_idx_buffers: list[torch.Tensor] = []
+        self._mb_idx_ipcs: list[tuple[Any]] = []
+        self._mb_logits_buffers: list[torch.Tensor] = []
+        self._mb_logits_ipcs: list[tuple[Any]] = []
+
+    def set_microbatch_index(self, mb_idx: int) -> None:
+        self._microbatch_idx = mb_idx
+
+    def _ensure_topk_buffer(
+        self,
+        buf_idx: int,
+        B: int,
+        S: int,
+        K: int,
+        vals_dtype: torch.dtype,
+        idx_dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        while len(self._mb_vals_buffers) <= buf_idx:
+            vals_buf = torch.empty((B, S, K), dtype=vals_dtype, device=device)
+            idx_buf = torch.empty((B, S, K), dtype=idx_dtype, device=device)
+            self._mb_vals_buffers.append(vals_buf)
+            self._mb_vals_ipcs.append(get_handle_from_tensor(vals_buf))
+            self._mb_idx_buffers.append(idx_buf)
+            self._mb_idx_ipcs.append(get_handle_from_tensor(idx_buf))
+        vals_buf = self._mb_vals_buffers[buf_idx]
+        idx_buf = self._mb_idx_buffers[buf_idx]
+        needs_realloc = (
+            vals_buf.shape[0] < B
+            or vals_buf.shape[1] < S
+            or vals_buf.shape[2] < K
+            or vals_buf.dtype != vals_dtype
+            or vals_buf.device != device
+            or idx_buf.shape[0] < B
+            or idx_buf.shape[1] < S
+            or idx_buf.shape[2] < K
+            or idx_buf.dtype != idx_dtype
+            or idx_buf.device != device
+        )
+        if needs_realloc:
+            vals_buf = torch.empty((B, S, K), dtype=vals_dtype, device=device)
+            idx_buf = torch.empty((B, S, K), dtype=idx_dtype, device=device)
+            self._mb_vals_buffers[buf_idx] = vals_buf
+            self._mb_vals_ipcs[buf_idx] = get_handle_from_tensor(vals_buf)
+            self._mb_idx_buffers[buf_idx] = idx_buf
+            self._mb_idx_ipcs[buf_idx] = get_handle_from_tensor(idx_buf)
+
+    def _ensure_logits_buffer(
+        self,
+        buf_idx: int,
+        B: int,
+        S: int,
+        V: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        while len(self._mb_logits_buffers) <= buf_idx:
+            buf = torch.empty((B, S, V), dtype=dtype, device=device)
+            self._mb_logits_buffers.append(buf)
+            self._mb_logits_ipcs.append(get_handle_from_tensor(buf))
+        buf = self._mb_logits_buffers[buf_idx]
+        needs_realloc = (
+            buf.shape[0] < B
+            or buf.shape[1] < S
+            or buf.shape[2] < V
+            or buf.dtype != dtype
+            or buf.device != device
+        )
+        if needs_realloc:
+            buf = torch.empty((B, S, V), dtype=dtype, device=device)
+            self._mb_logits_buffers[buf_idx] = buf
+            self._mb_logits_ipcs[buf_idx] = get_handle_from_tensor(buf)
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        data_dict: BatchedDataDict[Any],  # noqa: ARG002
+        processed_inputs: ProcessedInputs,  # noqa: ARG002
+        global_valid_seqs: torch.Tensor,  # noqa: ARG002
+        global_valid_toks: torch.Tensor,  # noqa: ARG002
+        sequence_dim: int = 1,  # noqa: ARG002
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if isinstance(logits, DTensor):
+            mb_logits_local = logits.to_local()
+        else:
+            mb_logits_local = logits
+
+        tp_group = self.tp_mesh.get_group()
+        tp_rank = torch.distributed.get_rank(tp_group)
+        V_local = int(mb_logits_local.shape[-1])
+        vocab_start_index = tp_rank * V_local
+        vocab_end_index = (tp_rank + 1) * V_local
+
+        if self.topk_logits is not None:
+            # Top-k path (same-tokenizer distillation): the student loss
+            # consumes IPC payload entries as log-probs (it `.exp()`s them
+            # to recover probs), so do the fp32 cast + distributed
+            # log-softmax here before extracting the top-k.
+            mb_logits_fp32 = mb_logits_local.to(torch.float32)
+            mb_log_prob = _compute_distributed_log_softmax(
+                mb_logits_fp32, group=tp_group
+            )
+            del mb_logits_fp32, mb_logits_local
+
+            if isinstance(mb_log_prob, DTensor):
+                mb_log_prob = mb_log_prob.to_local()
+
+            if self.is_mdlm:
+                shared_seq_len = int(mb_log_prob.shape[1] / 2)
+                mb_log_prob = mb_log_prob[:, shared_seq_len:, :]
+
+            mb_topk_vals, mb_topk_idx = distributed_vocab_topk(
+                mb_log_prob,
+                k=self.topk_logits,
+                tp_group=tp_group,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index,
+            )
+            del mb_log_prob
+
+            B_mb, S_mb, K_mb = mb_topk_vals.shape
+            buf_idx = self._microbatch_idx
+            self._ensure_topk_buffer(
+                buf_idx,
+                B_mb,
+                S_mb,
+                K_mb,
+                mb_topk_vals.dtype,
+                mb_topk_idx.dtype,
+                mb_topk_vals.device,
+            )
+            self._mb_vals_buffers[buf_idx][:B_mb, :S_mb, :K_mb].copy_(mb_topk_vals)
+            self._mb_idx_buffers[buf_idx][:B_mb, :S_mb, :K_mb].copy_(mb_topk_idx)
+            del mb_topk_vals, mb_topk_idx
+
+            rank = torch.distributed.get_rank()
+            handle = {
+                rank: self._mb_vals_ipcs[buf_idx],
+                "actual_shape": (B_mb, S_mb, K_mb),
+                "topk_indices_ipc": self._mb_idx_ipcs[buf_idx],
+            }
+        else:
+            # Full-vocab path (cross-tokenizer distillation): ship raw logits
+            # in their native dtype (typically bf16). The student-side loss
+            # applies log_softmax exactly once, on raw logits, matching the
+            # reference train_distillation_ddp.py. This avoids the teacher-
+            # side fp32 cast + full-vocab log_softmax kernel and removes the
+            # redundant student-side log_softmax of already-log-softmaxed
+            # values (idempotent at T=1, mathematically wrong at T!=1).
+            if self.is_mdlm:
+                shared_seq_len = int(mb_logits_local.shape[1] / 2)
+                mb_logits_local = mb_logits_local[:, shared_seq_len:, :]
+
+            B_mb, S_mb, V_mb = mb_logits_local.shape
+            buf_idx = self._microbatch_idx
+            self._ensure_logits_buffer(
+                buf_idx,
+                B_mb,
+                S_mb,
+                V_mb,
+                mb_logits_local.dtype,
+                mb_logits_local.device,
+            )
+            self._mb_logits_buffers[buf_idx][:B_mb, :S_mb, :V_mb].copy_(mb_logits_local)
+            del mb_logits_local
+
+            rank = torch.distributed.get_rank()
+            handle = {
+                rank: self._mb_logits_ipcs[buf_idx],
+                "actual_shape": (B_mb, S_mb, V_mb),
+            }
+
+        self.microbatch_handles.append(handle)
+
+        dummy_loss = torch.zeros((), device="cuda", dtype=torch.float32)
+        return dummy_loss, {"num_valid_samples": 1.0}
 
 
 class LogprobsPostProcessor:
