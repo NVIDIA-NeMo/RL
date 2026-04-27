@@ -1616,7 +1616,6 @@ def _tail(dashboard: str, job_id: str) -> None:
 
 def _tail_daemon(cluster_name: str, namespace: str, submission_id: str) -> None:
     """Open a dashboard port-forward and tail a Ray Job by submission_id."""
-    from . import inspect as ins
     from . import submit as submit_mod
 
     try:
