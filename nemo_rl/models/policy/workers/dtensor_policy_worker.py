@@ -49,6 +49,7 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy.param_groups import get_param_groups_with_weight_decay
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
@@ -64,6 +65,7 @@ from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
 )
+# from nemo_rl.models.nemotron_h_nano_vl import register as register_nemotron_h_nano_vl
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -76,6 +78,7 @@ from nemo_rl.models.policy.utils import (
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.patches import apply_torch_aten_alias_tensor_patch
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -157,12 +160,17 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
+        # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
+        apply_torch_aten_alias_tensor_patch()
+
         """Initialize the DTensorPolicyWorker."""
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None
 
         print(f"Initializing DTensorPolicyWorker with is_vlm={self.is_vlm}")
+
+        # register_nemotron_h_nano_vl()
 
         self.is_generation_colocated = None
         if "generation" in config and config["generation"] is not None:
@@ -277,6 +285,9 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 trust_remote_code=True,
             )
 
+        if self.model.__class__.__name__ == "InternVLChatModel":
+            self.model.img_context_token_id = self.tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
 
@@ -295,10 +306,6 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if sequence_parallel_enabled and tp_size == 1:
             print(
                 "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
-            )
-        elif sequence_parallel_enabled and tp_size > 1:
-            raise RuntimeError(
-                "Sequence parallel + tp_size >1 is currently broken in torch==2.8.0. See https://github.com/NVIDIA-NeMo/Automodel/issues/652 for more details."
             )
 
         if cp_size > 1:
@@ -398,9 +405,10 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         if init_optimizer:
             optimizer_cls = get_class(self.cfg["optimizer"]["name"])
-            self.optimizer = optimizer_cls(
-                self.model.parameters(), **self.cfg["optimizer"]["kwargs"]
-            )
+            optimizer_kwargs = dict(self.cfg["optimizer"]["kwargs"])
+            weight_decay = optimizer_kwargs.pop("weight_decay", 0.0)
+            param_groups = get_param_groups_with_weight_decay(self.model, weight_decay)
+            self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
         else:
             self.optimizer = None
 
@@ -669,6 +677,11 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                             as_tensors=True, device=input_ids.device
                         )
                         if len(vlm_kwargs) > 0:
+                            assert self.dtype in (torch.bfloat16, torch.float16), (
+                                f"Multimodal training requires bfloat16 or float16 precision, got {self.dtype}. "
+                                f"Pixel values are pre-cast to bfloat16 for transfer efficiency; "
+                                f"float32 precision is incompatible with this optimization."
+                            )
                             position_ids = None
                             assert not self.cfg["dtensor_cfg"]["sequence_parallel"], (
                                 "Sequence parallel is not supported with multimodal since there's an issue when you do not pass position_ids. See https://github.com/NVIDIA-NeMo/Automodel/issues/652"
@@ -822,6 +835,11 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
+                    # strategic fix for sporadic OOM during grad norm
+                    del loss
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
                     with torch.no_grad():
                         grad_norm = get_grad_norm(
                             self.model.parameters(),
@@ -947,6 +965,12 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 vlm_kwargs = lp_batch.get_multimodal_dict(
                     as_tensors=True, device=input_ids.device
                 )
+                if len(vlm_kwargs) > 0:
+                    assert self.dtype in (torch.bfloat16, torch.float16), (
+                        f"Multimodal training requires bfloat16 or float16 precision, got {self.dtype}. "
+                        f"Pixel values are pre-cast to bfloat16 for transfer efficiency; "
+                        f"float32 precision is incompatible with this optimization."
+                    )
 
                 batch_size, seq_len = input_ids.shape
                 if self.enable_seq_packing:
@@ -1369,6 +1393,12 @@ class DTensorPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 vlm_kwargs = lp_batch.get_multimodal_dict(
                     as_tensors=True, device=input_ids.device
                 )
+                if len(vlm_kwargs) > 0:
+                    assert self.dtype in (torch.bfloat16, torch.float16), (
+                        f"Multimodal training requires bfloat16 or float16 precision, got {self.dtype}. "
+                        f"Pixel values are pre-cast to bfloat16 for transfer efficiency; "
+                        f"float32 precision is incompatible with this optimization."
+                    )
                 batch_size, seq_len = input_ids.shape
 
                 # Store original shapes for unpacking later

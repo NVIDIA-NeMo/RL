@@ -1,0 +1,157 @@
+# MPO (preference learning) training for Nemotron Nano v3 VL on MMPR dataset
+
+mpo:
+  max_num_epochs: 1
+  max_num_steps: 7000  # ~890k samples
+  val_period: 100
+  val_batches: 32
+  val_global_batch_size: 32
+  val_micro_batch_size: 1
+  val_at_start: false
+  seed: 42
+
+  reference_policy_kl_penalty: 0.05
+  preference_average_log_probs: false
+  sft_average_log_probs: true
+  quality_average_log_probs: false
+  reward_shift_momentum: 0.99
+  reward_shift: 0.0
+
+  preference_loss_weight: 0.8
+  sft_loss_weight: 0.0
+  bco_loss_weight: 0.2
+
+data:
+  dataset_name: "mmpr"
+  # typically overridden by launcher scripts
+  data_path: "REPLACE_WITH_MMPR_METADATA_PATH"
+  split: "train"
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  prompt_file: null
+  system_prompt_file: null
+  download_dir: null
+  shuffle: true
+
+policy:
+  # typically overridden by launcher scripts
+  model_name: "REPLACE_WITH_MODEL_OR_CHECKPOINT_PATH"
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 256  # actually 256 due to pairwise examples
+  train_micro_batch_size: 1  # important: megatron dynamic resolution requires mbz=1
+  max_total_sequence_length: 32768
+  precision: "bfloat16"
+  offload_optimizer_for_logprob: false
+  logprob_chunk_size: 1024
+
+  dtensor_cfg:
+    enabled: false
+
+  dynamic_batching:
+    enabled: false
+
+  sequence_packing:
+    enabled: false
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer: null
+  scheduler: null
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 32
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    # MoE aux loss is currently not supported due to a known bug in Megatron-LM.
+    # See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details.
+    # moe_router_load_balancing_type: "aux_loss"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1e-3
+    moe_permute_fusion: false
+    apply_rope_fusion: true
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+    moe_per_layer_logging: false
+    radio_force_cpe_eval_mode: true
+    freeze_vision_encoder: false
+    freeze_vision_projector: false
+    freeze_audio_encoder: true
+    freeze_audio_projector: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 8e-7
+      min_lr: 2e-9
+      weight_decay: 0.1
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      adam_beta1: 0.9
+      adam_beta2: 0.98
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 1.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "cosine"
+      lr_warmup_iters: 50
+      lr_warmup_init: 2e-9
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+      use_custom_fsdp: false
+
+logger:
+  log_dir: "logs"
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  num_val_samples_to_print: 0
+  wandb:
+    project: "nemo-rl-omni"
+    name: "nanov3-mpo"
+  tensorboard:
+    log_dir: "tb_logs-mpo-dev"
+  mlflow:
+    experiment_name: "mpo-dev"
+    run_name: "mpo"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/nanov3-mpo"
+  metric_name: "val_loss"
+  higher_is_better: false
+  keep_top_k: 50
+  save_period: 50
+  checkpoint_must_save_by: "00:03:45:00"

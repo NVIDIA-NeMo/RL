@@ -19,10 +19,111 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
+from importlib.util import find_spec
 from typing import Any, Iterator, Optional, TypedDict, TypeVar, cast
 
 import ray
 import torch
+import zmq
+
+
+def _get_transformer_engine_file(relative_path: str) -> str:
+    """Return absolute path to a Transformer Engine file or raise if it cannot be found.
+
+    The relative_path should be a POSIX-style path under the transformer_engine
+    package root, e.g. "pytorch/triton/permutation.py".
+    """
+    spec = find_spec("transformer_engine")
+    if spec is None or not spec.submodule_search_locations:
+        raise RuntimeError(
+            "Transformer Engine package not found while attempting to patch "
+            f"'{relative_path}'. Ensure `transformer-engine` is installed and "
+            "available in this environment."
+        )
+
+    base_dir = next(iter(spec.submodule_search_locations))
+    file_path = os.path.join(base_dir, *relative_path.split("/"))
+
+    if not os.path.exists(file_path):
+        raise RuntimeError(
+            "Failed to locate expected Transformer Engine file to patch. "
+            f"Looked for '{relative_path}' at '{file_path}'. "
+            "This likely indicates an unexpected Transformer Engine installation "
+            "layout or version mismatch."
+        )
+
+    return file_path
+
+
+def _maybe_apply_transformer_engine_patch():
+    """Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files.
+
+    This locates the target file via importlib metadata instead of importing
+    `transformer_engine`, to avoid side effects during initialization. If the
+    permutation module has already been imported, it will be reloaded so that
+    the patched source takes effect.
+    """
+    if find_spec("transformer_engine") is None:
+        return
+
+    try:
+        perm_file = _get_transformer_engine_file("pytorch/triton/permutation.py")
+
+        with open(perm_file, "r") as f:
+            content = f.read()
+
+        if "get_int_dtype = triton.constexpr_function(get_int_dtype)" not in content:
+            print(f"Applying Triton fix to {perm_file}...")
+
+            # 1. Replace the usage
+            old_usage = "idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)"
+            new_usage = "idtype = get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)"
+
+            # 2. Insert the definition before the first @triton.jit
+            jit_anchor = "@triton.jit"
+
+            new_definition = (
+                "\n\n"
+                "get_int_dtype = core.get_int_dtype\n"
+                "get_int_dtype = triton.constexpr_function(get_int_dtype)\n"
+            )
+
+            new_content = None
+            if old_usage in content:
+                temp_content = content.replace(old_usage, new_usage)
+
+                if jit_anchor in temp_content:
+                    new_content = temp_content.replace(
+                        jit_anchor, new_definition + jit_anchor, 1
+                    )
+
+            if new_content:
+                try:
+                    with open(perm_file, "w") as f:
+                        f.write(new_content)
+                    print("Successfully patched transformer_engine permutation.py.")
+                except OSError as e:
+                    print(
+                        f"Could not write patch to transformer_engine (permission denied?): {e}"
+                    )
+
+        # If the permutation module is already imported in this process,
+        # reload it so that the patched source takes effect for subsequent use.
+        import importlib
+        import sys
+
+        perm_module_name = "transformer_engine.pytorch.triton.permutation"
+        if perm_module_name in sys.modules:
+            importlib.reload(sys.modules[perm_module_name])
+
+    except Exception as e:
+        print(f"Error checking/patching transformer_engine: {e}")
+
+
+# Must run before megatron.bridge import, which triggers the full
+# transformer_engine import chain and would race with the file patch.
+_maybe_apply_transformer_engine_patch()
+
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
 from megatron.bridge.peft.lora import LoRA
@@ -64,7 +165,7 @@ from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+from megatron.core.distributed.custom_fsdp.fully_sharded_data_parallel import (
     FullyShardedDataParallel as custom_FSDP,
 )
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
@@ -101,6 +202,7 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
+    repack_original_tokens_for_vlm_logprobs,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.fp8 import (
@@ -113,12 +215,21 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from megatron.core.transformer.moe.routing_diagnostics import (
+    extract_router_diagnostics_from_model,
+)
 from nemo_rl.models.megatron.common import (
     _get_pack_sequence_parameters_for_megatron,
     _pack_sequences_for_megatron,
+    _round_up_to_multiple,
+    _vlm_sp_repad_collapsed,
     broadcast_tensor,
     forward_step_arbitrary_loss,
-    get_moe_metrics,
+)
+from nemo_rl.models.megatron.multimodal import (
+    collapse_multimodal_tokens,
+    is_llava_model,
+    prepare_multimodal_data,
 )
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.policy import PolicyConfig
@@ -297,6 +408,8 @@ def setup_megatron_model(
                 if isinstance(model_module, Float16Module):
                     model_module = model_module.module
                 # Handle VLM models
+                if hasattr(model_module, "llava_model"):
+                    model_module = model_module.llava_model
                 if hasattr(model_module, "language_model"):
                     model_module = model_module.language_model
                 for layer in model_module.decoder.layers:
@@ -305,6 +418,60 @@ def setup_megatron_model(
 
         mixed_precision_wrapper = CustomFloat16Module
         pre_wrap_hook.extend([freeze_moe_router])
+
+    if policy_cfg["megatron_cfg"].get("freeze_embedding", False):
+        def freeze_embedding(megatron_model):
+            if not isinstance(megatron_model, list):
+                megatron_model = [megatron_model]
+            for model_module in megatron_model:
+                # Handle both wrapped (Float16Module) and unwrapped models
+                if isinstance(model_module, Float16Module):
+                    model_module = model_module.module
+                # Handle VLM models
+                if hasattr(model_module, "language_model"):
+                    model_module = model_module.language_model
+                if hasattr(model_module, "embedding"):
+                    embedding = model_module.embedding
+                    embedding.word_embeddings.weight.requires_grad = False
+                    if getattr(embedding, "position_embeddings", None) is not None:
+                        embedding.position_embeddings.weight.requires_grad = False
+                    if getattr(embedding, "tokentype_embeddings", None) is not None:
+                        embedding.tokentype_embeddings.weight.requires_grad = False
+        pre_wrap_hook.extend([freeze_embedding])
+
+    freeze_vision_encoder = policy_cfg["megatron_cfg"].get("freeze_vision_encoder", False)
+    freeze_vision_projector = policy_cfg["megatron_cfg"].get("freeze_vision_projector", False)
+    freeze_audio_encoder = policy_cfg["megatron_cfg"].get("freeze_audio_encoder", False)
+    freeze_audio_projector = policy_cfg["megatron_cfg"].get("freeze_audio_projector", False)
+    if freeze_vision_encoder or freeze_vision_projector or freeze_audio_encoder or freeze_audio_projector:
+        if use_peft:
+            raise ValueError(
+                "Freezing the vision/audio encoder/projection is not currently supported when using PEFT"
+            )
+
+        def freeze_vision_modules(megatron_model):
+            if not isinstance(megatron_model, list):
+                megatron_model = [megatron_model]
+            for model_module in megatron_model:
+                if isinstance(model_module, Float16Module):
+                    model_module = model_module.module
+                if hasattr(model_module, "llava_model"):
+                    llava = model_module.llava_model
+                    if freeze_vision_encoder and hasattr(llava, "vision_model") and llava.vision_model is not None:
+                        for p in llava.vision_model.parameters():
+                            p.requires_grad = False
+                    if freeze_vision_projector and hasattr(llava, "vision_projection") and llava.vision_projection is not None:
+                        for p in llava.vision_projection.parameters():
+                            p.requires_grad = False
+                    if freeze_audio_encoder and hasattr(llava, "sound_model") and llava.sound_model is not None:
+                        for p in llava.sound_model.parameters():
+                            p.requires_grad = False
+                    if freeze_audio_projector and hasattr(llava, "sound_projection") and llava.sound_projection is not None:
+                        for p in llava.sound_projection.parameters():
+                            p.requires_grad = False
+            return megatron_model
+
+        pre_wrap_hook.extend([freeze_vision_modules])
 
     if use_peft:
         peft_cfg = policy_cfg["megatron_cfg"].get("peft", {})
@@ -516,8 +683,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         pre_init_communication_queue: Queue,
         **kwargs: Any,
     ):
-        apply_transformer_engine_patch()
-
         self.is_generation_colocated = None
         if "generation" in config and config["generation"] is not None:
             self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
@@ -560,9 +725,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
 
         pretrained_path = f"{get_megatron_checkpoint_dir()}/{hf_model_subdir}"
+        pretrained_run_config = os.path.join(
+            pretrained_path, "iter_0000000/run_config.yaml"
+        )
         pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
             os.path.join(pretrained_path, "iter_0000000")
-        )
+        ) and os.path.exists(pretrained_run_config)
 
         # Ensure clean slate before import
         destroy_parallel_state()
@@ -586,9 +754,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 print("Reinitializing model parallel after loading model state.")
                 parallel_state.destroy_model_parallel()
 
-        pretrained_run_config = os.path.join(
-            pretrained_path, "iter_0000000/run_config.yaml"
-        )
+        # Barrier to ensure all ranks wait for the HF->mcore conversion to complete
+        # before checking for run_config.yaml (avoids race condition with NFS caching)
+        torch.distributed.barrier()
 
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
@@ -733,6 +901,38 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
         ) and (model_cfg.fp16 or model_cfg.bf16)
+
+        if hasattr(model_cfg, "dynamic_resolution"):
+            from transformers import AutoConfig
+
+            from nemo_rl.models.nano_v3_vl.dynamic_resolution_processor import (
+                is_dynamic_resolution_model,
+            )
+
+            hf_config = AutoConfig.from_pretrained(
+                hf_model_name, trust_remote_code=True
+            )
+            derived_dr = is_dynamic_resolution_model(hf_config)
+
+            user_dr = self.cfg["megatron_cfg"].get("dynamic_resolution")
+            if user_dr is not None and user_dr != derived_dr:
+                if user_dr and not derived_dr:
+                    raise ValueError(
+                        f"dynamic_resolution=true was set in config, but the model "
+                        f"does not support it (no min_num_patches in HF config at "
+                        f"{hf_model_name}). Remove this setting or set it to false."
+                    )
+                else:
+                    raise ValueError(
+                        f"dynamic_resolution=false was set in config, but the model "
+                        f"supports dynamic_resolution=true (HF config has "
+                        f"min_num_patches). Overriding to false is not currently "
+                        f"supported because vLLM and the data pipeline always "
+                        f"auto-derive from the HF config. Remove this setting or "
+                        f"set it to true."
+                    )
+
+            model_cfg.dynamic_resolution = derived_dr
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
@@ -935,6 +1135,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     else:
                         cpu_item = item
                     self.reference_state_dict[name] = cpu_item
+                del reference_model
+                gc.collect()
+                torch.cuda.empty_cache()
                 print("Reference model loaded")
             else:
                 print("Reference model not loaded")
@@ -1177,16 +1380,17 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                 # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
                 # so we must gather across mp ranks
+                mp_group = parallel_state.get_model_parallel_group()
                 update_successful = logical_and_across_model_parallel_group(
-                    update_successful
+                    update_successful, mp_group=mp_group
                 )
                 # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
                 # so we must gather across mp ranks
                 grad_norm: float = reduce_max_stat_across_model_parallel_group(
-                    grad_norm
+                    grad_norm, mp_group=mp_group
                 )
                 num_zeros_in_grad: float = reduce_max_stat_across_model_parallel_group(
-                    num_zeros_in_grad
+                    num_zeros_in_grad, mp_group=mp_group
                 )
 
                 if update_successful:
@@ -1261,16 +1465,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             "all_mb_metrics": dict(mb_metrics),
             "grad_norm": torch.tensor([grad_norm]),
         }
-        # Collect MoE aux metrics averaged across microbatches
+        # Collect MoE routing diagnostics
         num_moe_experts = getattr(self.model.config, "num_moe_experts", None)
         if num_moe_experts is not None and num_moe_experts > 1:
-            moe_loss_scale = 1.0 / max(1, total_num_microbatches)
-            moe_metrics = get_moe_metrics(
-                loss_scale=moe_loss_scale,
-                per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
-            )
-            if moe_metrics:
-                metrics["moe_metrics"] = moe_metrics
+            routing_diagnostics = extract_router_diagnostics_from_model(self.model)
+            if routing_diagnostics:
+                metrics["moe_routing_diagnostics"] = routing_diagnostics
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
@@ -1331,8 +1531,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ):
             nonlocal pad_full_seq_to, pad_packed_seq_to_multiple_of, pad_factor
             data_dict = next(data_iterator).to("cuda")
+
+            original_input_ids = data_dict["input_ids"].clone()
+            original_input_lengths = data_dict.get("input_lengths", torch.tensor([])).clone()
+
+            data_dict = collapse_multimodal_tokens(data_dict, model)
+            use_llava_handoff = is_llava_model(model)
+
+            # Extract per-sample token removal counts for VLM expanded↔collapsed conversion
+            tokens_removed_per_sample = data_dict.pop("tokens_removed_per_sample", None)
+
             if self.cfg["sequence_packing"]["enabled"]:
                 original_seq_length = data_dict["input_ids"].shape[1]
+
                 cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
                 cp_rank = get_context_parallel_rank()
                 (
@@ -1349,11 +1560,66 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     pad_packed_seq_to=pad_full_seq_to,
                     cp_rank=cp_rank,
                     cp_size=cp_size,
+                    tokens_removed_per_sample=tokens_removed_per_sample,
+                    skip_local_cp_sharding=use_llava_handoff,
                 )
+
+                # --- VLM fix: compute expanded cu_seqlens for logprob alignment ---
+                # When VLM + SP, the model output is in expanded space (LLaVA
+                # re-expands collapsed image tokens), but the target and cu_seqlens
+                # are in collapsed space.  We pre-compute expanded cu_seqlens here
+                # so that collection_fn can align all three inputs.
+                cu_seqlens_padded_expanded = None
+                cu_seqlens_expanded = None
+                if tokens_removed_per_sample is not None:
+                    n_seqs = cu_seqlens_padded.shape[0] - 1
+                    cumulative_removed = torch.zeros(
+                        n_seqs + 1, dtype=torch.int32, device=cu_seqlens_padded.device
+                    )
+                    cumulative_removed[1:] = (
+                        tokens_removed_per_sample[:n_seqs].to(torch.int32).cumsum(0)
+                    )
+                    cu_seqlens_padded_expanded = cu_seqlens_padded.clone() + cumulative_removed
+                    cu_seqlens_expanded = cu_seqlens.clone() + cumulative_removed
+
+                    # --- Phase 2: Pre-set expanded cu_seqlens on packed_seq_params ---
+                    # Fix Layer 1 (attention masking): provide expanded boundaries
+                    # BEFORE model forward so attention sees correct sequence boundaries
+                    # for ALL sequences in the pack, not just the last one.
+                    # LLaVA builds embeddings from input_ids positions, not cu_seqlens,
+                    # so providing expanded boundaries is safe.
+                    #
+                    # IMPORTANT: use a single clone for all four fields to preserve
+                    # the aliasing pattern from _pack_sequences_for_megatron (all
+                    # four point to the same tensor).  TE's attention backend
+                    # selection relies on identity (cu_seqlens_q is cu_seqlens_kv)
+                    # to detect self-attention; separate clones break this.
+                    # The closure-captured cu_seqlens_padded_expanded is already a
+                    # distinct tensor, so LLaVA's in-place [-1] mutation won't
+                    # propagate to collection_fn.
+                    cu_seqlens_for_attn = cu_seqlens_padded_expanded.clone()
+                    packed_seq_params.cu_seqlens_q = cu_seqlens_for_attn
+                    packed_seq_params.cu_seqlens_kv = cu_seqlens_for_attn
+                    packed_seq_params.cu_seqlens_q_padded = cu_seqlens_for_attn
+                    packed_seq_params.cu_seqlens_kv_padded = cu_seqlens_for_attn
+
+                    # Update max_seqlen to reflect expanded individual sequence lengths
+                    expanded_slot_lengths = (
+                        cu_seqlens_padded_expanded[1:] - cu_seqlens_padded_expanded[:-1]
+                    )
+                    packed_seq_params.max_seqlen_q = expanded_slot_lengths.max().item()
+                    packed_seq_params.max_seqlen_kv = expanded_slot_lengths.max().item()
+
                 attention_mask, position_ids = None, None
-                unpacked_input_ids = data_dict["input_ids"]
             else:
                 input_ids = data_dict["input_ids"]
+                sp = self.cfg["megatron_cfg"]["sequence_parallel"]
+                tp_size = self.cfg["megatron_cfg"]["tensor_model_parallel_size"]
+                if sp and tp_size > 1:
+                    input_ids = _vlm_sp_repad_collapsed(
+                        input_ids, tokens_removed_per_sample, tp_size
+                    )
+                    data_dict["input_ids"] = input_ids
                 input_ids_cp_sharded = input_ids
                 attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                     data=input_ids,
@@ -1365,14 +1631,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     pad_mask_loss=False,
                 )
                 packed_seq_params = None
-                unpacked_input_ids = input_ids
 
             multimodal_data = data_dict.get_multimodal_dict(
                 as_tensors=True, device=input_ids.device
             )
-            if len(multimodal_data) > 0:
-                position_ids = None
-
             additional_kwargs = {}
             # Mamba models currently do not support packed_seq_params
             if packed_seq_params is not None:
@@ -1381,13 +1643,32 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             if self.defer_fp32_logits:
                 additional_kwargs["fp32_output"] = False
 
+            prepare_multimodal_data(multimodal_data, model, input_ids.device)
+
+            # LLaVA models must see the full packed input_ids so they can rebuild
+            # embeddings and apply CP internally, even for text-only microbatches.
+            has_multimodal_payload = len(multimodal_data) > 0
+            cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
+
+            # Assert that CP > 1 is only supported for LLaVA models
+            if has_multimodal_payload and cp_size > 1:
+                assert use_llava_handoff, (
+                    f"Context parallelism (CP > 1) with VLM is only supported for LLaVA models. "
+                    f"Got CP size {cp_size} with model type {type(model).__name__}. "
+                    f"Please set context_parallel_size to 1 for non-LLaVA VLM models."
+                )
+
+            model_input_ids = input_ids if use_llava_handoff else input_ids_cp_sharded
+
             output_tensor = model(
-                input_ids=input_ids_cp_sharded,
+                input_ids=model_input_ids,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 **multimodal_data,
                 **additional_kwargs,
             )
+            if type(output_tensor) == tuple:
+                output_tensor = output_tensor[0]
 
             # Apply temperature scaling to logits for training
             # This matches the dtensor worker's _apply_temperature_scaling in the train method
@@ -1399,23 +1680,46 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 tp_grp = get_tensor_model_parallel_group()
                 tp_rank = get_tensor_model_parallel_rank()
                 logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
+
                 if self.cfg["sequence_packing"]["enabled"]:
+                    # --- VLM fix: align target + cu_seqlens to expanded space ---
+                    if cu_seqlens_padded_expanded is not None:
+                        # Repack original (uncollapsed) tokens into expanded
+                        # packed format so target matches model output space.
+                        sp_target = repack_original_tokens_for_vlm_logprobs(
+                            original_input_ids,
+                            original_input_lengths,
+                            cu_seqlens_padded_expanded,
+                            device=output_tensor.device,
+                        )
+                        sp_cu_seqlens_padded = cu_seqlens_padded_expanded
+                        sp_cu_seqlens = cu_seqlens_expanded
+                        sp_unpacked_seqlen = original_input_ids.shape[1]
+                    else:
+                        # No VLM token collapse — use collapsed (== expanded) tensors as-is
+                        sp_target = input_ids
+                        sp_cu_seqlens_padded = cu_seqlens_padded
+                        sp_cu_seqlens = None
+                        sp_unpacked_seqlen = original_seq_length
+
                     token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
                         output_tensor,
-                        target=input_ids,
-                        cu_seqlens_padded=cu_seqlens_padded,
-                        unpacked_seqlen=original_seq_length,
+                        target=sp_target,
+                        cu_seqlens_padded=sp_cu_seqlens_padded,
+                        unpacked_seqlen=sp_unpacked_seqlen,
                         vocab_start_index=tp_rank * output_tensor.shape[-1],
                         vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
                         group=tp_grp,
                         inference_only=True,
                         cp_group=get_context_parallel_group(),
                         chunk_size=logprob_chunk_size,
+                        cu_seqlens=sp_cu_seqlens,
                     )
+
                 else:
                     token_logprobs = from_parallel_logits_to_logprobs(
                         output_tensor,
-                        target=unpacked_input_ids,
+                        target=original_input_ids,
                         vocab_start_index=tp_rank * output_tensor.shape[-1],
                         vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
                         tp_group=tp_grp,
@@ -1427,6 +1731,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 token_logprobs = torch.cat(
                     [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
                 )
+
                 return torch.tensor(0.0, device=token_logprobs.device), {
                     "logprobs": token_logprobs
                 }
@@ -1462,7 +1767,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if is_pipeline_last_stage(ignore_virtual=True):
             all_log_probs_padded = []
             all_logprobs = [l["logprobs"] for l in list_of_logprobs]
-            for lp in all_logprobs:
+
+            for i, lp in enumerate(all_logprobs):
+                if lp.shape[1] > input_seq_dim_size:
+                    lp = lp[:, :input_seq_dim_size]
                 padding_needed = input_seq_dim_size - lp.shape[1]
                 if padding_needed > 0:
                     lp = torch.nn.functional.pad(
@@ -1471,6 +1779,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 all_log_probs_padded.append(lp)
 
             logprobs = torch.cat(all_log_probs_padded, dim=0)
+
             # broadcast logprobs to first pp rank
             broadcast_tensor(logprobs, torch.distributed.get_rank(), pp_grp)
         else:
@@ -1592,10 +1901,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         ):
             nonlocal pad_full_seq_to, pad_packed_seq_to_multiple_of, pad_factor
             data_dict = next(data_iterator).to("cuda")
+            original_seq_length = data_dict["input_ids"].shape[1]
+            data_dict = collapse_multimodal_tokens(data_dict, model)
+            use_llava_handoff = is_llava_model(model)
+
+            # Extract per-sample token removal counts for VLM expanded↔collapsed conversion
+            tokens_removed_per_sample = data_dict.pop("tokens_removed_per_sample", None)
 
             pack = self.cfg["sequence_packing"]["enabled"]
             if pack:
-                original_seq_length = data_dict["input_ids"].shape[1]
                 cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
                 cp_rank = get_context_parallel_rank()
 
@@ -1613,12 +1927,47 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     pad_packed_seq_to=pad_full_seq_to,
                     cp_rank=cp_rank,
                     cp_size=cp_size,
+                    tokens_removed_per_sample=tokens_removed_per_sample,
+                    skip_local_cp_sharding=use_llava_handoff,
                 )
+
+                # --- Phase 2: Pre-set expanded cu_seqlens for VLM attention masking ---
+                if tokens_removed_per_sample is not None:
+                    n_seqs = cu_seqlens_padded.shape[0] - 1
+                    cumulative_removed = torch.zeros(
+                        n_seqs + 1, dtype=torch.int32, device=cu_seqlens_padded.device
+                    )
+                    cumulative_removed[1:] = (
+                        tokens_removed_per_sample[:n_seqs].to(torch.int32).cumsum(0)
+                    )
+                    cu_seqlens_padded_expanded = cu_seqlens_padded.clone() + cumulative_removed
+                    cu_seqlens_expanded = cu_seqlens.clone() + cumulative_removed
+
+                    cu_seqlens_for_attn = cu_seqlens_padded_expanded.clone()
+                    packed_seq_params.cu_seqlens_q = cu_seqlens_for_attn
+                    packed_seq_params.cu_seqlens_kv = cu_seqlens_for_attn
+                    packed_seq_params.cu_seqlens_q_padded = cu_seqlens_for_attn
+                    packed_seq_params.cu_seqlens_kv_padded = cu_seqlens_for_attn
+
+                    expanded_slot_lengths = (
+                        cu_seqlens_padded_expanded[1:] - cu_seqlens_padded_expanded[:-1]
+                    )
+                    packed_seq_params.max_seqlen_q = expanded_slot_lengths.max().item()
+                    packed_seq_params.max_seqlen_kv = expanded_slot_lengths.max().item()
+
                 attention_mask, position_ids = None, None
                 seq_lengths = data_dict["input_lengths"]
                 unpacked_seqlen = original_seq_length
             else:
-                input_ids_cp_sharded = data_dict["input_ids"]
+                input_ids = data_dict["input_ids"]
+                sp = self.cfg["megatron_cfg"]["sequence_parallel"]
+                tp_size = self.cfg["megatron_cfg"]["tensor_model_parallel_size"]
+                if sp and tp_size > 1:
+                    input_ids = _vlm_sp_repad_collapsed(
+                        input_ids, tokens_removed_per_sample, tp_size
+                    )
+                    data_dict["input_ids"] = input_ids
+                input_ids_cp_sharded = input_ids
                 attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                     data=input_ids_cp_sharded,
                     eod_token=0,
@@ -1635,19 +1984,50 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
             if len(multimodal_data) > 0:
                 position_ids = None
+            # LLaVA models must see the full packed input_ids so they can rebuild
+            # embeddings and apply CP internally, even for text-only microbatches.
+            has_multimodal_payload = len(multimodal_data) > 0
+            cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
+
+            # Assert that CP > 1 is only supported for LLaVA models
+            if has_multimodal_payload and cp_size > 1:
+                assert use_llava_handoff, (
+                    f"Context parallelism (CP > 1) with VLM is only supported for LLaVA models. "
+                    f"Got CP size {cp_size} with model type {type(model).__name__}. "
+                    f"Please set context_parallel_size to 1 for non-LLaVA VLM models."
+                )
+
+            model_input_ids = (
+                input_ids_unpacked if (use_llava_handoff and pack) else input_ids_cp_sharded
+            )
+            prepare_multimodal_data(multimodal_data, model, model_input_ids.device)
 
             additional_kwargs = {}
             if packed_seq_params is not None:
                 additional_kwargs["packed_seq_params"] = packed_seq_params
 
             output_tensor = model(
-                input_ids=input_ids_cp_sharded,
+                input_ids=model_input_ids,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 **additional_kwargs,
                 **multimodal_data,
             )
 
+            cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
+            sp = self.cfg["megatron_cfg"]["sequence_parallel"]
+            tp_size = self.cfg["megatron_cfg"]["tensor_model_parallel_size"]
+            if use_llava_handoff and cp_size > 1:
+                expected_length = original_seq_length // cp_size
+            elif has_multimodal_payload and sp and tp_size > 1 and tokens_removed_per_sample is not None:
+                max_removed = int(tokens_removed_per_sample.max().item())
+                collapsed_width = data_dict["input_ids"].shape[1]
+                expected_length = _round_up_to_multiple(collapsed_width + max_removed, tp_size)
+            else:
+                expected_length = original_seq_length
+            assert output_tensor.shape[1] == expected_length, (
+                f"Model output length {output_tensor.shape[1]} != expected length {expected_length}"
+            )
             if "generation" in self.cfg and self.cfg["generation"] is not None:
                 output_tensor.div_(self.cfg["generation"]["temperature"])
 
@@ -2109,7 +2489,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     torch.float16: 2,
                     torch.float32: 4,
                 }
-                scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
+                scale = prec_to_bytes[self.dtype] / param.element_size()
                 size_in_bytes = (
                     param.element_size() * param.numel() * tp_size * ep_size * scale
                 )
@@ -2306,6 +2686,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         print(
             f"GPU Memory after refit complete: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
+        print(torch.cuda.memory_summary(device=None, abbreviated=False))
         no_grad.__exit__(None, None, None)
 
     @torch.no_grad()

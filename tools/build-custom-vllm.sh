@@ -25,7 +25,34 @@ GIT_REF=${2:-cc99baf14dacc2497d0c5ed84e076ef2c37f6a4d}
 # NOTE: VLLM_USE_PRECOMPILED=1 didn't always seem to work since the wheels were sometimes built against an incompatible torch/cuda combo.
 # This commit was chosen as one close to the v0.10 release: git merge-base --fork-point origin/main tags/v0.10.0
 VLLM_WHEEL_COMMIT=${3:-862f2ef893d9751db0a92bd2d4ae0e3d9677872f}  # use full commit hash from the main branch
-export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${VLLM_WHEEL_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+
+discover_wheel_url() {
+    local commit=$1
+    local variant=${2:-cu129}
+    local index_url="https://wheels.vllm.ai/${commit}/${variant}/vllm/"
+    
+    echo "[INFO] Discovering wheel from $index_url" >&2
+    
+    local wheel_filename
+    wheel_filename=$(curl -sL "$index_url" | grep -oE 'href="[^"]*x86_64\.whl"' | head -1 | sed 's/href="//;s/"$//' | sed 's|.*/||')
+    
+    if [[ -z "$wheel_filename" ]]; then
+        echo "[ERROR] Could not find x86_64 wheel at $index_url" >&2
+        echo "[ERROR] Check that commit $commit has precompiled wheels available at wheels.vllm.ai" >&2
+        return 1
+    fi
+    
+    local wheel_url="https://wheels.vllm.ai/${commit}/${wheel_filename}"
+    echo "[INFO] Found wheel: $wheel_url" >&2
+    echo "$wheel_url"
+}
+
+if [[ -n "${VLLM_PRECOMPILED_WHEEL_LOCATION:-}" ]]; then
+    echo "[INFO] Using user-specified VLLM_PRECOMPILED_WHEEL_LOCATION"
+else
+    VLLM_PRECOMPILED_WHEEL_LOCATION=$(discover_wheel_url "$VLLM_WHEEL_COMMIT") || exit 1
+    export VLLM_PRECOMPILED_WHEEL_LOCATION
+fi
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty/vllm")
 if [[ -e "$BUILD_DIR" ]]; then

@@ -14,6 +14,7 @@
 
 import argparse
 import base64
+import io
 import os
 import pprint
 from collections import defaultdict
@@ -21,6 +22,7 @@ from io import BytesIO
 from typing import Any, Optional
 
 import requests
+import torch
 from omegaconf import OmegaConf
 from PIL import Image
 from transformers import AutoProcessor
@@ -38,11 +40,16 @@ from nemo_rl.data.interfaces import (
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
+from nemo_rl.data.datasets.response_datasets.vision_r1 import format_vision_r1_dataset
+from nemo_rl.data.datasets.response_datasets.mmpr_tiny import format_mmpr_tiny_dataset
+from nemo_rl.data.datasets.response_datasets.mmpr_nanov2_filtered import format_mmpr_nanov2_filtered_dataset
+from nemo_rl.data.datasets.response_datasets.blend_v1 import format_blend_v1_dataset
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     get_dim_to_pack_along,
     get_multimodal_keys_from_processor,
 )
+from nemo_rl.data.llm_message_utils import strip_image_tokens_from_text
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
@@ -52,6 +59,8 @@ from nemo_rl.environments.vlm_environment import VLMEnvironment
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
+
+from nemo_rl.models import nemotron_h_nano_vl
 
 OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
@@ -114,6 +123,15 @@ def hf_data_processor(
         datum_dict = format_refcoco_dataset(datum_dict)
     elif task_data_spec.task_name == "geometry3k":
         datum_dict = format_geometry3k_dataset(datum_dict)
+    elif task_data_spec.task_name == "vision_r1":
+        datum_dict = format_vision_r1_dataset(datum_dict)
+    elif task_data_spec.task_name in ("mmpr_tiny", "tinier_math"):
+        datum_dict = format_mmpr_tiny_dataset(datum_dict)
+        datum_dict["task_name"] = task_data_spec.task_name
+    elif task_data_spec.task_name == "mmpr_nanov2_filtered":
+        datum_dict = format_mmpr_nanov2_filtered_dataset(datum_dict)
+    elif task_data_spec.task_name == "blend_v1":
+        datum_dict = format_blend_v1_dataset(datum_dict)
     else:
         raise ValueError(f"No data processor for task {task_data_spec.task_name}")
 
@@ -123,99 +141,143 @@ def hf_data_processor(
 
     message_log: LLMMessageLogType = []
     ### only one round of interaction is assumed, this can easily be extended to a conversational setting
+    system_message = {
+        "role": "system",
+        "content": [{"type": "text", "text": task_data_spec.system_prompt}],
+    }
     user_message = {"role": "user", "content": []}
     #
-    images = []
+    image_paths = []
     if isinstance(problem, list):
         for content in problem:
             # for image, video, just append it
             # for text, format the prompt to the problem
-            if content["type"] != "text":
+            if content["type"] == "image":
                 user_message["content"].append(content)
-                if content["type"] == "image":
-                    images.append(content["image"])
-                else:
-                    raise ValueError(f"Unsupported content type: {content['type']}")
+                image_paths.append(content["image"])
             elif content["type"] == "text":
+                text = strip_image_tokens_from_text(content["text"])
                 user_message["content"].append(
                     {
                         "type": "text",
-                        "text": task_data_spec.prompt.format(content["text"])
+                        "text": task_data_spec.prompt.format(text)
                         if task_data_spec.prompt
-                        else content["text"],
+                        else text,
                     }
                 )
-    else:
+            else:
+                raise ValueError(f"Unsupported content type: {content['type']}")
+    elif isinstance(problem, str):
         # conversation consists of a text-only message
-        user_message["content"] = task_data_spec.prompt.format(problem)
-
-    images = [resolve_to_image(image) for image in images]
-
-    # get formatted user message
+        text = strip_image_tokens_from_text(problem)
+        user_message["content"] = [
+            {"type": "text", "text": task_data_spec.prompt.format(text)}
+        ]
+    else:
+        raise ValueError(f"Unsupported problem type: {type(problem)}")
+    # get formatted conversation messages
     if hasattr(processor, "conversation_preprocessor"):
+        system_message_for_chat_template = processor.conversation_preprocessor(
+            system_message
+        )
         user_message_for_chat_template = processor.conversation_preprocessor(
             user_message
         )
     else:
+        system_message_for_chat_template = system_message
         user_message_for_chat_template = user_message
 
     # this is the string-tokenized conversation template for the generation policy (for vllm)
     string_formatted_dialog = processor.apply_chat_template(
-        [user_message_for_chat_template],
+        [system_message_for_chat_template, user_message_for_chat_template],
         tokenize=False,
         add_generation_prompt=True,
     )
 
     # this is the id-tokenized and image processed conversation template for the policy
-    message: dict = processor.apply_chat_template(
-        [user_message],
+    message_sys: dict = processor.apply_chat_template(
+        [system_message],
+        tokenize=True,
+        add_generation_prompt=False,
+        return_tensors="pt",
+        return_dict=True,
+    )
+    # load images for processing
+    user_message_with_images = {
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "image": resolve_to_image(content["image"]),
+            }
+            if content["type"] == "image"
+            else content
+            for content in user_message["content"]
+        ],
+    }
+    message_both: dict = processor.apply_chat_template(
+        [system_message, user_message_with_images],
         tokenize=True,
         add_generation_prompt=True,
         return_tensors="pt",
         return_dict=True,
     )
 
-    # add this for backward compatibility
-    user_message["token_ids"] = message["input_ids"][0]
+    system_message["token_ids"] = message_sys["input_ids"][0]
+    sys_len = message_sys["input_ids"].shape[1]
+    user_message["token_ids"] = message_both["input_ids"][0][sys_len:]
     # add all keys and values to the user message, and the list of keys
     multimodal_keys = get_multimodal_keys_from_processor(processor)
     for key in multimodal_keys:
-        if key in message:
+        if key in message_both:
             user_message[key] = PackedTensor(
-                message[key], dim_to_pack=get_dim_to_pack_along(processor, key)
+                message_both[key], dim_to_pack=get_dim_to_pack_along(processor, key)
             )
 
+    if "imgs_sizes" in message_both:
+        user_message["imgs_sizes"] = PackedTensor(message_both["imgs_sizes"], dim_to_pack=0)
+
     # specifically for gemma, we need to add token_type_ids to the user message as a sequence-type value
-    if "token_type_ids" in message:
-        user_message["token_type_ids"] = message["token_type_ids"][0]
+    if "token_type_ids" in message_both:
+        system_message["token_type_ids"] = message_sys["token_type_ids"][0]
+        user_message["token_type_ids"] = message_both["token_type_ids"][0][sys_len:]
 
     ### append to user message
+    message_log.append(system_message)
     message_log.append(user_message)
 
     length = sum(len(m["token_ids"]) for m in message_log)
     loss_multiplier = 1.0
     if length >= max_seq_length:
-        # Treat truncated messages as text only
+        print(f"Discarding sample with length {length} >= {max_seq_length}")
+        # Treat discarded messages as text only
         vllm_kwargs = {
             "vllm_content": None,
             "vllm_images": [],
         }
 
         # make smaller and mask out
+        tokenizer = processor.tokenizer
+        image_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in ("<img>", "<image>", "</img>")]
         for chat_message in message_log:
-            chat_message["token_ids"] = chat_message["token_ids"][
+            token_ids = chat_message["token_ids"][
                 : min(4, max_seq_length // len(message_log))
             ]
+            # Filter out all image tokens (<img>, <image>, </img>) since we're discarding images
+            for img_token_id in image_token_ids:
+                token_ids = token_ids[token_ids != img_token_id]
+            chat_message["token_ids"] = token_ids
             for key, value in chat_message.items():
                 if isinstance(value, PackedTensor):
                     chat_message[key] = PackedTensor.empty_like(value)
         loss_multiplier = 0.0
+        length = sum(len(m["token_ids"]) for m in message_log)
     else:
         # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images) for the entire conversation
         # add images for vllm serving
         vllm_kwargs = {
             "vllm_content": string_formatted_dialog,
-            "vllm_images": images,
+            "vllm_images": image_paths,
         }
 
     output: DatumSpec = {
@@ -301,6 +363,9 @@ def setup_data(
 
 def main() -> None:
     """Main entry point."""
+    os.environ["NRL_VLLM_USE_V1"] = "0"  # VLM path only supports v0
+    nemotron_h_nano_vl.register()
+
     args, overrides = parse_args()
 
     if not args.config:

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import re
 from typing import Callable, Optional
 
@@ -18,6 +19,7 @@ import numpy as np
 from math_verify.errors import TimeoutException
 from math_verify.metric import math_metric
 from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+from mathruler.grader import extract_boxed_content, grade_answer
 
 # initialize math_verify_func once
 math_verify_func = math_metric(
@@ -171,3 +173,189 @@ def combine_reward_functions(
         return np.sum(np.array(rewards) * weights), is_correct
 
     return combined_reward_func
+
+def vision_r1_reward(
+    ground_truth: str,
+    response: str,
+    format_reward: float = 0.5,
+    correct_reward: float = 1.0,
+) -> tuple[float, bool]:
+    """Reward function for the Vision-R1 task.
+
+    Inputs:
+        - ground_truth: str - The correct answer (e.g., "A", "42", or a mathematical expression).
+        - response: str - The model's response containing <answer> tags.
+        - format_reward: float - Reward for correct format but incorrect answer (default 0.5).
+        - correct_reward: float - Reward for correct answer (default 1.0).
+
+    Outputs:
+        - tuple[float, bool]: (reward_score, is_correct)
+            - reward_score: float - The computed reward.
+            - is_correct: bool - True if the answer is correct, False otherwise.
+
+    Based on empirical analysis of Vision-R1 answers:
+    - 66% multiple choice (A-E only)
+    - 30% integers/decimals
+    - 4% mathematical expressions
+    """
+    # Extract answer from <answer> tags
+    pattern = r'<answer>(.*?)</answer>'
+    matches = list(re.finditer(pattern, response, re.DOTALL))
+    if matches:
+        # Take the last match if multiple answers
+        final_answer = matches[-1].group(1).strip()
+    else:
+        # Did not format the answer correctly
+        return 0.0, False
+
+    golden_answer = str(ground_truth).strip()
+
+    # Special handling for multiple choice (A-E only)
+    if golden_answer.upper() in ['A', 'B', 'C', 'D', 'E']:
+        if final_answer.upper() == golden_answer.upper():
+            return correct_reward, True
+        else:
+            # For multiple choice, we're strict - must be exact letter match
+            return format_reward, False
+
+    # For all other answers, use math_verify
+    try:
+        from math_verify import parse, verify
+        parsed_answer = parse(final_answer)
+        correct_answer = verify(golden_answer, parsed_answer)
+        if correct_answer:
+            return correct_reward, True
+    except Exception:
+        # math_verify couldn't parse - try exact string match as fallback
+        if final_answer.lower() == golden_answer.lower():
+            return correct_reward, True
+
+    return format_reward, False
+
+
+def verl_geo3k_reward(
+    ground_truth: str,
+    response: str,
+    format_score: float = 0.1,
+) -> tuple[float, bool]:
+    """Reward function for MMPR-Tiny task following verl's geo3k implementation.
+    
+    Exact replication of: https://github.com/volcengine/verl/blob/main/verl/utils/reward_score/geo3k.py
+    
+    Args:
+        ground_truth: The correct answer
+        response: Model's complete response (with <think> and \\boxed{})
+        format_score: Weight for format check (default 0.1 = 10%)
+    
+    Returns:
+        (reward, is_correct) where reward = (1-format_score)*accuracy + format_score*format
+    """
+    # Format check (relaxed to accept missing opening <think> tag)
+    # Original verl regex used fullmatch: r"<think>.*</think>.*\\boxed\{.*\}.*"
+    # Modified to use search() to handle nested braces like \boxed{\dfrac{3}{20}}
+    # Only requires </think> tag (not opening <think>) and \boxed{} with closing brace
+    format_pattern = re.compile(r"</think>.*\\boxed\{.*\}", re.DOTALL)
+    has_format = bool(re.search(format_pattern, response))
+    format_reward_value = 1.0 if has_format else 0.0
+    
+    # Accuracy check (verl's exact approach)
+    try:
+        answer = extract_boxed_content(response)
+        is_correct = grade_answer(answer, ground_truth)
+        acc_reward_value = 1.0 if is_correct else 0.0
+    except Exception as e:
+        print("=" * 80)
+        print("MATHRULER FAILED")
+        print("=" * 80)
+        print(f"Exception type: {type(e).__name__}")
+        print(f"Exception message: {e}")
+        print(f"Ground truth: '{ground_truth}'")
+        print(f"Response snippet: {response[:500]}...")
+        print("=" * 80)
+        import traceback
+        traceback.print_exc()
+        print("=" * 80)
+        acc_reward_value = 0.0
+        is_correct = False
+    
+    # Weighted combination (verl's exact formula)
+    final_reward = (1.0 - format_score) * acc_reward_value + format_score * format_reward_value
+
+    return final_reward, is_correct
+
+
+def progressive_geo3k_reward(
+    ground_truth: str,
+    response: str,
+    format_score: float = 0.1,
+) -> tuple[float, bool]:
+    r"""Progressive reward function for MMPR-Tiny task.
+
+    Gives partial reward if there are multiple \\boxed{} answers.
+
+    Args:
+        ground_truth: The correct answer
+        response: Model's complete response (with <think> and \\boxed{})
+        format_score: Weight for format check (default 0.1 = 10%)
+
+    Returns:
+        (reward, is_correct) where reward = (1-format_score)*accuracy + format_score*format
+    """
+    # Format check
+    if "</think>" in response and "<think>" not in response:
+        # XXX nano-v2 tokenizer adds <think> in reasoning mode, but that is omitted from prediction
+        response = "<think>\n" + response
+    think_blocks = list(re.finditer(r"<think>.*?</think>", response, re.DOTALL))
+    if think_blocks:
+        # remove first think block
+        response = response[think_blocks[0].end() :].strip()
+
+    boxed_answers = extract_all_boxed(response)
+    format_reward_value = 1.0 if len(think_blocks) == 1 and len(boxed_answers) == 1 else 0.0
+
+    # Accuracy check
+    if boxed_answers:
+        grades = []
+        for boxed_answer in boxed_answers[:5]:
+            try:
+                ok = grade_answer(boxed_answer, ground_truth)
+                grades.append(1.0 if ok else 0.0)
+            except Exception:
+                logging.exception("Mathruler failed to grade answer: %s", boxed_answer)
+                grades.append(0.0)
+        if len(boxed_answers) > 5:
+            grades.extend([0.0] * (len(boxed_answers) - 5))
+        acc_reward_value = float(np.mean(grades))
+        is_correct = any(x > 0.0 for x in grades)
+    else:
+        acc_reward_value = 0.0
+        is_correct = False
+
+    # penalize 10% for any additional syntax error
+    extra_thinks = response.count("<think>") + response.count("</think>")
+    extra_boxeds = max(0, len(boxed_answers) - 1)
+    acc_reward_value = acc_reward_value * (0.9 ** (extra_thinks + extra_boxeds))
+
+    # Weighted combination (verl's exact formula)
+    final_reward = (1.0 - format_score) * acc_reward_value + format_score * format_reward_value
+    return final_reward, is_correct
+
+
+def extract_all_boxed(text: str) -> list[str]:
+    if "\\boxed{" not in text:
+        return []
+    results = []
+    # require that boxed can't be nested
+    parts = text.split("\\boxed{")[1:]
+    for part in parts:
+        depth = 1
+        for i, char in enumerate(part):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+            if depth == 0:
+                results.append(part[:i])
+                break
+        # if parens are not balanced, the answer is ignored
+    return results

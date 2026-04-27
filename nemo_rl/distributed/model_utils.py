@@ -18,6 +18,62 @@ import torch
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 
+def repack_original_tokens_for_vlm_logprobs(
+    original_input_ids: torch.Tensor,
+    original_input_lengths: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Repack original (uncollapsed) tokens into expanded space for VLM logprob computation.
+    
+    When sequence packing is enabled for VLMs, the pipeline collapses multimodal tokens
+    before packing, but the model (LLaVA) internally re-expands them and mutates
+    cu_seqlens_padded in-place to reflect the expanded positions. This function repacks
+    the original uncollapsed tokens to match that expanded space, ensuring all three
+    components (target, logits, cu_seqlens) are aligned for logprob computation.
+    
+    Args:
+        original_input_ids: Original uncollapsed tokens [batch, max_seqlen]
+        original_input_lengths: Actual length of each sequence [batch]
+        cu_seqlens_padded: Cumulative sequence lengths in expanded space [n_seqs + 1]
+                          (mutated by model during forward pass)
+        device: Target device for output tensor
+        
+    Returns:
+        Packed target tensor in expanded space [1, total_expanded]
+        
+    Example:
+        Original sequence (len=10): [10, 20, IMG_START, IMG_TOK, IMG_TOK, IMG_TOK, IMG_END, 30, 40, 50]
+        After collapse (len=8): [10, 20, IMG_START, IMG_TOK, IMG_END, 30, 40, 50]
+        After model forward: cu_seqlens_padded mutated from [0, 8] to [0, 10]
+        
+        This function repacks the original 10 tokens into a [1, 10] tensor matching
+        the expanded cu_seqlens_padded.
+    """
+    batch_size = original_input_ids.shape[0]
+    n_seqs = cu_seqlens_padded.shape[0] - 1
+    total_expanded = cu_seqlens_padded[-1].item()
+
+    packed_orig_target = torch.zeros(
+        1, total_expanded,
+        dtype=original_input_ids.dtype,
+        device=device,
+    )
+
+    for i in range(n_seqs):
+        start_idx = cu_seqlens_padded[i].item()
+        end_idx = cu_seqlens_padded[i + 1].item()
+        slot_len = end_idx - start_idx
+
+        orig_seq_len = original_input_lengths[i].item()
+        copy_len = min(orig_seq_len, slot_len)
+
+        packed_orig_target[0, start_idx : start_idx + copy_len] = \
+            original_input_ids[i, :copy_len].to(device)
+
+    return packed_orig_target
+
+
 @torch.no_grad()
 def _compute_distributed_log_softmax(
     vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
@@ -45,7 +101,8 @@ def _compute_distributed_log_softmax(
     # Subtract the maximum value.
     vocab_parallel_logits = vocab_parallel_logits - logits_max
 
-    sum_exp_logits = vocab_parallel_logits.exp().sum(-1, keepdim=True).float()
+    # Use logsumexp to avoid temporary logits tensor allocation.
+    sum_exp_logits = vocab_parallel_logits.logsumexp(-1, keepdim=True).float().exp()
 
     torch.distributed.all_reduce(
         sum_exp_logits,
@@ -552,6 +609,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     inference_only: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     chunk_size: Optional[int] = None,
+     cu_seqlens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Get log probabilities from TP sharded vocab logits for packed sequences.
 
@@ -560,8 +618,10 @@ def from_parallel_logits_to_logprobs_packed_sequences(
             where T is the total number of tokens across all packed sequences.
         target (torch.Tensor): Packed target token indices with shape [1, T].
             NOTE: Must be the unmodified targets as this function will shift them internally.
-        cu_seqlens (torch.Tensor): Cumulative sequence lengths tensor with shape [batch_size + 1].
-            cu_seqlens[i] indicates the start position of sequence i in the packed format.
+        cu_seqlens_padded (torch.Tensor): Cumulative sequence lengths tensor with padding, shape [batch_size + 1].
+            cu_seqlens_padded[i] indicates the padded start position of sequence i in the packed format.
+        cu_seqlens (torch.Tensor, optional): Cumulative sequence lengths without padding. If provided,
+            used to avoid rolling into padding tokens.
         unpacked_seqlen (int): The length of the unpacked sequence tensor.
         vocab_start_index (int): Starting vocabulary index for this worker's partition.
         vocab_end_index (int): Ending vocabulary index for this worker's partition.
@@ -578,6 +638,9 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     vocab_parallel_logits = vocab_parallel_logits.squeeze(0)
     target = target.squeeze(0)
 
+    if cu_seqlens is None:
+        cu_seqlens = cu_seqlens_padded
+
     batch_size = cu_seqlens_padded.shape[0] - 1
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
     cp_rank = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
@@ -587,13 +650,23 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         target.shape[0] // cp_size, dtype=target.dtype, device=target.device
     )
     for i in range(batch_size):
-        start_idx = cu_seqlens_padded[i].item()
-        end_idx = cu_seqlens_padded[i + 1].item()
+        padded_start = cu_seqlens_padded[i].item()
+        padded_end = cu_seqlens_padded[i + 1].item()
+        padded_len = padded_end - padded_start
+        true_len = (cu_seqlens[i + 1] - cu_seqlens[i]).item()
+        true_len = min(true_len, padded_len)
 
-        # Get the sequence targets and roll by -1
-        seq_targets = target[start_idx:end_idx]
-        rolled_seq_targets = seq_targets.roll(shifts=-1, dims=0)
-        rolled_targets[start_idx // cp_size : end_idx // cp_size] = (
+        # Get the true sequence tokens (exclude padding) and roll by -1
+        seq_targets_padded = target[padded_start:padded_end]
+        if true_len > 0:
+            seq_targets_true = seq_targets_padded[:true_len]
+            rolled_true = seq_targets_true.roll(shifts=-1, dims=0)
+            rolled_seq_targets = torch.zeros_like(seq_targets_padded)
+            rolled_seq_targets[:true_len] = rolled_true
+        else:
+            rolled_seq_targets = torch.zeros_like(seq_targets_padded)
+
+        rolled_targets[padded_start // cp_size : padded_end // cp_size] = (
             _get_tokens_on_this_cp_rank(rolled_seq_targets, cp_rank, cp_size, seq_dim=0)
         )
 
@@ -648,12 +721,15 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     )
     # Filter out the last token of each sequence
     for i in range(batch_size):
-        start_idx = cu_seqlens_padded[i].item()
-        end_idx = cu_seqlens_padded[i + 1].item()
+        padded_start = cu_seqlens_padded[i].item()
+        padded_end = cu_seqlens_padded[i + 1].item()
+        padded_len = padded_end - padded_start
+        true_len = (cu_seqlens[i + 1] - cu_seqlens[i]).item()
+        true_len = min(true_len, padded_len)
 
         # Exclude the last position (which has the rolled target from position 0)
-        if end_idx - start_idx > 0:
-            seq_probs = probs[start_idx : end_idx - 1]
+        if true_len > 1:
+            seq_probs = probs[padded_start : padded_start + true_len - 1]
             # Ensure seq_probs is 1D
             if seq_probs.dim() > 1:
                 seq_probs = seq_probs.squeeze()

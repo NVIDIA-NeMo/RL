@@ -195,42 +195,47 @@ class BaseVllmGenerationWorker:
             return file_path
 
         def _patch_vllm_init_workers_ray():
-            """Patch the vLLM ray_distributed_executor.py file.
+            """Patch vLLM Ray executor behavior in memory.
 
-            1. Pass custom runtime_env in _init_workers_ray call.
-                - This allows passing custom py_executable to worker initialization.
-            2. Add NCCL_CUMEM_ENABLE and NCCL_NVLS_ENABLE to vLLM ADDITIONAL_ENV_VARS.
-                - This is a workaround to fix async vllm in some scenarios.
-                - See https://github.com/NVIDIA-NeMo/RL/pull/898 for more details.
+            We avoid editing files in-place because vLLM is installed in editable
+            mode from `3rdparty/vllm`, so file rewrites can dirty the git submodule
+            and create runtime races between workers importing and rewriting source.
             """
-            file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
+            from vllm.v1.executor.ray_executor import RayDistributedExecutor
 
-            with open(file_to_patch, "r") as f:
-                content = f.read()
+            additional_env_vars = set(RayDistributedExecutor.ADDITIONAL_ENV_VARS)
+            additional_env_vars.update(
+                {"NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}
+            )
+            RayDistributedExecutor.ADDITIONAL_ENV_VARS = additional_env_vars
 
-            old_lines = [
-                "self._init_workers_ray(placement_group)",
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
-            ]
-
-            new_lines = [
-                f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
-            ]
-
-            need_replace = False
-            for old_line, new_line in zip(old_lines, new_lines):
-                if new_line in content or old_line not in content:
-                    continue
-                content = content.replace(old_line, new_line)
-                need_replace = True
-
-            if not need_replace:
+            setattr(RayDistributedExecutor, "_nemo_rl_py_executable", self.py_executable)
+            if getattr(RayDistributedExecutor, "_nemo_rl_runtime_env_patch_applied", False):
                 return
 
-            # Write back the patched content
-            with open(file_to_patch, "w") as f:
-                f.write(content)
+            original_init_executor = RayDistributedExecutor._init_executor
+
+            def _init_executor_with_runtime_env(executor_self):
+                original_init_workers_ray = executor_self._init_workers_ray
+
+                def _init_workers_ray_with_runtime_env(placement_group, **ray_remote_kwargs):
+                    runtime_env = dict(ray_remote_kwargs.pop("runtime_env", {}))
+                    py_executable = getattr(
+                        RayDistributedExecutor, "_nemo_rl_py_executable", sys.executable
+                    )
+                    runtime_env.setdefault("py_executable", py_executable)
+                    return original_init_workers_ray(
+                        placement_group, runtime_env=runtime_env, **ray_remote_kwargs
+                    )
+
+                executor_self._init_workers_ray = _init_workers_ray_with_runtime_env
+                try:
+                    return original_init_executor(executor_self)
+                finally:
+                    executor_self._init_workers_ray = original_init_workers_ray
+
+            RayDistributedExecutor._init_executor = _init_executor_with_runtime_env
+            setattr(RayDistributedExecutor, "_nemo_rl_runtime_env_patch_applied", True)
 
         def _patch_vllm_vit_flash_attn_backend():
             """Patch vLLM vision attention backend selection logic.
@@ -282,7 +287,7 @@ class BaseVllmGenerationWorker:
                 f.write(content)
 
         _patch_vllm_init_workers_ray()
-        logger.info("Successfully patched vllm _init_workers_ray.")
+        logger.info("Successfully patched vllm Ray executor in memory.")
 
         _patch_vllm_vit_flash_attn_backend()
         logger.info("Successfully patched vllm vit flash attention backend.")
@@ -308,9 +313,11 @@ class BaseVllmGenerationWorker:
             # Configure vLLM for tensor/pipeline parallelism within Ray
             # Reset CUDA_VISIBLE_DEVICES to allow vLLM to manage GPU assignment
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-            os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(
-                self.fraction_of_gpus / model_parallel_size
-            )
+            # FIXME(jseppanen): bug fix for OOM during TP=2
+            os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(self.fraction_of_gpus)
+            # os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(
+            #     self.fraction_of_gpus / model_parallel_size
+            # )
 
             # Set bundle indices for parallel workers
             bundle_indices_str = ",".join(map(str, bundle_indices))
@@ -318,6 +325,9 @@ class BaseVllmGenerationWorker:
             print(
                 f"VLLM_RAY_BUNDLE_INDICES environment variable set to: {os.environ.get('VLLM_RAY_BUNDLE_INDICES')}"
             )
+
+            # FIXME(jseppanen): prevent OOM during TP>1 model initialization in vLLM V0 engine. Not needed with V1
+            os.environ["CUDA_VISIBLE_DEVICES"] = bundle_indices_str
 
             # Use Ray for distributed execution in parallel mode
             vllm_kwargs["distributed_executor_backend"] = "ray"
@@ -327,6 +337,10 @@ class BaseVllmGenerationWorker:
 
         os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+        print(f"[driver] TP={self.tensor_parallel_size} PP={self.pipeline_parallel_size}", flush=True)
+        print(f"[driver] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}", flush=True)
+        print(f"[driver] VLLM_RAY_PER_WORKER_GPUS={os.environ.get('VLLM_RAY_PER_WORKER_GPUS')} VLLM_RAY_BUNDLE_INDICES={os.environ.get('VLLM_RAY_BUNDLE_INDICES')}", flush=True)
 
         # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
         # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
@@ -470,6 +484,7 @@ class BaseVllmGenerationWorker:
             logprobs=0,
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
+            bad_words=self.cfg.get("bad_words"),
             include_stop_str_in_output=True,
         )
 
@@ -492,11 +507,19 @@ class BaseVllmGenerationWorker:
 class VllmGenerationWorker(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         import vllm
+        # from nemo_rl.models.generation.vllm import custom_vlm  # vLLM model
+        # from nemo_rl.models import nemotron_h_nano_vl  # Huggingface model (for Ray/pickling)
 
+        # custom_vlm.register()
+        # nemotron_h_nano_vl.register()
         self.llm = vllm.LLM(**llm_kwargs)
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
+        print(f"[driver] vllm_device_ids={self.vllm_device_ids}", flush=True)
+        info = self.llm.collective_rpc('report_mapping', args=tuple())
+        for i, x in enumerate(info):
+            print(f"[worker {i}] {x}", flush=True)
 
     def init_collective(
         self,
@@ -690,6 +713,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             max_tokens=self.cfg["max_new_tokens"],
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
+            bad_words=self.cfg.get("bad_words"),
             include_stop_str_in_output=True,  # returning stop strings like hf
         )
 

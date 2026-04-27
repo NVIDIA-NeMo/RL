@@ -271,8 +271,8 @@ def test_multimodal_specific_functionality():
     image_tensors = [torch.randn(3, 128, 128 + i) for i in range(2)]
 
     mm_batch = PackedTensor(image_tensors, dim_to_pack=0)
-    with pytest.raises(RuntimeError):
-        batch_tensor = mm_batch.as_tensor()
+    batch_tensor = mm_batch.as_tensor()
+    assert batch_tensor.shape == (6, 128, 129)
 
     # check for packing on correct dimension
     image_tensors = [torch.randn(3 + 10**i, 128, 128) for i in range(2)]
@@ -349,3 +349,145 @@ def test_packedtensor_as_tensor_with_mixed_none_and_tensors():
     out = pt.as_tensor()
     expected = torch.cat([t1, t3], dim=0)
     assert torch.equal(out, expected)
+
+
+def _make_repeated_prompt_tensors(
+    num_prompts: int, repeats_per_prompt: int
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    tensors = []
+    prompt_indices = []
+    for prompt_idx in range(num_prompts):
+        prompt_tensor = torch.full((2, 3), float(prompt_idx), dtype=torch.float32)
+        for _ in range(repeats_per_prompt):
+            tensors.append(prompt_tensor.clone())
+            prompt_indices.append(prompt_idx)
+    return tensors, torch.tensor(prompt_indices, dtype=torch.long)
+
+
+def test_packedtensor_deduplicate_basic():
+    tensors, prompt_indices = _make_repeated_prompt_tensors(
+        num_prompts=8, repeats_per_prompt=4
+    )
+    pt = PackedTensor(tensors, dim_to_pack=0)
+    deduped = pt.deduplicate(prompt_indices)
+
+    assert len(deduped.tensors) == 8
+    assert len(deduped) == 32
+    assert torch.equal(deduped.as_tensor(), pt.as_tensor())
+
+
+def test_packedtensor_slice_with_dedup_remaps_indices():
+    tensors, prompt_indices = _make_repeated_prompt_tensors(
+        num_prompts=3, repeats_per_prompt=2
+    )
+    deduped = PackedTensor(tensors, dim_to_pack=0).deduplicate(prompt_indices)
+    sliced = deduped.slice([1, 4, 5])
+
+    assert len(sliced.tensors) == 2
+    assert sliced._dedup_indices == [0, 1, 1]
+    expected = torch.cat([tensors[1], tensors[4], tensors[5]], dim=0)
+    assert torch.equal(sliced.as_tensor(), expected)
+
+
+def test_packedtensor_concat_with_dedup():
+    tensors_a, prompt_indices_a = _make_repeated_prompt_tensors(
+        num_prompts=2, repeats_per_prompt=2
+    )
+    tensors_b, prompt_indices_b = _make_repeated_prompt_tensors(
+        num_prompts=3, repeats_per_prompt=2
+    )
+    dedup_a = PackedTensor(tensors_a, dim_to_pack=0).deduplicate(prompt_indices_a)
+    dedup_b = PackedTensor(tensors_b, dim_to_pack=0).deduplicate(prompt_indices_b)
+
+    merged = PackedTensor.concat([dedup_a, dedup_b])
+    expected = torch.cat([dedup_a.as_tensor(), dedup_b.as_tensor()], dim=0)
+    assert len(merged) == len(dedup_a) + len(dedup_b)
+    assert torch.equal(merged.as_tensor(), expected)
+
+
+def test_packedtensor_slice_then_concat_roundtrip():
+    tensors, prompt_indices = _make_repeated_prompt_tensors(
+        num_prompts=4, repeats_per_prompt=3
+    )
+    deduped = PackedTensor(tensors, dim_to_pack=0).deduplicate(prompt_indices)
+
+    shard_0 = deduped.slice([0, 1, 2, 3, 4, 5])
+    shard_1 = deduped.slice([6, 7, 8, 9, 10, 11])
+    roundtrip = PackedTensor.concat([shard_0, shard_1])
+
+    assert torch.equal(roundtrip.as_tensor(), deduped.as_tensor())
+
+
+def test_packedtensor_to_preserves_dedup():
+    tensors, prompt_indices = _make_repeated_prompt_tensors(
+        num_prompts=3, repeats_per_prompt=2
+    )
+    deduped = PackedTensor(tensors, dim_to_pack=0).deduplicate(prompt_indices)
+    before = list(deduped._dedup_indices)
+    deduped = deduped.to(torch.float16)
+
+    assert deduped._dedup_indices == before
+    assert all(t is None or t.dtype == torch.float16 for t in deduped.tensors)
+
+
+def test_packedtensor_dedup_with_none_entries():
+    tensors: list[torch.Tensor | None] = [
+        None,
+        None,
+        torch.ones(2, 3),
+        torch.ones(2, 3),
+        None,
+        None,
+    ]
+    prompt_indices = torch.tensor([0, 0, 1, 1, 2, 2], dtype=torch.long)
+    pt = PackedTensor(tensors, dim_to_pack=0)
+    deduped = pt.deduplicate(prompt_indices)
+
+    assert len(deduped.tensors) == 3
+    assert deduped._dedup_indices == [0, 0, 1, 1, 2, 2]
+    assert torch.equal(deduped.as_tensor(), pt.as_tensor())
+
+
+def test_packedtensor_empty_like_asserts_on_dedup():
+    tensors, prompt_indices = _make_repeated_prompt_tensors(
+        num_prompts=2, repeats_per_prompt=2
+    )
+    deduped = PackedTensor(tensors, dim_to_pack=0).deduplicate(prompt_indices)
+    with pytest.raises(AssertionError, match="empty_like on a deduplicated PackedTensor"):
+        PackedTensor.empty_like(deduped)
+
+
+def test_packedtensor_dedup_after_filtering_non_contiguous_prompts():
+    tensors, prompt_indices = _make_repeated_prompt_tensors(
+        num_prompts=3, repeats_per_prompt=3
+    )
+    deduped = PackedTensor(tensors, dim_to_pack=0).deduplicate(prompt_indices)
+
+    # Drop all samples from prompt 1; only prompts 0 and 2 remain.
+    filtered = deduped.slice([0, 1, 2, 6, 7, 8])
+    assert len(filtered.tensors) == 2
+    assert filtered._dedup_indices == [0, 0, 0, 1, 1, 1]
+    expected = torch.cat(
+        [tensors[0], tensors[1], tensors[2], tensors[6], tensors[7], tensors[8]], dim=0
+    )
+    assert torch.equal(filtered.as_tensor(), expected)
+
+
+def test_packedtensor_deduplicate_length_mismatch_asserts():
+    tensors, _ = _make_repeated_prompt_tensors(num_prompts=2, repeats_per_prompt=2)
+    pt = PackedTensor(tensors, dim_to_pack=0)
+
+    with pytest.raises(AssertionError, match="PackedTensor has .* entries but got .*"):
+        pt.deduplicate(torch.tensor([0, 0, 1], dtype=torch.long))
+
+
+def test_packedtensor_deduplicate_already_deduped_asserts():
+    tensors, prompt_indices = _make_repeated_prompt_tensors(
+        num_prompts=2, repeats_per_prompt=2
+    )
+    deduped = PackedTensor(tensors, dim_to_pack=0).deduplicate(prompt_indices)
+
+    with pytest.raises(
+        AssertionError, match="Cannot deduplicate an already-deduplicated PackedTensor"
+    ):
+        deduped.deduplicate(prompt_indices)

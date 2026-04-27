@@ -54,6 +54,285 @@ def test_nemo_gym_stub_module():
     )
 
 
+class _DummyTokenizer:
+    """Minimal tokenizer surface used by `_postprocess_nemo_gym_to_nemo_rl_result`."""
+
+    def decode(self, token_ids):
+        if hasattr(token_ids, "tolist"):
+            token_ids = token_ids.tolist()
+        return " ".join(str(token_id) for token_id in token_ids)
+
+
+def _make_unwrapped_nemo_gym(policy_max_input_tokens=None):
+    """Build a `NemoGym` instance without invoking the Ray-wrapped __init__.
+
+    Tests only need access to the postprocessing helper, so we bypass the
+    Ray actor lifecycle and seed `cfg` with the fields the helper reads.
+    """
+    env_cls = getattr(
+        getattr(NemoGym, "__ray_metadata__", None), "modified_class", NemoGym
+    )
+    env = env_cls.__new__(env_cls)
+    env.cfg = {  # type: ignore[assignment]
+        "initial_global_config_dict": (
+            {"policy_max_input_tokens": policy_max_input_tokens}
+            if policy_max_input_tokens is not None
+            else {}
+        ),
+    }
+    return env
+
+
+def _make_overflow_output_item(prompt_token_ids):
+    """A single overflow output_item shaped like a `context_length_exceeded` turn."""
+    return {
+        "id": "msg_overflow",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message",
+        "content": [
+            {
+                "annotations": [],
+                "text": "",
+                "type": "output_text",
+            }
+        ],
+        "prompt_token_ids": list(prompt_token_ids),
+        "generation_token_ids": [],
+        "generation_log_probs": [],
+    }
+
+
+def _make_assistant_output_item(prompt_token_ids, generation_token_ids):
+    """A single successful assistant output_item with non-empty generation."""
+    return {
+        "id": "msg_ok",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message",
+        "content": [
+            {
+                "annotations": [],
+                "text": "",
+                "type": "output_text",
+            }
+        ],
+        "prompt_token_ids": list(prompt_token_ids),
+        "generation_token_ids": list(generation_token_ids),
+        "generation_log_probs": [0.0] * len(generation_token_ids),
+    }
+
+
+def _make_overflow_nemo_gym_result(prompt_token_ids):
+    """A NeMo-Gym vllm response shaped like a `context_length_exceeded` overflow."""
+    return {
+        "response": {
+            "metadata": {"context_length_exceeded": "true"},
+            "output": [_make_overflow_output_item(prompt_token_ids)],
+        },
+        "reward": 0.0,
+    }
+
+
+def _make_multi_turn_overflow_nemo_gym_result(turns):
+    """Build a multi-turn response where the LAST turn hit `context_length_exceeded`.
+
+    `turns` is an iterable of (prompt_token_ids, generation_token_ids) tuples for
+    every turn in order; for the final overflow turn, generation_token_ids must
+    be empty.
+    """
+    output = []
+    for idx, (prompt_token_ids, generation_token_ids) in enumerate(turns):
+        is_last = idx == len(turns) - 1
+        if is_last and not generation_token_ids:
+            output.append(_make_overflow_output_item(prompt_token_ids))
+        else:
+            output.append(
+                _make_assistant_output_item(prompt_token_ids, generation_token_ids)
+            )
+    return {
+        "response": {
+            "metadata": {"context_length_exceeded": "true"},
+            "output": output,
+        },
+        "reward": 0.0,
+    }
+
+
+def test_postprocess_context_length_exceeded_truncates_overlong_prompt():
+    env = _make_unwrapped_nemo_gym(policy_max_input_tokens=2)
+    result = env._postprocess_nemo_gym_to_nemo_rl_result(
+        nemo_gym_result=_make_overflow_nemo_gym_result([11, 12, 13, 14]),
+        tokenizer=_DummyTokenizer(),
+    )
+
+    assert result["context_length_exceeded"] is True
+    # Single user turn truncated to policy_max_input_tokens; full prompt is
+    # still retained for logging via `prompt_str`.
+    assert [message["role"] for message in result["message_log"]] == ["user"]
+    assert result["message_log"][0]["token_ids"].tolist() == [11, 12]
+    assert result["message_log"][0]["content"] == "11 12"
+    assert result["input_message_log"][0]["token_ids"].tolist() == [11, 12]
+    assert (
+        result["full_result"]["response"]["output"][0]["prompt_str"]
+        == "11 12 13 14"
+    )
+    assert result["full_result"]["response"]["output"][0]["generation_str"] == ""
+
+
+def test_postprocess_context_length_exceeded_under_limit_keeps_full_prompt():
+    env = _make_unwrapped_nemo_gym(policy_max_input_tokens=8)
+    result = env._postprocess_nemo_gym_to_nemo_rl_result(
+        nemo_gym_result=_make_overflow_nemo_gym_result([11, 12, 13, 14]),
+        tokenizer=_DummyTokenizer(),
+    )
+
+    assert result["context_length_exceeded"] is True
+    # Prompt length (4) < policy_max_input_tokens (8), so the full prompt is
+    # preserved as the single user turn.
+    assert result["message_log"][0]["token_ids"].tolist() == [11, 12, 13, 14]
+    assert result["input_message_log"][0]["token_ids"].tolist() == [11, 12, 13, 14]
+
+
+def test_postprocess_context_length_exceeded_without_max_input_tokens_keeps_full_prompt():
+    env = _make_unwrapped_nemo_gym(policy_max_input_tokens=None)
+    result = env._postprocess_nemo_gym_to_nemo_rl_result(
+        nemo_gym_result=_make_overflow_nemo_gym_result([11, 12, 13, 14]),
+        tokenizer=_DummyTokenizer(),
+    )
+
+    assert result["context_length_exceeded"] is True
+    # Without a configured limit, behavior falls back to the prior "preserve
+    # full prompt" path so configs that don't go through `setup_nemo_gym_config`
+    # keep working unchanged.
+    assert result["message_log"][0]["token_ids"].tolist() == [11, 12, 13, 14]
+    assert result["input_message_log"][0]["token_ids"].tolist() == [11, 12, 13, 14]
+
+
+def test_postprocess_truncated_overflow_passes_bin_packer():
+    """Regression test for the single-turn bin-packer crash in
+    `BatchedDataDict.shard_by_batch_size` when an overflow rollout's user turn
+    carried the full (>max_model_len) prompt. After truncation, the sample
+    must fit a bin sized at `max_model_len`.
+    """
+    from nemo_rl.data.packing.algorithms import get_packer
+
+    max_input_tokens = 16
+    env = _make_unwrapped_nemo_gym(policy_max_input_tokens=max_input_tokens)
+    overlong_prompt = list(range(max_input_tokens * 3))  # well over the limit
+
+    result = env._postprocess_nemo_gym_to_nemo_rl_result(
+        nemo_gym_result=_make_overflow_nemo_gym_result(overlong_prompt),
+        tokenizer=_DummyTokenizer(),
+    )
+
+    total_message_log_tokens = sum(
+        len(m["token_ids"]) for m in result["message_log"]
+    )
+    assert total_message_log_tokens == max_input_tokens
+
+    bin_packer = get_packer(
+        algorithm="modified_first_fit_decreasing",
+        bin_capacity=max_input_tokens,
+        collect_metrics=False,
+        min_bin_count=1,
+        bin_count_multiple=1,
+    )
+    # Should not raise `ValueError: Sequence length ... exceeds bin capacity ...`
+    bins = bin_packer.pack(sequence_lengths=[total_message_log_tokens])
+    assert sum(len(b) for b in bins) == 1
+
+
+def test_postprocess_multi_turn_overflow_drops_prior_turns():
+    """Regression test for the multi-turn agent case (e.g. workplace_assistant
+    tool loops): without dropping prior turns, the cumulative message_log
+    (user + assistant + tool_user + assistant + ...) can exceed
+    `max_total_sequence_length` even when the final overflow turn's delta
+    fits, and `BatchedDataDict.shard_by_batch_size` would crash.
+    """
+    from nemo_rl.data.packing.algorithms import get_packer
+
+    max_input_tokens = 16
+    env = _make_unwrapped_nemo_gym(policy_max_input_tokens=max_input_tokens)
+
+    # Three turns:
+    #   turn 1: prompt=[1..4],          generation=[5..10]
+    #   turn 2: prompt=[1..10, 11..15], generation=[16..20]
+    #   turn 3: prompt=[1..20, 21..30], generation=[]  (context_length_exceeded)
+    # Cumulative message_log tokens without dropping prior turns:
+    #   user(4) + assistant(6) + user(5) + assistant(5) + user(10) = 30 tokens,
+    # which is well over max_input_tokens (16) and would crash bin packing.
+    turn1 = (list(range(1, 5)), list(range(5, 11)))
+    turn2 = (list(range(1, 11)) + list(range(11, 16)), list(range(16, 21)))
+    turn3 = (list(range(1, 21)) + list(range(21, 31)), [])
+
+    result = env._postprocess_nemo_gym_to_nemo_rl_result(
+        nemo_gym_result=_make_multi_turn_overflow_nemo_gym_result(
+            [turn1, turn2, turn3]
+        ),
+        tokenizer=_DummyTokenizer(),
+    )
+
+    # The entire history is replaced with a single user turn truncated to
+    # policy_max_input_tokens so the cumulative message_log fits the bin.
+    assert [message["role"] for message in result["message_log"]] == ["user"]
+    user_token_ids = result["message_log"][0]["token_ids"].tolist()
+    assert user_token_ids == list(range(1, 1 + max_input_tokens))
+    total_message_log_tokens = sum(
+        len(m["token_ids"]) for m in result["message_log"]
+    )
+    assert total_message_log_tokens == max_input_tokens
+
+    bin_packer = get_packer(
+        algorithm="modified_first_fit_decreasing",
+        bin_capacity=max_input_tokens,
+        collect_metrics=False,
+        min_bin_count=1,
+        bin_count_multiple=1,
+    )
+    bins = bin_packer.pack(sequence_lengths=[total_message_log_tokens])
+    assert sum(len(b) for b in bins) == 1
+
+
+def test_setup_nemo_gym_config_propagates_max_model_len():
+    config = {
+        "policy": {
+            "generation": {
+                "vllm_cfg": {"max_model_len": 16384},
+                "stop_strings": ["</answer>"],
+                "stop_token_ids": [42],
+            },
+        },
+    }
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert config["env"]["nemo_gym"]["policy_max_input_tokens"] == 16384
+    # Sanity: the helper also forces async/http-server on and clears stop criteria.
+    assert config["policy"]["generation"]["vllm_cfg"]["async_engine"] is True
+    assert config["policy"]["generation"]["vllm_cfg"]["expose_http_server"] is True
+    assert config["policy"]["generation"]["stop_strings"] is None
+    assert config["policy"]["generation"]["stop_token_ids"] is None
+
+
+def test_setup_nemo_gym_config_without_max_model_len_skips_max_input_tokens():
+    config = {
+        "policy": {
+            "generation": {
+                "vllm_cfg": {},
+                "stop_strings": None,
+                "stop_token_ids": None,
+            },
+        },
+    }
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    # No `max_model_len` means no `policy_max_input_tokens` is injected; gym
+    # then falls back to its prior "no truncation, no clamp" behavior.
+    assert "env" not in config or "policy_max_input_tokens" not in config.get(
+        "env", {}
+    ).get("nemo_gym", {})
+
+
 @pytest.fixture(scope="function")
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)

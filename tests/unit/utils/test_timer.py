@@ -191,6 +191,19 @@ class TestTimer:
 
 
 class TestTimeoutChecker:
+    @patch("time.time", return_value=110.0)
+    def test_uses_slurm_job_start_time_when_available(self, _mock_time):
+        with patch.dict("os.environ", {"SLURM_JOB_START_TIME": "100"}, clear=False):
+            checker = TimeoutChecker(timeout="00:00:00:05")
+            assert checker.check_save() is True
+
+    @patch("time.time", return_value=110.0)
+    def test_warns_when_slurm_job_start_time_missing(self, _mock_time):
+        with patch.dict("os.environ", {}, clear=True):
+            with pytest.warns(UserWarning, match="Timeout will be late"):
+                checker = TimeoutChecker(timeout="00:00:00:05")
+            assert checker.check_save() is False
+
     def test_infinite_timeout(self):
         checker = TimeoutChecker(timeout=None)
         time.sleep(0.1)

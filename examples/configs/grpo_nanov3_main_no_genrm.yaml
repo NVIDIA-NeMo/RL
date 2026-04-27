@@ -1,112 +1,135 @@
+# GRPO Algorithm Configuration
 grpo:
-  max_num_epochs: 1
   num_prompts_per_step: 64
   num_generations_per_prompt: 16
+  num_val_generations_per_prompt: 4
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+  max_num_epochs: 1
   max_num_steps: 1000000
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: true
   overlong_filtering: false
-  max_val_samples: null   # inferred from size of val dataset. for multi evals, repeat val ds via `num_repeats` in `ng_prepare_data`.
-  val_batch_size: null
+  max_val_samples: null
+  val_batch_size: 256
   seed: 42
-  use_dynamic_sampling: false
-  dynamic_sampling_max_gen_batches: 10
+  async_grpo:
+    enabled: false # Set to true to enable async training mode
+    # Max age (in training steps) for trajectories used in training
+    max_trajectory_age_steps: 1
+
+  # Best@k training configuration (optional - set use_best_at_k to true to enable)
+  use_best_at_k: false  # Enable Best@k training to optimize for best reward among k samples
+  best_at_k_k: 8  # Number of samples per bootstrap group (should be <= num_generations_per_prompt)
+  best_at_k_m: 1000  # Number of bootstrap groups (will use C(n,k) if smaller)
+  # Note: With num_generations_per_prompt=16 and k=8, C(16,8)=12870
+  # So m=1000 will use bootstrap sampling (not all combinations)
+
+  # Combined training: blend of Best@k and Pass@1
+  use_combined_training: false  # Enable combined training
+  combined_training_weight_mode: "auto"  # "auto" for adaptive, "fixed" for custom weights
+  combined_training_best_at_k_weight: 0.2  # Used when mode is "fixed"
+  combined_training_pass_at_1_weight: 1.0  # Used when mode is "fixed"
+  # "auto": adaptive weights (N_pos/N) per prompt
+  # "fixed": use custom weights specified above
+
+  # Dynamic sampling: oversample prompts, keep only those with non-zero advantages
+  dynamic_sampling_oversample_ratio: 1.0  # 1.0 = disabled, 2.0 = load 2x and filter, etc.
+
   batch_multiplier: 1
+  use_dynamic_sampling: False
   reward_shaping:
-    enabled: false
-    overlong_buffer_length: 128
-    overlong_buffer_penalty: 1
-    max_response_length: ${policy.max_total_sequence_length}
+    enabled: False
   reward_scaling:
-    enabled: false
-    source_min: 0.0
-    source_max: 1.0
-    target_min: 0.0
-    target_max: 1.0
-  skip_reference_policy_logprobs_calculation: true
+    enabled: False
 
 loss_fn:
   reference_policy_kl_penalty: 0
-  reference_policy_kl_type: "k3"
-  kl_input_clamp_value: 20.0
-  kl_output_clamp_value: 10.0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
   ratio_clip_min: 0.2
-  ratio_clip_max: 0.2
+  ratio_clip_max: 0.28
   ratio_clip_c: null
   # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
   use_on_policy_kl_approximation: false
-  truncated_importance_sampling_ratio: null
-  use_importance_sampling_correction: false
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: false
   token_level_loss: true
-  force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
+  truncated_importance_sampling_ratio: null
 
 checkpointing:
   enabled: true
   checkpoint_dir: "results/grpo"
-  metric_name: "val:accuracy"
+  metric_name: "val:total_reward/mean"
   higher_is_better: true
   keep_top_k: 3
-  save_period: 1
-  checkpoint_must_save_by: null
+  save_period: 10
+  checkpoint_must_save_by: "00:03:35:00"
 
 policy:
-  model_name: "Qwen/Qwen3-4B-Instruct-2507"
+  #model_name: "/lustre/fs2/portfolios/llmservice/users/lvega/models/NVIDIA-Nemotron-Nano-31B-A3-v3"
+  model_name: "/lustre/fsw/portfolios/llmservice/users/tkonuk/models/nano-v3-base"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
-    chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
-  hf_config_overrides: {}
-  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}  # Match the total rollouts per step
+  train_global_batch_size: 1024
   train_micro_batch_size: 1
-  logprob_batch_size: 1
-  generation_batch_size: 32 # Only used when generating using HF backend
-  max_total_sequence_length: 32768
+  generation_batch_size: 64 # Only used when generating using HF backend
+  logprob_batch_size: 4
+  max_total_sequence_length: 8192
   precision: "bfloat16"
-  logprob_chunk_size: 1024
+  logprob_chunk_size: 2048
 
   dtensor_cfg:
-    _v2: false
-    enabled: true
+    _v2: true
+    enabled: false
     cpu_offload: False
     sequence_parallel: false
-    activation_checkpointing: true
-    tensor_parallel_size: 2
+    activation_checkpointing: false
+    tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
-    clear_cache_every_n_steps: null
-  
+
   megatron_cfg:
-    enabled: false
-    # We might want to consider setting this value higher (e.g. to 1) and raising the vllm generation max mem utilization
-    empty_unused_memory_level: 0
+    enabled: true
+    empty_unused_memory_level: 1
     activation_checkpointing: true
-    converter_type: "Qwen2ForCausalLM"  # Apparently this is comptible with Qwen 3 dense models.
-    tensor_model_parallel_size: 1
+    bias_activation_fusion: False
+      # converter_type: "Qwen2ForCausalLM"
+    tensor_model_parallel_size: 4
     expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 1
+    expert_model_parallel_size: 8
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
-    sequence_parallel: false
+    sequence_parallel: true
     freeze_moe_router: true
-    moe_router_dtype: "fp64"
+      # moe_router_dtype: "fp64"
+    moe_router_dtype: "fp32"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_aux_loss_coeff: 1e-4
+    moe_router_enable_expert_bias: true
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
-    defer_fp32_logits: true
-    moe_permute_fusion: false
-    bias_activation_fusion: True
-    moe_per_layer_logging: False
+    defer_fp32_logits: null
+    track_moe_metrics: True
+    moe_per_layer_logging: True
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
 
     optimizer:
       optimizer: "adam"
-      lr: 5.0e-6
-      min_lr: 5.0e-7
+      lr: 1.0e-6
+      min_lr: 0.9999e-6
       weight_decay: 0.01
       bf16: true
       fp16: false
@@ -120,15 +143,14 @@ policy:
       #sgd
       sgd_momentum: 0.9
 
+      clip_grad: ${policy.max_grad_norm}
+
       #distributed optimizer
       use_distributed_optimizer: true
       use_precision_aware_optimizer: true
 
-      # optimizer cpu offload
-      optimizer_cpu_offload: false
-      optimizer_offload_fraction: 0.0
-
-      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: False
+      optimizer_offload_fraction: 0
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -136,19 +158,20 @@ policy:
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
       lr_decay_iters: null
-      lr_warmup_iters: 13
-      lr_warmup_init: 5.0e-7
+      lr_warmup_iters: 1
+      lr_warmup_init: 0.9999e-6
 
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: true
       overlap_param_gather: true
+      average_in_collective: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
     env_vars: null
 
-  # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
+  # See docs/design-docs/sequence-packing-and-dynamic-batching.md
   # for more details on dynamic batching and sequence packing.
   dynamic_batching:
     enabled: False
@@ -157,7 +180,7 @@ policy:
     sequence_length_round: 64
 
   sequence_packing:
-    enabled: false
+    enabled: False
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
@@ -165,27 +188,13 @@ policy:
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   max_grad_norm: 1.0
 
-  optimizer:
-    name: "torch.optim.AdamW"
-    kwargs:
-      lr: 1.0e-6
-      weight_decay: 0.01
-      betas: [0.9, 0.999]
-      eps: 1e-8
-      # when using Dtensor, we need to set foreach
-      # and fused to False
-      foreach: False
-      fused: False
+  optimizer: null # remove default FSDP optimizer
+  scheduler: null
 
-  scheduler:
-    - name: "torch.optim.lr_scheduler.ConstantLR"
-      kwargs:
-        factor: 1.0
-        total_iters: 10000000000
-    - milestones: []
+  offload_optimizer_for_logprob: False
 
   generation:
     backend: "vllm"
@@ -196,27 +205,31 @@ policy:
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
-      async_engine: true
+      # NB: can re-enable prefix cache on vllm >= 0.11.2.
+      # enable_prefix_caching: false
+      async_engine: false
+      kv_cache_dtype: auto
       precision: ${policy.precision}
-      tensor_parallel_size: 1
+      tensor_parallel_size: 2
       pipeline_parallel_size: 1
-      enable_expert_parallel: false
-      expert_parallel_size: 1
-      gpu_memory_utilization: 0.8
+      expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
+      gpu_memory_utilization: 0.5
       max_model_len: ${policy.max_total_sequence_length}
-      enforce_eager: false
+      # when enforce_eager is False, it is optional to set ++policy.generation.vllm_kwargs.compilation_config.use_inductor=False for better accuracy,
+      # with the flag, vllm will use the custom CUDA kernels instead of the Triton kernels generated by torch.compile
+      # for more details, see convergence issue https://github.com/NVIDIA-NeMo/RL/issues/998
+      enforce_eager: False
       use_deep_gemm: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       expose_http_server: true
-      skip_tokenizer_init: false
       http_server_serving_chat_kwargs:
-        # This is the tool parser for Qwen 3 4B Instruct. This needs to be changed for other models.
         enable_auto_tools: true
-        tool_parser: hermes
-        # Enable the appropriate reasoning parser here. Since this model is an instruct model, we comment it out.
-        # reasoning_parser: deepseek_r1
+        tool_parser: qwen3_coder
+        reasoning_parser: deepseek_r1
+
     vllm_kwargs:
+      mamba_ssm_cache_dtype: "float32"
       compilation_config:
         # when enforce_eager is False, set ++policy.generation.vllm_kwargs.compilation_config.use_inductor=False for better accuracy,
         # with the flag, vllm will use the custom CUDA kernels instead of the Triton kernels generated by torch.compile
@@ -232,37 +245,44 @@ policy:
         num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
-  train_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/bytedtsinghua_dapo17k/train.jsonl
-  validation_jsonl_fpath: 3rdparty/Gym-workspace/Gym/data/bytedtsinghua_dapo17k/validation.jsonl
-  shuffle: true
-  num_workers: 0
+  train_jsonl_fpath: train.jsonl
+  validation_jsonl_fpath: validation.jsonl
+  shuffle: false
+  num_workers: 1
 
 env:
   should_use_nemo_gym: true
-  should_log_nemo_gym_responses: true  # If you have low logging storage, set this to false
-  nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
+  nemo_gym:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
-    - resources_servers/library_judge_math/configs/library_judge_math.yaml
-    library_judge_math:
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/code_gen/configs/code_gen.yaml
+    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/instruction_following/configs/instruction_following.yaml
+    - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
+    math_with_judge:
       resources_servers:
-        library_judge_math:
+        math_with_judge:
           judge_model_server:
             name: policy_model
           should_use_judge: false
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: 1024
+          unit_test_timeout_secs: 10
+          debug: false
 
 logger:
   log_dir: "logs"  # Base directory for all logs
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
-  wandb_enabled: true
+  wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging
-  swanlab_enabled: false
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  swanlab_enabled: false # Disable SwanLab logging
   wandb:
-    project: "grpo-dev"
-    name: "grpo-dev-logger"
-  swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"
   tensorboard: {}
@@ -275,4 +295,4 @@ logger:
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 8
+  num_nodes: 1

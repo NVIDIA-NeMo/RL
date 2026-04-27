@@ -1,0 +1,236 @@
+# GRPO training for Nemotron Nano v3 VL on MMPR-Tiny
+grpo:
+  num_prompts_per_step: 512
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: 1000000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 10
+  val_at_start: false
+  overlong_filtering: true
+  zero_variance_prompt_filtering: false
+  max_val_samples: 256
+  val_batch_size: 256
+  seed: 42
+  seq_logprob_error_threshold: 2
+  use_dynamic_sampling: false
+  batch_multiplier: 1
+  deduplicate_multimodal_data: true
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 512
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 1
+  debug_snapshot_error_threshold: 1000000  # Save token_mult_prob_error repro snapshots
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28  # Clip-Higher, ref: DAPO, JustRL
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: false
+  sequence_level_importance_ratios: true
+  token_level_loss: false
+  use_sequence_length_scaling: false
+  truncated_importance_sampling_ratio: null
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/nanov3-image-grpo"
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  keep_top_k: 1000000
+  save_period: 10
+  checkpoint_must_save_by: "00:03:45:00"
+
+policy:
+  # Keep this key in YAML (OmegaConf struct mode); launcher/CLI overrides it.
+  model_name: "REPLACE_WITH_MODEL_OR_CHECKPOINT_PATH"
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  precision: "bfloat16"
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    enabled: false
+
+  dynamic_batching:
+    enabled: false
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  optimizer: null
+  scheduler: null
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 16
+    expert_tensor_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1e-3
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: true
+    moe_aux_loss_coeff: 0.0
+    track_moe_metrics: true
+    moe_per_layer_logging: false
+    apply_rope_fusion: true
+    bias_activation_fusion: false  # VLM: must be false for Nano v3 VL
+    defer_fp32_logits: true
+    radio_force_cpe_eval_mode: true
+    freeze_vision_encoder: false
+    freeze_vision_projector: false
+    freeze_audio_encoder: true
+    freeze_audio_projector: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 3e-6
+      min_lr: 2e-9
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      adam_beta1: 0.9
+      adam_beta2: 0.99
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 0.3e-7
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    env_vars: null
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    bad_words: ["<image>", "<img>", "</img>", "<so_embedding>", "<so_start>", "<so_end>"]
+    vllm_cfg:
+      async_engine: false
+      kv_cache_dtype: auto
+      precision: ${policy.precision}
+      tensor_parallel_size: 2
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.7
+      max_model_len: ${policy.max_total_sequence_length}
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      skip_tokenizer_init: False
+      enforce_eager: true
+    vllm_kwargs:
+      limit_mm_per_prompt: {"image": 2}
+      max_num_batched_tokens: 16384
+      mamba_ssm_cache_dtype: "float32"
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  prompt_file: null
+  system_prompt_file: null
+  dataset_name: "mmpr_tiny"
+  env_name: "mmpr_tiny"
+  split: "train"
+  shuffle: true
+  val_size: 500
+  cache_dir: "REPLACE_WITH_MMPR_TINY_CACHE_DIR"
+  num_workers: 1
+
+env:
+  mmpr_tiny:
+    num_workers: 8
+    reward_functions:
+      - name: verl_geo3k
+        weight: 1.0
+        kwargs:
+          format_score: 0.1
+
+logger:
+  log_dir: "logs"
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "nemo-rl-omni"
+    name: "step-3-nanov3-vision-rl"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

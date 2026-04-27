@@ -29,6 +29,11 @@ from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
 from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
+from nemo_rl.data.datasets.response_datasets.vision_r1 import VisionR1Dataset
+from nemo_rl.data.datasets.response_datasets.mmpr_tiny import MMPRTinyDataset
+from nemo_rl.data.datasets.response_datasets.tinier_math import TinierMathDataset
+from nemo_rl.data.datasets.response_datasets.mmpr_nanov2_filtered import MmprNanov2FilteredDataset
+from nemo_rl.data.datasets.response_datasets.blend_v1 import BlendV1Dataset
 from nemo_rl.data.datasets.utils import get_extra_kwargs
 
 
@@ -125,6 +130,33 @@ def load_response_dataset(data_config, seed: int = 42):
             train_data_path=data_config["train_data_path"],
             **extra_kwargs,
         )
+    elif dataset_name == "vision_r1":
+        base_dataset: Any = VisionR1Dataset(
+            split=data_config["split"],
+        )
+    elif dataset_name == "mmpr_tiny":
+        base_dataset: Any = MMPRTinyDataset(
+            split=data_config["split"],
+            prompt_file=data_config.get("prompt_file"),
+            cache_dir=data_config.get("cache_dir"),
+            val_size=data_config.get("val_size", 500),
+        )
+    elif dataset_name == "tinier_math":
+        base_dataset: Any = TinierMathDataset(
+            train_data_path=data_config["train_data_path"],
+            prompt_file=data_config.get("prompt_file"),
+        )
+    elif dataset_name == "mmpr_nanov2_filtered":
+        base_dataset: Any = MmprNanov2FilteredDataset(
+            train_data_path=data_config["train_data_path"],
+            prompt_file=data_config.get("prompt_file"),
+            val_size=data_config.get("val_size", 500),
+        )
+    elif dataset_name == "blend_v1":
+        base_dataset: Any = BlendV1Dataset(
+            train_data_path=data_config["train_data_path"],
+            prompt_file=data_config.get("prompt_file"),
+        )
     else:
         raise ValueError(
             f"Unsupported {dataset_name=}. "
@@ -153,6 +185,8 @@ __all__ = [
     "DeepScalerDataset",
     "DAPOMath17KDataset",
     "Geometry3KDataset",
+    "MMPRTinyDataset",
+    "TinierMathDataset",
     "OpenAIFormatDataset",
     "OasstDataset",
     "OpenMathInstruct2Dataset",
@@ -161,4 +195,5 @@ __all__ = [
     "SquadDataset",
     "Tulu3SftMixtureDataset",
     "HelpSteer3Dataset",
+    "VisionR1Dataset",
 ]

@@ -536,8 +536,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "loss": results[0]["global_loss"],
             "grad_norm": results[0]["grad_norm"],
         }
-        if "moe_metrics" in results[0]:
-            aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
+        if "moe_routing_diagnostics" in results[0]:
+            aggregated_results["moe_routing_diagnostics"] = results[0]["moe_routing_diagnostics"]
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
@@ -690,7 +690,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def calibrate_qkv_fp8_scales(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
-        micro_batch_size: Optional[int] = None,
+        micro_batch_size: Optional[int] = 1,
+        max_calib_samples: int = 256,
         percentile: float = 99.9,
         margin: float = 1.05,
         include_q: bool = False,
@@ -700,8 +701,41 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         Note: The backend `MegatronPolicyWorker.calibrate_qkv_fp8_scales` already implements
         distributed reduction, returning results merged across ranks. Therefore, we shard the
         input by DP and call in parallel, then take the result from the first worker.
+
+        Args:
+            data: Input batch for calibration. Only ``input_ids``,
+                ``input_lengths``, and multimodal fields are used; all other
+                fields (rewards, advantages, logprobs, masks, ...) are stripped
+                before distribution to workers to reduce Ray object-store
+                pressure.
+            micro_batch_size: Micro-batch size for the calibration forward pass.
+                Defaults to 1 to minimise peak GPU activation memory.
+            max_calib_samples: Maximum number of samples used for calibration.
+                The input is capped to this many samples (must be >= dp_size
+                for even sharding).  Calibration converges with far fewer
+                samples than a full training batch.
         """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+
+        n = min(max_calib_samples, data.size)
+        n = max(n, dp_size)
+        if n < data.size:
+            mm_fields = data.get_multimodal_dict(as_tensors=False)
+            stripped = BatchedDataDict(
+                {
+                    "input_ids": data["input_ids"][:n],
+                    "input_lengths": data["input_lengths"][:n],
+                }
+            )
+            calib_indices = list(range(n))
+            for mm_key, mm_val in mm_fields.items():
+                if hasattr(mm_val, "slice"):
+                    stripped[mm_key] = mm_val.slice(calib_indices)
+                else:
+                    stripped[mm_key] = mm_val[:n]
+            stripped.to("cpu")
+            data = stripped
+
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"

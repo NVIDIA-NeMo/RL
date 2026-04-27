@@ -44,3 +44,8 @@ class VllmSpecificArgs(TypedDict):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    # When True, compact vllm_images/vllm_content per shard before sending to workers,
+    # removing N-scaling of image payload over the driver->vllm Ray boundary.
+    deduplicate_multimodal_data: NotRequired[bool]
+    # When True, emit payload metric debug prints for Ray boundaries.
+    debug_payload_metrics: NotRequired[bool]

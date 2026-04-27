@@ -93,9 +93,79 @@ def create_local_venv(
     # Command doesn't matter, since `uv` syncs the environment no matter the command.
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
-    # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
-    subprocess.run(exec_cmd, env=env, check=True)
+    # TODO this is temporarily needed b/c container has mcore before fix to build-meta was introduced
+    # Install build tooling from PyPI first.
+    # Keeping this separate avoids uv's "first-index" behavior selecting the PyTorch
+    # wheel index for setuptools (which only exposes older versions).
+    subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "setuptools>=77.0.3,<81.0.0",
+            "setuptools_scm",
+        ],
+        env=env | {"VIRTUAL_ENV": venv_path},
+        check=True,
+    )
+
+    # Install torch from the CUDA 12.9 wheel index.
+    subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "torch==2.9.1",
+            "--index-url",
+            "https://download.pytorch.org/whl/cu129",
+        ],
+        env=env | {"VIRTUAL_ENV": venv_path},
+        check=True,
+    )
+
+    # Pre-install transformer-engine (pure Python) so it's available in the venv
+    subprocess.run(
+        "uv pip install transformer-engine==2.9.0 --no-deps".split(),
+        env=env | {"VIRTUAL_ENV": venv_path},
+        check=True,
+    )
+
+    # Extract extras from exec_cmd (e.g. --extra mcore) and pass them to uv sync.
+    sync_extras = []
+    for i, part in enumerate(exec_cmd):
+        if part == "--extra" and i + 1 < len(exec_cmd):
+            sync_extras.extend(["--extra", exec_cmd[i + 1]])
+
+    # Run uv sync. transformer-engine[pytorch] has been replaced with transformer-engine
+    # (without [pytorch] extra) in pyproject.toml, so transformer-engine-torch is NOT pulled
+    # in by uv sync. This avoids the uv build failure for transformer-engine-torch.
+    subprocess.run(
+        ["uv", "sync", "--directory", git_root] + sync_extras,
+        env=env | {"VIRTUAL_ENV": venv_path},
+        check=True,
+    )
+
+    # Install transformer-engine-cu12 (core C library) and transformer-engine-torch
+    # (PyTorch bindings) into the venv AFTER uv sync. These are the [pytorch] extra deps
+    # that we excluded from uv sync because uv cannot build transformer-engine-torch
+    # (its no-build-isolation mode doesn't set sys.path correctly for build_tools).
+    # Use the venv's python -m pip to ensure packages go into the venv, not the system env.
+    venv_python = os.path.join(venv_path, "bin", "python")
+    subprocess.run(
+        [venv_python, "-m", "pip", "install", "transformer-engine-cu12==2.9.0", "--no-deps"],
+        env=env,
+        check=True,
+    )
+    subprocess.run(
+        [
+            venv_python, "-m", "pip", "install", "transformer-engine-torch==2.9.0",
+            "--no-build-isolation", "--no-deps",
+        ],
+        env=env,
+        check=True,
+    )
+
+    subprocess.run(exec_cmd, env=env | {"VIRTUAL_ENV": venv_path}, check=True)
 
     # Return the path to the python executable in the virtual environment
     python_path = os.path.join(venv_path, "bin", "python")

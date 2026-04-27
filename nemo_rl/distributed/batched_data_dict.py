@@ -76,6 +76,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
     # keys that are model specific, but not part of the PackedTensor
     ADDITIONAL_OPTIONAL_KEY_TENSORS = [
         "token_type_ids",  # specific to gemma3 that tells where the image tokens are in the sequence, not required for llm-only inference/training
+        "imgs_sizes",  # for dynamic resolution VLMs: [num_images, 2] with (H, W) per image
     ]
 
     def __init__(self, *args, **kwargs):
@@ -85,16 +86,32 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         self.micro_batch_lengths = None
         self.elem_counts_per_gb = None
 
+    _PIXEL_DTYPE_CAST_KEYS = frozenset({"pixel_values"})
+
     def get_multimodal_dict(
-        self, as_tensors: bool = False, device: Optional[torch.device] = None
+        self,
+        as_tensors: bool = False,
+        device: Optional[torch.device] = None,
+        pixel_dtype: Optional[torch.dtype] = None,
     ) -> dict[str, Any]:
         """Return a regular dict of tensors or packed multimodal data items."""
         multimodal_dict = {}
         for k, v in self.data.items():
             if isinstance(v, PackedTensor):
-                multimodal_dict[k] = v.as_tensor(device=device) if as_tensors else v
-            elif k in self.ADDITIONAL_OPTIONAL_KEY_TENSORS:
-                multimodal_dict[k] = v
+                if pixel_dtype is not None and k in self._PIXEL_DTYPE_CAST_KEYS:
+                    v = PackedTensor(
+                        [t.to(pixel_dtype) if t is not None else None for t in v.tensors],
+                        v.dim_to_pack,
+                        dedup_indices=v._dedup_indices,
+                    )
+                value = v.as_tensor(device=device) if as_tensors else v
+                if value is not None:
+                    multimodal_dict[k] = value
+            elif k in self.ADDITIONAL_OPTIONAL_KEY_TENSORS and v is not None:
+                if as_tensors and device is not None and isinstance(v, torch.Tensor):
+                    multimodal_dict[k] = v.to(device)
+                else:
+                    multimodal_dict[k] = v
 
         return multimodal_dict
 
@@ -854,6 +871,13 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     f"Unsupported type {type(v)} for index selection in BatchedDataDict"
                 )
         return selected_batch
+
+    def as_shuffled(self, *, generator: Optional[torch.Generator] = None) -> Self:
+        """Return a shuffled view along the batch dimension."""
+        if self.size == 0:
+            return type(self)()
+        permutation = torch.randperm(self.size, generator=generator)
+        return self.select_indices(permutation)
 
     def get_dict(self) -> dict[Any, Any]:
         """Get the underlying data dictionary."""

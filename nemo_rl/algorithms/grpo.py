@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import math
 import os
 import time
 import warnings
@@ -26,6 +27,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import (
@@ -51,6 +53,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -66,14 +69,22 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.debug_snapshot import DebugSnapshotSaver
+from nemo_rl.utils.gpu_memory_logging import maybe_log_gpu_memory
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
     print_message_log_samples,
 )
+from nemo_rl.utils.multimodal_payload_metrics import (
+    collect_multimodal_payload_metrics,
+    infer_unique_prompt_count,
+    print_multimodal_payload_metrics,
+)
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+
 
 # ===============================================================================
 # Configuration
@@ -138,6 +149,13 @@ class GRPOConfig(TypedDict):
     batch_multiplier: NotRequired[float]
     reward_shaping: RewardShapingConfig
     reward_scaling: RewardScalingConfig
+    zero_variance_prompt_filtering: NotRequired[bool]
+    # Sequence-level logprob error masking for training stability
+    seq_logprob_error_threshold: NotRequired[
+        float
+    ]  # If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
+    # If true, enable sync-only zero-N multimodal transfer optimizations.
+    deduplicate_multimodal_data: NotRequired[bool]
 
 
 class GRPOSaveState(TypedDict):
@@ -160,6 +178,40 @@ def _default_grpo_save_state() -> GRPOSaveState:
         "total_valid_tokens": 0,
         "val_reward": -99999999.0,
     }
+
+
+def _get_reward_valid_mask(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    use_overlong_filtering: bool,
+) -> torch.Tensor:
+    """Build the validity mask used for reward-group statistics.
+
+    Samples with loss multiplier 0 are already invalid for training and should
+    also be excluded from GRPO baseline/std computation. When overlong filtering
+    is enabled, truncated samples are likewise excluded before normalization.
+    """
+
+    rewards = repeated_batch["total_reward"]
+    device = rewards.device if torch.is_tensor(rewards) else None
+
+    loss_multiplier = repeated_batch["loss_multiplier"]
+    if not torch.is_tensor(loss_multiplier):
+        loss_multiplier = torch.tensor(
+            loss_multiplier, dtype=torch.float32, device=device
+        )
+    else:
+        loss_multiplier = loss_multiplier.to(dtype=torch.float32, device=device)
+    valid_mask = (loss_multiplier > 0).to(dtype=torch.float32)
+
+    if use_overlong_filtering and "truncated" in repeated_batch:
+        truncated = repeated_batch["truncated"]
+        if not torch.is_tensor(truncated):
+            truncated = torch.tensor(truncated, dtype=torch.bool, device=device)
+        else:
+            truncated = truncated.to(dtype=torch.bool, device=device)
+        valid_mask = valid_mask * (~truncated).to(dtype=valid_mask.dtype)
+
+    return valid_mask
 
 
 class GRPOLoggerConfig(LoggerConfig):
@@ -461,9 +513,11 @@ def setup(
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Define initialization functions that will be used in all paths
+
     def init_policy():
         """Initialize policy training workers."""
         t0 = time.perf_counter()
+        need_reference_model = loss_config["reference_policy_kl_penalty"] > 0
         p = Policy(
             cluster=train_cluster,
             config=policy_config,
@@ -472,6 +526,7 @@ def setup(
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_optimizer=True,
+            init_reference_model=need_reference_model,
         )
         return p, time.perf_counter() - t0
 
@@ -521,6 +576,15 @@ def setup(
         ## make vllm hf overrides match the training policy
         generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
             "hf_config_overrides", {}
+        )
+
+        # Propagate deduplicate_multimodal_data flag so VllmGeneration.generate() can
+        # compact vllm_images/vllm_content per shard before dispatching to workers.
+        generation_config["deduplicate_multimodal_data"] = grpo_config.get(
+            "deduplicate_multimodal_data", False
+        )
+        generation_config["debug_payload_metrics"] = master_config["logger"].get(
+            "debug_payload_metrics", False
         )
 
         # Determine if parallel initialization is possible (non-colocated mode)
@@ -1007,6 +1071,13 @@ def grpo_train(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
+    debug_snapshot_threshold = master_config["grpo"].get("debug_snapshot_error_threshold")
+    snapshot_saver = (
+        DebugSnapshotSaver(os.path.join(logger.base_log_dir, "debug_snapshots"))
+        if debug_snapshot_threshold is not None
+        else None
+    )
+
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
@@ -1038,6 +1109,24 @@ def grpo_train(
     val_at_start = master_config["grpo"]["val_at_start"]
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    deduplicate_multimodal_data = master_config["grpo"].get(
+        "deduplicate_multimodal_data", False
+    )
+    debug_payload_metrics = master_config["logger"].get("debug_payload_metrics", False)
+    should_dedup_multimodal = deduplicate_multimodal_data
+    if deduplicate_multimodal_data:
+        generation_cfg = master_config["policy"]["generation"]
+        if generation_cfg is None or generation_cfg.get("backend") != "vllm":
+            raise ValueError(
+                "grpo.deduplicate_multimodal_data requires policy.generation.backend='vllm' "
+                "for generation-side payload optimization."
+            )
+        if _should_use_async_rollouts(master_config):
+            raise ValueError(
+                "grpo.deduplicate_multimodal_data currently supports only sync rollout paths. "
+                "Disable policy.generation.vllm_cfg.async_engine (and NeMo-Gym), or set "
+                "grpo.deduplicate_multimodal_data=false."
+            )
 
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
@@ -1048,6 +1137,7 @@ def grpo_train(
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
+        maybe_log_gpu_memory()
         val_metrics, validation_timings = validate(
             policy_generation,
             val_dataloader,
@@ -1088,12 +1178,19 @@ def grpo_train(
                             master_config["grpo"]["num_generations_per_prompt"]
                         )
                     )
+                    if should_dedup_multimodal:
+                        repeated_batch["_dedup_prompt_idx"] = torch.arange(
+                            batch.size
+                        ).repeat_interleave(
+                            master_config["grpo"]["num_generations_per_prompt"]
+                        )
                     # Convert LLMMessageLogType to FlatMessagesType for generation
-                    batched_flat, input_lengths = batched_message_log_to_flat_message(
+                    batched_flat, _ = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
                     input_ids = batched_flat["token_ids"]
+                    del batched_flat
 
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 print(
@@ -1106,10 +1203,20 @@ def grpo_train(
                         if sync_kv_scales and kv_scales_cache is None:
                             print("▶ Computing KV cache scales...", flush=True)
                             policy.prepare_for_lp_inference()
-                            # Align with training data processing to ensure parallel training compatibility
+                            # Under zero-N transfer, calibrate from unique prompts (pre-repeat) to
+                            # avoid N-duplicated payload and improve calibration sample diversity.
+                            calibration_message_logs = (
+                                batch["message_log"]
+                                if deduplicate_multimodal_data
+                                else repeated_batch["message_log"]
+                            )
+                            calibration_unique_prompt_source = (
+                                batch if deduplicate_multimodal_data else repeated_batch
+                            )
+                            # Align with training data processing to ensure parallel training compatibility.
                             calib_flat, calib_input_lengths = (
                                 batched_message_log_to_flat_message(
-                                    repeated_batch["message_log"],
+                                    calibration_message_logs,
                                     pad_value_dict={
                                         "token_ids": tokenizer.pad_token_id
                                     },
@@ -1126,9 +1233,20 @@ def grpo_train(
                                 }
                             )
                             calibration_data.update(
-                                calib_flat.get_multimodal_dict(as_tensors=False)
+                                calib_flat.get_multimodal_dict(as_tensors=False, pixel_dtype=torch.bfloat16)
                             )
                             calibration_data.to("cpu")
+                            print_multimodal_payload_metrics(
+                                collect_multimodal_payload_metrics(
+                                    calibration_data,
+                                    boundary="driver_to_policy_calibrate_qkv_fp8_scales_pre_refit",
+                                    unique_prompts=infer_unique_prompt_count(
+                                        calibration_unique_prompt_source,
+                                        default_rows=calibration_data.size,
+                                    ),
+                                ),
+                                enabled=debug_payload_metrics,
+                            )
                             kv_scales_cache = policy.calibrate_qkv_fp8_scales(
                                 calibration_data, include_q=True
                             )["layers"]
@@ -1147,6 +1265,7 @@ def grpo_train(
                         policy_generation.prepare_for_generation()
 
                 dynamic_sampling_num_gen_batches += 1
+                maybe_log_gpu_memory()
                 with timer.time("generation"):
                     # Clear vLLM logger metrics for each generation step
                     if policy_generation is not None and hasattr(
@@ -1200,6 +1319,7 @@ def grpo_train(
                                 "max_rollout_turns"
                             ],
                             greedy=False,
+                            skip_generation_multimodal_tensors=deduplicate_multimodal_data,
                         )
                     policy_generation.finish_generation()
                     # Collect vLLM logger metrics for performance reporting after each generation step
@@ -1227,12 +1347,16 @@ def grpo_train(
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
+                    valid_mask = _get_reward_valid_mask(
+                        repeated_batch,
+                        master_config["grpo"]["overlong_filtering"],
+                    )
 
                     print("▶ Computing advantages...", flush=True)
                     baseline, std = calculate_baseline_and_std_per_prompt(
                         input_ids,
                         rewards,
-                        torch.ones_like(rewards),
+                        valid_mask,
                         leave_one_out_baseline=master_config["grpo"][
                             "use_leave_one_out_baseline"
                         ],
@@ -1273,17 +1397,51 @@ def grpo_train(
                             std=std,
                         )
 
+                    advantage_clip = master_config["grpo"].get("advantage_clip", 10.0)
+                    advantages = torch.clamp(advantages, min=-advantage_clip, max=advantage_clip)
+                    zero_var_mask = std == 0
+
                 with timer.time("data_processing"):
                     use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
-                    if use_overlong_filtering:
+                    use_zero_variance_prompt_filtering = master_config["grpo"].get(
+                        "zero_variance_prompt_filtering", False
+                    )
+                    effective_gbs = policy.cfg["train_global_batch_size"]
+                    if use_overlong_filtering or use_zero_variance_prompt_filtering:
                         loss_multiplier = repeated_batch["loss_multiplier"].clone()
-                        truncated = repeated_batch["truncated"]
+                        if use_overlong_filtering:
+                            truncated = repeated_batch["truncated"]
 
-                        if isinstance(truncated, list):
-                            truncated = torch.tensor(truncated, dtype=torch.bool)
+                            if isinstance(truncated, list):
+                                truncated = torch.tensor(truncated, dtype=torch.bool)
 
-                        loss_multiplier[truncated] = 0
+                            loss_multiplier[truncated] = 0
+                        if use_zero_variance_prompt_filtering:
+                            loss_multiplier[zero_var_mask] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
+
+                        # feature flag for sample filtering
+                        if use_zero_variance_prompt_filtering:
+                            sample_mask = loss_multiplier > 0
+                            if torch.all(~sample_mask).item():
+                                warnings.warn("All prompts were filtered out. Skipping training.")
+                                continue
+                            # reduce effective batch size and round up to a multiple of dp_size
+                            total_num_samples = len(sample_mask)
+                            train_gbs = policy.cfg["train_global_batch_size"]  # minibatch size
+                            dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
+                            assert total_num_samples % train_gbs == 0, "total_num_samples must be divisible by train_gbs"
+                            keep_fraction = sample_mask.float().mean().item()
+                            effective_gbs = math.ceil(train_gbs * keep_fraction / dp_size) * dp_size
+                            effective_num_samples = total_num_samples // train_gbs * effective_gbs
+                            indices = torch.argsort((~sample_mask).int())
+                            assert (advantages[indices[effective_num_samples:]] == 0).all().item(), "logic error in zero-variance filtering"
+                            indices = indices[:effective_num_samples].sort().values
+
+                            repeated_batch = repeated_batch.select_indices(indices)
+                            advantages = advantages[indices]
+                            print(f"Effective batch size {effective_num_samples // master_config['grpo']['num_generations_per_prompt']} prompts, {effective_num_samples} rollouts")
+
                     # Add loss mask and advantages to each message in LLMMessageLogType
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -1324,23 +1482,131 @@ def grpo_train(
                         }
                     )
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
-                    train_data.update(
-                        flat_messages.get_multimodal_dict(as_tensors=False)
+                    multimodal_dict = flat_messages.get_multimodal_dict(
+                        as_tensors=False, pixel_dtype=torch.bfloat16
                     )
+                    if should_dedup_multimodal:
+                        prompt_indices = repeated_batch["_dedup_prompt_idx"]
+                        for key, val in multimodal_dict.items():
+                            if isinstance(val, PackedTensor):
+                                multimodal_dict[key] = val.deduplicate(prompt_indices)
+                    train_data.update(multimodal_dict)
                     train_data.to("cpu")
+                    unique_prompts_for_policy = infer_unique_prompt_count(
+                        repeated_batch, default_rows=train_data.size
+                    )
 
                 print("▶ Preparing for logprob inference...", flush=True)
                 with timer.time("logprob_inference_prep"):
                     policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
+                maybe_log_gpu_memory()
                 with timer.time("policy_and_reference_logprobs"):
+                    print_multimodal_payload_metrics(
+                        collect_multimodal_payload_metrics(
+                            train_data,
+                            boundary="driver_to_policy_get_logprobs",
+                            unique_prompts=unique_prompts_for_policy,
+                        ),
+                        enabled=debug_payload_metrics,
+                    )
                     fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
-                    reference_logprobs = policy.get_reference_policy_logprobs(
-                        train_data
-                    )["reference_logprobs"]
+
+                    print_multimodal_payload_metrics(
+                        collect_multimodal_payload_metrics(
+                            train_data,
+                            boundary="driver_to_policy_get_reference_policy_logprobs",
+                            unique_prompts=unique_prompts_for_policy,
+                        ),
+                        enabled=debug_payload_metrics,
+                    )
+                    if master_config["loss_fn"]["reference_policy_kl_penalty"] > 0:
+                        reference_logprobs = policy.get_reference_policy_logprobs(
+                            train_data
+                        )["reference_logprobs"]
+                    else:
+                        reference_logprobs = torch.zeros_like(fprop_logprobs)
                     train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
+
+                    # Compute sequence-level logprob error metrics (always)
+                    token_mask = train_data["token_mask"][:, 1:]
+                    sample_mask = train_data["sample_mask"]
+                    prev_logprobs = train_data["prev_logprobs"][:, 1:]
+                    generation_logprobs = train_data["generation_logprobs"][:, 1:]
+                    lp_error = torch.abs(generation_logprobs - prev_logprobs)
+
+                    # Use combined mask exactly as in loss function
+                    mask = token_mask * sample_mask.unsqueeze(-1)
+
+                    # Calculate sequence-level multiplicative prob error
+                    # EXACT same calculation as token_mult_prob_error but per-sequence
+                    seq_mult_prob_error = (torch.exp(lp_error * mask) * mask).sum(
+                        dim=-1
+                    ) / mask.sum(dim=-1).clamp(min=1)
+                    max_seq_mult_prob_error = (
+                        seq_mult_prob_error.max().item()
+                        if seq_mult_prob_error.numel() > 0
+                        else 0.0
+                    )
+
+                    # Save debug snapshot for large errors
+                    if (
+                        snapshot_saver is not None
+                        and max_seq_mult_prob_error > debug_snapshot_threshold
+                    ):
+                        snapshot_saver.save(
+                            step=total_steps + 1,
+                            seq_mult_prob_error=seq_mult_prob_error,
+                            lp_error=lp_error,
+                            train_data=train_data,
+                            prompt_lengths=repeated_batch["length"],
+                            vllm_images=repeated_batch.get("vllm_images"),
+                        )
+
+                    # Apply sequence-level masking if configured
+                    num_masked_seqs = 0
+                    seq_logprob_error_threshold = master_config["grpo"].get(
+                        "seq_logprob_error_threshold", None
+                    )
+                    masked_correct_pct = 0.0
+                    if seq_logprob_error_threshold is not None:
+                        print(
+                            f"▶ Applying sequence-level logprob error masking (threshold={seq_logprob_error_threshold})...",
+                            flush=True,
+                        )
+
+                        original_sample_mask = sample_mask.clone()
+
+                        # Create mask for sequences below threshold
+                        seq_error_mask = (
+                            seq_mult_prob_error <= seq_logprob_error_threshold
+                        ).float() * original_sample_mask
+
+                        diff_mask = original_sample_mask - seq_error_mask
+                        num_masked_seqs = diff_mask.sum().item()
+
+                        if num_masked_seqs > 0:
+                            diff_mask_bool = diff_mask.bool()
+                            masked_correct_count = (
+                                (rewards.view(-1)[diff_mask_bool] == 1).sum().item()
+                            )
+                            masked_correct_pct = masked_correct_count / num_masked_seqs
+
+                        # Update sample_mask in train_data
+                        train_data["sample_mask"] = seq_error_mask
+
+                        print(
+                            f"  Masked {num_masked_seqs} sequences with mult_prob_error > {seq_logprob_error_threshold}",
+                            flush=True,
+                        )
+                        if num_masked_seqs > 0:
+                            print(
+                                f"  • {masked_correct_count}/{num_masked_seqs} masked sequences were correct (reward=1)"
+                                f" → {masked_correct_pct:.2%}",
+                                flush=True,
+                            )
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -1348,8 +1614,17 @@ def grpo_train(
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...", flush=True)
+                maybe_log_gpu_memory()
                 with timer.time("policy_training"):
-                    train_results = policy.train(train_data, loss_fn)
+                    print_multimodal_payload_metrics(
+                        collect_multimodal_payload_metrics(
+                            train_data,
+                            boundary="driver_to_policy_train",
+                            unique_prompts=unique_prompts_for_policy,
+                        ),
+                        enabled=debug_payload_metrics,
+                    )
+                    train_results = policy.train(train_data.as_shuffled(), loss_fn, gbs=effective_gbs)
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -1357,6 +1632,14 @@ def grpo_train(
                         print(
                             "▶ Recomputing KV cache scales after policy update...",
                             flush=True,
+                        )
+                        print_multimodal_payload_metrics(
+                            collect_multimodal_payload_metrics(
+                                train_data,
+                                boundary="driver_to_policy_calibrate_qkv_fp8_scales_post_train",
+                                unique_prompts=unique_prompts_for_policy,
+                            ),
+                            enabled=debug_payload_metrics,
                         )
                         kv_scales_cache = policy.calibrate_qkv_fp8_scales(
                             train_data, include_q=True
@@ -1383,6 +1666,7 @@ def grpo_train(
                         if colocated_inference:
                             policy.offload_after_refit()  # unload optimizer to make space for generation
                         policy_generation.prepare_for_generation()
+                    maybe_log_gpu_memory()
                     val_metrics, validation_timings = validate(
                         policy_generation,
                         val_dataloader,
@@ -1398,6 +1682,28 @@ def grpo_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+                metrics = {
+                    "loss": train_results["loss"].numpy(),
+                    "reward": rewards.numpy(),
+                    "grad_norm": train_results["grad_norm"].numpy(),
+                    "mean_prompt_length": repeated_batch["length"].numpy(),
+                    "total_num_tokens": input_lengths.numpy(),
+                }
+                metrics.update(train_results["all_mb_metrics"])
+                for k, v in metrics.items():
+                    if k in {
+                        "lr",
+                        "wd",
+                        "reward",
+                        "global_valid_seqs",
+                        "global_valid_toks",
+                        "mean_prompt_length",
+                    }:
+                        metrics[k] = np.mean(v).item()
+                    else:
+                        metrics[k] = np.sum(v).item()
+                metrics.update(rollout_metrics)
+                total_valid_tokens += metrics["global_valid_toks"]
 
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = flat_messages["advantages"]
@@ -1426,9 +1732,9 @@ def grpo_train(
                     else 0.0,
                     **ds_metrics,
                 }
-                if "moe_metrics" in train_results:
+                if "moe_routing_diagnostics" in train_results:
                     metrics.update(
-                        {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+                        {f"moe_routing/{k}": v for k, v in train_results["moe_routing_diagnostics"].items()}
                     )
                 if master_config["grpo"]["use_dynamic_sampling"]:
                     metrics["filtered_reward"] = rewards.numpy()
@@ -1462,6 +1768,11 @@ def grpo_train(
                 metrics.update(rollout_metrics)
                 metrics["vllm_logger_metrics"] = vllm_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
+
+                # Always log sequence-level error metrics (useful for deciding threshold)
+                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
+                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
+                metrics["masked_correct_pct"] = masked_correct_pct
 
                 ## Checkpointing
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
@@ -1549,15 +1860,22 @@ def grpo_train(
 
             # Logging
             # Log training data
-            log_data = {"content": flat_messages["content"]}
+            log_data = {}
+            if "agent_ref" in repeated_batch:
+                log_data["agent_ref"] = repeated_batch["agent_ref"]
+            log_data["content"] = flat_messages["content"]
             log_data["rewards"] = rewards.tolist()
             if master_config["grpo"]["use_dynamic_sampling"]:
                 log_data["filtered_rewards"] = rewards.tolist()
                 log_data["rewards"] = repeated_batch["total_reward"].tolist()
-
+            log_data["input_lengths"] = input_lengths.tolist()
+            log_data["token_ids"] = train_data["input_ids"].tolist()
+            log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+            log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+            log_data["advantages"] = train_data["advantages"].tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-            log_data["input_lengths"] = input_lengths.tolist()
+
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{total_steps + 1}.jsonl"
             )
@@ -1609,6 +1927,8 @@ def grpo_train(
 
             print(f"  • Loss: {metrics['loss']:.4f}")
             print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
+            print(f"  • Grad Norm: {metrics['grad_norm']:.4f}")
+            print(f"  • Token Mult Prob Error: {metrics['token_mult_prob_error']:.4f}")
             if master_config["grpo"]["use_dynamic_sampling"]:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
@@ -1748,6 +2068,9 @@ def validate(
                     max_seq_len=master_config["policy"]["max_total_sequence_length"],
                     max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                     greedy=False,
+                    skip_generation_multimodal_tensors=master_config["grpo"].get(
+                        "deduplicate_multimodal_data", False
+                    ),
                 )
 
             total_rewards.extend(val_batch["total_reward"].tolist())
@@ -1861,6 +2184,15 @@ def async_grpo_train(
     assert master_config["loss_fn"]["use_importance_sampling_correction"] is True, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
+    deduplicate_multimodal_data = master_config["grpo"].get(
+        "deduplicate_multimodal_data", False
+    )
+    if deduplicate_multimodal_data:
+        raise ValueError(
+            "grpo.deduplicate_multimodal_data does not support async GRPO collector/replay. "
+            "Use sync GRPO (grpo.async_grpo.enabled=false) or set "
+            "grpo.deduplicate_multimodal_data=false."
+        )
 
     if master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"] > 1:
         if not master_config["grpo"]["async_grpo"].get(
@@ -1880,6 +2212,14 @@ def async_grpo_train(
         fit_last_save_time=True,
     )
     timeout.start_iterations()
+
+    debug_snapshot_threshold = master_config["grpo"].get("debug_snapshot_error_threshold")
+    snapshot_saver = (
+        DebugSnapshotSaver(os.path.join(logger.base_log_dir, "debug_snapshots"))
+        if debug_snapshot_threshold is not None
+        else None
+    )
+
     NEED_REFIT = True
 
     # Setup generation interface
@@ -2145,6 +2485,13 @@ def async_grpo_train(
                     # Concatenate per-prompt groups into a single training batch
                     per_prompt_batches = [t["batch"] for t in trajectories]
                     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
+                    if deduplicate_multimodal_data:
+                        repeated_batch["_dedup_prompt_idx"] = torch.cat(
+                            [
+                                torch.full((prompt_batch.size,), i, dtype=torch.long)
+                                for i, prompt_batch in enumerate(per_prompt_batches)
+                            ]
+                        )
                     # Aggregate rollout metrics across groups (simple mean where applicable)
                     rollout_metrics = {}
                     for t in trajectories:
@@ -2196,13 +2543,17 @@ def async_grpo_train(
                     prompt_only_ids = prompt_batched_flat["token_ids"]
 
                     rewards = repeated_batch["total_reward"]
+                    valid_mask = _get_reward_valid_mask(
+                        repeated_batch,
+                        master_config["grpo"]["overlong_filtering"],
+                    )
 
                     print("▶ Computing advantages...")
 
                     baseline, std = calculate_baseline_and_std_per_prompt(
                         prompt_only_ids,
                         rewards,
-                        torch.ones_like(rewards),
+                        valid_mask,
                         leave_one_out_baseline=master_config["grpo"][
                             "use_leave_one_out_baseline"
                         ],
@@ -2228,9 +2579,24 @@ def async_grpo_train(
                         print(
                             f"  📊 Normalized advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
                         )
+                    zero_var_mask = std == 0
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
+                    use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
+                    use_zero_variance_prompt_filtering = master_config["grpo"].get(
+                        "zero_variance_prompt_filtering", False
+                    )
+                    if use_overlong_filtering or use_zero_variance_prompt_filtering:
+                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                        if use_overlong_filtering:
+                            truncated = repeated_batch["truncated"]
+                            if isinstance(truncated, list):
+                                truncated = torch.tensor(truncated, dtype=torch.bool)
+                            loss_multiplier[truncated] = 0
+                        if use_zero_variance_prompt_filtering:
+                            loss_multiplier[zero_var_mask] = 0
+                        repeated_batch["loss_multiplier"] = loss_multiplier
                     # Add loss mask and advantages to each message
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
@@ -2270,6 +2636,15 @@ def async_grpo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    multimodal_dict = flat_messages.get_multimodal_dict(
+                        as_tensors=False, pixel_dtype=torch.bfloat16
+                    )
+                    if deduplicate_multimodal_data:
+                        prompt_indices = repeated_batch["_dedup_prompt_idx"]
+                        for key, val in multimodal_dict.items():
+                            if isinstance(val, PackedTensor):
+                                multimodal_dict[key] = val.deduplicate(prompt_indices)
+                    train_data.update(multimodal_dict)
                     train_data.to("cpu")
 
                 # Training phase (same as sync version)
@@ -2280,11 +2655,92 @@ def async_grpo_train(
                 print("▶ Computing logprobs...")
                 with timer.time("policy_and_reference_logprobs"):
                     fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
-                    reference_logprobs = policy.get_reference_policy_logprobs(
-                        train_data
-                    )["reference_logprobs"]
+                    if master_config["loss_fn"]["reference_policy_kl_penalty"] > 0:
+                        reference_logprobs = policy.get_reference_policy_logprobs(
+                            train_data
+                        )["reference_logprobs"]
+                    else:
+                        reference_logprobs = torch.zeros_like(fprop_logprobs)
                     train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
+
+                    # Compute sequence-level logprob error metrics (always)
+                    token_mask = train_data["token_mask"][:, 1:]
+                    sample_mask = train_data["sample_mask"]
+                    prev_logprobs = train_data["prev_logprobs"][:, 1:]
+                    generation_logprobs = train_data["generation_logprobs"][:, 1:]
+                    lp_error = torch.abs(generation_logprobs - prev_logprobs)
+
+                    # Use combined mask exactly as in loss function
+                    mask = token_mask * sample_mask.unsqueeze(-1)
+
+                    # Calculate sequence-level multiplicative prob error
+                    # EXACT same calculation as token_mult_prob_error but per-sequence
+                    seq_mult_prob_error = (torch.exp(lp_error * mask) * mask).sum(
+                        dim=-1
+                    ) / mask.sum(dim=-1).clamp(min=1)
+                    max_seq_mult_prob_error = (
+                        seq_mult_prob_error.max().item()
+                        if seq_mult_prob_error.numel() > 0
+                        else 0.0
+                    )
+
+                    # Save debug snapshot for large errors
+                    if (
+                        snapshot_saver is not None
+                        and max_seq_mult_prob_error > debug_snapshot_threshold
+                    ):
+                        snapshot_saver.save(
+                            step=step + 1,
+                            seq_mult_prob_error=seq_mult_prob_error,
+                            lp_error=lp_error,
+                            train_data=train_data,
+                            prompt_lengths=repeated_batch["length"],
+                            vllm_images=repeated_batch.get("vllm_images"),
+                        )
+
+                    # Apply sequence-level masking if configured
+                    num_masked_seqs = 0
+                    seq_logprob_error_threshold = master_config["grpo"].get(
+                        "seq_logprob_error_threshold", None
+                    )
+                    masked_correct_pct = 0.0
+                    if seq_logprob_error_threshold is not None:
+                        print(
+                            f"▶ Applying sequence-level logprob error masking (threshold={seq_logprob_error_threshold})...",
+                            flush=True,
+                        )
+
+                        original_sample_mask = sample_mask.clone()
+
+                        # Create mask for sequences below threshold
+                        seq_error_mask = (
+                            seq_mult_prob_error <= seq_logprob_error_threshold
+                        ).float() * original_sample_mask
+
+                        diff_mask = original_sample_mask - seq_error_mask
+                        num_masked_seqs = diff_mask.sum().item()
+
+                        if num_masked_seqs > 0:
+                            diff_mask_bool = diff_mask.bool()
+                            masked_correct_count = (
+                                (rewards.view(-1)[diff_mask_bool] == 1).sum().item()
+                            )
+                            masked_correct_pct = masked_correct_count / num_masked_seqs
+
+                        # Update sample_mask in train_data
+                        train_data["sample_mask"] = seq_error_mask
+
+                        print(
+                            f"  Masked {num_masked_seqs} sequences with mult_prob_error > {seq_logprob_error_threshold}",
+                            flush=True,
+                        )
+                        if num_masked_seqs > 0:
+                            print(
+                                f"  • {masked_correct_count}/{num_masked_seqs} masked sequences were correct (reward=1)"
+                                f" → {masked_correct_pct:.2%}",
+                                flush=True,
+                            )
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
@@ -2293,7 +2749,7 @@ def async_grpo_train(
 
                 print("▶ Training policy...")
                 with timer.time("policy_training"):
-                    train_results = policy.train(train_data, loss_fn)
+                    train_results = policy.train(train_data.as_shuffled(), loss_fn)
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 vllm_logger_metrics = None
@@ -2396,9 +2852,9 @@ def async_grpo_train(
                     if response_advantages.numel() > 0
                     else 0.0,
                 }
-                if "moe_metrics" in train_results:
+                if "moe_routing_diagnostics" in train_results:
                     metrics.update(
-                        {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+                        {f"moe_routing/{k}": v for k, v in train_results["moe_routing_diagnostics"].items()}
                     )
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
@@ -2427,6 +2883,11 @@ def async_grpo_train(
                 if vllm_logger_metrics is not None:
                     metrics["vllm_logger_metrics"] = vllm_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
+
+                # Always log sequence-level error metrics (useful for deciding threshold)
+                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
+                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
+                metrics["masked_correct_pct"] = masked_correct_pct
 
                 # Checkpointing (same as sync version)
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]

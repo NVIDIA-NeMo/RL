@@ -1,0 +1,46 @@
+defaults: vlm_grpo_nanov2vl.yaml
+checkpointing:
+  checkpoint_dir: results/clevr_grpo
+policy:
+  max_total_sequence_length: 3072
+  dtensor_cfg:
+    _v2: false
+    enabled: true
+    cpu_offload: true
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    clear_cache_every_n_steps: 1
+  dynamic_batching:
+    enabled: false
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5e-7
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      # when using Dtensor, we need to set foreach
+      # and fused to False
+      foreach: False
+      fused: False
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 50
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [50]
+  megatron_cfg:
+    enabled: false
+logger:
+  wandb:
+    name: vlm-grpo-3b-megatron

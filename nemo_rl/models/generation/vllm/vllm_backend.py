@@ -36,6 +36,12 @@ except ImportError:
         "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
     )
 
+# import nemo_rl.models.generation.vllm.custom_vlm
+# import nemo_rl.models.nemotron_h_nano_vl
+
+# nemo_rl.models.generation.vllm.custom_vlm.register()
+# nemo_rl.models.nemotron_h_nano_vl.register()
+
 
 class VllmInternalWorkerExtension:
     def init_collective(
@@ -70,6 +76,29 @@ class VllmInternalWorkerExtension:
     def get_zmq_address(self):
         """Get the ZMQ address for the current device."""
         return f"ipc:///tmp/{self.report_device_id()}.sock"
+
+    def report_mapping(self):
+        import os
+        import socket
+        import torch
+        cvd = [x for x in os.environ.get('CUDA_VISIBLE_DEVICES','').split(',') if x]
+        local = torch.cuda.current_device() if torch.cuda.is_available() else None
+        physical = int(cvd[local]) if (local is not None and cvd) else local
+        props = torch.cuda.get_device_properties(local) if local is not None else None
+        used, total = (torch.cuda.mem_get_info() if local is not None else (None, None))
+        return {
+            'pid': os.getpid(),
+            'host': socket.gethostname(),
+            'cvd': cvd,
+            'local_rank': local,
+            'physical_id': physical,
+            'name': getattr(props, 'name', None),
+            'total_gb': round((getattr(props, 'total_memory', 0))/1e9, 2) if props else None,
+            'free_gb': round((used or 0)/1e9, 2) if used is not None else None,
+            'VLLM_RAY_PER_WORKER_GPUS': os.environ.get('VLLM_RAY_PER_WORKER_GPUS'),
+            'VLLM_RAY_BUNDLE_INDICES': os.environ.get('VLLM_RAY_BUNDLE_INDICES'),
+            'CUDA_VISIBLE_DEVICES': os.environ.get('CUDA_VISIBLE_DEVICES'),
+        }
 
     def maybe_init_zmq(self):
         """Initialize the ZMQ socket if it doesn't exist."""
