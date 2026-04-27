@@ -13,8 +13,9 @@
 # limitations under the License.
 
 #!/bin/bash
-# Shard: All mcore-marked tests anywhere in the codebase
+# Shard: All mcore-marked tests except policy worker tests
+# Policy worker mcore tests run in L0_Unit_Tests_Mcore_Policy
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
-uv run --extra mcore bash -x ./tests/run_unit.sh "unit/" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated --mcore-only
+uv run --extra mcore bash -x ./tests/run_unit.sh "unit/" "--ignore=unit/models/policy/" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated --mcore-only
