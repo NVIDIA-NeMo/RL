@@ -180,7 +180,7 @@ policy:
       clip_grad: ${policy.max_grad_norm}  # matches --clip-grad 1.0
 
       # optimizer cpu offload
-      optimizer_cpu_offload: true
+      optimizer_cpu_offload: false
       optimizer_offload_fraction: 1.0
 
     scheduler:
