@@ -707,6 +707,62 @@ def nemo_gym_data_processor(
     return output
 
 
+def tau_bench_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a tau-bench datum into a DatumSpec for multi-turn GRPO training.
+
+    Expects datum_dict produced by ``examples/prepare_tau_bench_data.py``:
+      - messages: [system_message, initial_user_message]
+      - extra_env_info: {task_index, episode_id, step_count}
+      - task_name: "tau_bench"
+
+    The full system + user prompt is collapsed into a single message_log entry
+    (role "user") whose content is the chat-template-formatted string.  This is
+    the same layout used by math_hf_data_processor and is required because the
+    multi-turn rollout loop appends subsequent turns on top of this entry.
+    """
+    messages = datum_dict["messages"]
+    extra_env_info = datum_dict["extra_env_info"]
+
+    formatted: str = tokenizer.apply_chat_template(  # type: ignore[assignment]
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    token_ids = tokenizer(
+        formatted,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )["input_ids"][0]
+
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": formatted, "token_ids": token_ids}
+    ]
+
+    length = len(token_ids)
+    loss_multiplier = 1.0
+    if length >= max_seq_length:
+        for msg in message_log:
+            msg["token_ids"] = msg["token_ids"][: min(4, max_seq_length // len(message_log))]
+        loss_multiplier = 0.0
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict.get("task_name", "tau_bench"),
+    }
+    return output
+
+
 # Processor registry. Key is the processor name, value is the processor function.
 # Note: We cast the literal dict to Dict[str, TaskDataProcessFnCallable] because
 # type checkers see each concrete function's signature as a distinct callable type.
@@ -724,6 +780,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "sft_processor": sft_processor,
         "vlm_hf_data_processor": vlm_hf_data_processor,
         "nemo_gym_data_processor": nemo_gym_data_processor,
+        "tau_bench_data_processor": tau_bench_data_processor,
     },
 )
 

@@ -1,0 +1,98 @@
+# GRPO training on tau-bench: multi-turn customer service tasks with LLM-as-judge rewards.
+#
+# The agent must complete realistic retail or airline service tasks by calling domain
+# tools across multiple turns.  Rewards blend tau-bench's deterministic task-completion
+# check with an optional LLM judge score for policy compliance.
+#
+# Data preparation: run scripts/prepare_tau_bench_data.py to generate the JSONL files
+# before starting training.  The script calls tau-bench's env.reset() for each task
+# so that the prompts (tool definitions, domain wiki, initial user message) are
+# exactly consistent with the environment state.
+#
+# Tool call format expected from the policy:
+#   <tool_call>{"name": "tool_name", "arguments": {"key": "value"}}</tool_call>
+# Text without a <tool_call> block is treated as a respond action to the user.
+
+defaults: "grpo_math_1B.yaml"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  # tau-bench episodes can be up to ~30 tool calls; set headroom above max_steps.
+  max_rollout_turns: 35
+  max_num_steps: 10000
+  max_num_epochs: 1
+
+checkpointing:
+  checkpoint_dir: "results/grpo-tau-bench"
+  metric_name: "val:tau_bench/task_completion_rate"
+  higher_is_better: true
+
+policy:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  max_total_sequence_length: 4096
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: 512   # per turn; tool calls are short
+    temperature: 1.0
+    top_p: 1.0
+    stop_strings: null    # stop strings are supplied per-turn by the environment
+    stop_token_ids: null
+    vllm_cfg:
+      async_engine: false
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+
+data:
+  train:
+    dataset_name: "tau_bench"
+    tau_bench_env_name: "retail"   # "retail" or "airline"
+    split: "train"
+  validation:
+    dataset_name: "tau_bench"
+    tau_bench_env_name: "retail"
+    split: "dev"
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: "tau_bench_data_processor"
+    env_name: "tau_bench"
+
+env:
+  tau_bench:
+    num_workers: 8
+    env_name: "retail"       # "retail" or "airline"
+    task_split: "train"
+    user_strategy: "llm"
+    # User simulator model: any OpenAI-compatible endpoint.
+    # A small, fast model is sufficient since the user just follows the task script.
+    user_model: "openai/Qwen2.5-3B-Instruct"
+    user_base_url: "http://localhost:8001"   # separate vLLM instance for user model
+    user_api_key: "dummy"
+    max_steps: 30
+    # LLM-as-judge: scores policy compliance and communication quality.
+    # Set judge_model to null to disable and use pure tau-bench rewards.
+    judge_model: "openai/Qwen2.5-7B-Instruct"
+    judge_base_url: "http://localhost:8002"  # can reuse the policy server after training step
+    judge_api_key: "dummy"
+    judge_weight: 0.3   # 70% task-completion + 30% judge score
+
+logger:
+  log_dir: "logs"
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "grpo-dev"
+    name: "grpo-tau-bench"
+  swanlab:
+    project: "grpo-dev"
+    name: "grpo-tau-bench"
+  mlflow:
+    experiment_name: "grpo-dev"
+    run_name: "grpo-tau-bench"
+    tracking_uri: "http://localhost:5000"
