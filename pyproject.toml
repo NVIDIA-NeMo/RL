@@ -13,7 +13,7 @@ readme = { file = "README.md", content-type = "text/markdown" }
 name = "nemo-rl"
 dynamic = ["version", "readme"]
 description = "NeMo RL: A Scalable and Efficient Post-Training Library for Models Ranging from 1 GPU to 1000s, and from Tiny to >100B Parameters"
-requires-python = ">=3.13.13"
+requires-python = ">=3.13.13,<3.14"
 license = { text = "Apache 2.0" }
 dependencies = [
   "setuptools",
@@ -74,21 +74,22 @@ automodel = [
 ]
 vllm = [
   "cuda-python",
-  # Commit matches vllm-DSV4's vendored deep_gemm (zyongye/vllm cmake/external_projects/deepgemm.cmake);
+  # Commit matches vllm main's vendored deep_gemm (cmake/external_projects/deepgemm.cmake @ post-#40860);
   # required so the top-level package exposes DSV4 kernels (tf32_hc_prenorm_gemm, fp8_fp4_*, etc.)
   # and vllm's _import_deep_gemm picks it up instead of the cpython-312 vendored _C.so.
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7f2a703ed51ac1f7af07f5e1453b2d3267d37d50",
+  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@891d57b4db1071624b5c8fa0d1e51cb317fa709f",
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  # Prebuilt DeepSeek-V4 vLLM wheel extracted from vllm/vllm-openai:deepseekv4-cu129
-  # (commit 306b63f67, built against torch 2.11.0+cu129). See docs/model-readiness/deepseek-v4/.
-  "vllm @ file:///lustre/fsw/portfolios/coreai/users/shuangy/wheels/vllm-0.1.dev15826+g306b63f67-cp38-abi3-linux_x86_64.whl",
+  # Prebuilt vLLM wheel from teammate's local build off vllm-project/vllm main @ c0879d948
+  # (post-#40860 "[Feat] DeepSeek V4 Rebased" merge; includes dummy-load fix and full DSV4
+  # rebase). cu129 / cp313. md5 50571679730c1d26196ddb3107d25204.
+  "vllm @ file:///lustre/fsw/portfolios/coreai/users/larkz/nemorl-ds4/dist/vllm-0.19.2rc1.dev219+gc0879d948.cu129-cp313-cp313-linux_x86_64.whl",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.4",
-  "flashinfer-cubin==0.6.4",
-  "nvidia-cutlass-dsl>=4.4.0.dev1",
+  "flashinfer-python==0.6.8.post1",
+  "flashinfer-cubin==0.6.8.post1",
+  "nvidia-cutlass-dsl>=4.4.2",
 ]
 sglang = [
   "sglang",
@@ -257,14 +258,16 @@ override-dependencies = [
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  # Note: flashinfer versions are pinned per-extra (vllm uses 0.6.4, sglang uses 0.6.7.post2)
-  # since vllm and sglang extras are mutually exclusive and have different requirements.
-  # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm (0.6.4) and sglang (0.6.7.post2)
-  "flashinfer-python>=0.5.0",
-  "flashinfer-cubin>=0.5.0",
-  # sglang 0.5.10 requires nvidia-cutlass-dsl>=4.4.1 (via flashinfer 0.6.7.post2 which uses CUTLASS 4.4.2).
-  # Override to >=4.4.1 so uv can resolve to a version satisfying both vllm and sglang.
-  "nvidia-cutlass-dsl>=4.4.1",
+  # The DSV4 vllm wheel pins flashinfer-python/cubin == 0.6.8.post1 directly. uv
+  # overrides REPLACE constraints (not merge), so without an exact pin here the
+  # override loosens the wheel's == constraint and uv may resolve to a different
+  # version. This branch is vllm-only; sglang's 0.6.7.post2 pin is intentionally
+  # superseded.
+  "flashinfer-python==0.6.8.post1",
+  "flashinfer-cubin==0.6.8.post1",
+  # vllm DSV4 (post-#40860) requires nvidia-cutlass-dsl>=4.4.2; sglang 0.5.10 requires >=4.4.1.
+  # Override to >=4.4.2 so uv can resolve to a version satisfying both extras.
+  "nvidia-cutlass-dsl>=4.4.2",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
   # Automodel main + Gemma 4 + DSV4 PR #2039 require transformers>=5.5.0 (gemma4 module added in 5.5.0.dev).
