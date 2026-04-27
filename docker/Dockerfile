@@ -146,10 +146,7 @@ if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
     uv sync --link-mode symlink --locked --extra vllm --no-install-project
 fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    CMAKE_BUILD_PARALLEL_LEVEL=1 \
-    CUDAFLAGS="--threads 1 -Xptxas -O1" \
-    CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1 -DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
-    uv sync --link-mode symlink --locked --extra sglang --no-install-project
+    MAX_JOBS=2 CMAKE_BUILD_PARALLEL_LEVEL=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1" uv sync --link-mode symlink --locked --extra sglang --no-install-project
 fi
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --extra automodel --no-install-project
