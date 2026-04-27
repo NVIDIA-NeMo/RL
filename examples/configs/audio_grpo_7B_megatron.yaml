@@ -8,14 +8,15 @@ grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 8
   max_num_steps: 1000
-  max_val_samples: 32
-  val_batch_size: 32
+  val_at_start: true
+  max_val_samples: 256
+  val_batch_size: 256
 
 checkpointing:
   enabled: true
   checkpoint_dir: results/audio_grpo_7B_megatron
   keep_top_k: 10
-  save_period: 400
+  save_period: 50
 
 policy:
   model_name: Qwen/Qwen2.5-Omni-7B
