@@ -17,6 +17,7 @@ import random
 import re
 import warnings
 from functools import partial, wraps
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -24,6 +25,7 @@ import torch
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
+    PreTrainedTokenizerFast,
     PreTrainedTokenizerBase,
 )
 
@@ -312,9 +314,17 @@ def get_tokenizer(
         )
         tokenizer = processor.tokenizer
     else:
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True
-        )
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_config["name"], trust_remote_code=True
+            )
+        except (AttributeError, KeyError, ValueError):
+            tokenizer_path = Path(tokenizer_config["name"])
+            if not (tokenizer_path / "tokenizer.json").is_file():
+                raise
+            tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                tokenizer_config["name"], trust_remote_code=True
+            )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

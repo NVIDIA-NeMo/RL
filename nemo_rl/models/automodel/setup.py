@@ -711,7 +711,10 @@ def setup_model_and_optimizer(
     optimizer = None
     if init_optimizer:
         optimizer_cls = get_class(config["optimizer"]["name"])
-        optimizer = optimizer_cls(model.parameters(), **config["optimizer"]["kwargs"])
+        optimizer = optimizer_cls(
+            (param for param in model.parameters() if param.requires_grad),
+            **config["optimizer"]["kwargs"],
+        )
 
     # Initialize scheduler
     scheduler = None
