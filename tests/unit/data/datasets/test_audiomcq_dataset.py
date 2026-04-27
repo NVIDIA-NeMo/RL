@@ -255,6 +255,38 @@ class TestAudioMCQConstruction:
         # Different seed should produce a materially different split.
         assert train_ids_a != train_ids_c
 
+    def test_split_validation_returns_held_out_slice_not_train(
+        self, monkeypatch, tmp_path
+    ):
+        # Regression for round-1 review #2: split="validation" used to load
+        # the train manifest split and then drop the held-out slice on the
+        # floor, returning training rows. The wrapper must now route correctly.
+        rows = [_row(i) for i in range(10)]
+        snapshot_root = _build_fixture_snapshot(tmp_path, rows)
+        _patch_snapshot(monkeypatch, snapshot_root)
+
+        train_ds = AudioMCQDataset(split="train", split_validation_size=0.2, seed=42)
+        val_ds = AudioMCQDataset(split="validation", split_validation_size=0.2, seed=42)
+
+        train_ids = set(r["id"] for r in train_ds.dataset)
+        held_out_ids = set(r["id"] for r in train_ds.val_dataset)
+        val_loader_ids = set(r["id"] for r in val_ds.dataset)
+
+        assert val_loader_ids == held_out_ids, (
+            "split='validation' must return the held-out slice, not the training slice"
+        )
+        assert train_ids.isdisjoint(val_loader_ids), (
+            "validation IDs must not overlap with training IDs"
+        )
+
+    def test_validation_split_requires_size(self, monkeypatch, tmp_path):
+        rows = [_row(i) for i in range(5)]
+        snapshot_root = _build_fixture_snapshot(tmp_path, rows)
+        _patch_snapshot(monkeypatch, snapshot_root)
+
+        with pytest.raises(ValueError, match="split_validation_size > 0"):
+            AudioMCQDataset(split="validation", split_validation_size=0.0)
+
 
 class TestAudioMCQFormatData:
     def test_format_data_emits_avqa_shape(self, monkeypatch, tmp_path):

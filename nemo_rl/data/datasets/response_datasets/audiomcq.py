@@ -89,6 +89,9 @@ class AudioMCQDataset(RawDataset):
                 f"{AUDIOMCQ_MANIFEST} at its root."
             )
 
+        # The upstream dataset has only a native 'train' split; we always
+        # load the full manifest and synthesize a validation slice from it
+        # when the caller requests one.
         ds = load_dataset("json", data_files=manifest_path, split="train")
 
         # Defensive filter: the dataset is already pre-filtered to the StrongAC
@@ -105,10 +108,24 @@ class AudioMCQDataset(RawDataset):
 
         ds = ds.add_column("task_name", [self.task_name] * len(ds))
 
-        self.dataset = ds
-        self.preprocessor = self.format_data
-        self.val_dataset = None
-        self.split_train_validation(split_validation_size, seed)
+        if split == "validation":
+            if split_validation_size <= 0:
+                raise ValueError(
+                    "AudioMCQDataset(split='validation') requires "
+                    "split_validation_size > 0; the upstream dataset has no "
+                    "native validation split."
+                )
+            split_ds = ds.train_test_split(test_size=split_validation_size, seed=seed)
+            self.dataset = split_ds["test"]
+            self.preprocessor = self.format_data
+            self.val_dataset = None
+        else:
+            self.dataset = ds
+            self.preprocessor = self.format_data
+            self.val_dataset = None
+            # Populate self.val_dataset for the train-and-validate-from-train
+            # convention used by the rest of the codebase.
+            self.split_train_validation(split_validation_size, seed)
 
     def _eager_audio_probe(self, ds: Dataset) -> None:
         """Verify the first row's audio file exists under the snapshot root.
