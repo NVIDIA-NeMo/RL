@@ -388,10 +388,10 @@ def training_setup(request):
     "training_setup",
     [
         # (num_gpus, tp, pp, model_fixture_name, config_updates)
+        # Qwen2 variants removed — converter path is covered by functional tests
+        # (grpo_megatron.sh, dpo_megatron.sh, sft_megatron.sh)
         (2, 1, 1, "tiny_llama_model_path", {}),
         (2, 2, 1, "tiny_llama_model_path", {}),
-        (2, 1, 1, "tiny_qwen2_model_path", {}),
-        (2, 2, 1, "tiny_qwen2_model_path", {}),
         (2, 1, 1, "tiny_llama_model_path", {"precision": "bfloat16"}),
         (2, 1, 1, "tiny_llama_model_path", {"activation_checkpointing": True}),
         (2, 2, 1, "tiny_llama_model_path", {"sequence_parallel": True}),
@@ -408,8 +408,6 @@ def training_setup(request):
     ids=[
         "2gpu_dp2_llama",
         "2gpu_tp2_llama",
-        "2gpu_dp2_qwen2",
-        "2gpu_tp2_qwen2",
         "2gpu_dp2_llama_bf16",
         "2gpu_dp2_llama_ac",
         "2gpu_tp2_llama_sp",
@@ -731,33 +729,22 @@ def logprob_setup(request):
     "logprob_setup",
     [
         # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name)
+        # Qwen2 variants removed — converter path is covered by functional tests
         (2, 1, 1, None, None, "tiny_llama_model_path"),
         (2, 2, 1, None, None, "tiny_llama_model_path"),
-        (2, 1, 1, None, None, "tiny_qwen2_model_path"),
-        (2, 2, 1, None, None, "tiny_qwen2_model_path"),
         (2, 1, 1, None, True, "tiny_llama_model_path"),
         (2, 2, 1, None, True, "tiny_llama_model_path"),
-        (2, 1, 1, None, True, "tiny_qwen2_model_path"),
-        (2, 2, 1, None, True, "tiny_qwen2_model_path"),
         (2, 1, 1, 16, True, "tiny_llama_model_path"),
         (2, 2, 1, 16, True, "tiny_llama_model_path"),
-        (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
-        (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
     ],
     indirect=True,
     ids=[
         "2gpu_dp2_llama",
         "2gpu_tp2_llama",
-        "2gpu_dp2_qwen2",
-        "2gpu_tp2_qwen2",
         "2gpu_dp2_deferfp32_llama",
         "2gpu_tp2_deferfp32_llama",
-        "2gpu_dp2_deferfp32_qwen2",
-        "2gpu_tp2_deferfp32_qwen2",
         "2gpu_dp2_chunked_deferfp32_llama",
         "2gpu_tp2_chunked_deferfp32_llama",
-        "2gpu_dp2_chunked_deferfp32_qwen2",
-        "2gpu_tp2_chunked_deferfp32_qwen2",
     ],
 )
 def test_megatron_policy_logprobs(logprob_setup):
@@ -1585,33 +1572,22 @@ def topk_setup(request):
     "topk_setup",
     [
         # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name)
+        # Qwen2 variants removed — converter path is covered by functional tests
         (2, 1, 1, None, None, "tiny_llama_model_path"),
         (2, 2, 1, None, None, "tiny_llama_model_path"),
-        (2, 1, 1, None, None, "tiny_qwen2_model_path"),
-        (2, 2, 1, None, None, "tiny_qwen2_model_path"),
         (2, 1, 1, None, True, "tiny_llama_model_path"),
         (2, 2, 1, None, True, "tiny_llama_model_path"),
-        (2, 1, 1, None, True, "tiny_qwen2_model_path"),
-        (2, 2, 1, None, True, "tiny_qwen2_model_path"),
         (2, 1, 1, 16, True, "tiny_llama_model_path"),
         (2, 2, 1, 16, True, "tiny_llama_model_path"),
-        (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
-        (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
     ],
     indirect=True,
     ids=[
         "2gpu_dp2_llama",
         "2gpu_tp2_llama",
-        "2gpu_dp2_qwen2",
-        "2gpu_tp2_qwen2",
         "2gpu_dp2_deferfp32_llama",
         "2gpu_tp2_deferfp32_llama",
-        "2gpu_dp2_deferfp32_qwen2",
-        "2gpu_tp2_deferfp32_qwen2",
         "2gpu_dp2_chunked_deferfp32_llama",
         "2gpu_tp2_chunked_deferfp32_llama",
-        "2gpu_dp2_chunked_deferfp32_qwen2",
-        "2gpu_tp2_chunked_deferfp32_qwen2",
     ],
 )
 def test_megatron_policy_topk_logits(topk_setup):
