@@ -36,12 +36,88 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.utils.multimodal_payload_metrics import (
+    collect_multimodal_payload_metrics,
+    print_multimodal_payload_metrics,
+)
 
 # Global thresholds for top_k and top_p validation.
 # While top-k/p are not supported, these values allow for token filtering while the logprobs should be compatible.
 # See https://github.com/NVIDIA-NeMo/RL/issues/69 and https://github.com/NVIDIA-NeMo/RL/issues/237 for more details.
 TOP_K_THRESHOLD = 8000  # Allow top_k >= 8000 (effectively no filtering)
 TOP_P_THRESHOLD = 0.99  # Allow top_p >= 0.99 (close to 1.0)
+
+_COMPACT_SCHEMA_VERSION = 1
+
+
+def _build_compact_mm_payload(shard: "SlicedDataDict") -> dict[str, Any]:
+    """Build a compact multimodal payload from a sharded batch.
+
+    Deduplicates vllm_images and vllm_content across rows, storing only unique
+    values plus per-row index mappings. This removes N-scaling of image payload
+    when the same prompt (and its images) appears multiple times in the shard.
+
+    Returns a dict with schema_version, row_count, per-row lookup indices,
+    unique_contents, and unique_images lists.
+    """
+    row_count = len(shard["input_ids"])
+
+    # Build unique pools and per-row mappings
+    unique_contents: list[str] = []
+    unique_images: list[str] = []
+    content_to_idx: dict[str, int] = {}
+    # Map image string -> unique index
+    image_to_idx: dict[str, int] = {}
+
+    row_use_token_prompt: list[bool] = []
+    row_content_idx: list[int] = []
+    row_image_ref_indices: list[list[int]] = []
+
+    vllm_content = shard.get("vllm_content", None)
+    vllm_images = shard.get("vllm_images", None)
+
+    for i in range(row_count):
+        content = vllm_content[i] if vllm_content is not None else None
+        images = vllm_images[i] if vllm_images is not None else None
+
+        # Determine if this row uses a token-based prompt (no content / no real images)
+        has_real_images = (
+            images is not None
+            and len(images) > 0
+            and images[0] != "__noimage__"
+        )
+        if content is None or not has_real_images:
+            row_use_token_prompt.append(True)
+            row_content_idx.append(-1)
+            row_image_ref_indices.append([])
+            continue
+
+        row_use_token_prompt.append(False)
+
+        # Deduplicate content string
+        if content not in content_to_idx:
+            content_to_idx[content] = len(unique_contents)
+            unique_contents.append(content)
+        row_content_idx.append(content_to_idx[content])
+
+        # Deduplicate image strings
+        img_refs: list[int] = []
+        for img in images:
+            if img not in image_to_idx:
+                image_to_idx[img] = len(unique_images)
+                unique_images.append(img)
+            img_refs.append(image_to_idx[img])
+        row_image_ref_indices.append(img_refs)
+
+    return {
+        "schema_version": _COMPACT_SCHEMA_VERSION,
+        "row_count": row_count,
+        "row_use_token_prompt": row_use_token_prompt,
+        "row_content_idx": row_content_idx,
+        "row_image_ref_indices": row_image_ref_indices,
+        "unique_contents": unique_contents,
+        "unique_images": unique_images,
+    }
 
 
 class VllmGeneration(GenerationInterface):
@@ -436,6 +512,45 @@ class VllmGeneration(GenerationInterface):
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
         )
+        debug_payload_metrics = self.cfg.get("debug_payload_metrics", False)
+
+        # When deduplicate_multimodal_data is enabled, compact vllm_images/vllm_content
+        # per shard to remove N-scaling of string image payload on the driver->vllm boundary.
+        if self.cfg.get("deduplicate_multimodal_data", False):
+            for shard in sharded_data:
+                has_vllm_mm = "vllm_content" in shard or "vllm_images" in shard
+                if has_vllm_mm:
+                    shard["vllm_mm_compact_payload"] = _build_compact_mm_payload(shard)
+                    # Remove the raw per-row fields; workers reconstruct from compact payload.
+                    shard.pop("vllm_content", None)
+                    shard.pop("vllm_images", None)
+                    shard.pop("vllm_videos", None)
+            # Measure actual bytes sent to workers (post-compaction, summed across shards).
+            total_rows = len(data["input_ids"])
+            total_non_tensor = sum(
+                collect_multimodal_payload_metrics(
+                    shard,
+                    boundary="driver_to_vllm_generation",
+                )["payload_bytes/driver_to_vllm_generation/non_tensor_mm"]
+                for shard in sharded_data
+            )
+            print_multimodal_payload_metrics({
+                "payload_bytes/driver_to_vllm_generation/non_tensor_mm": total_non_tensor,
+                "payload_bytes/driver_to_vllm_generation/tensor_mm": 0,
+                "payload_bytes/driver_to_vllm_generation/total_mm": total_non_tensor,
+                "payload_counts/driver_to_vllm_generation/logical_rows": total_rows,
+            }, enabled=debug_payload_metrics)
+        else:
+            # Measure pre-transfer bytes when compaction is not active.
+            print_multimodal_payload_metrics(
+                collect_multimodal_payload_metrics(
+                    data,
+                    boundary="driver_to_vllm_generation",
+                    logical_rows=len(data["input_ids"]),
+                ),
+                enabled=debug_payload_metrics,
+            )
+
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate",
             data=sharded_data,
@@ -710,7 +825,7 @@ class VllmGeneration(GenerationInterface):
             return all(result for result in results if result is not None)
         except Exception as e:
             print(f"Error during policy preparation: {e}")
-            return False
+            raise
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""
@@ -737,7 +852,7 @@ class VllmGeneration(GenerationInterface):
             return all(result for result in results if result is not None)
         except Exception as e:
             print(f"Error during policy preparation: {e}")
-            return False
+            raise
 
     def shutdown(self) -> bool:
         """Shut down all vLLM workers and clean up resources."""
@@ -905,7 +1020,7 @@ class VllmGeneration(GenerationInterface):
             return all(result for result in results if result is not None)
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")
-            return False
+            raise
 
     @property
     def requires_kv_scale_sync(self) -> bool:

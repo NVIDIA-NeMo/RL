@@ -296,15 +296,36 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             OpenAIServingModels,
             OpenAIServingTokenization,
         )
-        from vllm.entrypoints.openai.protocol import (
-            ChatCompletionRequest,
-            ChatCompletionResponse,
-            ErrorResponse,
-            TokenizeChatRequest,
-            TokenizeCompletionRequest,
-            TokenizeResponse,
-        )
-        from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+
+        # vllm <= 0.13.0:
+        try:
+            from vllm.entrypoints.openai.protocol import (
+                ChatCompletionRequest,
+                ChatCompletionResponse,
+                ErrorResponse,
+                TokenizeChatRequest,
+                TokenizeCompletionRequest,
+                TokenizeResponse,
+            )
+        # vllm > 0.13.0:
+        except ModuleNotFoundError:
+            from vllm.entrypoints.openai.engine.protocol import (
+                ErrorResponse,
+            )
+            from vllm.entrypoints.openai.chat_completion.protocol import (
+                ChatCompletionRequest,
+                ChatCompletionResponse,
+            )
+            from vllm.entrypoints.serve.tokenize.protocol import (
+                TokenizeChatRequest,
+                TokenizeCompletionRequest,
+                TokenizeResponse,
+            )
+        try:
+            from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+        except ImportError:
+            from vllm.tool_parsers import ToolParserManager
+
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
@@ -325,10 +346,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             base_model_paths=base_model_paths,
             lora_modules=None,
         )
-        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
+        # Older vLLM builds sometimes required model_config; newer ones reject it.
         if vllm_version < "0.11.1":
-            openai_serving_models_kwargs["model_config"] = model_config
-        openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
+            try:
+                openai_serving_models = OpenAIServingModels(
+                    **openai_serving_models_kwargs, model_config=model_config
+                )
+            except TypeError:
+                openai_serving_models = OpenAIServingModels(
+                    **openai_serving_models_kwargs
+                )
+        else:
+            openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
 
         class NeMoRLOpenAIChatRequestMixin:
             def model_post_init(self, context):
@@ -357,6 +386,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 tool_dicts=None,
                 documents=None,
                 chat_template_kwargs=None,
+                default_chat_template_kwargs=None,
                 tool_parser=None,
                 add_special_tokens=False,
             ):
@@ -368,23 +398,114 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 # Deepcopy messages here since _preprocess_chat may be destructive.
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
-                # res is conversation, [request_prompt], [engine_prompt]
-                res = await super()._preprocess_chat(
-                    request,
-                    tokenizer,
-                    messages,
-                    chat_template,
-                    chat_template_content_format,
-                    add_generation_prompt,
-                    continue_final_message,
-                    tool_dicts,
-                    documents,
-                    chat_template_kwargs,
-                    tool_parser,
-                    add_special_tokens,
+                def _extract_engine_prompts(preprocess_res):
+                    """Handle both old and new vLLM _preprocess_chat return shapes.
+
+                    Old shape: (conversation, [request_prompt], [engine_prompt])
+                    New shape: (conversation, [engine_prompt])
+                    """
+                    if not isinstance(preprocess_res, tuple):
+                        raise TypeError(
+                            f"Unexpected _preprocess_chat return type: {type(preprocess_res)}"
+                        )
+                    if len(preprocess_res) >= 3:
+                        return preprocess_res[2]
+                    if len(preprocess_res) == 2:
+                        return preprocess_res[1]
+                    raise ValueError(
+                        f"Unexpected _preprocess_chat tuple length: {len(preprocess_res)}"
+                    )
+
+                original_max_tokens = getattr(request, "max_tokens", None)
+                original_max_completion_tokens = getattr(
+                    request, "max_completion_tokens", None
                 )
+                has_output_budget = (
+                    original_max_tokens is not None
+                    or original_max_completion_tokens is not None
+                )
+                if has_output_budget:
+                    # vLLM validates max_tokens during preprocessing, before
+                    # NeMo RL can account for final chat-template tokenization.
+                    # Temporarily use a minimal generation budget, then clamp
+                    # the real budget after preprocessing exposes prompt tokens.
+                    if original_max_tokens is not None:
+                        setattr(request, "max_tokens", 1)
+                    if original_max_completion_tokens is not None:
+                        setattr(request, "max_completion_tokens", 1)
+
+                try:
+                    res = await super()._preprocess_chat(
+                        request,
+                        tokenizer,
+                        messages,
+                        chat_template,
+                        chat_template_content_format,
+                        add_generation_prompt,
+                        continue_final_message,
+                        tool_dicts,
+                        documents,
+                        chat_template_kwargs,
+                        default_chat_template_kwargs,
+                        tool_parser,
+                        add_special_tokens,
+                    )
+                except Exception:
+                    if has_output_budget:
+                        setattr(request, "max_tokens", original_max_tokens)
+                        setattr(
+                            request,
+                            "max_completion_tokens",
+                            original_max_completion_tokens,
+                        )
+                    raise
+
+                def _clamp_output_budget(prompt_token_count: int) -> None:
+                    if not has_output_budget:
+                        return
+
+                    max_model_len = getattr(self, "max_model_len")
+                    remaining_ctx = max_model_len - prompt_token_count
+                    allowed_new_tokens = max(0, remaining_ctx)
+
+                    if original_max_tokens is not None:
+                        setattr(
+                            request,
+                            "max_tokens",
+                            min(original_max_tokens, allowed_new_tokens),
+                        )
+                    if original_max_completion_tokens is not None:
+                        setattr(
+                            request,
+                            "max_completion_tokens",
+                            min(
+                                original_max_completion_tokens,
+                                allowed_new_tokens,
+                            ),
+                        )
+
+                    effective_before = (
+                        original_max_completion_tokens
+                        if original_max_completion_tokens is not None
+                        else original_max_tokens
+                    )
+                    effective_after = (
+                        getattr(request, "max_completion_tokens")
+                        if original_max_completion_tokens is not None
+                        else getattr(request, "max_tokens")
+                    )
+                    if effective_before != effective_after:
+                        vllm_async_llm_logger.info(
+                            "Clamped OpenAI chat max_tokens from %s to %s for prompt_len=%s max_model_len=%s",
+                            effective_before,
+                            effective_after,
+                            prompt_token_count,
+                            max_model_len,
+                        )
 
                 if request.required_prefix_token_ids is None:
+                    engine_prompts = _extract_engine_prompts(res)
+                    _clamp_output_budget(len(engine_prompts[0]["prompt_token_ids"]))
                     return res
 
                 # Find the last assistant message
@@ -419,14 +540,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     tool_dicts=tool_dicts,
                     documents=documents,
                     chat_template_kwargs=chat_template_kwargs,
+                    default_chat_template_kwargs=default_chat_template_kwargs,
                     tool_parser=tool_parser,
                     add_special_tokens=add_special_tokens,
                 )
-                actual_corresponding_token_ids = corresponding_res[2][0][
+                corresponding_engine_prompts = _extract_engine_prompts(corresponding_res)
+                actual_corresponding_token_ids = corresponding_engine_prompts[0][
                     "prompt_token_ids"
                 ]
 
-                engine_prompt = res[2][
+                engine_prompts = _extract_engine_prompts(res)
+                engine_prompt = engine_prompts[
                     0
                 ]  # We need to modify engine_prompt.prompt_token_ids
 
@@ -438,6 +562,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
+                _clamp_output_budget(len(final_prompt_token_ids))
 
                 return res
 
@@ -914,6 +1039,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 max_tokens=self.cfg["max_new_tokens"],
                 stop_token_ids=self.cfg["stop_token_ids"],
                 stop=final_stop_strings,
+                bad_words=self.cfg.get("bad_words"),
                 include_stop_str_in_output=True,  # returning stop strings like hf
             )
 

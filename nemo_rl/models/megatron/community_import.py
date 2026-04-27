@@ -53,6 +53,18 @@ def import_model_from_hf_name(
     )
     orig_pipeline_dtype = model_provider.pipeline_dtype
 
+    radio_config_keys = [
+        "radio_force_eval_mode",
+        "radio_force_cpe_eval_mode",
+        "radio_interpolate_only_cpe",
+        "radio_cpe_aspect_ratio_select",
+        "radio_disable_cpe",
+    ]
+    if megatron_config is not None:
+        for key in radio_config_keys:
+            if key in megatron_config:
+                setattr(model_provider, key, megatron_config[key])
+
     if megatron_config is not None:
         model_provider.tensor_model_parallel_size = megatron_config[
             "tensor_model_parallel_size"
@@ -136,10 +148,82 @@ def export_model_from_megatron(
             input_path, skip_temp_dist_context=True
         )
 
-        # Save in HuggingFace format
-        bridge.save_hf_pretrained(megatron_model, output_path)
+        # Save with frozen tensors included
+        _save_hf_with_frozen_tensors(bridge, megatron_model, output_path)
 
     # resetting mcore state
     import megatron.core.rerun_state_machine
 
     megatron.core.rerun_state_machine.destroy_rerun_state_machine()
+
+
+def _save_hf_with_frozen_tensors(
+    bridge: AutoBridge,
+    megatron_model: list,
+    output_path: str,
+) -> None:
+    """Save HF checkpoint, including constant buffers from the base model.
+
+    The Megatron model only contains trainable parameters. Constant buffers
+    like vision encoder normalization values (input_conditioner.norm_mean/std)
+    are not part of the Megatron state_dict. This function wraps the export
+    to include those missing tensors from the base HF model.
+    """
+    import torch.distributed as dist
+
+    from megatron.bridge.models.hf_pretrained.state import SafeTensorsStateSource
+
+    # Save artifacts (config, tokenizer, etc.) - only rank 0
+    if dist.is_available() and dist.is_initialized():
+        if dist.get_rank() == 0:
+            bridge.hf_pretrained.save_artifacts(output_path)
+        dist.barrier()
+    else:
+        bridge.hf_pretrained.save_artifacts(output_path)
+
+    # Get the base export generator
+    base_generator = bridge.export_hf_weights(megatron_model, cpu=True)
+
+    # Wrap it to also yield missing tensors (constant buffers) from the base model
+    generator = _generator_with_missing_tensors(
+        base_generator,
+        bridge.hf_pretrained,
+    )
+
+    # Save using the wrapped generator
+    state_source = bridge.hf_pretrained.state.source
+    if not isinstance(state_source, SafeTensorsStateSource):
+        raise ValueError("Expected SafeTensorsStateSource for streaming save")
+    state_source.save_generator(generator, output_path, strict=True)
+
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def _generator_with_missing_tensors(base_generator, hf_pretrained):
+    """Wrap export generator to include missing tensors from the base HF model."""
+    from megatron.bridge.models.hf_pretrained.state import SafeTensorsStateSource
+
+    state_source = hf_pretrained.state.source
+    if not isinstance(state_source, SafeTensorsStateSource):
+        yield from base_generator
+        return
+
+    # Get all expected tensor names from the base model
+    all_expected_keys = set(state_source.get_all_keys())
+
+    # Track which tensors we've yielded
+    yielded_keys = set()
+
+    # Yield all tensors from the base generator
+    for name, tensor in base_generator:
+        yielded_keys.add(name)
+        yield name, tensor
+
+    # Find and yield missing tensors (constant buffers) from the base model
+    missing_keys = all_expected_keys - yielded_keys
+    if missing_keys:
+        print(f"Adding {len(missing_keys)} missing tensors from base model: {sorted(missing_keys)}")
+        missing_tensors = state_source.load_tensors(list(missing_keys))
+        for name, tensor in missing_tensors.items():
+            yield name, tensor

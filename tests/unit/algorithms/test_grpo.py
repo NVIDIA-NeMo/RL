@@ -21,11 +21,13 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
+    _get_reward_valid_mask,
     async_grpo_train,
     dynamic_sampling,
     grpo_train,
     normalize_advantages_with_epsilon,
 )
+from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.algorithms.loss_functions import ClippedPGLossFn
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -38,6 +40,58 @@ from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
     create_mock_batch,
 )
+
+
+def test_reward_valid_mask_excludes_zero_loss_multiplier_and_truncated():
+    repeated_batch = BatchedDataDict[DatumSpec](
+        {
+            "total_reward": torch.tensor([1.0, 0.0, 1.0], dtype=torch.float32),
+            "loss_multiplier": torch.tensor([1.0, 0.0, 1.0], dtype=torch.float32),
+            "truncated": torch.tensor([False, False, True], dtype=torch.bool),
+        }
+    )
+
+    valid_mask = _get_reward_valid_mask(
+        repeated_batch, use_overlong_filtering=True
+    )
+
+    torch.testing.assert_close(
+        valid_mask,
+        torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32),
+    )
+
+
+def test_overflow_sample_does_not_contaminate_prompt_group_baseline():
+    repeated_batch = BatchedDataDict[DatumSpec](
+        {
+            "total_reward": torch.tensor([1.0, 3.0, 100.0], dtype=torch.float32),
+            "loss_multiplier": torch.tensor([1.0, 1.0, 0.0], dtype=torch.float32),
+            "truncated": torch.tensor([False, False, False], dtype=torch.bool),
+        }
+    )
+    prompts = torch.tensor(
+        [
+            [10, 11, 0],
+            [10, 11, 0],
+            [10, 11, 0],
+        ],
+        dtype=torch.long,
+    )
+
+    valid_mask = _get_reward_valid_mask(
+        repeated_batch, use_overlong_filtering=True
+    )
+    baseline, _ = calculate_baseline_and_std_per_prompt(
+        prompts,
+        repeated_batch["total_reward"],
+        valid_mask,
+        leave_one_out_baseline=True,
+    )
+
+    torch.testing.assert_close(
+        baseline[:2],
+        torch.tensor([3.0, 1.0], dtype=torch.float32),
+    )
 
 # ============================================================================
 # Stub classes for async GRPO testing (non-Ray versions for easy mocking)

@@ -1,0 +1,6 @@
+The following is a visual math problem.
+Answer the question with a step-by-step process.
+Provide your final answer only once at the very end, between <answer> and </answer> tags.
+For example: <answer>42</answer>
+Do not repeat the answer tag or provide multiple answers.
+Problem: {}

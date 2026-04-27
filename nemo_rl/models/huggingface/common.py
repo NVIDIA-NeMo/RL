@@ -50,17 +50,26 @@ class ModelFlag(Enum):
     def matches(self, model_name: str) -> bool:
         match self:
             case ModelFlag.VLLM_LOAD_FORMAT_AUTO:
-                return is_gemma_model(model_name)
+                return is_gemma_model(model_name) or is_nano_nemotron_vl_model(model_name)
             case _:
                 raise ValueError(f"Unknown ModelFlag: {self}")
 
 
 def is_gemma_model(model_name: str) -> bool:
+    # TODO(jseppanen): hardcoded for nemotron nano vl (AutoConfig.from_pretrained would need registration)
+    return False
     hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     return hasattr(hf_config, "model_type") and hf_config.model_type in [
         "gemma2",
         "gemma3",
         "gemma3_text",
+    ]
+
+
+def is_nano_nemotron_vl_model(model_name: str) -> bool:
+    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    return hasattr(hf_config, "model_type") and hf_config.model_type in [
+        "NemotronH_Nano_VL_V2",
     ]
 
 

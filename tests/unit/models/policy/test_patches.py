@@ -18,9 +18,11 @@ import tempfile
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
+import torch
 
 from nemo_rl.models.policy.workers.patches import (
     _get_transformer_engine_file,
+    apply_torch_aten_alias_tensor_patch,
     apply_transformer_engine_patch,
 )
 
@@ -445,3 +447,44 @@ def permutation_kernel(x):
                 assert captured.out.count("Successfully patched") == 1
         finally:
             os.unlink(tmp_path)
+
+
+def build_sharded_3d(rank: int, world_size: int):
+    """
+    Build tensor, DTensor, and test the sharding rule for torch.ops.aten.alias.default.
+    """
+    from torch.distributed.tensor import DeviceMesh, DTensor
+
+    mesh = DeviceMesh("cuda", list(range(world_size)))
+    global_shape = (4, 2, 4)
+    tensor = torch.arange(
+        torch.tensor(global_shape).prod(), dtype=torch.float32
+    ).reshape(global_shape)
+
+    try:
+        dtensor = DTensor.from_local(
+            tensor,
+            device_mesh=mesh,
+        )
+        alias_dtensor = torch.ops.aten.alias.default(dtensor)
+        assert False, (
+            "Torch==2.9 should raise 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered', but it didn't."
+            "You can:\n "
+            "1. Check is you bump your torch version which contain the fix https://github.com/pytorch/pytorch/pull/166867\n"
+            "2. If yes, remove patch apply_torch_aten_alias_tensor_patch in nemo_rl/models/policy/workers/patches.py \n"
+            "3. Remove the patching call in nemo_rl/models/policy/workers/dtensor_policy_worker.py and nemo_rl/models/policy/workers/dtensor_policy_worker_v2.py \n"
+            "4. Delete this test"
+        )
+    except NotImplementedError:
+        apply_torch_aten_alias_tensor_patch()
+        alias_dtensor = torch.ops.aten.alias.default(dtensor)
+        assert alias_dtensor.shape == global_shape
+        assert torch.allclose(alias_dtensor.to_local().cpu(), tensor.cpu())
+
+
+@pytest.mark.cuda
+def test_aten_alias_sharding_still_missing_upstream(
+    distributed_test_runner, world_size=2
+):
+    """Test that sharding rule for aten.alias.default is still missing upstream."""
+    distributed_test_runner(build_sharded_3d, world_size=world_size)

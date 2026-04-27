@@ -15,7 +15,6 @@
 import argparse
 import json
 import os
-import pprint
 from itertools import chain, repeat
 from typing import Optional
 
@@ -75,34 +74,43 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return args, overrides
 
 
+class LazyNemoGymDataset:
+    """List-like wrapper that defers image loading and HF-processor work to access time."""
+
+    def __init__(self, raw_examples: list[dict], processor):
+        self._raw = raw_examples
+        self._processor = processor
+
+    def __len__(self):
+        return len(self._raw)
+
+    def __getitem__(self, idx) -> DatumSpec:
+        return nemo_gym_example_to_nemo_rl_datum_spec(
+            self._raw[idx], idx, processor=self._processor
+        )
+
+
 def setup_single_nemo_gym_dataset(
-    jsonl_fpath: str, tokenizer, num_repeats: Optional[int] = None
+    jsonl_fpath: str, tokenizer, num_repeats: Optional[int] = None, processor=None
 ):
     with open(jsonl_fpath) as f:
         nemo_gym_examples = list(map(json.loads, f))
 
-    print(f"Loaded data at {jsonl_fpath}. Found {len(nemo_gym_examples)} examples")
-
     if num_repeats:
-        previous_length = len(nemo_gym_examples)
         nemo_gym_examples = list(
             chain.from_iterable(
                 repeat(nemo_gym_example, num_repeats)
                 for nemo_gym_example in nemo_gym_examples
             )
         )
-        print(
-            f"Repeating examples (in a pattern of abc to aabbcc) for {jsonl_fpath} from {previous_length} to {len(nemo_gym_examples)}!"
-        )
 
-    nemo_rl_compatible_examples: list[DatumSpec] = [
-        nemo_gym_example_to_nemo_rl_datum_spec(nemo_gym_example, idx)
-        for idx, nemo_gym_example in enumerate(nemo_gym_examples)
-    ]
+    print(f"  ✓ Loaded {len(nemo_gym_examples)} examples from {jsonl_fpath} (lazy image loading)")
+
+    dataset = LazyNemoGymDataset(nemo_gym_examples, processor)
 
     passthrough_task_processor = lambda datum_dict, *args, **kwargs: datum_dict
     return AllTaskProcessedDataset(
-        nemo_rl_compatible_examples,
+        dataset,
         tokenizer,
         None,
         passthrough_task_processor,
@@ -126,7 +134,6 @@ def collect_trajectories(
 
     log_filename = "trajectory_collection.jsonl"
 
-    print("\n🔍 Running trajectory collection...", flush=True)
     generation_config = master_config["policy"]["generation"]
     for val_batch in val_dataloader:
         nemo_gym_rollout_result = run_async_nemo_gym_rollout(
@@ -169,25 +176,23 @@ def main() -> None:
         )
 
     config = load_config(args.config)
-    print(f"Loaded configuration from: {args.config}")
 
     if overrides:
-        print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
     config: MasterConfig = OmegaConf.to_container(config, resolve=True)
-    print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
     config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
-    print(f"📊 Using log directory: {config['logger']['log_dir']}")
-    if config["checkpointing"]["enabled"]:
-        print(
-            f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
-        )
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+    is_vlm = config["policy"].get("is_vlm", False)
+    if is_vlm:
+        processor = get_tokenizer(config["policy"]["tokenizer"], get_processor=True)
+        tokenizer = processor.tokenizer
+    else:
+        processor = None
+        tokenizer = get_tokenizer(config["policy"]["tokenizer"])
     assert config["policy"]["generation"] is not None, (
         "A generation config is required for GRPO"
     )
@@ -195,20 +200,25 @@ def main() -> None:
         config["policy"]["generation"], tokenizer
     )
 
+    if is_vlm and "vllm_cfg" in config["policy"]["generation"]:
+        assert not config["policy"]["generation"]["vllm_cfg"]["skip_tokenizer_init"], (
+            "VLMs require skip_tokenizer_init=False"
+        )
     # NeMo-Gym specific config setup.
     setup_nemo_gym_config(config, tokenizer)
 
     # We assert here since this is right after the final config has been materialized.
     assert _should_use_nemo_gym(config)
 
-    print("\n▶ Setting up data...")
     train_dataset = setup_single_nemo_gym_dataset(
         jsonl_fpath=config["data"]["train_jsonl_fpath"],
         tokenizer=tokenizer,
+        processor=processor,
     )
     val_dataset = setup_single_nemo_gym_dataset(
         jsonl_fpath=config["data"]["validation_jsonl_fpath"],
         tokenizer=tokenizer,
+        processor=processor,
     )
 
     # Validation dataset config setup.
@@ -221,15 +231,8 @@ Gym principle is that there is no hidden data pre or post processing from you. W
 The validation set you pass in will directly be used for validation with no additional preprocessing. If you want to have some number of repetitions, please include that in your dataset, via ``num_repeats``, in your dataset config and `ng_prepare_data` will prepare it accordingly."""
         )
 
-    print(
-        f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
-    )
     config["grpo"]["max_val_samples"] = len(val_dataset)
     config["grpo"]["val_batch_size"] = config["grpo"]["max_val_samples"]
-
-    # Print config
-    print("Final config:")
-    pprint.pprint(config)
 
     init_ray()
 
@@ -244,7 +247,7 @@ The validation set you pass in will directly be used for validation with no addi
         checkpointer,
         grpo_state,
         master_config,
-    ) = setup(config, tokenizer, train_dataset, val_dataset)
+    ) = setup(config, tokenizer, train_dataset, val_dataset, processor=processor)
 
     is_trajectory_collection = (
         config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False
@@ -259,6 +262,7 @@ The validation set you pass in will directly be used for validation with no addi
             "py_executable": get_actor_python_env(
                 "nemo_rl.environments.nemo_gym.NemoGym"
             ),
+            "env_vars": dict(os.environ),
         }
     ).remote(nemo_gym_config)
     # Blocking wait for NeMo-Gym to spin up

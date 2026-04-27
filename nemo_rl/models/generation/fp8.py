@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 from dataclasses import dataclass, field
 from unittest.mock import patch
+
+logger = logging.getLogger(__name__)
 
 import ray
 import torch
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModel
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-from vllm.model_executor.layers.linear import LinearBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
@@ -43,14 +44,11 @@ class FP8Config:
     model_parallel_size: int = None
     kv_cache_dtype: str = "auto"
     use_fp8_weights: bool = True  # Whether model weights are quantized to FP8
+    ignored_layer_keywords: tuple = ()  # Substring keywords for layers to skip FP8
 
 
 @dataclass()
 class FP8State:
-    # A cache of fp8 parameter names, we can check this cache to see if a
-    # param name corresponds to a fp8 weight
-    seen_params: set = field(default_factory=lambda: set())
-    fp8_param_names: set = field(default_factory=lambda: set())
     vllm_patches: list = field(default_factory=lambda: [])
 
 
@@ -179,11 +177,16 @@ def convert_calibration_to_vllm_format(
     """
     vllm_scales = {}
     for layer_key, scales in calibration_results.items():
-        # Extract layer index from "layer_N" format
-        layer_idx = int(layer_key.split("_")[1])
+        if not layer_key.startswith("layer_"):
+            continue
+        try:
+            layer_idx = int(layer_key.split("_")[1])
+        except (IndexError, ValueError):
+            continue
         param_names = get_vllm_qkv_scale_names(layer_idx)
 
-        vllm_scales[param_names["q_scale"]] = scales["q_scale"]
+        if "q_scale" in scales:
+            vllm_scales[param_names["q_scale"]] = scales["q_scale"]
         vllm_scales[param_names["k_scale"]] = scales["k_scale"]
         vllm_scales[param_names["v_scale"]] = scales["v_scale"]
 
@@ -230,14 +233,60 @@ def apply_fp8_patches(self, fp8_config):
         patcher5 = patch(func5_path, process_weights_after_loading_kv)
         fp8_state.vllm_patches.append(patcher5)
 
+    # Patch init_fp8_kv_scales to handle hybrid model KV caches (lists of tensors)
+    if global_fp8_config.kv_cache_dtype.startswith("fp8"):
+        func_kv_init_path = "vllm.v1.worker.gpu_model_runner.GPUModelRunner.init_fp8_kv_scales"
+        patcher_kv_init = patch(func_kv_init_path, _patched_init_fp8_kv_scales)
+        fp8_state.vllm_patches.append(patcher_kv_init)
+
+    if global_fp8_config.ignored_layer_keywords:
+        import vllm.model_executor.layers.quantization.fp8 as _vllm_fp8
+
+        _original_is_layer_skipped = _vllm_fp8.is_layer_skipped
+        logger.info("Patching is_layer_skipped with keywords: %s", global_fp8_config.ignored_layer_keywords)
+
+        def _keyword_aware_is_layer_skipped(prefix, ignored_layers, fused_mapping=None, *, skip_with_substr=False):
+            from types import MappingProxyType
+
+            if fused_mapping is None:
+                fused_mapping = MappingProxyType({})
+            if _original_is_layer_skipped(prefix, ignored_layers, fused_mapping, skip_with_substr=skip_with_substr):
+                return True
+            if any(kw in prefix for kw in global_fp8_config.ignored_layer_keywords):
+                return True
+            return False
+
+        _vllm_fp8.is_layer_skipped = _keyword_aware_is_layer_skipped
+
     for p in fp8_state.vllm_patches:
         p.start()
 
     fp8_patches_applied = True
 
 
+def _get_param_names_from_checkpoint(model_name: str) -> list[str]:
+    """Read parameter names from the checkpoint without model instantiation.
+
+    Reads from model.safetensors.index.json (sharded checkpoints) which avoids
+    executing model code or network access. Falls back to AutoModel.from_config
+    for non-safetensors checkpoints.
+    """
+    import json
+
+    index_path = os.path.join(model_name, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        return list(index["weight_map"].keys())
+
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    with init_empty_weights():
+        model = AutoModel.from_config(config, trust_remote_code=True)
+    return [name for name, _ in model.named_parameters()]
+
+
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
-    config = AutoConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
@@ -266,7 +315,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         model_parallel_size=model_parallel_size,
         kv_cache_dtype=kv_cache_dtype,
         use_fp8_weights=use_fp8_weights,
+        ignored_layer_keywords=tuple(vllm_cfg.get("quantization_ignored_layer_kws", [])),
     )
+    if global_fp8_config.ignored_layer_keywords:
+        logger.info("FP8 ignored_layer_keywords: %s", global_fp8_config.ignored_layer_keywords)
 
     if vllm_cfg.get("use_deep_gemm", False):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
@@ -287,14 +339,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
 
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
-        with init_empty_weights():
-            model = AutoModel.from_config(config)
-        param_names = [name for name, _ in model.named_parameters()]
+        param_names = _get_param_names_from_checkpoint(model_name)
 
         bf16_params = []
         if num_first_layers_in_bf16 > 0:
             layers = [l for l in range(num_first_layers_in_bf16)]
-            bf16_params.append(_get_params_in_layers(param_names, layers))
+            bf16_params.extend(_get_params_in_layers(param_names, layers))
 
         if num_last_layers_in_bf16 > 0:
             layers = [
@@ -304,27 +354,14 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
                     config.num_hidden_layers,
                 )
             ]
-            bf16_params.append(_get_params_in_layers(param_names, layers))
+            bf16_params.extend(_get_params_in_layers(param_names, layers))
 
         fp8_block_quant_kwargs["ignored_layers"] = bf16_params
-    quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws", [])
-    if len(quantization_ignored_layer_kws):
-        with init_empty_weights():
-            model = AutoModel.from_config(config)
-        param_names = [
-            f"model.{name}".removesuffix(".weight")
-            for name, _ in model.named_parameters()
-        ]
-        ignored_layers = [
-            n
-            for n in param_names
-            if any(p in n for p in quantization_ignored_layer_kws)
-        ]
-        if "ignored_layers" not in fp8_block_quant_kwargs:
-            fp8_block_quant_kwargs["ignored_layers"] = ignored_layers
-        else:
-            fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
-        print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
+    if global_fp8_config.ignored_layer_keywords:
+        logger.info(
+            "FP8: layers matching keywords %s will be kept in BF16 (substring match at runtime)",
+            global_fp8_config.ignored_layer_keywords,
+        )
 
     # Return FP8 kwargs (precision=fp8 is required at this point)
     vllm_kwargs = {
@@ -380,74 +417,18 @@ def _get_params_in_layers(param_names, layers):
     return params
 
 
-def _get_module_from_param_name(model, name: str):
-    # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
-    # The module path is all but the last part (the parameter's own name)
-    path_parts = name.split(".")
-    module_path = path_parts[:-1]
-    # Replace with the fused model name
-    packed_modules_mapping = model.packed_modules_mapping
-    reversed_mapping = {
-        original_name: fused_name
-        for fused_name, original_names_list in packed_modules_mapping.items()
-        for original_name in original_names_list
-    }
-    if module_path[-1] in reversed_mapping.keys():
-        module_path[-1] = reversed_mapping[module_path[-1]]
-
-    current_module = model
-    try:
-        # Traverse the model hierarchy
-        for part in module_path:
-            if isinstance(current_module, FusedMoE):
-                return current_module
-            if isinstance(current_module, torch.nn.ModuleList):
-                current_module = current_module[int(part)]
-            else:
-                current_module = getattr(current_module, part)
-    except (AttributeError, IndexError, ValueError) as e:
-        print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
-    return current_module
-
-
-def _is_fp8_weight(name, model):
-    if name not in fp8_state.seen_params:
-        fp8_state.seen_params.add(name)
-        # Filter out bias params
-        if name.endswith("weight"):
-            module = _get_module_from_param_name(model, name)
-            # We currently only quantize linear layers
-            if (
-                isinstance(module, LinearBase)
-                and module.weight.dtype == torch.float8_e4m3fn
-                or (
-                    isinstance(module, FusedMoE)
-                    and module.w13_weight.dtype == torch.float8_e4m3fn
-                    and module.w2_weight.dtype == torch.float8_e4m3fn
-                )
-            ):
-                fp8_state.fp8_param_names.add(name)
-    return name in fp8_state.fp8_param_names
 
 
 def load_weights(weights, model_runner):
-    weights_quantized = []
-    model = model_runner.model
+    """Load BF16 weights into the FP8 vLLM model.
 
-    for k, v in weights:
-        if not _is_fp8_weight(k, model):
-            weights_quantized.append((k, v))
-            continue
-        # Cast the weight into fp8 and its scale factor
-        param_lp, param_scale = cast_tensor_to_fp8_blockwise(
-            v.to(torch.float),
-            weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
-        )
-        param_scale = torch.squeeze(param_scale, dim=-1)
-        weights_quantized.append([k, param_lp])
-        weights_quantized.append([k + "_scale_inv", param_scale])
-    # Finally load the weights into vllm
-    model.load_weights(weights_quantized)
+    Passes all weights as BF16 to model.load_weights(). vLLM's
+    Float8_e4m3fnParameter.weight_loader direct-casts BF16->FP8 for eligible
+    layers. Proper block-quantization scales are computed later in
+    process_weights_after_loading, which detects direct-cast FP8 values and
+    calibrates their scales before DeepGemm alignment.
+    """
+    model_runner.model.load_weights(weights)
 
 
 def cast_tensor_to_fp8_blockwise(
@@ -470,9 +451,6 @@ def cast_tensor_to_fp8_blockwise(
             0
             if data_hp.shape[0] % block_size0 == 0
             else block_size0 - data_hp.shape[0] % block_size0
-        )
-        print(
-            f"Padding data_hp from {data_hp.shape} to {(data_hp.shape[0] + pad0, data_hp.shape[1] + pad1)}"
         )
         data_hp = torch.nn.functional.pad(
             data_hp, (0, pad1, 0, pad0), mode="constant", value=data_hp[-1, -1]
@@ -554,23 +532,23 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
         should_use_deepgemm_for_fp8_linear,
     )
 
-    # On Blackwell or Hopper, if E8M0 for DeepGemm is used, we need to
-    # requantize the weight and input to the specific scale
-    # at the same time.
     should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
         layer.orig_dtype, layer.weight
     )
     if should_use_deepgemm:
+        scale_attr = (
+            "weight_scale_inv"
+            if hasattr(layer, "weight_scale_inv")
+            else "weight_scale"
+        )
         dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
             wq=layer.weight.data,
-            ws=layer.weight_scale.data,
+            ws=getattr(layer, scale_attr).data,
             quant_block_shape=tuple(layer.weight_block_size),
             use_e8m0=is_deep_gemm_e8m0_used(),
         )
-        # This is the only part we change from the original function (https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1196-L1197)
-        # Instead of creating new torch.nn.Parameter, we update the data in place.
         layer.weight.data.copy_(dg_weight)
-        layer.weight_scale.data.copy_(dg_weight_scale)
+        getattr(layer, scale_attr).data.copy_(dg_weight_scale)
 
 
 def process_weights_after_loading(self, layer) -> None:
@@ -589,13 +567,40 @@ def process_weights_after_loading(self, layer) -> None:
     weight_scale = layer.weight_scale_inv
     weight, weight_scale = process_fp8_weight_block_strategy(layer.weight, weight_scale)
     layer.weight.data = weight.data
-    if hasattr(layer, "weight_scale"):
-        # Not the first time to call this function, just need to update the data
-        layer.weight_scale.copy_(weight_scale.data)
-    else:
-        # The first time to call this function, create a new parameter and update the tp status
-        layer.weight_scale = torch.nn.Parameter(weight_scale.data, requires_grad=False)
-        layer.update_param_tp_status()
+    layer.weight_scale_inv.data.copy_(weight_scale.data)
+
+    layer.input_scale = None
+
+    # Calibrate FP8 scales before DeepGemm alignment when needed:
+    #
+    # 1. Initial model load: vLLM direct-casts BF16->FP8 and sets
+    #    weight_scale_inv to sentinel (~-3.4e38). Without calibration,
+    #    DeepGemm would dequantize with sentinel scales and corrupt weights.
+    #
+    # 2. Weight refit: model.load_weights() direct-casts new BF16 weights
+    #    to FP8, but the old scale_inv doesn't match the new values.
+    #
+    # Detection: sentinel scales (s <= 0 or inf), OR direct-cast FP8 values
+    # whose max abs < 16 (still in BF16 range, not block-quantized to full
+    # FP8 range of [-448, 448]).
+    if layer.weight.dtype == torch.float8_e4m3fn and hasattr(layer, "weight_scale_inv"):
+        s = layer.weight_scale_inv.data
+        w_max = layer.weight.data.float().abs().max().item()
+        needs_calibration = (
+            (s <= 0).any().item()
+            or torch.isinf(s).any().item()
+            or w_max < 16.0
+        )
+        if needs_calibration:
+            w_float = layer.weight.data.float()
+            new_fp8, new_scale = cast_tensor_to_fp8_blockwise(
+                w_float,
+                weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
+            )
+            new_scale = torch.squeeze(new_scale, dim=-1)
+            if new_scale.shape == s.shape:
+                layer.weight.data.copy_(new_fp8)
+                layer.weight_scale_inv.data.copy_(new_scale)
 
     maybe_post_process_fp8_weight_block(layer)
 
@@ -862,6 +867,56 @@ def _per_token_group_quant_fp8_colmajor(
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
+
+
+def _patched_init_fp8_kv_scales(self) -> None:
+    """Replacement for GPUModelRunner.init_fp8_kv_scales that handles hybrid models.
+
+    Hybrid architectures (e.g. NemotronH with Mamba + Attention layers) store
+    KV caches as lists of tensors rather than single tensors. The upstream
+    vLLM implementation calls cache_tensor.zero_() directly, which crashes
+    with "'list' object has no attribute 'zero_'" on these models.
+    """
+    if not self.cache_config.cache_dtype.startswith("fp8"):
+        return
+
+    try:
+        from vllm.attention import Attention
+    except ImportError:
+        from vllm.attention.layer import Attention
+    try:
+        from vllm.attention.backends.mla.common import MLAAttention
+    except ImportError:
+        from vllm.attention.layer import MLAAttention
+
+    kv_caches = getattr(self, "kv_caches", [])
+    for cache_tensor in kv_caches:
+        if cache_tensor is None:
+            continue
+        if isinstance(cache_tensor, torch.Tensor):
+            cache_tensor.zero_()
+        elif isinstance(cache_tensor, (list, tuple)):
+            for t in cache_tensor:
+                if isinstance(t, torch.Tensor):
+                    t.zero_()
+
+    k_attr_names = ("_k_scale", "k_scale")
+    v_attr_names = ("_v_scale", "v_scale")
+
+    attn_layers = self.compilation_config.static_forward_context
+    for name, module in attn_layers.items():
+        if isinstance(module, (Attention, MLAAttention)):
+            k_scale_val, v_scale_val = 1.0, 1.0
+            for attr in k_attr_names:
+                if hasattr(module, attr):
+                    param = getattr(module, attr)
+                    if isinstance(param, torch.Tensor):
+                        param.fill_(k_scale_val)
+            for attr in v_attr_names:
+                if hasattr(module, attr):
+                    param = getattr(module, attr)
+                    if isinstance(param, torch.Tensor):
+                        param.fill_(v_scale_val)
 
 
 def per_token_group_quant_fp8(

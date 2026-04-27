@@ -288,7 +288,7 @@ def validate(
             )
 
             # update multimodal data
-            val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
+            val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False, pixel_dtype=torch.bfloat16))
             # When running validation with drop_last=False, we might end up with a partial batch.
             # Check if we need to pad the final batch to make it divisible by micro_batch_size * dp_size.
             if val_data.size < val_batch_size:
@@ -451,7 +451,7 @@ def sft_train(
                         }
                     )
                     train_data.update(
-                        cat_and_padded.get_multimodal_dict(as_tensors=False)
+                        cat_and_padded.get_multimodal_dict(as_tensors=False, pixel_dtype=torch.bfloat16)
                     )
 
                 print("▶ Taking a training step...")
@@ -489,9 +489,9 @@ def sft_train(
                     "loss": train_results["loss"].numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
                 }
-                if "moe_metrics" in train_results:
+                if "moe_routing_diagnostics" in train_results:
                     metrics.update(
-                        {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+                        {f"moe_routing/{k}": v for k, v in train_results["moe_routing_diagnostics"].items()}
                     )
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():

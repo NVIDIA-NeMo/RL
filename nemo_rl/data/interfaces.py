@@ -60,10 +60,10 @@ class TaskDataSpec:
     def __post_init__(self) -> None:
         def load_prompt_file(
             prompt_file: Optional[PathLike],
-        ) -> Optional[str]:
-            """Load prompt from file if it exists, otherwise return as is."""
+        ) -> str:
+            """Load prompt from file if provided, otherwise return empty string."""
             if prompt_file is None:
-                return None
+                return ""
             if os.path.exists(prompt_file):
                 with open(prompt_file, "r", encoding="utf-8") as f:
                     return f.read()

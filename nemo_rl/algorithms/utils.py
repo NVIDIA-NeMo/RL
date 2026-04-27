@@ -270,6 +270,35 @@ def get_tokenizer(
         processor = AutoProcessor.from_pretrained(
             tokenizer_config["name"], trust_remote_code=True, use_fast=True
         )
+        if not hasattr(processor, "tokenizer") and "InternVL" in tokenizer_config["name"]:
+            # InternVL native checkpoint lacks a processor
+            from nemo_rl.models.internvl import InternVLProcessor
+            from transformers import AutoConfig
+
+            processor_config = AutoConfig.from_pretrained(tokenizer_config["name"], trust_remote_code=True)
+            processor = InternVLProcessor(processor, processor_config)
+        elif hasattr(processor, "tokenizer"):
+            # Check for dynamic resolution models (e.g., Nano v3 VL)
+            # These need custom processing to bypass HF's static tiling
+            from transformers import AutoConfig
+
+            from nemo_rl.models.nano_v3_vl import (
+                DynamicResolutionProcessor,
+                is_dynamic_resolution_model,
+            )
+
+            processor_config = AutoConfig.from_pretrained(
+                tokenizer_config["name"], trust_remote_code=True
+            )
+            if is_dynamic_resolution_model(processor_config):
+                print(
+                    "Using DynamicResolutionProcessor (bypassing HF static tiling)"
+                )
+                processor = DynamicResolutionProcessor(
+                    processor.tokenizer,
+                    processor_config,
+                    chat_template=processor.tokenizer.chat_template,
+                )
         tokenizer = processor.tokenizer
     else:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -280,9 +309,15 @@ def get_tokenizer(
         tokenizer.pad_token = tokenizer.eos_token
 
     if "chat_template" in tokenizer_config:
+
+        def set_chat_template(chat_template: str):
+            tokenizer.chat_template = chat_template
+            if processor is not None:
+                processor.chat_template = chat_template
+
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
-            tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
+            set_chat_template(COMMON_CHAT_TEMPLATES.passthrough_prompt_response)
         elif tokenizer_config["chat_template"].lower() == "default":
             print("Using tokenizer's default chat template")
         elif tokenizer_config["chat_template"].endswith(".jinja"):
@@ -290,12 +325,14 @@ def get_tokenizer(
             template_path = tokenizer_config["chat_template"]
             print(f"Loading chat template from file: {template_path}")
             with open(template_path, "r") as f:
-                tokenizer.chat_template = f.read()
+                set_chat_template(f.read())
         else:
             print("Using custom chat template")
-            tokenizer.chat_template = tokenizer_config["chat_template"]
+            set_chat_template(tokenizer_config["chat_template"])
     else:
         print("No chat template provided, using tokenizer's default")
+        if processor is not None and tokenizer.chat_template:
+            processor.chat_template = tokenizer.chat_template
 
     if (
         "chat_template_kwargs" in tokenizer_config

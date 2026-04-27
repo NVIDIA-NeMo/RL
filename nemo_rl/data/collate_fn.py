@@ -194,4 +194,7 @@ def preference_collate_fn(
     if add_loss_mask:
         data["token_mask"] = cat_and_padded["token_loss_mask"]
 
+    # Preserve multimodal fields (e.g., images) for VLM preference training
+    data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
+
     return data

@@ -38,6 +38,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
@@ -61,6 +62,11 @@ from nemo_rl.utils.logger import (
     LoggerConfig,
     print_message_log_samples,
 )
+from nemo_rl.utils.multimodal_payload_metrics import (
+    collect_multimodal_payload_metrics,
+    infer_unique_prompt_count,
+    print_multimodal_payload_metrics,
+)
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
@@ -83,6 +89,8 @@ class DistillationConfig(TypedDict):
     max_val_samples: int
     topk_logits_k: int
     seed: int
+    # If true, enable sync-only zero-N multimodal transfer optimizations.
+    deduplicate_multimodal_data: NotRequired[bool]
 
 
 class DistillationSaveState(TypedDict):
@@ -409,6 +417,9 @@ def setup(
             generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
                 "hf_config_overrides", {}
             )
+        generation_config["debug_payload_metrics"] = master_config["logger"].get(
+            "debug_payload_metrics", False
+        )
         student_generation = VllmGeneration(
             cluster=inference_cluster, config=generation_config
         )
@@ -536,7 +547,9 @@ def distillation_train(
         "total_steps"
     ]  # total number of steps across all epochs
     consumed_samples = distillation_save_state["consumed_samples"]
-    total_valid_tokens = distillation_save_state["total_valid_tokens"]
+    total_valid_tokens = distillation_save_state.get(
+        "total_valid_tokens", 0
+    )  # Default to 0 for backward compatibility with older checkpoints
     val_period = master_config["distillation"]["val_period"]
     val_at_start = master_config["distillation"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
@@ -546,6 +559,24 @@ def distillation_train(
     max_steps = master_config["distillation"][
         "max_num_steps"
     ]  # max number of steps to train for
+    deduplicate_multimodal_data = master_config["distillation"].get(
+        "deduplicate_multimodal_data", False
+    )
+    debug_payload_metrics = master_config["logger"].get("debug_payload_metrics", False)
+    should_dedup_multimodal = deduplicate_multimodal_data
+    if deduplicate_multimodal_data:
+        generation_cfg = master_config["policy"]["generation"]
+        if generation_cfg is None or generation_cfg.get("backend") != "vllm":
+            raise ValueError(
+                "distillation.deduplicate_multimodal_data requires policy.generation.backend='vllm' "
+                "for generation-side payload optimization."
+            )
+        if _should_use_async_rollouts(master_config):
+            raise ValueError(
+                "distillation.deduplicate_multimodal_data currently supports only sync rollout paths. "
+                "Disable policy.generation.vllm_cfg.async_engine or set "
+                "distillation.deduplicate_multimodal_data=false."
+            )
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -598,6 +629,14 @@ def distillation_train(
                             master_config["distillation"]["num_generations_per_prompt"]
                         )
                     )
+                    if should_dedup_multimodal:
+                        repeated_batch["_dedup_prompt_idx"] = torch.arange(
+                            batch.size
+                        ).repeat_interleave(
+                            master_config["distillation"][
+                                "num_generations_per_prompt"
+                            ]
+                        )
 
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 print(
@@ -648,6 +687,7 @@ def distillation_train(
                                 "max_rollout_turns"
                             ],
                             greedy=False,
+                            skip_generation_multimodal_tensors=deduplicate_multimodal_data,
                         )
                     student_generation.finish_generation()
 
@@ -683,10 +723,19 @@ def distillation_train(
                         }
                     )
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
-                    train_data.update(
-                        flat_messages.get_multimodal_dict(as_tensors=False)
+                    multimodal_dict = flat_messages.get_multimodal_dict(
+                        as_tensors=False, pixel_dtype=torch.bfloat16
                     )
+                    if should_dedup_multimodal:
+                        prompt_indices = repeated_batch["_dedup_prompt_idx"]
+                        for key, val in multimodal_dict.items():
+                            if isinstance(val, PackedTensor):
+                                multimodal_dict[key] = val.deduplicate(prompt_indices)
+                    train_data.update(multimodal_dict)
                     train_data.to("cpu")
+                    unique_prompts_for_policy = infer_unique_prompt_count(
+                        repeated_batch, default_rows=train_data.size
+                    )
 
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
@@ -694,6 +743,14 @@ def distillation_train(
 
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
+                    print_multimodal_payload_metrics(
+                        collect_multimodal_payload_metrics(
+                            train_data,
+                            boundary="driver_to_teacher_get_topk_logits",
+                            unique_prompts=unique_prompts_for_policy,
+                        ),
+                        enabled=debug_payload_metrics,
+                    )
                     teacher_topk = teacher_policy.get_topk_logits(
                         train_data, k=master_config["distillation"]["topk_logits_k"]
                     )
@@ -708,6 +765,14 @@ def distillation_train(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
+                    print_multimodal_payload_metrics(
+                        collect_multimodal_payload_metrics(
+                            train_data,
+                            boundary="driver_to_student_train",
+                            unique_prompts=unique_prompts_for_policy,
+                        ),
+                        enabled=debug_payload_metrics,
+                    )
                     train_results = student_policy.train(train_data, loss_fn)
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
@@ -739,6 +804,27 @@ def distillation_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+
+                metrics = {
+                    "loss": train_results["loss"].numpy(),
+                    "grad_norm": train_results["grad_norm"].numpy(),
+                    "mean_prompt_length": repeated_batch["length"].numpy(),
+                    "total_num_tokens": input_lengths.numpy(),
+                }
+                metrics.update(train_results["all_mb_metrics"])
+                for k, v in metrics.items():
+                    if k in {
+                        "lr",
+                        "wd",
+                        "global_valid_seqs",
+                        "global_valid_toks",
+                        "mean_prompt_length",
+                    }:
+                        metrics[k] = np.mean(v).item()
+                    else:
+                        metrics[k] = np.sum(v).item()
+                metrics.update(rollout_metrics)
+                total_valid_tokens += metrics["global_valid_toks"]
 
                 metrics = {
                     "loss": train_results["loss"].numpy(),
@@ -994,6 +1080,9 @@ def validate(
                         "max_rollout_turns"
                     ],
                     greedy=False,
+                    skip_generation_multimodal_tensors=master_config[
+                        "distillation"
+                    ].get("deduplicate_multimodal_data", False),
                 )
             rewards = val_batch["total_reward"]
 

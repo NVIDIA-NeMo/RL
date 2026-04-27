@@ -337,6 +337,7 @@ def run_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    skip_generation_multimodal_tensors: bool = False,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Runs a multi-turn rollout loop, interacting with the environment.
 
@@ -348,6 +349,8 @@ def run_multi_turn_rollout(
         max_rollout_turns: Maximum number of agent-environment interaction turns.
         max_seq_len: Maximum sequence length allowed.
         greedy: Whether to use greedy decoding.
+        skip_generation_multimodal_tensors: If True, omit tensor/PackedTensor multimodal
+            fields from generation payload while still sending vLLM prompt multimedia refs.
 
     Returns:
         Tuple containing:
@@ -404,9 +407,11 @@ def run_multi_turn_rollout(
                 "stop_strings": active_stop_strings,
             }
         )
-        # add the multimodal data to the generation input data
-        multimodal_data = active_flat_messages.get_multimodal_dict(as_tensors=False)
-        generation_input_data.update(multimodal_data)
+        if not skip_generation_multimodal_tensors:
+            # Add tensor/PackedTensor multimodal data to the generation payload only
+            # when explicitly requested by the caller.
+            multimodal_data = active_flat_messages.get_multimodal_dict(as_tensors=False)
+            generation_input_data.update(multimodal_data)
 
         # keep message log for generation
         if "vllm_content" in active_batch:
@@ -952,6 +957,14 @@ def run_async_multi_turn_rollout(
     return asyncio.run(_async_rollout_implementation())
 
 
+def _tensorize_by_key(message_logs: list, key: str):
+    if not message_logs or key not in message_logs[0]:
+        return
+
+    for m in message_logs:
+        m[key] = torch.tensor(m[key])
+
+
 @dataclass
 class AsyncNemoGymRolloutResult:
     input_ids: torch.Tensor
@@ -962,12 +975,13 @@ class AsyncNemoGymRolloutResult:
 def _calculate_single_metric(
     values: list[float], batch_size: int, key_name: str
 ) -> dict:
+    stddev = statistics.stdev(values) if len(values) >= 2 else 0.0
     return {
         f"{key_name}/mean": sum(values) / batch_size,
         f"{key_name}/max": max(values),
         f"{key_name}/min": min(values),
         f"{key_name}/median": statistics.median(values),
-        f"{key_name}/stddev": statistics.stdev(values),
+        f"{key_name}/stddev": stddev,
         f"{key_name}/histogram": Histogram(values),
     }
 
@@ -1018,6 +1032,10 @@ def run_async_nemo_gym_rollout(
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
 
+        # Pass bad_words to prevent vLLM from generating specific tokens
+        if "bad_words" in generation_config and generation_config["bad_words"]:
+            responses_create_params["bad_words"] = generation_config["bad_words"]
+
         # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
         # generation_config["max_new_tokens"]
 
@@ -1025,11 +1043,23 @@ def run_async_nemo_gym_rollout(
 
     with timer.time(f"{timer_prefix}/run_rollouts"):
         nemo_gym_environment = task_to_env["nemo_gym"]
+        # Pass original message_logs with pixel_values to preserve them through postprocessing
+        original_message_logs = input_batch["message_log"]
+
         results, rollout_loop_timing_metrics = ray.get(
             nemo_gym_environment.run_rollouts.remote(
-                nemo_gym_rows, tokenizer, timer_prefix
+                nemo_gym_rows, tokenizer, timer_prefix, original_message_logs
             )
         )
+
+        # Tensorize all token ids
+        for r in results:
+            _tensorize_by_key(r["input_message_log"], "token_ids")
+            _tensorize_by_key(r["message_log"], "token_ids")
+            _tensorize_by_key(
+                [m for m in r["message_log"] if m["role"] == "assistant"],
+                "generation_logprobs",
+            )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
@@ -1038,6 +1068,7 @@ def run_async_nemo_gym_rollout(
         all_sample_metrics = [
             {
                 "total_reward": r["full_result"]["reward"],
+                "context_length_exceeded": r.get("context_length_exceeded", False),
                 "assistant_tokens": sum(
                     len(m["token_ids"])
                     for m in r["message_log"]
@@ -1075,6 +1106,10 @@ def run_async_nemo_gym_rollout(
                 batch_size,
                 "total_reward",
             ),
+            "context_length_exceeded_rate": sum(
+                m["context_length_exceeded"] for m in all_sample_metrics
+            )
+            / batch_size,
             "natural_termination_rate": sum(
                 not m["hit_max_tokens"] for m in all_sample_metrics
             )
@@ -1093,8 +1128,10 @@ def run_async_nemo_gym_rollout(
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
         for nemo_gym_row, result in zip(nemo_gym_rows, results):
-            agent_name = nemo_gym_row["agent_ref"]["name"]
+            agent_ref = nemo_gym_row["agent_ref"]
+            agent_name = agent_ref["name"]
             agent_to_results[agent_name].append(result["full_result"])
+            result["agent_ref"] = agent_ref
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
@@ -1138,15 +1175,30 @@ def run_async_nemo_gym_rollout(
         pad_value_dict={"token_ids": tokenizer.pad_token_id},
     )
     input_ids = batched_flat["token_ids"]
+    loss_multiplier = input_batch["loss_multiplier"]
+    if not torch.is_tensor(loss_multiplier):
+        loss_multiplier = torch.tensor(loss_multiplier, dtype=torch.float32)
+    else:
+        loss_multiplier = loss_multiplier.clone()
+    context_length_exceeded = torch.tensor(
+        [r.get("context_length_exceeded", False) for r in results], dtype=torch.bool
+    )
+    loss_multiplier[context_length_exceeded] = 0
 
     final_batch = BatchedDataDict[DatumSpec](
         {
+            "agent_ref": [r["agent_ref"] for r in results],
             "message_log": [r["message_log"] for r in results],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(
-                [len(r["input_message_log"][0]["token_ids"]) for r in results]
+                [
+                    len(r["input_message_log"][0]["token_ids"])
+                    if r["input_message_log"]
+                    else 0
+                    for r in results
+                ]
             ),
-            "loss_multiplier": input_batch["loss_multiplier"],
+            "loss_multiplier": loss_multiplier,
             # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
             # extra_env_info: dict[str, Any]
             # idx: int
@@ -1154,6 +1206,11 @@ def run_async_nemo_gym_rollout(
             # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
             # Extra information not in the DatumSpec used by the GRPO algorithm
             "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
+            "context_length_exceeded": context_length_exceeded,
+            # Add truncated field to match other rollout paths (reusing hit_max_tokens logic)
+            "truncated": torch.tensor(
+                [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
+            ),
         }
     )
 

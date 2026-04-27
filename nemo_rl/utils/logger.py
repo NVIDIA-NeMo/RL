@@ -87,6 +87,7 @@ class LoggerConfig(TypedDict):
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
     num_val_samples_to_print: NotRequired[int]
+    debug_payload_metrics: NotRequired[bool]
 
 
 class LoggerInterface(ABC):
@@ -449,7 +450,7 @@ class GpuMetricSnapshot(TypedDict):
 
 
 class RayGpuMonitorLogger:
-    """Monitor GPU utilization across a Ray cluster and log metrics to a parent logger."""
+    """Monitor Ray node metrics and log them to a parent logger."""
 
     def __init__(
         self,
@@ -458,6 +459,7 @@ class RayGpuMonitorLogger:
         metric_prefix: str,
         step_metric: str,
         parent_logger: Optional["Logger"] = None,
+        emit_object_store_summary: bool = False,
     ):
         """Initialize the GPU monitor.
 
@@ -466,12 +468,15 @@ class RayGpuMonitorLogger:
             flush_interval: Interval in seconds to flush metrics to parent logger
             step_metric: Name of the field to use as the step metric
             parent_logger: Logger to receive the collected metrics
+            emit_object_store_summary: Whether to print object-store rollup summaries
+                to stdout during flush.
         """
         self.collection_interval = collection_interval
         self.flush_interval = flush_interval
         self.metric_prefix = metric_prefix
         self.step_metric = step_metric
         self.parent_logger = parent_logger
+        self.emit_object_store_summary = emit_object_store_summary
         self.metrics_buffer: list[
             GpuMetricSnapshot
         ] = []  # Store metrics with timestamps
@@ -573,6 +578,23 @@ class RayGpuMonitorLogger:
         elif metric_name == "ray_node_mem_total":
             metric_name = f"node.{node_idx}.mem_total_gb"
             value /= 1024 * 1024 * 1024
+        elif metric_name == "ray_object_store_memory":
+            # Track object store memory by location/state to derive high-level
+            # pressure and spill metrics across all optimization layers.
+            location = labels.get("Location", "unknown").lower()
+            object_state = labels.get("ObjectState", "unknown").lower()
+            metric_name = f"node.{node_idx}.object_store.{location}.{object_state}.mb"
+            value /= 1024 * 1024
+        elif metric_name == "ray_resources":
+            # Use ray_resources for object store used/available to estimate
+            # object-store pressure before spilling.
+            resource_name = labels.get("Name", "")
+            resource_state = labels.get("State", "").lower()
+            if resource_name != "object_store_memory":
+                return {}
+            metric_name = (
+                f"node.{node_idx}.resource.object_store_memory.{resource_state}_bytes"
+            )
         else:
             # Skip unexpected metrics
             return {}
@@ -627,12 +649,58 @@ class RayGpuMonitorLogger:
         return self._collect(sku=True)
 
     def _collect_metrics(self) -> dict[str, Any]:
-        """Collect GPU metrics from all Ray nodes.
+        """Collect monitored Ray metrics from all nodes.
 
         Returns:
             Dictionary of collected metrics
         """
         return self._collect(metrics=True)
+
+    def _compute_object_store_rollups(
+        self, metrics: dict[str, Any]
+    ) -> dict[str, float]:
+        """Compute cluster-level object-store rollup metrics."""
+        spilled_mb = 0.0
+        used_bytes = 0.0
+        available_bytes = 0.0
+        saw_spilled = False
+        saw_used = False
+        saw_available = False
+
+        for metric_name, metric_value in metrics.items():
+            value = float(metric_value)
+            if ".object_store.spilled." in metric_name and metric_name.endswith(".mb"):
+                spilled_mb += value
+                saw_spilled = True
+            elif metric_name.endswith(".resource.object_store_memory.used_bytes"):
+                used_bytes += value
+                saw_used = True
+            elif metric_name.endswith(".resource.object_store_memory.available_bytes"):
+                available_bytes += value
+                saw_available = True
+
+        rollups: dict[str, float] = {}
+        if saw_spilled:
+            rollups["object_store/spilled_mb"] = spilled_mb
+
+        if saw_used or saw_available:
+            used_mb = used_bytes / (1024 * 1024)
+            available_mb = available_bytes / (1024 * 1024)
+            total_bytes = used_bytes + available_bytes
+
+            rollups["object_store/used_mb"] = used_mb
+            rollups["object_store/available_mb"] = available_mb
+            rollups["object_store/total_mb"] = used_mb + available_mb
+            if total_bytes > 0:
+                rollups["object_store/pressure_ratio"] = used_bytes / total_bytes
+                rollups["object_store/pressure_pct"] = (
+                    100.0 * used_bytes / total_bytes
+                )
+            else:
+                rollups["object_store/pressure_ratio"] = 0.0
+                rollups["object_store/pressure_pct"] = 0.0
+
+        return rollups
 
     def _collect(self, metrics: bool = False, sku: bool = False) -> dict[str, Any]:
         """Collect GPU metrics from all Ray nodes.
@@ -668,10 +736,15 @@ class RayGpuMonitorLogger:
             # Process each node's metrics
             collected_metrics: dict[str, Any] = {}
             for node_idx, metric_address in enumerate(unique_metric_addresses):
-                metrics = self._fetch_and_parse_metrics(
+                node_metrics = self._fetch_and_parse_metrics(
                     node_idx, metric_address, parser_fn
                 )
-                collected_metrics.update(metrics)
+                collected_metrics.update(node_metrics)
+
+            if metrics:
+                collected_metrics.update(
+                    self._compute_object_store_rollups(collected_metrics)
+                )
 
             return collected_metrics
 
@@ -725,6 +798,20 @@ class RayGpuMonitorLogger:
                 for entry in self.metrics_buffer:
                     step = entry["step"]
                     metrics = entry["metrics"]
+
+                    # Optionally emit a concise object-store summary to stdout.
+                    if self.emit_object_store_summary and "object_store/pressure_pct" in metrics:
+                        pressure_pct = float(metrics["object_store/pressure_pct"])
+                        used_mb = float(metrics.get("object_store/used_mb", 0.0))
+                        total_mb = float(metrics.get("object_store/total_mb", 0.0))
+                        spilled_mb = float(metrics.get("object_store/spilled_mb", 0.0))
+                        print(
+                            "[RAY OBJECT STORE] "
+                            f"t={step}s pressure={pressure_pct:.1f}% "
+                            f"used={used_mb:.1f}MB total={total_mb:.1f}MB "
+                            f"spilled={spilled_mb:.1f}MB",
+                            flush=True,
+                        )
 
                     # Add the step metric directly to metrics for use as step_metric
                     metrics[self.step_metric] = step
@@ -894,6 +981,7 @@ class Logger(LoggerInterface):
                 metric_prefix=metric_prefix,
                 step_metric=step_metric,
                 parent_logger=self,
+                emit_object_store_summary=cfg.get("debug_payload_metrics", False),
             )
             self.gpu_monitor.start()
 

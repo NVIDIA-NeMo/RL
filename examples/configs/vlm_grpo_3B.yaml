@@ -205,6 +205,7 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
+    bad_words: null
     vllm_cfg:
       async_engine: false # Only for internal testing, will be enabled by https://github.com/NVIDIA/NeMo-RL/issues/447.
       precision: ${policy.precision}
@@ -238,7 +239,7 @@ data:
 
 env:
   clevr-cogent:
-    num_workers: 8
+    num_workers: 1
     reward_functions:
       - name: format
         weight: 0.2
@@ -281,5 +282,5 @@ logger:
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
 
 cluster:
-  gpus_per_node: 2
+  gpus_per_node: 1
   num_nodes: 1

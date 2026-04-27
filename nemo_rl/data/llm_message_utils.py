@@ -111,9 +111,15 @@ def message_log_to_flat_messages(
                         f"tensors for {key=} must have same number of dimensions: {[t.shape for t in result[key]]}"
                     ) from e
                 raise
-        elif result[key] and isinstance(result[key][0], PackedTensor):
+        elif result[key] and any(isinstance(v, PackedTensor) for v in result[key]):
             try:
-                concat[key] = PackedTensor.concat(result[key])
+                packed_values = [v for v in result[key] if isinstance(v, PackedTensor)]
+                reference = cast(PackedTensor, packed_values[0])
+                filled_values = [
+                    v if isinstance(v, PackedTensor) else PackedTensor.empty_like(reference)
+                    for v in result[key]
+                ]
+                concat[key] = PackedTensor.concat(cast(list[PackedTensor], filled_values))
             except Exception as e:
                 raise RuntimeError(
                     f"Error concatenating packed multimodal data for {key=}"
@@ -359,9 +365,17 @@ def batched_message_log_to_flat_message(
     result = BatchedDataDict()
     for key in all_keys:
         values = [seq.get(key) for seq in sequenced_lists]
-        # if the values are PackedTensors, create a new PackedTensor from the list of values
-        if values and isinstance(values[0], PackedTensor):
-            result[key] = PackedTensor.flattened_concat(values)
+        # if any value is PackedTensor, normalize missing entries to empty PackedTensor
+        if values and any(isinstance(v, PackedTensor) for v in values):
+            packed_values = [v for v in values if isinstance(v, PackedTensor)]
+            reference = cast(PackedTensor, packed_values[0])
+            filled_values = [
+                v if isinstance(v, PackedTensor) else PackedTensor.empty_like(reference)
+                for v in values
+            ]
+            result[key] = PackedTensor.flattened_concat(
+                cast(list[PackedTensor], filled_values)
+            )
             continue
         if not values or not isinstance(values[0], Tensor):
             result[key] = values
@@ -422,6 +436,19 @@ def get_first_index_that_differs(str1: str, str2: str) -> int:
     return min(len(str1), len(str2))
 
 
+def strip_image_tokens_from_text(text: str) -> str:
+    """Remove image placeholder tokens from text."""
+    for token in ("<image>", "<img>", "</img>"):
+        text = text.replace(token, "")
+    return text
+
+
+def replace_image_tokens_with_word(text: str, replacement: str = "image") -> str:
+    """Replace image placeholder tokens in text with a plain word."""
+    text = text.replace("<image>", replacement)
+    return text
+
+
 def get_images_from_message(message: dict[str, Any]) -> list[Any]:
     """Get all images from a message log item."""
     # Handle None or missing content (e.g., assistant messages with only tool_calls)
@@ -430,13 +457,21 @@ def get_images_from_message(message: dict[str, Any]) -> list[Any]:
     # Handle string content (no images)
     if isinstance(message["content"], str):
         return []
-    # iterate over the content list
+
     images = []
     for item in message["content"]:
-        if item["type"] == "image":
-            images.extend(list(item["image"])) if isinstance(
-                item["image"], (list, tuple)
-            ) else images.append(item["image"])
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type not in ("image", "input_image"):
+            continue
+
+        image_value = item.get("image", item.get("image_url"))
+        if image_value is None:
+            continue
+
+        images.extend(list(image_value)) if isinstance(image_value, (list, tuple)) else images.append(image_value)
     return images
 
 
@@ -608,6 +643,10 @@ def get_formatted_message_log(
         # get images too (extend this for other modalities)
         images_cur_message = get_images_from_message(message)
 
+        # For text-only samples, avoid treating placeholder tags as real multimodal tokens.
+        if len(images_cur_message) == 0:
+            message_chunk = replace_image_tokens_with_word(message_chunk)
+
         new_message = message.copy()
         # extend this if statement to check for all(len(modality)) == 0 when adding other modalities
         if len(images_cur_message) == 0:
@@ -628,6 +667,12 @@ def get_formatted_message_log(
             for key in multimodal_keys:
                 if key in processed_chunk:
                     new_message[key] = PackedTensor(processed_chunk[key], dim_to_pack=0)
+
+            if "imgs_sizes" in processed_chunk:
+                imgs_sizes = processed_chunk["imgs_sizes"]
+                if not isinstance(imgs_sizes, torch.Tensor):
+                    imgs_sizes = torch.tensor(imgs_sizes, dtype=torch.int32)
+                new_message["imgs_sizes"] = PackedTensor(imgs_sizes, dim_to_pack=0)
 
         if len(new_message["token_ids"]) == 0:
             # if there is an empty message, the empty `token_ids` tensor ends up being in fp32,

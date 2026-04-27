@@ -13,7 +13,7 @@
 # limitations under the License.
 import contextlib
 import os
-from typing import Generator
+from typing import Any, Generator
 
 import pynvml
 
@@ -88,3 +88,51 @@ def get_free_memory_bytes(device_idx: int) -> float:
             raise RuntimeError(
                 f"Failed to get free memory for device {device_idx} (global index: {global_device_idx}): {e}"
             )
+
+
+def get_full_nvml_snapshot() -> dict[str, Any]:
+    """Return per-GPU memory and per-process usage for the local node."""
+    with nvml_context():
+        device_count = pynvml.nvmlDeviceGetCount()
+        devices: list[dict[str, Any]] = []
+        for i in range(device_count):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            name = pynvml.nvmlDeviceGetName(handle)
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", errors="ignore")
+            procs: list[dict[str, Any]] = []
+            try:
+                proc_info = pynvml.nvmlDeviceGetComputeRunningProcesses_v2(handle)
+            except Exception:
+                proc_info = []
+            for p in proc_info:
+                used_bytes = getattr(p, "usedGpuMemory", 0) or 0
+                try:
+                    pname = pynvml.nvmlSystemGetProcessName(p.pid)
+                    if isinstance(pname, bytes):
+                        pname = pname.decode("utf-8", errors="ignore")
+                except Exception:
+                    pname = ""
+                procs.append(
+                    {
+                        "pid": int(p.pid),
+                        "usedMiB": int(used_bytes / (1024**2)),
+                        "name": pname,
+                    }
+                )
+            devices.append(
+                {
+                    "index": i,
+                    "name": name,
+                    "totalMiB": int(mem.total / (1024**2)),
+                    "usedMiB": int(mem.used / (1024**2)),
+                    "freeMiB": int(mem.free / (1024**2)),
+                    "processes": procs,
+                }
+            )
+        return {
+            "node": os.uname().nodename,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "devices": devices,
+        }

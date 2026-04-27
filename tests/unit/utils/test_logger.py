@@ -929,6 +929,41 @@ class TestRayGpuMonitorLogger:
         # Verify the result
         assert result == {"node.1.mem_total_gb": 200.0}
 
+        # Create a sample with object store memory metric
+        object_store_spilled_sample = Sample(
+            name="ray_object_store_memory",
+            labels={"Location": "SPILLED", "ObjectState": "SEALED"},
+            value=512.0 * 1024 * 1024,
+            timestamp=None,
+            exemplar=None,
+        )
+
+        # Parse the sample
+        result = monitor._parse_metric(object_store_spilled_sample, node_idx=1)
+
+        # Verify the result
+        assert result == {"node.1.object_store.spilled.sealed.mb": 512.0}
+
+        # Create a sample with object store resource usage metric
+        object_store_used_resource_sample = Sample(
+            name="ray_resources",
+            labels={"Name": "object_store_memory", "State": "USED"},
+            value=2.0 * 1024 * 1024 * 1024,
+            timestamp=None,
+            exemplar=None,
+        )
+
+        # Parse the sample
+        result = monitor._parse_metric(object_store_used_resource_sample, node_idx=1)
+
+        # Verify the result
+        assert result == {
+            "node.1.resource.object_store_memory.used_bytes": 2.0
+            * 1024
+            * 1024
+            * 1024
+        }
+
         # Test with an unexpected metric name
         other_sample = Sample(
             name="ray_node_cpu_utilization",
@@ -943,6 +978,38 @@ class TestRayGpuMonitorLogger:
 
         # Verify the result is empty
         assert result == {}
+
+    @patch("nemo_rl.utils.logger.ray")
+    def test_compute_object_store_rollups(self, mock_ray):
+        """Test cluster-level object-store rollup computation."""
+        # Mock ray.is_initialized to return True
+        mock_ray.is_initialized.return_value = True
+
+        monitor = RayGpuMonitorLogger(
+            collection_interval=10.0,
+            flush_interval=60.0,
+            metric_prefix="test",
+            step_metric="test/step",
+            parent_logger=None,
+        )
+
+        gib = 1024 * 1024 * 1024
+        metrics = {
+            "node.0.object_store.spilled.sealed.mb": 100.0,
+            "node.1.object_store.spilled.created.mb": 50.0,
+            "node.0.resource.object_store_memory.used_bytes": 3.0 * gib,
+            "node.1.resource.object_store_memory.used_bytes": 1.0 * gib,
+            "node.0.resource.object_store_memory.available_bytes": 1.0 * gib,
+            "node.1.resource.object_store_memory.available_bytes": 3.0 * gib,
+        }
+
+        rollups = monitor._compute_object_store_rollups(metrics)
+        assert rollups["object_store/spilled_mb"] == pytest.approx(150.0)
+        assert rollups["object_store/used_mb"] == pytest.approx(4096.0)
+        assert rollups["object_store/available_mb"] == pytest.approx(4096.0)
+        assert rollups["object_store/total_mb"] == pytest.approx(8192.0)
+        assert rollups["object_store/pressure_ratio"] == pytest.approx(0.5)
+        assert rollups["object_store/pressure_pct"] == pytest.approx(50.0)
 
     @patch("nemo_rl.utils.logger.ray")
     @patch("nemo_rl.utils.logger.requests.get")
@@ -1046,6 +1113,53 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
             }
 
     @patch("nemo_rl.utils.logger.ray")
+    def test_collect_metrics_includes_object_store_rollups(self, mock_ray):
+        """Test _collect_metrics adds object-store rollups when source metrics exist."""
+        # Mock ray.is_initialized to return True
+        mock_ray.is_initialized.return_value = True
+
+        # Mock ray.nodes to return test nodes
+        mock_ray.nodes.return_value = [
+            {"NodeManagerAddress": "10.0.0.1", "MetricsExportPort": 8080},
+            {"NodeManagerAddress": "10.0.0.2", "MetricsExportPort": 8080},
+        ]
+
+        monitor = RayGpuMonitorLogger(
+            collection_interval=10.0,
+            flush_interval=60.0,
+            metric_prefix="test",
+            step_metric="test/step",
+            parent_logger=None,
+        )
+
+        gib = 1024 * 1024 * 1024
+        with patch.object(monitor, "_fetch_and_parse_metrics") as mock_fetch:
+            mock_fetch.side_effect = [
+                {
+                    "node.0.object_store.spilled.sealed.mb": 200.0,
+                    "node.0.resource.object_store_memory.used_bytes": 3.0 * gib,
+                    "node.0.resource.object_store_memory.available_bytes": 1.0 * gib,
+                },
+                {
+                    "node.1.object_store.spilled.created.mb": 300.0,
+                    "node.1.resource.object_store_memory.used_bytes": 1.0 * gib,
+                    "node.1.resource.object_store_memory.available_bytes": 3.0 * gib,
+                },
+            ]
+
+            result = monitor._collect_metrics()
+
+            # Raw metrics are preserved.
+            assert result["node.0.object_store.spilled.sealed.mb"] == 200.0
+            assert result["node.1.object_store.spilled.created.mb"] == 300.0
+            # Rollup metrics are added.
+            assert result["object_store/spilled_mb"] == pytest.approx(500.0)
+            assert result["object_store/used_mb"] == pytest.approx(4096.0)
+            assert result["object_store/available_mb"] == pytest.approx(4096.0)
+            assert result["object_store/pressure_ratio"] == pytest.approx(0.5)
+            assert result["object_store/pressure_pct"] == pytest.approx(50.0)
+
+    @patch("nemo_rl.utils.logger.ray")
     def test_flush_empty_buffer(self, mock_ray, mock_parent_logger):
         """Test flush method with empty buffer."""
         # Mock ray.is_initialized to return True
@@ -1058,6 +1172,7 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
             metric_prefix="ray",
             step_metric="ray/ray_step",
             parent_logger=mock_parent_logger,
+            emit_object_store_summary=True,
         )
 
         # Call flush with empty buffer
@@ -1079,6 +1194,7 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
             metric_prefix="ray",
             step_metric="ray/ray_step",
             parent_logger=mock_parent_logger,
+            emit_object_store_summary=True,
         )
 
         # Add test metrics to buffer
@@ -1159,6 +1275,40 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
         assert mock_parent_logger.logged_steps[0] == 15
         assert mock_parent_logger.logged_prefixes[0] == custom_prefix
         assert mock_parent_logger.logged_step_metrics[0] == custom_step_metric
+
+    @patch("nemo_rl.utils.logger.ray")
+    def test_flush_prints_object_store_summary(
+        self, mock_ray, mock_parent_logger, capsys
+    ):
+        """Object-store rollups should be printed to stdout on flush."""
+        mock_ray.is_initialized.return_value = True
+
+        monitor = RayGpuMonitorLogger(
+            collection_interval=10.0,
+            flush_interval=60.0,
+            metric_prefix="ray",
+            step_metric="ray/ray_step",
+            parent_logger=mock_parent_logger,
+        )
+
+        monitor.metrics_buffer = [
+            {
+                "step": 42,
+                "metrics": {
+                    "object_store/pressure_pct": 75.0,
+                    "object_store/used_mb": 3072.0,
+                    "object_store/total_mb": 4096.0,
+                    "object_store/spilled_mb": 512.0,
+                },
+            }
+        ]
+
+        monitor.flush()
+        captured = capsys.readouterr()
+        assert "[RAY OBJECT STORE]" in captured.out
+        assert "t=42s" in captured.out
+        assert "pressure=75.0%" in captured.out
+        assert "spilled=512.0MB" in captured.out
 
     @patch("nemo_rl.utils.logger.ray")
     @patch("nemo_rl.utils.logger.time")

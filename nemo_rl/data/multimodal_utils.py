@@ -33,6 +33,7 @@ class PackedTensor:
         self,
         tensors: Union[torch.Tensor, list[Optional[torch.Tensor]], list[None]],
         dim_to_pack: int,
+        dedup_indices: Optional[list[int]] = None,
     ) -> None:
         assert tensors is not None, "Input tensors to PackedTensor cannot be None"
 
@@ -48,6 +49,13 @@ class PackedTensor:
                 f"Unsupported type for input tensors to PackedTensor: {type(tensors)}"
             )
         self.dim_to_pack = dim_to_pack
+        if dedup_indices is not None:
+            assert len(dedup_indices) > 0, "dedup_indices must be non-empty when provided"
+            assert min(dedup_indices) >= 0, "dedup_indices must contain only non-negative values"
+            assert max(dedup_indices) < len(self.tensors), (
+                "dedup_indices cannot reference out-of-range unique tensor indices"
+            )
+        self._dedup_indices = dedup_indices
 
     def as_tensor(
         self, device: Optional[torch.device] = None
@@ -57,30 +65,77 @@ class PackedTensor:
             for i, item in enumerate(self.tensors):
                 if item is not None:
                     self.tensors[i] = item.to(device)
-        non_none_tensors = [t for t in self.tensors if t is not None]
+        tensors = self.tensors
+        if self._dedup_indices is not None:
+            tensors = [self.tensors[i] for i in self._dedup_indices]
+        non_none_tensors = [t for t in tensors if t is not None]
         if len(non_none_tensors) == 0:
             return None
-        else:
-            return torch.cat(non_none_tensors, dim=self.dim_to_pack).to(device)
+        # Pad non-pack dimensions to the max size across tensors when they differ.
+        # This handles variable-resolution images (e.g. pixel_values with different
+        # H/W per sample in a sequence-packing bin). The padding is zero-filled and
+        # safe because downstream code (e.g. _patchify_for_dynamic_resolution) crops
+        # each image back to its actual size via imgs_sizes before processing.
+        if len(non_none_tensors) > 1:
+            ndim = non_none_tensors[0].ndim
+            pack_dim = self.dim_to_pack % ndim
+            has_mismatch = any(
+                non_none_tensors[0].shape[d] != t.shape[d]
+                for t in non_none_tensors[1:]
+                for d in range(ndim)
+                if d != pack_dim
+            )
+            if has_mismatch:
+                max_shape = [
+                    max(t.shape[d] for t in non_none_tensors) for d in range(ndim)
+                ]
+                padded = []
+                for t in non_none_tensors:
+                    # F.pad expects padding in reverse dim order:
+                    # (last_dim_left, last_dim_right, ..., first_dim_left, first_dim_right)
+                    pad: list[int] = []
+                    for d in reversed(range(ndim)):
+                        pad_amt = 0 if d == pack_dim else max_shape[d] - t.shape[d]
+                        pad.extend([0, pad_amt])
+                    padded.append(torch.nn.functional.pad(t, pad, value=0))
+                non_none_tensors = padded
+        return torch.cat(non_none_tensors, dim=self.dim_to_pack).to(device)
 
     def __len__(self) -> int:
         # this is the number of tensors in this data wrapper
+        if self._dedup_indices is not None:
+            return len(self._dedup_indices)
         return len(self.tensors)
 
-    def to(self, device: str | torch.device) -> "PackedTensor":
+    def to(self, device_or_dtype: str | torch.device | torch.dtype) -> "PackedTensor":
         self.tensors = [
-            item.to(device) if item is not None else None for item in self.tensors
+            item.to(device_or_dtype) if item is not None else None
+            for item in self.tensors
         ]
         return self
 
     def slice(self, indices: Union[list[int], torch.Tensor]) -> "PackedTensor":
         idx = indices.tolist() if isinstance(indices, torch.Tensor) else indices
+        if self._dedup_indices is not None:
+            new_dedup = [self._dedup_indices[i] for i in idx]
+            used_unique_indices = sorted(set(new_dedup))
+            remap = {old: new for new, old in enumerate(used_unique_indices)}
+            unique_tensors = [self.tensors[i] for i in used_unique_indices]
+            return PackedTensor(
+                unique_tensors,
+                self.dim_to_pack,
+                dedup_indices=[remap[i] for i in new_dedup],
+            )
         tensors = [self.tensors[i] for i in idx]
         return PackedTensor(tensors, self.dim_to_pack)
 
     @classmethod
     def empty_like(cls, other: "PackedTensor") -> "PackedTensor":
         """Return a new PackedTensor with same length and dim_to_pack as `other`, with all entries None."""
+        assert other._dedup_indices is None, (
+            "empty_like on a deduplicated PackedTensor is ambiguous "
+            "(len(tensors) != logical length). Deduplicate after empty_like if needed."
+        )
         return cls([None] * len(other.tensors), other.dim_to_pack)
 
     @classmethod
@@ -109,12 +164,54 @@ class PackedTensor:
         assert len(set(dim_to_packs)) == 1, (
             "All packed tensors must have the same dim_to_pack"
         )
+        dim_to_pack = dim_to_packs[0]
+        if any(pt._dedup_indices is not None for pt in from_packed_tensors):
+            all_tensors: list[Optional[torch.Tensor]] = []
+            all_dedup_indices: list[int] = []
+            offset = 0
+            for packed_tensor in from_packed_tensors:
+                if packed_tensor._dedup_indices is not None:
+                    all_tensors.extend(packed_tensor.tensors)
+                    all_dedup_indices.extend(
+                        idx + offset for idx in packed_tensor._dedup_indices
+                    )
+                    offset += len(packed_tensor.tensors)
+                else:
+                    all_tensors.extend(packed_tensor.tensors)
+                    all_dedup_indices.extend(
+                        range(offset, offset + len(packed_tensor.tensors))
+                    )
+                    offset += len(packed_tensor.tensors)
+            return cls(all_tensors, dim_to_pack, dedup_indices=all_dedup_indices)
+
         # concatenate the tensors
         tensors = []
         for packed_tensor in from_packed_tensors:
             tensors.extend(packed_tensor.tensors)
-        dim_to_pack = dim_to_packs[0]
         return cls(tensors, dim_to_pack)
+
+    def deduplicate(self, prompt_indices: torch.Tensor) -> "PackedTensor":
+        assert self._dedup_indices is None, (
+            "Cannot deduplicate an already-deduplicated PackedTensor"
+        )
+        prompt_index_list = prompt_indices.tolist()
+        assert len(self.tensors) == len(prompt_index_list), (
+            f"PackedTensor has {len(self.tensors)} entries but got "
+            f"{len(prompt_index_list)} prompt indices"
+        )
+
+        seen: dict[int, int] = {}
+        unique_tensors: list[Optional[torch.Tensor]] = []
+        dedup_indices: list[int] = []
+        for i, prompt_idx in enumerate(prompt_index_list):
+            if prompt_idx not in seen:
+                seen[prompt_idx] = len(unique_tensors)
+                unique_tensors.append(self.tensors[i])
+            dedup_indices.append(seen[prompt_idx])
+
+        return PackedTensor(
+            unique_tensors, self.dim_to_pack, dedup_indices=dedup_indices
+        )
 
     @classmethod
     def flattened_concat(
@@ -165,7 +262,8 @@ def get_multimodal_keys_from_processor(processor) -> list[str]:
         all_keys.update(processor.video_processor.model_input_names)
     if hasattr(processor, "feature_extractor"):
         all_keys.update(processor.feature_extractor.model_input_names)
-    # all_keys.update(processor.model_input_names)
+    if hasattr(processor, "model_input_names"):
+        all_keys.update(processor.model_input_names)
     all_keys.difference_update(set(processor.tokenizer.model_input_names))
     return list(all_keys)
 

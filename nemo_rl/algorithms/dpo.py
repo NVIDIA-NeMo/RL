@@ -251,7 +251,10 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = DPOLossFn(master_config["dpo"])
+    loss_fn = DPOLossFn(
+        master_config["dpo"],
+        logprob_chunk_size=master_config["policy"].get("logprob_chunk_size"),
+    )
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
@@ -603,9 +606,9 @@ def dpo_train(
                     "loss": train_results["loss"].numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
                 }
-                if "moe_metrics" in train_results:
+                if "moe_routing_diagnostics" in train_results:
                     metrics.update(
-                        {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+                        {f"moe_routing/{k}": v for k, v in train_results["moe_routing_diagnostics"].items()}
                     )
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():

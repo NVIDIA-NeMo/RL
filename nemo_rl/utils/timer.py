@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import sys
 import time
+import warnings
 from contextlib import contextmanager
 from typing import Callable, Generator, Optional, Sequence, Union
 
@@ -275,7 +277,14 @@ class TimeoutChecker:
         self.last_save_time = (
             float("inf") if timeout is None else convert_to_seconds(timeout)
         )
-        self.start_time = time.time()
+        if "SLURM_JOB_START_TIME" in os.environ:
+            self.start_time = float(os.environ["SLURM_JOB_START_TIME"])
+        else:
+            warnings.warn(
+                "Timeout will be late because SLURM_JOB_START_TIME is not set",
+                stacklevel=2,
+            )
+            self.start_time = time.time()
         self.last_saved = False
         self.iteration_times = []
         self.previous_iteration_time: Optional[float] = None

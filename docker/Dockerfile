@@ -7,8 +7,9 @@
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.05-cuda12.9-devel-ubuntu24.04
 FROM scratch AS nemo-rl
-ARG NRL_GIT_REF=main
-ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
+# ARG NRL_GIT_REF=main
+# ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
+ADD . /
 
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
@@ -85,8 +86,17 @@ COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
+# for using custom vllm (must be provided via --build-arg)
+ARG VLLM_PRECOMPILED_WHEEL_LOCATION
+ARG SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM
+ENV VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_PRECOMPILED_WHEEL_LOCATION}
+ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM}
+
 RUN --mount=type=ssh <<"EOF" bash -exu
 uv venv --seed
+# Install vllm build dependencies early since vllm is built without isolation
+VIRTUAL_ENV=/opt/nemo_rl_venv uv pip install setuptools setuptools_scm
+VIRTUAL_ENV=/opt/nemo_rl_venv uv pip install torch==2.9.1 --index https://download.pytorch.org/whl/cu129
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     bash tools/build-custom-vllm.sh
     source 3rdparty/vllm/nemo-rl.env
@@ -96,6 +106,11 @@ fi
 # Sync each training + inference backend one at a time (since they may conflict)
 # to warm the uv cache, then at the end just sync the default dependencies.
 # Do everything in one layer to prevent large layers.
+
+# Explicitly export for setuptools-scm (vllm submodule lacks git history in container)
+export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM="${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM}"
+export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM}"
+echo "SETUPTOOLS_SCM_PRETEND_VERSION=$SETUPTOOLS_SCM_PRETEND_VERSION"
 
 # The venv is symlinked to avoid bloating the layer size
 uv sync --link-mode symlink --locked --no-install-project
@@ -124,6 +139,11 @@ LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+# for using custom vllm (must be provided via --build-arg)
+ARG VLLM_PRECOMPILED_WHEEL_LOCATION
+ARG SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM
+ENV VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_PRECOMPILED_WHEEL_LOCATION}
+ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM}
 
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh

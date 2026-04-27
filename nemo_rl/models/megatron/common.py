@@ -26,16 +26,16 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
-from megatron.core.transformer.moe.moe_utils import (
-    clear_aux_losses_tracker,
-    get_moe_layer_wise_logging_tracker,
-    reduce_aux_losses_tracker_across_ranks,
-)
 from megatron.training.utils import get_ltor_masks_and_position_ids
 
 from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+from nemo_rl.models.megatron.multimodal import (
+    collapse_multimodal_tokens,
+    is_llava_model,
+    prepare_multimodal_data,
+)
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
@@ -46,6 +46,34 @@ def _round_up_to_multiple(value: int, multiple: int) -> int:
     )
 
 
+def _vlm_sp_repad_collapsed(
+    input_ids: torch.Tensor,
+    tokens_removed_per_sample: Optional[torch.Tensor],
+    tp_size: int,
+) -> torch.Tensor:
+    """Re-pad collapsed VLM input_ids for sequence parallelism alignment.
+
+    In non-packing mode all samples share the same tensor width. LLaVA
+    re-expands image tokens internally, producing:
+        combined_embeddings.shape[0] = collapsed_width + max(tokens_removed)
+    With sequence_parallel=True, _calc_shard_factor asserts this is
+    divisible by tp_size.
+
+    Required invariant: (collapsed_width + max_removed) % tp_size == 0
+    Solution: required_width = round_up(collapsed_width + max_removed, tp_size) - max_removed
+    """
+    if tokens_removed_per_sample is None or tp_size <= 1:
+        return input_ids
+    max_removed = int(tokens_removed_per_sample.max().item())
+    collapsed_width = input_ids.shape[1]
+    required_width = _round_up_to_multiple(collapsed_width + max_removed, tp_size) - max_removed
+    if required_width > collapsed_width:
+        input_ids = torch.nn.functional.pad(
+            input_ids, (0, required_width - collapsed_width), value=0
+        )
+    return input_ids
+
+
 def _pack_sequences_for_megatron(
     input_ids: torch.Tensor,
     seq_lengths: torch.Tensor,
@@ -54,6 +82,8 @@ def _pack_sequences_for_megatron(
     pad_packed_seq_to: Optional[int] = None,
     cp_rank: int = 0,
     cp_size: int = 1,
+    tokens_removed_per_sample: Optional[torch.Tensor] = None,
+    skip_local_cp_sharding: bool = False,
 ) -> tuple[torch.Tensor, PackedSeqParams, torch.Tensor, Optional[torch.Tensor]]:
     """Pack sequences for Megatron model processing with optional context parallelism.
 
@@ -65,6 +95,12 @@ def _pack_sequences_for_megatron(
         pad_packed_seq_to: Pad packed sequences to this value (before CP)
             - The three parameters above can be calculated using _get_pack_sequence_parameters_for_megatron, we do not recommend users to set these parameters manually.
         cp_size: Context parallelism size
+        tokens_removed_per_sample: Per-sample count of tokens removed by VLM multimodal
+            token collapsing (from collapse_multimodal_tokens). When provided, per-sequence
+            padding ensures that expanded lengths (collapsed + removed) are multiples of
+            pad_individual_seqs_to_multiple_of. None for non-VLM paths.
+        skip_local_cp_sharding: Keep packed_input_ids unsharded because the downstream
+            model will apply context parallel sharding after rebuilding embeddings.
 
     Returns:
         Tuple of:
@@ -76,6 +112,23 @@ def _pack_sequences_for_megatron(
     """
     batch_size = input_ids.shape[0]
 
+    # --- Guard: PP + VLM + CP > 1 is explicitly unsupported ---
+    # VLM token expansion causes per-microbatch total length variation that
+    # breaks pipeline parallelism's uniform sequence length requirement.
+    if tokens_removed_per_sample is not None and pad_packed_seq_to is not None and cp_size > 1:
+        raise NotImplementedError(
+            "PP > 1 with VLM sequence packing and CP > 1 is not yet supported. "
+            "VLM token expansion causes per-microbatch total length variation "
+            "that breaks pipeline parallelism's uniform sequence length requirement."
+        )
+
+    # --- Input validation ---
+    if tokens_removed_per_sample is not None:
+        assert tokens_removed_per_sample.shape[0] >= batch_size, (
+            f"tokens_removed_per_sample has {tokens_removed_per_sample.shape[0]} entries "
+            f"but batch_size is {batch_size}"
+        )
+
     # Build cumulative sequence lengths (cu_seqlens) and extract valid tokens
     needs_padding = (
         pad_individual_seqs_to_multiple_of > 1
@@ -84,7 +137,6 @@ def _pack_sequences_for_megatron(
     )
 
     cu_seqlens = [0]
-    cu_seqlens_padded = [0] if needs_padding else None
     valid_tokens = []
 
     # Round up the pad_packed_seq_to to the nearest multiple of pad_packed_seq_to_multiple_of
@@ -94,6 +146,11 @@ def _pack_sequences_for_megatron(
         )
 
     pad_factor = pad_individual_seqs_to_multiple_of
+
+    # --- Loop 1: Build cu_seqlens and padded_seq_lens ---
+    # padded_seq_lens is shared with Loop 2 to ensure dual-loop consistency
+    # (both loops must agree on per-sequence padding).
+    padded_seq_lens: list[int] = []
 
     for b in range(batch_size):
         seq_len = (
@@ -106,23 +163,75 @@ def _pack_sequences_for_megatron(
         # Update cumulative sequence lengths
         cu_seqlens.append(cu_seqlens[-1] + seq_len)
 
-        # For context parallelism, track padded sequence lengths
+        # Compute padded sequence length
         if needs_padding:
-            # Pad sequence length to multiple of (cp_size * 2)
-            padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
-            cu_seqlens_padded.append(cu_seqlens_padded[-1] + padded_seq_len)
+            # VLM-aware padding: ensure expanded length (collapsed + removed)
+            # is a multiple of pad_factor. When tokens_removed_per_sample is None,
+            # removed=0 and the formula degenerates to the standard case.
+            removed = (
+                tokens_removed_per_sample[b].item()
+                if tokens_removed_per_sample is not None
+                else 0
+            )
+            padded_seq_len = _round_up_to_multiple(seq_len + removed, pad_factor) - removed
+            padded_seq_lens.append(padded_seq_len)
 
-    # Convert to tensors
-    cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=input_ids.device)
-    if needs_padding:
-        cu_seqlens_padded = torch.tensor(
-            cu_seqlens_padded, dtype=torch.int32, device=input_ids.device
-        )
+    # --- Post-loop: adjust last sequence for PP or FP8 total alignment ---
+    if needs_padding and batch_size > 0:
+        running = sum(padded_seq_lens[:-1]) if batch_size > 1 else 0
+
         if pad_packed_seq_to is not None:
-            cu_seqlens_padded[-1] = pad_packed_seq_to
+            # PP > 1: target collapsed total is pad_packed_seq_to.
+            # VLM + CP > 1 is guarded above, so this handles non-VLM or CP=1 VLM.
+            padded_seq_lens[-1] = pad_packed_seq_to - running
         elif pad_packed_seq_to_multiple_of > 1:
-            cu_seqlens_padded[-1] = _round_up_to_multiple(
-                cu_seqlens_padded[-1], pad_packed_seq_to_multiple_of
+            if tokens_removed_per_sample is not None:
+                # VLM + FP8: align total in expanded space, then derive collapsed padding.
+                running_removed = (
+                    sum(
+                        tokens_removed_per_sample[b].item()
+                        for b in range(batch_size - 1)
+                    )
+                    if batch_size > 1
+                    else 0
+                )
+                running_expanded = running + running_removed
+                last_removed = tokens_removed_per_sample[batch_size - 1].item()
+                last_expanded = padded_seq_lens[-1] + last_removed  # already per-seq aligned
+                total_expanded = _round_up_to_multiple(
+                    running_expanded + last_expanded, pad_packed_seq_to_multiple_of
+                )
+                padded_seq_lens[-1] = total_expanded - running_expanded - last_removed
+            else:
+                # Non-VLM: current behavior -- align collapsed total.
+                current = padded_seq_lens[-1]
+                new_total = _round_up_to_multiple(
+                    running + current, pad_packed_seq_to_multiple_of
+                )
+                padded_seq_lens[-1] = new_total - running
+
+    # --- Build cu_seqlens_padded from padded_seq_lens ---
+    cu_seqlens_padded = None
+    if needs_padding:
+        cu_seqlens_padded_list = [0]
+        for psl in padded_seq_lens:
+            cu_seqlens_padded_list.append(cu_seqlens_padded_list[-1] + psl)
+        cu_seqlens_padded = torch.tensor(
+            cu_seqlens_padded_list, dtype=torch.int32, device=input_ids.device
+        )
+
+    # Convert cu_seqlens to tensor
+    cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=input_ids.device)
+
+    # --- VLM assertions: verify expanded slot alignment ---
+    if tokens_removed_per_sample is not None and pad_factor > 1 and needs_padding:
+        for b in range(batch_size):
+            removed = tokens_removed_per_sample[b].item()
+            expanded_slot = padded_seq_lens[b] + removed
+            assert expanded_slot % pad_factor == 0, (
+                f"[VLM-CP] Expanded slot {b} = {expanded_slot} "
+                f"(collapsed_padded={padded_seq_lens[b]}, removed={removed}) "
+                f"not aligned to pad_factor={pad_factor}"
             )
 
     # Calculate max sequence length (padded if using CP)
@@ -133,10 +242,8 @@ def _pack_sequences_for_megatron(
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
 
-    # Concatenate all valid tokens
-    # If using individual padding, we need to pad individual sequences
-    # CP will always need padding (of at least cp_size * 2)
-    running_seq_len = 0
+    # --- Loop 2: Build padded token tensors ---
+    # Uses padded_seq_lens[b] from Loop 1 for consistency (no re-computation).
     if pad_factor > 1:
         all_input_ids = []
         padded_tokens = []
@@ -146,25 +253,9 @@ def _pack_sequences_for_megatron(
                 if torch.is_tensor(seq_lengths[b])
                 else seq_lengths[b]
             )
-            # if last element, pad to the max sequence length
-            if b == batch_size - 1 and needs_padding:
-                if pad_packed_seq_to is not None:
-                    padded_seq_len = pad_packed_seq_to - running_seq_len
-                elif pad_packed_seq_to_multiple_of > 1:
-                    padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
-                    padded_seq_len = (
-                        _round_up_to_multiple(
-                            running_seq_len + padded_seq_len,
-                            pad_packed_seq_to_multiple_of,
-                        )
-                        - running_seq_len
-                    )
-                else:
-                    padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
-            else:
-                padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
 
-            running_seq_len += padded_seq_len
+            # Use shared padded_seq_lens from Loop 1
+            padded_seq_len = padded_seq_lens[b]
 
             # Pad this sequence to the required length
             seq_tokens = input_ids[b, :seq_len]
@@ -175,7 +266,14 @@ def _pack_sequences_for_megatron(
                 )
             all_input_ids.append(seq_tokens)
 
-            if cp_size > 1:
+            # Skip local CP-sharding when the downstream model will shard after
+            # rebuilding its embedding sequence (for example, LLaVA) or when VLM
+            # collapsing already moved padding/alignment decisions into expanded space.
+            if (
+                cp_size > 1
+                and not skip_local_cp_sharding
+                and tokens_removed_per_sample is None
+            ):
                 seq_tokens = _get_tokens_on_this_cp_rank(
                     seq_tokens, cp_rank, cp_size, seq_dim=0
                 )
@@ -401,6 +499,13 @@ def forward_step_arbitrary_loss(
 
     with straggler_timer(bdata=True):
         data_dict = next(data_iterator).to("cuda")
+        original_input_ids = data_dict["input_ids"]
+        data_dict = collapse_multimodal_tokens(data_dict, model)
+        use_llava_handoff = is_llava_model(model)
+
+        # Extract per-sample token removal counts for VLM expanded↔collapsed conversion
+        tokens_removed_per_sample = data_dict.pop("tokens_removed_per_sample", None)
+
         input_ids = data_dict["input_ids"]
         attention_mask = None
         position_ids = None
@@ -439,13 +544,53 @@ def forward_step_arbitrary_loss(
                 pad_full_seq_to,
                 cp_rank=get_context_parallel_rank(),
                 cp_size=get_context_parallel_world_size(),
+                tokens_removed_per_sample=tokens_removed_per_sample,
+                skip_local_cp_sharding=use_llava_handoff,
             )
+
+            # --- Phase 2: Pre-set expanded cu_seqlens for VLM attention masking ---
+            # When VLM + SP, the model re-expands collapsed image tokens internally
+            # (LLaVA's _preprocess_data). The attention mechanism must see expanded
+            # boundaries for ALL sequences, not just the last one.
+            if tokens_removed_per_sample is not None:
+                n_seqs = cu_seqlens_padded.shape[0] - 1
+                cumulative_removed = torch.zeros(
+                    n_seqs + 1, dtype=torch.int32, device=cu_seqlens_padded.device
+                )
+                cumulative_removed[1:] = (
+                    tokens_removed_per_sample[:n_seqs].to(torch.int32).cumsum(0)
+                )
+                cu_seqlens_padded_expanded = cu_seqlens_padded.clone() + cumulative_removed
+                cu_seqlens_expanded = cu_seqlens.clone() + cumulative_removed
+
+                # Single clone, all four fields alias it (same as original packing).
+                # TE relies on identity (cu_seqlens_q is cu_seqlens_kv) for
+                # self-attention detection; separate clones break this.
+                cu_seqlens_for_attn = cu_seqlens_padded_expanded.clone()
+                packed_seq_params.cu_seqlens_q = cu_seqlens_for_attn
+                packed_seq_params.cu_seqlens_kv = cu_seqlens_for_attn
+                packed_seq_params.cu_seqlens_q_padded = cu_seqlens_for_attn
+                packed_seq_params.cu_seqlens_kv_padded = cu_seqlens_for_attn
+
+                # Update max_seqlen to reflect expanded individual sequence lengths
+                expanded_slot_lengths = (
+                    cu_seqlens_padded_expanded[1:] - cu_seqlens_padded_expanded[:-1]
+                )
+                packed_seq_params.max_seqlen_q = expanded_slot_lengths.max().item()
+                packed_seq_params.max_seqlen_kv = expanded_slot_lengths.max().item()
 
             # For packed sequences, position_ids and attention_mask are typically None
             # The PackedSeqParams handles all necessary sequence information
             position_ids = None
             attention_mask = None
         else:
+            if policy_cfg is not None:
+                sp = policy_cfg["megatron_cfg"].get("sequence_parallel", False)
+                tp_size = policy_cfg["megatron_cfg"].get("tensor_model_parallel_size", 1)
+                if sp and tp_size > 1:
+                    input_ids = _vlm_sp_repad_collapsed(
+                        input_ids, tokens_removed_per_sample, tp_size
+                    )
             input_ids_cp_sharded = input_ids
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                 data=input_ids,
@@ -460,8 +605,6 @@ def forward_step_arbitrary_loss(
     multimodal_data = data_dict.get_multimodal_dict(
         as_tensors=True, device=input_ids_cp_sharded.device
     )
-    if len(multimodal_data) > 0:
-        position_ids = None
 
     additional_kwargs = {}
     # Mamba models currently do not support packed_seq_params
@@ -471,14 +614,32 @@ def forward_step_arbitrary_loss(
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
 
+    # LLaVA models must see the full packed input_ids so they can rebuild their
+    # embedding sequence and apply CP internally, even for text-only microbatches.
+    has_multimodal_payload = len(multimodal_data) > 0
+    cp_size = get_context_parallel_world_size()
+
+    # Assert that CP > 1 is only supported for LLaVA models
+    if has_multimodal_payload and cp_size > 1:
+        assert use_llava_handoff, (
+            f"Context parallelism (CP > 1) with VLM is only supported for LLaVA models. "
+            f"Got CP size {cp_size} with model type {type(model).__name__}. "
+            f"Please set context_parallel_size to 1 for non-LLaVA VLM models."
+        )
+
+    model_input_ids = input_ids if use_llava_handoff else input_ids_cp_sharded
+
     with straggler_timer:
+        prepare_multimodal_data(multimodal_data, model, model_input_ids.device)
         output_tensor = model(
-            input_ids=input_ids_cp_sharded,
+            input_ids=model_input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
             **additional_kwargs,
             **multimodal_data,
         )
+        if type(output_tensor) == tuple:
+            output_tensor = output_tensor[0]
 
         # Apply temperature scaling to logits for training
         # This matches the dtensor worker's _apply_temperature_scaling in the train method
@@ -499,6 +660,7 @@ def forward_step_arbitrary_loss(
             )
 
         loss_data = data_dict
+        loss_data["input_ids"] = original_input_ids
 
     loss_fn_wrapped = partial(
         loss_fn,
@@ -610,49 +772,3 @@ def broadcast_tensor(
     dist.broadcast(tensor, src=src_rank, group=group)
 
     return tensor
-
-
-def get_moe_metrics(
-    loss_scale: float,
-    total_loss_dict: Optional[dict] = None,
-    per_layer_logging: bool = False,
-) -> dict[str, Any]:
-    """Returns Mixture of Experts (MoE) auxiliary-loss metrics.
-
-    This function reduces MoE auxiliary losses across ranks, aggregates them, and
-    returns a dictionary of metrics.
-
-    Args:
-        loss_scale: Scale factor to apply to each auxiliary loss (e.g., 1/num_microbatches).
-        total_loss_dict: If provided, accumulate means into this dict (by name).
-        per_layer_logging: If True, include per-layer values in the returned dict.
-
-    Returns:
-        dict[str, Any]: A flat dict of aggregated metrics. For each aux loss name,
-        the mean value is returned under the same key (e.g., "load_balancing_loss").
-        If per_layer_logging is True, per-layer values are returned under keys of the
-        form "moe/{name}_layer_{i}".
-    """
-    reduce_aux_losses_tracker_across_ranks()
-    tracker = get_moe_layer_wise_logging_tracker()
-
-    metrics: dict[str, Any] = {}
-    if len(tracker) > 0:
-        aux_losses = {k: v["values"].float() * loss_scale for k, v in tracker.items()}
-        for name, loss_list in aux_losses.items():
-            # Megatron-LM aggregates aux losses across layers and normalizes by number of MoE layers
-            num_layers = int(loss_list.numel()) if loss_list.numel() > 0 else 1
-            aggregated_value = loss_list.sum() / num_layers
-            metrics[name] = float(aggregated_value.item())
-            if total_loss_dict is not None:
-                if name not in total_loss_dict:
-                    total_loss_dict[name] = aggregated_value
-                else:
-                    total_loss_dict[name] += aggregated_value
-
-            if per_layer_logging:
-                for i, loss in enumerate(loss_list.tolist()):
-                    metrics[f"moe/{name}_layer_{i}"] = float(loss)
-
-    clear_aux_losses_tracker()
-    return metrics

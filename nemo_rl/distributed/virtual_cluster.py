@@ -97,6 +97,20 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
+        "excludes": [
+            "3rdparty/",
+            ".git/",
+            ".venv/",
+            "debug_results/",
+            "__pycache__/",
+            "*.egg-info/",
+            "*_logs/",
+            "logs/",
+            # Exclude project config so uv doesn't try to resolve the incomplete
+            # workspace on workers (3rdparty/ is excluded above)
+            "pyproject.toml",
+            "uv.lock",
+        ],
     }
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")

@@ -13,10 +13,13 @@
 # limitations under the License.
 
 import argparse
+import os
+import shutil
 
 import yaml
 
 from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf
+from nemo_rl.models import nemotron_h_nano_vl
 
 
 def parse_args():
@@ -35,6 +38,9 @@ def parse_args():
     )
     parser.add_argument(
         "--hf-ckpt-path", type=str, default=None, help="Path to save HF checkpoint"
+    )
+    parser.add_argument(
+        "--extras-path", type=str, default="/lustre/fs1/portfolios/llmservice/users/jseppanen/convert_dcp_to_hf_extras", help="Path to extras directory"
     )
     # Parse known args for the script
     args = parser.parse_args()
@@ -59,6 +65,8 @@ def main():
     tokenizer_name_or_path = config["policy"]["model_name"]
     hf_overrides = config["policy"].get("hf_overrides", {}) or {}
 
+    nemotron_h_nano_vl.register()
+
     hf_ckpt = convert_dcp_to_hf(
         dcp_ckpt_path=args.dcp_ckpt_path,
         hf_ckpt_path=args.hf_ckpt_path,
@@ -66,6 +74,13 @@ def main():
         tokenizer_name_or_path=tokenizer_name_or_path,
         hf_overrides=hf_overrides,
     )
+
+    # copy extra *.jinja/*.json/*.py files
+    for file in os.listdir(args.extras_path):
+        if "safetensors" in file:
+            continue
+        shutil.copyfile(f"{args.extras_path}/{file}", f"{args.hf_ckpt_path}/{file}")
+
     print(f"Saved HF checkpoint to: {hf_ckpt}")
 
 

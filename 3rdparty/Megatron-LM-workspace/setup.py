@@ -67,7 +67,7 @@ CACHED_DEPENDENCIES = [
     "onnxscript",
     "flash-linear-attention~=0.3.2",
     # VCS dependency - must match pyproject.toml [tool.uv.sources]
-    "emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.1.0",
+    "emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@fb1add873e7851ec34b48581ea1b15761b73d189",
 ]
 
 
