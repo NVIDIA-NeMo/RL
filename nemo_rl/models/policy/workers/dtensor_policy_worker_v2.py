@@ -21,9 +21,7 @@ from typing import Any, Generator, Optional
 import ray
 import torch
 from nemo_automodel.components._peft.lora import LinearLoRA
-from nemo_automodel.components.distributed.cp_utils import (
-    create_context_parallel_ctx,
-)
+from nemo_automodel.components.distributed.cp_utils import create_context_parallel_ctx
 from nemo_automodel.components.distributed.cp_utils import (
     get_train_context as get_train_context_automodel,
 )
@@ -1026,6 +1024,12 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             self.move_optimizer_to_device("cuda")
 
         torch.cuda.empty_cache()
+
+    def finish_inference(self, *args, **kwargs) -> None:
+        pass
+
+    def finish_training(self, *args, **kwargs) -> None:
+        pass
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")
