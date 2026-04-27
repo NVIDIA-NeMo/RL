@@ -14,8 +14,10 @@
 
 from nemo_rl.data.datasets.eval_datasets.aime import AIMEDataset
 from nemo_rl.data.datasets.eval_datasets.gpqa import GPQADataset
+from nemo_rl.data.datasets.eval_datasets.humaneval_plus import HumanEvalPlusDataset
 from nemo_rl.data.datasets.eval_datasets.local_math_dataset import LocalMathDataset
 from nemo_rl.data.datasets.eval_datasets.math import MathDataset
+from nemo_rl.data.datasets.eval_datasets.mbpp_plus import MBPPPlusDataset
 from nemo_rl.data.datasets.eval_datasets.mmau import MMAUDataset
 from nemo_rl.data.datasets.eval_datasets.mmlu import MMLUDataset
 from nemo_rl.data.datasets.eval_datasets.mmlu_pro import MMLUProDataset
@@ -35,10 +37,12 @@ def load_eval_dataset(data_config):
 
     # mmlu
     if dataset_name.startswith("mmlu") and dataset_name != "mmlu_pro":
+        num_few_shot = data_config.get("num_few_shot", 0)
         if dataset_name == "mmlu":
             base_dataset = MMLUDataset(
                 prompt_file=data_config["prompt_file"],
                 system_prompt_file=data_config["system_prompt_file"],
+                num_few_shot=num_few_shot,
             )
         else:
             language = dataset_name.split("_")[1]
@@ -46,6 +50,7 @@ def load_eval_dataset(data_config):
                 language=language,
                 prompt_file=data_config["prompt_file"],
                 system_prompt_file=data_config["system_prompt_file"],
+                num_few_shot=num_few_shot,
             )
     elif dataset_name == "mmlu_pro":
         base_dataset = MMLUProDataset(
@@ -98,6 +103,21 @@ def load_eval_dataset(data_config):
             dataset_name="TwinkStart/MMAU",
             split=split,
         )
+    # code-execution benchmarks
+    elif dataset_name == "mbpp_plus":
+        base_dataset = MBPPPlusDataset(
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+            dataset_path=data_config.get("dataset_path") or "evalplus/mbppplus",
+            split=data_config.get("split") or "test",
+        )
+    elif dataset_name in ("humaneval_plus", "human_eval_plus"):
+        base_dataset = HumanEvalPlusDataset(
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+            dataset_path=data_config.get("dataset_path") or "evalplus/humanevalplus",
+            split=data_config.get("split") or "test",
+        )
     # fall back to local dataset
     else:
         print(f"Loading dataset from {dataset_name}...")
@@ -117,8 +137,10 @@ def load_eval_dataset(data_config):
 __all__ = [
     "AIMEDataset",
     "GPQADataset",
+    "HumanEvalPlusDataset",
     "LocalMathDataset",
     "MathDataset",
+    "MBPPPlusDataset",
     "MMAUDataset",
     "MMLUDataset",
     "MMLUProDataset",
