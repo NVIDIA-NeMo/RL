@@ -1,6 +1,9 @@
 # Adding to .gitignore helps reduce the size of your working_dir
 
 /.git
+.codex
+.codex/
+.humanize/
 *.out
 *.log
 *.tar
