@@ -840,6 +840,8 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=1,
+            pp_size=1,
+            pp_mesh=None,
         )
 
     @pytest.fixture
@@ -1450,6 +1452,8 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=2,  # CP enabled
+            pp_size=1,
+            pp_mesh=None,
         )
 
         mock_model = MagicMock()
@@ -1494,6 +1498,8 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=2,  # TP enabled
             cp_size=2,  # CP enabled
+            pp_size=1,
+            pp_mesh=None,
         )
 
         mock_model = MagicMock()
@@ -1538,6 +1544,8 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=2,  # CP enabled
+            pp_size=1,
+            pp_mesh=None,
         )
 
         # Set model_type to gemma3 to trigger validation
