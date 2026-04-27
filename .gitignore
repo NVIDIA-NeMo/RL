@@ -29,6 +29,10 @@ coverage.json
 .testmondata*
 unit_results.json
 unit_results/
+tests/functional/*/logs/
+tests/functional/*/run.log
+tests/functional/*/metrics.json
+tests/functional/*/.coverage*
 test_assets/
 actual_test_nemo_gym_sanity.json
 .nrl_remote_map.json
