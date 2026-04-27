@@ -1,0 +1,282 @@
+# Off-Policy Distillation Algorithm Configuration
+#
+# Off-policy distillation runs against a fixed dataset of (prompt, response)
+# pairs — no student generation — and aligns the student to the teacher via
+# top-k KL on the dataset's responses.
+distillation:
+    # The global batch size is taken from policy.train_global_batch_size;
+    # off-policy has no generation so num_prompts_per_step is redundant.
+    max_num_steps: 1000
+    max_num_epochs: 10
+    topk_logits_k: 64 # top-k teacher logits used for the sparse KL loss
+    seed: 42
+
+    # validation
+    val_period: 0 # 0 disables periodic validation
+    val_at_start: false
+    val_batches: 0 # 0 = run on the full validation dataloader
+    val_global_batch_size: 64
+    val_micro_batch_size: 1
+
+    # IPC plumbing for teacher->student logit handoff
+    use_ipc: true # required when token_aligner.enabled=true
+    cross_tokenizer_num_workers: null # null = os.cpu_count(); 1 = sequential
+
+loss_fn:
+    # same-tokenizer fields (used by DistillationLossFn when token_aligner.enabled=false)
+    kl_type: "mixed" # forward, reverse, mixed
+    mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
+    zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
+
+    # cross-tokenizer fields (used by CrossTokenizerDistillationLossFn when token_aligner.enabled=true)
+    loss_type: "KL" # KL, cross_entropy, chunked_ce
+    temperature: 1.0
+    vocab_topk: 8192 # reduce teacher vocab to top-k (0 = full vocab)
+    exact_token_match_only: false
+    reverse_kl: false
+    project_teacher_to_student: false
+    gold_loss: false # common-KL + uncommon-L1 split, no projection matrix
+    xtoken_loss: false # relaxed exact-map threshold (>= 0.6 instead of == 1.0)
+    ce_loss_scale: 0.0 # aux next-token CE weight (0 = disabled)
+    dynamic_loss_scaling: false # rescale KL to match CE magnitude
+
+checkpointing:
+    enabled: true
+    checkpoint_dir: "checkpoints/off-policy-distillation-${policy.model_name}"
+    metric_name: "val:val_loss" # one of "val:" or "train:" followed by the metric name
+    higher_is_better: false
+    keep_top_k: 3
+    save_period: 50
+    checkpoint_must_save_by: null
+    model_save_format: "safetensors"
+    save_consolidated: false
+    save_optimizer: true
+
+policy: &POLICY_BASE
+    model_name: "Qwen/Qwen3-1.7B-Base"
+    tokenizer:
+        name: ${..model_name} ## specify if you'd like to use a tokenizer different from the model's default
+        chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
+    train_global_batch_size: 64
+    train_micro_batch_size: 1
+    logprob_batch_size: 1
+    max_total_sequence_length: 8192
+    precision: "bfloat16"
+    logprob_chunk_size: null
+
+    offload_optimizer_for_logprob: false
+
+    dtensor_cfg: &DTENSOR_BASE
+        enabled: true
+        _v2: true
+        cpu_offload: False
+        sequence_parallel: false
+        activation_checkpointing: true
+        tensor_parallel_size: 1
+        context_parallel_size: 1
+        custom_parallel_plan: null
+
+    dynamic_batching:
+        enabled: true
+        train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+        logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+        sequence_length_round: 64
+
+    sequence_packing:
+        enabled: false
+        train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+        logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+        algorithm: "modified_first_fit_decreasing"
+        sequence_length_round: 64
+
+    max_grad_norm: 1.0
+    # makes the training sequence length divisible by the tensor parallel size
+    # this is useful for sequence parallel training
+    # must be divisible by 2*cp
+    make_sequence_length_divisible_by: ${mul:${mul:${.dtensor_cfg.tensor_parallel_size}, ${.dtensor_cfg.context_parallel_size}}, 2}
+    optimizer:
+        name: "torch.optim.AdamW"
+        kwargs:
+            lr: 2.0e-5
+            weight_decay: 0.01
+            betas: [0.9, 0.999]
+            eps: 1e-8
+            # when using Dtensor, we need to set foreach
+            # and fused to False
+            foreach: False
+            fused: False
+
+    megatron_cfg: &MEGATRON_BASE
+        enabled: false
+        force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
+        empty_unused_memory_level: 0
+        activation_checkpointing: false
+        converter_type: "Qwen3ForCausalLM"
+        tensor_model_parallel_size: 2
+        expert_tensor_parallel_size: 1
+        expert_model_parallel_size: 1
+        pipeline_model_parallel_size: 2
+        num_layers_in_first_pipeline_stage: null
+        num_layers_in_last_pipeline_stage: null
+        context_parallel_size: 2
+        pipeline_dtype: ${policy.precision}
+        sequence_parallel: false
+        freeze_moe_router: true
+        moe_router_dtype: "fp64"
+        moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+        moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+        moe_permute_fusion: true
+        apply_rope_fusion: True
+        bias_activation_fusion: True
+        defer_fp32_logits: False
+        moe_per_layer_logging: False
+        moe_enable_deepep: false
+        moe_token_dispatcher_type: "alltoall"
+        moe_shared_expert_overlap: false
+        gradient_accumulation_fusion: false
+
+        optimizer:
+            optimizer: "adam"
+            lr: 2.00001e-5
+            min_lr: 2.0e-5
+            weight_decay: 0.01
+            bf16: true
+            fp16: false
+            params_dtype: "float32"
+
+            #adam
+            adam_beta1: 0.9
+            adam_beta2: 0.999
+            adam_eps: 1e-8
+
+            #sgd
+            sgd_momentum: 0.9
+
+            #distributed optimizer
+            use_distributed_optimizer: true
+            use_precision_aware_optimizer: true
+
+            # optimizer cpu offload
+            optimizer_cpu_offload: false
+            optimizer_offload_fraction: 0.0
+
+            clip_grad: ${policy.max_grad_norm}
+
+        scheduler:
+            start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+            end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+            weight_decay_incr_style: "constant"
+            lr_decay_style: "constant"
+            lr_decay_iters: 1000
+            lr_warmup_iters: 10
+            lr_warmup_init: 2.0e-6
+
+        distributed_data_parallel_config:
+            grad_reduce_in_fp32: false
+            overlap_grad_reduce: true
+            overlap_param_gather: true
+            use_custom_fsdp: false
+            data_parallel_sharding_strategy: "optim_grads_params"
+
+        fp8_cfg:
+            enabled: false
+            fp8: "e4m3"
+            fp8_recipe: "blockwise"
+            fp8_param: false
+
+    scheduler:
+        - name: "torch.optim.lr_scheduler.LinearLR"
+          kwargs:
+              start_factor: 0.1
+              end_factor: 1.0
+              total_iters: 10
+        - name: "torch.optim.lr_scheduler.ConstantLR"
+          kwargs:
+              factor: 1.0
+              total_iters: 10000000000
+        - milestones: [10]
+
+    # off-policy distillation does not generate; the dataset already provides responses
+    generation: null
+
+teacher:
+    <<: *POLICY_BASE
+    model_name: "Qwen/Qwen3-4B"
+    dtensor_cfg:
+        <<: *DTENSOR_BASE
+        context_parallel_size: 1
+        tensor_parallel_size: 1
+
+data:
+    max_input_seq_length: ${policy.max_total_sequence_length}
+    add_bos: false # ArrowTextDataset already wraps text as an assistant message
+    add_eos: false
+    add_generation_prompt: false
+    shuffle: true
+
+    # dataset (uses load_response_dataset registry; arrow_text expects a glob)
+    train:
+        dataset_name: arrow_text
+        # raw-text continued-pretraining processor: no chat template, BOS only,
+        # loss on every token. Use sft_processor instead for chat-formatted data.
+        processor: arrow_text_processor
+        arrow_files: "/path/to/your/*.arrow" # override on the CLI
+        text_key: "text"
+        split_validation_size: 0.05
+        seed: ${distillation.seed}
+        # writable location for HF .map() cache; required when source arrow
+        # files live on a read-only filesystem
+        cache_dir: null
+        num_proc: null # parallel .map() workers; null = single process
+    # default settings shared by all train/validation entries
+    default:
+        prompt_file: null
+        system_prompt_file: null
+
+logger:
+    log_dir: "logs/off-policy-distillation"
+    num_val_samples_to_print: 0 # off-policy validation prints loss only
+    wandb_enabled: true
+    tensorboard_enabled: true
+    mlflow_enabled: false
+    swanlab_enabled: false
+    monitor_gpus: true
+    wandb:
+        project: "nemo-off-policy-distillation"
+        name: "off-policy-${teacher.model_name}-to-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    swanlab:
+        project: "nemo-off-policy-distillation"
+        name: "off-policy-${teacher.model_name}-to-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    tensorboard:
+        log_dir: "tb_logs-off-policy-distillation"
+    mlflow:
+        experiment_name: "off-policy-distillation-dev"
+        run_name: "off-policy-distillation"
+        tracking_uri: "http://localhost:5000"
+    gpu_monitoring:
+        collection_interval: 10
+        flush_interval: 10
+
+cluster:
+    gpus_per_node: 8
+    num_nodes: 1
+
+# cross-tokenizer distillation (optional; set enabled=true to use a different teacher tokenizer)
+token_aligner:
+    enabled: false
+    projection_matrix_path: null # path to the precomputed .pt projection matrix
+    use_sparse_format: true # true = sparse COO; false = dense indices/values
+    loss_type: "KL" # kept in sync with loss_fn.loss_type when cross-tokenizer is active
+    exact_token_match_only: false
+    temperature: 1.0
+    vocab_topk: 8192
+    reverse_kl: false
+    projection_matrix_multiplier: 1.0
+    max_comb_len: 4
+    learnable: false
+    project_teacher_to_student: false
+    use_char_offset: false # try char-offset alignment before DP fallback
+    force_dp_only: false # disable char-offset path and always run DP
+    use_cuda_dp: false # monkeypatch the chunked DP base case with a CUDA kernel
+    dp_chunk_size: 128
+    use_align_fast: false # use align_fast for DP path; default off for parity

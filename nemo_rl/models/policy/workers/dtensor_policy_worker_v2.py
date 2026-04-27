@@ -16,7 +16,7 @@ import contextlib
 import gc
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Optional
+from typing import Any, Callable, Generator, NamedTuple, Optional
 
 import ray
 import torch
@@ -55,6 +55,8 @@ from nemo_rl.models.automodel.train import (
     LossPostProcessor,
     ScorePostProcessor,
     TopkLogitsPostProcessor,
+    XTokenStudentIPCLossPostProcessor,
+    XTokenTeacherIPCExportPostProcessor,
     aggregate_training_statistics,
     automodel_forward_backward,
     forward_with_post_processing_fn,
@@ -188,6 +190,23 @@ def get_train_context(
         yield
 
 
+class _OffPolicyLoopState(NamedTuple):
+    """Per-call loop state shared by the off-policy paths.
+
+    Produced by :meth:`DTensorPolicyWorkerV2Impl._prepare_off_policy_loop_state`
+    and consumed by both ``_run_teacher_ipc_export`` and
+    ``_run_student_off_policy_distillation``.
+    """
+
+    gbs: int
+    mbs: int
+    local_gbs: int
+    num_global_batches: int
+    sequence_dim: int
+    train_context_fn: Callable[[Any], Any]
+    empty_cache_steps: Optional[int]
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface):
@@ -238,6 +257,28 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         # Initialize checkpoint manager
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
+
+        # Force pad_token_id=None during HF model construction.
+        #
+        # Why: HF's `_init_weights(nn.Embedding)` zeros the padding row via
+        #      `init.zeros_(module.weight[module.padding_idx])`. Under DTensor
+        #      (torch>=2.10), this indexing op triggers a redistribute whose
+        #      shard_order metadata is None, hitting an assertion in
+        #      `torch.distributed.tensor._redistribute._gen_transform_infos_non_cached`.
+        #      This blocks Llama/Mistral/Phi-4/etc. (any model whose HF config
+        #      has pad_token_id set) from loading at all under `_v2=true`.
+        #
+        # What: inject `pad_token_id: None` into hf_config_overrides so
+        #       from_pretrained builds the embedding with padding_idx=None,
+        #       which makes _init_weights skip the zeros_ call entirely.
+        #       `setup_model_and_optimizer` later restores model.config.pad_token_id
+        #       from the tokenizer (automodel/setup.py), so runtime behavior is
+        #       unaffected (padding is masked via token_loss_mask, not via a
+        #       pre-zeroed embedding row).
+        hf_cfg_overrides = dict(config.get("hf_config_overrides") or {})
+        if "pad_token_id" not in hf_cfg_overrides:
+            hf_cfg_overrides["pad_token_id"] = None
+            config["hf_config_overrides"] = hf_cfg_overrides
 
         # Validate configuration and prepare runtime settings
         runtime_config = validate_and_prepare_config(
@@ -323,6 +364,43 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
+
+    def init_cross_tokenizer_loss_fn(
+        self, loss_config: Any, token_aligner_config: dict[str, Any]
+    ) -> None:
+        """Build CrossTokenizerDistillationLossFn locally from config + shared filesystem."""
+        from nemo_rl.algorithms.loss.loss_functions import (
+            CrossTokenizerDistillationLossFn,
+        )
+        from nemo_rl.algorithms.x_token import TokenAligner
+
+        aligner = TokenAligner(
+            teacher_tokenizer_name=token_aligner_config["teacher_model"],
+            student_tokenizer_name=token_aligner_config["student_model"],
+            max_comb_len=token_aligner_config.get("max_comb_len", 4),
+            projection_matrix_multiplier=token_aligner_config.get(
+                "projection_matrix_multiplier", 1.0
+            ),
+        )
+        aligner._load_logits_projection_map(
+            file_path=token_aligner_config["projection_matrix_path"],
+            use_sparse_format=token_aligner_config.get("use_sparse_format", True),
+            learnable=token_aligner_config.get("learnable", False),
+            device="cpu",
+        )
+        if token_aligner_config.get("project_teacher_to_student", False):
+            aligner.create_reverse_projection_matrix(device="cpu")
+        self._cached_loss_fn = CrossTokenizerDistillationLossFn(loss_config, aligner)
+
+    def update_cross_tokenizer_data(
+        self, teacher_input_ids: Any, aligned_pairs: Any
+    ) -> None:
+        """Update per-step cross-tokenizer data on the cached loss function."""
+        if hasattr(self, "_cached_loss_fn") and self._cached_loss_fn is not None:
+            self._cached_loss_fn.set_cross_tokenizer_data(
+                teacher_input_ids=teacher_input_ids,
+                aligned_pairs=aligned_pairs,
+            )
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -506,6 +584,373 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             )
 
             return metrics
+
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/train_off_policy_distillation")
+    def train_off_policy_distillation(
+        self,
+        data: BatchedDataDict[Any],
+        loss_fn: Optional[LossFunction],
+        *,
+        role: str,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        teacher_logits: Optional[Any] = None,
+        topk_logits: Optional[int] = None,
+        use_teacher_ipc_loss_postprocessor: bool = False,
+    ) -> dict[str, Any]:
+        """Off-policy distillation entrypoint.
+
+        Teacher role: run a forward-only pass exporting per-microbatch logits
+        (optionally top-k) via CUDA IPC handles.
+
+        Student role: consume teacher IPC outputs and run the usual
+        loss/backward/update cycle with a cross-tokenizer-aware loss post-processor.
+        """
+        # Shared setup (DP aggregation, train-context factory, etc.) lives in
+        # one place so the teacher- and student-side helpers below only need
+        # to receive the prepared state.
+        loop_state = self._prepare_off_policy_loop_state(data, gbs, mbs)
+
+        if role == "teacher":
+            return self._run_teacher_ipc_export(
+                data=data,
+                loop_state=loop_state,
+                topk_logits=topk_logits,
+            )
+        if role == "student":
+            return self._run_student_off_policy_distillation(
+                data=data,
+                loss_fn=loss_fn,
+                loop_state=loop_state,
+                eval_mode=eval_mode,
+                teacher_logits=teacher_logits,
+                use_teacher_ipc_loss_postprocessor=use_teacher_ipc_loss_postprocessor,
+            )
+        raise ValueError(f"Unknown role {role!r}; must be 'teacher' or 'student'.")
+
+    def _prepare_off_policy_loop_state(
+        self,
+        data: BatchedDataDict[Any],
+        gbs: Optional[int],
+        mbs: Optional[int],
+    ) -> _OffPolicyLoopState:
+        """Prepare the shared per-call loop state for off-policy paths.
+
+        Resolves batch sizes, aggregates the dataset size across the DP group,
+        pulls the sequence dimension, and builds the per-step training-context
+        factory used by both the teacher-export and student-training paths.
+        """
+        if gbs is None:
+            gbs = self.cfg["train_global_batch_size"]
+        if mbs is None:
+            mbs = self.cfg["train_micro_batch_size"]
+        local_gbs = gbs // self.dp_size
+
+        total_dataset_size = torch.tensor(data.size, device="cuda")
+        torch.distributed.all_reduce(
+            total_dataset_size,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self.dp_mesh.get_group(),
+        )
+        num_global_batches = int(total_dataset_size.item()) // gbs
+
+        sequence_dim, _ = check_sequence_dim(data)
+
+        def train_context_fn(processed_inputs):
+            return get_train_context(
+                cp_size=self.cp_size,
+                cp_mesh=self.cp_mesh,
+                cp_buffers=processed_inputs.cp_buffers,
+                sequence_dim=sequence_dim,
+                dtype=self.dtype,
+                autocast_enabled=self.autocast_enabled,
+            )
+
+        empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
+            "clear_cache_every_n_steps"
+        )
+        if empty_cache_steps:
+            warnings.warn(
+                f"Emptying cache every {empty_cache_steps} microbatches; "
+                "doing so unnecessarily would incur a large performance overhead.",
+            )
+
+        return _OffPolicyLoopState(
+            gbs=gbs,
+            mbs=mbs,
+            local_gbs=local_gbs,
+            num_global_batches=num_global_batches,
+            sequence_dim=sequence_dim,
+            train_context_fn=train_context_fn,
+            empty_cache_steps=empty_cache_steps,
+        )
+
+    def _make_on_microbatch_start(
+        self,
+        post_processor: Any,
+        empty_cache_steps: Optional[int],
+    ) -> Any:
+        """Build the ``on_microbatch_start`` callback for the inner loop.
+
+        Forwards the microbatch index to ``post_processor.set_microbatch_index``
+        when that method exists (IPC-aware post-processors need it; the plain
+        ``LossPostProcessor`` does not define it and is silently skipped).
+        Optionally empties the CUDA cache every ``empty_cache_steps``
+        microbatches.
+        """
+
+        def on_microbatch_start(mb_idx: int) -> None:
+            if hasattr(post_processor, "set_microbatch_index"):
+                post_processor.set_microbatch_index(mb_idx)
+            if empty_cache_steps and mb_idx % empty_cache_steps == 0:
+                torch.cuda.empty_cache()
+
+        return on_microbatch_start
+
+    def _run_teacher_ipc_export(
+        self,
+        data: BatchedDataDict[Any],
+        *,
+        loop_state: _OffPolicyLoopState,
+        topk_logits: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Teacher-side forward-only pass exporting logits via CUDA IPC handles."""
+        ctx: AbstractContextManager[Any] = torch.no_grad()
+        self.model.eval()
+
+        teacher_post_processor = XTokenTeacherIPCExportPostProcessor(
+            loss_fn=None,
+            cfg=self.cfg,
+            device_mesh=self.device_mesh,
+            cp_mesh=self.cp_mesh,
+            tp_mesh=self.tp_mesh,
+            cp_size=self.cp_size,
+            dp_size=self.dp_size,
+            enable_seq_packing=self.enable_seq_packing,
+            sampling_params=None,
+            topk_logits=topk_logits,
+            is_mdlm=self.cfg.get("is_mdlm", False),
+        )
+
+        on_microbatch_start = self._make_on_microbatch_start(
+            post_processor=teacher_post_processor,
+            empty_cache_steps=loop_state.empty_cache_steps,
+        )
+
+        with ctx:
+            data = data.to("cuda")
+            for gb_idx in range(loop_state.num_global_batches):
+                gb_result = process_global_batch(
+                    data,
+                    None,
+                    self.dp_mesh.get_group(),
+                    batch_idx=gb_idx,
+                    batch_size=loop_state.local_gbs,
+                )
+                batch = gb_result["batch"]
+                global_valid_seqs = gb_result["global_valid_seqs"]
+                global_valid_toks = gb_result["global_valid_toks"]
+
+                processed_iterator, iterator_len = get_microbatch_iterator(
+                    batch,
+                    self.cfg,
+                    loop_state.mbs,
+                    self.dp_mesh,
+                    tokenizer=self.tokenizer,
+                    cp_size=self.cp_size,
+                )
+
+                automodel_forward_backward(
+                    model=self.model,
+                    data_iterator=processed_iterator,
+                    post_processing_fn=teacher_post_processor,
+                    forward_only=True,
+                    is_reward_model=self._is_reward_model,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    sampling_params=None,
+                    sequence_dim=loop_state.sequence_dim,
+                    dp_size=self.dp_size,
+                    cp_size=self.cp_size,
+                    num_global_batches=loop_state.num_global_batches,
+                    train_context_fn=loop_state.train_context_fn,
+                    num_valid_microbatches=iterator_len,
+                    on_microbatch_start=on_microbatch_start,
+                )
+                break
+
+        # Ensure writes to IPC-exported buffers are complete before returning handles.
+        torch.cuda.current_stream().synchronize()
+        self.teacher_logits = {
+            "microbatch_handles": teacher_post_processor.microbatch_handles,
+            "is_topk": topk_logits is not None,
+        }
+        return self.teacher_logits
+
+    def _run_student_off_policy_distillation(
+        self,
+        data: BatchedDataDict[Any],
+        loss_fn: Optional[LossFunction],
+        *,
+        loop_state: _OffPolicyLoopState,
+        eval_mode: bool = False,
+        teacher_logits: Optional[Any] = None,
+        use_teacher_ipc_loss_postprocessor: bool = False,
+    ) -> dict[str, Any]:
+        """Student-side off-policy distillation training step."""
+        # Off-policy flow calls ``offload_after_refit()`` to free GPU memory
+        # for teacher inference; that helper unconditionally moves the optimizer
+        # to CPU, but ``prepare_for_training()`` only moves it back when
+        # ``offload_optimizer_for_logprob`` or ``is_generation_colocated`` is
+        # set. If neither is, Adam's state stays on CPU while param/grad are
+        # CUDA, crashing ``exp_avg.lerp_(grad)`` on the first ``step()``.
+        # Bring the optimizer back on every student call; no-op if already
+        # on CUDA.
+        if not eval_mode and self.optimizer is not None and not self.cpu_offload:
+            self.move_optimizer_to_device("cuda")
+
+        if loss_fn is None:
+            loss_fn = getattr(self, "_cached_loss_fn", None)
+
+        if eval_mode:
+            ctx: AbstractContextManager[Any] = torch.no_grad()
+            self.model.eval()
+        else:
+            ctx = nullcontext()
+            self.model.train()
+
+        teacher_worker_result = None
+        if teacher_logits is not None:
+            rank = torch.distributed.get_rank()
+            teacher_worker_result = teacher_logits[rank]
+
+        if use_teacher_ipc_loss_postprocessor and teacher_worker_result is not None:
+            loss_post_processor = XTokenStudentIPCLossPostProcessor(
+                loss_fn=loss_fn,
+                cfg=self.cfg,
+                device_mesh=self.device_mesh,
+                cp_mesh=self.cp_mesh,
+                tp_mesh=self.tp_mesh,
+                cp_size=self.cp_size,
+                dp_size=self.dp_size,
+                enable_seq_packing=self.enable_seq_packing,
+                sampling_params=None,
+                teacher_result=teacher_worker_result,
+            )
+        else:
+            loss_post_processor = LossPostProcessor(
+                loss_fn=loss_fn,
+                cfg=self.cfg,
+                device_mesh=self.device_mesh,
+                cp_mesh=self.cp_mesh,
+                tp_mesh=self.tp_mesh,
+                cp_size=self.cp_size,
+                dp_size=self.dp_size,
+                enable_seq_packing=self.enable_seq_packing,
+                sampling_params=None,
+            )
+
+        on_microbatch_start = self._make_on_microbatch_start(
+            post_processor=loss_post_processor,
+            empty_cache_steps=loop_state.empty_cache_steps,
+        )
+
+        with ctx:
+            data = data.to("cuda")
+            losses = []
+            all_mb_metrics = []
+            grad_norm: Optional[float | torch.Tensor] = None
+
+            for gb_idx in range(loop_state.num_global_batches):
+                gb_result = process_global_batch(
+                    data,
+                    loss_fn,
+                    self.dp_mesh.get_group(),
+                    batch_idx=gb_idx,
+                    batch_size=loop_state.local_gbs,
+                )
+                batch = gb_result["batch"]
+                global_valid_seqs = gb_result["global_valid_seqs"]
+                global_valid_toks = gb_result["global_valid_toks"]
+
+                self.optimizer.zero_grad()
+                processed_iterator, iterator_len = get_microbatch_iterator(
+                    batch,
+                    self.cfg,
+                    loop_state.mbs,
+                    self.dp_mesh,
+                    tokenizer=self.tokenizer,
+                    cp_size=self.cp_size,
+                )
+
+                mb_results = automodel_forward_backward(
+                    model=self.model,
+                    data_iterator=processed_iterator,
+                    post_processing_fn=loss_post_processor,
+                    forward_only=eval_mode,
+                    is_reward_model=self._is_reward_model,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    sampling_params=None,
+                    sequence_dim=loop_state.sequence_dim,
+                    dp_size=self.dp_size,
+                    cp_size=self.cp_size,
+                    num_global_batches=loop_state.num_global_batches,
+                    train_context_fn=loop_state.train_context_fn,
+                    num_valid_microbatches=iterator_len,
+                    on_microbatch_start=on_microbatch_start,
+                )
+
+                mb_losses = []
+                for mb_idx, (loss, loss_metrics) in enumerate(mb_results):
+                    if mb_idx < iterator_len:
+                        num_valid_samples = loss_metrics["num_valid_samples"]
+                        loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                        if num_valid_samples > 0:
+                            mb_losses.append(loss.item())
+                            all_mb_metrics.append(loss_metrics)
+
+                if not eval_mode:
+                    grad_norm = scale_grads_and_clip_grad_norm(
+                        self.max_grad_norm,
+                        [self.model],
+                        norm_type=2.0,
+                        pp_enabled=False,
+                        device_mesh=self.device_mesh,
+                        moe_mesh=self.moe_mesh,
+                        ep_axis_name="ep"
+                        if self.moe_mesh is not None
+                        and "ep" in self.moe_mesh.mesh_dim_names
+                        else None,
+                        pp_axis_name=None,
+                        foreach=True,
+                        num_label_tokens=1,
+                        dp_group_size=self.dp_size * self.cp_size,
+                    )
+                    grad_norm = torch.tensor(
+                        grad_norm, device="cpu", dtype=torch.float32
+                    )
+                    self.optimizer.step()
+
+                losses.append(torch.tensor(mb_losses).sum().item())
+
+            self.optimizer.zero_grad()
+            if not eval_mode:
+                self.scheduler.step()
+            torch.cuda.empty_cache()
+
+            return aggregate_training_statistics(
+                losses=losses,
+                all_mb_metrics=all_mb_metrics,
+                grad_norm=grad_norm,
+                dp_group=self.dp_mesh.get_group(),
+                dtype=self.dtype,
+            )
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
     def get_logprobs(

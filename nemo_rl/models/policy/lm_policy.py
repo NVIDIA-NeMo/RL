@@ -686,6 +686,173 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return aggregated_results
 
+    def init_cross_tokenizer_loss_fn(
+        self, loss_config: Any, token_aligner_config: Any
+    ) -> None:
+        """Have each worker build its own CrossTokenizerDistillationLossFn from config + shared filesystem."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "init_cross_tokenizer_loss_fn",
+            loss_config=loss_config,
+            token_aligner_config=token_aligner_config,
+        )
+        ray.get(futures)
+
+    def update_cross_tokenizer_data(
+        self, teacher_input_ids: Any, aligned_pairs: Any
+    ) -> None:
+        """Update per-step cross-tokenizer data on all workers' cached loss functions.
+
+        Shards the data so each worker only receives its slice, not the full batch.
+        """
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        batch_size = teacher_input_ids.shape[0]
+        shard_size = batch_size // dp_size
+
+        futures = self.worker_group.run_all_workers_multiple_data(
+            "update_cross_tokenizer_data",
+            teacher_input_ids=[
+                teacher_input_ids[i * shard_size : (i + 1) * shard_size]
+                for i in range(dp_size)
+            ],
+            aligned_pairs=[
+                aligned_pairs[i * shard_size : (i + 1) * shard_size]
+                for i in range(dp_size)
+            ],
+        )
+        ray.get(futures)
+
+    def train_off_policy_distillation(
+        self,
+        data: BatchedDataDict[Any],
+        loss_fn: Optional[LossFunction],
+        *,
+        role: str,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        teacher_logits: Optional[Any] = None,
+        topk_logits: Optional[int] = None,
+        use_teacher_ipc_loss_postprocessor: bool = False,
+        timer: Optional[Timer] = None,
+    ) -> dict[str, Any]:
+        """Run one off-policy distillation step (teacher or student)."""
+        batch_size = gbs or self.cfg["train_global_batch_size"]
+        micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+
+        # Shard and replicate the batch
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        with timer.time("policy_training/sharding_data") if timer else nullcontext():
+            if self.use_dynamic_batches:
+                self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                    "dynamic_batching"
+                ]["train_mb_tokens"]
+                sharded_data, _ = data.shard_by_batch_size(
+                    dp_size,
+                    batch_size=batch_size,
+                    dynamic_batching_args=self.dynamic_batching_args,
+                )
+            elif self.use_sequence_packing:
+                self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                    "sequence_packing"
+                ]["train_mb_tokens"]
+                sharded_data, _ = data.shard_by_batch_size(
+                    dp_size,
+                    batch_size=batch_size,
+                    sequence_packing_args=self.sequence_packing_args,
+                )
+            else:
+                sharded_data = data.shard_by_batch_size(
+                    dp_size,
+                    batch_size=batch_size,
+                )
+
+        if self.flops_tracker is not None:
+            self.flops_tracker.reset()
+            for shard in sharded_data:
+                input_lengths = shard["input_lengths"]
+                self.flops_tracker.track_batch(input_lengths.tolist())
+
+        common_kwargs: dict[str, Any] = {
+            "loss_fn": loss_fn,
+            "role": role,
+            "eval_mode": eval_mode,
+            "gbs": batch_size,
+            "mbs": micro_batch_size,
+            "teacher_logits": teacher_logits,
+            "topk_logits": topk_logits,
+        }
+        if use_teacher_ipc_loss_postprocessor:
+            common_kwargs["use_teacher_ipc_loss_postprocessor"] = True
+
+        is_teacher = role == "teacher"
+        if is_teacher:
+            output_replicated = [
+                "context_parallel",
+                "pipeline_parallel",
+            ]
+        else:
+            output_replicated = [
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ]
+
+        with (
+            timer.time("policy_training/submit_training_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "train_off_policy_distillation",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=output_replicated,
+                common_kwargs=common_kwargs,
+            )
+        results = self.worker_group.get_all_worker_results(futures)
+
+        if is_teacher:
+            return results
+
+        aggregated_results = {
+            "loss": results[0]["global_loss"],
+            "grad_norm": results[0]["grad_norm"],
+            "kl_loss": sum(results[0]["all_mb_metrics"]["kl_loss"])
+            if "kl_loss" in results[0]["all_mb_metrics"]
+            else 0.0,
+            "nll_loss": sum(results[0]["all_mb_metrics"]["nll_loss"])
+            if "nll_loss" in results[0]["all_mb_metrics"]
+            else 0.0,
+        }
+        if "moe_metrics" in results[0]:
+            aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
+
+        if self.flops_tracker is not None:
+            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+            aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
+            gpus_per_worker = self.worker_group.cluster.world_size() / len(results)
+
+            try:
+                aggregated_results["theoretical_tflops"] = gpus_per_worker * sum(
+                    get_theoretical_tflops(r["gpu_name"], r["model_dtype"])
+                    for r in results
+                )
+            except Exception as e:
+                warnings.warn(f"Error getting theoretical flops: {e}")
+
+        all_mb_metrics = defaultdict(list)
+        for r in results:
+            for k, v in r["all_mb_metrics"].items():
+                all_mb_metrics[k].extend(v)
+        aggregated_results["all_mb_metrics"] = dict(all_mb_metrics)
+
+        return aggregated_results
+
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
