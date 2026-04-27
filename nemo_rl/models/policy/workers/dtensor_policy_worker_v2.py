@@ -1480,6 +1480,21 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         gc.collect()
         torch.cuda.empty_cache()
 
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/move_optimizer_to_cuda")
+    def move_optimizer_to_cuda(self) -> None:
+        """Move optimizer state back to CUDA.
+
+        Used by off-policy distillation when ``keep_models_resident=False``:
+        ``offload_after_refit`` moves optimizer state to CPU between teacher
+        inference and student training, but ``prepare_for_training`` only
+        re-onloads the optimizer for the logprob/colocated-generation
+        offload cases. This is the explicit onload for the off-policy
+        distillation offload path. No-op if no optimizer or if cpu offload
+        is in effect.
+        """
+        if self.optimizer is not None and not self.cpu_offload:
+            self.move_optimizer_to_device("cuda")
+
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
         # onload models and optimizer state to cuda

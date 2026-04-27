@@ -491,6 +491,12 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             "use DTensorPolicyWorkerV2 (set policy.dtensor_cfg._v2=true)."
         )
 
+    def move_optimizer_to_cuda(self) -> None:
+        raise NotImplementedError(
+            "MegatronPolicyWorker does not support move_optimizer_to_cuda; "
+            "use DTensorPolicyWorkerV2 (set policy.dtensor_cfg._v2=true)."
+        )
+
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
         self, *, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None

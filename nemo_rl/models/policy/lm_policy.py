@@ -938,6 +938,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
 
+    def move_optimizer_to_cuda(self) -> None:
+        """Move optimizer state to CUDA on all workers.
+
+        Used by off-policy distillation when ``keep_models_resident=False`` to
+        restore the optimizer state that ``offload_after_refit`` moves to CPU
+        between teacher inference and student training.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "move_optimizer_to_cuda"
+        )
+        ray.get(futures)
+
     def prepare_for_lp_inference(self, *args: Any, **kwargs: Any) -> None:
         futures = self.worker_group.run_all_workers_single_data(
             "prepare_for_lp_inference"

@@ -1089,6 +1089,13 @@ def off_policy_distillation_train(
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
                     student_policy.prepare_for_training()
+                    if not keep_models_resident:
+                        # offload_after_refit above moved the student optimizer
+                        # state to CPU; prepare_for_training only re-onloads it
+                        # for the logprob/colocated-generation gate. Restore it
+                        # explicitly so the next optimizer.step finds tensors
+                        # on the same device as the gradients.
+                        student_policy.move_optimizer_to_cuda()
 
                 if cross_tokenizer_enabled:
                     if not getattr(student_policy, "_loss_fn_initialized", False):
