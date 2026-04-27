@@ -1101,20 +1101,25 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             owner_pp_rank = name_to_owner[name]
             owner_global_rank = pp_ranks[owner_pp_rank]
 
+            # Owner adapts the (name, tensor) pairs and broadcasts the adapted
+            # list along with metadata + tensor data; non-owners receive and
+            # yield without re-adapting (the owner's adapter is authoritative).
             if my_pp_rank == owner_pp_rank:
-                # Materialise and adapt the tensor (TP gather + HF name adapt)
                 tensor, owning_part = self._get_local_param_tensor(name)
                 tensor = tensor.cuda()
-                meta = [list(tensor.shape), str(tensor.dtype)]
+                adapted_pairs = list(
+                    _maybe_adapt_tensor_to_hf(owning_part, name, tensor)
+                )
+                meta = [(an, list(at.shape), str(at.dtype)) for an, at in adapted_pairs]
                 torch.distributed.broadcast_object_list(
                     [meta], src=owner_global_rank, group=pp_group
                 )
-                torch.distributed.broadcast(
-                    tensor, src=owner_global_rank, group=pp_group
-                )
-                for adapted_name, adapted_tensor in _maybe_adapt_tensor_to_hf(
-                    owning_part, name, tensor
-                ):
+                for _, adapted_tensor in adapted_pairs:
+                    contig = adapted_tensor.contiguous()
+                    torch.distributed.broadcast(
+                        contig, src=owner_global_rank, group=pp_group
+                    )
+                for adapted_name, adapted_tensor in adapted_pairs:
                     yield (
                         adapted_name,
                         adapted_tensor.to(self.dtype, non_blocking=True).contiguous(),
@@ -1124,16 +1129,16 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 torch.distributed.broadcast_object_list(
                     meta_list, src=owner_global_rank, group=pp_group
                 )
-                shape, dtype_str = meta_list[0]
-                dtype = getattr(torch, dtype_str.replace("torch.", ""))
-                buf = torch.empty(shape, dtype=dtype, device="cuda")
-                torch.distributed.broadcast(buf, src=owner_global_rank, group=pp_group)
-                for adapted_name, adapted_tensor in _maybe_adapt_tensor_to_hf(
-                    self.model_handle.parts[0], name, buf
-                ):
+                meta = meta_list[0]
+                for adapted_name, shape, dtype_str in meta:
+                    dtype = getattr(torch, dtype_str.replace("torch.", ""))
+                    buf = torch.empty(shape, dtype=dtype, device="cuda")
+                    torch.distributed.broadcast(
+                        buf, src=owner_global_rank, group=pp_group
+                    )
                     yield (
                         adapted_name,
-                        adapted_tensor.to(self.dtype, non_blocking=True).contiguous(),
+                        buf.to(self.dtype, non_blocking=True).contiguous(),
                     )
 
     def _get_local_param_tensor(self, name: str) -> tuple[torch.Tensor, nn.Module]:
