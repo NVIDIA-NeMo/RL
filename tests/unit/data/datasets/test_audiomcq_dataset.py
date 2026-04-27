@@ -287,6 +287,49 @@ class TestAudioMCQConstruction:
         with pytest.raises(ValueError, match="split_validation_size > 0"):
             AudioMCQDataset(split="validation", split_validation_size=0.0)
 
+    def test_populate_val_dataset_false_keeps_train_disjoint_no_dup(
+        self, monkeypatch, tmp_path
+    ):
+        # When the YAML configures both `data.train` (with
+        # populate_val_dataset=false) and an explicit `data.validation`
+        # entry, the train wrapper must (a) drop the held-out rows from
+        # its `dataset` so train/val stay disjoint and (b) leave
+        # `val_dataset` unset so setup_response_data does not double-count
+        # those rows alongside the validation entry.
+        rows = [_row(i) for i in range(20)]
+        snapshot_root = _build_fixture_snapshot(tmp_path, rows)
+        _patch_snapshot(monkeypatch, snapshot_root)
+
+        train_ds = AudioMCQDataset(
+            split="train",
+            split_validation_size=0.25,
+            seed=7,
+            populate_val_dataset=False,
+        )
+        val_ds = AudioMCQDataset(split="validation", split_validation_size=0.25, seed=7)
+
+        train_ids = set(r["id"] for r in train_ds.dataset)
+        val_ids = set(r["id"] for r in val_ds.dataset)
+
+        # Train slice excludes the held-out rows.
+        assert len(train_ids) == len(rows) - len(val_ids)
+        assert train_ids.isdisjoint(val_ids)
+        # No auto-population on the train wrapper.
+        assert train_ds.val_dataset is None
+
+    def test_populate_val_dataset_false_with_size_zero_keeps_full_train(
+        self, monkeypatch, tmp_path
+    ):
+        rows = [_row(i) for i in range(8)]
+        snapshot_root = _build_fixture_snapshot(tmp_path, rows)
+        _patch_snapshot(monkeypatch, snapshot_root)
+
+        train_ds = AudioMCQDataset(
+            split="train", split_validation_size=0, populate_val_dataset=False
+        )
+        assert len(train_ds.dataset) == len(rows)
+        assert train_ds.val_dataset is None
+
 
 class TestAudioMCQFormatData:
     def test_format_data_emits_avqa_shape(self, monkeypatch, tmp_path):

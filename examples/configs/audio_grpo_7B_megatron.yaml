@@ -63,12 +63,20 @@ data:
   train:
     dataset_name: audiomcq
     split: train
-    # ~506/19480 rows held out as the synthesized validation slice.
-    # setup_response_data picks this up from train wrapper's val_dataset, so
-    # leave data.validation=null to avoid double-counting the same rows.
+    # Held-out validation slice is synthesized from this train manifest.
+    # The matching `validation` entry below loads the held-out partition;
+    # populate_val_dataset=false suppresses train-side auto-population so
+    # setup_response_data only sees the explicit validation entry (no
+    # duplication, no train/val leakage).
     split_validation_size: 0.026
     seed: 42
-  validation: null
+    populate_val_dataset: false
+  validation:
+    dataset_name: audiomcq
+    split: validation
+    # Must match the train block to share the same partition.
+    split_validation_size: 0.026
+    seed: 42
   default:
     prompt_file: null
     system_prompt_file: null

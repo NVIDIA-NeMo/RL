@@ -72,8 +72,31 @@ class AudioMCQDataset(RawDataset):
         split_validation_size: float = 0,
         seed: int = 42,
         max_samples: int | None = None,
+        populate_val_dataset: bool = True,
         **kwargs,
     ):
+        """Construct the wrapper.
+
+        Args:
+            split: ``"train"`` or ``"validation"``. The upstream manifest only
+                ships a native train split; both values share the same
+                shuffled+filtered base dataset and partition deterministically
+                from ``split_validation_size`` and ``seed``.
+            split_validation_size: Fraction (or absolute count) of held-out
+                rows. Required when ``split == "validation"``.
+            seed: Shuffle and partition seed. Use the same value across the
+                train and validation entries to share the same partition.
+            max_samples: Optional cap, applied after the defensive
+                ``audio-contribution`` filter and the deterministic shuffle.
+            populate_val_dataset: For ``split == "train"``: when ``True``
+                (the default), populate ``self.val_dataset`` with the
+                held-out slice (the convention used by AVQA and the
+                ``setup_response_data`` train-only path). Set to ``False``
+                when the YAML configures an explicit ``data.validation``
+                entry — the train slice still excludes the held-out rows
+                (no leakage), but ``self.val_dataset`` stays ``None`` so
+                ``setup_response_data`` does not double-count the same rows.
+        """
         valid_splits = ("train", "validation")
         if split not in valid_splits:
             raise ValueError(
@@ -120,12 +143,27 @@ class AudioMCQDataset(RawDataset):
             self.preprocessor = self.format_data
             self.val_dataset = None
         else:
-            self.dataset = ds
             self.preprocessor = self.format_data
             self.val_dataset = None
-            # Populate self.val_dataset for the train-and-validate-from-train
-            # convention used by the rest of the codebase.
-            self.split_train_validation(split_validation_size, seed)
+            if populate_val_dataset:
+                # Train-and-validate-from-train convention: keep the train
+                # slice on self.dataset and expose the held-out slice via
+                # self.val_dataset. setup_response_data will pick it up.
+                self.dataset = ds
+                self.split_train_validation(split_validation_size, seed)
+            else:
+                # Caller is loading validation through a separate
+                # data.validation entry; drop the held-out rows from train
+                # so the two splits remain disjoint, but leave val_dataset
+                # unset so setup_response_data does not duplicate the rows
+                # the validation entry already contributes.
+                if split_validation_size > 0:
+                    split_ds = ds.train_test_split(
+                        test_size=split_validation_size, seed=seed
+                    )
+                    self.dataset = split_ds["train"]
+                else:
+                    self.dataset = ds
 
     def _eager_audio_probe(self, ds: Dataset) -> None:
         """Verify the first row's audio file exists under the snapshot root.
