@@ -325,6 +325,14 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     self.model.zero_grad_buffer()
                     self.optimizer.zero_grad()
 
+                    # Set moe_grad_scale_func for MOE aux loss scaling.
+                    # With calculate_per_token_loss=True, the router pre-multiplies
+                    # aux_loss by num_local_tokens. Setting loss_scale = 1/global_valid_toks
+                    # makes the final MOE gradient correctly normalized:
+                    #   (1/G) * N_local * aux_grad -> after DDP SUM -> avg(aux_grad)
+                    moe_scale = 1.0 / global_valid_toks.clamp(min=1).float()
+                    self._set_moe_grad_scale_func(lambda: moe_scale)
+
                     # Forward pass.
                     draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
                     losses_reduced = megatron_forward_backward(
@@ -346,6 +354,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                             "use_linear_ce_fusion_loss", False
                         ),
                     )
+
+                    # Clear moe_grad_scale_func after the forward-backward pass
+                    self._set_moe_grad_scale_func(None)
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -444,6 +455,21 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
         return metrics
+
+    def _get_model_config(self):
+        """Get the underlying model config (handle Float16Module wrapper)."""
+        model = self.model
+        if hasattr(model, "module") and hasattr(model.module, "config"):
+            return model.module.config
+        elif hasattr(model, "config"):
+            return model.config
+        return None
+
+    def _set_moe_grad_scale_func(self, func):
+        """Set moe_grad_scale_func on the model config for MOE aux loss scaling."""
+        config = self._get_model_config()
+        if config is not None:
+            config.moe_grad_scale_func = func
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
