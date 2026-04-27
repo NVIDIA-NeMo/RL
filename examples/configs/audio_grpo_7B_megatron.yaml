@@ -5,8 +5,8 @@
 defaults: "grpo_math_1B_megatron.yaml"
 
 grpo:
-  num_prompts_per_step: 4
-  num_generations_per_prompt: 4
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
   max_num_steps: 1000
   max_val_samples: 32
   val_batch_size: 32
@@ -19,7 +19,7 @@ checkpointing:
 
 policy:
   model_name: Qwen/Qwen2.5-Omni-7B
-  train_global_batch_size: 16
+  train_global_batch_size: 32
   train_micro_batch_size: 1
   generation_batch_size: 16
   # Megatron TP>=4 requires train_micro_batch_size == logprob_batch_size
@@ -63,15 +63,12 @@ data:
   train:
     dataset_name: audiomcq
     split: train
-    # ~506/19480 rows held out for validation; identical seed across train
-    # and validation entries so both loaders see the same partition.
+    # ~506/19480 rows held out as the synthesized validation slice.
+    # setup_response_data picks this up from train wrapper's val_dataset, so
+    # leave data.validation=null to avoid double-counting the same rows.
     split_validation_size: 0.026
     seed: 42
-  validation:
-    dataset_name: audiomcq
-    split: validation
-    split_validation_size: 0.026
-    seed: 42
+  validation: null
   default:
     prompt_file: null
     system_prompt_file: null
