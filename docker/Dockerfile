@@ -146,8 +146,6 @@ if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
     uv sync --link-mode symlink --locked --extra vllm --no-install-project
 fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    CMAKE_BUILD_PARALLEL_LEVEL=1 \
-    CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1" \
     uv sync --link-mode symlink --locked --extra sglang --no-install-project
 fi
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
