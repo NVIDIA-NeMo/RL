@@ -68,6 +68,7 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
@@ -444,11 +445,6 @@ def setup(
         )
 
     else:
-        assert generation_config["backend"] != "megatron", (
-            "Non-colocated inference is not supported for Megatron generation backends. "
-            "Please use vLLM backend for generation."
-        )
-
         # train resources will be updated through overall and inference resources below
         train_gpus_per_node = cluster_config["gpus_per_node"]
         train_nodes = policy_nodes
@@ -582,6 +578,18 @@ def setup(
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
+    def init_megatron_generation():
+        """Initialize Megatron generation workers for non-colocated inference."""
+        t0 = time.perf_counter()
+        mg = MegatronGeneration(
+            cluster=inference_cluster,
+            config=policy_config,
+            tokenizer=tokenizer,
+            processor=processor,
+            weights_path=weights_path,
+        )
+        return mg, time.perf_counter() - t0
+
     def initialize_generation_with_policy(
         init_generation_fn,
         generation_name: str,
@@ -645,15 +653,28 @@ def setup(
 
     # Handle generation-specific setup
     if backend == "megatron":
-        # Megatron generation: policy_generation is None, only initialize policy
-        policy_generation = None
+        # Megatron generation: policy_generation is None for colocated;
+        # for non-colocated, MegatronGeneration runs on a dedicated cluster.
+        if colocated_inference:
+            policy_generation = None
+            policy, policy_time = init_policy()
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        else:
+            # Non-colocated Megatron: initialize training first so HF→Megatron
+            # checkpoint conversion completes before inference workers start.
+            # Both sides target the same checkpoint path, so parallel init
+            # causes a write race during conversion.
+            policy, policy_time = init_policy()
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+
+            policy_generation, megatron_gen_time = init_megatron_generation()
+            worker_init_timing_metrics["megatron_generation_init_time_s"] = (
+                megatron_gen_time
+            )
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
             flush=True,
         )
-
-        policy, policy_time = init_policy()
-        worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
     elif backend == "vllm":
         # vLLM generation: setup config, then initialize with policy
@@ -732,21 +753,43 @@ def setup(
         train_world_size = train_cluster.world_size()
         inference_world_size = inference_nodes * inference_gpus_per_node
         world_size = train_world_size + inference_world_size
-        # init collective
-        futures_train = policy.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )
-        futures_inference = policy_generation.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )  # type: ignore
-        # wait for all futures to complete
-        ray.get(futures_train + futures_inference)
+
+        if backend == "megatron":
+            # Non-colocated Megatron: use init_refit_collective with the
+            # configured refit backend (gloo or nvshmem).
+            refit_backend = policy_config.get("megatron_cfg", {}).get(
+                "refit_backend", "gloo"
+            )
+            futures_train = policy.init_refit_collective(
+                ip, port, world_size,
+                rank_offset=0,
+                dst_rank_offset=train_world_size,
+                refit_backend=refit_backend,
+            )
+            futures_inference = policy_generation.init_collective(
+                ip, port, world_size,
+                train_world_size=train_world_size,
+                refit_backend=refit_backend,
+            )
+            ray.get(futures_train + futures_inference)
+        else:
+            # vLLM/SGLang path: init_collective
+            futures_train = policy.init_collective(
+                ip, port, world_size, train_world_size=train_world_size
+            )
+            futures_inference = policy_generation.init_collective(
+                ip, port, world_size, train_world_size=train_world_size
+            )  # type: ignore
+            ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
-    # prepare refit info
-    state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None:
-        policy_generation.prepare_refit_info(state_dict_info)
+    # prepare refit info (not needed for non-colocated megatron, which uses swap_model_weights)
+    if not colocated_inference and backend == "megatron":
+        pass
+    else:
+        state_dict_info = policy.prepare_refit_info()
+        if policy_generation is not None:
+            policy_generation.prepare_refit_info(state_dict_info)
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -978,18 +1021,22 @@ def scale_rewards(
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
-    Returns True if vLLM backend is used with async_engine enabled.
+    Returns True if vLLM backend is used with async_engine enabled,
+    or if Megatron backend is used with async engine enabled.
     """
     generation_config = master_config["policy"]["generation"]
     if generation_config is None:
         return False
-
     backend = generation_config.get("backend", "")
-    if backend != "vllm":
-        return False
 
-    vllm_cfg = generation_config.get("vllm_cfg", {})
-    return vllm_cfg.get("async_engine", False)
+    if backend == "vllm":
+        vllm_cfg = generation_config.get("vllm_cfg", {})
+        return vllm_cfg.get("async_engine", False)
+    elif backend == "megatron":
+        mcore_cfg = generation_config.get("mcore_generation_config", {})
+        return mcore_cfg.get("async_engine", False)
+    else:
+        return False
 
 
 def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
@@ -1001,15 +1048,24 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
 
     # Validate the setup for training with NeMo-Gym
     assert _should_use_async_rollouts(master_config), (
-        "❌ Error: In order to use NeMo-Gym, you must use vllm generation backend with `async_engine: true`!"
+        "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
     )
 
     generation_config = master_config["policy"]["generation"]
 
     # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
-    should_expose_http_server = generation_config["vllm_cfg"].get("expose_http_server")
+    if generation_config["backend"] == "vllm":
+        should_expose_http_server = generation_config["vllm_cfg"].get(
+            "expose_http_server"
+        )
+    elif generation_config["backend"] == "megatron":
+        should_expose_http_server = generation_config["mcore_generation_config"].get(
+            "expose_http_server"
+        )
+    else:
+        should_expose_http_server = False
     assert should_expose_http_server, (
-        "In order to use NeMo-Gym, you must expose the vllm server via `expose_http_server: true`!"
+        "In order to use NeMo-Gym, you must expose the generation server via `expose_http_server: true`!"
     )
 
     return should_use_nemo_gym
@@ -1115,7 +1171,7 @@ def refit_policy_generation(
     """
     if colocated_inference:
         policy.offload_before_refit()
-        policy_generation.prepare_for_generation(tags=["weights"])
+    policy_generation.prepare_for_generation(tags=["weights"])
 
     # Create a context manager that does nothing when timer is None
     timer_context = (
@@ -1188,7 +1244,7 @@ def refit_policy_generation(
 
     if colocated_inference:
         policy.offload_after_refit()
-        policy_generation.prepare_for_generation(tags=["kv_cache"])
+    policy_generation.prepare_for_generation(tags=["kv_cache"])
 
 
 def _log_mixed_rewards_and_advantages_information(
@@ -2551,7 +2607,14 @@ def async_grpo_train(
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
+            is_megatron = (
+                master_config["policy"]["generation"]["backend"] == "megatron"
+            )
+            if is_megatron:
+                policy_generation.suspend_for_refit(recompute_kv_cache=False)
             refit_policy_generation(policy, policy_generation, colocated_inference)
+            if is_megatron:
+                policy_generation.resume_after_refit(recompute_kv_cache=False)
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
         except Exception as e:
@@ -2874,6 +2937,22 @@ def async_grpo_train(
                             policy_generation.get_logger_metrics()
                         )
 
+                    # Pause the megatron engine loop before weight transfer.
+                    # Without this, swap_weights_via_reshard races with in-flight
+                    # CUDA-graph replays and corrupts state.
+                    is_megatron = (
+                        master_config["policy"]["generation"]["backend"] == "megatron"
+                    )
+                    recompute_kv_cache = (
+                        master_config.get("grpo", {})
+                        .get("async_grpo", {})
+                        .get("recompute_kv_cache_after_weight_updates", False)
+                    )
+                    if is_megatron:
+                        policy_generation.suspend_for_refit(
+                            recompute_kv_cache=recompute_kv_cache
+                        )
+
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
@@ -2882,10 +2961,15 @@ def async_grpo_train(
                         )
                         POLICY_GENERATION_STALE = False
 
-                        # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
-                        weight_version += 1
-                        trajectory_collector.set_weight_version.remote(weight_version)
-                        trajectory_collector.resume_after_refit.remote()
+                    if is_megatron:
+                        policy_generation.resume_after_refit(
+                            recompute_kv_cache=recompute_kv_cache
+                        )
+
+                    # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
+                    weight_version += 1
+                    trajectory_collector.set_weight_version.remote(weight_version)
+                    trajectory_collector.resume_after_refit.remote()
 
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:

@@ -1,0 +1,57 @@
+defaults: grpo_nanov3.yaml
+
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 2
+
+policy:
+  megatron_cfg:
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+    converter_type: "LlamaForCausalLM"
+    cuda_graph_impl: "local"
+    cuda_graph_scope: "full_iteration"
+    use_te_rng_tracker: true
+    batch_invariant_mode: false
+    # Needed to set this to false because it causes "full" recompute_granularity
+    # which isn't compatible with "full_iteration_inference" CUDA graph scope.
+    activation_checkpointing: false
+
+  generation:
+    backend: "megatron"
+
+    mcore_generation_config:
+      transformer_impl: "inference_optimized"
+      cuda_graph_scope: "full_iteration_inference"
+      moe_pad_experts_for_cuda_graph_inference: false
+      mamba_inference_ssm_states_dtype: "float32"
+      pipeline_model_parallel_size: 1
+      expert_tensor_parallel_size: 1
+      expert_model_parallel_size: 8
+      sequence_parallel: True
+      context_parallel_size: 1
+      tensor_model_parallel_size: 2
+      buffer_size_gb: 20  # Total GPU memory (in GB) allocated for KV cache buffers
+      num_cuda_graphs: -1  # Number of CUDA graphs to pre-compile for different batch sizes
+      block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
+      use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
+      unified_memory_level: 0  # Unified memory usage level (0=disabled, 1+=enables unified memory )
+      max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
+      enable_chunked_prefill: true
+      kv_cache_management_mode: "persist" # Can be "persist", "offload", or "recompute"
+      static_kv_memory_pointers: true # Relevant only for offload and recompute modes
+      materialize_only_last_token_logits: true
+      async_engine: true
+      expose_http_server: true
+      num_speculative_tokens: 0
+      enable_prefix_caching: true
+      parsers:
+        - deepseek-r1-reasoning
+        - qwen3-coder-tool
+
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 4

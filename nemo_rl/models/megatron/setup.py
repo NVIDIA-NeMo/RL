@@ -732,6 +732,7 @@ def setup_model_and_optimizer(
     load_optimizer: bool = True,
     get_embedding_ranks=None,  # TODO @sahilj: What is this?
     get_position_embedding_ranks=None,
+    inference_only: bool = False,
 ):
     state = GlobalState()
     state.cfg = megatron_cfg
@@ -879,16 +880,19 @@ def setup_model_and_optimizer(
         patch_gpt_model_forward_for_linear_ce_fusion(
             chunk_size=policy_cfg["megatron_cfg"]["linear_ce_fusion_chunk_size"]
         )
-    model = get_model(
-        megatron_cfg.model,
-        megatron_cfg.ddp,
-        use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
-        overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
-        pre_wrap_hook=pre_wrap_hook,
-        mixed_precision_wrapper=mixed_precision_wrapper,
-        pg_collection=pg_collection,
-    )
+    inference_ctx = torch.inference_mode() if inference_only else nullcontext()
+    with inference_ctx:
+        model = get_model(
+            megatron_cfg.model,
+            megatron_cfg.ddp,
+            use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
+            overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
+            pre_wrap_hook=pre_wrap_hook,
+            mixed_precision_wrapper=mixed_precision_wrapper,
+            pg_collection=pg_collection,
+            wrap_with_ddp=load_optimizer,
+        )
 
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(

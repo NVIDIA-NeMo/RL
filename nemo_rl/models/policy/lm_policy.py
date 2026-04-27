@@ -15,7 +15,7 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Any, Optional, Union
+from typing import Any, AsyncGenerator, Optional, Union
 
 import numpy as np
 import ray
@@ -66,6 +66,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         name_prefix: str = "lm_policy",
         workers_per_node: Optional[Union[int, list[int]]] = None,
         init_optimizer: bool = True,
+        inference_only: bool = False,
         weights_path: Optional[PathLike] = None,
         optimizer_path: Optional[PathLike] = None,
         init_reference_model: bool = True,
@@ -212,6 +213,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         worker_kwargs = dict(
             init_optimizer=init_optimizer,
+            inference_only=inference_only,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_reference_model=init_reference_model,
@@ -306,6 +308,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         self.cfg = config
 
+        # Non-colocated Megatron uses swap_model_weights for refit instead of
+        # an NCCL broadcast. Track this flag here so broadcast_weights_for_collective
+        # can dispatch to the appropriate worker method.
+        generation_cfg = config.get("generation", {}) or {}
+        megatron_generation_enabled = generation_cfg.get("backend") == "megatron"
+        colocated_generation = generation_cfg.get("colocated", {}).get("enabled", True)
+        self._uses_megatron_refit = megatron_generation_enabled and not colocated_generation
+        self._refit_dst_rank_offset = 0
+
     def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:
         """Run a method on all workers in parallel with the same data.
 
@@ -357,6 +368,69 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
+
+    def init_refit_collective(
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        rank_offset: int = 0,
+        dst_rank_offset: int = 0,
+        refit_backend: str = "gloo",
+    ) -> list[ray.ObjectRef]:
+        """Initialize the refit collective for non-colocated Megatron weight transfer.
+
+        Args:
+            ip: IP address for the process group rendezvous.
+            port: Port for the process group rendezvous.
+            world_size: Total world size (train + inference workers).
+            rank_offset: Offset for this side's ranks (0 for training, train_ws for inference).
+            dst_rank_offset: Offset of the destination side, stored for later use by
+                broadcast_weights_for_collective.
+            refit_backend: Copy service backend ("gloo" or "nvshmem").
+
+        Returns:
+            List of Ray ObjectRefs for the init futures.
+        """
+        self._refit_dst_rank_offset = dst_rank_offset
+        futures = self.worker_group.run_all_workers_single_data(
+            "init_refit_collective",
+            ip=ip,
+            port=port,
+            world_size=world_size,
+            rank_offset=rank_offset,
+            refit_backend=refit_backend,
+        )
+        return futures
+
+    def report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
+        """Collect the per-DP-leader OpenAI HTTP server base URLs."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "report_dp_openai_server_base_url",
+            run_rank_0_only_axes=["data_parallel", "tensor_parallel", "pipeline_parallel"],
+        )
+        return ray.get(futures)
+
+    def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
+        """Pre-initialize the NVSHMEM copy service collectively across all workers."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "preinit_nvshmem_collective",
+        )
+        return futures
+
+    def suspend_for_refit(self, recompute_kv_cache: bool = False) -> None:
+        """Suspend the inference engine on all workers in preparation for a weight refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "suspend_for_refit", recompute_kv_cache=recompute_kv_cache
+        )
+        ray.get(futures)
+
+    def resume_after_refit(self, recompute_kv_cache: bool = False) -> None:
+        """Resume the inference engine on all workers after a weight refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "resume_after_refit", recompute_kv_cache=recompute_kv_cache
+        )
+        ray.get(futures)
 
     def get_logprobs(
         self,
@@ -689,7 +763,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
-        """Generate a batch of data using the policy."""
+        """Generate a batch of data using the policy.
+
+        For the Megatron backend, all data is sent to worker 0 — the
+        coordinator on that rank dispatches requests across all DP engines.
+        Other ranks participate in the engine loop but don't receive input
+        directly. For other backends, data is sharded across DP ranks as usual.
+        """
         # Verify input data is right-padded
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
@@ -698,21 +778,33 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "Missing required input fields"
         )
 
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
-        futures = self.worker_group.run_all_workers_sharded_data(
-            "generate",
-            data=sharded_data,
-            in_sharded_axes=["data_parallel"],
-            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
-            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
-            common_kwargs={"greedy": greedy},
-        )
         assert self.cfg["generation"] is not None, "Generation config is not set"
-        result: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
-            self.worker_group.get_all_worker_results(futures),
-            pad_value_dict={"output_ids": self.cfg["generation"]["_pad_token_id"]},
-        )
+        backend = self.cfg["generation"]["backend"]
+
+        if backend == "megatron":
+            worker_idx = 0
+            future = self.worker_group.run_single_worker_single_data(
+                method_name="generate",
+                worker_idx=worker_idx,
+                data=data,
+                greedy=greedy,
+            )
+            result: BatchedDataDict[GenerationOutputSpec] = ray.get(future)
+        else:
+            dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+            sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "generate",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
+                output_is_replicated=["tensor_parallel", "pipeline_parallel"],
+                common_kwargs={"greedy": greedy},
+            )
+            result = BatchedDataDict.from_batches(
+                self.worker_group.get_all_worker_results(futures),
+                pad_value_dict={"output_ids": self.cfg["generation"]["_pad_token_id"]},
+            )
 
         # Verify the output has all required fields
         required_keys = [
@@ -728,6 +820,54 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
 
         return result
+
+    async def generate_async(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Generate a batch of data using the Megatron generation backend asynchronously.
+
+        For Megatron, the coordinator on worker 0 dispatches the request to all DP
+        engines. We force streaming mode because the Policy runtime can't see that
+        ``MegatronPolicyWorker.generate_async`` is a generator and would otherwise
+        return a plain ``ObjectRef`` instead of a ``ObjectRefGenerator``.
+        """
+        assert isinstance(data, BatchedDataDict), (
+            f"data must be a BatchedDataDict, got type: {type(data)}"
+        )
+        assert "input_ids" in data and "input_lengths" in data, (
+            "Missing required input fields"
+        )
+
+        backend = self.cfg["generation"]["backend"]
+        assert backend == "megatron", (
+            f"Policy.generate_async only supports the megatron backend, got {backend!r}"
+        )
+
+        worker_idx = 0
+        worker = self.worker_group.workers[worker_idx]
+        method = getattr(worker, "generate_async")
+        futures = method.options(num_returns="streaming").remote(
+            data=data, greedy=greedy
+        )
+
+        async for result_ref in futures:
+            result: tuple[int, BatchedDataDict[GenerationOutputSpec]] = await result_ref
+
+            result_batch = result[1]
+            result_batch["gen_leader_worker_idx"] = [int(worker_idx)]
+            required_keys = [
+                "output_ids",
+                "generation_lengths",
+                "unpadded_sequence_lengths",
+                "logprobs",
+            ]
+            missing_keys = [key for key in required_keys if key not in result_batch]
+            if missing_keys:
+                raise ValueError(
+                    f"Missing required keys for GenerationOutputSpec: {missing_keys}"
+                )
+
+            yield result
 
     def score(
         self, data: BatchedDataDict[GenerationDatumSpec]
@@ -911,6 +1051,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
+        if self._uses_megatron_refit:
+            # Non-colocated Megatron: use Megatron's swap_model_weights resharding
+            # API instead of an NCCL broadcast.
+            futures = self.worker_group.run_all_workers_single_data(
+                "swap_weights_via_reshard",
+                is_source=True,
+                dst_rank_offset=self._refit_dst_rank_offset,
+            )
+            return futures
         futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective",
             kv_scales=kv_scales,
