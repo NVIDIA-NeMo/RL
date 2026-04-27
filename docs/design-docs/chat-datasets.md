@@ -60,4 +60,4 @@ assert output == expected_output
 :hide:
 ```
 
-For more details on creating chat templates, refer to the [Hugging Face documentation](https://huggingface.co/docs/transformers/v4.34.0/en/chat_templating#how-do-i-create-a-chat-template).
+For more details on creating chat templates, refer to the [Hugging Face documentation](https://huggingface.co/docs/transformers/en/chat_templating#how-do-i-create-a-chat-template).
