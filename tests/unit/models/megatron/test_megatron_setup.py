@@ -559,6 +559,28 @@ class TestCreateCheckpointConfig:
         assert checkpoint_config.fully_parallel_load is True
         assert checkpoint_config.load_rng is False
 
+    def test_checkpoint_config_overrides(self, tmp_path):
+        """Test that checkpoint config fields can be overridden via megatron_cfg."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        config = {
+            "megatron_cfg": {
+                "async_save": True,
+                "fully_parallel_save": False,
+                "fully_parallel_load": False,
+                "load_rng": True,
+            }
+        }
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"), None, None, config
+        )
+
+        assert checkpoint_config.async_save is True
+        assert checkpoint_config.fully_parallel_save is False
+        assert checkpoint_config.fully_parallel_load is False
+        assert checkpoint_config.load_rng is True
+
 
 @pytest.mark.mcore
 class TestValidateTrainingConfig:

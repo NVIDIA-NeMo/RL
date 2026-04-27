@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import hashlib
+from datetime import timedelta
 import json
 import os
 import time
@@ -143,7 +144,7 @@ def destroy_parallel_state():
         pass
 
 
-def setup_distributed() -> None:
+def setup_distributed(timeout_minutes: Optional[int] = None) -> None:
     """Handle NCCL settings, dtype mapping, and basic config setup."""
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles
@@ -151,7 +152,10 @@ def setup_distributed() -> None:
     # Ensure clean slate before import
     destroy_parallel_state()
     # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-    torch.distributed.init_process_group("nccl")
+    kwargs = {}
+    if timeout_minutes is not None:
+        kwargs["timeout"] = timedelta(minutes=timeout_minutes)
+    torch.distributed.init_process_group("nccl", **kwargs)
 
 
 def validate_and_set_config(
@@ -352,7 +356,7 @@ def setup_model_config(
 
     # Create checkpoint configs
     checkpoint_config = _create_checkpoint_config(
-        pretrained_path, weights_path, optimizer_path
+        pretrained_path, weights_path, optimizer_path, config
     )
 
     # Validate training configuration
@@ -543,7 +547,7 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
 
 
 def _create_checkpoint_config(
-    pretrained_path: str, weights_path: Optional[str], optimizer_path: Optional[str]
+    pretrained_path: str, weights_path: Optional[str], optimizer_path: Optional[str], config=None
 ) -> CheckpointConfig:
     """Create checkpoint configurations."""
     return CheckpointConfig(
@@ -552,10 +556,10 @@ def _create_checkpoint_config(
         load=weights_path,
         load_optim=optimizer_path is not None,
         pretrained_checkpoint=pretrained_path,
-        async_save=False,
-        fully_parallel_save=True,
-        fully_parallel_load=True,
-        load_rng=False,
+        async_save=(config or {}).get("megatron_cfg", {}).get("async_save", False),
+        fully_parallel_save=(config or {}).get("megatron_cfg", {}).get("fully_parallel_save", True),
+        fully_parallel_load=(config or {}).get("megatron_cfg", {}).get("fully_parallel_load", True),
+        load_rng=(config or {}).get("megatron_cfg", {}).get("load_rng", False),
     )
 
 
@@ -628,7 +632,7 @@ def _create_megatron_config(
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
-        logger=LoggerConfig(logging_level=0),
+        logger=LoggerConfig(logging_level=config["megatron_cfg"].get("logging_level", 0)),
         train=TrainingConfig(
             micro_batch_size=1,  # ignored
             global_batch_size=config["train_global_batch_size"],  # ignored
@@ -636,7 +640,9 @@ def _create_megatron_config(
         ),
         optimizer=OptimizerConfig(**config["megatron_cfg"]["optimizer"]),
         ddp=DistributedDataParallelConfig(
-            check_for_nan_in_grad=True,
+            check_for_nan_in_grad=config["megatron_cfg"][
+                "distributed_data_parallel_config"
+            ].get("check_for_nan_in_grad", True),
             grad_reduce_in_fp32=config["megatron_cfg"][
                 "distributed_data_parallel_config"
             ]["grad_reduce_in_fp32"],
