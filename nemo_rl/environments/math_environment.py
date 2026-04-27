@@ -464,7 +464,7 @@ class MathEnvironment(BaseMathEnvironment):
 
         # Process each chunk in parallel
         futures = [
-            self.workers[worker_index + i % self.num_workers].verify.remote(
+            self.workers[(worker_index + i) % self.num_workers].verify.remote(
                 chunk,
                 ground_truth_chunk,
                 return_extracted_answer,
@@ -569,7 +569,7 @@ class MathMultiRewardEnvironment(BaseMathEnvironment):
 
         # Process each chunk in parallel
         futures = [
-            self.workers[worker_index + i % self.num_workers].verify.remote(
+            self.workers[(worker_index + i) % self.num_workers].verify.remote(
                 chunk,
                 ground_truth_chunk,
                 return_extracted_answer,
