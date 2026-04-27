@@ -40,6 +40,7 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
+    resolve_generation_worker_cls,
 )
 
 
@@ -143,6 +144,7 @@ class VllmGeneration(GenerationInterface):
             worker_cls = (
                 "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
             )
+        worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
         worker_builder = RayWorkerBuilder(worker_cls, config)
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars

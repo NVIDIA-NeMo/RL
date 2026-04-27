@@ -1,0 +1,55 @@
+# Example custom quantization recipe for QARL.
+#
+# Reference this file from a NeMo-RL YAML config via:
+#
+#     policy:
+#       quant_cfg: "examples/modelopt/quant_configs/example_w8a8.yaml"
+#
+# This recipe uses ModelOpt's standard PTQ recipe layout (see
+# ``modelopt_recipes/general/ptq/`` in the TensorRT-Model-Optimizer repo).
+# Only the ``quantize:`` section is consumed by ``mtq.quantize``; the
+# ``metadata:`` section is informational.
+#
+# This example defines W8A8 (FP8 per-tensor weights, FP8 per-tensor
+# activations). Sensitive layers (lm_head, MoE gate layers, BatchNorm, etc.)
+# are disabled to match the built-in defaults.
+#
+# See https://github.com/NVIDIA/Model-Optimizer for the full set of
+# supported quantizer options and built-in PTQ recipes.
+metadata:
+  recipe_type: ptq
+  description: Example W8A8 (FP8 per-tensor weight + activation) recipe.
+quantize:
+  algorithm: max
+  quant_cfg:
+    - quantizer_name: '*'
+      enable: false
+    - quantizer_name: '*weight_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
+        axis:
+    - quantizer_name: '*input_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
+        axis:
+    - quantizer_name: '*lm_head*'
+      enable: false
+    - quantizer_name: '*output_layer*'
+      enable: false
+    - quantizer_name: '*router*'
+      enable: false
+    - quantizer_name: '*mlp.gate.*'
+      enable: false
+    - quantizer_name: '*block_sparse_moe.gate*'
+      enable: false
+    - parent_class: 'nn.BatchNorm1d'
+      quantizer_name: '*'
+      enable: false
+    - parent_class: 'nn.BatchNorm2d'
+      quantizer_name: '*'
+      enable: false
+    - parent_class: 'nn.BatchNorm3d'
+      quantizer_name: '*'
+      enable: false

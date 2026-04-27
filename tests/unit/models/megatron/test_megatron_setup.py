@@ -933,6 +933,8 @@ class TestHandleModelImport:
             "test-model",
             pretrained_path,
             {"some_config": "value"},
+            model_post_wrap_hook=None,
+            transformer_layer_spec=None,
         )
 
     @patch("nemo_rl.models.megatron.setup.import_model_from_hf_name")
@@ -994,6 +996,8 @@ class TestHandleModelImport:
             "test-model",
             pretrained_path,
             {"force_reconvert_from_hf": True},
+            model_post_wrap_hook=None,
+            transformer_layer_spec=None,
             rope_scaling={
                 "rope_type": "yarn",
                 "factor": 4.0,

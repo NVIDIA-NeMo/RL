@@ -174,6 +174,31 @@ class VllmInternalWorkerExtension:
             return
         draft_model.load_weights(weights=draft_weights)
 
+    def _load_weights(self, weights):
+        """Load weights with GptOss transpose fix, FP8, and draft-weight support.
+
+        Applies GPT-OSS down_proj transpose if needed, splits policy/draft
+        weights, applies FP8 conversion if needed, and loads draft weights
+        into the drafter model.
+        """
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if (
+            "GptOssForCausalLM"
+            in self.model_runner.vllm_config.model_config.architectures
+        ):
+            for idx, (key, weight) in enumerate(weights):
+                weight = fix_gpt_oss_export_transpose(key, weight)
+                weights[idx] = (key, weight)
+
+        policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            fp8.load_weights(policy_weights, self.model_runner)
+        else:
+            self.model_runner.model.load_weights(weights=policy_weights)
+
+        self._load_draft_weights(draft_weights)
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
@@ -183,8 +208,6 @@ class VllmInternalWorkerExtension:
         """
         buffer = None
         weights = None
-        policy_weights = None
-        draft_weights = None
 
         try:
             self.maybe_init_zmq()
@@ -239,18 +262,7 @@ class VllmInternalWorkerExtension:
                 )
 
                 # Load weights into the model
-                from nemo_rl.models.generation.vllm.quantization import fp8
-
-                policy_weights, draft_weights = self._split_policy_and_draft_weights(
-                    weights
-                )
-                if fp8.is_fp8_model(self.model_runner.vllm_config):
-                    # the fp8 load_weights additionally casts bf16 weights into fp8
-                    fp8.load_weights(policy_weights, self.model_runner)
-                else:
-                    self.model_runner.model.load_weights(weights=policy_weights)
-
-                self._load_draft_weights(draft_weights)
+                self._load_weights(weights)
 
                 torch.cuda.current_stream().synchronize()
 
@@ -259,11 +271,9 @@ class VllmInternalWorkerExtension:
                 # copied the data, Python may not garbage collect these view objects immediately.
                 # If sender reuses the buffer before GC runs, old views would read corrupted data.
                 # Explicit del ensures immediate cleanup before sending ACK.
-                del weight, weights, policy_weights, draft_weights, buffer
+                del weight, weights, buffer
                 weight = None
                 weights = None
-                policy_weights = None
-                draft_weights = None
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
@@ -290,40 +300,7 @@ class VllmInternalWorkerExtension:
             "Please call prepare_refit_info when initializing the worker."
         )
 
-        def _load_model_weights(weights, model_runner):
-            """Load model weights.
-
-            Args:
-                weights: List[(name, tensor)]
-                model_runner: vLLM ModelRunner
-
-            Returns:
-                None
-            """
-            from nemo_rl.models.generation.vllm.quantization import fp8
-
-            # apply gpt-oss transpose fix
-            if (
-                "GptOssForCausalLM"
-                in self.model_runner.vllm_config.model_config.architectures
-            ):
-                for idx, (key, weight) in enumerate(weights):
-                    weight = fix_gpt_oss_export_transpose(key, weight)
-                    weights[idx] = (key, weight)
-
-            policy_weights, draft_weights = self._split_policy_and_draft_weights(
-                weights
-            )
-
-            if fp8.is_fp8_model(model_runner.vllm_config):
-                # the fp8 load_weights additionally casts bf16 weights into fp8
-                fp8.load_weights(policy_weights, model_runner)
-            else:
-                model_runner.model.load_weights(weights=policy_weights)
-
-            self._load_draft_weights(draft_weights)
-
-        load_model_weight_func = lambda x: _load_model_weights(x, self.model_runner)
+        load_model_weight_func = self._load_weights
 
         try:
             packed_broadcast_consumer(
