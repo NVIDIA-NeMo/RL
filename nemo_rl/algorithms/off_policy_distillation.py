@@ -1,0 +1,1393 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and limitations.
+# limitations under the License.
+
+"""
+Off-Policy Distillation Algorithm
+
+This module implements off-policy distillation where:
+- A fixed dataset of prompt-response pairs is used (no student generation)
+- Teacher provides logits for the fixed responses
+- Student aligns with teacher using KL divergence loss
+
+Key difference from on-policy distillation (in distillation.py):
+- No student generation step - uses pre-existing responses from dataset
+- No environment needed for reward computation
+- Simpler training loop without rollout generation
+"""
+
+import importlib.util
+import os
+import warnings
+from pathlib import Path
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cast
+else:
+    from typing import Any, Callable, Optional, TypedDict, TypeVar, cast
+    from typing_extensions import NotRequired
+
+import numpy as np
+import torch
+from torchdata.stateful_dataloader import StatefulDataLoader
+from transformers import AutoConfig, AutoTokenizer
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+from nemo_rl.algorithms.loss.loss_functions import (
+    CrossTokenizerDistillationLossFn,
+    DistillationLossConfig,
+    DistillationLossDataDict,
+    DistillationLossFn,
+    MultiTeacherLossAggregator,
+)
+from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
+from nemo_rl.data import DataConfig
+from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.cross_tokenizer_collate import (
+    CrossTokenizerCollator,
+    TeacherCTSpec,
+)
+from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import (
+    ClusterConfig,
+    RayVirtualCluster,
+)
+from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
+from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.logger import Logger, LoggerConfig
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.timer import TimeoutChecker, Timer
+
+# ===============================================================================
+# Configuration
+# ===============================================================================
+TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+class TokenAlignerConfig(TypedDict, total=False):
+    """Configuration for cross-tokenizer distillation via TokenAligner.
+
+    When enabled, teacher and student may use different tokenizers/vocabularies.
+    A precomputed projection matrix maps between the two vocabulary spaces.
+    """
+    enabled: bool                          # Master switch for cross-tokenizer mode
+    projection_matrix_path: str            # Path to .pt projection matrix file
+    use_sparse_format: bool                # True = sparse COO format, False = dense indices/values
+    loss_type: str                         # 'KL', 'cross_entropy', or 'chunked_ce'
+    exact_token_match_only: bool           # Only use 1:1 aligned token positions for loss
+    temperature: float                     # Softmax temperature for KL computation
+    vocab_topk: int                        # Reduce teacher vocab to top-k for speed (0 = all)
+    reverse_kl: bool                       # If True, use reverse KL direction
+    projection_matrix_multiplier: float    # Scaling factor for projection matrix
+    max_comb_len: int                      # Max combination length for token alignment DP
+    learnable: bool                        # If True, projection matrix is trainable
+    project_teacher_to_student: bool       # If True, project teacher->student instead of student->teacher
+    use_char_offset: bool                  # If True, try char-offset alignment before DP fallback
+    force_dp_only: bool                    # If True, disable char-offset path and run DP for all samples
+    use_cuda_dp: bool                      # If True, patch TokenAligner chunked DP base case with CUDA kernel
+    dp_chunk_size: int                     # Chunk size used by DP chunked solver
+    use_align_fast: bool                   # If True, use align_fast for DP path; default False for parity
+
+
+class OffPolicyDistillationConfig(TypedDict):
+    """Configuration for off-policy distillation training.
+    
+    Simplified compared to on-policy:
+    - No num_generations_per_prompt (we use fixed responses)
+    - No max_rollout_turns (no generation)
+    """
+    num_prompts_per_step: int  # Batch size
+    max_num_steps: int  # Maximum number of steps to train for
+    max_num_epochs: int  # Maximum number of epochs to train for
+    topk_logits_k: int  # Top-k logits for sparse KL loss
+    seed: int
+    # Validation settings
+    val_period: NotRequired[int]  # Run validation every N steps (0 = disabled)
+    val_batches: NotRequired[int]  # Number of validation batches (0 = all)
+    val_global_batch_size: NotRequired[int]  # Validation batch size
+    val_micro_batch_size: NotRequired[int]  # Validation micro batch size
+    val_at_start: NotRequired[bool]  # Run validation before training starts
+
+
+class OffPolicyDistillationSaveState(TypedDict):
+    """State to save for checkpointing."""
+    total_steps: int  # Track total number of steps across all epochs
+    current_epoch: int  # Track current epoch
+    current_step: int  # Track step within current epoch
+    consumed_samples: int
+    total_valid_tokens: int  # Track total number of non-padding tokens during training
+
+
+def _default_distillation_save_state() -> OffPolicyDistillationSaveState:
+    return {
+        "current_epoch": 0,
+        "current_step": 0,
+        "total_steps": 0,
+        "consumed_samples": 0,
+        "total_valid_tokens": 0,
+    }
+
+
+class OffPolicyMasterConfig(TypedDict):
+    """Main configuration structure for off-policy distillation.
+    
+    Key difference from on-policy MasterConfig:
+    - No 'env' config (no environment needed)
+    """
+    policy: PolicyConfig  # Student model configuration
+    teacher: PolicyConfig  # Teacher model configuration (single-teacher compatibility)
+    loss_fn: DistillationLossConfig  # Loss function configuration
+    data: DataConfig  # Data configuration
+    distillation: OffPolicyDistillationConfig  # Distillation configuration
+    logger: LoggerConfig  # Logger configuration
+    cluster: ClusterConfig  # Cluster configuration
+    checkpointing: CheckpointingConfig  # Checkpointing configuration
+    token_aligner: NotRequired[TokenAlignerConfig]  # Cross-tokenizer config (single-teacher compatibility)
+    teachers: NotRequired[list["TeacherSpec"]]  # Multi-teacher configuration
+
+
+class TeacherSpec(TypedDict, total=False):
+    """Per-teacher configuration for multi-teacher distillation."""
+
+    teacher: PolicyConfig
+    token_aligner: TokenAlignerConfig
+    loss_fn: DistillationLossConfig
+    weight: float
+
+
+# ===============================================================================
+# Cross-Tokenizer Processing
+# ===============================================================================
+# CT (teacher tokenize + DP alignment) runs inside the StatefulDataLoader's
+# worker processes via ``CrossTokenizerCollator`` (nemo_rl/data/cross_tokenizer_collate.py).
+# The training loop just consumes pre-processed batches.
+
+
+# ===============================================================================
+# Setup & Initialization
+# ===============================================================================
+def check_vocab_equality(
+    tokenizer: TokenizerType, student_model_name: str, teacher_model_name: str
+) -> None:
+    """Check if the vocab of the tokenizer (student) and the teacher tokenizer are equal."""
+    teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_name)
+
+    skip_hint = "Set NRL_SKIP_DISTILLATION_TOKENIZER_CHECK=true to skip this check."
+
+    # 1) Exact token->id mapping equality
+    vocab_a = tokenizer.get_vocab()
+    vocab_b = teacher_tokenizer.get_vocab()
+    assert vocab_a == vocab_b, (
+        f"Token->ID mapping differs between student and teacher. {skip_hint}"
+    )
+
+    # 2) Size consistency (sanity checks)
+    assert len(tokenizer) == len(teacher_tokenizer), (
+        f"Effective vocab sizes differ between student and teacher. {skip_hint}"
+    )
+
+    # 3) Check model.config.vocab_size to guarantee the last dimension of the logits is the same
+    student_config = AutoConfig.from_pretrained(student_model_name)
+    teacher_config = AutoConfig.from_pretrained(teacher_model_name)
+    assert student_config.vocab_size == teacher_config.vocab_size, (
+        f"Model config vocab sizes differ between student and teacher. {skip_hint}"
+    )
+
+
+def _ensure_topk_logprobs_for_non_ipc(
+    teacher_topk_logits: torch.Tensor,
+) -> tuple[torch.Tensor, bool]:
+    """Normalize teacher top-k values to log-probs for non-IPC distillation.
+
+    Depending on worker/backend path, `get_topk_logits` may return either:
+    - top-k log-probabilities, or
+    - raw top-k logits.
+    Distillation loss expects log-probs in this non-IPC data-dict path.
+    """
+    teacher_topk_logits = teacher_topk_logits.to(torch.float32)
+    topk_mass = teacher_topk_logits.exp().sum(dim=-1)
+    looks_like_logprobs = bool(
+        (teacher_topk_logits.max() <= 1e-6).item()
+        and (topk_mass.max() <= 1.0001).item()
+    )
+    if looks_like_logprobs:
+        return teacher_topk_logits, False
+    return torch.nn.functional.log_softmax(teacher_topk_logits, dim=-1), True
+
+
+def _normalize_teacher_specs(master_config: OffPolicyMasterConfig) -> list[TeacherSpec]:
+    """Return a normalized teacher spec list for unified single/multi path."""
+    teachers_cfg = master_config.get("teachers", [])
+    if teachers_cfg:
+        return teachers_cfg
+
+    single_spec: TeacherSpec = {
+        "teacher": master_config["teacher"],
+        "weight": 1.0,
+    }
+    token_aligner_cfg = master_config.get("token_aligner", {})
+    if token_aligner_cfg.get("enabled", False):
+        single_spec["token_aligner"] = token_aligner_cfg
+    return [single_spec]
+
+
+def _group_teacher_logits_by_rank(all_teacher_logits: list[Any]) -> dict[int, list[Any]]:
+    """Repack ``[teacher][rank]`` payloads into ``{rank: [teacher_payloads...]}``."""
+    teacher_logits_by_rank: dict[int, list[Any]] = {}
+    for teacher_result in all_teacher_logits:
+        for rank, payload in enumerate(teacher_result):
+            teacher_logits_by_rank.setdefault(rank, []).append(payload)
+    return teacher_logits_by_rank
+
+
+def setup(
+    master_config: OffPolicyMasterConfig,
+    tokenizer: TokenizerType,
+    train_dataset: AllTaskProcessedDataset,
+    val_dataset: Optional[AllTaskProcessedDataset] = None,
+) -> tuple[
+    ColocatablePolicyInterface,  # student_policy
+    list[ColocatablePolicyInterface],  # teacher_policies
+    StatefulDataLoader,  # train_dataloader
+    Optional[StatefulDataLoader],  # val_dataloader
+    DistillationLossFn,
+    Logger,
+    CheckpointManager,
+    OffPolicyDistillationSaveState,
+    OffPolicyMasterConfig,
+]:
+    """Setup for off-policy distillation algorithm.
+    
+    Key differences from on-policy setup():
+    - No student_generation interface (we don't generate responses)
+    - Simpler cluster setup (training only, no inference cluster needed)
+
+    Returns:
+        tuple of student_policy, teacher_policy, train_dataloader, val_dataloader,
+        loss_fn, logger, checkpointer, distillation_save_state, master_config
+    """
+    # Extract configuration
+    policy_config = master_config["policy"]
+    loss_config = master_config["loss_fn"]
+    distillation_config = master_config["distillation"]
+    data_config = master_config["data"]
+    logger_config = master_config["logger"]
+    cluster_config = master_config["cluster"]
+    teacher_specs = _normalize_teacher_specs(master_config)
+
+    # Disallow SP + packing for dtensor path
+    for cfg, who in ((policy_config, "student"),):
+        dtensor_enabled = cfg["dtensor_cfg"]["enabled"]
+        sequence_packing_enabled = (
+            "sequence_packing" in cfg and cfg["sequence_packing"]["enabled"]
+        )
+        sequence_parallel_enabled = (
+            "sequence_parallel" in cfg["dtensor_cfg"]
+            and cfg["dtensor_cfg"]["sequence_parallel"]
+        )
+
+        if dtensor_enabled and sequence_packing_enabled and sequence_parallel_enabled:
+            raise AssertionError(
+                f"Distillation does not support DTensor sequence parallel + sequence packing ({who} policy). "
+                "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details."
+            )
+    for teacher_idx, spec in enumerate(teacher_specs):
+        teacher_cfg = spec["teacher"]
+        dtensor_enabled = teacher_cfg["dtensor_cfg"]["enabled"]
+        sequence_packing_enabled = (
+            "sequence_packing" in teacher_cfg
+            and teacher_cfg["sequence_packing"]["enabled"]
+        )
+        sequence_parallel_enabled = (
+            "sequence_parallel" in teacher_cfg["dtensor_cfg"]
+            and teacher_cfg["dtensor_cfg"]["sequence_parallel"]
+        )
+        if dtensor_enabled and sequence_packing_enabled and sequence_parallel_enabled:
+            raise AssertionError(
+                "Distillation does not support DTensor sequence parallel + sequence packing "
+                f"(teacher_{teacher_idx} policy). "
+                "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details."
+            )
+
+    # Set random seed
+    set_seed(distillation_config["seed"])
+
+    # ==========================
+    #         Logger
+    # ==========================
+    logger = Logger(logger_config)
+    logger.log_hyperparams(master_config)
+
+    # ==========================
+    #      Checkpointing
+    # ==========================
+    checkpointer = CheckpointManager(master_config["checkpointing"])
+    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    distillation_save_state: Optional[OffPolicyDistillationSaveState] = cast(
+        Optional[OffPolicyDistillationSaveState],
+        checkpointer.load_training_info(last_checkpoint_path),
+    )
+    if distillation_save_state is None:
+        distillation_save_state = _default_distillation_save_state()
+
+    # ==========================
+    #           Data
+    # ==========================
+    teacher_ct_specs: list[Optional[TeacherCTSpec]] = []
+    for spec_cfg in teacher_specs:
+        ta_cfg = spec_cfg.get("token_aligner", {})
+        if not ta_cfg.get("enabled", False):
+            teacher_ct_specs.append(None)
+            continue
+        teacher_model_name = spec_cfg["teacher"]["model_name"]
+        per_teacher_loss_cfg = spec_cfg.get("loss_fn", loss_config)
+        teacher_ct_specs.append(
+            TeacherCTSpec(
+                teacher_tokenizer_name=teacher_model_name,
+                student_tokenizer_name=policy_config["model_name"],
+                projection_matrix_path=ta_cfg["projection_matrix_path"],
+                use_sparse_format=bool(ta_cfg.get("use_sparse_format", False)),
+                learnable=bool(ta_cfg.get("learnable", False)),
+                max_comb_len=int(ta_cfg.get("max_comb_len", 4)),
+                projection_matrix_multiplier=float(
+                    ta_cfg.get("projection_matrix_multiplier", 1.0)
+                ),
+                project_teacher_to_student=bool(
+                    ta_cfg.get("project_teacher_to_student", False)
+                ),
+                max_teacher_len=int(
+                    spec_cfg["teacher"].get(
+                        "max_total_sequence_length",
+                        policy_config["max_total_sequence_length"],
+                    )
+                ),
+                dp_chunk_size=int(ta_cfg.get("dp_chunk_size", 128)),
+                use_align_fast=bool(ta_cfg.get("use_align_fast", False)),
+                exact_token_match_only=bool(
+                    per_teacher_loss_cfg.get("exact_token_match_only", False)
+                ),
+            )
+        )
+
+    train_collator = CrossTokenizerCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        make_sequence_length_divisible_by=policy_config.get(
+            "make_sequence_length_divisible_by", 1
+        ),
+        teacher_ct_specs=teacher_ct_specs,
+        fallback_student_tokenizer_name=policy_config["model_name"],
+    )
+
+    nw = int(data_config.get("num_workers", 8))
+    pf = int(data_config.get("prefetch_factor", 4))
+    dataloader_kwargs: dict[str, Any] = dict(
+        batch_size=distillation_config["num_prompts_per_step"],
+        shuffle=data_config.get("shuffle", True),
+        collate_fn=train_collator,
+        drop_last=True,
+        num_workers=nw,
+        persistent_workers=nw > 0,
+    )
+    if nw > 0:
+        dataloader_kwargs["prefetch_factor"] = pf
+    dataloader = StatefulDataLoader(train_dataset, **dataloader_kwargs)
+
+    if last_checkpoint_path:
+        dataloader_state_dict = torch.load(
+            os.path.join(last_checkpoint_path, "train_dataloader.pt")
+        )
+        dataloader.load_state_dict(dataloader_state_dict)
+
+    print(
+        f"  ✓ Training dataloader loaded with {len(train_dataset)} samples", flush=True
+    )
+
+    # Load validation dataloader if provided
+    val_dataloader: Optional[StatefulDataLoader] = None
+    val_period = distillation_config.get("val_period", 0)
+    val_at_start = distillation_config.get("val_at_start", False)
+    if val_period > 0 or val_at_start:
+        assert val_dataset is not None, (
+            "Validation dataset is required if validation is enabled "
+            "(val_period > 0 or val_at_start = True)"
+        )
+        val_dataloader = StatefulDataLoader(
+            val_dataset,
+            batch_size=distillation_config.get(
+                "val_global_batch_size", distillation_config["num_prompts_per_step"]
+            ),
+            shuffle=False,
+            collate_fn=rl_collate_fn,
+            drop_last=False,
+        )
+        print(
+            f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples",
+            flush=True,
+        )
+
+    # ==========================
+    #          Cluster
+    # ==========================
+    # For off-policy distillation, we only need a training cluster
+    # No inference cluster needed since we don't generate responses
+    print("\n▶ Setting up compute cluster...", flush=True)
+    
+    # Need one colocated worker-group slot per policy (all teachers + student).
+    # Keep historical minimum of 3 for existing two-teacher setups.
+    required_worker_groups = max(3, len(teacher_specs) + 1)
+    cluster = RayVirtualCluster(
+        name="off_policy_distillation_cluster",
+        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
+        * cluster_config["num_nodes"],
+        use_gpus=True,
+        num_gpus_per_node=cluster_config["gpus_per_node"],
+        max_colocated_worker_groups=required_worker_groups,
+    )
+    print(
+        f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes",
+        flush=True,
+    )
+
+    # ==========================
+    #      Teacher Policies
+    # ==========================
+    token_aligners: list[Any] = []
+    teacher_tokenizers: list[Optional[TokenizerType]] = []
+    teacher_policies: list[ColocatablePolicyInterface] = []
+    for teacher_idx, spec_cfg in enumerate(teacher_specs):
+        teacher_cfg = spec_cfg["teacher"]
+        token_aligner_cfg = spec_cfg.get("token_aligner", {})
+        cross_tokenizer_enabled = token_aligner_cfg.get("enabled", False)
+        token_aligner = None
+        teacher_tokenizer = None
+
+        if cross_tokenizer_enabled:
+            from nemo_rl.algorithms.x_token.tokenalign import TokenAligner
+
+            print(
+                f"\n▶ Setting up cross-tokenizer distillation for teacher {teacher_idx}...",
+                flush=True,
+            )
+            teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_cfg["model_name"])
+            if teacher_tokenizer.pad_token is None:
+                teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
+
+            token_aligner = TokenAligner(
+                teacher_tokenizer_name=teacher_cfg["model_name"],
+                student_tokenizer_name=policy_config["model_name"],
+                max_comb_len=token_aligner_cfg.get("max_comb_len", 4),
+                projection_matrix_multiplier=token_aligner_cfg.get(
+                    "projection_matrix_multiplier", 1.0
+                ),
+            )
+            token_aligner._load_logits_projection_map(
+                file_path=token_aligner_cfg["projection_matrix_path"],
+                use_sparse_format=token_aligner_cfg.get("use_sparse_format", True),
+                learnable=token_aligner_cfg.get("learnable", False),
+                device="cpu",
+            )
+            if token_aligner_cfg.get("project_teacher_to_student", False):
+                token_aligner.create_reverse_projection_matrix(device="cpu")
+            token_aligner.precompute_canonical_maps()
+            if token_aligner_cfg.get("use_cuda_dp", False):
+                cuda_dp_path = (
+                    Path(__file__).resolve().parents[2]
+                    / "x_token"
+                    / "cuda_tokenalign_dp.py"
+                )
+                if not cuda_dp_path.exists():
+                    raise FileNotFoundError(
+                        "Requested token_aligner.use_cuda_dp=true but file not found: "
+                        f"{cuda_dp_path}"
+                    )
+                spec_obj = importlib.util.spec_from_file_location(
+                    "x_token_cuda_dp", str(cuda_dp_path)
+                )
+                if spec_obj is None or spec_obj.loader is None:
+                    raise ImportError(
+                        f"Failed to load CUDA DP module from: {cuda_dp_path}"
+                    )
+                mod = importlib.util.module_from_spec(spec_obj)
+                spec_obj.loader.exec_module(mod)
+                mod.monkeypatch_tokenaligner_cuda_basecase()
+                token_aligner._use_cuda_dp = True
+                token_aligner._cuda_dp_module_path = str(cuda_dp_path)
+                print(
+                    f"  ✓ Teacher {teacher_idx} CUDA DP monkeypatch enabled",
+                    flush=True,
+                )
+        else:
+            if not bool(os.getenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", False)):
+                check_vocab_equality(
+                    tokenizer, policy_config["model_name"], teacher_cfg["model_name"]
+                )
+
+        if "megatron_cfg" in teacher_cfg and teacher_cfg["megatron_cfg"]["enabled"]:
+            total_train_iters = min(
+                distillation_config["max_num_steps"],
+                distillation_config["max_num_epochs"] * len(dataloader),
+            )
+            teacher_cfg["megatron_cfg"]["train_iters"] = total_train_iters
+
+        print(
+            f"\n▶ Setting up teacher policy {teacher_idx} ({teacher_cfg['model_name']})...",
+            flush=True,
+        )
+        teacher_policy = Policy(
+            name_prefix=f"teacher_{teacher_idx}"
+            if len(teacher_specs) > 1
+            else "teacher",
+            cluster=cluster,
+            config=teacher_cfg,
+            tokenizer=teacher_tokenizer if cross_tokenizer_enabled else tokenizer,
+            weights_path=None,
+            optimizer_path=None,
+            init_optimizer=False,
+            init_reference_model=False,
+        )
+        if not bool(distillation_config.get("keep_models_resident", False)):
+            teacher_policy.offload_after_refit()
+
+        token_aligners.append(token_aligner)
+        teacher_tokenizers.append(teacher_tokenizer)
+        teacher_policies.append(teacher_policy)
+
+    # ==========================
+    #      Student Policy
+    # ==========================
+    # Note: No student_generation interface for off-policy distillation
+    print("\n▶ Setting up student policy...", flush=True)
+
+    # Checkpoint paths
+    weights_path = None
+    optimizer_path = None
+    if last_checkpoint_path:
+        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+
+    if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
+        ## NOTE: this is equal to the total number of scheduler steps
+        total_train_iters = min(
+            distillation_config["max_num_steps"],
+            distillation_config["max_num_epochs"] * len(dataloader),
+        )
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+
+    student_policy = Policy(
+        name_prefix="student",
+        cluster=cluster,
+        config=policy_config,
+        tokenizer=tokenizer,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
+        init_optimizer=True,
+        init_reference_model=False,
+    )
+
+    if any(ta is not None for ta in token_aligners):
+        # Unified single-/multi-teacher path: always go through the aggregator
+        # so per-microbatch metrics are batched + .cpu()-synced once and the
+        # downstream code never sees stray GPU tensors in `all_mb_metrics`.
+        per_teacher_loss_fns: list[Optional[CrossTokenizerDistillationLossFn]] = []
+        per_teacher_weights: list[float] = []
+        for t_idx, spec_cfg in enumerate(teacher_specs):
+            teacher_loss_cfg = spec_cfg.get("loss_fn", loss_config)
+            if token_aligners[t_idx] is None:
+                per_teacher_loss_fns.append(None)
+            else:
+                per_teacher_loss_fns.append(
+                    CrossTokenizerDistillationLossFn(
+                        teacher_loss_cfg, token_aligners[t_idx]
+                    )
+                )
+            per_teacher_weights.append(spec_cfg.get("weight", 1.0))
+        loss_fn = MultiTeacherLossAggregator(
+            per_teacher_loss_fns,
+            per_teacher_weights,
+            normalize_by_vocab=loss_config.get("normalize_by_vocab", False),
+            cfg=loss_config,
+        )
+    else:
+        loss_fn = DistillationLossFn(loss_config)
+
+    print("\n" + "=" * 60)
+    print(" " * 12 + "OFF-POLICY DISTILLATION SETUP COMPLETE")
+    print("=" * 60 + "\n", flush=True)
+
+    return (
+        student_policy,
+        teacher_policies,
+        dataloader,
+        val_dataloader,
+        loss_fn,
+        logger,
+        checkpointer,
+        distillation_save_state,
+        master_config,
+    )
+
+
+# ===============================================================================
+# Training
+# ===============================================================================
+
+
+def validate(
+    student_policy: ColocatablePolicyInterface,
+    teacher_policies: list[ColocatablePolicyInterface],
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    loss_fn: DistillationLossFn,
+    step: int,
+    master_config: OffPolicyMasterConfig,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run validation on the validation dataset for off-policy distillation.
+
+    Computes teacher top-k logits and student distillation loss on validation data
+    in eval mode (no gradient updates).
+
+    Args:
+        student_policy: The student policy to evaluate.
+        teacher_policies: Teacher policy list; first teacher used for validation.
+        val_dataloader: Validation dataloader.
+        tokenizer: Tokenizer for processing text.
+        loss_fn: Distillation loss function.
+        step: Current training step (for logging).
+        master_config: Master configuration dictionary.
+
+    Returns:
+        Tuple of (val_metrics, timing_metrics).
+    """
+    if val_dataloader is None:
+        print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
+        return {}, {}
+
+    timer = Timer()
+
+    with timer.time("total_validation_time"):
+        print(f"▶ Starting validation at step {step}...", flush=True)
+
+        val_metrics: dict[str, Any] = {"val_loss": 0.0}
+        sum_num_valid_tokens = 0
+
+        val_batches = master_config["distillation"].get("val_batches", 0)
+        val_batch_size = master_config["distillation"].get(
+            "val_global_batch_size",
+            master_config["distillation"]["num_prompts_per_step"],
+        )
+        val_mbs = master_config["distillation"].get(
+            "val_micro_batch_size", val_batch_size
+        )
+
+        for batch_idx, val_batch in enumerate(val_dataloader):
+            # Add loss masks for assistant tokens
+            for message_log in val_batch["message_log"]:
+                for message in message_log:
+                    if "token_loss_mask" not in message:
+                        if message["role"] == "assistant":
+                            message["token_loss_mask"] = torch.ones_like(
+                                message["token_ids"]
+                            )
+                        else:
+                            message["token_loss_mask"] = torch.zeros_like(
+                                message["token_ids"]
+                            )
+
+            # Flatten messages
+            flat_messages, input_lengths = batched_message_log_to_flat_message(
+                val_batch["message_log"],
+                pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                make_sequence_length_divisible_by=master_config["policy"].get(
+                    "make_sequence_length_divisible_by", 1
+                ),
+            )
+
+            val_data = BatchedDataDict[DistillationLossDataDict](
+                {
+                    "input_ids": flat_messages["token_ids"],
+                    "input_lengths": input_lengths,
+                    "token_mask": flat_messages["token_loss_mask"],
+                    "sample_mask": val_batch["loss_multiplier"],
+                }
+            )
+            val_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
+            val_data.to("cpu")
+
+            # Pad partial batch if needed (drop_last=False for val)
+            # Must pad BEFORE teacher logits to avoid size mismatch:
+            # teacher.get_topk_logits internally pads for its own DP sharding
+            # and returns padded-size outputs, so all inputs must be
+            # uniformly padded first.
+            if val_data.size < val_batch_size:
+                dp_size = student_policy.sharding_annotations.get_axis_size(
+                    "data_parallel"
+                )
+                val_data = maybe_pad_last_batch(val_data, dp_size, val_mbs)
+
+            # Get teacher top-k logits
+            use_ipc = master_config["distillation"].get("use_ipc", True)
+            topk_k = master_config["distillation"]["topk_logits_k"]
+
+            teacher_policy = teacher_policies[0]
+            teacher_policy.prepare_for_lp_inference()
+            if use_ipc:
+                teacher_logits = teacher_policy.compute_teacher_logits_ipc(
+                    val_data,
+                    topk_logits=topk_k,
+                    gbs=val_data.size,
+                    mbs=master_config["distillation"].get(
+                        "val_micro_batch_size",
+                        master_config["distillation"].get(
+                            "val_global_batch_size",
+                            master_config["distillation"]["num_prompts_per_step"],
+                        ),
+                    ),
+                )
+            else:
+                teacher_topk = teacher_policy.get_topk_logits(val_data, k=topk_k)
+                teacher_topk_logprobs, _ = _ensure_topk_logprobs_for_non_ipc(
+                    teacher_topk["topk_logits"]
+                )
+                val_data["teacher_topk_logits"] = teacher_topk_logprobs
+                val_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                del teacher_topk
+            if not bool(master_config["distillation"].get("keep_models_resident", False)):
+                teacher_policy.offload_after_refit()
+
+            # Compute student validation loss (eval mode, no gradient updates)
+            student_policy.prepare_for_training()
+            if use_ipc:
+                val_results = student_policy.train_off_policy_distillation(
+                    val_data,
+                    teacher_logits=teacher_logits,
+                    loss_fn=loss_fn,
+                    eval_mode=True,
+                    gbs=val_data.size,
+                    mbs=val_mbs,
+                )
+                del teacher_logits
+            else:
+                val_results = student_policy.train(
+                    val_data,
+                    loss_fn,
+                    eval_mode=True,
+                    gbs=val_data.size,
+                    mbs=val_mbs,
+                )
+
+            if len(val_results["all_mb_metrics"]) == 0:
+                warnings.warn(
+                    "No validation metrics were collected for this batch."
+                    " This is likely because there were no valid samples."
+                )
+            else:
+                num_valid_tokens = (
+                    val_data["sample_mask"].unsqueeze(-1) * val_data["token_mask"]
+                ).sum()
+                val_metrics["val_loss"] += float(val_results["loss"]) * num_valid_tokens
+                sum_num_valid_tokens += num_valid_tokens
+
+            if val_batches > 0 and batch_idx >= val_batches - 1:
+                break
+
+        if sum_num_valid_tokens > 0:
+            val_metrics["val_loss"] /= sum_num_valid_tokens
+        else:
+            warnings.warn(
+                "No validation metrics were collected."
+                " This is likely because there were no valid samples in the validation set."
+            )
+
+        student_policy.prepare_for_training()
+
+    # Get timing metrics
+    timing_metrics = timer.get_timing_metrics(reduction_op="sum")
+    validation_time = timing_metrics.get("total_validation_time", 0)
+
+    if sum_num_valid_tokens > 0:
+        # Print summary of validation results
+        print("\n📊 Validation Results:")
+        print(f"    • Validation loss: {val_metrics['val_loss']:.4f}")
+
+        # Print timing information
+        print("\n  ⏱️  Validation Timing:")
+        print(f"    • Total validation time: {validation_time:.2f}s")
+
+    # Make sure to reset the timer after validation
+    timer.reset()
+
+    return val_metrics, timing_metrics
+
+
+def off_policy_distillation_train(
+    student_policy: ColocatablePolicyInterface,
+    teacher_policies: list[ColocatablePolicyInterface],
+    dataloader: StatefulDataLoader,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    loss_fn: DistillationLossFn,
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    distillation_save_state: OffPolicyDistillationSaveState,
+    master_config: OffPolicyMasterConfig,
+    eval_hook: Optional[Callable] = None,
+    eval_hook_period: int = 0,
+    eval_hook_at_start: bool = False,
+    token_aligners: Optional[list[Any]] = None,
+    teacher_tokenizers: Optional[list[Optional[PreTrainedTokenizerBase]]] = None,
+) -> None:
+    """Run off-policy distillation training algorithm.
+    
+    Key differences from on-policy distillation train():
+    - No student_generation parameter (we don't generate responses)
+    - No task_to_env / val_task_to_env (no environment scoring)
+    - No rollout generation step - uses fixed responses from dataset directly
+    
+    Training loop:
+    1. Load batch with prompt-response pairs (responses already in dataset)
+    2. Add loss masks (train on assistant tokens only)
+    3. Get teacher top-k logits for the fixed responses
+    4. Train student with KL divergence loss
+
+    Args:
+        eval_hook: Optional callback ``(step, student_policy, teacher_policy, logger) -> dict``
+            called every *eval_hook_period* steps.  Return value (if dict) is
+            logged under ``prefix="eval_hook"`` and used for checkpoint metric lookup.
+        eval_hook_period: How often (in steps) to call *eval_hook*. 0 = disabled.
+        eval_hook_at_start: If True, call eval_hook before the first training step.
+    """
+    timer = Timer()
+    timeout = TimeoutChecker(
+        timeout=master_config["checkpointing"].get("checkpoint_must_save_by", None),
+        fit_last_save_time=True,
+    )
+    timeout.start_iterations()
+
+    # common config/state items
+    current_epoch = distillation_save_state["current_epoch"]  # current epoch
+    current_step = distillation_save_state[
+        "current_step"
+    ]  # current step within current epoch
+    total_steps = distillation_save_state[
+        "total_steps"
+    ]  # total number of steps across all epochs
+    consumed_samples = distillation_save_state["consumed_samples"]
+    total_valid_tokens = distillation_save_state["total_valid_tokens"]
+    max_epochs = master_config["distillation"][
+        "max_num_epochs"
+    ]  # max number of epochs to train for
+    max_steps = master_config["distillation"][
+        "max_num_steps"
+    ]  # max number of steps to train for
+
+    # Validation configuration
+    val_period = master_config["distillation"].get("val_period", 0)
+    val_at_start = master_config["distillation"].get("val_at_start", False)
+
+    # Per-step model/optimizer offload control (off-policy distillation only).
+    # When True, skip the `offload_after_refit` calls between teacher and student
+    # phases. Requires that student + all teachers + student optimizer state fit
+    # resident on each GPU. Default False preserves the original eviction behavior.
+    keep_models_resident = bool(
+        master_config["distillation"].get("keep_models_resident", False)
+    )
+    if keep_models_resident:
+        print(
+            "▶ keep_models_resident=True — skipping per-step model/optimizer "
+            "offloads in off-policy distillation loop",
+            flush=True,
+        )
+
+    # Run validation at the start if configured
+    if val_at_start and total_steps == 0:
+        print("\n🔍 Running initial validation...", flush=True)
+        val_metrics, validation_timings = validate(
+            student_policy,
+            teacher_policies,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            step=0,
+            master_config=master_config,
+        )
+        logger.log_metrics(val_metrics, total_steps, prefix="validation")
+        logger.log_metrics(validation_timings, total_steps, prefix="timing/validation")
+
+    # Run eval hook at start if configured
+    eval_hook_metrics = None
+    if eval_hook and eval_hook_at_start and total_steps == 0:
+        print("\n🔍 Running initial eval hook...", flush=True)
+        eval_hook_metrics = eval_hook(
+            step=0,
+            student_policy=student_policy,
+            teacher_policy=teacher_policies[0],
+            logger=logger,
+        )
+        if isinstance(eval_hook_metrics, dict):
+            logger.log_metrics(eval_hook_metrics, 0, prefix="eval_hook")
+
+    # Run off-policy distillation training
+    batch: BatchedDataDict[DatumSpec]
+
+    teacher_specs = _normalize_teacher_specs(master_config)
+    num_teachers = len(teacher_specs)
+    token_aligners = token_aligners or [None] * num_teachers
+    teacher_tokenizers = teacher_tokenizers or [None] * num_teachers
+    cross_tokenizer_enabled = any(a is not None for a in token_aligners)
+
+    while total_steps < max_steps and current_epoch < max_epochs:
+        print(
+            f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_epochs} {'=' * 25}",
+            flush=True,
+        )
+
+        dataloader_iter = iter(dataloader)
+        while total_steps < max_steps:
+            try:
+                batch = next(dataloader_iter)
+            except StopIteration:
+                break
+
+            print(
+                f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_steps)} {'=' * 25}",
+                flush=True,
+            )
+            maybe_gpu_profile_step(student_policy, total_steps + 1)
+            val_metrics, validation_timings = None, None
+
+            with timer.time("total_step_time"):
+                # ==== Data Processing ====
+                # CrossTokenizerCollator in the StatefulDataLoader's worker
+                # processes already did the message flatten + per-teacher CT
+                # (teacher tokenize + DP alignment). The batch carries
+                # input_ids / input_lengths / token_mask / sample_mask /
+                # flat_messages / per_teacher_ct_data.
+                print("▶ Processing batch data (off-policy - using fixed responses)...", flush=True)
+                with timer.time("data_processing"):
+                    flat_messages = batch["flat_messages"]
+                    input_lengths = batch["input_lengths"]
+                    train_data = BatchedDataDict[DistillationLossDataDict](
+                        {
+                            "input_ids": batch["input_ids"],
+                            "input_lengths": input_lengths,
+                            "token_mask": batch["token_mask"],
+                            "sample_mask": batch["sample_mask"],
+                        }
+                    )
+                    mm_dict = flat_messages.get_multimodal_dict(as_tensors=False)
+                    if mm_dict:
+                        train_data.update(mm_dict)
+                    train_data.to("cpu")
+
+                # ==== Teacher Logprob Inference ====
+                use_ipc = bool(master_config["distillation"].get("use_ipc", True))
+                topk_k = master_config["distillation"]["topk_logits_k"]
+                if num_teachers > 1 and not use_ipc:
+                    raise NotImplementedError(
+                        "Multi-teacher distillation currently requires use_ipc=True."
+                    )
+                all_teacher_logits: list[Any] = []
+                per_teacher_ct_data: list[tuple[torch.Tensor, list[Any], Optional[dict[str, list]]]] = []
+
+                print(
+                    f"▶ Preparing for teacher logprob inference ({num_teachers} teacher(s))...",
+                    flush=True,
+                )
+                if not keep_models_resident:
+                    student_policy.offload_after_refit()
+
+                batch_ct_data = batch.get("per_teacher_ct_data", [None] * num_teachers)
+                for teacher_idx, teacher_policy in enumerate(teacher_policies):
+                    ct = batch_ct_data[teacher_idx]
+                    if ct is not None:
+                        teacher_data = ct["teacher_data"]
+                        chunk_indices = None
+                        if "student_chunk_coo" in ct:
+                            chunk_indices = {
+                                "student_chunk_coo": ct["student_chunk_coo"],
+                                "teacher_chunk_coo": ct["teacher_chunk_coo"],
+                                "num_chunks": ct["num_chunks"],
+                            }
+                        per_teacher_ct_data.append(
+                            (ct["teacher_input_ids"], ct["aligned_pairs"], chunk_indices)
+                        )
+                    else:
+                        teacher_data = None
+                        per_teacher_ct_data.append((torch.empty(0), [], None))
+
+                    teacher_fwd_data = teacher_data if teacher_data is not None else train_data
+                    # Always send full logits: cross-tokenizer teachers need them
+                    # for projection, and same-tokenizer teachers need them for
+                    # exact full-vocab KL (topk approximation inflates KL by ~30%).
+                    teacher_topk_k = None
+
+                    teacher_policy.prepare_for_lp_inference()
+                    if use_ipc:
+                        with timer.time(f"teacher_{teacher_idx}_logprob_inference"):
+                            teacher_logits = teacher_policy.compute_teacher_logits_ipc(
+                                teacher_fwd_data,
+                                topk_logits=teacher_topk_k,
+                                gbs=master_config["policy"]["train_global_batch_size"],
+                                mbs=master_config["policy"]["train_micro_batch_size"],
+                            )
+                            all_teacher_logits.append(teacher_logits)
+                    else:
+                        if token_aligners[teacher_idx] is not None:
+                            raise NotImplementedError(
+                                "Cross-tokenizer distillation requires use_ipc=True. "
+                                "Set distillation.use_ipc: true in the config."
+                            )
+                        with timer.time(f"teacher_{teacher_idx}_logprob_inference"):
+                            teacher_topk = teacher_policy.get_topk_logits(train_data, k=topk_k)
+                            teacher_topk_logprobs, converted_to_logprobs = _ensure_topk_logprobs_for_non_ipc(
+                                teacher_topk["topk_logits"]
+                            )
+                            train_data["teacher_topk_logits"] = teacher_topk_logprobs
+                            train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                            if converted_to_logprobs and total_steps == 0 and current_step == 0:
+                                print(
+                                    "⚠️ teacher.get_topk_logits returned raw logits in non-IPC mode; "
+                                    "normalizing with log_softmax before distillation loss.",
+                                    flush=True,
+                                )
+                            del teacher_topk
+                        all_teacher_logits.append(None)
+                    if not keep_models_resident:
+                        teacher_policy.offload_after_refit()
+
+                # ==== Student Training ====
+                print("▶ Preparing for training...", flush=True)
+                with timer.time("training_prep"):
+                    student_policy.prepare_for_training()
+
+                if cross_tokenizer_enabled:
+                    if not getattr(student_policy, "_loss_fn_initialized", False):
+                        student_policy._loss_fn_initialized = True
+                        # Unified single-/multi-teacher path: always send the
+                        # list-shape worker spec so each worker builds a
+                        # MultiTeacherLossAggregator (with N=1 for single
+                        # teacher). This eliminates the diverging code path
+                        # that previously left single-teacher metrics on GPU.
+                        teacher_worker_specs: list[tuple[DistillationLossConfig, Optional[dict[str, Any]], float]] = []
+                        for teacher_idx, spec_cfg in enumerate(teacher_specs):
+                            aligner_cfg = spec_cfg.get("token_aligner", {})
+                            teacher_loss_cfg = spec_cfg.get("loss_fn", master_config["loss_fn"])
+                            if token_aligners[teacher_idx] is None:
+                                teacher_worker_specs.append((teacher_loss_cfg, None, spec_cfg.get("weight", 1.0)))
+                            else:
+                                teacher_worker_specs.append(
+                                    (
+                                        teacher_loss_cfg,
+                                        {
+                                            "teacher_model": spec_cfg["teacher"]["model_name"],
+                                            "student_model": master_config["policy"]["model_name"],
+                                            "projection_matrix_path": aligner_cfg["projection_matrix_path"],
+                                            "use_sparse_format": aligner_cfg.get("use_sparse_format", True),
+                                            "learnable": aligner_cfg.get("learnable", False),
+                                            "max_comb_len": aligner_cfg.get("max_comb_len", 4),
+                                            "projection_matrix_multiplier": aligner_cfg.get(
+                                                "projection_matrix_multiplier", 1.0
+                                            ),
+                                            "project_teacher_to_student": aligner_cfg.get(
+                                                "project_teacher_to_student", False
+                                            ),
+                                        },
+                                        spec_cfg.get("weight", 1.0),
+                                    )
+                                )
+                        student_policy.init_cross_tokenizer_loss_fn(
+                            loss_config=teacher_worker_specs,
+                            token_aligner_config=None,
+                        )
+                    for teacher_idx, (teacher_input_ids, aligned_pairs, chunk_indices) in enumerate(per_teacher_ct_data):
+                        if teacher_input_ids.numel() == 0:
+                            continue
+                        # Always pass the teacher index now that every cached
+                        # loss fn is a MultiTeacherLossAggregator (N>=1).
+                        student_policy.update_cross_tokenizer_data(
+                            teacher_input_ids=teacher_input_ids,
+                            aligned_pairs=aligned_pairs,
+                            teacher_idx=teacher_idx,
+                            chunk_indices=chunk_indices,
+                        )
+
+                student_loss_fn = None if cross_tokenizer_enabled else loss_fn
+                print("▶ Training policy...", flush=True)
+                with timer.time("policy_training"):
+                    if use_ipc:
+                        if num_teachers > 1:
+                            teacher_logits_arg = _group_teacher_logits_by_rank(
+                                all_teacher_logits
+                            )
+                        else:
+                            teacher_logits_arg = all_teacher_logits[0]
+                        train_results = student_policy.train_off_policy_distillation(
+                            train_data,
+                            teacher_logits=teacher_logits_arg,
+                            loss_fn=student_loss_fn,
+                        )
+                        del all_teacher_logits
+                    else:
+                        train_results = student_policy.train(
+                            train_data,
+                            student_loss_fn,
+                        )
+
+                is_last_step = (total_steps + 1 >= max_steps) or (
+                    (current_epoch + 1 == max_epochs)
+                    and (current_step + 1 == len(dataloader))
+                )
+
+                # ==== Validation ====
+                if val_period > 0 and (total_steps + 1) % val_period == 0:
+                    val_metrics, validation_timings = validate(
+                        student_policy,
+                        teacher_policies,
+                        val_dataloader,
+                        tokenizer,
+                        loss_fn,
+                        step=total_steps + 1,
+                        master_config=master_config,
+                    )
+                    logger.log_metrics(
+                        validation_timings, total_steps + 1, prefix="timing/validation"
+                    )
+                    logger.log_metrics(
+                        val_metrics, total_steps + 1, prefix="validation"
+                    )
+
+                # ==== Eval Hook (e.g., generation-based MATH/MMLU eval) ====
+                if eval_hook and eval_hook_period > 0 and (total_steps + 1) % eval_hook_period == 0:
+                    print(f"\n🔍 Running eval hook at step {total_steps + 1}...", flush=True)
+                    with timer.time("eval_hook"):
+                        eval_hook_metrics = eval_hook(
+                            step=total_steps + 1,
+                            student_policy=student_policy,
+                            teacher_policy=teacher_policies[0],
+                            logger=logger,
+                        )
+                    if isinstance(eval_hook_metrics, dict):
+                        logger.log_metrics(eval_hook_metrics, total_steps + 1, prefix="eval_hook")
+                    student_policy.prepare_for_training()
+
+                # ==== Metrics ====
+                metrics = {
+                    "loss": train_results["loss"].numpy(),
+                    "grad_norm": train_results["grad_norm"].numpy(),
+                    "mean_seq_length": batch["length"].numpy().mean(),
+                    "total_num_tokens": input_lengths.numpy().sum(),
+                }
+                metrics.update(train_results["all_mb_metrics"])
+                for k, v in metrics.items():
+                    if k in {
+                        "lr",
+                        "wd",
+                        "global_valid_seqs",
+                        "global_valid_toks",
+                        "mean_seq_length",
+                    }:
+                        metrics[k] = np.mean(v).item()
+                    else:
+                        metrics[k] = np.sum(v).item()
+                total_valid_tokens += metrics["global_valid_toks"]
+
+                ## Checkpointing
+                consumed_samples += master_config["distillation"][
+                    "num_prompts_per_step"
+                ]
+                timeout.mark_iteration()
+
+                should_save_by_step = (
+                    is_last_step
+                    or (total_steps + 1) % master_config["checkpointing"]["save_period"]
+                    == 0
+                )
+                # Check if timeout-based checkpointing is enabled in config.
+                should_save_by_timeout = timeout.check_save()
+
+                if master_config["checkpointing"]["enabled"] and (
+                    should_save_by_step or should_save_by_timeout
+                ):
+                    student_policy.prepare_for_training()
+
+                    distillation_save_state["current_epoch"] = current_epoch
+                    distillation_save_state["current_step"] = current_step + 1
+                    distillation_save_state["total_steps"] = total_steps + 1
+                    distillation_save_state["total_valid_tokens"] = total_valid_tokens
+                    distillation_save_state["consumed_samples"] = consumed_samples
+
+                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    if full_metric_name is not None:
+                        assert full_metric_name.startswith(
+                            "train:"
+                        ) or full_metric_name.startswith("val:"), (
+                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
+                            f'followed by the corresponding name in the "val" or "train" metrics dictionary. '
+                            f"Example: 'train:loss' or 'val:val_loss'"
+                        )
+                        prefix, metric_name = full_metric_name.split(":", 1)
+                        metrics_source = metrics if prefix == "train" else val_metrics
+                        if not metrics_source:
+                            warnings.warn(
+                                f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
+                                "This checkpoint will not be saved as top-k.",
+                                stacklevel=2,
+                            )
+                            if full_metric_name in distillation_save_state:
+                                del distillation_save_state[full_metric_name]
+                        elif metric_name not in metrics_source:
+                            raise ValueError(
+                                f"Metric {metric_name} not found in {prefix} metrics"
+                            )
+                        else:
+                            distillation_save_state[full_metric_name] = metrics_source[
+                                metric_name
+                            ]
+
+                    with timer.time("checkpointing"):
+                        print(
+                            f"Saving checkpoint for step {total_steps + 1}...",
+                            flush=True,
+                        )
+                        checkpoint_path = checkpointer.init_tmp_checkpoint(
+                            total_steps + 1, distillation_save_state, master_config
+                        )
+                        student_policy.save_checkpoint(
+                            weights_path=os.path.join(
+                                checkpoint_path, "policy", "weights"
+                            ),
+                            optimizer_path=os.path.join(
+                                checkpoint_path, "policy", "optimizer"
+                            ),
+                            tokenizer_path=os.path.join(
+                                checkpoint_path, "policy", "tokenizer"
+                            ),
+                            checkpointing_cfg=master_config["checkpointing"],
+                        )
+                        torch.save(
+                            dataloader.state_dict(),
+                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        )
+                        checkpointer.finalize_checkpoint(checkpoint_path)
+
+            # Logging
+            # Log training data
+            log_data = {"content": flat_messages["content"]}
+            log_data["input_lengths"] = input_lengths.tolist()
+            logger.log_batched_dict_as_jsonl(
+                log_data, f"train_data_step{total_steps + 1}.jsonl"
+            )
+
+            timing_metrics: dict[str, float] = timer.get_timing_metrics(
+                reduction_op="sum"
+            )  # type: ignore
+            for teacher_idx in range(num_teachers):
+                ct_key = f"teacher_{teacher_idx}_ct_processing"
+                lp_key = f"teacher_{teacher_idx}_logprob_inference"
+                if ct_key in timing_metrics:
+                    timing_metrics[f"teacher_{teacher_idx}/ct_processing"] = timing_metrics[ct_key]
+                if lp_key in timing_metrics:
+                    timing_metrics[f"teacher_{teacher_idx}/logprob_inference"] = timing_metrics[lp_key]
+                loss_compute_key = f"teacher_{teacher_idx}/loss_compute"
+                if loss_compute_key in metrics:
+                    timing_metrics[loss_compute_key] = float(metrics[loss_compute_key])
+
+            teacher_total = 0.0
+            for teacher_idx in range(num_teachers):
+                teacher_total += timing_metrics.get(f"teacher_{teacher_idx}/ct_processing", 0.0)
+                teacher_total += timing_metrics.get(f"teacher_{teacher_idx}/logprob_inference", 0.0)
+                teacher_total += timing_metrics.get(f"teacher_{teacher_idx}/loss_compute", 0.0)
+            timing_metrics["multi_teacher_total"] = teacher_total
+            # policy_training is the only worker-side timing exposed at this layer.
+            timing_metrics["student_forward"] = timing_metrics.get("policy_training", 0.0)
+            timing_metrics["student_backward"] = timing_metrics.get("policy_training", 0.0)
+
+            print("\n📊 Training Results:")
+
+            print(f"  • Loss: {metrics['loss']:.4f}")
+            print(f"  • Grad Norm: {metrics['grad_norm']:.4f}")
+            print(f"  • Mean Sequence Length: {metrics['mean_seq_length']:.1f}")
+            
+            if "total_flops" in train_results:
+                total_time = timing_metrics.get("total_step_time", 0)
+                total_tflops = (
+                    train_results["total_flops"]
+                    / timing_metrics["policy_training"]
+                    / 1e12
+                )
+                num_ranks = train_results["num_ranks"]
+                print(
+                    f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)",
+                    flush=True,
+                )
+                if "theoretical_tflops" in train_results:
+                    theoretical_tflops = train_results["theoretical_tflops"]
+                    print(
+                        f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%",
+                        flush=True,
+                    )
+                    metrics["train_fp_utilization"] = total_tflops / theoretical_tflops
+
+            print("\n⏱️  Timing:", flush=True)
+            # Display total time first, separately
+            total_time = timing_metrics.get("total_step_time", 0)
+
+            total_num_gpus = (
+                master_config["cluster"]["num_nodes"]
+                * master_config["cluster"]["gpus_per_node"]
+            )
+            metrics.update(
+                {
+                    "tokens_per_sec_per_gpu": metrics["total_num_tokens"]
+                    / total_time
+                    / total_num_gpus
+                }
+            )
+
+            print(f"  • Total step time: {total_time:.2f}s", flush=True)
+
+            # Display all other timing metrics
+            for k, v in sorted(
+                timing_metrics.items(), key=lambda item: item[1], reverse=True
+            ):
+                if k != "total_step_time":
+                    percent = (v / total_time * 100) if total_time > 0 else 0
+                    print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
+
+            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                metrics["global_valid_toks"] / total_time / total_num_gpus
+            )
+            logger.log_metrics(metrics, total_steps + 1, prefix="train")
+            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+
+            timer.reset()
+            current_step += 1
+            total_steps += 1
+            if should_save_by_timeout:
+                print("Timeout has been reached, stopping training early", flush=True)
+                return
+            if total_steps >= max_steps:
+                print(
+                    "Max number of steps has been reached, stopping training early",
+                    flush=True,
+                )
+                return
+
+        # End of epoch
+        current_epoch += 1
+        current_step = 0  # Reset step counter for new epoch

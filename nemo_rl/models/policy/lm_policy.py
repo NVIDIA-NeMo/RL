@@ -729,6 +729,98 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return result
 
+    def train_off_policy_distillation(
+        self,
+        data: BatchedDataDict[Any],
+        teacher_logits: Optional[Any] = None,
+        loss_fn: Optional[LossFunction] = None,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Run cross-tokenizer off-policy distillation on the student worker group.
+
+        Sibling of :meth:`train` that dispatches to
+        ``DTensorPolicyWorkerV2Impl.train_off_policy_distillation`` instead of
+        the regular ``train`` so the on-policy / GRPO / SFT path stays
+        unaffected.
+        """
+        batch_size = gbs or self.cfg["train_global_batch_size"]
+        micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        sharded_data = data.shard_by_batch_size(dp_size, batch_size=batch_size)
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "train_off_policy_distillation",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={
+                "teacher_logits": teacher_logits,
+                "loss_fn": loss_fn,
+                "eval_mode": eval_mode,
+                "gbs": batch_size,
+                "mbs": micro_batch_size,
+            },
+        )
+        results = self.worker_group.get_all_worker_results(futures)
+        return {
+            "loss": results[0]["global_loss"],
+            "grad_norm": results[0]["grad_norm"],
+            **{
+                k: v for k, v in results[0].items()
+                if k not in ("global_loss", "grad_norm")
+            },
+        }
+
+    def compute_teacher_logits_ipc(
+        self,
+        data: BatchedDataDict[Any],
+        topk_logits: Optional[int] = None,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Run the teacher forward pass and return per-rank IPC handle dicts.
+
+        The teacher is always run forward-only; the student consumes the
+        returned per-rank IPC handles in :meth:`train_off_policy_distillation`.
+        """
+        batch_size = gbs or self.cfg["train_global_batch_size"]
+        micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        sharded_data = data.shard_by_batch_size(dp_size, batch_size=batch_size)
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "compute_teacher_logits_ipc",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={
+                "topk_logits": topk_logits,
+                "gbs": batch_size,
+                "mbs": micro_batch_size,
+            },
+        )
+        return self.worker_group.get_all_worker_results(futures)
+
     def score(
         self, data: BatchedDataDict[GenerationDatumSpec]
     ) -> BatchedDataDict[ScoreOutputSpec]:

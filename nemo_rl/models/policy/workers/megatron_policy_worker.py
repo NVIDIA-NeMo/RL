@@ -445,6 +445,52 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 metrics["moe_metrics"] = moe_metrics
         return metrics
 
+    def train_off_policy_distillation(
+        self,
+        data: BatchedDataDict[Any],
+        teacher_logits: Optional[Any] = None,
+        loss_fn: Optional[LossFunction] = None,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            "MegatronPolicyWorker does not support off-policy distillation; "
+            "use DTensorPolicyWorkerV2 (set policy.dtensor_cfg._v2=true)."
+        )
+
+    def compute_teacher_logits_ipc(
+        self,
+        data: BatchedDataDict[Any],
+        topk_logits: Optional[int] = None,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            "MegatronPolicyWorker does not support compute_teacher_logits_ipc; "
+            "use DTensorPolicyWorkerV2 (set policy.dtensor_cfg._v2=true)."
+        )
+
+    def init_cross_tokenizer_loss_fn(
+        self, loss_config: Any, token_aligner_config: Any
+    ) -> None:
+        raise NotImplementedError(
+            "MegatronPolicyWorker does not support cross-tokenizer distillation; "
+            "use DTensorPolicyWorkerV2 (set policy.dtensor_cfg._v2=true)."
+        )
+
+    def update_cross_tokenizer_data(
+        self,
+        teacher_input_ids: Any,
+        aligned_pairs: Any,
+        teacher_idx: Optional[int] = None,
+        chunk_indices: Optional[dict[str, Any]] = None,
+    ) -> None:
+        raise NotImplementedError(
+            "MegatronPolicyWorker does not support cross-tokenizer distillation; "
+            "use DTensorPolicyWorkerV2 (set policy.dtensor_cfg._v2=true)."
+        )
+
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
         self, *, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
