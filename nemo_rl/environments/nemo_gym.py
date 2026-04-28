@@ -270,7 +270,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 
 
 def setup_nemo_gym_config(config, tokenizer) -> None:
-    generation_config = config["policy"]["generation"]
+    generation_config = config.policy["generation"]
 
     # Enable the http server. Requires both async engine and the expose_http_server flag
     generation_config["vllm_cfg"]["async_engine"] = True

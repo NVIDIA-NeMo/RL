@@ -53,7 +53,7 @@ When accessing a `NotRequired` field, use an `in` check or `.get(key)` / `.get(k
 stop_properly_penalty_coef = cfg.get("stop_properly_penalty_coef", None)
 
 # Truthiness check for optional booleans
-if master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
+if master_config.grpo.get("skip_reference_policy_logprobs_calculation"):
     ...
 
 # Nested NotRequired: check presence at each level explicitly

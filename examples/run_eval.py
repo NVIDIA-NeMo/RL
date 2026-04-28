@@ -90,7 +90,8 @@ def main():
         print(f"Overrides: {override_conf}")
         config = OmegaConf.merge(config, override_conf)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Print config
@@ -101,7 +102,7 @@ def main():
     init_ray()
 
     # Setup tokenizer — get_tokenizer handles both text-only and multimodal
-    is_multimodal = _is_multimodal_dataset(config["data"]["dataset_name"])
+    is_multimodal = _is_multimodal_dataset(config.data["dataset_name"])
     tokenizer = get_tokenizer(config["tokenizer"], get_processor=is_multimodal)
     config["generation"] = configure_generation_config(
         config["generation"], tokenizer, is_eval=True
@@ -112,7 +113,7 @@ def main():
         dataset,
         env,
         tokenizer,
-    ) = setup_data(tokenizer, config["data"], config["env"])
+    ) = setup_data(tokenizer, config.data, config.env)
 
     # Setup
     (

@@ -379,7 +379,7 @@ class TestAsyncTrajectoryCollector:
 
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
-        return {
+        config = {
             "grpo": {
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 3,
@@ -388,6 +388,7 @@ class TestAsyncTrajectoryCollector:
             },
             "policy": {"max_total_sequence_length": 512},
         }
+        return MasterConfig.model_construct(**config)
 
     def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
         """Create a mock batch for testing."""
@@ -571,7 +572,7 @@ class TestAsyncUtilsIntegration:
 
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
-        return {
+        config = {
             "grpo": {
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 2,
@@ -580,6 +581,7 @@ class TestAsyncUtilsIntegration:
             },
             "policy": {"max_total_sequence_length": 512},
         }
+        return MasterConfig.model_construct(**config)
 
     def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
         """Create a mock batch for testing."""

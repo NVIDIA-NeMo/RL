@@ -594,9 +594,9 @@ def print_performance_metrics(
             else:
                 print(f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)}")
 
-    is_vllm_metrics_logger_enabled = master_config["policy"]["generation"].get(
+    is_vllm_metrics_logger_enabled = master_config.policy["generation"].get(
         "vllm_cfg", {}
-    ).get("enable_vllm_metrics_logger", False) and master_config["policy"][
+    ).get("enable_vllm_metrics_logger", False) and master_config.policy[
         "generation"
     ].get("vllm_cfg", {}).get("async_engine", False)
     generation_logger_metrics = metrics.get("generation_logger_metrics", {})
@@ -618,9 +618,9 @@ def print_performance_metrics(
             "num_pending_samples must be a dictionary"
         )
 
-        vllm_metrics_logger_interval = master_config["policy"]["generation"][
-            "vllm_cfg"
-        ]["vllm_metrics_logger_interval"]
+        vllm_metrics_logger_interval = master_config.policy["generation"]["vllm_cfg"][
+            "vllm_metrics_logger_interval"
+        ]
         print("  • vLLM Logger Metrics:")
         # Visualize the inflight batch sizes timeline
         if len(vllm_logger_metrics["inflight_batch_sizes"].values()) > 0:
@@ -666,14 +666,15 @@ def print_performance_metrics(
             + timing_metrics["policy_training"]
         )
 
-    num_nodes = master_config["cluster"]["num_nodes"]
-    gpus_per_node = master_config["cluster"]["gpus_per_node"]
+    num_nodes = master_config.cluster["num_nodes"]
+    gpus_per_node = master_config.cluster["gpus_per_node"]
     total_num_gpus = num_nodes * gpus_per_node
-    colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Idle Time from Training Worker (Async GRPO only)
+    grpo_config = master_config.grpo
     if (
-        "async_grpo" in master_config and master_config["async_grpo"]["enabled"]
+        "async_grpo" in grpo_config and grpo_config["async_grpo"]["enabled"]
     ) and not colocated_inference:
         # async grpo
         exposed_generation_time = timing_metrics["exposed_generation"]
@@ -696,8 +697,7 @@ def print_performance_metrics(
         )
 
     number_of_samples_per_step = (
-        master_config["grpo"]["num_prompts_per_step"]
-        * master_config["grpo"]["num_generations_per_prompt"]
+        grpo_config["num_prompts_per_step"] * grpo_config["num_generations_per_prompt"]
     )
 
     if colocated_inference:
@@ -705,11 +705,11 @@ def print_performance_metrics(
         generation_num_gpus = total_num_gpus
     else:
         generation_num_nodes = (
-            master_config["policy"]["generation"]["colocated"]["resources"]["num_nodes"]
+            master_config.policy["generation"]["colocated"]["resources"]["num_nodes"]
             or 1
         )
         generation_num_gpus = (
-            master_config["policy"]["generation"]["colocated"]["resources"][
+            master_config.policy["generation"]["colocated"]["resources"][
                 "gpus_per_node"
             ]
             * generation_num_nodes

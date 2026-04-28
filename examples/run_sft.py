@@ -174,27 +174,28 @@ def main(is_vlm: bool = False):
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Print config
     print("Final config:")
     pprint.pprint(config)
 
-    config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
-    print(f"📊 Using log directory: {config['logger']['log_dir']}")
-    if config["checkpointing"]["enabled"]:
+    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    if config.checkpointing["enabled"]:
         print(
-            f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
+            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
     init_ray()
 
     # setup tokenizer (or processor)
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"], get_processor=is_vlm)
+    tokenizer = get_tokenizer(config.policy["tokenizer"], get_processor=is_vlm)
 
     # setup data
-    dataset, val_dataset = setup_data(tokenizer, config["data"])
+    dataset, val_dataset = setup_data(tokenizer, config.data)
 
     (
         policy,

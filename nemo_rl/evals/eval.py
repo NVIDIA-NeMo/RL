@@ -21,6 +21,7 @@ from typing import NotRequired, TypedDict
 
 import ray
 import torch
+from pydantic import BaseModel
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
@@ -56,7 +57,7 @@ class _PassThroughEnvConfig(TypedDict):
     mmau: NotRequired[VLMEnvConfig]
 
 
-class MasterConfig(TypedDict):
+class MasterConfig(BaseModel, extra="allow"):
     eval: EvalConfig
     generation: GenerationConfig  # Fixed: was 'generate'
     tokenizer: TokenizerConfig  # Added missing tokenizer key
@@ -91,9 +92,9 @@ def setup(
         VLLM model, data loader, and config.
     """
     # Extract individual configs for easier access
-    eval_config = master_config["eval"]
-    generation_config = master_config["generation"]
-    cluster_config = master_config["cluster"]
+    eval_config = master_config.eval
+    generation_config = master_config.generation
+    cluster_config = master_config.cluster
 
     # Set seed for reproducibility
     set_seed(eval_config["seed"])
@@ -288,7 +289,7 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
         master_config: Configuration settings.
     """
     # Check if async engine is enabled and run appropriate version
-    if master_config["generation"]["vllm_cfg"]["async_engine"]:
+    if master_config.generation["vllm_cfg"]["async_engine"]:
         asyncio.run(
             _run_env_eval_impl(
                 vllm_generation, dataloader, env, master_config, use_async=True
@@ -307,8 +308,8 @@ async def _run_env_eval_impl(
 ):
     """Unified implementation for both sync and async evaluation."""
     # Extract for easier access
-    generation_config = master_config["generation"]
-    eval_config = master_config["eval"]
+    generation_config = master_config.generation
+    eval_config = master_config.eval
     metric = eval_config["metric"]
     num_tests_per_prompt = eval_config["num_tests_per_prompt"]
     k_value = eval_config["k_value"]
@@ -459,14 +460,14 @@ def _save_evaluation_data_to_json(evaluation_data, master_config, save_path):
     """
     # Extract configuration information
     config_data = {
-        "model_name": master_config["generation"]["model_name"],
-        "dataset_name": master_config["data"]["dataset_name"],
-        "metric": master_config["eval"]["metric"],
-        "k_value": master_config["eval"]["k_value"],
-        "num_tests_per_prompt": master_config["eval"]["num_tests_per_prompt"],
-        "temperature": master_config["generation"]["temperature"],
-        "top_p": master_config["generation"]["top_p"],
-        "top_k": master_config["generation"]["top_k"],
+        "model_name": master_config.generation["model_name"],
+        "dataset_name": master_config.data["dataset_name"],
+        "metric": master_config.eval["metric"],
+        "k_value": master_config.eval["k_value"],
+        "num_tests_per_prompt": master_config.eval["num_tests_per_prompt"],
+        "temperature": master_config.generation["temperature"],
+        "top_p": master_config.generation["top_p"],
+        "top_k": master_config.generation["top_k"],
     }
 
     # Create directory if it doesn't exist
@@ -517,10 +518,10 @@ def _print_results(
     num_tests_per_prompt,
 ):
     """Print evaluation results."""
-    dataset_name = os.path.basename(master_config["data"]["dataset_name"])
+    dataset_name = os.path.basename(master_config.data["dataset_name"])
     model_name = os.path.basename(generation_config["model_name"])
     max_new_tokens = generation_config["vllm_cfg"]["max_model_len"]
-    seed = master_config["eval"]["seed"]
+    seed = master_config.eval["seed"]
     temperature = generation_config["temperature"]
     top_p = generation_config["top_p"]
     top_k = generation_config["top_k"]
