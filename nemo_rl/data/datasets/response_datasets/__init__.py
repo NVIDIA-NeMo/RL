@@ -14,6 +14,7 @@
 
 from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
+from nemo_rl.data.datasets.response_datasets.audiomcq import AudioMCQDataset
 from nemo_rl.data.datasets.response_datasets.avqa import AVQADataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.daily_omni import DailyOmniDataset
@@ -46,6 +47,7 @@ from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
 
 DATASET_REGISTRY = {
     # built-in datasets
+    "audiomcq": AudioMCQDataset,
     "avqa": AVQADataset,
     "AIME2024": AIME2024Dataset,
     "clevr-cogent": CLEVRCoGenTDataset,
@@ -96,6 +98,7 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
 
 
 __all__ = [
+    "AudioMCQDataset",
     "AVQADataset",
     "AIME2024Dataset",
     "CLEVRCoGenTDataset",

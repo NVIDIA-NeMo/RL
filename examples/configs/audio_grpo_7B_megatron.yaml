@@ -1,0 +1,108 @@
+# Audio GRPO 7B Megatron Configuration (Qwen2.5-Omni-7B + AudioMCQ)
+# Standalone audio recipe: inherits the generic math 1B Megatron defaults and
+# explicitly redeclares the audio-specific vLLM, Megatron, processor, and
+# reward settings inline rather than chaining through the 3B audio recipe.
+defaults: "grpo_math_1B_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  max_num_steps: 1000
+  val_at_start: true
+  max_val_samples: 256
+  val_batch_size: 256
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/audio_grpo_7B_megatron
+  keep_top_k: 10
+  save_period: 50
+
+policy:
+  model_name: Qwen/Qwen2.5-Omni-7B
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  generation_batch_size: 16
+  # Megatron TP>=4 requires train_micro_batch_size == logprob_batch_size
+  # to avoid the batch-variant accuracy issue. See
+  # https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+
+  sequence_packing:
+    enabled: false
+
+  generation:
+    max_new_tokens: 1024
+    vllm_cfg:
+      # Audio/multimodal models require tokenizer to be initialized before generation
+      skip_tokenizer_init: False
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.55
+      limit_mm_per_prompt:
+        audio: 1
+    vllm_kwargs:
+      # Disable mm processor cache to avoid vLLM cache eviction assertion error during validation.
+      mm_processor_cache_gb: 0
+
+  megatron_cfg:
+    converter_type: Qwen2_5OmniForConditionalGeneration
+    apply_rope_fusion: false
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-7
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-7
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+
+data:
+  num_workers: 0
+  train:
+    dataset_name: audiomcq
+    split: train
+    # Held-out validation slice is synthesized from this train manifest.
+    # The matching `validation` entry below loads the held-out partition;
+    # populate_val_dataset=false suppresses train-side auto-population so
+    # setup_response_data only sees the explicit validation entry (no
+    # duplication, no train/val leakage).
+    split_validation_size: 0.026
+    seed: 42
+    populate_val_dataset: false
+  validation:
+    dataset_name: audiomcq
+    split: validation
+    # Must match the train block to share the same partition.
+    split_validation_size: 0.026
+    seed: 42
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: "vlm_hf_data_processor"
+    env_name: "vlm"
+
+env:
+  vlm:
+    num_workers: 8
+    reward_functions:
+    - name: format
+      weight: 0.2
+    - name: exact_alnum
+      weight: 0.8
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb:
+    project: grpo-dev
+    name: audio-grpo-7b-megatron
+  swanlab:
+    project: grpo-dev
+    name: audio-grpo-7b-megatron
+
+cluster:
+  gpus_per_node: 8
