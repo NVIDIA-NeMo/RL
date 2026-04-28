@@ -200,592 +200,447 @@ def create_megatron_test_config(
     }
 
 
-@pytest.fixture(scope="function")
-def gc_collect():
-    """Helper function to force garbage collection after a test"""
-    import gc
-
-    yield
-    gc.collect()
-
-
-@pytest.fixture
-def policy_setup(request, tiny_llama_model_path):
-    """Setup and teardown for policy tests - creates a virtual cluster and policy."""
-    # Get parameters from request
-    if hasattr(request, "param") and request.param is not None:
-        num_gpus, tp, pp = request.param
-    else:
-        num_gpus, tp, pp = 2, 1, 1
-
-    policy = None
-    cluster = None
-
-    try:
-        cluster_name = f"test-megatron-init-{num_gpus}gpu-tp{tp}-pp{pp}"
-        print(
-            f"Creating virtual cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})..."
-        )
-
-        cluster = RayVirtualCluster(
-            name=cluster_name,
-            bundle_ct_per_node_list=[num_gpus],
-            use_gpus=True,
-            num_gpus_per_node=num_gpus,
-            max_colocated_worker_groups=1,
-        )
-
-        config = create_megatron_test_config(tiny_llama_model_path, tp=tp, pp=pp)
-        tokenizer = get_tokenizer(config["tokenizer"])
-        config["generation"] = configure_generation_config(
-            config["generation"], tokenizer
-        )
-
-        print("Creating Megatron Policy...")
-        policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
-
-        yield policy, cluster
-
-    finally:
-        print("Cleaning up resources for test")
-        if policy:
-            policy.shutdown()
-        if cluster:
-            cluster.shutdown()
-
-
-@pytest.fixture
-def training_setup(request):
-    """Setup and teardown specifically for training tests."""
-    # Parse parameters: (num_gpus, tp, pp, model_fixture_name, config_updates)
-    if hasattr(request, "param") and request.param is not None:
-        num_gpus, tp, pp, model_fixture_name, config_updates = request.param
-    else:
-        num_gpus, tp, pp, model_fixture_name, config_updates = (
-            2,
-            1,
-            1,
-            "tiny_llama_model_path",
-            {},
-        )
-
-    # Get the actual model path from the requested fixture
-    model_name = request.getfixturevalue(model_fixture_name)
-
-    policy = None
-    cluster = None
-    data = None
-    loss_fn = None
-
-    try:
-        cluster_name = f"test-megatron-train-{num_gpus}gpu-tp{tp}-pp{pp}"
-        if config_updates:
-            cluster_name += "-" + "-".join(
-                [f"{k}={v}" for k, v in config_updates.items()]
-            )
-
-        print(
-            f"Creating training cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})"
-        )
-
-        cluster = RayVirtualCluster(
-            name=cluster_name,
-            bundle_ct_per_node_list=[num_gpus],
-            use_gpus=True,
-            num_gpus_per_node=num_gpus,
-            max_colocated_worker_groups=1,
-        )
-
-        # Determine converter type based on model
-        converter_type = "LlamaForCausalLM"
-        if "qwen" in model_name.lower():
-            converter_type = "Qwen2ForCausalLM"
-        elif "gemma" in model_name.lower():
-            converter_type = "GemmaForCausalLM"
-
-        config = create_megatron_test_config(
-            model_name=model_name,
-            tp=tp,
-            pp=pp,
-            converter_type=converter_type,
-        )
-
-        # Apply config updates
-        if config_updates:
-            if "precision" in config_updates:
-                config["precision"] = config_updates["precision"]
-                config["megatron_cfg"]["pipeline_dtype"] = config_updates["precision"]
-                config["megatron_cfg"]["optimizer"]["bf16"] = (
-                    config_updates["precision"] == "bfloat16"
-                )
-                config["megatron_cfg"]["optimizer"]["fp16"] = (
-                    config_updates["precision"] == "float16"
-                )
-            if "activation_checkpointing" in config_updates:
-                config["megatron_cfg"]["activation_checkpointing"] = config_updates[
-                    "activation_checkpointing"
-                ]
-            if "sequence_parallel" in config_updates:
-                config["megatron_cfg"]["sequence_parallel"] = config_updates[
-                    "sequence_parallel"
-                ]
-            if "attention_backend" in config_updates:
-                config["megatron_cfg"]["attention_backend"] = config_updates[
-                    "attention_backend"
-                ]
-
-        tokenizer = get_tokenizer(config["tokenizer"])
-        config["generation"] = configure_generation_config(
-            config["generation"], tokenizer
-        )
-
-        print("Creating Megatron training Policy...")
-        policy = Policy(
-            cluster=cluster,
-            config=config,
-            tokenizer=tokenizer,
-            init_reference_model=False,
-        )
-
-        # Create a test batch
-        print("Creating test batch...")
-        torch.manual_seed(42)
-
-        # Create test input_ids and attention_mask
-        input_ids = torch.randint(0, 32000, (8, 128))  # 8 sequences, each of length 128
-        attention_mask = torch.ones(8, 128)
-        input_lengths = attention_mask.sum(dim=1).to(torch.int32)
-
-        data = BatchedDataDict(
-            {
-                "input_ids": input_ids,
-                "input_lengths": input_lengths,
-                "attention_mask": attention_mask,
-                "labels": torch.randint(0, 32000, (8, 128)),
-                "sample_mask": torch.ones(8),
-            }
-        )
-
-        # Create loss function
-        loss_fn: LossFunction = SimpleLossFn()
-
-        yield policy, cluster, data, loss_fn
-
-    except Exception as e:
-        print(f"Error during training setup: {e}")
-        pytest.skip(f"Training setup failed: {e}")
-    finally:
-        print("Cleaning up training resources")
-        if policy:
-            policy.shutdown()
-        if cluster:
-            cluster.shutdown()
-
-
 @pytest.mark.hf_gated
-@pytest.mark.timeout(300)
-@pytest.mark.parametrize(
-    "training_setup",
-    [
-        # (num_gpus, tp, pp, model_fixture_name, config_updates)
-        (2, 1, 1, "tiny_llama_model_path", {}),
-        (2, 2, 1, "tiny_llama_model_path", {}),
-        (2, 1, 1, "tiny_qwen2_model_path", {}),
-        (2, 2, 1, "tiny_qwen2_model_path", {}),
-        (2, 1, 1, "tiny_llama_model_path", {"precision": "bfloat16"}),
-        (2, 1, 1, "tiny_llama_model_path", {"activation_checkpointing": True}),
-        (2, 2, 1, "tiny_llama_model_path", {"sequence_parallel": True}),
-        (2, 2, 1, "tiny_llama_model_path", {"precision": "bfloat16", "fp8": "hybrid"}),
-        (
-            2,
-            1,
-            1,
-            "tiny_llama_model_path",
-            {"attention_backend": "flash", "precision": "bfloat16"},
-        ),
-    ],
-    indirect=True,
-    ids=[
-        "2gpu_dp2_llama",
-        "2gpu_tp2_llama",
-        "2gpu_dp2_qwen2",
-        "2gpu_tp2_qwen2",
-        "2gpu_dp2_llama_bf16",
-        "2gpu_dp2_llama_ac",
-        "2gpu_tp2_llama_sp",
-        "2gpu_tp2_llama_fp8",
-        "2gpu_dp2_llama_attention_backend_flash",
-    ],
-)
-def test_megatron_policy_training(training_setup):
-    """Test Megatron policy training with different configurations."""
+class TestMegatronTwoGPU:
+    """Parametrized tests that share a single 2-GPU Ray cluster.
 
-    def verify_loss_tensor(loss_tensor):
-        assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
-        assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
-        return loss_tensor
+    The cluster is created once per class and reused across all tests.
+    Each test creates and destroys its own Policy for isolation.
+    """
 
-    policy, cluster, data, loss_fn = training_setup
-
-    # Verify resources were created properly
-    assert policy is not None, "Training policy was not created properly"
-    assert cluster is not None, "Training cluster was not created properly"
-    assert data is not None, "Test data was not created properly"
-    assert loss_fn is not None, "Loss function was not created properly"
-
-    # Call prepare_for_training
-    print("\nPreparing for training...")
-    policy.prepare_for_training()
-
-    losses = []
-    for step in range(3):
-        results = policy.train(data, loss_fn)
-
-        # Verify results
-        assert "loss" in results, "Training results should contain 'loss'"
-        loss_tensor = results["loss"]
-        verify_loss_tensor(loss_tensor)
-        losses.append(loss_tensor[-1].item())
-
-        print(f"Training loss at step {step}: {results['loss']}")
-
-    policy.finish_training()
-
-    # Verify loss changed between iterations (model parameters were updated)
-    assert losses[0] > losses[-1], "Loss should decrease over training iterations"
-
-    if policy.flops_tracker is not None:
-        assert "total_flops" in results and isinstance(
-            results["total_flops"], (int, float)
-        ), "training backend should report total_flops"
-        assert results["total_flops"] > 0, "total_flops should be positive"
-        assert "num_ranks" in results and isinstance(results["num_ranks"], int), (
-            "training backend should report num_ranks"
-        )
-        assert results["num_ranks"] > 0, "num_ranks should be positive"
-
-        # we don't always require theoretical_tflops since the data about the GPU
-        # is not always available.
-        if "theoretical_tflops" in results:
-            assert isinstance(results["theoretical_tflops"], (int, float)), (
-                "training backend should report theoretical_tflops"
-            )
-            assert results["theoretical_tflops"] > 0, (
-                "theoretical_tflops should be positive"
-            )
-
-
-@pytest.fixture
-def generation_setup(request, tiny_llama_model_path):
-    """Setup and teardown specifically for generation tests."""
-    # Parse parameters: (num_gpus, tp, pp, generation_backend)
-    if hasattr(request, "param") and request.param is not None:
-        num_gpus, tp, pp, generation_backend = request.param
-    else:
-        num_gpus, tp, pp, generation_backend = 2, 1, 1, "megatron"
-
-    policy = None
-    cluster = None
-    data = None
-
-    try:
-        cluster_name = (
-            f"test-megatron-gen-{num_gpus}gpu-tp{tp}-pp{pp}-{generation_backend}"
-        )
-        print(
-            f"Creating generation cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp}, backend={generation_backend})"
-        )
-
+    @pytest.fixture(scope="class")
+    def two_gpu_cluster(self):
+        """Class-scoped 2-GPU virtual cluster fixture."""
+        cluster_name = "test-megatron-two-gpu"
+        print(f"Creating virtual cluster '{cluster_name}'...")
         cluster = RayVirtualCluster(
             name=cluster_name,
-            bundle_ct_per_node_list=[num_gpus],
+            bundle_ct_per_node_list=[2],
             use_gpus=True,
-            num_gpus_per_node=num_gpus,
+            num_gpus_per_node=2,
             max_colocated_worker_groups=1,
         )
+        yield cluster
+        print("Shutting down virtual cluster...")
+        cluster.shutdown()
 
-        config = create_megatron_test_config(
-            tiny_llama_model_path,
-            tp=tp,
-            pp=pp,
-            precision="bfloat16",  # FlashAttention requires fp16 or bf16
-            generation_backend=generation_backend,
-        )
+    @pytest.fixture
+    def training_setup(self, request, two_gpu_cluster):
+        """Setup and teardown specifically for training tests. Uses shared cluster."""
+        # Parse parameters: (tp, pp, model_fixture_name, config_updates)
+        if hasattr(request, "param") and request.param is not None:
+            tp, pp, model_fixture_name, config_updates = request.param
+        else:
+            tp, pp, model_fixture_name, config_updates = (
+                1,
+                1,
+                "tiny_llama_model_path",
+                {},
+            )
 
-        # Configure vLLM if using vLLM backend
-        if generation_backend == "vllm":
-            config["generation"]["vllm_cfg"] = {
-                "tensor_parallel_size": tp,
-                "gpu_memory_utilization": 0.6,
-                "max_model_len": 256,
-            }
+        model_name = request.getfixturevalue(model_fixture_name)
+        policy = None
 
-        tokenizer = get_tokenizer(config["tokenizer"])
-        config["generation"] = configure_generation_config(
-            config["generation"], tokenizer
-        )
+        try:
+            converter_type = "LlamaForCausalLM"
+            if "qwen" in model_name.lower():
+                converter_type = "Qwen2ForCausalLM"
+            elif "gemma" in model_name.lower():
+                converter_type = "GemmaForCausalLM"
 
-        print("Creating Megatron generation Policy...")
-        policy = Policy(
-            cluster=cluster,
-            config=config,
-            tokenizer=tokenizer,
-            init_reference_model=False,
-        )
+            config = create_megatron_test_config(
+                model_name=model_name,
+                tp=tp,
+                pp=pp,
+                converter_type=converter_type,
+            )
 
-        # Create test data
-        print("Creating test batch...")
-        torch.manual_seed(42)
+            if config_updates:
+                if "precision" in config_updates:
+                    config["precision"] = config_updates["precision"]
+                    config["megatron_cfg"]["pipeline_dtype"] = config_updates[
+                        "precision"
+                    ]
+                    config["megatron_cfg"]["optimizer"]["bf16"] = (
+                        config_updates["precision"] == "bfloat16"
+                    )
+                    config["megatron_cfg"]["optimizer"]["fp16"] = (
+                        config_updates["precision"] == "float16"
+                    )
+                if "activation_checkpointing" in config_updates:
+                    config["megatron_cfg"]["activation_checkpointing"] = (
+                        config_updates["activation_checkpointing"]
+                    )
+                if "sequence_parallel" in config_updates:
+                    config["megatron_cfg"]["sequence_parallel"] = config_updates[
+                        "sequence_parallel"
+                    ]
+                if "attention_backend" in config_updates:
+                    config["megatron_cfg"]["attention_backend"] = config_updates[
+                        "attention_backend"
+                    ]
 
-        prompts = [
-            "Hello, how are you?",
-            "The capital of France is",
-            "Write a short story about",
-            "Explain quantum physics in simple terms:",
-        ]
+            tokenizer = get_tokenizer(config["tokenizer"])
+            config["generation"] = configure_generation_config(
+                config["generation"], tokenizer
+            )
 
-        tokenized = tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            max_length=64,
-            return_tensors="pt",
-            padding_side="right",
-        )
+            print("Creating Megatron training Policy...")
+            policy = Policy(
+                cluster=two_gpu_cluster,
+                config=config,
+                tokenizer=tokenizer,
+                init_reference_model=False,
+            )
 
-        input_lengths = tokenized["attention_mask"].sum(dim=1).to(torch.int32)
+            torch.manual_seed(42)
+            input_ids = torch.randint(
+                0, 32000, (8, 128)
+            )  # 8 sequences, each of length 128
+            attention_mask = torch.ones(8, 128)
+            input_lengths = attention_mask.sum(dim=1).to(torch.int32)
 
-        data = BatchedDataDict(
-            {
-                "input_ids": tokenized["input_ids"],
-                "input_lengths": input_lengths,
-            }
-        )
+            data = BatchedDataDict(
+                {
+                    "input_ids": input_ids,
+                    "input_lengths": input_lengths,
+                    "attention_mask": attention_mask,
+                    "labels": torch.randint(0, 32000, (8, 128)),
+                    "sample_mask": torch.ones(8),
+                }
+            )
 
-        yield policy, cluster, data, prompts
+            loss_fn: LossFunction = SimpleLossFn()
 
-    except Exception as e:
-        print(f"Error during generation setup: {e}")
-        pytest.skip(f"Generation setup failed: {e}")
-    finally:
-        print("Cleaning up generation resources")
-        if policy:
-            policy.shutdown()
-        if cluster:
-            cluster.shutdown()
+            yield policy, data, loss_fn
 
+        except Exception as e:
+            print(f"Error during training setup: {e}")
+            pytest.skip(f"Training setup failed: {e}")
+        finally:
+            if policy:
+                policy.shutdown()
 
-@pytest.mark.timeout(240)
-@pytest.mark.parametrize(
-    "generation_setup",
-    [
-        # (num_gpus, tp, pp, generation_backend)
-        (2, 1, 1, "megatron"),
-        (2, 2, 1, "megatron"),
-    ],
-    indirect=True,
-    ids=["2gpu_dp2_megatron", "2gpu_tp2_megatron"],
-)
-def test_megatron_policy_generation(generation_setup):
-    """Test Megatron policy generation with different backends."""
-    policy, cluster, data, prompts = generation_setup
+    @pytest.fixture
+    def generation_setup(self, request, two_gpu_cluster, tiny_llama_model_path):
+        """Setup and teardown specifically for generation tests. Uses shared cluster."""
+        if hasattr(request, "param") and request.param is not None:
+            tp, pp, generation_backend = request.param
+        else:
+            tp, pp, generation_backend = 1, 1, "megatron"
 
-    # Verify resources were created properly
-    assert policy is not None, "Generation policy was not created properly"
-    assert cluster is not None, "Generation cluster was not created properly"
-    assert data is not None, "Test data was not created properly"
+        policy = None
 
-    # Call prepare_for_generation
-    print("Preparing for generation...")
-    policy.prepare_for_generation()
+        try:
+            config = create_megatron_test_config(
+                tiny_llama_model_path,
+                tp=tp,
+                pp=pp,
+                precision="bfloat16",
+                generation_backend=generation_backend,
+            )
 
-    # Generate text
-    print("Generating text...")
-    results = policy.generate(data, greedy=True)
+            if generation_backend == "vllm":
+                config["generation"]["vllm_cfg"] = {
+                    "tensor_parallel_size": tp,
+                    "gpu_memory_utilization": 0.6,
+                    "max_model_len": 256,
+                }
 
-    # Verify results
-    assert "output_ids" in results, "Generation results should contain 'output_ids'"
-    output_ids = results["output_ids"]
+            tokenizer = get_tokenizer(config["tokenizer"])
+            config["generation"] = configure_generation_config(
+                config["generation"], tokenizer
+            )
 
-    # Basic validation of output shape and content
-    assert isinstance(output_ids, torch.Tensor), "Output should be a tensor"
-    assert output_ids.dim() == 2, (
-        "Output should be 2-dimensional [batch_size, seq_length]"
+            print("Creating Megatron generation Policy...")
+            policy = Policy(
+                cluster=two_gpu_cluster,
+                config=config,
+                tokenizer=tokenizer,
+                init_reference_model=False,
+            )
+
+            torch.manual_seed(42)
+            prompts = [
+                "Hello, how are you?",
+                "The capital of France is",
+                "Write a short story about",
+                "Explain quantum physics in simple terms:",
+            ]
+            tokenized = tokenizer(
+                prompts,
+                padding=True,
+                truncation=True,
+                max_length=64,
+                return_tensors="pt",
+                padding_side="right",
+            )
+            input_lengths = tokenized["attention_mask"].sum(dim=1).to(torch.int32)
+            data = BatchedDataDict(
+                {
+                    "input_ids": tokenized["input_ids"],
+                    "input_lengths": input_lengths,
+                }
+            )
+
+            yield policy, data, prompts
+
+        except Exception as e:
+            print(f"Error during generation setup: {e}")
+            pytest.skip(f"Generation setup failed: {e}")
+        finally:
+            if policy:
+                policy.shutdown()
+
+    @pytest.fixture
+    def logprob_setup(self, request, two_gpu_cluster):
+        """Setup and teardown specifically for logprob tests. Uses shared cluster."""
+        if hasattr(request, "param") and request.param is not None:
+            (
+                tp,
+                pp,
+                logprob_chunk_size,
+                defer_fp32_logits,
+                model_fixture_name,
+            ) = request.param
+        else:
+            (
+                tp,
+                pp,
+                logprob_chunk_size,
+                defer_fp32_logits,
+                model_fixture_name,
+            ) = (1, 1, None, None, "tiny_llama_model_path")
+
+        model_name = request.getfixturevalue(model_fixture_name)
+        policy = None
+
+        try:
+            converter_type = "LlamaForCausalLM"
+            if "qwen" in model_name.lower():
+                converter_type = "Qwen2ForCausalLM"
+            elif "gemma" in model_name.lower():
+                converter_type = "GemmaForCausalLM"
+
+            config = create_megatron_test_config(
+                model_name=model_name,
+                tp=tp,
+                pp=pp,
+                converter_type=converter_type,
+                logprob_chunk_size=logprob_chunk_size,
+                defer_fp32_logits=defer_fp32_logits,
+            )
+            tokenizer = get_tokenizer(config["tokenizer"])
+            config["generation"] = configure_generation_config(
+                config["generation"], tokenizer
+            )
+
+            print("Creating Megatron logprob Policy...")
+            policy = Policy(
+                cluster=two_gpu_cluster,
+                config=config,
+                tokenizer=tokenizer,
+                init_reference_model=False,
+            )
+
+            torch.manual_seed(66)
+            input_ids = torch.randint(
+                0, 32000, (4, 64)
+            )  # 4 sequences, each of length 64
+            attention_mask = torch.ones(4, 64)
+            input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+            data = BatchedDataDict(
+                {
+                    "input_ids": input_ids,
+                    "input_lengths": input_lengths,
+                    "attention_mask": attention_mask,
+                }
+            )
+
+            yield policy, data
+
+        except Exception as e:
+            print(f"Error during logprob setup: {e}")
+            pytest.skip(f"Logprob setup failed: {e}")
+        finally:
+            if policy:
+                policy.shutdown()
+
+    # --- Parametrized test methods ---
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize(
+        "training_setup",
+        [
+            # (tp, pp, model_fixture_name, config_updates)
+            # Qwen2 variants removed — converter path is covered by functional tests
+            # (grpo_megatron.sh, dpo_megatron.sh, sft_megatron.sh)
+            (1, 1, "tiny_llama_model_path", {}),
+            (2, 1, "tiny_llama_model_path", {}),
+            (1, 1, "tiny_llama_model_path", {"precision": "bfloat16"}),
+            (1, 1, "tiny_llama_model_path", {"activation_checkpointing": True}),
+            (2, 1, "tiny_llama_model_path", {"sequence_parallel": True}),
+            (2, 1, "tiny_llama_model_path", {"precision": "bfloat16", "fp8": "hybrid"}),
+            (
+                1,
+                1,
+                "tiny_llama_model_path",
+                {"attention_backend": "flash", "precision": "bfloat16"},
+            ),
+        ],
+        indirect=True,
+        ids=[
+            "2gpu_dp2_llama",
+            "2gpu_tp2_llama",
+            "2gpu_dp2_llama_bf16",
+            "2gpu_dp2_llama_ac",
+            "2gpu_tp2_llama_sp",
+            "2gpu_tp2_llama_fp8",
+            "2gpu_dp2_llama_attention_backend_flash",
+        ],
     )
-    assert output_ids.size(0) == data.get("input_ids").size(0), (
-        "Output batch size should match input"
+    def test_megatron_policy_training(self, training_setup):
+        """Test Megatron policy training with different configurations."""
+
+        def verify_loss_tensor(loss_tensor):
+            assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
+            assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
+            return loss_tensor
+
+        policy, data, loss_fn = training_setup
+
+        assert policy is not None, "Training policy was not created properly"
+        assert data is not None, "Test data was not created properly"
+        assert loss_fn is not None, "Loss function was not created properly"
+
+        print("\nPreparing for training...")
+        policy.prepare_for_training()
+
+        losses = []
+        for step in range(3):
+            results = policy.train(data, loss_fn)
+
+            assert "loss" in results, "Training results should contain 'loss'"
+            loss_tensor = results["loss"]
+            verify_loss_tensor(loss_tensor)
+            losses.append(loss_tensor[-1].item())
+
+            print(f"Training loss at step {step}: {results['loss']}")
+
+        policy.finish_training()
+
+        assert losses[0] > losses[-1], "Loss should decrease over training iterations"
+
+        if policy.flops_tracker is not None:
+            assert "total_flops" in results and isinstance(
+                results["total_flops"], (int, float)
+            ), "training backend should report total_flops"
+            assert results["total_flops"] > 0, "total_flops should be positive"
+            assert "num_ranks" in results and isinstance(
+                results["num_ranks"], int
+            ), "training backend should report num_ranks"
+            assert results["num_ranks"] > 0, "num_ranks should be positive"
+
+            if "theoretical_tflops" in results:
+                assert isinstance(results["theoretical_tflops"], (int, float)), (
+                    "training backend should report theoretical_tflops"
+                )
+                assert results["theoretical_tflops"] > 0, (
+                    "theoretical_tflops should be positive"
+                )
+
+    @pytest.mark.timeout(240)
+    @pytest.mark.parametrize(
+        "generation_setup",
+        [
+            # (tp, pp, generation_backend)
+            (1, 1, "megatron"),
+            (2, 1, "megatron"),
+        ],
+        indirect=True,
+        ids=["2gpu_dp2_megatron", "2gpu_tp2_megatron"],
     )
-    assert output_ids.size(1) > data.get("input_ids").size(1), (
-        "Output should be longer than input"
+    def test_megatron_policy_generation(self, generation_setup):
+        """Test Megatron policy generation with different backends."""
+        policy, data, prompts = generation_setup
+
+        assert policy is not None, "Generation policy was not created properly"
+        assert data is not None, "Test data was not created properly"
+
+        print("Preparing for generation...")
+        policy.prepare_for_generation()
+
+        print("Generating text...")
+        results = policy.generate(data, greedy=True)
+
+        assert "output_ids" in results, "Generation results should contain 'output_ids'"
+        output_ids = results["output_ids"]
+
+        assert isinstance(output_ids, torch.Tensor), "Output should be a tensor"
+        assert output_ids.dim() == 2, (
+            "Output should be 2-dimensional [batch_size, seq_length]"
+        )
+        assert output_ids.size(0) == data.get("input_ids").size(0), (
+            "Output batch size should match input"
+        )
+        assert output_ids.size(1) > data.get("input_ids").size(1), (
+            "Output should be longer than input"
+        )
+
+        print("Finishing generation...")
+        policy.finish_generation()
+
+    @pytest.mark.timeout(180)
+    @pytest.mark.parametrize(
+        "logprob_setup",
+        [
+            # (tp, pp, chunk sz, defer fp32, model_fixture_name)
+            # Qwen2 variants removed — converter path is covered by functional tests
+            (1, 1, None, None, "tiny_llama_model_path"),
+            (2, 1, None, None, "tiny_llama_model_path"),
+            (1, 1, None, True, "tiny_llama_model_path"),
+            (2, 1, None, True, "tiny_llama_model_path"),
+            (1, 1, 16, True, "tiny_llama_model_path"),
+            (2, 1, 16, True, "tiny_llama_model_path"),
+        ],
+        indirect=True,
+        ids=[
+            "2gpu_dp2_llama",
+            "2gpu_tp2_llama",
+            "2gpu_dp2_deferfp32_llama",
+            "2gpu_tp2_deferfp32_llama",
+            "2gpu_dp2_chunked_deferfp32_llama",
+            "2gpu_tp2_chunked_deferfp32_llama",
+        ],
     )
+    def test_megatron_policy_logprobs(self, logprob_setup):
+        """Test Megatron policy logprob computation."""
+        policy, data = logprob_setup
 
-    # Call finish_generation
-    print("Finishing generation...")
-    policy.finish_generation()
+        assert policy is not None, "Policy was not created properly"
+        assert data is not None, "Test data was not created properly"
 
+        print("\nGenerating logprobs...")
+        policy.prepare_for_lp_inference()
+        policy_logprobs = policy.get_logprobs(data)["logprobs"]
 
-@pytest.fixture
-def logprob_setup(request):
-    """Setup and teardown specifically for logprob tests."""
-    # Parse parameters: (num_gpus, tp, pp, model_fixture_name)
-    if hasattr(request, "param") and request.param is not None:
-        (
-            num_gpus,
-            tp,
-            pp,
-            logprob_chunk_size,
-            defer_fp32_logits,
-            model_fixture_name,
-        ) = request.param
-    else:
-        (
-            num_gpus,
-            tp,
-            pp,
-            logprob_chunk_size,
-            defer_fp32_logits,
-            model_fixture_name,
-        ) = (2, 1, 1, None, None, "tiny_llama_model_path")
-
-    # Get the actual model path from the requested fixture
-    model_name = request.getfixturevalue(model_fixture_name)
-
-    policy = None
-    cluster = None
-    data = None
-
-    try:
-        cluster_name = f"test-megatron-logprob-{num_gpus}gpu-tp{tp}-pp{pp}"
-        print(
-            f"Creating logprob cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})"
+        assert isinstance(policy_logprobs, torch.Tensor), "Logprobs should be a tensor"
+        assert policy_logprobs.dtype == torch.float32
+        assert policy_logprobs.shape == data.get("input_ids").shape, (
+            f"Logprobs shape {policy_logprobs.shape} should match input shape {data.get('input_ids').shape}"
         )
 
-        cluster = RayVirtualCluster(
-            name=cluster_name,
-            bundle_ct_per_node_list=[num_gpus],
-            use_gpus=True,
-            num_gpus_per_node=num_gpus,
-            max_colocated_worker_groups=1,
+        assert torch.all(
+            policy_logprobs[:, 0] == 0
+        ), "First token logprobs should be zero"
+
+        assert not torch.isnan(policy_logprobs).any(), (
+            "Logprobs should not contain NaN"
         )
-
-        # Determine converter type based on model
-        converter_type = "LlamaForCausalLM"
-        if "qwen" in model_name.lower():
-            converter_type = "Qwen2ForCausalLM"
-        elif "gemma" in model_name.lower():
-            converter_type = "GemmaForCausalLM"
-
-        config = create_megatron_test_config(
-            model_name=model_name,
-            tp=tp,
-            pp=pp,
-            converter_type=converter_type,
-            logprob_chunk_size=logprob_chunk_size,
-            defer_fp32_logits=defer_fp32_logits,
+        assert not torch.isinf(policy_logprobs).any(), (
+            "Logprobs should not contain Inf"
         )
-        tokenizer = get_tokenizer(config["tokenizer"])
-        config["generation"] = configure_generation_config(
-            config["generation"], tokenizer
-        )
-
-        print("Creating Megatron logprob Policy...")
-        policy = Policy(
-            cluster=cluster,
-            config=config,
-            tokenizer=tokenizer,
-            init_reference_model=False,
-        )
-
-        # Create test data
-        print("Creating test batch...")
-        torch.manual_seed(66)
-
-        input_ids = torch.randint(0, 32000, (4, 64))  # 4 sequences, each of length 64
-        attention_mask = torch.ones(4, 64)
-        input_lengths = attention_mask.sum(dim=1).to(torch.int32)
-
-        data = BatchedDataDict(
-            {
-                "input_ids": input_ids,
-                "input_lengths": input_lengths,
-                "attention_mask": attention_mask,
-            }
-        )
-
-        yield policy, cluster, data
-
-    except Exception as e:
-        print(f"Error during logprob setup: {e}")
-        pytest.skip(f"Logprob setup failed: {e}")
-    finally:
-        print("Cleaning up logprob resources")
-        if policy:
-            policy.shutdown()
-        if cluster:
-            cluster.shutdown()
-
-
-@pytest.mark.timeout(180)
-@pytest.mark.hf_gated
-@pytest.mark.parametrize(
-    "logprob_setup",
-    [
-        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name)
-        (2, 1, 1, None, None, "tiny_llama_model_path"),
-        (2, 2, 1, None, None, "tiny_llama_model_path"),
-        (2, 1, 1, None, None, "tiny_qwen2_model_path"),
-        (2, 2, 1, None, None, "tiny_qwen2_model_path"),
-        (2, 1, 1, None, True, "tiny_llama_model_path"),
-        (2, 2, 1, None, True, "tiny_llama_model_path"),
-        (2, 1, 1, None, True, "tiny_qwen2_model_path"),
-        (2, 2, 1, None, True, "tiny_qwen2_model_path"),
-        (2, 1, 1, 16, True, "tiny_llama_model_path"),
-        (2, 2, 1, 16, True, "tiny_llama_model_path"),
-        (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
-        (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
-    ],
-    indirect=True,
-    ids=[
-        "2gpu_dp2_llama",
-        "2gpu_tp2_llama",
-        "2gpu_dp2_qwen2",
-        "2gpu_tp2_qwen2",
-        "2gpu_dp2_deferfp32_llama",
-        "2gpu_tp2_deferfp32_llama",
-        "2gpu_dp2_deferfp32_qwen2",
-        "2gpu_tp2_deferfp32_qwen2",
-        "2gpu_dp2_chunked_deferfp32_llama",
-        "2gpu_tp2_chunked_deferfp32_llama",
-        "2gpu_dp2_chunked_deferfp32_qwen2",
-        "2gpu_tp2_chunked_deferfp32_qwen2",
-    ],
-)
-def test_megatron_policy_logprobs(logprob_setup):
-    """Test Megatron policy logprob computation."""
-    policy, cluster, data = logprob_setup
-
-    # Verify resources were created properly
-    assert policy is not None, "Policy was not created properly"
-    assert data is not None, "Test data was not created properly"
-
-    # Generate logprobs
-    print("\nGenerating logprobs...")
-    policy.prepare_for_lp_inference()
-    policy_logprobs = policy.get_logprobs(data)["logprobs"]
-
-    # Basic validation
-    assert isinstance(policy_logprobs, torch.Tensor), "Logprobs should be a tensor"
-    assert policy_logprobs.dtype == torch.float32
-    assert policy_logprobs.shape == data.get("input_ids").shape, (
-        f"Logprobs shape {policy_logprobs.shape} should match input shape {data.get('input_ids').shape}"
-    )
-
-    # Check that first token logprobs are zero (by convention)
-    assert torch.all(policy_logprobs[:, 0] == 0), "First token logprobs should be zero"
-
-    # Check that logprobs are reasonable values (not NaN or inf)
-    assert not torch.isnan(policy_logprobs).any(), "Logprobs should not contain NaN"
-    assert not torch.isinf(policy_logprobs).any(), "Logprobs should not contain Inf"
 
 
 @pytest.mark.timeout(240)
@@ -1478,195 +1333,157 @@ def test_megatron_dpo_training(tiny_llama_model_path):
         cluster.shutdown()
 
 
-@pytest.fixture
-def topk_setup(request):
-    """Setup and teardown specifically for top-k logits tests."""
-    # Parse parameters: (num_gpus, tp, pp, logprob_chunk_size, defer_fp32_logits, model_fixture_name)
-    if hasattr(request, "param") and request.param is not None:
-        (
-            num_gpus,
-            tp,
-            pp,
-            logprob_chunk_size,
-            defer_fp32_logits,
-            model_fixture_name,
-        ) = request.param
-    else:
-        (
-            num_gpus,
-            tp,
-            pp,
-            logprob_chunk_size,
-            defer_fp32_logits,
-            model_fixture_name,
-        ) = (2, 1, 1, None, None, "tiny_llama_model_path")
+    @pytest.fixture
+    def topk_setup(self, request, two_gpu_cluster):
+        """Setup and teardown specifically for top-k logits tests. Uses shared cluster."""
+        if hasattr(request, "param") and request.param is not None:
+            (
+                tp,
+                pp,
+                logprob_chunk_size,
+                defer_fp32_logits,
+                model_fixture_name,
+            ) = request.param
+        else:
+            (
+                tp,
+                pp,
+                logprob_chunk_size,
+                defer_fp32_logits,
+                model_fixture_name,
+            ) = (1, 1, None, None, "tiny_llama_model_path")
 
-    # Get the actual model path from the requested fixture
-    model_name = request.getfixturevalue(model_fixture_name)
+        model_name = request.getfixturevalue(model_fixture_name)
+        policy = None
 
-    policy = None
-    cluster = None
-    data = None
+        try:
+            converter_type = "LlamaForCausalLM"
+            if "qwen" in model_name.lower():
+                converter_type = "Qwen2ForCausalLM"
+            elif "gemma" in model_name.lower():
+                converter_type = "GemmaForCausalLM"
 
-    try:
-        cluster_name = f"test-megatron-topk-{num_gpus}gpu-tp{tp}-pp{pp}"
-        print(
-            f"Creating topk cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})"
-        )
+            config = create_megatron_test_config(
+                model_name=model_name,
+                tp=tp,
+                pp=pp,
+                converter_type=converter_type,
+                logprob_chunk_size=logprob_chunk_size,
+                defer_fp32_logits=defer_fp32_logits,
+            )
+            tokenizer = get_tokenizer(config["tokenizer"])
+            config["generation"] = configure_generation_config(
+                config["generation"], tokenizer
+            )
 
-        cluster = RayVirtualCluster(
-            name=cluster_name,
-            bundle_ct_per_node_list=[num_gpus],
-            use_gpus=True,
-            num_gpus_per_node=num_gpus,
-            max_colocated_worker_groups=1,
-        )
+            print("Creating Megatron topk Policy...")
+            policy = Policy(
+                cluster=two_gpu_cluster,
+                config=config,
+                tokenizer=tokenizer,
+                init_reference_model=False,
+            )
 
-        # Determine converter type based on model
-        converter_type = "LlamaForCausalLM"
-        if "qwen" in model_name.lower():
-            converter_type = "Qwen2ForCausalLM"
-        elif "gemma" in model_name.lower():
-            converter_type = "GemmaForCausalLM"
+            torch.manual_seed(77)
+            input_ids = torch.randint(
+                0, 32000, (4, 64)
+            )  # 4 sequences, each of length 64
+            attention_mask = torch.ones(4, 64)
+            input_lengths = attention_mask.sum(dim=1).to(torch.int32)
 
-        config = create_megatron_test_config(
-            model_name=model_name,
-            tp=tp,
-            pp=pp,
-            converter_type=converter_type,
-            logprob_chunk_size=logprob_chunk_size,
-            defer_fp32_logits=defer_fp32_logits,
-        )
-        tokenizer = get_tokenizer(config["tokenizer"])
-        config["generation"] = configure_generation_config(
-            config["generation"], tokenizer
-        )
+            data = BatchedDataDict(
+                {
+                    "input_ids": input_ids,
+                    "input_lengths": input_lengths,
+                    "attention_mask": attention_mask,
+                }
+            )
 
-        print("Creating Megatron topk Policy...")
-        policy = Policy(
-            cluster=cluster,
-            config=config,
-            tokenizer=tokenizer,
-            init_reference_model=False,
-        )
+            yield policy, data
 
-        # Create test data
-        print("Creating test batch...")
-        torch.manual_seed(77)
+        except Exception as e:
+            print(f"Error during topk setup: {e}")
+            pytest.skip(f"Topk setup failed: {e}")
+        finally:
+            if policy:
+                policy.shutdown()
 
-        input_ids = torch.randint(0, 32000, (4, 64))  # 4 sequences, each of length 64
-        attention_mask = torch.ones(4, 64)
-        input_lengths = attention_mask.sum(dim=1).to(torch.int32)
-
-        data = BatchedDataDict(
-            {
-                "input_ids": input_ids,
-                "input_lengths": input_lengths,
-                "attention_mask": attention_mask,
-            }
-        )
-
-        yield policy, cluster, data
-
-    except Exception as e:
-        print(f"Error during topk setup: {e}")
-        pytest.skip(f"Topk setup failed: {e}")
-    finally:
-        print("Cleaning up topk resources")
-        if policy:
-            policy.shutdown()
-        if cluster:
-            cluster.shutdown()
-
-
-@pytest.mark.timeout(180)
-@pytest.mark.hf_gated
-@pytest.mark.parametrize(
-    "topk_setup",
-    [
-        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name)
-        (2, 1, 1, None, None, "tiny_llama_model_path"),
-        (2, 2, 1, None, None, "tiny_llama_model_path"),
-        (2, 1, 1, None, None, "tiny_qwen2_model_path"),
-        (2, 2, 1, None, None, "tiny_qwen2_model_path"),
-        (2, 1, 1, None, True, "tiny_llama_model_path"),
-        (2, 2, 1, None, True, "tiny_llama_model_path"),
-        (2, 1, 1, None, True, "tiny_qwen2_model_path"),
-        (2, 2, 1, None, True, "tiny_qwen2_model_path"),
-        (2, 1, 1, 16, True, "tiny_llama_model_path"),
-        (2, 2, 1, 16, True, "tiny_llama_model_path"),
-        (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
-        (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
-    ],
-    indirect=True,
-    ids=[
-        "2gpu_dp2_llama",
-        "2gpu_tp2_llama",
-        "2gpu_dp2_qwen2",
-        "2gpu_tp2_qwen2",
-        "2gpu_dp2_deferfp32_llama",
-        "2gpu_tp2_deferfp32_llama",
-        "2gpu_dp2_deferfp32_qwen2",
-        "2gpu_tp2_deferfp32_qwen2",
-        "2gpu_dp2_chunked_deferfp32_llama",
-        "2gpu_tp2_chunked_deferfp32_llama",
-        "2gpu_dp2_chunked_deferfp32_qwen2",
-        "2gpu_tp2_chunked_deferfp32_qwen2",
-    ],
-)
-def test_megatron_policy_topk_logits(topk_setup):
-    """Test Megatron policy top-k logits computation."""
-    policy, cluster, data = topk_setup
-
-    # Verify resources were created properly
-    assert policy is not None, "Policy was not created properly"
-    assert data is not None, "Test data was not created properly"
-
-    # Generate top-k logits
-    print("\nGenerating top-k logits...")
-    policy.prepare_for_lp_inference()
-    k = 5
-    outputs = policy.get_topk_logits(data, k=k)
-
-    # Basic validation
-    assert "topk_logits" in outputs and "topk_indices" in outputs, (
-        "Top-k outputs should contain both 'topk_logits' and 'topk_indices'"
+    @pytest.mark.timeout(180)
+    @pytest.mark.parametrize(
+        "topk_setup",
+        [
+            # (tp, pp, chunk sz, defer fp32, model_fixture_name)
+            # Qwen2 variants removed — converter path is covered by functional tests
+            (1, 1, None, None, "tiny_llama_model_path"),
+            (2, 1, None, None, "tiny_llama_model_path"),
+            (1, 1, None, True, "tiny_llama_model_path"),
+            (2, 1, None, True, "tiny_llama_model_path"),
+            (1, 1, 16, True, "tiny_llama_model_path"),
+            (2, 1, 16, True, "tiny_llama_model_path"),
+        ],
+        indirect=True,
+        ids=[
+            "2gpu_dp2_llama",
+            "2gpu_tp2_llama",
+            "2gpu_dp2_deferfp32_llama",
+            "2gpu_tp2_deferfp32_llama",
+            "2gpu_dp2_chunked_deferfp32_llama",
+            "2gpu_tp2_chunked_deferfp32_llama",
+        ],
     )
-    topk_logits = outputs["topk_logits"]
-    topk_indices = outputs["topk_indices"]
+    def test_megatron_policy_topk_logits(self, topk_setup):
+        """Test Megatron policy top-k logits computation."""
+        policy, data = topk_setup
 
-    assert isinstance(topk_logits, torch.Tensor)
-    assert isinstance(topk_indices, torch.Tensor)
-    assert topk_logits.dtype == torch.float32
-    assert topk_indices.dtype in (torch.int32, torch.int64, torch.long)
+        assert policy is not None, "Policy was not created properly"
+        assert data is not None, "Test data was not created properly"
 
-    # Shape checks
-    B, S = data.get("input_ids").shape
-    assert topk_logits.shape == (B, S, k)
-    assert topk_indices.shape == (B, S, k)
+        print("\nGenerating top-k logits...")
+        policy.prepare_for_lp_inference()
+        k = 5
+        outputs = policy.get_topk_logits(data, k=k)
 
-    # Mask invalid positions and check for NaN/Inf
-    valid_mask = (
-        data.get("attention_mask")
-        .unsqueeze(-1)
-        .bool()
-        .expand(-1, -1, topk_logits.shape[-1])
-    )
-    valid_logits = topk_logits[valid_mask]
-    assert not torch.isnan(valid_logits).any(), "Top-k logits should not contain NaN"
-    assert not torch.isinf(valid_logits).any(), "Top-k logits should not contain Inf"
+        assert "topk_logits" in outputs and "topk_indices" in outputs, (
+            "Top-k outputs should contain both 'topk_logits' and 'topk_indices'"
+        )
+        topk_logits = outputs["topk_logits"]
+        topk_indices = outputs["topk_indices"]
 
-    # Check descending order within top-k for valid positions
-    if S > 1:
-        diffs = topk_logits[..., :-1] - topk_logits[..., 1:]
-        valid_mask_diffs = (
+        assert isinstance(topk_logits, torch.Tensor)
+        assert isinstance(topk_indices, torch.Tensor)
+        assert topk_logits.dtype == torch.float32
+        assert topk_indices.dtype in (torch.int32, torch.int64, torch.long)
+
+        B, S = data.get("input_ids").shape
+        assert topk_logits.shape == (B, S, k)
+        assert topk_indices.shape == (B, S, k)
+
+        valid_mask = (
             data.get("attention_mask")
             .unsqueeze(-1)
             .bool()
-            .expand(-1, -1, topk_logits.shape[-1] - 1)
+            .expand(-1, -1, topk_logits.shape[-1])
         )
-        diffs = diffs[valid_mask_diffs]
-        assert (diffs >= -1e-6).all(), "Top-k logits should be non-increasing across k"
+        valid_logits = topk_logits[valid_mask]
+        assert not torch.isnan(valid_logits).any(), (
+            "Top-k logits should not contain NaN"
+        )
+        assert not torch.isinf(valid_logits).any(), (
+            "Top-k logits should not contain Inf"
+        )
+
+        if S > 1:
+            diffs = topk_logits[..., :-1] - topk_logits[..., 1:]
+            valid_mask_diffs = (
+                data.get("attention_mask")
+                .unsqueeze(-1)
+                .bool()
+                .expand(-1, -1, topk_logits.shape[-1] - 1)
+            )
+            diffs = diffs[valid_mask_diffs]
+            assert (diffs >= -1e-6).all(), (
+                "Top-k logits should be non-increasing across k"
+            )
 
 
 @pytest.mark.hf_gated

@@ -13,65 +13,21 @@
 # limitations under the License.
 
 #!/bin/bash
-set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
+# Shard: Catch-all for everything not in other shards
+# Covers: experience (base), utils, tools, evals, rewards, root-level tests
+# Extra-marked tests are picked up by their respective shards (Mcore, Automodel, etc.)
 
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-PROJECT_ROOT=$(realpath ${SCRIPT_DIR}/../..)
+source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
-cd ${PROJECT_ROOT}
+IGNORE=(
+    "--ignore=unit/models/"
+    "--ignore=unit/environments/"
+    "--ignore=unit/algorithms/"
+    "--ignore=unit/data/"
+    "--ignore=unit/distributed/"
+)
 
-# Source exclusion list for FAST mode
-EXCLUDED_UNIT_TESTS=()
-if [[ "${FAST:-0}" == "1" ]]; then
-    source ${SCRIPT_DIR}/excluded_unit_tests.sh
-fi
-
-uv run tests/unit/prepare_unit_test_assets.py
-
-TEST_PATHS=("unit/")
-IGNORE=("--ignore=unit/models/generation/" "--ignore=unit/models/policy/")
-
-uv run --no-sync bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
-
-# Check and run mcore tests
-exit_code=$(cd ${PROJECT_ROOT}/tests && uv run --extra mcore pytest "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --collect-only --hf-gated --mcore-only -q >/dev/null 2>&1; echo $?)
-if [[ $exit_code -eq 5 ]]; then
-    echo "No mcore tests to run"
-else
-    uv run --extra mcore bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --mcore-only
-fi
-
-# Check and run automodel tests
-exit_code=$(cd ${PROJECT_ROOT}/tests && uv run --extra automodel pytest "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --collect-only --hf-gated --automodel-only -q >/dev/null 2>&1; echo $?)
-if [[ $exit_code -eq 5 ]]; then
-    echo "No automodel tests to run"
-else
-    uv run --extra automodel bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --automodel-only
-fi
-
-# Check and run vllm tests
-exit_code=$(cd ${PROJECT_ROOT}/tests && uv run --extra vllm pytest "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --collect-only --hf-gated --vllm-only -q >/dev/null 2>&1; echo $?)
-if [[ $exit_code -eq 5 ]]; then
-    echo "No vllm tests to run"
-else
-    uv run --extra vllm bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --vllm-only
-fi
-
-# Check and run sglang tests
-exit_code=$(cd ${PROJECT_ROOT}/tests && uv run --extra sglang pytest "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --collect-only --hf-gated --sglang-only -q >/dev/null 2>&1; echo $?)
-if [[ $exit_code -eq 5 ]]; then
-    echo "No sglang tests to run"
-else
-    uv run --extra sglang bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --sglang-only
-fi
-
-# Check and run nemo_gym tests
-exit_code=$(cd ${PROJECT_ROOT}/tests && uv run --extra nemo_gym pytest "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --collect-only --nemo-gym-only -q >/dev/null 2>&1; echo $?)
-if [[ $exit_code -eq 5 ]]; then
-    echo "No nemo_gym tests to run"
-else
-    uv run --extra nemo_gym bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --nemo-gym-only -vv
-fi
+uv run --no-sync bash -x ./tests/run_unit.sh "unit/" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
 
 # Skip research tests in fast mode
 if [[ "${FAST:-0}" != "1" ]]; then

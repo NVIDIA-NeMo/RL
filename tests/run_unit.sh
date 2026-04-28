@@ -40,7 +40,11 @@ else
     pytest_args="$@"
 fi
 
-if ! pytest $pytest_args; then
+pytest $pytest_args
+exit_code=$?
+if [[ $exit_code -eq 5 ]]; then
+    echo "No tests collected — skipping."
+elif [[ $exit_code -ne 0 ]]; then
     echo "[ERROR]: Unit tests failed."
     exit 1
 fi
