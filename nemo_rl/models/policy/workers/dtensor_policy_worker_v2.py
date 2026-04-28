@@ -1054,6 +1054,12 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
 
+    def set_learning_rate(self, learning_rate: float) -> None:
+        """Set the learning rate on the optimizer's param groups."""
+        if self.optimizer is not None:
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = learning_rate
+
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
         for state in self.optimizer.state.values():
             for k, v in state.items():
