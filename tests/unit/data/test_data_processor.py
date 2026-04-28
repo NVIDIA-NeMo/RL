@@ -39,6 +39,7 @@ from nemo_rl.data.datasets.response_datasets import (
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import (
     helpsteer3_data_processor,
+    kd_data_processor,
     math_data_processor,
     math_hf_data_processor,
 )
@@ -60,10 +61,19 @@ class DummyTokenizer:
             content += "assistant:"
         return content
 
-    def __call__(self, text, return_tensors=None, add_special_tokens=False):
+    def __call__(
+        self,
+        text,
+        return_tensors=None,
+        add_special_tokens=False,
+        max_length=None,
+        truncation=False,
+    ):
         if isinstance(text, list):
             text = "".join(text)
         encoded = list(range(len(text)))
+        if truncation and max_length is not None:
+            encoded = encoded[:max_length]
         if return_tensors == "pt":
             return {"input_ids": torch.tensor([encoded], dtype=torch.long)}
         return {"input_ids": encoded}
@@ -348,3 +358,98 @@ def test_helpsteer3_data_processor():
 
     # Length equals sum of token lengths
     assert out["length"] == sum(int(m["token_ids"].numel()) for m in msg_log)
+
+
+def test_kd_data_processor():
+    datum_dict = {
+        "messages": [
+            {"role": "assistant", "content": "Hello world"},
+            {"role": "assistant", "content": "Goodbye"},
+        ],
+    }
+    tokenizer = DummyTokenizer()
+    task_spec = TaskDataSpec(
+        task_name="arrow_text_dataset",
+        prompt_file=None,
+        system_prompt_file=None,
+    )
+
+    out = kd_data_processor(
+        datum_dict=datum_dict,
+        task_data_spec=task_spec,
+        tokenizer=tokenizer,
+        max_seq_length=128,
+        idx=7,
+    )
+
+    expected_raw_text = "Hello world\nGoodbye"
+    assert out["extra_env_info"]["raw_text"] == expected_raw_text
+    assert out["loss_multiplier"] == 1.0
+    assert out["idx"] == 7
+
+    # Single assistant-role entry; raw text is mirrored back into the message.
+    assert len(out["message_log"]) == 1
+    msg = out["message_log"][0]
+    assert msg["role"] == "assistant"
+    assert msg["content"] == expected_raw_text
+
+    # KD invariant: loss applies to every token.
+    assert isinstance(msg["token_ids"], torch.Tensor)
+    assert isinstance(msg["token_loss_mask"], torch.Tensor)
+    assert msg["token_loss_mask"].shape == msg["token_ids"].shape
+    assert torch.all(msg["token_loss_mask"] == 1)
+
+    # Reported length matches the tokenized output.
+    assert out["length"] == int(msg["token_ids"].numel())
+
+
+def test_kd_data_processor_truncates_to_max_seq_length():
+    long_text = "x" * 200
+    datum_dict = {"messages": [{"role": "assistant", "content": long_text}]}
+    tokenizer = DummyTokenizer()
+    task_spec = TaskDataSpec(
+        task_name="arrow_text_dataset",
+        prompt_file=None,
+        system_prompt_file=None,
+    )
+
+    out = kd_data_processor(
+        datum_dict=datum_dict,
+        task_data_spec=task_spec,
+        tokenizer=tokenizer,
+        max_seq_length=64,
+        idx=0,
+    )
+
+    msg = out["message_log"][0]
+    assert int(msg["token_ids"].numel()) == 64
+    assert out["length"] == 64
+    # Truncated length equals the cap (not strictly greater) — loss stays on.
+    assert out["loss_multiplier"] == 1.0
+
+
+def test_kd_data_processor_skips_non_string_content():
+    datum_dict = {
+        "messages": [
+            {"role": "assistant", "content": "kept"},
+            {"role": "assistant", "content": None},
+            {"role": "assistant"},  # no content key
+            {"role": "assistant", "content": "also kept"},
+        ],
+    }
+    tokenizer = DummyTokenizer()
+    task_spec = TaskDataSpec(
+        task_name="arrow_text_dataset",
+        prompt_file=None,
+        system_prompt_file=None,
+    )
+
+    out = kd_data_processor(
+        datum_dict=datum_dict,
+        task_data_spec=task_spec,
+        tokenizer=tokenizer,
+        max_seq_length=128,
+        idx=0,
+    )
+
+    assert out["extra_env_info"]["raw_text"] == "kept\nalso kept"
