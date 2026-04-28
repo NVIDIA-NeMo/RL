@@ -206,6 +206,19 @@ patch_file(
                 "            self.use_mega_moe = False\n"
             ),
         ),
+        (
+            # vLLM's Fp8Config.from_config only reads quant_method,
+            # activation_scheme, ignored_layers, weight_block_size — the dict
+            # that gets written back onto hf_config.quantization_config drops
+            # `scale_fmt` (and `fmt`). DeepseekV4Attention.__init__ in this
+            # file still does `config.quantization_config["scale_fmt"]`, which
+            # raises KeyError. The sibling vllm/.../layers/deepseek_v4_attention.py
+            # already hardcodes `self.scale_fmt = "ue8m0"`; mirror that here
+            # by falling back to "ue8m0" when the key is absent (matches the
+            # only scale_fmt value DeepseekV4 ships with).
+            "        self.scale_fmt = config.quantization_config[\"scale_fmt\"]\n",
+            "        self.scale_fmt = config.quantization_config.get(\"scale_fmt\", \"ue8m0\")\n",
+        ),
     ],
 )
 

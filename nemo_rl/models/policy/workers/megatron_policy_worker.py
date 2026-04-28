@@ -1049,10 +1049,18 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             and self.cfg["generation"]["backend"] == "vllm"
         ):
             generation_cfg = cast(VllmConfig, self.cfg["generation"])
+            # fp8_ds_mla (DSV4 MLA) packs KV scales inline in the cache tensor;
+            # there are no Parameter-style q/k/v_scale buffers on the vLLM side
+            # for refit to write into, so we skip appending those metadata keys.
+            kv_cache_dtype_val = (
+                generation_cfg["vllm_cfg"].get("kv_cache_dtype")
+                if "vllm_cfg" in generation_cfg
+                else None
+            )
             use_fp8_kv_cache = (
-                "vllm_cfg" in generation_cfg
-                and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
-                and generation_cfg["vllm_cfg"]["kv_cache_dtype"].startswith("fp8")
+                kv_cache_dtype_val is not None
+                and kv_cache_dtype_val.startswith("fp8")
+                and kv_cache_dtype_val != "fp8_ds_mla"
             )
 
         if not use_fp8_kv_cache:

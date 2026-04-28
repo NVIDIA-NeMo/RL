@@ -82,7 +82,7 @@ def monkey_patch_vllm_ray_executor(fp8_config):
     if fp8_config.model_parallel_size > 1:
         # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
         # a ray remote that patches each worker with the required fp8 vllm patches
-        from vllm.v1.executor.ray_distributed_executor import RayDistributedExecutor
+        from vllm.v1.executor.ray_executor import RayDistributedExecutor
 
         original_run_workers = RayDistributedExecutor.collective_rpc
 
@@ -142,10 +142,15 @@ def apply_fp8_patches(self, fp8_config):
             patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
             fp8_state.vllm_patches.append(patcher2, patcher3, patcher4)
 
-        # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates
-        func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
-        patcher5 = patch(func5_path, process_weights_after_loading_kv)
-        fp8_state.vllm_patches.append(patcher5)
+        # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates.
+        # Skipped for fp8_ds_mla: the DeepSeek V4 MLA cache format packs scales inline in the cache tensor and
+        # does not register k_scale/v_scale as nn.Parameter, so BaseKVCacheMethod.process_weights_after_loading is
+        # never invoked for those layers and the patch would be a global no-op (and could cause confusing metadata
+        # sync downstream).
+        if global_fp8_config.kv_cache_dtype != "fp8_ds_mla":
+            func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
+            patcher5 = patch(func5_path, process_weights_after_loading_kv)
+            fp8_state.vllm_patches.append(patcher5)
 
     for p in fp8_state.vllm_patches:
         p.start()
@@ -161,9 +166,9 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
     # Validate configuration: kv_cache_dtype
-    if kv_cache_dtype not in ["auto", "fp8", "fp8_e4m3"]:
+    if kv_cache_dtype not in ["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]:
         raise ValueError(
-            f"kv_cache_dtype must be one of ['auto', 'fp8', 'fp8_e4m3'], but got {kv_cache_dtype}"
+            f"kv_cache_dtype must be one of ['auto', 'fp8', 'fp8_e4m3', 'fp8_ds_mla'], but got {kv_cache_dtype}"
         )
 
     # Validate configuration: kv_cache_dtype=fp8 requires precision=fp8
@@ -474,20 +479,58 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     # On Blackwell or Hopper, if E8M0 for DeepGemm is used, we need to
     # requantize the weight and input to the specific scale
     # at the same time.
+    # NOTE: vllm changed this API to accept weight_shape (tuple[int, int])
+    # instead of the weight tensor; passing layer.weight raised
+    # `NotImplementedError: "remainder_cuda" not implemented for Float8_e4m3fn`
+    # because tensor[0] % int was attempted on the fp8 weight rows.
     should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
-        layer.orig_dtype, layer.weight
+        layer.orig_dtype, tuple(layer.weight.shape)
     )
     if should_use_deepgemm:
+        # Honor BMM marker on the layer (e.g., DeepseekV4 wo_a sets
+        # `is_bmm=True` and `bmm_batch_size=n_local_groups`). Without this,
+        # deepgemm_post_process_fp8_weight_block keeps the weight 2D, but the
+        # downstream `deepseek_v4_fp8_einsum` expects 3D (`bhr,hdr->bhd`) and
+        # the DeepGEMM kernel asserts `t.dim() == N` at layout.hpp:39.
+        is_bmm = getattr(layer, "is_bmm", False)
+        bmm_batch_size = getattr(layer, "bmm_batch_size", 0)
         dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
             wq=layer.weight.data,
             ws=layer.weight_scale.data,
             quant_block_shape=tuple(layer.weight_block_size),
             use_e8m0=is_deep_gemm_e8m0_used(),
+            is_bmm=is_bmm,
+            bmm_batch_size=bmm_batch_size,
         )
         # This is the only part we change from the original function (https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1196-L1197)
-        # Instead of creating new torch.nn.Parameter, we update the data in place.
-        layer.weight.data.copy_(dg_weight)
-        layer.weight_scale.data.copy_(dg_weight_scale)
+        # Instead of creating new torch.nn.Parameter (vllm stock uses
+        # replace_parameter), we update the data in place to preserve
+        # Parameter object identity and the `weight_loader` attribute that
+        # NeMo-RL's refit pipeline relies on.
+        #
+        # For is_bmm=True the new tensor is 3D while layer.weight is 2D, so
+        # `.data.copy_()` (which requires same shape) would fail. Rebind
+        # `.data` to the new tensor instead — Parameter object identity (and
+        # weight_loader) is preserved, but the shape now reflects the BMM
+        # layout. Same for weight_scale.
+        if is_bmm:
+            layer.weight.data = dg_weight
+            layer.weight_scale.data = dg_weight_scale
+        else:
+            layer.weight.data.copy_(dg_weight)
+            layer.weight_scale.data.copy_(dg_weight_scale)
+
+        # vllm-stock writes the DG-transformed scale back to `weight_scale_inv`
+        # (see model_executor/kernels/linear/scaled_mm/deep_gemm.py:replace_parameter
+        # with scale_attr=WEIGHT_SCALE_INV). DeepseekV4MLAAttention reads
+        # `self.wo_a.weight_scale_inv` directly at runtime; if we leave it at
+        # its pre-transform value the DeepGEMM einsum kernel asserts
+        # `sf.dim() == num_groups + 2` (layout.hpp:94). Mirror weight_scale's
+        # data into weight_scale_inv so both attribute names work. Use rebind
+        # (`.data = ...`) rather than `.data.copy_()` to handle the BMM 2D→3D
+        # shape change.
+        if hasattr(layer, "weight_scale_inv"):
+            layer.weight_scale_inv.data = dg_weight_scale
 
 
 def process_weights_after_loading(self, layer) -> None:
@@ -513,6 +556,14 @@ def process_weights_after_loading(self, layer) -> None:
         # The first time to call this function, create a new parameter and update the tp status
         layer.weight_scale = torch.nn.Parameter(weight_scale.data, requires_grad=False)
         layer.update_param_tp_status()
+
+    # vLLM upstream renamed the post-processed scale attribute to
+    # `weight_scale_inv` (this NeMo-RL fork was written against an older
+    # commit that used `weight_scale`). DeepseekV4MLAAttention and other
+    # consumers read `weight_scale_inv` directly, so keep it in sync with
+    # the just-processed weight_scale.
+    if hasattr(layer, "weight_scale_inv"):
+        layer.weight_scale_inv.data = weight_scale.data
 
     maybe_post_process_fp8_weight_block(layer)
 

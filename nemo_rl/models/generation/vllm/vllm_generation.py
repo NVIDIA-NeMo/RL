@@ -961,8 +961,14 @@ class VllmGeneration(GenerationInterface):
     def requires_kv_scale_sync(self) -> bool:
         """Check if KV cache scales should be synchronized during refit.
 
-        Returns True if kv_cache_dtype is fp8/fp8_e4m3.
+        Returns True for kv_cache_dtype starting with "fp8" EXCEPT fp8_ds_mla:
+        the DeepSeek V4 MLA cache format packs scales inline in the cache tensor
+        and does not expose k_scale/v_scale as Parameter-style buffers, so there
+        is nothing for refit to synchronize.
         """
-        return "kv_cache_dtype" in self.cfg["vllm_cfg"] and self.cfg["vllm_cfg"][
-            "kv_cache_dtype"
-        ].startswith("fp8")
+        if "kv_cache_dtype" not in self.cfg["vllm_cfg"]:
+            return False
+        kv_cache_dtype = self.cfg["vllm_cfg"]["kv_cache_dtype"]
+        if kv_cache_dtype == "fp8_ds_mla":
+            return False
+        return kv_cache_dtype.startswith("fp8")
