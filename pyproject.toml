@@ -510,7 +510,7 @@ requires-dist = [
 # Tracking: https://github.com/NVIDIA/nvidia-resiliency-ext/issues/301
 [[tool.uv.dependency-metadata]]
 name = "logsage"
-version = "0.1.5"
+version = "0.1.7"
 requires-dist = [
   "drain3>=0.9.11,<0.10.0",
   "langchain>=0.3.27,<0.4.0",
