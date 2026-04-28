@@ -14,7 +14,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
     RayVirtualCluster,
-    get_reordered_bundle_and_gpu_ids,
+    get_reordered_bundle,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
@@ -67,7 +67,7 @@ class SGLangGeneration(GenerationInterface):
             use_unified_pg=True,
         )
         self.pg = pgs[0]
-        self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids = get_reordered_bundle_and_gpu_ids(self.pg)
+        self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids = get_reordered_bundle(self.pg)
 
         init_http_client(sglang_cfg)
 

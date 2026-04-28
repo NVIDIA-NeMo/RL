@@ -123,7 +123,7 @@ EXCLUDED_UNIT_TESTS=(
     --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_hf_training_colocated[False-False-bfloat16-True]
     --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_hf_training_colocated[True-False-bfloat16-True]
 
-# test_vllm_utils.py — exclude only the @vllm-marked test (rest are cheap)
+    # test_vllm_utils.py — exclude only the @vllm-marked test (rest are cheap)
     --deselect=tests/unit/models/generation/test_vllm_utils.py::test_vllm_speculative_decoding_patch_still_needed
 
     # test_vllm_logprobs_mode.py — keep test_processed_logprobs_matches_manual_computation (66s, critical)

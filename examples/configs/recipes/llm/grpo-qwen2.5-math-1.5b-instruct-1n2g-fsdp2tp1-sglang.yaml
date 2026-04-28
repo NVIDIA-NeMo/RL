@@ -35,6 +35,12 @@ policy:
       # (likely torch 2.10 + sglang incompatibility). Keep disabled until upstream fix.
       disable_piecewise_cuda_graph: true
       disable_cuda_graph: true
+      # Fault tolerance (RolloutHealthMonitor). Off by default; when enabled,
+      # a daemon thread health-checks each engine and kills hung actors.
+      use_fault_tolerance: false
+      rollout_health_check_interval: 60
+      rollout_health_check_timeout: 60
+      rollout_health_check_first_wait: 60
     sglang_server:
       needs_offload: true
       cpu_weight_backup: true
