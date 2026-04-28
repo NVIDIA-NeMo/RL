@@ -37,6 +37,17 @@ from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
+def _register_vllm_custom_configs_with_hf_autoconfig() -> None:
+    """Register vLLM-shipped custom HF configs early so AutoConfig.from_pretrained works."""
+    try:
+        from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
+        AutoConfig.register("deepseek_v4", DeepseekV4Config, exist_ok=True)
+    except (ImportError, AttributeError):
+        pass
+
+_register_vllm_custom_configs_with_hf_autoconfig()
+
+
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
