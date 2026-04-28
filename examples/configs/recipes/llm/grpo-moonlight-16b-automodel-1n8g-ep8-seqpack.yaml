@@ -1,0 +1,8 @@
+defaults: ./grpo-moonlight-16b-automodel-1n8g-ep8.yaml
+policy:
+  sequence_packing:
+    enabled: true
+  dynamic_batching:
+    enabled: false
+checkpointing:
+  checkpoint_dir: results/grpo-moonlight-16b-automodel-1n8g-ep8-seqpack

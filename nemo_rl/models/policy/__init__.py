@@ -94,10 +94,11 @@ class DTensorConfig(TypedDict):
     env_vars: NotRequired[dict[str, str] | None]
     _v2: NotRequired[bool]
     # Distributed parallelism sizes
-    # data_parallel_size is derived from world_size / (tp * cp * ep)
+    # data_parallel_size is derived from world_size / (pp * tp * cp * ep)
     tensor_parallel_size: int
     context_parallel_size: int
     expert_parallel_size: NotRequired[int]
+    pipeline_parallel_size: NotRequired[int]
     # Distributed config options (mirrors Automodel's FSDP2Config)
     sequence_parallel: bool
     activation_checkpointing: bool

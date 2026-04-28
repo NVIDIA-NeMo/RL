@@ -54,6 +54,7 @@ class AutomodelCheckpointManager:
         dp_mesh: DeviceMesh,
         tp_mesh: DeviceMesh,
         moe_mesh: Optional[DeviceMesh] = None,
+        pp_mesh: Optional[DeviceMesh] = None,
     ):
         """Initialize the AutomodelCheckpointManager.
 
@@ -61,12 +62,14 @@ class AutomodelCheckpointManager:
             dp_mesh: The data parallel device mesh.
             tp_mesh: The tensor parallel device mesh.
             moe_mesh: Optional MoE device mesh.
+            pp_mesh: Optional pipeline parallel device mesh.
         """
         self.checkpointer: Optional[Checkpointer] = None
         self.checkpoint_config: Optional[AutomodelCheckpointingConfig] = None
         self.dp_mesh = dp_mesh
         self.tp_mesh = tp_mesh
         self.moe_mesh = moe_mesh
+        self.pp_mesh = pp_mesh
 
     def _get_dp_rank(self) -> int:
         """Get the data parallel rank."""
@@ -98,7 +101,11 @@ class AutomodelCheckpointManager:
 
         dp_rank = self._get_dp_rank()
         tp_rank = self._get_tp_rank()
-        pp_rank = 0
+        pp_rank = (
+            torch.distributed.get_rank(self.pp_mesh.get_group())
+            if self.pp_mesh is not None
+            else 0
+        )
 
         # Initialize a base config with sensible defaults
         base_cfg = AutomodelCheckpointingConfig(
@@ -182,11 +189,14 @@ class AutomodelCheckpointManager:
 
     def save_checkpoint(
         self,
-        model: nn.Module,
+        model: nn.Module | list[nn.Module],
         weights_path: str,
-        optimizer: Optional[torch.optim.Optimizer] = None,
+        optimizer: Optional[torch.optim.Optimizer | list[torch.optim.Optimizer]] = None,
         optimizer_path: Optional[str] = None,
-        scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+        scheduler: Optional[
+            torch.optim.lr_scheduler.LRScheduler
+            | list[torch.optim.lr_scheduler.LRScheduler]
+        ] = None,
         tokenizer: Optional[AutoTokenizer] = None,
         tokenizer_path: Optional[str] = None,
         checkpointing_cfg: Optional[CheckpointingConfig] = None,
@@ -197,12 +207,16 @@ class AutomodelCheckpointManager:
 
         The optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
 
+        For pipeline parallel, model/optimizer/scheduler can be lists (one per PP stage).
+        The automodel Checkpointer's ModelState/OptimizerState wrappers handle list inputs
+        by merging state dicts from all parts.
+
         Args:
-            model: The model to save.
+            model: The model to save, or list of model parts for PP.
             weights_path: Path to save model weights.
-            optimizer: Optional optimizer to save.
+            optimizer: Optional optimizer (or list for PP) to save.
             optimizer_path: Optional path to save optimizer state.
-            scheduler: Optional learning rate scheduler.
+            scheduler: Optional learning rate scheduler (or list for PP).
             tokenizer: Optional tokenizer to save with the checkpoint.
             tokenizer_path: Optional path to save tokenizer separately.
             checkpointing_cfg: Checkpointing configuration.
@@ -267,20 +281,25 @@ class AutomodelCheckpointManager:
 
     def load_checkpoint(
         self,
-        model: nn.Module,
+        model: nn.Module | list[nn.Module],
         weights_path: str,
-        optimizer: Optional[torch.optim.Optimizer] = None,
+        optimizer: Optional[torch.optim.Optimizer | list[torch.optim.Optimizer]] = None,
         optimizer_path: Optional[str] = None,
-        scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+        scheduler: Optional[
+            torch.optim.lr_scheduler.LRScheduler
+            | list[torch.optim.lr_scheduler.LRScheduler]
+        ] = None,
     ) -> None:
         """Load a checkpoint into the model using Automodel Checkpointer.
 
+        For pipeline parallel, model/optimizer/scheduler can be lists (one per PP stage).
+
         Args:
-            model: The model to load weights into.
+            model: The model to load weights into, or list of model parts for PP.
             weights_path: Path to the checkpoint weights.
-            optimizer: Optional optimizer to load state into.
+            optimizer: Optional optimizer (or list for PP) to load state into.
             optimizer_path: Optional path to optimizer checkpoint.
-            scheduler: Optional learning rate scheduler.
+            scheduler: Optional learning rate scheduler (or list for PP).
         """
         print(f"Loading weights from {weights_path}")
         assert self.checkpointer is not None, (

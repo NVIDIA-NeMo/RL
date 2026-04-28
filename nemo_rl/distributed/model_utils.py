@@ -30,6 +30,68 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 
 
+class _AllGatherCPNoReduceBackward(torch.autograd.Function):
+    """Like AllGatherCPTensor but WITHOUT all-reduce in backward.
+
+    Used when each CP rank computes loss on allgathered (identical) logprobs.
+    In this case, all ranks produce the same gradient, so all-reduce would
+    double it. This version just slices the gradient to the local chunk.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, cp_group, seq_dim=1):
+        cp_size = torch.distributed.get_world_size(cp_group)
+        cp_rank_chunks = [torch.empty_like(tensor) for _ in range(cp_size)]
+        torch.distributed.all_gather(cp_rank_chunks, tensor, group=cp_group)
+
+        # Undo dual-chunk-swap ordering
+        tensor_chunks = []
+        for chunk in cp_rank_chunks:
+            tensor_chunks.extend(torch.chunk(chunk, chunks=2, dim=seq_dim))
+        chunk_indices = []
+        for r in range(cp_size):
+            chunk_indices.append(r)
+            chunk_indices.append(2 * cp_size - r - 1)
+        pairs = sorted(zip(tensor_chunks, chunk_indices), key=lambda t: t[1])
+        ret = torch.cat([c for c, _ in pairs], dim=seq_dim)
+
+        ctx.seq_dim = seq_dim
+        ctx.cp_group = cp_group
+        return ret
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        cp_size = torch.distributed.get_world_size(ctx.cp_group)
+        cp_rank = torch.distributed.get_rank(ctx.cp_group)
+        seq_dim = ctx.seq_dim
+        # NO all-reduce — just select this rank's chunk
+        grad_output = grad_output.view(
+            *grad_output.shape[:seq_dim],
+            2 * cp_size,
+            grad_output.shape[seq_dim] // (2 * cp_size),
+            *grad_output.shape[seq_dim + 1 :],
+        )
+        index = torch.tensor(
+            [cp_rank, 2 * cp_size - cp_rank - 1], device="cpu", pin_memory=True
+        ).cuda(non_blocking=True)
+        grad_input = grad_output.index_select(seq_dim, index)
+        grad_input = grad_input.view(
+            *grad_input.shape[:seq_dim], -1, *grad_input.shape[seq_dim + 2 :]
+        )
+        return grad_input, None, None
+
+
+_SELF_TP_GROUP: Optional[torch.distributed.ProcessGroup] = None
+
+
+def _get_self_tp_group() -> torch.distributed.ProcessGroup:
+    """Cached single-rank TP group for CP-only logprob computation."""
+    global _SELF_TP_GROUP
+    if _SELF_TP_GROUP is None:
+        _SELF_TP_GROUP = torch.distributed.new_group([torch.distributed.get_rank()])
+    return _SELF_TP_GROUP
+
+
 @torch.no_grad()
 def _compute_distributed_log_softmax(
     vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
@@ -941,6 +1003,7 @@ def from_parallel_logits_to_logprobs(
     tp_group: torch.distributed.ProcessGroup,
     inference_only: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_allgather_no_reduce: bool = False,
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
 ) -> torch.Tensor:
@@ -1020,10 +1083,12 @@ def from_parallel_logits_to_logprobs(
             ).contiguous()
 
     if cp_size > 1:
-        # we need to gather the logits by context parallelism
-        logprobs = allgather_cp_sharded_tensor(
-            logprobs, cp_group, seq_dim=1
-        )  # , unpadded_seqlen=target.shape[1])
+        if cp_allgather_no_reduce:
+            # No all-reduce in backward — used when each CP rank computes
+            # loss on allgathered logprobs (avoids 2x gradient).
+            logprobs = _AllGatherCPNoReduceBackward.apply(logprobs, cp_group, 1)
+        else:
+            logprobs = allgather_cp_sharded_tensor(logprobs, cp_group, seq_dim=1)
 
     if pad_len > 0:
         logprobs = logprobs[:, :-pad_len]
@@ -1392,6 +1457,27 @@ def get_next_token_logprobs_from_logits(
             sampling_params=sampling_params,
         )
         # slice off to the correct length to remove potential CP padding
+        logprobs = logprobs[:, : input_ids.shape[1] - 1]
+
+    elif context_parallel_group is not None and not isinstance(
+        next_token_logits, torch.distributed.tensor.DTensor
+    ):
+        # CP-only path (no TP): automodel backend with full vocab per rank.
+        # TE's thd_get_partitioned_indices uses dual-chunk-swap (same as
+        # _get_tokens_on_this_cp_rank), so from_parallel_logits_to_logprobs works.
+        tp_group = _get_self_tp_group()
+        vocab_size = next_token_logits.shape[-1]
+        logprobs = from_parallel_logits_to_logprobs(
+            next_token_logits,
+            input_ids,
+            vocab_start_index=0,
+            vocab_end_index=vocab_size,
+            tp_group=tp_group,
+            inference_only=False,
+            cp_group=context_parallel_group,
+            cp_allgather_no_reduce=True,  # avoid 2x gradient from allgather backward
+            sampling_params=sampling_params,
+        )
         logprobs = logprobs[:, : input_ids.shape[1] - 1]
 
     elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):

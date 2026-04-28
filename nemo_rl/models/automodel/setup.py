@@ -278,7 +278,6 @@ def validate_and_prepare_config(
                 "Please set policy.sequence_packing.enabled = False to train VLM models."
             )
         print(f"[Rank {rank}] Sequence packing is enabled for model {model_name}")
-        print(f"[Rank {rank}] Using FlashAttention2 for sequence packing")
 
     # Get HF config overrides
     hf_config_overrides = config.get("hf_config_overrides", {}) or {}
@@ -293,18 +292,19 @@ def validate_and_prepare_config(
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
     cp_size_cfg = config["dtensor_cfg"]["context_parallel_size"]
-    attn_impl = (
-        "flash_attention_2"
-        if (enable_seq_packing and cp_size_cfg == 1)
-        else ("sdpa" if cp_size_cfg > 1 else None)
-    )
+    if enable_seq_packing:
+        attn_impl = "flash_attention_2"
+    elif cp_size_cfg > 1:
+        attn_impl = "sdpa"
+    else:
+        attn_impl = None
 
     # Load model config
     model_config = AutoConfig.from_pretrained(
         model_name,
         torch_dtype=torch.float32,  # Always load in float32 for master weights
         trust_remote_code=True,
-        attn_implementation="flash_attention_2" if enable_seq_packing else None,
+        attn_implementation=attn_impl,
         **hf_config_overrides,
     )
 
@@ -346,13 +346,6 @@ def validate_and_prepare_config(
     tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
     cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
     sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
-
-    # Validate parallelization configuration
-    if cp_size > 1 and enable_seq_packing:
-        raise ValueError(
-            "Context parallel is not supported for sequence packing. "
-            "Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
-        )
 
     if sequence_parallel_enabled and tp_size == 1:
         print(
@@ -396,7 +389,10 @@ def setup_reference_model_state(
         >>> model = setup_model(...)
         >>> reference_model_state_dict = setup_reference_model_state(model)
     """
-    return get_cpu_state_dict(model.state_dict().items(), pin_memory=True)
+    from nemo_rl.models.automodel.model_handle import ModelHandle
+
+    handle = model if isinstance(model, ModelHandle) else ModelHandle(model)
+    return get_cpu_state_dict(handle.state_dict_items(), pin_memory=True)
 
 
 def setup_distributed(
@@ -428,6 +424,7 @@ def setup_distributed(
     tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
     cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
     ep_size = config["dtensor_cfg"].get("expert_parallel_size", 1)
+    pp_size = config["dtensor_cfg"].get("pipeline_parallel_size", 1)
     sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
 
     # Build tp_plan from custom_parallel_plan config if set, else None (auto-select)
@@ -459,11 +456,11 @@ def setup_distributed(
             "If you need this feature, please file an issue on https://github.com/NVIDIA-NeMo/Automodel."
         )
 
-    # Create device meshes (dp_size is derived from world_size / (tp * cp * ep))
+    # Create device meshes (dp_size is derived from world_size / (pp * tp * cp * ep))
     device_mesh, moe_mesh = create_device_mesh(
         fsdp2_config,
         tp_size=tp_size,
-        pp_size=1,
+        pp_size=pp_size,
         cp_size=cp_size,
         ep_size=ep_size,
         world_size=world_size,
@@ -473,6 +470,8 @@ def setup_distributed(
     resolved_dp_size = device_mesh["dp"].size()
     resolved_tp_size = device_mesh["tp"].size()
     resolved_cp_size = device_mesh["cp"].size()
+    resolved_pp_size = device_mesh["pp"].size() if pp_size > 1 else 1
+    pp_mesh = device_mesh["pp"] if pp_size > 1 else None
 
     return DistributedContext(
         device_mesh=device_mesh,
@@ -482,7 +481,65 @@ def setup_distributed(
         dp_size=resolved_dp_size,
         tp_size=resolved_tp_size,
         cp_size=resolved_cp_size,
+        pp_size=resolved_pp_size,
+        pp_mesh=pp_mesh,
     )
+
+
+def build_pipeline_config(
+    automodel_kwargs: dict,
+    config: "PolicyConfig",
+    model_config: Any,
+) -> Any:
+    """Build and configure PipelineConfig from automodel_kwargs.
+
+    Handles Hydra _target_ resolution, pp_batch_size computation, and
+    custom model detection for forward patching.
+
+    Returns:
+        Resolved PipelineConfig, or None if no pipeline_config in kwargs.
+    """
+    if automodel_kwargs.get("pipeline_config") is None:
+        return None
+
+    pipeline_class = _resolve_target(automodel_kwargs["pipeline_config"]["_target_"])
+    pipeline_kwargs = {
+        k: v for k, v in automodel_kwargs["pipeline_config"].items() if k != "_target_"
+    }
+
+    # pp_batch_size = what the schedule processes per step() call.
+    # Equals train_micro_batch_size (fits in GPU memory). Gradient accumulation
+    # handles the rest (local_gbs / pp_batch_size steps per optimizer update).
+    if "pp_batch_size" not in pipeline_kwargs or pipeline_kwargs["pp_batch_size"] <= 1:
+        pipeline_kwargs["pp_batch_size"] = config["train_micro_batch_size"]
+
+    # Custom nemo_automodel models (GPT-OSS, Qwen3 MoE, etc.) have their own
+    # forward() that handles rotary embeddings, attention masks, and layer
+    # iteration. Disable the generic HF pipeline_forward patching so the
+    # custom model's forward is preserved during PP.
+    is_custom_model = (
+        model_config.architectures[0] in ModelRegistry.model_arch_name_to_cls
+    )
+    if is_custom_model:
+        pipeline_kwargs.setdefault("patch_inner_model", False)
+        pipeline_kwargs.setdefault("patch_causal_lm_model", False)
+
+    # Provide a dummy loss_fn — the PP schedule requires it at build time,
+    # but NeMo RL injects the real loss via schedule._loss_fn before each step.
+    if "loss_fn" not in pipeline_kwargs or pipeline_kwargs["loss_fn"] is None:
+
+        def _dummy_loss(output, target):
+            logits = getattr(output, "logits", output)
+            return torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)).float(),
+                target.view(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+
+        pipeline_kwargs["loss_fn"] = _dummy_loss
+
+    return pipeline_class(**pipeline_kwargs)
 
 
 def setup_model_and_optimizer(
@@ -597,6 +654,11 @@ def setup_model_and_optimizer(
         backend = backend_class(**backend_kwargs)
         automodel_kwargs["backend"] = backend
 
+    # Resolve pipeline_config if present
+    pipeline_config = build_pipeline_config(automodel_kwargs, config, model_config)
+    if pipeline_config is not None:
+        automodel_kwargs["pipeline_config"] = pipeline_config
+
     if "use_liger_kernel" not in automodel_kwargs:
         automodel_kwargs["use_liger_kernel"] = False
 
@@ -665,8 +727,13 @@ def setup_model_and_optimizer(
 
     print(model)
 
-    # Compute model metadata after from_pretrained
-    model_state_dict_keys = list(model.state_dict().keys())
+    # Wrap in ModelHandle for unified PP/non-PP interface
+    from nemo_rl.models.automodel.model_handle import ModelHandle
+
+    model_handle = ModelHandle(model)
+
+    # Compute model metadata
+    model_state_dict_keys = model_handle.state_dict_keys()
     is_moe_model = any(["expert" in key for key in model_state_dict_keys])
     is_hf_model = (
         model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
@@ -674,17 +741,21 @@ def setup_model_and_optimizer(
     # Autocast is disabled for custom MoE models (non-HF) to avoid numerical issues
     autocast_enabled = not (is_moe_model and not is_hf_model)
 
-    # Set pad token ID if needed. Some model configs (e.g. Gemma3 in transformers v5)
-    # don't have pad_token_id as a direct attribute.
-    if getattr(model.config, "pad_token_id", None) is None:
-        model.config.pad_token_id = tokenizer.pad_token_id
+    # Set pad token ID if needed
+    for part in model_handle.parts:
+        if (
+            hasattr(part, "config")
+            and getattr(part.config, "pad_token_id", None) is None
+        ):
+            part.config.pad_token_id = tokenizer.pad_token_id
 
-    # Handle tied word embeddings (safety net after from_pretrained)
-    is_tied_lm_head = hasattr(model, "lm_head") and getattr(
-        getattr(model, "config", {}), "tie_word_embeddings", False
-    )
-    if is_tied_lm_head:
-        model.tie_weights()
+    # Handle tied word embeddings (PP validates tie_word_embeddings=False)
+    if not model_handle.pp_enabled:
+        is_tied_lm_head = hasattr(model, "lm_head") and getattr(
+            getattr(model, "config", {}), "tie_word_embeddings", False
+        )
+        if is_tied_lm_head:
+            model.tie_weights()
 
     # Freeze visual encoder when not doing VLM training.
     # Without this, the optimizer creates state entries for visual params that never
@@ -702,56 +773,70 @@ def setup_model_and_optimizer(
 
     # CPU offload if needed
     if cpu_offload:
-        # Move buffers to CPU for FSDP modules
-        for v in model.buffers():
-            v.data = v.data.to("cpu")
-        model = model.to("cpu")
+        model_handle.move_buffers_to("cpu")
+        model_handle.to("cpu")
 
-    # Initialize optimizer
-    optimizer = None
+    # Initialize optimizers — always a list (one per model part)
+    optimizers = None
     if init_optimizer:
         optimizer_cls = get_class(config["optimizer"]["name"])
-        optimizer = optimizer_cls(model.parameters(), **config["optimizer"]["kwargs"])
+        optimizers = [
+            optimizer_cls(
+                [p for p in part.parameters() if p.requires_grad],
+                **config["optimizer"]["kwargs"],
+            )
+            for part in model_handle.parts
+        ]
 
-    # Initialize scheduler
-    scheduler = None
-    if "scheduler" in config and optimizer is not None:
+    # Initialize schedulers — one per optimizer
+    schedulers = None
+
+    def _make_scheduler_for_optimizer(opt):
+        """Create a scheduler for a single optimizer based on config."""
+        if "scheduler" not in config:
+            return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda epoch: 1)
         if isinstance(config["scheduler"], dict):
-            scheduler_cls = get_class(config["scheduler"]["name"])
-            scheduler = scheduler_cls(optimizer, **config["scheduler"]["kwargs"])
+            sched_cls = get_class(config["scheduler"]["name"])
+            return sched_cls(opt, **config["scheduler"]["kwargs"])
         else:
-            schedulers = []
-            for scheduler_cfg in config["scheduler"]:
-                if "name" in scheduler_cfg:
-                    schedulers.append(
-                        get_class(scheduler_cfg["name"])(
-                            optimizer, **scheduler_cfg["kwargs"]
-                        )
+            scheds = []
+            for sched_cfg in config["scheduler"]:
+                if "name" in sched_cfg:
+                    scheds.append(
+                        get_class(sched_cfg["name"])(opt, **sched_cfg["kwargs"])
                     )
                 else:
-                    assert "milestones" in scheduler_cfg, (
+                    assert "milestones" in sched_cfg, (
                         "unknown scheduler config: ",
-                        scheduler_cfg,
+                        sched_cfg,
                     )
-                    milestones: list[int] = scheduler_cfg["milestones"]
+                    milestones_val: list[int] = sched_cfg["milestones"]
+            return torch.optim.lr_scheduler.SequentialLR(opt, scheds, milestones_val)
 
-            scheduler = torch.optim.lr_scheduler.SequentialLR(
-                optimizer, schedulers, milestones
-            )
-    elif optimizer is not None:
-        # Default to passthrough LR schedule
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lr_lambda=lambda epoch: 1
-        )
+    if optimizers is not None:
+        schedulers = [_make_scheduler_for_optimizer(opt) for opt in optimizers]
 
-    # Load NeMo RL checkpoint if provided
+    # Load NeMo RL checkpoint if provided.
+    # For PP, pass model parts list and full optimizer/scheduler lists
+    # so the automodel Checkpointer can load per-stage state.
     if weights_path:
+        model_for_ckpt = model_handle.parts if model_handle.pp_enabled else model
+        opt_for_ckpt = (
+            optimizers
+            if model_handle.pp_enabled
+            else (optimizers[0] if optimizers else None)
+        )
+        sched_for_ckpt = (
+            schedulers
+            if model_handle.pp_enabled
+            else (schedulers[0] if schedulers else None)
+        )
         checkpoint_manager.load_checkpoint(
-            model=model,
+            model=model_for_ckpt,
             weights_path=weights_path,
-            optimizer=optimizer,
+            optimizer=opt_for_ckpt,
             optimizer_path=optimizer_path,
-            scheduler=scheduler,
+            scheduler=sched_for_ckpt,
         )
     else:
         print(
@@ -759,14 +844,14 @@ def setup_model_and_optimizer(
         )
 
     return ModelAndOptimizerState(
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
+        model=model_handle,
+        optimizers=optimizers,
+        schedulers=schedulers,
         is_hf_model=is_hf_model,
         is_moe_model=is_moe_model,
         is_reward_model=is_reward_model,
         model_class=type(model),
-        model_config=model.config,
+        model_config=model_handle.config,
         peft_config=peft_config,
         autocast_enabled=autocast_enabled,
     )
