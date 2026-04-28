@@ -1,0 +1,85 @@
+# Default `infra:` block shipped with nrl-k8s.
+#
+# Users can override any field with:
+#   1. A recipe-level `infra:` mapping
+#   2. A per-user file at ~/.config/nrl-k8s/defaults.yaml
+#   3. CLI Hydra-style overrides: `infra.scheduler.queue=my-queue`
+#
+# Priority (low -> high): this file < user defaults < recipe < CLI overrides.
+infra:
+  # namespace, image are REQUIRED and must be set per-cluster; no default is sensible.
+  # serviceAccount is optional — when set, the CLI patches it onto every pod template.
+  # namespace: ""
+  # image: ""
+  imagePullSecrets: []
+  serviceAccount: null
+  scheduler:
+    kind: default
+    queue: null
+  placement:
+    nodeSelector: {}
+    tolerations: []
+  networking:
+    hostNetwork: false
+    gloo_socket_ifname: null
+    nccl_socket_ifname: null
+    nccl_ib_disable: false
+    nccl_net: null
+    extra_env: {}
+  workspace:
+    kind: rayUpload
+    pvcName: null
+    mountPath: /mnt/nemo-rl
+    repoSubdir: workdirs
+    size: null
+    hostPath: null
+  hf_cache:
+    kind: none
+    pvcName: null
+    mountPath: /root/.cache/huggingface
+  checkpoints:
+    kind: none
+    pvcName: null
+    mountPath: /mnt/nemo-rl/checkpoints
+  submit:
+    kind: sdk
+    portForward: auto
+    devPod: auto
+    localDashboardPort: 18265
+    # Transport: portForward = Ray Job SDK via kubectl port-forward;
+    # exec = kubectl exec + nohup python (for batch production).
+    submitter: portForward
+    # Pod path ExecSubmitter uses for launcher + stdout + pidfile.
+    execTmpDir: /tmp
+  launch:
+    mode: single
+    # interactive (default) = port-forward + upload + tail; batch = exec + image + no-wait.
+    # Can be overridden per-invocation with `--mode` on launch/run.
+    runMode: interactive
+    # Where the code lives: upload (default, Ray SDK), image (baked
+    # at launch.codePath), or lustre (mounted at launch.codePath).
+    codeSource: upload
+    codePath: null
+    attach:
+      generation: null
+      gym: null
+      training: null
+    peerWatcher: true
+  resources:
+    training:
+      head: {cpu: null, memory: null, gpu: null}
+      worker: {cpu: null, memory: null, gpu: null}
+    generation:
+      head: {cpu: null, memory: null, gpu: null}
+      worker: {cpu: null, memory: null, gpu: null}
+    gym:
+      head: {cpu: null, memory: null, gpu: null}
+      worker: {cpu: null, memory: null, gpu: null}
+  # Per-role RayCluster topology. Unset roles cannot be brought up via
+  # `nrl-k8s cluster up --role <role>`.
+  clusters:
+    training: null
+    generation: null
+    gym: null
+  labels: {}
+  annotations: {}

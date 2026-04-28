@@ -1,0 +1,291 @@
+# Disaggregated RL + Gym deployment: two gang-scheduled RayClusters.
+#
+# RL cluster: Ray head + GPU workers for training (vLLM + Megatron).
+# Gym cluster: CPU-only, runs NeMo Gym servers as a standalone HTTP service.
+#
+# Service discovery: K8s ConfigMap endpoint registry (see endpoint-registry-rbac.yaml).
+#   RL registers vLLM URLs, Gym registers its head server address. Both poll until
+#   the peer's address appears.
+#
+# Failure cascading: peer-watcher sidecar on each head pod monitors the other cluster
+#   via K8s API. If either is deleted/failed, both are torn down to release resources.
+#
+# Prerequisites:
+#   kubectl apply -f endpoint-registry-rbac.yaml
+#
+# Usage:
+#   kubectl apply -f disagg-rayclusters.yaml
+#
+#   # On RL head (exec into pod, submit via Ray Jobs API):
+#   ray job submit --address http://127.0.0.1:8265 -- bash -c \
+#     "cd /workspace/nemo-rl && python examples/nemo_gym/run_grpo_nemo_gym.py \
+#       --config examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml \
+#       +env.disagg_job_id=<job-id> \
+#       policy.model_name=Qwen/Qwen3-0.6B \
+#       cluster.gpus_per_node=2 \
+#       policy.megatron_cfg.tensor_model_parallel_size=1 \
+#       policy.megatron_cfg.pipeline_model_parallel_size=1 \
+#       policy.megatron_cfg.expert_model_parallel_size=1 \
+#       policy.megatron_cfg.context_parallel_size=1 \
+#       policy.megatron_cfg.sequence_parallel=false \
+#       policy.generation.vllm_cfg.tensor_parallel_size=1 \
+#       policy.generation.colocated.enabled=false \
+#       policy.generation.colocated.resources.num_nodes=1 \
+#       policy.generation.colocated.resources.gpus_per_node=1 \
+#       policy.generation.max_new_tokens=512 \
+#       policy.max_total_sequence_length=512 \
+#       grpo.num_prompts_per_step=4 grpo.num_generations_per_prompt=2 \
+#       grpo.max_num_steps=2 \
+#       policy.train_global_batch_size=4 policy.train_micro_batch_size=1 \
+#       logger.wandb_enabled=false"
+#
+#   # On Gym head: uv run --extra nemo_gym python -m nemo_rl.distributed.standalone_gym_server --job-id=<job-id>
+
+# ========================
+# RL RayCluster (GPU)
+# ========================
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: raycluster-rl
+  labels:
+    kai.scheduler/queue: high-prio     # KAI fairshare queue
+spec:
+  rayVersion: "2.52.0"
+  headGroupSpec:
+    rayStartParams:
+      object-store-memory: "200000000"
+    template:
+      spec:
+        serviceAccountName: nemo-rl-endpoint-registry  # RBAC for ConfigMap + RayCluster access
+        schedulerName: kai-scheduler
+        imagePullSecrets:
+        - name: nvcr-secret
+        containers:
+        # --- Ray head ---
+        - name: ray-head
+          image: nvcr.io/nvidian/nemo-rl:nightly
+          env:
+          - name: RAY_CLUSTER_NAME
+            value: raycluster-rl           # used by endpoint registry for ownerReference
+          - name: NRL_FORCE_REBUILD_VENVS
+            value: "true"
+          resources:
+            limits:   { cpu: "4", memory: "16Gi" }
+            requests: { cpu: "1", memory: "4Gi" }
+          ports:
+          - { containerPort: 6379, name: gcs-server }
+          - { containerPort: 8265, name: dashboard }
+          - { containerPort: 10001, name: client }
+          volumeMounts:
+          - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+          - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
+        # --- Peer-watcher sidecar: tears down both clusters if Gym fails ---
+        # Monitors raycluster-gym via K8s API. If peer is deleted, failed, or
+        # signals an error via ConfigMap, deletes both RayClusters.
+        - name: peer-watcher
+          image: python:3.12-slim
+          command: ["python3", "-u", "-c"]
+          args:
+          - |
+            import json, os, ssl, sys, time, urllib.request
+            from pathlib import Path
+
+            SELF = os.environ["SELF_CLUSTER_NAME"]
+            PEER = os.environ["PEER_CLUSTER_NAME"]
+            JOB_ID = os.environ.get("JOB_ID", "")
+            INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
+            MAX_FAIL = int(os.environ.get("MAX_PEER_FAILURES", "3"))
+
+            SA = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+            NS = (SA / "namespace").read_text().strip() if (SA / "namespace").exists() else "default"
+            TOKEN = (SA / "token").read_text().strip() if (SA / "token").exists() else ""
+            API = "https://kubernetes.default.svc"
+            CTX = ssl.create_default_context(cafile=str(SA / "ca.crt")) if (SA / "ca.crt").exists() else ssl._create_unverified_context()
+
+            def kube(path, method="GET"):
+                req = urllib.request.Request(f"{API}{path}", method=method)
+                req.add_header("Authorization", f"Bearer {TOKEN}")
+                try:
+                    with urllib.request.urlopen(req, context=CTX, timeout=10) as r:
+                        return json.loads(r.read())
+                except urllib.error.HTTPError as e:
+                    return {"code": e.code}
+                except Exception:
+                    return {"code": 0}
+
+            def teardown(reason):
+                print(f"[peer-watcher] TEARDOWN: {reason}", flush=True)
+                for n in (SELF, PEER):
+                    kube(f"/apis/ray.io/v1/namespaces/{NS}/rayclusters/{n}", "DELETE")
+                if JOB_ID:
+                    kube(f"/api/v1/namespaces/{NS}/configmaps/nemo-rl-endpoints-{JOB_ID}", "DELETE")
+                sys.exit(1)
+
+            print(f"[peer-watcher] self={SELF} peer={PEER} ns={NS} poll={INTERVAL}s max_fail={MAX_FAIL}", flush=True)
+            fails = 0
+            while True:
+                time.sleep(INTERVAL)
+                r = kube(f"/apis/ray.io/v1/namespaces/{NS}/rayclusters/{PEER}")
+                code = r.get("code", 0)
+                if code == 404:
+                    teardown(f"Peer {PEER} deleted")
+                if JOB_ID:
+                    cm = kube(f"/api/v1/namespaces/{NS}/configmaps/nemo-rl-endpoints-{JOB_ID}")
+                    if cm.get("data", {}).get("error", ""):
+                        teardown(f"Error via ConfigMap: {cm['data']['error']}")
+                state = r.get("status", {}).get("state", "")
+                if state in ("failed", "suspended") or (code != 0 and state == ""):
+                    fails += 1
+                    print(f"[peer-watcher] Peer {PEER} {state or 'unreachable'} ({fails}/{MAX_FAIL})", flush=True)
+                    if fails >= MAX_FAIL:
+                        teardown(f"Peer {PEER} failed {MAX_FAIL}x")
+                    continue
+                if fails > 0:
+                    print(f"[peer-watcher] Peer {PEER} recovered", flush=True)
+                fails = 0
+          env:
+          - { name: SELF_CLUSTER_NAME, value: raycluster-rl }
+          - { name: PEER_CLUSTER_NAME, value: raycluster-gym }
+          - { name: POLL_INTERVAL, value: "10" }
+          - { name: MAX_PEER_FAILURES, value: "3" }
+          # Uncomment to also clean up the ConfigMap on teardown:
+          # - { name: JOB_ID, value: "my-job-id" }
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "100m", memory: "128Mi" }
+        volumes:
+        - name: nemo-rl-src
+          hostPath: { path: /workspace/nemo-rl, type: DirectoryOrCreate }
+  workerGroupSpecs:
+  - groupName: gpu-workers
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+    rayStartParams:
+      num-gpus: "2"
+      object-store-memory: "200000000"
+    template:
+      spec:
+        serviceAccountName: nemo-rl-endpoint-registry
+        schedulerName: kai-scheduler
+        imagePullSecrets:
+        - name: nvcr-secret
+        containers:
+        - name: ray-worker
+          image: nvcr.io/nvidian/nemo-rl:nightly
+          env:
+          - name: NRL_FORCE_REBUILD_VENVS
+            value: "true"
+          resources:
+            limits:   { cpu: "8", memory: "32Gi", nvidia.com/gpu: "2" }
+            requests: { cpu: "2", memory: "8Gi", nvidia.com/gpu: "2" }
+          volumeMounts:
+          - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+          - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
+        volumes:
+        - name: nemo-rl-src
+          hostPath: { path: /workspace/nemo-rl, type: DirectoryOrCreate }
+
+---
+# ========================
+# Gym RayCluster (CPU only)
+# ========================
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: raycluster-gym
+  labels:
+    kai.scheduler/queue: high-prio
+spec:
+  rayVersion: "2.52.0"
+  headGroupSpec:
+    rayStartParams:
+      object-store-memory: "200000000"
+    template:
+      spec:
+        serviceAccountName: nemo-rl-endpoint-registry
+        schedulerName: kai-scheduler
+        imagePullSecrets:
+        - name: nvcr-secret
+        containers:
+        # --- Gym Ray head (runs standalone_gym_server) ---
+        - name: ray-head
+          image: nvcr.io/nvidian/nemo-rl:nightly
+          resources:
+            limits:   { cpu: "4", memory: "16Gi" }
+            requests: { cpu: "1", memory: "4Gi" }
+          ports:
+          - { containerPort: 6379, name: gcs-server }
+          - { containerPort: 8265, name: dashboard }
+          - { containerPort: 9090, name: head-server }  # Gym head server port
+        # --- Peer-watcher sidecar: tears down both clusters if RL fails ---
+        - name: peer-watcher
+          image: python:3.12-slim
+          command: ["python3", "-u", "-c"]
+          args:
+          - |
+            import json, os, ssl, sys, time, urllib.request
+            from pathlib import Path
+
+            SELF = os.environ["SELF_CLUSTER_NAME"]
+            PEER = os.environ["PEER_CLUSTER_NAME"]
+            JOB_ID = os.environ.get("JOB_ID", "")
+            INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
+            MAX_FAIL = int(os.environ.get("MAX_PEER_FAILURES", "3"))
+
+            SA = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+            NS = (SA / "namespace").read_text().strip() if (SA / "namespace").exists() else "default"
+            TOKEN = (SA / "token").read_text().strip() if (SA / "token").exists() else ""
+            API = "https://kubernetes.default.svc"
+            CTX = ssl.create_default_context(cafile=str(SA / "ca.crt")) if (SA / "ca.crt").exists() else ssl._create_unverified_context()
+
+            def kube(path, method="GET"):
+                req = urllib.request.Request(f"{API}{path}", method=method)
+                req.add_header("Authorization", f"Bearer {TOKEN}")
+                try:
+                    with urllib.request.urlopen(req, context=CTX, timeout=10) as r:
+                        return json.loads(r.read())
+                except urllib.error.HTTPError as e:
+                    return {"code": e.code}
+                except Exception:
+                    return {"code": 0}
+
+            def teardown(reason):
+                print(f"[peer-watcher] TEARDOWN: {reason}", flush=True)
+                for n in (SELF, PEER):
+                    kube(f"/apis/ray.io/v1/namespaces/{NS}/rayclusters/{n}", "DELETE")
+                if JOB_ID:
+                    kube(f"/api/v1/namespaces/{NS}/configmaps/nemo-rl-endpoints-{JOB_ID}", "DELETE")
+                sys.exit(1)
+
+            print(f"[peer-watcher] self={SELF} peer={PEER} ns={NS} poll={INTERVAL}s max_fail={MAX_FAIL}", flush=True)
+            fails = 0
+            while True:
+                time.sleep(INTERVAL)
+                r = kube(f"/apis/ray.io/v1/namespaces/{NS}/rayclusters/{PEER}")
+                code = r.get("code", 0)
+                if code == 404:
+                    teardown(f"Peer {PEER} deleted")
+                if JOB_ID:
+                    cm = kube(f"/api/v1/namespaces/{NS}/configmaps/nemo-rl-endpoints-{JOB_ID}")
+                    if cm.get("data", {}).get("error", ""):
+                        teardown(f"Error via ConfigMap: {cm['data']['error']}")
+                state = r.get("status", {}).get("state", "")
+                if state in ("failed", "suspended") or (code != 0 and state == ""):
+                    fails += 1
+                    print(f"[peer-watcher] Peer {PEER} {state or 'unreachable'} ({fails}/{MAX_FAIL})", flush=True)
+                    if fails >= MAX_FAIL:
+                        teardown(f"Peer {PEER} failed {MAX_FAIL}x")
+                    continue
+                if fails > 0:
+                    print(f"[peer-watcher] Peer {PEER} recovered", flush=True)
+                fails = 0
+          env:
+          - { name: SELF_CLUSTER_NAME, value: raycluster-gym }
+          - { name: PEER_CLUSTER_NAME, value: raycluster-rl }
+          - { name: POLL_INTERVAL, value: "10" }
+          - { name: MAX_PEER_FAILURES, value: "3" }
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "100m", memory: "128Mi" }
