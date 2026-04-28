@@ -162,7 +162,7 @@ ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 # code find the pip version first, and LD_LIBRARY_PATH makes the dynamic linker resolve
 # cuDNN sub-libraries from pip when loading libtransformer_engine.so.
 ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
-ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
 # Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 
 WORKDIR /opt/nemo-rl
