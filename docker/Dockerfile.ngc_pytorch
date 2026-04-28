@@ -95,7 +95,7 @@ COPY --from=nemo-rl uv.lock /tmp/uv.lock
 RUN <<"EOF" bash -exu
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
     echo "Building vLLM from source for PyTorch base image"
-    VLLM_VERSION=$(grep -A 1 'name = "vllm"' /tmp/uv.lock | grep 'version =' | sed 's/version = "\(.*\)"/\1/') && \
+    VLLM_VERSION=$(grep -A 1 '^name = "vllm"$' /tmp/uv.lock | grep '^version = ' | head -1 | sed 's/version = "\(.*\)"/\1/' | cut -d+ -f1) && \
     echo "Building vLLM version: $VLLM_VERSION"
     git clone https://github.com/vllm-project/vllm.git
     cd vllm
