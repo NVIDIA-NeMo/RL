@@ -104,6 +104,15 @@ class ClippedPGLossConfig(TypedDict):
     # If False (default), correction is applied at the token level as in the
     # original GRPO paper.
     sequence_level_importance_ratios: NotRequired[bool]
+    # Override the IS correction granularity independently of the PPO ratio.
+    # When set, this takes precedence over sequence_level_importance_ratios for
+    # the IS correction weight computation only (PPO ratio is still controlled
+    # by sequence_level_importance_ratios).
+    #   "sequence"      – exp(sum(prev - gen))      (one weight per sequence)
+    #   "sequence_mean" – exp(mean(prev - gen))      (geometric mean, more stable for long seqs)
+    #   "token"         – exp(prev - gen) per token  (token-level correction)
+    # If None (default), derived from sequence_level_importance_ratios for backward compat.
+    is_correction_level: NotRequired[str | None]
     disable_ppo_ratio: NotRequired[bool]
     # If True, force the ratio to 1.0 for truly on-policy behavior,
     # eliminating any importance sampling effects.
@@ -202,6 +211,13 @@ class ClippedPGLossFn(LossFunction):
             "sequence_level_importance_ratios",
             False,
         )
+        # IS correction level override (decoupled from PPO ratio level).
+        self.is_correction_level = cfg.get("is_correction_level", None)
+        if self.is_correction_level is not None:
+            assert self.is_correction_level in ("sequence", "sequence_mean", "token"), (
+                f"is_correction_level must be 'sequence', 'sequence_mean', or 'token', "
+                f"got {self.is_correction_level!r}"
+            )
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
         )
@@ -225,9 +241,13 @@ class ClippedPGLossFn(LossFunction):
                 f"got {self.truncated_importance_sampling_type}"
             )
             if self.truncated_importance_sampling_type == "seq-mask-tis":
-                assert not self.sequence_level_importance_ratios, (
+                _effective_is = self.is_correction_level
+                if _effective_is is None:
+                    _effective_is = "sequence" if self.sequence_level_importance_ratios else "token"
+                assert _effective_is == "token", (
                     "seq-mask-tis uses token-level IS correction with sequence-level masking, "
-                    "and is incompatible with sequence_level_importance_ratios=True"
+                    "and is incompatible with sequence-level IS correction "
+                    f"(is_correction_level={_effective_is!r})"
                 )
         else:
             # Warn user that TIS-related parameters are ignored when truncated_importance_sampling_ratio is not set
@@ -425,7 +445,13 @@ class ClippedPGLossFn(LossFunction):
         # -------------------------------------------------------------
         _is_filter_metrics: dict = {}  # populated for icepop / seq-mask-tis
         # See: docs/guides/grpo.md#importance-sampling-correction
-        if self.sequence_level_importance_ratios:
+        # Determine effective IS correction level.
+        _is_level = self.is_correction_level
+        if _is_level is None:
+            # Backward compat: derive from sequence_level_importance_ratios
+            _is_level = "sequence" if self.sequence_level_importance_ratios else "token"
+
+        if _is_level == "sequence":
             # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
             seq_lp_diff = ((prev_logprobs - generation_logprobs) * mask).sum(dim=-1)
             actor_importance_weights = torch.exp(seq_lp_diff).detach()
@@ -434,7 +460,18 @@ class ClippedPGLossFn(LossFunction):
             )
             # Broadcast to token dimension so we can reuse existing reduction
             actor_importance_weights_expanded = actor_importance_weights.unsqueeze(-1)
-        else:
+        elif _is_level == "sequence_mean":
+            # importance weight w_i = exp(mean_t (log π_actor − log π_behaviour))
+            # Geometric mean — more stable than exp(sum) for long sequences.
+            seq_lp_diff = masked_mean(
+                prev_logprobs - generation_logprobs, token_mask, dim=-1
+            )
+            actor_importance_weights = torch.exp(seq_lp_diff).detach()
+            actor_importance_weights = torch.nan_to_num(
+                actor_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            actor_importance_weights_expanded = actor_importance_weights.unsqueeze(-1)
+        else:  # "token"
             # Token-level correction
             actor_importance_weights_expanded = torch.exp(
                 prev_logprobs - generation_logprobs
@@ -549,7 +586,7 @@ class ClippedPGLossFn(LossFunction):
 
         # Metric: sampling importance ratio (mean over samples)
         # See: docs/guides/grpo.md#sampling-importance-ratio
-        if self.sequence_level_importance_ratios:
+        if _is_level in ("sequence", "sequence_mean"):
             sample_importance_ratio = masked_mean(
                 actor_importance_weights,
                 sample_mask,

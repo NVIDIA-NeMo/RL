@@ -1708,6 +1708,82 @@ def test_clipped_pg_loss_gspo_importance_sampling_correction():
     torch.testing.assert_close(actual_loss, expected_actor_loss, atol=1e-4, rtol=1e-3)
 
 
+def test_clipped_pg_loss_gspo_is_correction_level_sequence_mean():
+    """Tests GSPO with is_correction_level='sequence_mean' uses exp(mean) instead of exp(sum)."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
+
+    cfg = deepcopy(basic_pg_loss_test_config)
+    cfg["use_importance_sampling_correction"] = True
+    cfg["sequence_level_importance_ratios"] = True
+    cfg["is_correction_level"] = "sequence_mean"
+    cfg["token_level_loss"] = False
+    loss_fn = ClippedPGLossFn(cfg)
+
+    adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
+    prev_lp_masked = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    curr_lp_masked = torch.tensor(
+        [[-1.69315, -1.0, -0.59453]], device=device
+    )
+    ref_lp_masked = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    gen_lp_masked = torch.tensor([[-0.5, -1.5, -0.8]], device=device)
+
+    data["advantages"][0, 1:] = adv_masked
+    data["prev_logprobs"][0, 1:] = prev_lp_masked
+    data["generation_logprobs"][0, 1:] = gen_lp_masked
+    data["reference_policy_logprobs"][0, 1:] = ref_lp_masked
+
+    # --- Hand Calculation ---
+    # Key difference: IS weight = exp(MEAN(prev - gen)) instead of exp(SUM(prev - gen))
+    # prev - gen = [-0.5, 0.5, -0.2], mean = -0.0667, exp(-0.0667) = 0.9355
+    per_token_diff = prev_lp_masked - gen_lp_masked  # [-0.5, 0.5, -0.2]
+    actor_importance_weights = torch.exp(per_token_diff.mean(dim=-1).unsqueeze(-1))
+    assert torch.allclose(
+        actor_importance_weights,
+        torch.tensor([[0.9355]], device=device),
+        rtol=1e-3,
+    )
+
+    # Compare with exp(sum) version: exp(-0.2) = 0.8187 — sequence_mean is closer to 1.0
+    actor_importance_weights_sum = torch.exp(per_token_diff.sum(dim=-1).unsqueeze(-1))
+    assert torch.allclose(
+        actor_importance_weights_sum,
+        torch.tensor([[0.8187]], device=device),
+        rtol=1e-3,
+    )
+    # sequence_mean IS weight is closer to 1.0 than sum version
+    assert (actor_importance_weights - 1.0).abs() < (actor_importance_weights_sum - 1.0).abs()
+
+    # PPO ratio unchanged (still GSPO exp(mean) of log ratios)
+    log_ratios = curr_lp_masked - prev_lp_masked
+    seq_log_ratios_mean = torch.mean(log_ratios, dim=-1).unsqueeze(-1)
+    ratios = seq_log_ratios_mean.exp().repeat(1, 3)
+
+    ratios_clamped = torch.clamp(
+        ratios, 1.0 - cfg["ratio_clip_min"], 1.0 + cfg["ratio_clip_max"]
+    )
+    max_loss = torch.maximum(-adv_masked * ratios, -adv_masked * ratios_clamped)
+    importance_weighted_max_loss = actor_importance_weights * max_loss
+    expected_actor_loss = torch.mean(importance_weighted_max_loss)
+
+    input_ids = data["input_ids"]
+    dummy_logits = _create_exact_logits(
+        curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
+    )
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
+
+    actual_loss, _ = loss_fn(
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+        **loss_input,
+    )
+    torch.testing.assert_close(actual_loss, expected_actor_loss, atol=1e-4, rtol=1e-3)
+
+
 def setup_distillation_test_data(batch_size=2, seq_len=4, vocab_size=8, topk=64):
     """Setup test data for distillation loss function tests."""
     if not torch.cuda.is_available():
