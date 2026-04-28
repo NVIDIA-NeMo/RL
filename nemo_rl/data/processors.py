@@ -187,6 +187,72 @@ def sft_processor(
     return output
 
 
+def kd_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum for knowledge-distillation training on raw text.
+
+    Cross-tokenizer KD requires both student and teacher to see the same
+    raw text (no chat template, no instruction formatting), with loss
+    applied to every token. The raw text is preserved in
+    ``extra_env_info`` so the teacher worker can retokenize it with its
+    own tokenizer.
+
+    Args:
+        datum_dict: Sample dict with a ``messages`` list whose ``content``
+            fields are concatenated with newlines into the raw text.
+        task_data_spec: Task spec (unused; present for protocol parity).
+        tokenizer: Student tokenizer used for the student-side token ids.
+        max_seq_length: Truncation cap; samples longer than this are
+            zero-weighted via ``loss_multiplier``.
+        idx: Index of the sample within the dataset.
+
+    Returns:
+        DatumSpec with a single assistant-role ``message_log`` entry,
+        ``token_loss_mask`` set to all-ones (loss on every token), and
+        ``extra_env_info["raw_text"]`` carrying the joined text.
+    """
+    raw_text = "\n".join(
+        msg["content"]
+        for msg in datum_dict["messages"]
+        if isinstance(msg.get("content"), str)
+    )
+
+    token_ids = tokenizer(
+        raw_text,
+        return_tensors="pt",
+        add_special_tokens=True,
+        max_length=max_seq_length,
+        truncation=True,
+    )["input_ids"][0]
+
+    length = len(token_ids)
+    loss_multiplier = 1.0
+    if length > max_seq_length:
+        loss_multiplier = 0.0
+
+    message_log = [
+        {
+            "role": "assistant",
+            "content": raw_text,
+            "token_ids": token_ids,
+            "token_loss_mask": torch.ones_like(token_ids),
+        }
+    ]
+
+    return {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": {"raw_text": raw_text},
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+    }
+
+
 def preference_preprocessor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -718,6 +784,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
     {
         "default": math_hf_data_processor,
         "helpsteer3_data_processor": helpsteer3_data_processor,
+        "kd_data_processor": kd_data_processor,
         "math_data_processor": math_data_processor,
         "math_hf_data_processor": math_hf_data_processor,
         "multichoice_qa_processor": multichoice_qa_processor,
