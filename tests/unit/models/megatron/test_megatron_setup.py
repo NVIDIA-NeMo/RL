@@ -24,6 +24,7 @@ nemo_rl.models.megatron.setup, focusing on:
 - Model path validation
 """
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -132,6 +133,206 @@ class TestValidateModelPaths:
         assert yarn_pretrained_path != base_pretrained_path
         assert base_checkpoint_exists is False
         assert yarn_checkpoint_exists is False
+
+    def test_pretrained_checkpoint_megatron_bridge_valid(self, tmp_path):
+        """megatron_bridge format: path must be an iter dir containing run_config.yaml."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        iter_dir = tmp_path / "checkpoints" / "iter_0010000"
+        iter_dir.mkdir(parents=True)
+        (iter_dir / "run_config.yaml").touch()
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(iter_dir),
+                "format": "megatron_bridge",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        # pretrained_path is the iter dir itself, not the root
+        assert pretrained_path == str(iter_dir)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_bridge_uses_policy_model_name(
+        self, tmp_path
+    ):
+        """megatron_bridge format: hf_model_name is inferred from policy.model_name."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        iter_dir = tmp_path / "checkpoints" / "iter_0000000"
+        iter_dir.mkdir(parents=True)
+        (iter_dir / "run_config.yaml").touch()
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(iter_dir),
+                "format": "megatron_bridge",
+            },
+        }
+
+        hf_model_name, _, _ = validate_model_paths(config)
+
+        # hf_model_name is inferred from policy.model_name
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+
+    def test_pretrained_checkpoint_megatron_bridge_root_dir_resolves_to_latest_iter(
+        self, tmp_path
+    ):
+        """megatron_bridge format: root dir with iter_* subdirs resolves to the latest iter."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        ckpt_root = tmp_path / "mbridge_ckpt"
+        iter_old = ckpt_root / "iter_0000000"
+        iter_new = ckpt_root / "iter_0010000"
+        for d in (iter_old, iter_new):
+            d.mkdir(parents=True)
+            (d / "run_config.yaml").touch()
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(ckpt_root),
+                "format": "megatron_bridge",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        # Should resolve to the latest iter dir, not the root
+        assert pretrained_path == str(iter_new)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_bridge_root_dir_missing_run_config_raises(
+        self, tmp_path
+    ):
+        """megatron_bridge format: root dir whose iter subdir lacks run_config.yaml raises."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        ckpt_root = tmp_path / "mbridge_ckpt"
+        iter_dir = ckpt_root / "iter_0005000"
+        iter_dir.mkdir(parents=True)
+        # No run_config.yaml inside iter_dir
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(ckpt_root),
+                "format": "megatron_bridge",
+            },
+        }
+
+        with pytest.raises(FileNotFoundError, match="run_config.yaml"):
+            validate_model_paths(config)
+
+    def test_pretrained_checkpoint_megatron_bridge_missing_run_config_raises(
+        self, tmp_path
+    ):
+        """megatron_bridge format: raises FileNotFoundError when run_config.yaml is absent."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        # Directory exists but has no run_config.yaml and no iter_* subdirs
+        iter_dir = tmp_path / "iter_0001000"
+        iter_dir.mkdir()
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(iter_dir),
+                "format": "megatron_bridge",
+            },
+        }
+
+        with pytest.raises(FileNotFoundError, match="run_config.yaml"):
+            validate_model_paths(config)
+
+    def test_pretrained_checkpoint_megatron_lm_returns_path_directly(self, tmp_path):
+        """megatron_lm format: returns the provided path directly, always exists=True."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        mlm_root = tmp_path / "my_mlm_ckpt"
+        mlm_root.mkdir(parents=True)
+        (mlm_root / "iter_0005000").mkdir()
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(mlm_root),
+                "format": "megatron_lm",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        assert pretrained_path == str(mlm_root)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_lm_iter_dir_returns_path_directly(
+        self, tmp_path
+    ):
+        """megatron_lm format: an explicit iter dir is returned as-is, exists=True."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        mlm_iter = tmp_path / "my_mlm_ckpt" / "iter_0005000"
+        mlm_iter.mkdir(parents=True)
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(mlm_iter),
+                "format": "megatron_lm",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        assert pretrained_path == str(mlm_iter)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_lm_missing_path_raises(self, tmp_path):
+        """megatron_lm format: raises FileNotFoundError when path does not exist."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(tmp_path / "nonexistent"),
+                "format": "megatron_lm",
+            },
+        }
+
+        with pytest.raises(FileNotFoundError):
+            validate_model_paths(config)
+
+    def test_pretrained_checkpoint_unknown_format_raises(self, tmp_path):
+        """Unknown format raises ValueError."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(tmp_path),
+                "format": "some_unknown_format",
+            },
+        }
+
+        with pytest.raises(ValueError, match="Unknown pretrained_checkpoint format"):
+            validate_model_paths(config)
 
 
 @pytest.mark.mcore
@@ -1426,3 +1627,5 @@ class TestDraftSetup:
             restored_chunk.draft_model.weight,
             owner_chunk.draft_model.weight,
         )
+
+
