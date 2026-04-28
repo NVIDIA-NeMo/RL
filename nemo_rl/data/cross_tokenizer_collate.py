@@ -61,7 +61,6 @@ class TeacherCTSpec(TypedDict):
     project_teacher_to_student: bool
     max_teacher_len: int
     dp_chunk_size: int
-    use_align_fast: bool
     exact_token_match_only: bool
 
 
@@ -198,7 +197,6 @@ class CrossTokenizerCollator:
             )
             if bool(spec["project_teacher_to_student"]):
                 aligner.create_reverse_projection_matrix(device="cpu")
-            aligner.precompute_canonical_maps()
 
             self._teacher_tokenizers.append(teacher_tokenizer)
             self._aligners.append(aligner)
@@ -299,7 +297,6 @@ class CrossTokenizerCollator:
             teacher_token_mask = (teacher_attention_mask > 0).to(torch.float32)
 
             dp_chunk_size = int(spec["dp_chunk_size"])
-            use_align_fast = bool(spec["use_align_fast"])
             exact_match_only = bool(spec.get("exact_token_match_only", False))
             student_seq_len = int(student_ids.shape[1])
             teacher_seq_len = int(teacher_input_ids.shape[1])
@@ -311,12 +308,7 @@ class CrossTokenizerCollator:
             for b in range(batch_size):
                 s_t = student_ids[b : b + 1]
                 t_t = teacher_input_ids[b : b + 1]
-                if use_align_fast and aligner._student_canon_map is not None:
-                    result = aligner.align_fast(
-                        s_t, t_t, chunk_size=dp_chunk_size
-                    )
-                else:
-                    result = aligner.align(s_t, t_t, chunk_size=dp_chunk_size)
+                result = aligner.align(s_t, t_t, chunk_size=dp_chunk_size)
                 pairs = result[0]
                 aligned_pairs.append(pairs)
 
