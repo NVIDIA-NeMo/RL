@@ -62,7 +62,6 @@ teachers:
       learnable: false
       project_teacher_to_student: false
       use_char_offset: false
-      use_align_fast: true
       use_cuda_dp: false
       dp_chunk_size: 128
 
@@ -121,6 +120,7 @@ distillation:
   max_num_epochs: 1
   val_period: 1000
   val_at_start: false
+  val_micro_batch_size: 1
   topk_logits_k: 8192
   use_ipc: true
   seed: 42
@@ -237,6 +237,7 @@ data:
   prefetch_factor: 4
   train:
     dataset_name: "arrow_text"
+    processor: "kd_data_processor"
     arrow_files: null  # Override via Hydra CLI: data.train.arrow_files=/path/to/file.arrow
     prompt_file: null
     characters_per_sample: 32768  # 4096 tokens × 8 chars/token (lazy packing)

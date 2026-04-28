@@ -101,7 +101,6 @@ class TokenAlignerConfig(TypedDict, total=False):
     force_dp_only: bool                    # If True, disable char-offset path and run DP for all samples
     use_cuda_dp: bool                      # If True, patch TokenAligner chunked DP base case with CUDA kernel
     dp_chunk_size: int                     # Chunk size used by DP chunked solver
-    use_align_fast: bool                   # If True, use align_fast for DP path; default False for parity
 
 
 class OffPolicyDistillationConfig(TypedDict):
@@ -379,7 +378,6 @@ def setup(
                     )
                 ),
                 dp_chunk_size=int(ta_cfg.get("dp_chunk_size", 128)),
-                use_align_fast=bool(ta_cfg.get("use_align_fast", False)),
                 exact_token_match_only=bool(
                     per_teacher_loss_cfg.get("exact_token_match_only", False)
                 ),
@@ -505,7 +503,6 @@ def setup(
             )
             if token_aligner_cfg.get("project_teacher_to_student", False):
                 token_aligner.create_reverse_projection_matrix(device="cpu")
-            token_aligner.precompute_canonical_maps()
             if token_aligner_cfg.get("use_cuda_dp", False):
                 cuda_dp_path = (
                     Path(__file__).resolve().parents[2]
