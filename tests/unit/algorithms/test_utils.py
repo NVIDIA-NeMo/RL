@@ -192,6 +192,68 @@ def test_get_tokenizer_reraises_without_local_tokenizer_json(monkeypatch, tmp_pa
         get_tokenizer({"name": str(tmp_path)})
 
 
+class DummyDeepSeekV4Tokenizer:
+    pad_token = None
+    eos_token = "<｜end▁of▁sentence｜>"
+    bos_token = "<｜begin▁of▁sentence｜>"
+    vocab_size = 10
+
+    def get_added_vocab(self):
+        return {}
+
+    def encode(self, text, add_special_tokens=False, **kwargs):
+        assert add_special_tokens is False
+        return [ord(char) % 256 for char in text]
+
+
+def test_get_tokenizer_deepseek_v4_chat_template(monkeypatch):
+    """Test the explicit DeepSeek V4 chat template wrapper."""
+
+    monkeypatch.setattr(
+        algorithm_utils.AutoTokenizer,
+        "from_pretrained",
+        lambda *args, **kwargs: DummyDeepSeekV4Tokenizer(),
+    )
+
+    tokenizer = get_tokenizer(
+        {
+            "name": "dummy-dsv4",
+            "chat_template": "deepseek_v4",
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+    )
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Solve 1+1."}],
+        tokenize=False,
+    )
+
+    assert (
+        prompt
+        == "<｜begin▁of▁sentence｜><｜User｜>Solve 1+1.<｜Assistant｜></think>"
+    )
+
+
+def test_get_tokenizer_auto_detects_deepseek_v4_model_type(monkeypatch, tmp_path):
+    """Test that local deepseek_v4 config.json selects the built-in wrapper."""
+
+    (tmp_path / "config.json").write_text('{"model_type": "deepseek_v4"}')
+    monkeypatch.setattr(
+        algorithm_utils.AutoTokenizer,
+        "from_pretrained",
+        lambda *args, **kwargs: DummyDeepSeekV4Tokenizer(),
+    )
+
+    tokenizer = get_tokenizer({"name": str(tmp_path)})
+
+    prompt_tokens = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Hi"}],
+    )
+    expected_prompt = "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>"
+
+    assert prompt_tokens == tokenizer.encode(expected_prompt, add_special_tokens=False)
+
+
 def test_maybe_pad_last_batch():
     """Test maybe_pad_last_batch function for various scenarios"""
     # Test case 1: No padding needed
