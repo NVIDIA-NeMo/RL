@@ -214,11 +214,194 @@ class SGLangGeneration(GenerationInterface):
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
-        """Initialize the collective communication.
+        """No-op for the SGLang non-colocated-NCCL refit path.
 
-        TODO:       if weight updates via NCCL are needed in the future.
+        Kept for parity with vLLM's signature so the existing
+        ``policy_generation.init_collective(...)`` call site in
+        ``grpo.setup`` can invoke us without branching. The non-colocated
+        SGLang NCCL path uses ``init_collective_nccl_bridge`` below
+        instead, which sets up a slime-style bridge ``ProcessGroup``
+        with only ``train rank 0`` + every SGLang TP rank.
         """
         return []
+
+    def init_collective_nccl_bridge(
+        self,
+        train_master_address: str,
+        train_master_port: int,
+        train_world_size: int = 1,
+        group_name: str = "nrl-sglang-bridge",
+    ) -> bool:
+        """Set up the SGLang side of the slime-style NCCL bridge group.
+
+        Asks each SGLang engine's HTTP master to call
+        ``torch.distributed.init_process_group(backend='nccl',
+        init_method=f'tcp://{train_master_address}:{train_master_port}',
+        world_size=train_world_size + sum(engine_tp_sizes),
+        rank=cumulative_rank_offset + local_tp_rank,
+        group_name=group_name)``.
+
+        The training-side counterpart (``train rank 0`` only) joins the
+        same TCPStore at ``rank=0`` with a matching ``group_name``. Other
+        train ranks stay out of the bridge group entirely — they keep
+        their existing Megatron torch.distributed world untouched. This
+        is the slime topology and the reason the bridge is cheap to set
+        up: only a tiny handful of process-group joins, not a per-train-
+        rank rendezvous.
+
+        Args:
+            train_master_address: TCPStore host (the train cluster's
+                Ray head IP).
+            train_master_port: TCPStore port.
+            train_world_size: Number of train ranks that will join the
+                bridge. Always ``1`` in v1 (only train rank 0 joins);
+                kept as a parameter for forward-compat with future
+                multi-sender designs.
+            group_name: Identifier for the bridge ``ProcessGroup``;
+                must match the train side.
+
+        Returns:
+            True iff every engine's master successfully joined the bridge.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        # Bridge layout: [train ranks 0..train_world_size-1] then
+        # [engine 0 TP rank 0..tp-1] then [engine 1 TP rank 0..tp-1] ...
+        num_engines = self.dp_size
+        engine_tp = self.gpus_per_server
+        bridge_world_size = train_world_size + num_engines * engine_tp
+
+        rank_offsets = [
+            train_world_size + i * engine_tp for i in range(num_engines)
+        ]
+
+        logger.info(
+            f"[sglang nccl bridge] init: train_world_size={train_world_size}, "
+            f"num_engines={num_engines}, engine_tp={engine_tp}, "
+            f"bridge_world_size={bridge_world_size}, "
+            f"rank_offsets={rank_offsets}, "
+            f"master={train_master_address}:{train_master_port}, "
+            f"group_name={group_name!r}"
+        )
+
+        # Dispatch ``init_weights_update_group`` to every engine's master
+        # with that engine's ``rank_offset``. Only the model owner of
+        # each TP group actually issues the HTTP POST (others
+        # short-circuit in the worker), so we get exactly
+        # ``num_engines`` real posts.
+        try:
+            futures = self.worker_group.run_all_workers_multiple_data(
+                "init_weights_update_group",
+                rank_offset=rank_offsets,
+                run_rank_0_only_axes=["tensor_parallel"],
+                common_kwargs={
+                    "master_address": train_master_address,
+                    "master_port": int(train_master_port),
+                    "world_size": int(bridge_world_size),
+                    "group_name": group_name,
+                    "backend": "nccl",
+                },
+            )
+            results = ray.get(futures)
+            results = [r for r in results if r is not None]
+            ok = all(results) if results else True
+            if ok:
+                logger.info(
+                    f"[sglang nccl bridge] all {num_engines} engines joined "
+                    f"group={group_name!r}"
+                )
+            else:
+                logger.warning(
+                    f"[sglang nccl bridge] not all engines joined "
+                    f"group={group_name!r}; results={results}"
+                )
+            return ok
+        except Exception as e:
+            logger.error(
+                f"[sglang nccl bridge] init_weights_update_group raised: {e}"
+            )
+            return False
+
+    def update_weights_via_nccl_bridge(
+        self,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "nrl-sglang-bridge",
+        flush_cache: bool = False,
+        load_format: Optional[str] = None,
+    ) -> list[ray.ObjectRef]:
+        """Tell every SGLang engine to receive the next batch via NCCL.
+
+        Returns ``ray.ObjectRef`` futures so the train-side caller can
+        issue the matching ``dist.broadcast(send=...)`` calls in parallel
+        without deadlocking on the synchronous HTTP recv side.
+
+        The train-side counterpart is
+        ``MegatronPolicyWorker.broadcast_weights_via_nccl_to_sglang``
+        which prefers to POST directly to engine HTTP servers (bypasses
+        Ray for lower latency on the metadata RPC). This method is kept
+        as a Ray-actor-call alternative for callers that already have
+        the SGLangGeneration handle in scope (e.g. driver-side
+        diagnostics or the fallback path).
+
+        Args:
+            names: HF-format parameter names, in broadcast order.
+            dtypes: Per-name dtype strings (SGLang wire format, e.g.
+                ``"bfloat16"``).
+            shapes: Per-name shape lists.
+            group_name: Bridge group name. Must match the
+                ``init_collective_nccl_bridge`` call.
+            flush_cache: ``True`` for the LAST batch of a refit so
+                SGLang invalidates its prefix cache.
+            load_format: Forwarded to SGLang. ``None`` (default) routes
+                to the standard N-broadcast-per-RPC path;
+                ``"flattened_bucket"`` routes to the
+                ``_update_bucketed_weights_from_distributed`` path
+                (one big flat broadcast per RPC) which the train side
+                must mirror.
+
+        Returns:
+            List of Ray futures, one per engine master worker. Caller
+            should ``ray.get(...)`` AFTER issuing the matching
+            ``dist.broadcast(send=...)`` on the train side.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        return self.worker_group.run_all_workers_single_data(
+            "update_weights_from_distributed",
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            flush_cache=flush_cache,
+            load_format=load_format,
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+
+    def destroy_collective_nccl_bridge(
+        self, group_name: str = "nrl-sglang-bridge"
+    ) -> bool:
+        """Best-effort teardown of the bridge group on all engines.
+
+        Idempotent and tolerant of "no such group" errors.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            return True
+        try:
+            futures = self.worker_group.run_all_workers_single_data(
+                "destroy_weights_update_group",
+                group_name=group_name,
+                run_rank_0_only_axes=["tensor_parallel"],
+            )
+            results = ray.get(futures)
+            return all(r for r in results if r is not None)
+        except Exception as e:
+            logger.warning(
+                f"[sglang nccl bridge] destroy raised: {e}"
+            )
+            return False
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

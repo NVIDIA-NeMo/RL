@@ -293,6 +293,245 @@ class SGLangGenerationWorker:
         )
         return False
 
+    # ------------------------------------------------------------------
+    # NCCL bridge: weight transfer via torch.distributed broadcast.
+    #
+    # Used by the non-colocated SGLang refit path (slime-style: train rank
+    # 0 + every SGLang TP rank join a SHARED named ProcessGroup spanning
+    # the two clusters; per-tensor ``dist.broadcast`` at NCCL speed).
+    # The three wrappers below POST to SGLang's HTTP endpoints which in
+    # turn drive the SGLang scheduler subprocesses on each TP rank. Only
+    # the engine's HTTP master (``is_model_owner`` and
+    # ``base_url is not None``) actually issues the POST; for multi-node
+    # SGLang servers the slave-node workers are no-ops because the
+    # master's request fans out internally via SGLang's TP NCCL group.
+    # ------------------------------------------------------------------
+
+    def init_weights_update_group(
+        self,
+        master_address: str,
+        master_port: int,
+        rank_offset: int,
+        world_size: int,
+        group_name: str = "nrl-sglang-bridge",
+        backend: str = "nccl",
+    ) -> bool:
+        """Tell SGLang to join an external NCCL ``ProcessGroup`` for weight updates.
+
+        Wraps SGLang's HTTP ``/init_weights_update_group`` endpoint, which
+        triggers a ``torch.distributed.init_process_group(backend=...,
+        init_method=tcp://{master_address}:{master_port},
+        world_size=..., rank=rank_offset+local_tp_rank,
+        group_name=group_name)`` inside SGLang's scheduler subprocesses.
+
+        The training-side counterpart is
+        ``MegatronPolicyWorker.init_collective_for_sglang_nccl`` (only
+        train rank 0 joins; other train ranks stay in Megatron's existing
+        torch.distributed world untouched, matching slime's topology).
+
+        Args:
+            master_address: Host where the bridge ``TCPStore`` lives
+                (typically the train-cluster's master IP).
+            master_port: Port for the bridge ``TCPStore``.
+            rank_offset: Rank of THIS engine's TP rank 0 in the bridge
+                group. With ``+1`` for train rank 0, the cumulative
+                TP-size offset across engines, e.g. for two engines with
+                TP=8 each: rank_offset_engine0=1, rank_offset_engine1=9.
+            world_size: Total bridge ranks (= ``1 + sum(engine_tp_sizes)``).
+            group_name: Unique identifier for the bridge group; must
+                match what the train side passes to
+                ``init_process_group``.
+            backend: Distributed backend, ``"nccl"`` (GPU) or
+                ``"gloo"`` (CPU debugging).
+
+        Returns:
+            True on success or if this worker is a non-master (slave-node
+            TP rank); False on HTTP failure.
+        """
+        if not self.is_model_owner or self.base_url is None:
+            return True
+        url = f"{self.base_url}/init_weights_update_group"
+        body = {
+            "master_address": master_address,
+            "master_port": int(master_port),
+            "rank_offset": int(rank_offset),
+            "world_size": int(world_size),
+            "group_name": group_name,
+            "backend": backend,
+        }
+        try:
+            # init_weights_update_group is a one-shot rendezvous; it
+            # blocks until ALL ``world_size`` participants (train rank 0
+            # + every SGLang TP rank in every engine) have joined the
+            # TCPStore. 1800s gives ~30 min of slack for slow first-call
+            # NCCL warmup.
+            timeout_s = float(
+                os.environ.get("NRL_SGLANG_BRIDGE_INIT_TIMEOUT_S", "1800")
+            )
+            response = requests.post(url, json=body, timeout=timeout_s)
+            if response.status_code == 200:
+                logger.info(
+                    f"[SGLang Worker] Rank {self.global_rank} joined NCCL "
+                    f"bridge group={group_name!r} master={master_address}:"
+                    f"{master_port} world_size={world_size} "
+                    f"rank_offset={rank_offset} at {self.base_url}"
+                )
+                return True
+            logger.warning(
+                f"[SGLang Worker] Rank {self.global_rank} "
+                f"init_weights_update_group group={group_name!r} returned "
+                f"status {response.status_code}: {response.text[:200]}"
+            )
+            return False
+        except Exception as e:
+            logger.warning(
+                f"[SGLang Worker] Rank {self.global_rank} "
+                f"init_weights_update_group group={group_name!r} raised: {e}"
+            )
+            return False
+
+    def update_weights_from_distributed(
+        self,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "nrl-sglang-bridge",
+        flush_cache: bool = False,
+        load_format: Optional[str] = None,
+    ) -> bool:
+        """Tell SGLang to receive a batch of weights via the bridge NCCL group.
+
+        Wraps SGLang's HTTP ``/update_weights_from_distributed`` endpoint.
+        For each ``(name, dtype, shape)`` triple in the batch SGLang's
+        scheduler subprocesses allocate a recv buffer and call
+        ``dist.broadcast(recv=buf, src=0, group=...)`` on the bridge group.
+        The train-side counterpart simultaneously calls
+        ``dist.broadcast(send=tensor, src=0, group=...)``. NCCL transfers
+        each tensor; SGLang then hands the result to ``model.load_weights``
+        which slices to the rank's TP shard.
+
+        Args:
+            names: Tensor names in HF parameter format, in the order the
+                train side will broadcast them.
+            dtypes: One dtype string per name. Must use the SGLang
+                wire-format style (``"bfloat16"``, ``"float8_e4m3fn"``,
+                etc.) — i.e. ``str(t.dtype).removeprefix("torch.")``.
+            shapes: One shape list per name (e.g. ``[1024, 4096]``).
+            group_name: The same name passed to ``init_weights_update_group``.
+            flush_cache: Forwarded to SGLang; ``True`` invalidates the
+                prefix cache after this batch (typical for the LAST
+                bucket of a refit).
+            load_format: ``"flattened_bucket"`` to use SGLang's
+                ``_update_bucketed_weights_from_distributed`` path
+                (one ``dist.broadcast(recv)`` per RPC, on a flat
+                ``uint8`` buffer concatenated from all named tensors).
+                The train side must broadcast the matching flat buffer
+                in this case. ``None`` (default) routes to SGLang's
+                standard path which does N async broadcasts per RPC,
+                one per tensor.
+
+        Returns:
+            ``True`` iff SGLang reports body-level ``success=True``.
+            We deliberately surface the body-level status because
+            SGLang returns HTTP 200 even when ``model.load_weights``
+            partially fails internally.
+        """
+        if not self.is_model_owner or self.base_url is None:
+            return True
+        url = f"{self.base_url}/update_weights_from_distributed"
+        body = {
+            "names": names,
+            "dtypes": dtypes,
+            "shapes": shapes,
+            "group_name": group_name,
+            "flush_cache": bool(flush_cache),
+        }
+        if load_format is not None:
+            body["load_format"] = load_format
+        try:
+            # Each call blocks on the engine side until ``len(names)``
+            # matching broadcasts from train rank 0 land. 7200s ceiling
+            # is generous; a typical 1-GiB bucket round-trips in seconds
+            # on EFA.
+            timeout_s = float(
+                os.environ.get("NRL_SGLANG_UPDATE_DIST_TIMEOUT_S", "7200")
+            )
+            response = requests.post(url, json=body, timeout=timeout_s)
+            if response.status_code != 200:
+                logger.warning(
+                    f"[SGLang Worker] Rank {self.global_rank} "
+                    f"update_weights_from_distributed (n={len(names)}, "
+                    f"first={names[0] if names else None}) returned status "
+                    f"{response.status_code}: {response.text[:200]}"
+                )
+                return False
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {}
+            body_success = payload.get("success", True)
+            if not body_success:
+                logger.warning(
+                    f"[SGLang Worker] Rank {self.global_rank} "
+                    f"update_weights_from_distributed body success=False "
+                    f"message={payload.get('message', '')[:300]!r}"
+                )
+                return False
+            logger.info(
+                f"[SGLang Worker] Rank {self.global_rank} received "
+                f"{len(names)} tensors via NCCL group={group_name!r} "
+                f"at {self.base_url}"
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                f"[SGLang Worker] Rank {self.global_rank} "
+                f"update_weights_from_distributed raised: {e}"
+            )
+            return False
+
+    def destroy_weights_update_group(
+        self, group_name: str = "nrl-sglang-bridge"
+    ) -> bool:
+        """Tell SGLang to tear down the NCCL bridge group.
+
+        Wraps SGLang's HTTP ``/destroy_weights_update_group`` endpoint.
+        Idempotent and tolerant of "no such group" errors (e.g. if the
+        engine just started and never joined).
+
+        Should be called at training-shutdown; safe to omit on hot
+        paths since SGLang cleans up at process exit anyway.
+        """
+        if not self.is_model_owner or self.base_url is None:
+            return True
+        url = f"{self.base_url}/destroy_weights_update_group"
+        try:
+            response = requests.post(
+                url, json={"group_name": group_name}, timeout=120
+            )
+            if response.status_code == 200:
+                logger.info(
+                    f"[SGLang Worker] Rank {self.global_rank} destroyed "
+                    f"NCCL bridge group={group_name!r} at {self.base_url}"
+                )
+                return True
+            # 4xx is OK (group might not exist); only WARN for 5xx
+            if 400 <= response.status_code < 500:
+                return True
+            logger.warning(
+                f"[SGLang Worker] Rank {self.global_rank} "
+                f"destroy_weights_update_group group={group_name!r} "
+                f"returned {response.status_code}: {response.text[:200]}"
+            )
+            return False
+        except Exception as e:
+            logger.warning(
+                f"[SGLang Worker] Rank {self.global_rank} "
+                f"destroy_weights_update_group group={group_name!r} "
+                f"raised: {e}"
+            )
+            return True  # tolerant on shutdown
+
     def get_gpu_uuids(self) -> list[str]:
         """Get list of GPU UUIDs used by this SGLang server.
 
@@ -408,7 +647,17 @@ class SGLangGenerationWorker:
             # Create connector with connection pool limit
             self.connector = aiohttp.TCPConnector(limit=512, limit_per_host=512)
             # Create session with timeout
-            timeout = aiohttp.ClientTimeout(total=300)  # 5 minutes timeout
+            # Default 5 min is too tight for the non-colocated NCCL refit
+            # path: a fresh-after-refit /generate can take much longer
+            # than steady-state because SGLang needs to rebuild kernels
+            # / kv caches / etc. against the freshly transferred weights
+            # (slurm-2307 / slurm-2312 ran into 300s timeouts on the
+            # first post-refit /generate, slurm-2328 confirmed 1800s
+            # works). Override via NRL_SGLANG_GENERATE_TIMEOUT_S.
+            timeout_s = float(
+                os.environ.get("NRL_SGLANG_GENERATE_TIMEOUT_S", "1800")
+            )
+            timeout = aiohttp.ClientTimeout(total=timeout_s)
             self.session = aiohttp.ClientSession(
                 connector=self.connector, timeout=timeout
             )
@@ -458,8 +707,13 @@ class SGLangGenerationWorker:
                 response.raise_for_status()
                 result = await response.json()
         except Exception as e:
+            # Surface the exception TYPE explicitly: many aiohttp
+            # exceptions (e.g. ``asyncio.TimeoutError``) have empty
+            # ``__str__``, so the original log was useless.
             logger.error(
-                f"[SGLang Worker] Rank {self.global_rank} Request failed for input_len={len(input_ids)}: {e}"
+                f"[SGLang Worker] Rank {self.global_rank} Request failed "
+                f"for input_len={len(input_ids)}: "
+                f"{type(e).__name__}({e!r})"
             )
             raise
 
@@ -521,7 +775,15 @@ class SGLangGenerationWorker:
             "Content-Type": "application/json; charset=utf-8",
         }
 
-        max_wait_time = 300  # 5 minutes timeout
+        # SGLang server cold-start = container launch + model shard load +
+        # TP NCCL init + cuda graphs (if enabled). For large models like
+        # GLM-4.5-Air (47 shards * ~8s = ~6 min on slow filesystems) the
+        # 300s default is far too tight and fires a TimeoutError even
+        # though the server is making progress. Bumped to 1800s by
+        # default; override via NRL_SGLANG_SERVER_STARTUP_TIMEOUT_S.
+        max_wait_time = int(
+            os.environ.get("NRL_SGLANG_SERVER_STARTUP_TIMEOUT_S", "1800")
+        )
         start_time = time.time()
         with requests.Session() as session:
             while True:

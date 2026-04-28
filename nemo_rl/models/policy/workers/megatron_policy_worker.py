@@ -20,6 +20,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Iterator, Optional, TypeVar, cast
 
 import ray
+import requests
 import torch
 from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
@@ -1108,6 +1109,388 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             src=0,
             post_iter_func=lambda x: x[1],
         )
+
+    @torch.no_grad()
+    def init_collective_for_sglang_nccl(
+        self,
+        master_address: str,
+        master_port: int,
+        bridge_world_size: int,
+        group_name: str = "nrl-sglang-bridge",
+    ) -> bool:
+        """Train rank 0 ONLY joins the slime-style NCCL bridge group.
+
+        Other train ranks are no-ops; they keep their existing Megatron
+        torch.distributed world untouched. The bridge group is a
+        SECONDARY ``ProcessGroup`` that coexists with Megatron's groups
+        in the same process — created via the ``_new_process_group_helper``
+        + ``PrefixStore`` pattern slime uses (see
+        slime/utils/distributed_utils.py:init_process_group). Standard
+        ``torch.distributed.init_process_group(...)`` would clobber the
+        already-initialized default group; ``new_group(ranks=...)`` would
+        require all ranks to be part of the same world. The lower-level
+        helper avoids both.
+
+        Args:
+            master_address: TCPStore host (typically the train cluster's
+                Ray head IP).
+            master_port: TCPStore port.
+            bridge_world_size: Total ranks in the bridge group
+                (= ``1 + sum(engine_tp_sizes)``). Train rank 0 is the
+                ONLY train rank that joins; the rest of the world is
+                taken by SGLang's TP ranks.
+            group_name: Bridge group identifier; must match what
+                ``SGLangGeneration.init_collective_nccl_bridge`` passed
+                to every engine's ``init_weights_update_group``.
+
+        Returns:
+            True on success or for non-rank-0 (no-op).
+        """
+        if self.rank != 0:
+            return True
+
+        # Lazy import: the helper APIs are semi-private and may shift
+        # across PyTorch versions; we want the import error to surface
+        # on the SGLang-noncolocated-NCCL path only, not on every train
+        # worker startup.
+        from datetime import timedelta as _timedelta
+
+        from packaging.version import parse as _V
+        from torch.distributed.distributed_c10d import (
+            Backend,
+            PrefixStore,
+            _new_process_group_helper,
+            _world,
+            default_pg_timeout,
+            rendezvous,
+        )
+
+        # Allow override via env var so the user can lift the default
+        # rendezvous timeout (default 10 min) for slow first-init.
+        timeout_s = float(
+            os.environ.get("NRL_SGLANG_BRIDGE_INIT_TIMEOUT_S", "1800")
+        )
+        timeout = (
+            _timedelta(seconds=timeout_s)
+            if timeout_s > 0
+            else default_pg_timeout
+        )
+
+        init_method = f"tcp://{master_address}:{master_port}"
+        bridge_rank = 0  # train rank 0 only
+
+        rendezvous_iterator = rendezvous(
+            init_method, bridge_rank, bridge_world_size, timeout=timeout
+        )
+        store, rank, world_size = next(rendezvous_iterator)
+        store.set_timeout(timeout)
+        store = PrefixStore(group_name, store)
+
+        pg_options_param = (
+            "backend_options"
+            if _V(torch.__version__) >= _V("2.6")
+            else "pg_options"
+        )
+        pg, _ = _new_process_group_helper(
+            world_size,
+            rank,
+            [],
+            Backend("nccl"),
+            store,
+            group_name=group_name,
+            **{pg_options_param: None},
+            timeout=timeout,
+        )
+        # Register the rank mapping so c10d's group bookkeeping knows
+        # the bridge group's world. Without this, dist.broadcast on the
+        # new group can hit "rank not in group" errors.
+        _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+
+        self._sglang_bridge_pg = pg
+        self._sglang_bridge_group_name = group_name
+        self._sglang_bridge_world_size = world_size
+
+        print(
+            f"[sglang nccl bridge] {self} rank 0 joined "
+            f"group={group_name!r} world_size={world_size} "
+            f"master={master_address}:{master_port}",
+            flush=True,
+        )
+        return True
+
+    @torch.no_grad()
+    def broadcast_weights_via_nccl_to_sglang(
+        self,
+        engine_urls: list[str],
+        engine_tp_size: int,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> bool:
+        """Slime-style NCCL bridge weight transfer to SGLang (non-colocated).
+
+        Single-phase **interleaved** iterate-and-broadcast: all train
+        ranks call ``next`` on the Megatron-Bridge HF-export iterator in
+        lockstep (so the internal PP/TP/EP collectives drive correctly),
+        and rank 0 buckets each yielded tensor on GPU. As soon as the
+        bucket reaches ``NRL_REFIT_BUCKET_BYTES``, rank 0 ships it via:
+
+            (a) a parallel HTTP POST to every engine's
+                ``/update_weights_from_distributed`` (BLOCKS on the
+                engine side until the matching ``dist.broadcast(recv)``
+                lands in SGLang's TP scheduler), and
+            (b) async ``dist.broadcast(send=flat_tensor, src=0,
+                group=bridge_pg)`` on the flattened bucket.
+
+        Once both halves complete, rank 0 drops the bucket's tensor refs
+        so Megatron's CUDA allocator can reuse the memory, then resumes
+        iteration. Non-sender ranks just iterate and discard.
+
+        Why interleaved (vs collect-then-send): for NCCL we keep tensors
+        on GPU (no CPU detour); accumulating the full HF model on a
+        single GPU would OOM.  The interleaved design keeps peak GPU
+        RAM bounded by ``NRL_REFIT_BUCKET_BYTES`` (default ~1 GiB).
+
+        Why a single ``flattened_bucket`` broadcast (vs N broadcasts):
+        SGLang's standard ``update_weights_from_distributed`` path
+        does N async broadcasts per RPC (one per tensor); the
+        ``flattened_bucket`` path concatenates everything into ONE
+        ``uint8`` buffer and does ONE broadcast per RPC. The latter is
+        what slime / PR #2267 use in production and is the upstream-
+        blessed pattern; we observed in slurm-2307 / slurm-2312 that
+        the standard path leaves SGLang's scheduler in a wedged state
+        for /generate after a non-trivial refit.
+
+        Why parallel HTTP threads (not Ray actor RPCs): the train
+        workers are in a different Ray actor group from the SGLang
+        workers; passing actor handles around is awkward, but every
+        train rank already knows the SGLang HTTP base URLs (passed in
+        via ``engine_urls``). Direct HTTP also lets us run multiple
+        engine POSTs concurrently without going through the Ray
+        scheduler.
+
+        Args:
+            engine_urls: SGLang server base URLs, one per engine.
+            engine_tp_size: TP size per engine. Used for logging /
+                sanity checks only; the bridge layout was set up by
+                ``init_collective_for_sglang_nccl`` and the matching
+                ``init_collective_nccl_bridge`` on the SGLang side.
+            kv_scales: Optional FP8 KV cache scales (forwarded to the
+                shared HF iterator).
+
+        Returns:
+            True on success.
+
+        Env vars:
+            NRL_REFIT_BUCKET_BYTES: bytes per NCCL+HTTP bucket
+                (default 1 GiB).
+            NRL_SGLANG_NCCL_HTTP_TIMEOUT_S: timeout for the metadata
+                HTTP POSTs that drive the engine's recv side
+                (default 7200s).
+        """
+        import time as _time
+        from concurrent.futures import ThreadPoolExecutor
+
+        is_sender = self.rank == 0
+
+        if is_sender:
+            if not hasattr(self, "_sglang_bridge_pg"):
+                raise RuntimeError(
+                    "broadcast_weights_via_nccl_to_sglang: bridge "
+                    "ProcessGroup is not initialized. Call "
+                    "init_collective_for_sglang_nccl first (via grpo.setup)."
+                )
+            pg = self._sglang_bridge_pg
+            group_name = self._sglang_bridge_group_name
+
+            BUCKET_BYTES = int(
+                os.environ.get("NRL_REFIT_BUCKET_BYTES", str(1 * 1024**3))
+            )
+            http_timeout_s = float(
+                os.environ.get("NRL_SGLANG_NCCL_HTTP_TIMEOUT_S", "7200")
+            )
+
+            sessions = {url: requests.Session() for url in engine_urls}
+            pool = ThreadPoolExecutor(
+                max_workers=max(len(engine_urls), 4),
+                thread_name_prefix="sglang-nccl-http",
+            )
+
+            print(
+                f"[sglang nccl bridge] {self} interleaved iterate+broadcast "
+                f"begin (engines={len(engine_urls)}, "
+                f"engine_tp_size={engine_tp_size}, "
+                f"bucket_bytes={BUCKET_BYTES / 1024**3:.2f} GiB)",
+                flush=True,
+            )
+
+            cur_bucket: list[tuple[str, torch.Tensor]] = []
+            cur_bytes = 0
+            tensor_count = 0
+            bucket_count = 0
+
+            def _post_metadata(url: str, payload: dict) -> tuple[bool, str]:
+                """Background HTTP POST that BLOCKS on the engine until
+                its TP scheduler completes the matching recv broadcast.
+
+                Surfaces SGLang's body-level success/message: SGLang
+                returns HTTP 200 even when ``model.load_weights`` raises
+                or partially fails (with ``success=False`` in the JSON
+                body).
+                """
+                try:
+                    resp = sessions[url].post(
+                        f"{url}/update_weights_from_distributed",
+                        json=payload,
+                        headers={"Content-Type": "application/json"},
+                        timeout=http_timeout_s,
+                    )
+                    if resp.status_code != 200:
+                        return False, (
+                            f"status={resp.status_code} "
+                            f"body={resp.text[:500]}"
+                        )
+                    try:
+                        body = resp.json()
+                    except Exception:
+                        return True, "ok"
+                    if not body.get("success", True):
+                        return False, (
+                            f"server-side success=False, message="
+                            f"{body.get('message', '')[:500]!r}"
+                        )
+                    return True, "ok"
+                except Exception as e:
+                    return False, repr(e)
+
+            def _flush(is_last: bool) -> None:
+                """Pack the bucket as a SINGLE flattened uint8 tensor,
+                fan out parallel HTTP POSTs, and issue ONE async
+                ``dist.broadcast``. Matches SGLang's
+                ``_update_bucketed_weights_from_distributed`` path."""
+                nonlocal cur_bucket, cur_bytes, tensor_count, bucket_count
+                if not cur_bucket:
+                    return
+
+                names = [n for n, _ in cur_bucket]
+                dtypes = [
+                    str(t.dtype).removeprefix("torch.")
+                    for _, t in cur_bucket
+                ]
+                shapes = [list(t.shape) for _, t in cur_bucket]
+
+                # Flatten the bucket into ONE contiguous uint8 buffer
+                # whose byte layout exactly matches what SGLang's
+                # ``FlattenedTensorBucket(named_tensors=...)`` would
+                # produce on the receive side.
+                flat_parts = [
+                    t.flatten().contiguous().view(torch.uint8)
+                    for _, t in cur_bucket
+                ]
+                flattened = torch.cat(flat_parts, dim=0)
+
+                payload = {
+                    "names": names,
+                    "dtypes": dtypes,
+                    "shapes": shapes,
+                    "group_name": group_name,
+                    "flush_cache": is_last,
+                    # Routes the SGLang server-side to
+                    # _update_bucketed_weights_from_distributed which
+                    # allocates a matching flat recv tensor and does
+                    # ONE broadcast per RPC.
+                    "load_format": "flattened_bucket",
+                }
+
+                # Fire HTTP POSTs in parallel; each blocks on the
+                # engine side until the matching recv broadcast
+                # arrives.
+                http_futures = [
+                    pool.submit(_post_metadata, url, payload)
+                    for url in engine_urls
+                ]
+
+                # Issue the matching ONE async broadcast for the bucket.
+                h = torch.distributed.broadcast(
+                    flattened, src=0, group=pg, async_op=True
+                )
+                h.wait()
+
+                for fut in http_futures:
+                    ok, info = fut.result()
+                    if not ok:
+                        raise RuntimeError(
+                            f"sglang nccl bridge: engine HTTP failed for "
+                            f"bucket {bucket_count} (size={len(cur_bucket)}, "
+                            f"first={cur_bucket[0][0]}, "
+                            f"flat_bytes={flattened.numel()}): {info}"
+                        )
+
+                tensor_count += len(cur_bucket)
+                bucket_count += 1
+
+                # Drop GPU tensor refs so Megatron's allocator can
+                # reuse the memory while we keep iterating.
+                del flattened, flat_parts
+                cur_bucket = []
+                cur_bytes = 0
+
+            send_t0 = _time.perf_counter()
+            send_last_log_t = send_t0
+
+            try:
+                # All ranks must call next() in lockstep to drive the
+                # Megatron-Bridge PP/TP/EP collectives. Rank 0 also
+                # buckets and broadcasts.
+                for name, tensor in self._iter_params_with_optional_kv_scales(
+                    kv_scales=kv_scales
+                ):
+                    cur_bucket.append((name, tensor.contiguous().cuda()))
+                    cur_bytes += tensor.numel() * tensor.element_size()
+                    if cur_bytes >= BUCKET_BYTES:
+                        _flush(is_last=False)
+                        now = _time.perf_counter()
+                        if now - send_last_log_t > 30.0:
+                            rate = tensor_count / max(now - send_t0, 1e-9)
+                            print(
+                                f"[sglang nccl bridge] {self} progress "
+                                f"{tensor_count} tensors broadcast "
+                                f"({bucket_count} buckets, "
+                                f"{rate:.1f} tensors/s)",
+                                flush=True,
+                            )
+                            send_last_log_t = now
+
+                # Final bucket flush carries flush_cache=True so SGLang
+                # invalidates its prefix cache against the new weights.
+                _flush(is_last=True)
+
+                send_dt = _time.perf_counter() - send_t0
+                print(
+                    f"[sglang nccl bridge] {self} complete - {tensor_count} "
+                    f"tensors in {bucket_count} buckets across "
+                    f"{len(engine_urls)} engine(s) in {send_dt:.1f}s "
+                    f"({tensor_count / max(send_dt, 1e-9):.1f} tensors/s)",
+                    flush=True,
+                )
+
+                return True
+            finally:
+                pool.shutdown(wait=True)
+                for s in sessions.values():
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                cur_bucket = []
+                gc.collect()
+                torch.cuda.empty_cache()
+        else:
+            # Non-sender ranks: just drive the Megatron-Bridge collectives
+            # by iterating through the generator and discarding.
+            for _name, _tensor in self._iter_params_with_optional_kv_scales(
+                kv_scales=kv_scales
+            ):
+                pass
+            return True
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)

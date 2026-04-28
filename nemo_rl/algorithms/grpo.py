@@ -725,23 +725,111 @@ def setup(
 
     # if it is not colocated inference, initialize collective communication for update weights
     if not colocated_inference:
-        t0 = time.perf_counter()
-        ip, port = train_cluster.get_master_address_and_port()
-        print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
-        # world includes all training workers and all inference workers
-        train_world_size = train_cluster.world_size()
-        inference_world_size = inference_nodes * inference_gpus_per_node
-        world_size = train_world_size + inference_world_size
-        # init collective
-        futures_train = policy.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )
-        futures_inference = policy_generation.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )  # type: ignore
-        # wait for all futures to complete
-        ray.get(futures_train + futures_inference)
-        worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+        # Two paths for non-colocated inference:
+        #
+        #   - vLLM: an NCCL ``StatelessProcessGroup`` spanning ALL train
+        #     ranks + ALL inference ranks; weights flow via
+        #     ``packed_broadcast_producer/consumer``.
+        #
+        #   - SGLang: a slime-style NCCL bridge ``ProcessGroup`` spanning
+        #     ONLY ``train rank 0`` + every SGLang TP rank. Other train
+        #     ranks stay in Megatron's existing torch.distributed world
+        #     untouched. Weights flow via per-bucket ``dist.broadcast``
+        #     on the bridge group, with engine-side metadata POSTed via
+        #     HTTP. See ``MegatronPolicyWorker.broadcast_weights_via_nccl_to_sglang``
+        #     and ``SGLangGeneration.init_collective_nccl_bridge``.
+        if isinstance(policy_generation, SGLangGeneration):
+            t0 = time.perf_counter()
+            train_ip, _ = train_cluster.get_master_address_and_port()
+            # Dedicated bridge port: the train cluster's Ray master port
+            # (typically 6379) is in use, so we pick a different one.
+            # Override with NRL_SGLANG_BRIDGE_PORT.
+            bridge_port = int(
+                os.environ.get("NRL_SGLANG_BRIDGE_PORT", "29500")
+            )
+            num_engines = policy_generation.dp_size
+            engine_tp = policy_generation.gpus_per_server
+            # Bridge layout: 1 train rank + sum(engine_tp_sizes).
+            bridge_world_size = 1 + num_engines * engine_tp
+            bridge_group_name = os.environ.get(
+                "NRL_SGLANG_BRIDGE_GROUP_NAME", "nrl-sglang-bridge"
+            )
+            print(
+                f"  ⚡ SGLang non-colocated NCCL bridge: "
+                f"master={train_ip}:{bridge_port}, "
+                f"world_size={bridge_world_size} "
+                f"(1 train + {num_engines} engines x TP={engine_tp}), "
+                f"group={bridge_group_name!r}",
+                flush=True,
+            )
+            # Dispatch BOTH sides concurrently. The train side
+            # (only rank 0 joins) and the SGLang side (every engine
+            # master joins) must be in the rendezvous() call at the
+            # SAME time — calling them sequentially deadlocks.
+            # ``init_collective_for_sglang_nccl`` returns Ray futures
+            # (non-blocking); ``init_collective_nccl_bridge`` runs its
+            # own ``ray.get`` internally so we run it on a thread.
+            import threading as _threading
+
+            futures_train = policy.init_collective_for_sglang_nccl(
+                train_ip,
+                bridge_port,
+                bridge_world_size,
+                group_name=bridge_group_name,
+            )
+            sglang_init_result: list = []
+            sglang_init_err: list = []
+
+            def _do_sglang_init() -> None:
+                try:
+                    ok = policy_generation.init_collective_nccl_bridge(
+                        train_ip,
+                        bridge_port,
+                        train_world_size=1,
+                        group_name=bridge_group_name,
+                    )
+                    sglang_init_result.append(ok)
+                except Exception as e:
+                    sglang_init_err.append(e)
+
+            sglang_thread = _threading.Thread(target=_do_sglang_init)
+            sglang_thread.start()
+
+            ray.get(futures_train)
+            sglang_thread.join()
+            if sglang_init_err:
+                raise sglang_init_err[0]
+            assert sglang_init_result and sglang_init_result[0], (
+                "SGLang nccl bridge init returned False; "
+                "check the SGLang server logs for "
+                "init_weights_update_group errors"
+            )
+            worker_init_timing_metrics["nccl_bridge_init_time_s"] = (
+                time.perf_counter() - t0
+            )
+            print(
+                f"  ✓ SGLang nccl bridge ready in "
+                f"{worker_init_timing_metrics['nccl_bridge_init_time_s']:.1f}s",
+                flush=True,
+            )
+        else:
+            t0 = time.perf_counter()
+            ip, port = train_cluster.get_master_address_and_port()
+            print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
+            # world includes all training workers and all inference workers
+            train_world_size = train_cluster.world_size()
+            inference_world_size = inference_nodes * inference_gpus_per_node
+            world_size = train_world_size + inference_world_size
+            # init collective
+            futures_train = policy.init_collective(
+                ip, port, world_size, train_world_size=train_world_size
+            )
+            futures_inference = policy_generation.init_collective(
+                ip, port, world_size, train_world_size=train_world_size
+            )  # type: ignore
+            # wait for all futures to complete
+            ray.get(futures_train + futures_inference)
+            worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
@@ -1163,18 +1251,43 @@ def refit_policy_generation(
                 results = ray.get(futures_inference)
                 update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl
-            # SGLang haven't implemented non-colocated inference mode.
+            # Non-colocated refit. Two paths:
+            #   - vLLM: NCCL ``StatelessProcessGroup`` spanning train + infer
+            #     ranks; weights flow via packed_broadcast_producer/consumer.
+            #   - SGLang: slime-style NCCL bridge group; per-bucket
+            #     ``dist.broadcast`` from train rank 0 to every SGLang TP rank,
+            #     with metadata POSTed to engines via HTTP. Set up at startup
+            #     by ``policy.init_collective_for_sglang_nccl`` /
+            #     ``policy_generation.init_collective_nccl_bridge``.
             if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
+                engine_urls = policy_generation.get_sglang_server_urls()
+                engine_tp_size = policy_generation.gpus_per_server
+                futures_train = policy.broadcast_weights_via_nccl_to_sglang(
+                    engine_urls=engine_urls,
+                    engine_tp_size=engine_tp_size,
+                    kv_scales=kv_scales,
                 )
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+                # SGLang side has nothing to do during refit beyond
+                # receiving the NCCL broadcasts (driven via the
+                # background HTTP threads on the train side); no
+                # futures_inference. Success = all train workers OK.
+                results_train = ray.get(futures_train)
+                update_success = (
+                    all(r for r in results_train if r is not None)
+                    if results_train
+                    else True
+                )
+            else:
+                futures_train = policy.broadcast_weights_for_collective(
+                    kv_scales=kv_scales
+                )
+                futures_inference = policy_generation.update_weights_from_collective()
+                # wait for all futures to complete
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(
+                    result for result in results if result is not None
+                )
 
         # check if update is successful
         if not update_success:

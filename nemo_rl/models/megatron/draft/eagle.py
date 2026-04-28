@@ -24,7 +24,16 @@ from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     sharded_state_dict_default,
 )
-from modelopt.torch.speculative.plugins.megatron_eagle import EagleModule
+# modelopt is an optional dep (only required for EAGLE speculative-decoding
+# draft training). When it's not installed, leave EagleModule as None and
+# defer the failure to the moment someone actually tries to instantiate
+# EagleModel (i.e. ``policy.draft.enabled = True``); plain GRPO without
+# speculative-decoding doesn't need it but DOES still import this module
+# transitively via ``nemo_rl.models.megatron.draft.__init__``.
+try:
+    from modelopt.torch.speculative.plugins.megatron_eagle import EagleModule
+except ImportError:
+    EagleModule = None  # type: ignore[assignment]
 from torch import Tensor
 
 
@@ -47,6 +56,13 @@ class EagleModel(MegatronModule):
                 not torch.cuda.is_available(),
             ),
         )
+        if EagleModule is None:
+            raise ImportError(
+                "EagleModel requires `nvidia-modelopt[torch]` for the "
+                "EAGLE speculative-decoding draft module. Install via "
+                "`pip install nvidia-modelopt[torch]` (or the project's "
+                "modelopt extra) to enable `policy.draft.enabled = True`."
+            )
         # Many specdec libraries use LlamaForCausalLMEagle3 class by default so rope is hardcoded
         self.eagle_module = EagleModule(
             config=config, rotary_pos_emb=rotary_pos_emb, bias=False
