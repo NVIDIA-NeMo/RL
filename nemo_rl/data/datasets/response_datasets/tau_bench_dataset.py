@@ -25,9 +25,11 @@ at training time.
 
 from typing import Any
 
+import ray
 from datasets import Dataset
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
 
 _TOOL_CALL_INSTRUCTIONS = """\
@@ -60,8 +62,9 @@ def _format_tool(tool_info: dict[str, Any]) -> str:
 
 def _build_system_prompt(env: Any, env_name: str) -> str:
     tool_infos = []
-    for t in env.tools or []:
-        info = t.get_info() if hasattr(t, "get_info") else t
+    for t in env.tools_info or []:
+        # tau_bench wraps each tool spec as {"type": "function", "function": {...}}
+        info = t["function"] if "function" in t else t
         tool_infos.append(info)
 
     tools_section = "\n\n".join(_format_tool(t) for t in tool_infos)
@@ -81,6 +84,45 @@ def _build_system_prompt(env: Any, env_name: str) -> str:
             ],
         )
     )
+
+
+def _build_records(tau_bench_env_name: str, split: str) -> list[dict[str, Any]]:
+    """Build the list of dataset records from a tau-bench environment.
+
+    This function is invoked via Ray remote with PY_EXECUTABLES.TAU_BENCH so
+    that tau_bench is only required in the TAU_BENCH Ray environment, not in
+    the driver process.
+    """
+    from tau_bench.envs import get_env
+
+    # Use the "human" strategy so no LLM provider is required at data-load
+    # time. We read task.instruction directly — env.reset() is intentionally
+    # NOT called here because HumanUserSimulationEnv.reset() blocks on
+    # input(), which would hang the process for every task.
+    env = get_env(
+        env_name=tau_bench_env_name,
+        user_strategy="human",
+        user_model="",
+        task_split=split,
+    )
+
+    system_prompt = _build_system_prompt(env, tau_bench_env_name)
+
+    return [
+        {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": task.instruction},
+            ],
+            "extra_env_info": {
+                "task_index": task_index,
+                "episode_id": None,
+                "step_count": 0,
+            },
+            "task_name": "tau_bench",
+        }
+        for task_index, task in enumerate(env.tasks)
+    ]
 
 
 class TauBenchDataset(RawDataset):
@@ -103,38 +145,15 @@ class TauBenchDataset(RawDataset):
         repeat: int = 1,
         **kwargs: Any,
     ) -> None:
-        from tau_bench.envs import get_env
-
         self.task_name = "tau_bench"
 
-        # user_strategy and user_model are placeholders; no user simulation
-        # occurs during data loading — only during training rollouts.
-        env = get_env(
-            env_name=tau_bench_env_name,
-            user_strategy="llm",
-            user_model="placeholder",
-            task_split=split,
+        # Run record construction in the TAU_BENCH Ray environment so that
+        # tau_bench is not required in the driver process.
+        records = ray.get(
+            ray.remote(_build_records)
+            .options(runtime_env={"py_executable": PY_EXECUTABLES.TAU_BENCH})
+            .remote(tau_bench_env_name, split)
         )
-
-        system_prompt = _build_system_prompt(env, tau_bench_env_name)
-
-        records = []
-        for task_index in range(len(env.tasks)):
-            reset_response = env.reset(task_index=task_index)
-            records.append(
-                {
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": str(reset_response.observation)},
-                    ],
-                    "extra_env_info": {
-                        "task_index": task_index,
-                        "episode_id": None,
-                        "step_count": 0,
-                    },
-                    "task_name": "tau_bench",
-                }
-            )
 
         self.dataset = Dataset.from_list(records)
 

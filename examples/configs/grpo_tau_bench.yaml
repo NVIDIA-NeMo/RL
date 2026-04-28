@@ -13,7 +13,7 @@
 #   <tool_call>{"name": "tool_name", "arguments": {"key": "value"}}</tool_call>
 # Text without a <tool_call> block is treated as a respond action to the user.
 
-defaults: "grpo_math_1B.yaml"
+defaults: "grpo_math_1B_megatron.yaml"
 
 grpo:
   num_prompts_per_step: 32
@@ -31,6 +31,15 @@ checkpointing:
 policy:
   model_name: "Qwen/Qwen2.5-7B-Instruct"
   max_total_sequence_length: 4096
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
 
   generation:
     backend: "vllm"
@@ -41,9 +50,13 @@ policy:
     stop_token_ids: null
     vllm_cfg:
       async_engine: false
-      tensor_parallel_size: 1
+      tensor_parallel_size: 2
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
 
 data:
   train:
@@ -62,21 +75,21 @@ data:
 
 env:
   tau_bench:
-    num_workers: 8
+    num_workers: 2
     env_name: "retail"       # "retail" or "airline"
     task_split: "train"
     user_strategy: "llm"
     # User simulator model: any OpenAI-compatible endpoint.
     # A small, fast model is sufficient since the user just follows the task script.
-    user_model: "openai/Qwen2.5-3B-Instruct"
-    user_base_url: "http://localhost:8001"   # separate vLLM instance for user model
-    user_api_key: "dummy"
+    user_model: "openai/meta/llama-3.1-8b-instruct"
+    user_base_url: "https://integrate.api.nvidia.com/v1"
+    user_api_key: ${oc.env:NVIDIA_API_KEY}
     max_steps: 30
     # LLM-as-judge: scores policy compliance and communication quality.
     # Set judge_model to null to disable and use pure tau-bench rewards.
-    judge_model: "openai/Qwen2.5-7B-Instruct"
-    judge_base_url: "http://localhost:8002"  # can reuse the policy server after training step
-    judge_api_key: "dummy"
+    judge_model: "openai/meta/llama-3.1-8b-instruct"
+    judge_base_url: "https://integrate.api.nvidia.com/v1"
+    judge_api_key: ${oc.env:NVIDIA_API_KEY}
     judge_weight: 0.3   # 70% task-completion + 30% judge score
 
 logger:

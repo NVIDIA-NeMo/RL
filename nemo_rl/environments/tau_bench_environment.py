@@ -132,11 +132,19 @@ class TauBenchWorker:
         """Create and reset a tau-bench Env for a specific task index."""
         from tau_bench.envs import get_env
 
+        # tau_bench expects provider and model separately; split the LiteLLM
+        # "provider/model" format used in the config (e.g. "openai/gpt-4o-mini").
+        user_model = self._user_model
+        user_provider = None
+        if "/" in user_model:
+            user_provider, user_model = user_model.split("/", 1)
+
         env = get_env(
             env_name=self._env_name,
             user_strategy=self._user_strategy,
-            user_model=self._user_model,
+            user_model=user_model,
             task_split=self._task_split,
+            user_provider=user_provider,
             task_index=task_index,
         )
         env.reset(task_index=task_index)
@@ -184,10 +192,15 @@ class TauBenchWorker:
             f"CUSTOMER REQUEST:\n{task_instruction}\n\n"
             f"CONVERSATION:\n{convo_text}"
         )
-        base_url = (self._judge_base_url or "https://api.openai.com").rstrip("/")
+        raw_base = (self._judge_base_url or "https://api.openai.com/v1").rstrip("/")
+        # Normalise: ensure exactly one "/v1" suffix so callers can pass either
+        # "https://api.openai.com" or "https://integrate.api.nvidia.com/v1".
+        if not raw_base.endswith("/v1"):
+            raw_base = raw_base + "/v1"
+        base_url = raw_base
         try:
             resp = requests.post(
-                f"{base_url}/v1/chat/completions",
+                f"{base_url}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {self._judge_api_key}",
                     "Content-Type": "application/json",
@@ -322,7 +335,7 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
 
         self._workers = [
             TauBenchWorker.options(
-                runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
+                runtime_env={"py_executable": PY_EXECUTABLES.TAU_BENCH}
             ).remote(
                 env_name=cfg["env_name"],
                 task_split=cfg["task_split"],
