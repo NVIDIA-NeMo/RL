@@ -582,6 +582,69 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return stacked
 
+    def init_cross_tokenizer_loss_fn(
+        self, loss_config: Any, token_aligner_config: Any
+    ) -> None:
+        """Have each worker build its own cross-tokenizer loss function.
+
+        Each worker materializes a ``MultiTeacherLossAggregator`` (with
+        ``N=1`` for the single-teacher case) from ``loss_config`` plus
+        the shared filesystem (projection matrices, embeddings) and
+        caches it as ``self._cached_loss_fn`` so the per-step
+        ``update_cross_tokenizer_data`` and the training forward path
+        can find it.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "init_cross_tokenizer_loss_fn",
+            loss_config=loss_config,
+            token_aligner_config=token_aligner_config,
+        )
+        ray.get(futures)
+
+    def update_cross_tokenizer_data(
+        self,
+        teacher_input_ids: torch.Tensor,
+        aligned_pairs: Any,
+        teacher_idx: Optional[int] = None,
+        chunk_indices: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Push per-step cross-tokenizer data to all workers' cached loss functions.
+
+        Shards ``teacher_input_ids``, ``aligned_pairs``, and the optional
+        ``chunk_indices`` along the DP axis so each worker only receives
+        its own slice. ``chunk_indices`` carries the per-sample COO chunk
+        masks precomputed by ``CrossTokenizerCollator``.
+        """
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        batch_size = teacher_input_ids.shape[0]
+        shard_size = batch_size // dp_size
+
+        if chunk_indices is not None:
+            chunk_indices_shards: list[Optional[dict[str, Any]]] = [
+                {
+                    k: chunk_indices[k][i * shard_size : (i + 1) * shard_size]
+                    for k in chunk_indices
+                }
+                for i in range(dp_size)
+            ]
+        else:
+            chunk_indices_shards = [None for _ in range(dp_size)]
+
+        futures = self.worker_group.run_all_workers_multiple_data(
+            "update_cross_tokenizer_data",
+            teacher_input_ids=[
+                teacher_input_ids[i * shard_size : (i + 1) * shard_size]
+                for i in range(dp_size)
+            ],
+            aligned_pairs=[
+                aligned_pairs[i * shard_size : (i + 1) * shard_size]
+                for i in range(dp_size)
+            ],
+            teacher_idx=[teacher_idx for _ in range(dp_size)],
+            chunk_indices=chunk_indices_shards,
+        )
+        ray.get(futures)
+
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -729,6 +792,98 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return result
 
+    def train_off_policy_distillation(
+        self,
+        data: BatchedDataDict[Any],
+        teacher_logits: Optional[Any] = None,
+        loss_fn: Optional[LossFunction] = None,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Run cross-tokenizer off-policy distillation on the student worker group.
+
+        Sibling of :meth:`train` that dispatches to
+        ``DTensorPolicyWorkerV2Impl.train_off_policy_distillation`` instead of
+        the regular ``train`` so the on-policy / GRPO / SFT path stays
+        unaffected.
+        """
+        batch_size = gbs or self.cfg["train_global_batch_size"]
+        micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        sharded_data = data.shard_by_batch_size(dp_size, batch_size=batch_size)
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "train_off_policy_distillation",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={
+                "teacher_logits": teacher_logits,
+                "loss_fn": loss_fn,
+                "eval_mode": eval_mode,
+                "gbs": batch_size,
+                "mbs": micro_batch_size,
+            },
+        )
+        results = self.worker_group.get_all_worker_results(futures)
+        return {
+            "loss": results[0]["global_loss"],
+            "grad_norm": results[0]["grad_norm"],
+            **{
+                k: v for k, v in results[0].items()
+                if k not in ("global_loss", "grad_norm")
+            },
+        }
+
+    def compute_teacher_logits_ipc(
+        self,
+        data: BatchedDataDict[Any],
+        topk_logits: Optional[int] = None,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Run the teacher forward pass and return per-rank IPC handle dicts.
+
+        The teacher is always run forward-only; the student consumes the
+        returned per-rank IPC handles in :meth:`train_off_policy_distillation`.
+        """
+        batch_size = gbs or self.cfg["train_global_batch_size"]
+        micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        sharded_data = data.shard_by_batch_size(dp_size, batch_size=batch_size)
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "compute_teacher_logits_ipc",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={
+                "topk_logits": topk_logits,
+                "gbs": batch_size,
+                "mbs": micro_batch_size,
+            },
+        )
+        return self.worker_group.get_all_worker_results(futures)
+
     def score(
         self, data: BatchedDataDict[GenerationDatumSpec]
     ) -> BatchedDataDict[ScoreOutputSpec]:
@@ -781,6 +936,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
         # onload everything to the GPU
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
+        ray.get(futures)
+
+    def move_optimizer_to_cuda(self) -> None:
+        """Move optimizer state to CUDA on all workers.
+
+        Used by off-policy distillation when ``keep_models_resident=False`` to
+        restore the optimizer state that ``offload_after_refit`` moves to CPU
+        between teacher inference and student training.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "move_optimizer_to_cuda"
+        )
         ray.get(futures)
 
     def prepare_for_lp_inference(self, *args: Any, **kwargs: Any) -> None:
