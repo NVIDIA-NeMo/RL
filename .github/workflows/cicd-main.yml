@@ -295,6 +295,7 @@ jobs:
       image-label: ${{ vars.CI_CONTAINER_NAME }}
       target: release
       registry: ${{ needs.org-member-pre-flight.outputs.registry }}
+      use-cache: false
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
       build-args: |
