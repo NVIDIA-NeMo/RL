@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
+import warnings
 from pathlib import Path
-from typing import Optional, Union, cast
+from typing import Any, Optional, Union, cast, get_type_hints
 
 from hydra._internal.config_loader_impl import ConfigLoaderImpl
 from hydra.core.override_parser.overrides_parser import OverridesParser
 from omegaconf import DictConfig, ListConfig, OmegaConf
+from pydantic import TypeAdapter
 
 
 def resolve_path(base_path: Path, path: str) -> Path:
@@ -186,6 +189,107 @@ def parse_hydra_overrides(cfg: DictConfig, overrides: list[str]) -> DictConfig:
         return cfg
     except Exception as e:
         raise OverridesError(f"Failed to parse Hydra overrides: {str(e)}") from e
+
+
+def _merge_extras_back(
+    validated: dict[str, Any], user: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge extra keys from *user* (not in the schema) back into *validated*.
+
+    Pydantic with ``extra='ignore'`` drops unknown keys during validation.
+    This function restores them so that user forks, deprecated YAML fields,
+    and any keys not yet covered by a schema survive the round-trip.
+
+    Recurses into nested dicts so that extra keys at every level are preserved.
+    """
+    result = validated.copy()
+    for k, v in user.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _merge_extras_back(result[k], v)
+        elif k not in result:
+            result[k] = v  # carry forward unknown key as-is
+    return result
+
+
+def validate_config(user_config: dict[str, Any], schema: type) -> dict[str, Any]:
+    """Validate *user_config* against a pydantic dataclass *schema* and fill defaults.
+
+    Implements the "left join" pattern proposed in #2102:
+
+    1. **Validate** — ``TypeAdapter(schema).validate_python(user_config)`` checks
+       types of known fields and raises ``pydantic.ValidationError`` on mismatch.
+       Pydantic also coerces compatible types (e.g. ``"42"`` → ``42``).
+    2. **Fill defaults** — ``dataclasses.asdict()`` on the validated instance
+       produces a dict where every field with a default has a value.
+    3. **Preserve extras** — ``_merge_extras_back()`` restores any keys from
+       *user_config* that were not in the schema (dropped by ``extra='ignore'``).
+
+    Priority order: **CLI overrides > YAML values > dataclass defaults**.
+    Unknown keys are always preserved for backward compatibility.
+
+    Args:
+        user_config: Plain dict from ``OmegaConf.to_container(resolve=True)``.
+        schema: A **pydantic** dataclass class (decorated with
+            ``@pydantic.dataclasses.dataclass(config=ConfigDict(extra='ignore'))``).
+
+    Returns:
+        A new dict — known fields validated and defaulted, extra keys preserved.
+
+    Raises:
+        pydantic.ValidationError: If a known field has the wrong type.
+    """
+    ta = TypeAdapter(schema)
+    validated = ta.validate_python(user_config)
+    validated_dict = dataclasses.asdict(validated)
+    return _merge_extras_back(validated_dict, user_config)
+
+
+def apply_config_defaults(config: dict[str, Any], defaults_cls: type) -> dict[str, Any]:
+    """Deprecated — use :func:`validate_config` instead.
+
+    Kept for backward compatibility.  Delegates to :func:`validate_config`
+    when *defaults_cls* is a pydantic dataclass, otherwise falls back to the
+    legacy recursive fill.
+    """
+    warnings.warn(
+        "apply_config_defaults() is deprecated, use validate_config() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    # If it's a pydantic dataclass (has __pydantic_config__), use the new path.
+    if hasattr(defaults_cls, "__pydantic_config__"):
+        return validate_config(config, defaults_cls)
+
+    # Legacy fallback for plain stdlib dataclasses (should not happen in new code).
+    if not dataclasses.is_dataclass(defaults_cls):
+        return config
+
+    hints = get_type_hints(defaults_cls)
+
+    for f in dataclasses.fields(defaults_cls):
+        if f.default is not dataclasses.MISSING:
+            default = f.default
+        elif f.default_factory is not dataclasses.MISSING:
+            default = f.default_factory()
+        else:
+            continue
+
+        if f.name not in config:
+            if dataclasses.is_dataclass(default):
+                config[f.name] = {}
+                apply_config_defaults(config[f.name], type(default))
+            else:
+                config[f.name] = default
+        elif isinstance(config[f.name], dict):
+            nested_type = hints.get(f.name)
+            if (
+                nested_type is not None
+                and isinstance(nested_type, type)
+                and dataclasses.is_dataclass(nested_type)
+            ):
+                apply_config_defaults(config[f.name], nested_type)
+
+    return config
 
 
 def register_omegaconf_resolvers() -> None:

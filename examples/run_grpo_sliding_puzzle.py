@@ -23,7 +23,12 @@ from omegaconf import OmegaConf
 from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer
 
-from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
+from nemo_rl.algorithms.grpo import (
+    MasterConfig,
+    MasterConfigDefaults,
+    grpo_train,
+    setup,
+)
 from nemo_rl.algorithms.utils import get_tokenizer, set_seed
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -38,6 +43,7 @@ from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
     register_omegaconf_resolvers,
+    validate_config,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
 
@@ -210,6 +216,7 @@ def main():
         config = parse_hydra_overrides(config, overrides)
 
     config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = validate_config(config, MasterConfigDefaults)
     print("Applied CLI overrides")
 
     # Print config

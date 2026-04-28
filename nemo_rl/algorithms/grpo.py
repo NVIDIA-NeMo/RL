@@ -17,11 +17,14 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from dataclasses import field
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
 import torch
+from pydantic import ConfigDict
+from pydantic.dataclasses import dataclass
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -206,6 +209,102 @@ class MasterConfig(TypedDict):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+
+
+# ===============================================================================
+# Dataclass Defaults
+# ===============================================================================
+#
+# Companion defaults for the TypedDicts above.  Only fields with a sensible
+# default are listed; fields omitted here are required and must come from YAML.
+# See docs/design-docs/dataclass-config-defaults.md for rationale.
+
+
+_EXTRA_IGNORE = ConfigDict(extra="ignore")
+
+
+@dataclass(config=_EXTRA_IGNORE)
+class RewardScalingConfigDefaults:
+    """Defaults for RewardScalingConfig (disabled by default)."""
+
+    enabled: bool = False
+    source_min: float = 0.0
+    source_max: float = 1.0
+    target_min: float = 0.0
+    target_max: float = 1.0
+
+
+@dataclass(config=_EXTRA_IGNORE)
+class RewardShapingConfigDefaults:
+    """Defaults for RewardShapingConfig (disabled by default)."""
+
+    enabled: bool = False
+
+
+@dataclass(config=_EXTRA_IGNORE)
+class AsyncGRPOConfigDefaults:
+    """Defaults for AsyncGRPOConfig (disabled by default)."""
+
+    enabled: bool = False
+    in_flight_weight_updates: bool = False
+    recompute_kv_cache_after_weight_updates: bool = False
+
+
+@dataclass(config=_EXTRA_IGNORE)
+class GRPOConfigDefaults:
+    """Defaults for GRPOConfig.
+
+    Required fields (num_prompts_per_step, num_generations_per_prompt,
+    max_num_epochs, max_num_steps, max_rollout_turns, val_period,
+    val_batch_size, max_val_samples) are omitted — they must come from YAML.
+    """
+
+    seed: int = 42
+    normalize_rewards: bool = True
+    use_leave_one_out_baseline: bool = True
+    val_at_start: bool = False
+    val_at_end: bool = False
+    overlong_filtering: bool = False
+    use_dynamic_sampling: bool = False
+    dynamic_sampling_max_gen_batches: int = 10
+    batch_multiplier: float = 1.0
+    calculate_advantages_on_gpu: bool = False
+    skip_reference_policy_logprobs_calculation: bool = False
+    seq_logprob_error_threshold: float | None = None
+    reward_scaling: RewardScalingConfigDefaults = field(
+        default_factory=RewardScalingConfigDefaults
+    )
+    reward_shaping: RewardShapingConfigDefaults = field(
+        default_factory=RewardShapingConfigDefaults
+    )
+    async_grpo: AsyncGRPOConfigDefaults = field(default_factory=AsyncGRPOConfigDefaults)
+
+
+@dataclass(config=_EXTRA_IGNORE)
+class ClippedPGLossConfigDefaults:
+    """Defaults for ClippedPGLossConfig (NotRequired fields only)."""
+
+    truncated_importance_sampling_type: str | None = "tis"
+    truncated_importance_sampling_ratio_min: float | None = None
+    sequence_level_importance_ratios: bool = False
+    disable_ppo_ratio: bool = False
+    force_on_policy_ratio: bool = False
+    use_kl_in_reward: bool = False
+
+
+@dataclass(config=_EXTRA_IGNORE)
+class MasterConfigDefaults:
+    """Defaults for MasterConfig.
+
+    Sections with defaults (grpo, loss_fn) are validated and filled
+    automatically.  Other sections (policy, data, env, logger, cluster,
+    checkpointing) pass through unchanged as extras.
+    """
+
+    grpo: GRPOConfigDefaults = field(default_factory=GRPOConfigDefaults)
+    loss_fn: ClippedPGLossConfigDefaults = field(
+        default_factory=ClippedPGLossConfigDefaults
+    )
 
 
 # ===============================================================================
