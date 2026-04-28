@@ -248,6 +248,10 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             rank=0,  # Temporary, will be updated after distributed init
         )
 
+        self._apply_phi_inference_dtype_override(
+            runtime_config=runtime_config, init_optimizer=init_optimizer
+        )
+
         # Set up distributed environment (returns DistributedContext)
         distributed_context = setup_distributed(
             config=config,
@@ -328,6 +332,64 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
+    def _is_phi_style_model(
+        self, architectures: Optional[list[Any]] = None
+    ) -> bool:
+        """Return True for Phi-4 / Phi-3 model families.
+
+        Shared gate for the Phi-specific patches in this worker. Accepts an
+        optional ``architectures`` list so callers running before
+        ``self.model_config`` is populated (pre-load hooks) can pass the
+        list straight from ``runtime_config.model_config``.
+        """
+        model_name = str(self.cfg.get("model_name", "")).lower()
+        if architectures is None:
+            architectures = getattr(
+                getattr(self, "model_config", None), "architectures", []
+            )
+        arch_blob = " ".join(
+            a.lower() for a in architectures if isinstance(a, str)
+        )
+        return (
+            "phi-4" in model_name
+            or "phi4" in model_name
+            or "phi3" in arch_blob
+        )
+
+    def _apply_phi_inference_dtype_override(
+        self, runtime_config: Any, init_optimizer: bool
+    ) -> None:
+        """Drop FP32 master weights for inference-only Phi loads.
+
+        Automodel's load-before-shard path materializes the full model on
+        every rank before FSDP sharding. ``validate_and_prepare_config``
+        always pins ``model_config.torch_dtype = float32`` for FSDP
+        mixed-precision master weights, but FP32 master weights are only
+        consumed by the optimizer (AdamW state, grad-norm reductions). For
+        Phi-4 14B that's an extra ~28 GB on each GPU before the BF16 state
+        dict is even staged, which OOMs an 80 GB H100.
+
+        Inference-only paths (``init_optimizer=False``, e.g. teacher
+        policies) never touch the optimizer code paths, so we can safely
+        load directly in the compute dtype and halve the load-time
+        footprint. Scoped to Phi-style models so other families keep the
+        existing behavior; no-op when an optimizer is requested.
+        """
+        if init_optimizer:
+            return
+        if not self._is_phi_style_model(
+            architectures=getattr(runtime_config.model_config, "architectures", [])
+        ):
+            return
+        runtime_config.model_config.torch_dtype = runtime_config.dtype
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        print(
+            f"[Phi inference dtype] loading {self.cfg.get('model_name')} in "
+            f"{runtime_config.dtype} (no optimizer requested) instead of FP32 "
+            f"master weights to halve load-before-shard memory."
+        )
+
     def _fix_phi_rope_meta_buffers(self) -> None:
         """Repair Phi RoPE inv_freq buffers when loaded from meta init.
 
@@ -342,18 +404,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         Scoped to Phi-style models via the model_name / architecture
         string so other model families short-circuit immediately.
         """
-        model_name = str(self.cfg.get("model_name", "")).lower()
-        architectures = getattr(
-            getattr(self, "model_config", None), "architectures", []
-        )
-        arch_blob = " ".join(
-            a.lower() for a in architectures if isinstance(a, str)
-        )
-        if (
-            "phi-4" not in model_name
-            and "phi4" not in model_name
-            and "phi3" not in arch_blob
-        ):
+        if not self._is_phi_style_model():
             return
 
         fixed_count = 0
