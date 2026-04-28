@@ -1,2 +1,4 @@
 {"uri": "https://docs.nvidia.com/nsight-systems/UserGuide/index.html#viewing-multiple-reports-in-the-same-timeline"}
 {"uri": "https://platform.openai.com/docs/guides/function-calling"}
+{"uri": "https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForCausalLM"}
+{"uri": "https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForImageTextToText"}
