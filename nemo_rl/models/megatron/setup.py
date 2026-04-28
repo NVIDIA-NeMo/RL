@@ -386,8 +386,14 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
 
     if model_cfg.context_parallel_size > 1:
+        # Either NeMo-RL does the packing+CP-sharding itself (classic mcore
+        # GPTModel path) OR the model does it internally (mbridge VLM wrappers
+        # with delegate_pack_to_model=True). Both paths require cu_seqlens to
+        # flow via PackedSeqParams, so sequence_packing.enabled must be on.
         assert config["sequence_packing"]["enabled"], (
-            "Sequence Packing must be enabled to use Context Parallelism with MCore"
+            "Sequence Packing must be enabled to use Context Parallelism with MCore "
+            "(set delegate_pack_to_model: true under sequence_packing for VLM models "
+            "where the model does its own packing)."
         )
         assert not config["megatron_cfg"].get("use_linear_ce_fusion_loss", False), (
             "Context Parallelism is not supported with linear CE fusion loss, please set use_linear_ce_fusion_loss to false"
