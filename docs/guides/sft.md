@@ -67,7 +67,7 @@ NeMo RL SFT uses Hugging Face chat templates to format the individual examples. 
     tokenizer:
       chat_template: NULL
     ```
-3. Use a custom template: If you would like to use a custom template, create a string template in [Jinja format](https://huggingface.co/docs/transformers/en/chat_templating#how-do-i-create-a-chat-template), and add that string to the config. For example,
+3. Use a custom template: If you would like to use a custom template, create a string template in [Jinja format](https://huggingface.co/docs/transformers/en/chat_templating_writing), and add that string to the config. For example,
 
     ```yaml
     tokenizer:
