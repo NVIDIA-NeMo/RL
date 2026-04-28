@@ -1,0 +1,417 @@
+# Monolithic RayJob for GB300 — 64 GPU nodes (256 GPUs), segment-size 16.
+#
+# KubeRay creates a RayCluster, waits for all pods to be Ready, submits the
+# entrypoint via HTTP, polls until completion, then tears down the cluster.
+#
+# Structure:
+#   head         — CPU-only Ray head on a customer-cpu node (GCS + dashboard)
+#   segment-0..3 — 4 worker groups of 16 GPU pods each, topology-constrained
+#
+# Topology: each worker group has kai.scheduler/topology-required-placement
+# annotations (KAI PR #1125) to place all 16 pods in the same clique.
+#
+# Prerequisites:
+#   kubectl apply -f kai-queue.yaml
+#   kubectl apply -f kai-topology.yaml
+#
+# Usage:
+#   kubectl apply -f rayjob-monolithic-64n.yaml
+#   kubectl get rayjob sft-job-64n -w
+#
+# Logs:
+#   kubectl logs -f -l ray.io/cluster=sft-job-64n-raycluster --prefix   # all pods
+#   kubectl exec -it <head-pod> -- ray job logs --follow <job-id>        # via Ray
+#   kubectl exec -it <head-pod> -- cat /tmp/ray/session_latest/logs/...  # Ray file logs
+#
+# Cleanup:
+#   kubectl delete rayjob sft-job-64n
+#   kubectl delete computedomain compute-domain-rayjob-64n
+#   kubectl delete resourceclaimtemplate roce-rayjob-64n
+
+# --- 1. ComputeDomain (controller auto-creates the ResourceClaimTemplate) ---
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: compute-domain-rayjob-64n
+spec:
+  channel:
+    resourceClaimTemplate:
+      name: compute-domain-rayjob-64n
+  numNodes: 0
+---
+# --- 2. RoCE ResourceClaimTemplate ---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: roce-rayjob-64n
+spec:
+  spec:
+    devices:
+      requests:
+      - exactly:
+          count: 8
+          deviceClassName: roce.networking.k8s.aws
+        name: roce
+---
+# --- RayJob ---
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: sft-job-64n
+  labels:
+    kai.scheduler/queue: default-queue
+spec:
+  entrypoint: |
+    LOG=/mnt/rl-workspace/logs/sft-64n-$(date +%Y%m%d-%H%M%S).log
+    mkdir -p /mnt/rl-workspace/logs
+    cd /opt/nemo-rl
+    python -u examples/run_sft.py \
+      --config examples/configs/sft.yaml \
+      policy.model_name=Qwen/Qwen3-0.6B \
+      cluster.gpus_per_node=4 \
+      cluster.num_nodes=64 \
+      policy.train_global_batch_size=512 \
+      policy.train_micro_batch_size=1 \
+      policy.max_total_sequence_length=1024 \
+      policy.dtensor_cfg.tensor_parallel_size=1 \
+      sft.max_num_steps=10 \
+      sft.val_period=5 \
+      sft.val_global_batch_size=512 \
+      checkpointing.enabled=false \
+      logger.wandb_enabled=true \
+      logger.wandb.project=nemorl-rayjob-64n \
+      logger.wandb.name=sft-64n-gb300 \
+      logger.tensorboard_enabled=false \
+      2>&1 | tee "$LOG"
+  # HTTPMode submits via the Ray dashboard API. K8sJobMode creates a separate
+  # K8s Job which breaks KAI gang scheduling.
+  submissionMode: HTTPMode
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 60
+  rayClusterSpec:
+    rayVersion: "2.52.0"
+    # Disable KubeRay's autoscaler sidecar — we use fixed-size worker groups.
+    enableInTreeAutoscaling: false
+
+    # ========================
+    # Ray head (CPU-only, on customer-cpu node)
+    # ========================
+    headGroupSpec:
+      rayStartParams:
+        num-gpus: "0"
+        object-store-memory: "200000000"
+        # Disable the Ray monitor/autoscaler process. Without this, ray start
+        # --head launches a monitor that removes "excess" workers even when
+        # enableInTreeAutoscaling is false. The monitor sees more workers than
+        # its internal max and continuously removes them, starving the job of GPUs.
+        no-monitor: "true"
+      template:
+        spec:
+          schedulerName: kai-scheduler
+          imagePullSecrets:
+          - name: nvcr-secret
+          # Schedule head on CPU-only nodes (m8g.16xlarge, 64 vCPU / 250 GiB).
+          # The head runs GCS + dashboard for 256 GPU actors, spawning ~500 Python
+          # processes — needs generous CPU/memory but no GPUs.
+          nodeSelector:
+            nodeGroup: customer-cpu
+          containers:
+          - name: ray-head
+            image: nvcr.io/nvidian/nemo-rl:nightly
+            env:
+            - { name: RAY_memory_monitor_refresh_ms, value: "0" }
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: terryk-secrets, key: HF_TOKEN }
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef: { name: terryk-secrets, key: WANDB_API_KEY }
+            - { name: HF_HOME, value: /mnt/rl-workspace/shared/hf-cache }
+            - { name: HF_DATASETS_CACHE, value: /mnt/rl-workspace/shared/hf-cache/datasets }
+            - { name: TRANSFORMERS_CACHE, value: /mnt/rl-workspace/shared/hf-cache }
+            resources:
+              requests: { cpu: "48", memory: "200Gi" }
+              limits:   { cpu: "60", memory: "240Gi" }
+            ports:
+            - { containerPort: 6379, name: gcs-server }
+            - { containerPort: 8265, name: dashboard }
+            - { containerPort: 10001, name: client }
+            readinessProbe:
+              exec:
+                command: ["ray", "health-check"]
+              initialDelaySeconds: 10
+              periodSeconds: 10
+              timeoutSeconds: 10
+              failureThreshold: 30
+            volumeMounts:
+            - { name: dshm, mountPath: /dev/shm }
+            - { name: rl-workspace, mountPath: /mnt/rl-workspace }
+          volumes:
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 32Gi }
+          - name: rl-workspace
+            persistentVolumeClaim: { claimName: rl-workspace }
+
+    # ========================
+    # GPU worker segments (4 × 16 = 64 nodes, 256 GPUs)
+    #
+    # Split into 4 worker groups instead of 1 group of 64 so that KAI's
+    # topology-aware scheduling (PR #1125) places each group's 16 pods
+    # in the same clique. KubeRay doesn't support kai.scheduler/segment-size,
+    # so manual group splitting is required.
+    #
+    # Each group has topology annotations that KAI's Ray PodGrouper reads
+    # and propagates to PodGroup subgroups (unlike JobSets, this works).
+    # ========================
+    workerGroupSpecs:
+    - groupName: segment-0
+      replicas: 16
+      minReplicas: 16
+      maxReplicas: 16
+      rayStartParams:
+        num-gpus: "4"
+        object-store-memory: "200000000"
+      template:
+        metadata:
+          annotations:
+            kai.scheduler/topology: gb300-topology
+            kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+        spec:
+          schedulerName: kai-scheduler
+          imagePullSecrets:
+          - name: nvcr-secret
+          tolerations:
+          - operator: Exists
+          containers:
+          - name: ray-worker
+            image: nvcr.io/nvidian/nemo-rl:nightly
+            env:
+            - { name: RAY_memory_monitor_refresh_ms, value: "0" }
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: terryk-secrets, key: HF_TOKEN }
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef: { name: terryk-secrets, key: WANDB_API_KEY }
+            - { name: HF_HOME, value: /mnt/rl-workspace/shared/hf-cache }
+            - { name: HF_DATASETS_CACHE, value: /mnt/rl-workspace/shared/hf-cache/datasets }
+            - { name: TRANSFORMERS_CACHE, value: /mnt/rl-workspace/shared/hf-cache }
+            - { name: NCCL_DEBUG, value: WARN }
+            - { name: NCCL_MNNVL_ENABLE, value: "1" }
+            resources:
+              claims:
+              - name: compute-domain-channel
+              - name: roce-channel
+              requests:
+                cpu: "120"
+                memory: "850Gi"
+                nvidia.com/gpu: "4"
+              limits:
+                cpu: "132"
+                memory: "900Gi"
+                nvidia.com/gpu: "4"
+            volumeMounts:
+            - { name: dshm, mountPath: /dev/shm }
+            - { name: rl-workspace, mountPath: /mnt/rl-workspace }
+            securityContext:
+              capabilities:
+                add: [IPC_LOCK]
+          resourceClaims:
+          - name: compute-domain-channel
+            resourceClaimTemplateName: compute-domain-rayjob-64n
+          - name: roce-channel
+            resourceClaimTemplateName: roce-rayjob-64n
+          volumes:
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 64Gi }
+          - name: rl-workspace
+            persistentVolumeClaim: { claimName: rl-workspace }
+
+    - groupName: segment-1
+      replicas: 16
+      minReplicas: 16
+      maxReplicas: 16
+      rayStartParams:
+        num-gpus: "4"
+        object-store-memory: "200000000"
+      template:
+        metadata:
+          annotations:
+            kai.scheduler/topology: gb300-topology
+            kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+        spec:
+          schedulerName: kai-scheduler
+          imagePullSecrets:
+          - name: nvcr-secret
+          tolerations:
+          - operator: Exists
+          containers:
+          - name: ray-worker
+            image: nvcr.io/nvidian/nemo-rl:nightly
+            env:
+            - { name: RAY_memory_monitor_refresh_ms, value: "0" }
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: terryk-secrets, key: HF_TOKEN }
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef: { name: terryk-secrets, key: WANDB_API_KEY }
+            - { name: HF_HOME, value: /mnt/rl-workspace/shared/hf-cache }
+            - { name: HF_DATASETS_CACHE, value: /mnt/rl-workspace/shared/hf-cache/datasets }
+            - { name: TRANSFORMERS_CACHE, value: /mnt/rl-workspace/shared/hf-cache }
+            - { name: NCCL_DEBUG, value: WARN }
+            - { name: NCCL_MNNVL_ENABLE, value: "1" }
+            resources:
+              claims:
+              - name: compute-domain-channel
+              - name: roce-channel
+              requests:
+                cpu: "120"
+                memory: "850Gi"
+                nvidia.com/gpu: "4"
+              limits:
+                cpu: "132"
+                memory: "900Gi"
+                nvidia.com/gpu: "4"
+            volumeMounts:
+            - { name: dshm, mountPath: /dev/shm }
+            - { name: rl-workspace, mountPath: /mnt/rl-workspace }
+            securityContext:
+              capabilities:
+                add: [IPC_LOCK]
+          resourceClaims:
+          - name: compute-domain-channel
+            resourceClaimTemplateName: compute-domain-rayjob-64n
+          - name: roce-channel
+            resourceClaimTemplateName: roce-rayjob-64n
+          volumes:
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 64Gi }
+          - name: rl-workspace
+            persistentVolumeClaim: { claimName: rl-workspace }
+
+    - groupName: segment-2
+      replicas: 16
+      minReplicas: 16
+      maxReplicas: 16
+      rayStartParams:
+        num-gpus: "4"
+        object-store-memory: "200000000"
+      template:
+        metadata:
+          annotations:
+            kai.scheduler/topology: gb300-topology
+            kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+        spec:
+          schedulerName: kai-scheduler
+          imagePullSecrets:
+          - name: nvcr-secret
+          tolerations:
+          - operator: Exists
+          containers:
+          - name: ray-worker
+            image: nvcr.io/nvidian/nemo-rl:nightly
+            env:
+            - { name: RAY_memory_monitor_refresh_ms, value: "0" }
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: terryk-secrets, key: HF_TOKEN }
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef: { name: terryk-secrets, key: WANDB_API_KEY }
+            - { name: HF_HOME, value: /mnt/rl-workspace/shared/hf-cache }
+            - { name: HF_DATASETS_CACHE, value: /mnt/rl-workspace/shared/hf-cache/datasets }
+            - { name: TRANSFORMERS_CACHE, value: /mnt/rl-workspace/shared/hf-cache }
+            - { name: NCCL_DEBUG, value: WARN }
+            - { name: NCCL_MNNVL_ENABLE, value: "1" }
+            resources:
+              claims:
+              - name: compute-domain-channel
+              - name: roce-channel
+              requests:
+                cpu: "120"
+                memory: "850Gi"
+                nvidia.com/gpu: "4"
+              limits:
+                cpu: "132"
+                memory: "900Gi"
+                nvidia.com/gpu: "4"
+            volumeMounts:
+            - { name: dshm, mountPath: /dev/shm }
+            - { name: rl-workspace, mountPath: /mnt/rl-workspace }
+            securityContext:
+              capabilities:
+                add: [IPC_LOCK]
+          resourceClaims:
+          - name: compute-domain-channel
+            resourceClaimTemplateName: compute-domain-rayjob-64n
+          - name: roce-channel
+            resourceClaimTemplateName: roce-rayjob-64n
+          volumes:
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 64Gi }
+          - name: rl-workspace
+            persistentVolumeClaim: { claimName: rl-workspace }
+
+    - groupName: segment-3
+      replicas: 16
+      minReplicas: 16
+      maxReplicas: 16
+      rayStartParams:
+        num-gpus: "4"
+        object-store-memory: "200000000"
+      template:
+        metadata:
+          annotations:
+            kai.scheduler/topology: gb300-topology
+            kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+        spec:
+          schedulerName: kai-scheduler
+          imagePullSecrets:
+          - name: nvcr-secret
+          tolerations:
+          - operator: Exists
+          containers:
+          - name: ray-worker
+            image: nvcr.io/nvidian/nemo-rl:nightly
+            env:
+            - { name: RAY_memory_monitor_refresh_ms, value: "0" }
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: terryk-secrets, key: HF_TOKEN }
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef: { name: terryk-secrets, key: WANDB_API_KEY }
+            - { name: HF_HOME, value: /mnt/rl-workspace/shared/hf-cache }
+            - { name: HF_DATASETS_CACHE, value: /mnt/rl-workspace/shared/hf-cache/datasets }
+            - { name: TRANSFORMERS_CACHE, value: /mnt/rl-workspace/shared/hf-cache }
+            - { name: NCCL_DEBUG, value: WARN }
+            - { name: NCCL_MNNVL_ENABLE, value: "1" }
+            resources:
+              claims:
+              - name: compute-domain-channel
+              - name: roce-channel
+              requests:
+                cpu: "120"
+                memory: "850Gi"
+                nvidia.com/gpu: "4"
+              limits:
+                cpu: "132"
+                memory: "900Gi"
+                nvidia.com/gpu: "4"
+            volumeMounts:
+            - { name: dshm, mountPath: /dev/shm }
+            - { name: rl-workspace, mountPath: /mnt/rl-workspace }
+            securityContext:
+              capabilities:
+                add: [IPC_LOCK]
+          resourceClaims:
+          - name: compute-domain-channel
+            resourceClaimTemplateName: compute-domain-rayjob-64n
+          - name: roce-channel
+            resourceClaimTemplateName: roce-rayjob-64n
+          volumes:
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 64Gi }
+          - name: rl-workspace
+            persistentVolumeClaim: { claimName: rl-workspace }

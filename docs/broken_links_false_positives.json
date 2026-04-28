@@ -1,2 +1,7 @@
 {"uri": "https://docs.nvidia.com/nsight-systems/UserGuide/index.html#viewing-multiple-reports-in-the-same-timeline"}
 {"uri": "https://platform.openai.com/docs/guides/function-calling"}
+{"uri": "https://docs.nvidia.com/nsight-systems/InstallationGuide/index.html#package-manager-installation"}
+{"uri": "https://huggingface.co/docs/transformers/en/chat_templating#using-applychattemplate"}
+{"uri": "https://huggingface.co/docs/transformers/en/chat_templating_writing"}
+{"uri": "https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForCausalLM"}
+{"uri": "https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForImageTextToText"}

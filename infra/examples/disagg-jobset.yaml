@@ -1,0 +1,380 @@
+# Disaggregated RL + Gym as a single JobSet (alternative to disagg-rayclusters.yaml).
+#
+# Five ReplicatedJobs (two independent Ray clusters + a driver):
+#   rl-head      — RL Ray head daemon (CPU), long-running
+#   rl-workers   — RL GPU workers, connect to rl-head
+#   gym-head     — Gym Ray head (CPU), runs standalone Gym server
+#   gym-workers  — Gym CPU workers, connect to gym-head
+#   driver       — Submits GRPO training, gates JobSet success
+#
+# Advantages over the KubeRay RayCluster approach:
+#   - Native failure cascading via failurePolicy (no peer-watcher sidecar)
+#   - Predictable DNS names (no Service or ConfigMap needed for head discovery)
+#   - Single resource to manage (one JobSet instead of two RayClusters + RBAC)
+#
+# Note: KAI gang-schedules all pods in the JobSet together (one PodGroup),
+# so dependsOn cannot be used (it would deadlock — KAI waits for all pods,
+# JobSet waits for head to be Ready). Instead, workers use init containers
+# to wait for their head, same pattern as KubeRay.
+#
+# DNS names (auto-created by JobSet headless service):
+#   rl-head:      disagg-job-rl-head-0-0.disagg-job
+#   rl-workers:   disagg-job-rl-workers-0-0.disagg-job
+#   gym-head:     disagg-job-gym-head-0-0.disagg-job
+#   gym-workers:  disagg-job-gym-workers-0-{0,1,...}.disagg-job
+#   driver:       disagg-job-driver-0-0.disagg-job
+#
+# Prerequisites:
+#   JobSet controller installed (helmfile sync installs it)
+#   kubectl apply -f kai-queue.yaml
+#   kubectl apply -f endpoint-registry-rbac.yaml
+#
+# Usage:
+#   kubectl apply -f disagg-jobset.yaml
+#   kubectl get jobset disagg-job -w
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: disagg-job
+  labels:
+    kai.scheduler/queue: high-prio
+spec:
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
+
+  coordinator:
+    replicatedJob: rl-head
+    jobIndex: 0
+    podIndex: 0
+
+  # JobSet succeeds when the driver exits 0.
+  successPolicy:
+    operator: All
+    targetReplicatedJobs: [driver]
+
+  # Any failure tears down everything (replaces peer-watcher).
+  failurePolicy:
+    maxRestarts: 0
+    rules:
+    - name: head_crash
+      action: FailJobSet
+      targetReplicatedJobs: [rl-head]
+    - name: driver_crash
+      action: FailJobSet
+      targetReplicatedJobs: [driver]
+    - name: gym_crash
+      action: FailJobSet
+      targetReplicatedJobs: [gym-head, gym-workers]
+    - name: worker_crash
+      action: FailJobSet
+      targetReplicatedJobs: [rl-workers]
+
+  replicatedJobs:
+  # ========================
+  # RL Ray head (long-running daemon)
+  # ========================
+  - name: rl-head
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            serviceAccountName: nemo-rl-endpoint-registry
+            imagePullSecrets:
+            - name: nvcr-secret
+            containers:
+            - name: ray-head
+              image: nvcr.io/nvidian/nemo-rl:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                ulimit -n 65536
+                ray start --head --port=6379 \
+                  --dashboard-host=0.0.0.0 \
+                  --object-store-memory=200000000 \
+                  --block
+              ports:
+              - { containerPort: 6379, name: gcs-server }
+              - { containerPort: 8265, name: dashboard }
+              - { containerPort: 10001, name: client }
+              readinessProbe:
+                exec:
+                  command: ["ray", "health-check"]
+                initialDelaySeconds: 10
+                periodSeconds: 5
+                timeoutSeconds: 5
+              resources:
+                requests: { cpu: "1", memory: "4Gi" }
+                limits:   { cpu: "4", memory: "16Gi" }
+              env:
+              - name: RAY_ADDRESS
+                value: "127.0.0.1:6379"
+              - name: NRL_FORCE_REBUILD_VENVS
+                value: "true"
+              volumeMounts:
+              - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+              - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
+              - { name: dshm, mountPath: /dev/shm }
+            volumes:
+            - name: nemo-rl-src
+              hostPath: { path: /workspace/nemo-rl, type: DirectoryOrCreate }
+            - name: dshm
+              emptyDir: { medium: Memory }
+
+  # ========================
+  # RL GPU workers
+  # ========================
+  - name: rl-workers
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            serviceAccountName: nemo-rl-endpoint-registry
+            imagePullSecrets:
+            - name: nvcr-secret
+            initContainers:
+            - name: wait-for-rl-head
+              image: nvcr.io/nvidian/nemo-rl:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                HEAD=disagg-job-rl-head-0-0.disagg-job
+                echo "Waiting for RL head at ${HEAD}:6379..."
+                until ray health-check --address ${HEAD}:6379 >/dev/null 2>&1; do
+                  sleep 5
+                done
+                echo "RL head is ready."
+              resources:
+                requests: { cpu: "200m", memory: "256Mi" }
+            containers:
+            - name: ray-worker
+              image: nvcr.io/nvidian/nemo-rl:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                ulimit -n 65536
+                HEAD=disagg-job-rl-head-0-0.disagg-job
+                ray start --address=${HEAD}:6379 \
+                  --num-gpus=2 \
+                  --object-store-memory=200000000 \
+                  --block
+              resources:
+                requests: { cpu: "2", memory: "8Gi", nvidia.com/gpu: "2" }
+                limits:   { cpu: "8", memory: "32Gi", nvidia.com/gpu: "2" }
+              env:
+              - name: RAY_ADDRESS
+                value: "disagg-job-rl-head-0-0.disagg-job:6379"
+              - name: NRL_FORCE_REBUILD_VENVS
+                value: "true"
+              volumeMounts:
+              - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+              - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
+              - { name: dshm, mountPath: /dev/shm }
+            volumes:
+            - name: nemo-rl-src
+              hostPath: { path: /workspace/nemo-rl, type: DirectoryOrCreate }
+            - name: dshm
+              emptyDir: { medium: Memory }
+
+  # ========================
+  # Gym Ray head (runs standalone Gym server on its own Ray cluster)
+  # ========================
+  - name: gym-head
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            serviceAccountName: nemo-rl-endpoint-registry
+            imagePullSecrets:
+            - name: nvcr-secret
+            containers:
+            - name: ray-head
+              image: nvcr.io/nvidian/nemo-rl:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                ulimit -n 65536
+                ray start --head --port=6380 \
+                  --dashboard-host=0.0.0.0 --dashboard-port=8266 \
+                  --object-store-memory=200000000
+                git config --global --add safe.directory /workspace/nemo-rl/3rdparty/Gym-workspace/Gym
+                cd /workspace/nemo-rl
+                uv pip install kubernetes
+                uv run --extra nemo_gym python -m nemo_rl.distributed.standalone_gym_server \
+                  --job-id disagg-job \
+                  --port 9090 \
+                  --model-name Qwen/Qwen3-0.6B \
+                  --config-yaml infra/examples/gym_standalone_config.yaml
+              ports:
+              - { containerPort: 6380, name: gcs-server }
+              - { containerPort: 8266, name: dashboard }
+              - { containerPort: 9090, name: head-server }
+              readinessProbe:
+                exec:
+                  command: ["ray", "health-check", "--address", "127.0.0.1:6380"]
+                initialDelaySeconds: 10
+                periodSeconds: 5
+                timeoutSeconds: 5
+                failureThreshold: 60
+              resources:
+                requests: { cpu: "1", memory: "4Gi" }
+                limits:   { cpu: "4", memory: "16Gi" }
+              env:
+              - name: RAY_ADDRESS
+                value: "127.0.0.1:6380"
+              volumeMounts:
+              - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+              - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
+              - { name: dshm, mountPath: /dev/shm }
+            volumes:
+            - name: nemo-rl-src
+              hostPath: { path: /workspace/nemo-rl, type: DirectoryOrCreate }
+            - name: dshm
+              emptyDir: { medium: Memory }
+
+  # ========================
+  # Gym CPU workers (connect to gym-head's Ray cluster)
+  # ========================
+  - name: gym-workers
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completions: 2
+        parallelism: 2
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            imagePullSecrets:
+            - name: nvcr-secret
+            initContainers:
+            - name: wait-for-gym-head
+              image: nvcr.io/nvidian/nemo-rl:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                GYM_HEAD=disagg-job-gym-head-0-0.disagg-job
+                echo "Waiting for Gym head at ${GYM_HEAD}:6380..."
+                until ray health-check --address ${GYM_HEAD}:6380 >/dev/null 2>&1; do
+                  sleep 5
+                done
+                echo "Gym head is ready."
+              resources:
+                requests: { cpu: "200m", memory: "256Mi" }
+            containers:
+            - name: ray-worker
+              image: nvcr.io/nvidian/nemo-rl:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                ulimit -n 65536
+                GYM_HEAD=disagg-job-gym-head-0-0.disagg-job
+                ray start --address=${GYM_HEAD}:6380 \
+                  --object-store-memory=200000000 \
+                  --block
+              resources:
+                requests: { cpu: "1", memory: "4Gi" }
+                limits:   { cpu: "4", memory: "16Gi" }
+              env:
+              - name: RAY_ADDRESS
+                value: "disagg-job-gym-head-0-0.disagg-job:6380"
+              volumeMounts:
+              - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+              - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
+              - { name: dshm, mountPath: /dev/shm }
+            volumes:
+            - name: nemo-rl-src
+              hostPath: { path: /workspace/nemo-rl, type: DirectoryOrCreate }
+            - name: dshm
+              emptyDir: { medium: Memory }
+
+  # ========================
+  # Driver (submits GRPO, gates success)
+  # ========================
+  - name: driver
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            serviceAccountName: nemo-rl-endpoint-registry
+            imagePullSecrets:
+            - name: nvcr-secret
+            initContainers:
+            - name: wait-for-rl-head
+              image: nvcr.io/nvidian/nemo-rl:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                HEAD=disagg-job-rl-head-0-0.disagg-job
+                echo "Waiting for RL head at ${HEAD}:6379..."
+                until ray health-check --address ${HEAD}:6379 >/dev/null 2>&1; do
+                  sleep 5
+                done
+                echo "RL head is ready."
+              resources:
+                requests: { cpu: "200m", memory: "256Mi" }
+            containers:
+            - name: driver
+              image: nvcr.io/nvidian/nemo-rl:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                set -eo pipefail
+                HEAD=disagg-job-rl-head-0-0.disagg-job
+                SUBMISSION_ID="grpo-$(date +%s)"
+                ray job submit --address http://${HEAD}:8265 \
+                  --submission-id ${SUBMISSION_ID} \
+                  -- bash -c "cd /workspace/nemo-rl && python examples/nemo_gym/run_grpo_nemo_gym.py \
+                    --config examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml \
+                    +env.disagg_job_id=disagg-job \
+                    policy.model_name=Qwen/Qwen3-0.6B \
+                    cluster.gpus_per_node=2 \
+                    policy.megatron_cfg.tensor_model_parallel_size=1 \
+                    policy.megatron_cfg.pipeline_model_parallel_size=1 \
+                    policy.megatron_cfg.expert_model_parallel_size=1 \
+                    policy.megatron_cfg.context_parallel_size=1 \
+                    policy.megatron_cfg.sequence_parallel=false \
+                    policy.generation.vllm_cfg.tensor_parallel_size=1 \
+                    policy.generation.colocated.enabled=false \
+                    policy.generation.colocated.resources.num_nodes=1 \
+                    policy.generation.colocated.resources.gpus_per_node=1 \
+                    policy.generation.max_new_tokens=512 \
+                    policy.max_total_sequence_length=512 \
+                    grpo.num_prompts_per_step=4 grpo.num_generations_per_prompt=2 \
+                    grpo.max_num_steps=2 \
+                    policy.train_global_batch_size=4 policy.train_micro_batch_size=1 \
+                    logger.wandb_enabled=false" \
+                  2>&1 | tee /workspace/nemo-rl/outputs/driver.log
+              resources:
+                requests: { cpu: "500m", memory: "2Gi" }
+                limits:   { cpu: "2", memory: "8Gi" }
+              env:
+              - name: RAY_ADDRESS
+                value: "disagg-job-rl-head-0-0.disagg-job:6379"
+              volumeMounts:
+              - { name: nemo-rl-src, mountPath: /workspace/nemo-rl }
+              - { name: nemo-rl-src, mountPath: /opt/nemo-rl }
+            volumes:
+            - name: nemo-rl-src
+              hostPath: { path: /workspace/nemo-rl, type: DirectoryOrCreate }

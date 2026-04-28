@@ -1,0 +1,16 @@
+# KAI Topology for GB300 clique-aware scheduling.
+#
+# Defines a two-level hierarchy: clique → hostname. KAI uses this to
+# constrain worker groups annotated with
+#   kai.scheduler/topology: gb300-topology
+#   kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+# so that all pods in a group land on nodes within the same clique.
+
+apiVersion: kai.scheduler/v1alpha1
+kind: Topology
+metadata:
+  name: gb300-topology
+spec:
+  levels:
+  - nodeLabel: nvidia.com/gpu.clique
+  - nodeLabel: kubernetes.io/hostname
