@@ -3,7 +3,8 @@
 defaults: "../../examples/configs/vlm_grpo_3B.yaml"
 
 grpo:
-  num_prompts_per_step: 8
+  num_prompts_per_step: 32
+  val_at_start: true
   reward_shaping:
     overlong_buffer_length: 512
 
@@ -12,8 +13,8 @@ checkpointing:
   save_optimizer: false
 
 policy:
-  model_name: /lustre/fsw/portfolios/coreai/users/yuekaiz/HF/nemotron-3-nano-omni-ea1_v2.0
-  train_global_batch_size: 128
+  model_name: /lustre/fsw/portfolios/coreai/users/yuekaiz/HF/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  train_global_batch_size: 32
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 8192
@@ -26,7 +27,9 @@ policy:
       lr: 5.0e-07
   dtensor_cfg:
     expert_parallel_size: 8
-    activation_checkpointing: false
+    activation_checkpointing: true
+    moe_parallelizer:
+      ignore_router_for_ac: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
     automodel_kwargs:

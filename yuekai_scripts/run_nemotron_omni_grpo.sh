@@ -2,8 +2,8 @@
 # Nemotron-Omni GRPO training on CLEVR-CoGenT
 
 # Automodel-omni provides the NemotronOmni model implementation
-export PYTHONPATH=${PYTHONPATH}:/lustre/fsw/portfolios/coreai/users/yuekaiz/omni/automodel-omni
-
+# export PYTHONPATH=${PYTHONPATH}:/lustre/fsw/portfolios/coreai/users/yuekaiz/omni/automodel-omni
+export PYTHONPATH=${PYTHONPATH}:/lustre/fsw/portfolios/coreai/users/yuekaiz/pr/Automodel 
 # Custom vLLM with NemotronH_Nano_VL_V2 support (3rdparty/vllm)
 # Ray vLLM venv already has torch 2.11.0 + precompiled vllm 0.19.1
 # Do NOT set NRL_FORCE_REBUILD_VENVS=true — it would revert torch to 2.10.0
