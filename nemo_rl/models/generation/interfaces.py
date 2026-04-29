@@ -216,6 +216,7 @@ class GenerationOutputSpec(TypedDict):
     truncated: NotRequired[
         torch.Tensor
     ]  # Whether each sequence was truncated and hit max_tokens without stop token
+    spec_token_origins: NotRequired[torch.Tensor]  # Per-token speculative decoding origin: 0=target, N=draft iter N
     __extra__: Any
 
 

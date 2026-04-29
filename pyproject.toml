@@ -136,6 +136,9 @@ modelopt = ["nvidia-modelopt"]
 nvrx = [
   "nvidia-resiliency-ext",
 ] # for ft_launcher (fault-tolerant training launcher)
+trtllm = [
+  "tensorrt_llm>=0.21.0",
+]
 nemo_gym = ["nemo_gym"]
 
 [dependency-groups]

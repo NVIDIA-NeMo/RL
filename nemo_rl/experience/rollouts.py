@@ -111,6 +111,11 @@ def generate_responses(
                 i, input_length:total_length
             ]
 
+        if "spec_token_origins" in generation_outputs:
+            assistant_message["spec_token_origins"] = generation_outputs[
+                "spec_token_origins"
+            ][i, input_length:total_length]
+
         batch["message_log"][i].append(assistant_message)
 
     # Generation metrics
@@ -1175,7 +1180,12 @@ def run_async_nemo_gym_rollout(
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
-        max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+        if "vllm_cfg" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+        elif "trtllm_cfg" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg["trtllm_cfg"]["max_model_len"]
+        else:
+            max_total_tokens_per_sample = policy_generation.cfg.get("max_total_sequence_length", 4096)
         all_sample_metrics = [
             {
                 "total_reward": r["full_result"]["reward"],

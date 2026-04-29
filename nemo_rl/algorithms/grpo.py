@@ -69,6 +69,7 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
+from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -264,6 +265,9 @@ def setup(
     # ==========================
     #         Logger
     # ==========================
+    if logger_config.get("mongodb_enabled", False) and "mongodb" in logger_config:
+        logger_config["mongodb"]["_backend_hint"] = generation_config.get("backend", "unknown")
+        logger_config["mongodb"]["_model_name"] = policy_config.get("model_name", "")
     logger = Logger(logger_config)
     logger.log_hyperparams(master_config)
 
@@ -746,6 +750,42 @@ def setup(
             flush=True,
         )
 
+    elif backend == "trtllm":
+        generation_config = cast(TrtllmConfig, generation_config)
+
+        def init_trtllm():
+            """Initialize TRT-LLM generation workers."""
+            t0 = time.perf_counter()
+            pg = TrtllmGeneration(cluster=inference_cluster, config=generation_config)
+            pg.finish_generation()
+            return pg, time.perf_counter() - t0
+
+        assert not colocated_inference, (
+            "TRT-LLM backend only supports non-colocated inference for now."
+        )
+
+        print(
+            "  ⚡ Using parallel worker initialization (non-colocated mode)",
+            flush=True,
+        )
+        parallel_start_time = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            trtllm_future = executor.submit(init_trtllm)
+            policy_future = executor.submit(init_policy)
+            policy_generation, trtllm_time = trtllm_future.result()
+            policy, policy_time = policy_future.result()
+        parallel_wall_time = time.perf_counter() - parallel_start_time
+
+        worker_init_timing_metrics["trtllm_init_time_s"] = trtllm_time
+        worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
+        worker_init_timing_metrics["parallel_init_enabled"] = True
+
+        print(
+            f"  ✓ Using TRT-LLM backend for generation with {policy_config['model_name']}",
+            flush=True,
+        )
+
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
@@ -1007,18 +1047,24 @@ def scale_rewards(
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
-    Returns True if vLLM backend is used with async_engine enabled.
+    Returns True if vLLM backend is used with async_engine enabled,
+    or if TRT-LLM backend has expose_http_server enabled.
     """
     generation_config = master_config["policy"]["generation"]
     if generation_config is None:
         return False
 
     backend = generation_config.get("backend", "")
-    if backend != "vllm":
-        return False
 
-    vllm_cfg = generation_config.get("vllm_cfg", {})
-    return vllm_cfg.get("async_engine", False)
+    if backend == "vllm":
+        vllm_cfg = generation_config.get("vllm_cfg", {})
+        return vllm_cfg.get("async_engine", False)
+
+    if backend == "trtllm":
+        trtllm_cfg = generation_config.get("trtllm_cfg", {})
+        return trtllm_cfg.get("expose_http_server", False)
+
+    return False
 
 
 def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
@@ -1028,18 +1074,22 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     if not should_use_nemo_gym:
         return should_use_nemo_gym
 
-    # Validate the setup for training with NeMo-Gym
     assert _should_use_async_rollouts(master_config), (
-        "❌ Error: In order to use NeMo-Gym, you must use vllm generation backend with `async_engine: true`!"
+        "❌ Error: NeMo-Gym requires either vllm with `async_engine: true` "
+        "or trtllm with `expose_http_server: true`!"
     )
 
     generation_config = master_config["policy"]["generation"]
+    backend = generation_config.get("backend", "")
 
-    # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
-    should_expose_http_server = generation_config["vllm_cfg"].get("expose_http_server")
-    assert should_expose_http_server, (
-        "In order to use NeMo-Gym, you must expose the vllm server via `expose_http_server: true`!"
-    )
+    if backend == "vllm":
+        assert generation_config["vllm_cfg"].get("expose_http_server"), (
+            "In order to use NeMo-Gym with vllm, you must set `expose_http_server: true`!"
+        )
+    elif backend == "trtllm":
+        assert generation_config["trtllm_cfg"].get("expose_http_server"), (
+            "In order to use NeMo-Gym with trtllm, you must set `expose_http_server: true`!"
+        )
 
     return should_use_nemo_gym
 

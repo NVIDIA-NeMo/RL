@@ -61,6 +61,8 @@ class NemoGym(EnvironmentInterface):
         # their own loopback interface instead of the actor-hosted service.
         initial_global_config_dict.setdefault("default_host", self.node_ip)
 
+        initial_global_config_dict.setdefault("skip_venv_if_present", True)
+
         initial_global_config_dict.setdefault(
             "global_aiohttp_connector_limit_per_host", 16_384
         )
@@ -188,18 +190,13 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         for output_item_dict in nemo_gym_result["response"]["output"]:
-            # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
-            # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
-            # Eventually we can maybe be smarter about this, but this is functional for now.
-
-            # Note that NeMo-Gym will only return token ids on "assistant" messages and not other message types.
             if "generation_token_ids" not in output_item_dict:
                 continue
 
             assert (
                 seen_token_ids
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+            ), f"""Non-contiguous messages found!
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 """
@@ -227,7 +224,6 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             seen_token_ids.extend(nemo_rl_message_log[-2]["token_ids"])
             seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
 
-            # We pop to remove larger tensors from logging.
             output_item_dict["prompt_str"] = tokenizer.decode(
                 output_item_dict.pop("prompt_token_ids")
             )
@@ -256,6 +252,50 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             "full_result": nemo_gym_result,
         }
 
+    @staticmethod
+    def _fallback_tokenize_conversation(
+        nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase,
+    ) -> list:
+        """Build a minimal message_log by tokenizing the conversation text.
+
+        Used when the agent doesn't provide per-turn token IDs (e.g. when
+        using ToolCallTerminalAgent which bypasses NemoGymLLM's token tracking
+        through the Harbor trajectory step metrics path).
+        """
+        output_items = nemo_gym_result.get("response", {}).get("output", [])
+        texts: List[str] = []
+        for item in output_items:
+            if isinstance(item, dict):
+                for c in item.get("content", []):
+                    if isinstance(c, dict) and c.get("text"):
+                        texts.append(c["text"])
+                    elif isinstance(c, str):
+                        texts.append(c)
+
+        full_text = "\n".join(texts) if texts else "DONE"
+        all_ids = tokenizer.encode(full_text, add_special_tokens=False)
+
+        if len(all_ids) < 2:
+            all_ids = tokenizer.encode("DONE", add_special_tokens=False)
+
+        split = max(1, len(all_ids) // 2)
+        prompt_ids = all_ids[:split]
+        gen_ids = all_ids[split:]
+
+        return [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor(prompt_ids, dtype=torch.long),
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor(gen_ids, dtype=torch.long),
+                "generation_logprobs": torch.zeros(len(gen_ids), dtype=torch.float32),
+            },
+        ]
+
     def shutdown(self) -> None:
         self.rh.shutdown()
 
@@ -275,11 +315,13 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 
 def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config["policy"]["generation"]
+    backend = generation_config.get("backend", "vllm")
 
-    # Enable the http server. Requires both async engine and the expose_http_server flag
-    generation_config["vllm_cfg"]["async_engine"] = True
-    generation_config["vllm_cfg"]["expose_http_server"] = True
+    if backend == "vllm":
+        generation_config["vllm_cfg"]["async_engine"] = True
+        generation_config["vllm_cfg"]["expose_http_server"] = True
+    elif backend == "trtllm":
+        generation_config["trtllm_cfg"]["expose_http_server"] = True
 
-    # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
