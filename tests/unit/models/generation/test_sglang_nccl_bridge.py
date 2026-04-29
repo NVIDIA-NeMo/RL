@@ -14,8 +14,8 @@
 
 """Unit tests for the SGLang non-colocated NCCL bridge wire format.
 
-These tests cover the small, GPU-free, Ray-free pieces of the slime-style
-NCCL bridge refit path:
+These tests cover the small, GPU-free, Ray-free pieces of the NCCL
+bridge refit path:
 
   * ``SGLangGenerationWorker.init_weights_update_group`` — HTTP wrapper
     body / status-code handling, model-owner short-circuit.
@@ -114,7 +114,9 @@ def _get_unbound(method_name: str):
     return getattr(cls, method_name)
 
 
-def _make_response(status_code: int, json_body: dict | None = None, text: str = "") -> MagicMock:
+def _make_response(
+    status_code: int, json_body: dict | None = None, text: str = ""
+) -> MagicMock:
     resp = MagicMock()
     resp.status_code = status_code
     resp.text = text
@@ -163,8 +165,10 @@ def test_init_weights_update_group_no_base_url_returns_true_without_post():
 
 
 def test_init_weights_update_group_posts_correct_body():
-    """Verify the JSON body matches SGLang's
-    ``InitWeightsUpdateGroupReqInput`` schema."""
+    """Verify the JSON body matches SGLang's expected schema.
+
+    Specifically ``InitWeightsUpdateGroupReqInput``.
+    """
     init = _get_unbound("init_weights_update_group")
     worker = _make_stub_worker(base_url="http://1.2.3.4:9999")
 
@@ -275,9 +279,11 @@ def test_update_weights_from_distributed_posts_correct_body_with_load_format():
 
 
 def test_update_weights_from_distributed_omits_load_format_when_none():
-    """When ``load_format`` is ``None`` we must NOT send the field
-    (otherwise SGLang will treat the explicit ``None`` differently from
-    "not provided" via pydantic)."""
+    """When ``load_format`` is ``None`` we must NOT send the field.
+
+    Otherwise SGLang treats the explicit ``None`` differently from
+    "not provided" via pydantic.
+    """
     update = _get_unbound("update_weights_from_distributed")
     worker = _make_stub_worker(base_url="http://1.2.3.4:9999")
 
@@ -318,8 +324,10 @@ def test_update_weights_from_distributed_status_500_returns_false():
 
 
 def test_update_weights_from_distributed_body_success_false_returns_false():
-    """SGLang returns HTTP 200 even when ``model.load_weights`` raises;
-    we surface the body-level ``success=False`` as a failure."""
+    """Body-level ``success=False`` must surface as a failure.
+
+    SGLang returns HTTP 200 even when ``model.load_weights`` raises.
+    """
     update = _get_unbound("update_weights_from_distributed")
     worker = _make_stub_worker()
 
@@ -342,8 +350,11 @@ def test_update_weights_from_distributed_body_success_false_returns_false():
 
 
 def test_update_weights_from_distributed_body_no_success_field_defaults_true():
-    """Older SGLang versions may not include the ``success`` field; we
-    treat absence as success to avoid spurious failures."""
+    """Absence of the ``success`` field defaults to True.
+
+    Older SGLang versions may not include the field at all; we treat
+    absence as success to avoid spurious failures.
+    """
     update = _get_unbound("update_weights_from_distributed")
     worker = _make_stub_worker()
 
@@ -389,8 +400,10 @@ def test_destroy_weights_update_group_5xx_returns_false():
 
 
 def test_destroy_weights_update_group_exception_treated_as_success():
-    """Tolerant on shutdown — network errors during teardown should not
-    crash training."""
+    """Tolerant on shutdown.
+
+    Network errors during teardown should not crash training.
+    """
     destroy = _get_unbound("destroy_weights_update_group")
     worker = _make_stub_worker()
 
@@ -494,9 +507,7 @@ def test_init_collective_nccl_bridge_rank_offsets_multi_engine():
 def test_init_collective_nccl_bridge_propagates_failure():
     sg = _make_stub_generation()
     # Force one of the futures to be False.
-    sg.worker_group.run_all_workers_multiple_data = lambda *a, **k: [
-        _FakeFuture(False)
-    ]
+    sg.worker_group.run_all_workers_multiple_data = lambda *a, **k: [_FakeFuture(False)]
     with patch(
         "nemo_rl.models.generation.sglang.sglang_generation.ray.get",
         side_effect=_patched_ray_get,
@@ -548,14 +559,15 @@ def test_destroy_collective_nccl_bridge_idempotent_when_no_workers():
 
 
 def test_flattened_bucket_byte_layout_matches_sglang_concat():
-    """Train side: ``torch.cat([t.flatten().contiguous().view(uint8) ...])``
-    Receive side (SGLang): ``FlattenedTensorBucket(named_tensors=[
-        (name, torch.empty(shape, dtype, device)) ...
-    ]).flattened_tensor`` (constructed with the SAME shape/dtype list).
+    """The train-side flat buffer must be byte-equal to SGLang's recv layout.
 
-    Both must agree byte-for-byte: the train-side concat IS what SGLang
-    will write into via NCCL. We don't import SGLang here (heavy + GPU);
-    instead we assert the layout invariant directly.
+    Train side: ``torch.cat([t.flatten().contiguous().view(uint8) ...])``.
+    Receive side (SGLang): ``FlattenedTensorBucket(named_tensors=[
+    (name, torch.empty(shape, dtype, device)) ...]).flattened_tensor``
+    constructed with the SAME shape/dtype list. Both must agree
+    byte-for-byte: the train-side concat IS what SGLang will write into
+    via NCCL. We don't import SGLang here (heavy + GPU); instead we
+    assert the layout invariant directly.
     """
     torch = pytest.importorskip("torch")
 
@@ -589,10 +601,12 @@ def test_flattened_bucket_byte_layout_matches_sglang_concat():
 
 
 def test_flattened_bucket_round_trips_via_metadata_offsets():
-    """Validates the metadata schema we produce against
-    ``FlattenedTensorMetadata``: ``(name, shape, dtype, start_idx, end_idx,
-    numel)``. Reconstruction by ``flat[start:end].view(dtype).reshape(shape)``
-    must yield byte-equal tensors back."""
+    """Round-trip the metadata schema against ``FlattenedTensorMetadata``.
+
+    Schema: ``(name, shape, dtype, start_idx, end_idx, numel)``.
+    Reconstruction by ``flat[start:end].view(dtype).reshape(shape)`` must
+    yield byte-equal tensors back.
+    """
     torch = pytest.importorskip("torch")
 
     tensors = [
@@ -633,10 +647,13 @@ def test_flattened_bucket_round_trips_via_metadata_offsets():
 
 
 def test_dtype_string_format_matches_sglang_expectation():
-    """SGLang's server-side does ``getattr(torch, dtype)`` to look up the
+    """Dtype wire format must round-trip through ``getattr(torch, ...)``.
+
+    SGLang's server-side does ``getattr(torch, dtype)`` to look up the
     dtype, so we must emit ``"bfloat16"`` not ``"torch.bfloat16"`` in the
     HTTP body. The train-side helper uses
-    ``str(t.dtype).removeprefix("torch.")``."""
+    ``str(t.dtype).removeprefix("torch.")``.
+    """
     torch = pytest.importorskip("torch")
 
     cases = [

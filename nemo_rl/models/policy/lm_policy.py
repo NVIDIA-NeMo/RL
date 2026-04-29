@@ -925,17 +925,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         bridge_world_size: int,
         group_name: str = "nrl-sglang-bridge",
     ) -> list[ray.ObjectRef]:
-        """Set up the train side of the slime-style SGLang NCCL bridge.
+        """Train side of the SGLang non-colocated NCCL bridge setup (only train rank 0 joins).
 
-        Only train rank 0 actually joins the bridge ``ProcessGroup``;
-        other train ranks return ``True`` immediately. See
-        ``MegatronPolicyWorker.init_collective_for_sglang_nccl`` for the
-        topology rationale.
-
-        Returns Ray futures so the caller can dispatch this concurrently
-        with ``SGLangGeneration.init_collective_nccl_bridge`` (the
-        bridge rendezvous deadlocks otherwise — both sides must be in
-        the ``rendezvous(...)`` call simultaneously).
+        Returns Ray futures; the caller MUST dispatch this concurrently with
+        ``SGLangGeneration.init_collective_nccl_bridge`` because both sides have
+        to be in their respective ``rendezvous(...)`` call simultaneously.
         """
         return self.worker_group.run_all_workers_single_data(
             "init_collective_for_sglang_nccl",
@@ -951,27 +945,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         engine_tp_size: int,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> list[ray.ObjectRef]:
-        """Send weights to SGLang via the slime-style NCCL bridge group.
+        """Send weights to SGLang via the bridge group; tensors stay on GPU end-to-end.
 
-        Used by the non-colocated SGLang refit path. Faster than the
-        pure-HTTP refit because tensors stay on GPU end-to-end (no CPU
-        detour, no JSON / base64 / pickle serialization), and NCCL
-        transports the bytes at ~25-50 GB/s EFA bandwidth.
-
-        Requires ``init_collective_for_sglang_nccl`` (train side) and
-        ``SGLangGeneration.init_collective_nccl_bridge`` (SGLang side)
-        to have been called BEFORE the first refit.
-
-        Args:
-            engine_urls: SGLang server base URLs, one per engine. Used
-                for the per-bucket metadata POSTs to
-                ``/update_weights_from_distributed``.
-            engine_tp_size: TP size per engine (informational; the
-                bridge layout was set up at init).
-            kv_scales: Optional FP8 KV cache scales.
-
-        Returns:
-            Ray futures from each train worker. Wait outside.
+        Requires the bridge to have been initialized via
+        ``init_collective_for_sglang_nccl`` (train) +
+        ``SGLangGeneration.init_collective_nccl_bridge`` (engine) at startup.
+        Returns Ray futures; wait outside.
         """
         futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_via_nccl_to_sglang",

@@ -24,6 +24,7 @@ from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     sharded_state_dict_default,
 )
+
 # modelopt is an optional dep (only required for EAGLE speculative-decoding
 # draft training). When it's not installed, leave EagleModule as None and
 # defer the failure to the moment someone actually tries to instantiate
