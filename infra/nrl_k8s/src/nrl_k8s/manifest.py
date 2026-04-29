@@ -11,17 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Build a RayCluster manifest dict from the recipe's inline ``spec``.
+"""Build K8s manifests from the recipe's inline specs.
 
-The recipe encodes the full RayCluster shape inline under
-``infra.clusters.<role>.spec`` — this module just wraps it in the standard
-``apiVersion/kind/metadata`` envelope and patches three cross-cutting
-fields (``image`` on every container, ``imagePullSecrets`` on every pod
-template, optional ``serviceAccountName``) from the top-level ``infra``
-block so you don't repeat them across roles.
-
-The resulting dict is submitted as-is via the official ``kubernetes``
-Python client's ``CustomObjectsApi``.
+RayCluster specs live under ``infra.kuberay.<role>.spec``; Deployment specs
+live under ``infra.deployments.<key>.spec``. This module wraps each in the
+standard ``apiVersion/kind/metadata`` envelope and patches cross-cutting
+fields (image, imagePullSecrets, optional serviceAccountName) from the
+top-level ``infra`` block so you don't repeat them across roles.
 """
 
 from __future__ import annotations
@@ -29,7 +25,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from .schema import ClusterSpec, InfraConfig
+from .schema import ClusterSpec, DeploymentSpec, InfraConfig
 
 # Every resource the CLI creates carries this label so admins can find
 # orphans not managed by the tool:
@@ -64,6 +60,9 @@ def build_raycluster_manifest(
     """
     spec = copy.deepcopy(cluster.spec)
 
+    if cluster.segmentSize is not None:
+        _expand_worker_segments(spec, cluster.segmentSize)
+
     _patch_images(spec, infra.image)
     _patch_image_pull_secrets(spec, list(infra.imagePullSecrets))
     if infra.serviceAccount is not None:
@@ -97,6 +96,44 @@ def build_raycluster_manifest(
 # =============================================================================
 # Internals
 # =============================================================================
+
+
+def _expand_worker_segments(spec: dict, segment_size: int) -> None:
+    """Split worker groups whose replicas exceed *segment_size*.
+
+    Each qualifying group is replaced by ``replicas // segment_size``
+    identical copies named ``{groupName}-segment-{i}`` with replica counts
+    set to *segment_size*. Mutates *spec* in place.
+    """
+    original_groups = spec.get("workerGroupSpecs") or []
+    if not original_groups:
+        return
+
+    expanded: list[dict] = []
+    for wg in original_groups:
+        replicas = int(wg.get("replicas", 0))
+        if replicas <= segment_size:
+            expanded.append(wg)
+            continue
+
+        if replicas % segment_size != 0:
+            group_name = wg.get("groupName", "<unnamed>")
+            raise ValueError(
+                f"workerGroup '{group_name}' has replicas={replicas} which is "
+                f"not evenly divisible by segmentSize={segment_size}"
+            )
+
+        num_segments = replicas // segment_size
+        base_name = wg.get("groupName", "workers")
+        for i in range(num_segments):
+            segment = copy.deepcopy(wg)
+            segment["groupName"] = f"{base_name}-segment-{i}"
+            segment["replicas"] = segment_size
+            segment["minReplicas"] = segment_size
+            segment["maxReplicas"] = segment_size
+            expanded.append(segment)
+
+    spec["workerGroupSpecs"] = expanded
 
 
 def _walk_pod_templates(raycluster_spec: dict) -> list[dict]:
@@ -237,9 +274,106 @@ def build_roce_template_manifest(name: str, namespace: str) -> dict[str, Any]:
     }
 
 
+def build_deployment_manifest(
+    deployment: DeploymentSpec,
+    infra: InfraConfig,
+) -> dict[str, Any]:
+    """Build a Deployment dict for apply.
+
+    Same patching pattern as :func:`build_raycluster_manifest` — image,
+    imagePullSecrets, serviceAccountName, and labels are applied from the
+    top-level ``infra`` block.
+    """
+    spec = copy.deepcopy(deployment.spec)
+
+    template = spec.get("template", {})
+    pod_spec = template.get("spec")
+    if isinstance(pod_spec, dict):
+        for container in pod_spec.get("containers", []):
+            container.setdefault("image", infra.image)
+        if infra.imagePullSecrets:
+            pod_spec["imagePullSecrets"] = [{"name": s} for s in infra.imagePullSecrets]
+        if infra.serviceAccount is not None:
+            pod_spec["serviceAccountName"] = infra.serviceAccount
+
+    tmeta = template.setdefault("metadata", {})
+    existing_labels = tmeta.get("labels") or {}
+    tmeta["labels"] = {
+        **_MANAGED_BY_LABEL,
+        **infra.labels,
+        **deployment.labels,
+        **existing_labels,
+    }
+
+    metadata: dict[str, Any] = {
+        "name": deployment.name,
+        "namespace": infra.namespace,
+    }
+    labels = {**_MANAGED_BY_LABEL, **infra.labels, **deployment.labels}
+    annotations = {**infra.annotations, **deployment.annotations}
+    if labels:
+        metadata["labels"] = labels
+    if annotations:
+        metadata["annotations"] = annotations
+
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": metadata,
+        "spec": spec,
+    }
+
+
+def build_service_for_deployment(
+    deployment: DeploymentSpec,
+    infra: InfraConfig,
+) -> dict[str, Any] | None:
+    """Build a ClusterIP Service for a Deployment, or None if no ports declared.
+
+    The Service uses the Deployment's name and selector labels so DNS is
+    predictable: ``<deployment-name>.<namespace>.svc.cluster.local``.
+    """
+    selector = (deployment.spec.get("selector") or {}).get("matchLabels")
+    if not selector:
+        return None
+
+    ports: list[dict[str, Any]] = []
+    template = deployment.spec.get("template", {})
+    pod_spec = template.get("spec") or {}
+    for container in pod_spec.get("containers", []):
+        for i, p in enumerate(container.get("ports", [])):
+            port_entry: dict[str, Any] = {
+                "port": p["containerPort"],
+                "targetPort": p["containerPort"],
+                "protocol": p.get("protocol", "TCP"),
+            }
+            port_entry["name"] = p.get("name") or f"port-{i}"
+            ports.append(port_entry)
+
+    if not ports:
+        return None
+
+    return {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": deployment.name,
+            "namespace": infra.namespace,
+            "labels": {**_MANAGED_BY_LABEL},
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "selector": selector,
+            "ports": ports,
+        },
+    }
+
+
 __all__ = [
     "build_compute_domain_manifest",
+    "build_deployment_manifest",
     "build_raycluster_manifest",
     "build_roce_template_manifest",
+    "build_service_for_deployment",
     "dra_resources_for_cluster",
 ]

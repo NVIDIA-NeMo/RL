@@ -217,7 +217,7 @@ def check(
     Dumps the fully-resolved config + rendered RayCluster manifests
     to a file with ``-o``. Replaces the former ``validate`` + ``plan``.
     """
-    from .manifest import build_raycluster_manifest
+    from .manifest import build_deployment_manifest, build_raycluster_manifest
 
     try:
         loaded = load_recipe_with_infra(
@@ -228,20 +228,29 @@ def check(
 
     manifests: dict[str, dict] = {}
     for role in ALL_ROLES:
-        cluster = getattr(loaded.infra.clusters, role)
+        cluster = getattr(loaded.infra.kuberay, role)
         if cluster is None:
             continue
         manifests[role] = build_raycluster_manifest(cluster, loaded.infra, role=role)
 
+    dep_manifests: dict[str, dict] = {}
+    for key, dep_spec in loaded.infra.deployments.items():
+        dep_manifests[key] = build_deployment_manifest(dep_spec, loaded.infra)
+
     if output_path is not None:
-        _dump_check_output(loaded, manifests, output_path, output_format)
-        click.echo(f"wrote full config + {len(manifests)} manifest(s) to {output_path}")
+        _dump_check_output(loaded, manifests, output_path, output_format, dep_manifests)
+        total = len(manifests) + len(dep_manifests)
+        click.echo(f"wrote full config + {total} manifest(s) to {output_path}")
         return
 
-    _print_check_summary(loaded, manifests)
+    _print_check_summary(loaded, manifests, dep_manifests)
 
 
-def _print_check_summary(loaded: LoadedConfig, manifests: dict[str, dict]) -> None:
+def _print_check_summary(
+    loaded: LoadedConfig,
+    manifests: dict[str, dict],
+    dep_manifests: dict[str, dict] | None = None,
+) -> None:
     """One-page overview — namespace, image, launch/attach, per-role highlights."""
     infra = loaded.infra
     click.echo(f"namespace:   {infra.namespace}")
@@ -260,50 +269,67 @@ def _print_check_summary(loaded: LoadedConfig, manifests: dict[str, dict]) -> No
         _print_block(infra.launch.entrypoint)
 
     click.echo("")
-    click.echo("CLUSTERS")
-    click.echo("--------")
+    click.echo("KUBERAY")
+    click.echo("-------")
     if not manifests:
         click.echo("  (none declared)")
-        return
-    for role, m in manifests.items():
-        spec = m["spec"]
-        name = m["metadata"]["name"]
-        head = spec.get("headGroupSpec", {}).get("template", {}).get("spec", {})
-        head_res = (
-            head.get("containers", [{}])[0].get("resources", {}).get("limits") or {}
-        )
-        workers = spec.get("workerGroupSpecs") or []
-        wrep = sum(int(w.get("replicas", 0)) for w in workers)
-        wgpu = 0
-        wcpu = wmem = "—"
-        if workers:
-            w_res = (
-                workers[0]
-                .get("template", {})
-                .get("spec", {})
-                .get("containers", [{}])[0]
-                .get("resources", {})
-                .get("limits")
-                or {}
+    else:
+        for role, m in manifests.items():
+            spec = m["spec"]
+            name = m["metadata"]["name"]
+            head = spec.get("headGroupSpec", {}).get("template", {}).get("spec", {})
+            head_res = (
+                head.get("containers", [{}])[0].get("resources", {}).get("limits") or {}
             )
-            wgpu = int(w_res.get("nvidia.com/gpu", 0)) * wrep
-            wcpu = w_res.get("cpu", "—")
-            wmem = w_res.get("memory", "—")
-        daemon = loaded.infra.clusters.__dict__[role].daemon
-        daemon_id = daemon.submissionId if daemon else "—"
+            workers = spec.get("workerGroupSpecs") or []
+            wrep = sum(int(w.get("replicas", 0)) for w in workers)
+            wgpu = 0
+            wcpu = wmem = "—"
+            if workers:
+                w_res = (
+                    workers[0]
+                    .get("template", {})
+                    .get("spec", {})
+                    .get("containers", [{}])[0]
+                    .get("resources", {})
+                    .get("limits")
+                    or {}
+                )
+                wgpu = int(w_res.get("nvidia.com/gpu", 0)) * wrep
+                wcpu = w_res.get("cpu", "—")
+                wmem = w_res.get("memory", "—")
+            daemon = getattr(loaded.infra.kuberay, role).daemon
+            daemon_id = daemon.submissionId if daemon else "—"
 
-        click.echo(f"  {role}: {name}")
-        click.echo(
-            f"    head    cpu={head_res.get('cpu', '—')} mem={head_res.get('memory', '—')}"
-        )
-        if workers:
-            click.echo(f"    workers {wrep}x cpu={wcpu} mem={wmem} gpu={wgpu}")
-        else:
-            click.echo("    workers (none — head-only)")
-        click.echo(f"    daemon  {daemon_id}")
-        if daemon and daemon.entrypoint:
-            click.echo("    entrypoint:")
-            _print_block(daemon.entrypoint, indent="      ")
+            click.echo(f"  {role}: {name}")
+            click.echo(
+                f"    head    cpu={head_res.get('cpu', '—')} mem={head_res.get('memory', '—')}"
+            )
+            if workers:
+                cluster_obj = getattr(loaded.infra.kuberay, role)
+                seg = cluster_obj.segmentSize if cluster_obj else None
+                if seg and len(workers) > 1:
+                    click.echo(
+                        f"    workers {wrep}x ({len(workers)} segments x {seg})"
+                        f" cpu={wcpu} mem={wmem} gpu={wgpu}"
+                    )
+                else:
+                    click.echo(f"    workers {wrep}x cpu={wcpu} mem={wmem} gpu={wgpu}")
+            else:
+                click.echo("    workers (none — head-only)")
+            click.echo(f"    daemon  {daemon_id}")
+            if daemon and daemon.entrypoint:
+                click.echo("    entrypoint:")
+                _print_block(daemon.entrypoint, indent="      ")
+
+    if dep_manifests:
+        click.echo("")
+        click.echo("DEPLOYMENTS")
+        click.echo("-----------")
+        for key, m in dep_manifests.items():
+            name = m["metadata"]["name"]
+            replicas = m["spec"].get("replicas", 1)
+            click.echo(f"  {key}: {name} (replicas={replicas})")
 
 
 def _print_block(text: str, *, indent: str = "  ") -> None:
@@ -323,6 +349,7 @@ def _dump_check_output(
     manifests: dict[str, dict],
     path: Path,
     fmt_override: str | None,
+    dep_manifests: dict[str, dict] | None = None,
 ) -> None:
     fmt = fmt_override or ("json" if path.suffix == ".json" else "yaml")
     bundle = {
@@ -330,6 +357,8 @@ def _dump_check_output(
         "recipe": OmegaConf.to_container(loaded.recipe, resolve=True),
         "manifests": manifests,
     }
+    if dep_manifests:
+        bundle["deployment_manifests"] = dep_manifests
     path.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "json":
         path.write_text(json.dumps(bundle, indent=2, sort_keys=True))
@@ -505,7 +534,7 @@ def run(
     if dry_run:
         _cli_error(
             "--dry-run is only valid with --rayjob",
-            hint="for long-lived clusters, use `nrl-k8s cluster up --role training --dry-run`",
+            hint="for long-lived clusters, use `nrl-k8s cluster up --target kuberay.training --dry-run`",
         )
 
     if not submit_mod.is_in_cluster():
@@ -530,7 +559,7 @@ def run(
 
     namespace = loaded.infra.namespace
     for _role in ALL_ROLES:
-        _cl = getattr(loaded.infra.clusters, _role, None)
+        _cl = getattr(loaded.infra.kuberay, _role)
         if _cl is not None:
             _check_head_svc_collision(_cl.name, namespace, creating="raycluster")
 
@@ -723,7 +752,7 @@ def logs(
         if cluster.daemon is None or not cluster.daemon.submissionId:
             _cli_error(
                 f"role {role} has no daemon submissionId",
-                hint=f"use --source head|worker, or declare `clusters.{role}.daemon.submissionId`",
+                hint=f"use --source head|worker, or declare `kuberay.{role}.daemon.submissionId`",
             )
         _tail_daemon(cluster.name, namespace, cluster.daemon.submissionId)
         return
@@ -745,22 +774,65 @@ def logs(
 
 @main.group()
 def cluster() -> None:
-    """Manage long-lived RayClusters (generation, gym, training)."""
+    """Manage long-lived RayClusters and Deployments."""
+
+
+_TARGET_OPTION = click.option(
+    "--target",
+    multiple=True,
+    help="Dotted path to a resource (e.g. kuberay.training, deployments.nemo_skills). "
+    "Omit to target all resources in the infra spec.",
+)
+
+
+def _resolve_targets(loaded: LoadedConfig, targets: tuple[str, ...]):
+    """Return list of (kind, key, spec) tuples from dotted paths.
+
+    If targets is empty, return all resources in the infra spec.
+    """
+    if not targets:
+        results = []
+        for role in ALL_ROLES:
+            spec = getattr(loaded.infra.kuberay, role, None)
+            if spec is not None:
+                results.append(("kuberay", role, spec))
+        for key, spec in loaded.infra.deployments.items():
+            results.append(("deployment", key, spec))
+        return results
+
+    results = []
+    for t in targets:
+        kind, _, key = t.partition(".")
+        if not key:
+            _cli_error(
+                f"invalid target {t!r} — expected kind.name (e.g. kuberay.training)",
+            )
+        if kind == "kuberay":
+            spec = getattr(loaded.infra.kuberay, key, None)
+            if spec is None:
+                _cli_error(f"kuberay.{key} is not defined in the recipe")
+            results.append(("kuberay", key, spec))
+        elif kind == "deployments":
+            spec = loaded.infra.deployments.get(key)
+            if spec is None:
+                _cli_error(f"deployments.{key} is not defined in the recipe")
+            results.append(("deployment", key, spec))
+        else:
+            _cli_error(
+                f"unknown resource kind: {kind!r} (expected 'kuberay' or 'deployments')"
+            )
+    return results
 
 
 @cluster.command("up")
 @click.argument("recipe", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.argument("overrides", nargs=-1, type=click.UNPROCESSED)
 @_INFRA_OPTION
-@click.option(
-    "--role",
-    type=_ROLE_CHOICE,
-    required=True,
-)
+@_TARGET_OPTION
 @click.option(
     "--wait/--no-wait",
     default=True,
-    help="Wait for the cluster to reach state=ready before returning.",
+    help="Wait for resources to reach state=ready before returning.",
 )
 @click.option(
     "--timeout",
@@ -771,112 +843,121 @@ def cluster() -> None:
 @click.option(
     "--dry-run",
     is_flag=True,
-    help="Render the RayCluster manifest for the role and print it; do not apply.",
+    help="Render manifests and print them; do not apply.",
 )
 def cluster_up(
     recipe: Path,
     overrides: tuple[str, ...],
     infra_path: Path | None,
-    role: str,
+    target: tuple[str, ...],
     wait: bool,
     timeout: int,
     dry_run: bool,
 ) -> None:
-    """Bring up a RayCluster, then submit its daemon if the recipe has one."""
+    """Bring up RayClusters and/or Deployments declared in the recipe.
+
+    With no ``--target``, brings up everything. With ``--target kuberay.training``,
+    brings up just the training RayCluster. With ``--target deployments.nemo_skills``,
+    brings up just that Deployment.
+    """
     from . import orchestrate
-    from .manifest import build_raycluster_manifest
+    from .manifest import build_deployment_manifest, build_raycluster_manifest
 
     loaded = _load_or_exit(recipe, overrides, infra_path)
-    cluster_spec = _pick_cluster_or_exit(loaded, role)
+    targets = _resolve_targets(loaded, target)
+
+    if not targets:
+        _cli_error("no resources defined in the recipe")
+
     if dry_run:
-        manifest = build_raycluster_manifest(cluster_spec, loaded.infra, role=role)
-        click.echo(yaml.safe_dump(manifest, sort_keys=False).rstrip())
+        for kind, key, spec in targets:
+            if kind == "kuberay":
+                manifest = build_raycluster_manifest(spec, loaded.infra, role=key)
+            else:
+                manifest = build_deployment_manifest(spec, loaded.infra)
+            click.echo(yaml.safe_dump(manifest, sort_keys=False).rstrip())
+            click.echo("---")
         return
 
-    _check_head_svc_collision(
-        cluster_spec.name, loaded.infra.namespace, creating="raycluster"
-    )
-
-    try:
-        name = orchestrate.bring_up_cluster(
-            role, loaded, log=click.echo, wait_ready=wait, ready_timeout_s=timeout
-        )
-        if wait:
-            # Only submit the daemon once the cluster is ready (matches
-            # the `run` flow — same code path).
-            orchestrate.submit_daemon(
-                role,
-                loaded,
-                name,
-                log=click.echo,
-                repo_root=Path.cwd(),
-            )
-    except ApiException as exc:
-        if exc.status == 403:
-            _cli_error(
-                f"forbidden to create RayCluster in {loaded.infra.namespace}",
-                hint="missing RBAC — run `nrl-k8s doctor` or ask an admin to grant the edit role.",
-            )
-        _explain_and_exit(exc, context=f"cluster up ({role}) failed")
-    except Exception as exc:  # noqa: BLE001
-        _explain_and_exit(exc, context=f"cluster up ({role}) failed")
+    for kind, key, spec in targets:
+        try:
+            if kind == "kuberay":
+                _check_head_svc_collision(
+                    spec.name, loaded.infra.namespace, creating="raycluster"
+                )
+                name = orchestrate.bring_up_cluster(
+                    key,
+                    loaded,
+                    log=click.echo,
+                    wait_ready=wait,
+                    ready_timeout_s=timeout,
+                )
+                if wait:
+                    orchestrate.submit_daemon(
+                        key,
+                        loaded,
+                        name,
+                        log=click.echo,
+                        repo_root=Path.cwd(),
+                    )
+            else:
+                orchestrate.ensure_deployment(key, loaded, log=click.echo)
+        except ApiException as exc:
+            if exc.status == 403:
+                _cli_error(
+                    f"forbidden to create resource in {loaded.infra.namespace}",
+                    hint="missing RBAC — ask an admin to grant the edit role.",
+                )
+            _explain_and_exit(exc, context=f"cluster up ({kind}.{key}) failed")
+        except Exception as exc:  # noqa: BLE001
+            _explain_and_exit(exc, context=f"cluster up ({kind}.{key}) failed")
 
 
 @cluster.command("down")
 @click.argument("recipe", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.argument("overrides", nargs=-1, type=click.UNPROCESSED)
 @_INFRA_OPTION
-@click.option(
-    "--role",
-    type=_ROLE_CHOICE,
-    help="Delete the cluster for this role (uses recipe to resolve name).",
-)
-@click.option(
-    "--name",
-    "name_opt",
-    help="Delete a RayCluster by name directly (overrides --role).",
-)
+@_TARGET_OPTION
 @click.option(
     "--wait/--no-wait",
     default=True,
-    help="Wait for the RayCluster object to disappear.",
+    help="Wait for resources to disappear.",
 )
 def cluster_down(
     recipe: Path,
     overrides: tuple[str, ...],
     infra_path: Path | None,
-    role: str | None,
-    name_opt: str | None,
+    target: tuple[str, ...],
     wait: bool,
 ) -> None:
-    """Delete a managed RayCluster by role or by name."""
-    from . import k8s
+    """Delete managed RayClusters and/or Deployments.
+
+    With no ``--target``, deletes everything in the recipe. With
+    ``--target kuberay.training``, deletes just the training RayCluster.
+    """
+    from . import k8s, orchestrate
 
     loaded = _load_or_exit(recipe, overrides, infra_path)
     namespace = loaded.infra.namespace
+    targets = _resolve_targets(loaded, target)
 
-    if name_opt:
-        target = name_opt
-    elif role:
-        cluster = _pick_cluster_or_exit(loaded, role)
-        target = cluster.name
-    else:
-        _cli_error(
-            "pass --role or --name",
-            hint="e.g. `nrl-k8s cluster down recipe.yaml --role training`",
-            exit_code=2,
-        )
+    if not targets:
+        _cli_error("no resources defined in the recipe")
 
-    click.echo(f"deleting RayCluster {target} in {namespace} ...")
-    k8s.delete_raycluster(target, namespace)
-    if wait:
-        k8s.wait_for_raycluster_gone(target, namespace)
-    click.echo(f"RayCluster {target} deleted.")
-
-    if role:
-        from . import orchestrate
-
-        orchestrate.delete_dra_resources(role, loaded, log=click.echo)
+    for kind, key, spec in targets:
+        if kind == "kuberay":
+            click.echo(f"deleting RayCluster {spec.name} in {namespace} ...")
+            k8s.delete_raycluster(spec.name, namespace)
+            if wait:
+                k8s.wait_for_raycluster_gone(spec.name, namespace)
+            click.echo(f"RayCluster {spec.name} deleted.")
+            orchestrate.delete_dra_resources(key, loaded, log=click.echo)
+        else:
+            click.echo(f"deleting Service {spec.name} in {namespace} ...")
+            k8s.delete_service(spec.name, namespace)
+            click.echo(f"deleting Deployment {spec.name} in {namespace} ...")
+            k8s.delete_deployment(spec.name, namespace)
+            click.echo(f"Deployment {spec.name} deleted.")
 
 
 @cluster.command("list")
@@ -1610,11 +1691,11 @@ def _load_or_exit(
 
 
 def _pick_cluster_or_exit(loaded: LoadedConfig, role: str) -> ClusterSpec:
-    cluster = getattr(loaded.infra.clusters, role)
+    cluster = getattr(loaded.infra.kuberay, role)
     if cluster is None:
         _cli_error(
-            f"infra.clusters.{role} is not defined in {loaded.source_path}",
-            hint=f"declare a `clusters.{role}` block in the recipe or pass a different --role",
+            f"infra.kuberay.{role} is not defined in {loaded.source_path}",
+            hint=f"declare a `kuberay.{role}` block in the recipe or pass a different --target",
         )
     return cluster
 

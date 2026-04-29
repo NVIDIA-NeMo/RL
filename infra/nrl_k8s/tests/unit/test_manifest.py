@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import pytest
 from nrl_k8s.manifest import build_raycluster_manifest
 from nrl_k8s.schema import ClusterSpec, InfraConfig
 
@@ -218,3 +219,95 @@ class TestServiceAccountOverride:
         worker = got["spec"]["workerGroupSpecs"][0]["template"]["spec"]
         assert head["serviceAccountName"] == "new-sa"
         assert worker["serviceAccountName"] == "new-sa"
+
+
+# =============================================================================
+# Segment splitting
+# =============================================================================
+
+
+class TestSegmentSplitting:
+    def test_no_split_when_segment_size_is_none(self) -> None:
+        got = build_raycluster_manifest(_make_cluster(), _make_infra())
+        assert len(got["spec"]["workerGroupSpecs"]) == 1
+        assert got["spec"]["workerGroupSpecs"][0]["groupName"] == "gpu-workers"
+
+    def test_split_64_into_4_segments_of_16(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 64
+        spec["workerGroupSpecs"][0]["minReplicas"] = 64
+        spec["workerGroupSpecs"][0]["maxReplicas"] = 64
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        got = build_raycluster_manifest(cluster, _make_infra())
+        workers = got["spec"]["workerGroupSpecs"]
+        assert len(workers) == 4
+        for i, wg in enumerate(workers):
+            assert wg["groupName"] == f"gpu-workers-segment-{i}"
+            assert wg["replicas"] == 16
+            assert wg["minReplicas"] == 16
+            assert wg["maxReplicas"] == 16
+
+    def test_no_split_when_replicas_leq_segment_size(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 8
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        got = build_raycluster_manifest(cluster, _make_infra())
+        workers = got["spec"]["workerGroupSpecs"]
+        assert len(workers) == 1
+        assert workers[0]["groupName"] == "gpu-workers"
+
+    def test_indivisible_replicas_raises(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 65
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        with pytest.raises(ValueError, match="not evenly divisible"):
+            build_raycluster_manifest(cluster, _make_infra())
+
+    def test_preserves_pod_template(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 32
+        spec["workerGroupSpecs"][0]["template"]["metadata"] = {
+            "annotations": {"kai.scheduler/topology": "gb300-topology"}
+        }
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        got = build_raycluster_manifest(cluster, _make_infra())
+        workers = got["spec"]["workerGroupSpecs"]
+        assert len(workers) == 2
+        for wg in workers:
+            ann = wg["template"]["metadata"]["annotations"]
+            assert ann["kai.scheduler/topology"] == "gb300-topology"
+
+    def test_does_not_mutate_input(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 32
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        build_raycluster_manifest(cluster, _make_infra())
+        assert len(spec["workerGroupSpecs"]) == 1
+        assert spec["workerGroupSpecs"][0]["replicas"] == 32
+
+    def test_images_patched_on_all_segments(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 32
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        got = build_raycluster_manifest(cluster, _make_infra())
+        for wg in got["spec"]["workerGroupSpecs"]:
+            img = wg["template"]["spec"]["containers"][0]["image"]
+            assert img == "registry/img:new"
+
+    def test_dra_rewriting_on_all_segments(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 32
+        spec["workerGroupSpecs"][0]["template"]["spec"]["resourceClaims"] = [
+            {
+                "name": "compute-domain-channel",
+                "resourceClaimTemplateName": "placeholder",
+            },
+        ]
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        got = build_raycluster_manifest(cluster, _make_infra(), role="training")
+        for wg in got["spec"]["workerGroupSpecs"]:
+            claims = wg["template"]["spec"]["resourceClaims"]
+            assert (
+                claims[0]["resourceClaimTemplateName"]
+                == "compute-domain-rc-test-training"
+            )

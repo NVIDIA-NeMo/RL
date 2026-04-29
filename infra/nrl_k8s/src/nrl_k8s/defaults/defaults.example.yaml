@@ -76,10 +76,12 @@ infra:
       head: {cpu: null, memory: null, gpu: null}
       worker: {cpu: null, memory: null, gpu: null}
   # Per-role RayCluster topology. Unset roles cannot be brought up via
-  # `nrl-k8s cluster up --role <role>`.
-  clusters:
+  # `nrl-k8s cluster up --target kuberay.<role>`.
+  kuberay:
     training: null
     generation: null
     gym: null
+  # Kubernetes Deployments managed alongside RayClusters (e.g. nemo-skills sandbox).
+  deployments: {}
   labels: {}
   annotations: {}
