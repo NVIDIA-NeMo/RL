@@ -519,7 +519,10 @@ def vlm_hf_data_processor(
     # vs OpenAI content list style (e.g., Qwen-VL, Gemma).
     # These processors expand <image> tokens in __call__ but NOT in apply_chat_template,
     # so we must use processor(text=..., images=...) directly.
-    _PLACEHOLDER_STYLE_PROCESSORS = ("NemotronNanoVLV2Processor",)
+    _PLACEHOLDER_STYLE_PROCESSORS = (
+        "NemotronNanoVLV2Processor",
+        "NemotronH_Nano_Omni_Reasoning_V3Processor",
+    )
     _uses_image_placeholder = type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSORS
 
     # For Nemotron-Omni with dynamic-resolution vision config

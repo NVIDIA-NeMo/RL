@@ -70,6 +70,7 @@ def is_nano_nemotron_vl_model(model_name: str) -> bool:
     hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     return hasattr(hf_config, "model_type") and hf_config.model_type in [
         "NemotronH_Nano_VL_V2",
+        "NemotronH_Nano_Omni_Reasoning_V3",
     ]
 
 
