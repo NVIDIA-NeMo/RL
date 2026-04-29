@@ -325,6 +325,29 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
+    def test_replay_buffer_get_target_weight_counts(self):
+        """Test counting buffered trajectory groups by target weight."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        trajectories = [
+            ({"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}, 0, 2),
+            ({"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}, 1, 2),
+            ({"batch": {"data": "test3"}, "rollout_metrics": {"reward": 3.0}}, 1, 3),
+        ]
+        for trajectory, weight_version, target_weight_version in trajectories:
+            ray.get(
+                buffer.add.remote(
+                    trajectory,
+                    weight_version=weight_version,
+                    target_weight_version=target_weight_version,
+                )
+            )
+
+        target_counts = ray.get(buffer.get_target_weight_counts.remote())
+        assert target_counts == {2: 2, 3: 1}
+
+        ray.kill(buffer)
+
     def test_replay_buffer_clear(self):
         """Test clearing the buffer."""
         buffer = ReplayBuffer.remote(max_size=10)
