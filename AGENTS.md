@@ -20,4 +20,4 @@ When reviewing code, follow these principles:
 
 ## Kubernetes / nrl-k8s
 
-For launching, monitoring, stopping, and debugging NeMo-RL recipes on Kubernetes, see the skill at `skills/launch-nemo-rl/SKILL.md`.
+For launching, monitoring, stopping, and debugging NeMo-RL recipes on Kubernetes, see the skill at @skills/launch-nemo-rl/SKILL.md.
