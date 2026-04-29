@@ -105,6 +105,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
+from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
@@ -1292,6 +1293,29 @@ def setup(
             flush=True,
         )
 
+    elif backend == "trtllm":
+        generation_config = cast(TrtllmConfig, generation_config)
+
+        def init_trtllm():
+            """Initialize TRT-LLM generation workers."""
+            t0 = time.perf_counter()
+            pg = TrtllmGeneration(cluster=inference_cluster, config=generation_config)
+            pg.finish_generation()
+            return pg, time.perf_counter() - t0
+
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_trtllm,
+            generation_name="TRT-LLM",
+            init_time_key="trtllm_init_time_s",
+            colocated_inference=colocated_inference,
+            worker_init_timing_metrics=worker_init_timing_metrics,
+        )
+
+        print(
+            f"  ✓ Using TRT-LLM backend for generation with {policy_config['model_name']}",
+            flush=True,
+        )
+
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
@@ -1901,6 +1925,9 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     if backend == "vllm":
         return bool(generation_config.get("vllm_cfg", {}).get("async_engine", False))
 
+    if backend == "trtllm":
+        return bool(generation_config.get("trtllm_cfg", {}).get("async_engine", False))
+
     if backend == "megatron":
         mcore_cfg = generation_config.get("mcore_generation_config", {})
         return mcore_cfg.get("async_engine", False)
@@ -1937,6 +1964,12 @@ def _build_async_grpo_train_data(
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
     return train_data
 
+    if backend == "trtllm":
+        trtllm_cfg = generation_config.get("trtllm_cfg", {})
+        return trtllm_cfg.get("async_engine", False)
+
+    return False
+
 
 def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
     """Zero loss_multiplier where mask_sample is True and return the count."""
@@ -1963,7 +1996,6 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     if not should_use_nemo_gym:
         return should_use_nemo_gym
 
-    # Validate the setup for training with NeMo-Gym
     assert _should_use_async_rollouts(master_config), (
         "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
     )
@@ -1976,6 +2008,10 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
         )
     elif generation_config["backend"] == "megatron":
         should_expose_http_server = generation_config["mcore_generation_config"].get(
+            "expose_http_server"
+        )
+    elif generation_config["backend"] == "trtllm":
+        should_expose_http_server = generation_config["trtllm_cfg"].get(
             "expose_http_server"
         )
     else:
@@ -2220,7 +2256,10 @@ def refit_policy_generation(
                 ray.get(futures_train)
                 update_success = True
             else:
-                # Original ZMQ IPC path for vLLM
+                # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
+                # streams CUDA IPC handles in chunks; receiver reconstructs
+                # tensors in-place and feeds them into the inference engine's
+                # loader.
                 futures_train = policy.stream_weights_via_ipc_zmq(
                     buffer_size_bytes=buffer_size_bytes
                 )
