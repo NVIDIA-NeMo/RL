@@ -1103,7 +1103,6 @@ def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    assert max_seq_len is None, "`max_seq_len` is not supported in NeMo-Gym path!"
     # We don't use these stop criteria
     assert not generation_config["stop_strings"], (
         "Stop strings is not supported in the generation config in NeMo-Gym path!"
@@ -1121,16 +1120,23 @@ def run_async_nemo_gym_rollout(
     timer.start(f"{timer_prefix}/total")
 
     for rowidx, row in enumerate(nemo_gym_rows):
-        # We may need better handling here. The max tokens set here would be the max new generated tokens, not the total max tokens.
-        # Currently, we just rely on the underlying vLLM engine to do the truncation for us using the max model seq len set in the config.
-        # row["max_tokens"] = max_seq_len
+        # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
+        # still relies on the underlying model server's configured context/window limits.
+        # We do not translate max_seq_len into row-level max_tokens here because that would
+        # change semantics from "total sequence length" to "max new tokens".
 
         responses_create_params = row["responses_create_params"]
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
-
-        # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
-        # generation_config["max_new_tokens"]
+        if generation_config["max_new_tokens"] is not None:
+            existing_max_output_tokens = responses_create_params.get(
+                "max_output_tokens"
+            )
+            responses_create_params["max_output_tokens"] = (
+                min(existing_max_output_tokens, generation_config["max_new_tokens"])
+                if existing_max_output_tokens is not None
+                else generation_config["max_new_tokens"]
+            )
 
         row["_rowidx"] = rowidx
 

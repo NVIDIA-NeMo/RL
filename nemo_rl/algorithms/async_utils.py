@@ -657,7 +657,9 @@ class AsyncTrajectoryCollector:
                     input_batch=repeated_batch,
                     tokenizer=self.tokenizer,
                     task_to_env=self.task_to_env,
-                    max_seq_len=None,
+                    max_seq_len=self.master_config["policy"][
+                        "max_total_sequence_length"
+                    ],
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,

@@ -809,15 +809,23 @@ def test_run_async_nemo_gym_rollout(
     ]
 
     input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(nemo_rl_compatible_examples)
+    for row in input_batch["extra_env_info"]:
+        assert "max_output_tokens" not in row["responses_create_params"]
+
     actual_result = run_async_nemo_gym_rollout(
         policy_generation=nemo_gym_vllm_generation,
         input_batch=input_batch,
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
-        max_seq_len=None,
+        max_seq_len=65536,
         generation_config=nemo_gym_vllm_generation.cfg,
         max_rollout_turns=None,
     )
+    for row in input_batch["extra_env_info"]:
+        assert (
+            row["responses_create_params"]["max_output_tokens"]
+            == nemo_gym_vllm_generation.cfg["max_new_tokens"]
+        )
     actual_result = asdict(actual_result)
     actual_result["final_batch"] = actual_result["final_batch"].get_dict()
 
