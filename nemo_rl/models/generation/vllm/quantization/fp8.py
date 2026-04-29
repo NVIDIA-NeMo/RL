@@ -206,7 +206,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     # create fp8 kwargs for vllm's LLM(...)
     num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
     num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
-    fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+    # Preserve model-specific keys from the disk's quantization_config (e.g.
+    # DSV4's `scale_fmt="ue8m0"`, which deepseek_v4.py reads directly via
+    # `config.quantization_config["scale_fmt"]`). FP8_BLOCK_QUANT_KWARGS still
+    # wins on shared keys (block_size, fmt, etc.).
+    disk_qc = getattr(config, "quantization_config", None) or {}
+    fp8_block_quant_kwargs = {**disk_qc, **FP8_BLOCK_QUANT_KWARGS}
 
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         with init_empty_weights():
