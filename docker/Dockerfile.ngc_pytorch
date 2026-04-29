@@ -148,7 +148,7 @@ COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 RUN --mount=type=ssh \
     --mount=type=bind,from=build_vllm,source=/opt,target=/tmp/build_vllm,readonly \
     <<"EOF" bash -exu
-uv venv --seed --system-site-packages
+uv venv --seed --system-site-packages --python python3
 export VIRTUAL_ENV=/opt/nemo_rl_venv
 if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
     bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL} ${BUILD_CUSTOM_FLASHINFER_REF}
