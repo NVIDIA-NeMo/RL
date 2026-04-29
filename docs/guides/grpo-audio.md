@@ -1,15 +1,16 @@
 # Audio Post-training with Nemo-RL
 
-This guide explains how to use NeMo-RL to train [Qwen2.5-Omni](https://huggingface.co/Qwen) (3B or 7B) with GRPO on audio question-answering data, convert the resulting Megatron checkpoint to Hugging Face format, and evaluate it on the [MMAU benchmark](https://huggingface.co/datasets/TwinkStart/MMAU).
+This guide explains how to use NeMo-RL to train [Qwen2.5-Omni](https://huggingface.co/Qwen) (3B or 7B) and [Qwen3-Omni-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) with GRPO on audio question-answering data, convert the resulting Megatron checkpoint to Hugging Face format, and evaluate it on the [MMAU benchmark](https://huggingface.co/datasets/TwinkStart/MMAU).
 
-NeMo-RL ships two recipes out of the box, but the pieces are independent and can be mixed:
+NeMo-RL ships three recipes out of the box, but the pieces are independent and can be mixed:
 
 | Recipe | Model | Default dataset | Config |
 | --- | --- | --- | --- |
 | 3B (R1-AQA reproduction) | Qwen2.5-Omni-3B | [AVQA](https://mn.cs.tsinghua.edu.cn/avqa) | `examples/configs/audio_grpo_3B_megatron.yaml` |
 | 7B (StrongAC + Gemini CoT) | Qwen2.5-Omni-7B | [Harland/AudioMCQ-StrongAC-GeminiCoT](https://huggingface.co/datasets/Harland/AudioMCQ-StrongAC-GeminiCoT) | `examples/configs/audio_grpo_7B_megatron.yaml` |
+| 30B MoE (Qwen3-Omni) | Qwen3-Omni-30B-A3B-Instruct | Harland/AudioMCQ-StrongAC-GeminiCoT | `examples/configs/audio_grpo_qwen3_omni_megatron.yaml` |
 
-The 3B recipe accepts the AudioMCQ dataset via a CLI override (no new YAML needed), and the 7B recipe is standalone (it inherits non-audio defaults from `grpo_math_1B_megatron.yaml` rather than chaining through the 3B audio recipe), so you can swap models and datasets independently.
+The 3B recipe accepts the AudioMCQ dataset via a CLI override (no new YAML needed); the 7B recipe is standalone (it inherits non-audio defaults from `grpo_math_1B_megatron.yaml` rather than chaining through the 3B audio recipe); and the 30B recipe targets the Qwen3-Omni MoE thinker on 4 × 8 H100/H200, sharing the AudioMCQ dataset block with the 7B recipe. You can swap models and datasets independently.
 
 ## 1. Datasets
 
@@ -97,6 +98,32 @@ uv run --no-sync examples/run_vlm_grpo.py \
     logger.wandb_enabled=false
 ```
 
+### 30B MoE (Qwen3-Omni-30B-A3B-Instruct) — `audio_grpo_qwen3_omni_megatron.yaml`
+
+```
+uv run examples/run_vlm_grpo.py --config examples/configs/audio_grpo_qwen3_omni_megatron.yaml
+```
+
+Key hyperparameters (sized for 4 × 8 × H100/H200 80 GB):
+
+| Parameter | Value |
+| --- | --- |
+| Model | Qwen3-Omni-30B-A3B-Instruct (MoE thinker) |
+| Dataset | Harland/AudioMCQ-StrongAC-GeminiCoT (`dataset_name: audiomcq`) |
+| `cluster.num_nodes` × `gpus_per_node` | 4 × 8 |
+| Megatron `tensor_model_parallel_size` / `expert_model_parallel_size` / `pipeline_model_parallel_size` | 1 / 8 / 1 |
+| Megatron `moe_token_dispatcher_type` | allgather (matches EP≥16 large-MoE peers) |
+| vLLM `tensor_parallel_size` / `expert_parallel_size` / `async_engine` | 4 / 8 / false |
+| `train_global_batch_size` | 32 |
+| `max_total_sequence_length` | 2048 |
+| Learning rate | 1e-6 |
+| Reward | format (0.2) + exact_alnum (0.8) |
+
+The Qwen3-Omni recipe has three model-specific gotchas baked into the yaml:
+
+- **Thinker-only training.** The Megatron `Qwen3OmniBridge` only converts the thinker (LLM + audio + vision encoders); talker / code2wav modules emit a one-line `talker/code2wav audio-output is not supported yet` warning at convert time and stay frozen at the original HF weights, so checkpoint conversion in §3 needs `--no-strict`.
+- **vLLM `tensor_parallel_size: 4`, not 1.** With TP=1 + EP > 1, NeMo-RL's `VllmGenerationWorker` enters the `else` branch in `vllm_worker.py:431` (no `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`, no `VLLM_RAY_PER_WORKER_GPUS`); vLLM then auto-picks `RayDistributedExecutor` (because the worker actor itself runs inside a Ray actor) and `_init_workers_ray` blocks forever in `ray.get` waiting for a Ray sub-worker that has no GPU bundle to land on. TP=4 enters the `if model_parallel_size > 1` branch, which sets the per-worker GPU fraction so the sub-workers can co-tenant the parent actor's GPU bundle. TP must also divide the audio tower's 20 attention heads, which rules out TP=8.
+
 ## 3. Convert checkpoint (Megatron → HF)
 
 Throughout training, checkpoints are saved under `${checkpointing.checkpoint_dir}` (`results/audio_grpo_3B_megatron/` for 3B, `results/audio_grpo_7B_megatron/` for 7B). To evaluate a checkpoint, first convert it from Megatron format to Hugging Face format:
@@ -113,6 +140,7 @@ Notes:
 - Replace `<ckpt_dir>` and `<N>` with your run's checkpoint directory and step.
 - `--extra mcore` is required for the Megatron converter.
 - If the converter hits a Hugging Face Hub `429 Too Many Requests` while fetching tokenizer metadata, prepend `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1` so it uses the cached snapshot only.
+- For **Qwen3-Omni-30B-A3B-Instruct**, `--no-strict` is mandatory (not optional) — talker / code2wav tensors live only in the original HF snapshot, so the bridge writes thinker-side shards and copies the rest verbatim. The converter prints `Warning: model-000{14,15}-of-00015.safetensors: missing N tensors ... still saved because strict=False`, which is expected.
 
 ## 4. Evaluate on MMAU
 
@@ -126,6 +154,8 @@ uv run examples/run_eval.py \
 ```
 
 Config: `examples/configs/evals/mmau.yaml` (vLLM colocated, bf16, 8k context). For 7B add `generation.vllm_cfg.tensor_parallel_size=2 cluster.gpus_per_node=2` so the weights fit.
+
+
 
 ## 5. Results
 
