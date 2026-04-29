@@ -24,7 +24,12 @@ from yaml import safe_load
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
-from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig, setup_nemo_gym_config
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    NemoGymConfig,
+    _summarize_nemo_gym_empty_generation_result,
+    setup_nemo_gym_config,
+)
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -44,6 +49,55 @@ def test_nemo_gym_stub_module():
     print(
         f"NeMo-Gym test successfully run! NeMo-Gym config_types module: {config_types}"
     )
+
+
+def test_summarize_nemo_gym_empty_generation_result_is_diagnosable():
+    """The empty-generation summary should expose the response status, finish reason,
+    incomplete details, and per-output structure so the resulting ValueError points at
+    the actual cause (e.g. truncation due to max_output_tokens) instead of guessing."""
+    nemo_gym_result = {
+        "responses_create_params": {
+            "input": [{"role": "user", "content": "hello"}],
+        },
+        "response": {
+            "id": "resp_123",
+            "model": "dummy-model",
+            "status": "incomplete",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "incomplete",
+                    "finish_reason": "length",
+                    "content": [{"type": "output_text", "text": ""}],
+                }
+            ],
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "usage": {"input_tokens": 2, "output_tokens": 0},
+        },
+    }
+
+    summary = _summarize_nemo_gym_empty_generation_result(nemo_gym_result)
+
+    assert summary["response_status"] == "incomplete"
+    assert summary["response_incomplete_details"] == {"reason": "max_output_tokens"}
+    assert summary["output_count"] == 1
+    assert summary["response_id"] == "resp_123"
+    assert summary["response_model"] == "dummy-model"
+    assert summary["usage"] == {"input_tokens": 2, "output_tokens": 0}
+
+    [output_item] = summary["output_summary"]
+    assert output_item["status"] == "incomplete"
+    assert output_item["finish_reason"] == "length"
+    assert output_item["content_len"] == 1
+    assert output_item["content_types"] == ["output_text"]
+
+
+def test_summarize_nemo_gym_empty_generation_result_handles_non_dict_response():
+    """If the response field is missing / malformed, the summarizer should still
+    produce a useful representation rather than raising."""
+    summary = _summarize_nemo_gym_empty_generation_result({"response": None})
+    assert summary["response_python_type"] == "NoneType"
 
 
 @pytest.fixture(scope="function")

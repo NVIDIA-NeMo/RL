@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 from pathlib import Path
 from typing import Any, Dict, List, TypedDict
 
@@ -27,6 +28,107 @@ class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+
+
+def _truncate_error_value(value: Any, max_len: int = 256) -> str:
+    text = str(value)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _summarize_nemo_gym_output_item(output_item: Any) -> dict[str, Any]:
+    if not isinstance(output_item, dict):
+        return {
+            "python_type": type(output_item).__name__,
+            "repr": _truncate_error_value(output_item),
+        }
+
+    summary: dict[str, Any] = {
+        "keys": sorted(output_item.keys()),
+    }
+
+    for key in (
+        "type",
+        "role",
+        "status",
+        "finish_reason",
+        "stop_reason",
+        "id",
+    ):
+        if key in output_item:
+            summary[key] = output_item[key]
+
+    for key, summary_key in (
+        ("prompt_token_ids", "prompt_token_count"),
+        ("generation_token_ids", "generation_token_count"),
+        ("generation_log_probs", "generation_logprob_count"),
+    ):
+        value = output_item.get(key)
+        if isinstance(value, list):
+            summary[summary_key] = len(value)
+
+    content = output_item.get("content")
+    if isinstance(content, list):
+        summary["content_len"] = len(content)
+        summary["content_types"] = [
+            item.get("type", type(item).__name__)
+            if isinstance(item, dict)
+            else type(item).__name__
+            for item in content[:8]
+        ]
+    elif content is not None:
+        summary["content_type"] = type(content).__name__
+        summary["content_preview"] = _truncate_error_value(content)
+
+    if "refusal" in output_item and output_item["refusal"] is not None:
+        summary["refusal"] = _truncate_error_value(output_item["refusal"])
+
+    return summary
+
+
+def _summarize_nemo_gym_empty_generation_result(
+    nemo_gym_result: dict[str, Any],
+) -> dict[str, Any]:
+    response = nemo_gym_result.get("response")
+    if not isinstance(response, dict):
+        return {
+            "response_python_type": type(response).__name__,
+            "response_repr": _truncate_error_value(response),
+        }
+
+    output_items = response.get("output")
+    if isinstance(output_items, list):
+        output_summary = [
+            _summarize_nemo_gym_output_item(item) for item in output_items[:8]
+        ]
+        output_count = len(output_items)
+    else:
+        output_summary = [
+            {
+                "python_type": type(output_items).__name__,
+                "repr": _truncate_error_value(output_items),
+            }
+        ]
+        output_count = None
+
+    summary = {
+        "response_keys": sorted(response.keys()),
+        "response_status": response.get("status"),
+        "response_finish_reason": response.get("finish_reason"),
+        "response_incomplete_details": response.get("incomplete_details"),
+        "response_error": response.get("error"),
+        "usage": response.get("usage"),
+        "output_count": output_count,
+        "output_summary": output_summary,
+    }
+
+    if "id" in response:
+        summary["response_id"] = response["id"]
+    if "model" in response:
+        summary["response_model"] = response["model"]
+
+    return summary
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -241,13 +343,14 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             prompt_token_ids = tokenizer.apply_chat_template(
                 input_messages, tokenize=True
             )
+            response_summary = _summarize_nemo_gym_empty_generation_result(
+                nemo_gym_result
+            )
             raise ValueError(
-                f"NeMo Gym returned a result with no generation data. "
-                f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
-                f"so vLLM rejected the request before any tokens could be generated.\n"
+                "NeMo Gym returned a result with no generation data.\n"
                 f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
-                f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"to a value larger than {len(prompt_token_ids)}."
+                "  Response summary:\n"
+                f"  {json.dumps(response_summary, indent=2, sort_keys=True, default=str)}"
             )
 
         return {
