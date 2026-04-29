@@ -723,9 +723,15 @@ def setup_model_and_optimizer(
     optimizer = None
     if init_optimizer:
         optimizer_cls = get_class(config["optimizer"]["name"])
+        optimizer_kwargs = dict(config["optimizer"]["kwargs"])
+        # Resolve string-valued torch dtypes from YAML, e.g. "torch.bfloat16".
+        for key, value in optimizer_kwargs.items():
+            if isinstance(value, str) and value.startswith("torch."):
+                optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
+
         optimizer = optimizer_cls(
             (param for param in model.parameters() if param.requires_grad),
-            **config["optimizer"]["kwargs"],
+            **optimizer_kwargs,
         )
 
     # Initialize scheduler
