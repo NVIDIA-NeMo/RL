@@ -17,7 +17,7 @@ import os
 import re
 import shutil
 import zipfile
-from typing import Any, Optional
+from typing import Any
 
 import pandas as pd
 from datasets import Dataset, Features, Sequence, Value
@@ -154,7 +154,9 @@ def _load_mmpr_tiny_from_cache(download_dir: str) -> Dataset:
     num_multi = multi_mask.sum()
     if num_multi > 0:
         df = df[~multi_mask].reset_index(drop=True)
-        print(f"MMPR-Tiny: filtered out {num_multi} multi-image rows, {len(df)} rows remaining")
+        print(
+            f"MMPR-Tiny: filtered out {num_multi} multi-image rows, {len(df)} rows remaining"
+        )
 
     features = Features(
         {

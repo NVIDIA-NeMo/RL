@@ -538,12 +538,14 @@ def vlm_hf_data_processor(
                 DynamicResolutionProcessor,
                 is_dynamic_resolution_model,
             )
+
             model_config = getattr(processor, "config", None) or getattr(
                 getattr(processor, "tokenizer", None), "config", None
             )
             if model_config is None:
                 # Fall back to loading the checkpoint config on the fly.
                 from transformers import AutoConfig
+
                 model_path = getattr(processor.tokenizer, "name_or_path", None)
                 if model_path is not None:
                     try:

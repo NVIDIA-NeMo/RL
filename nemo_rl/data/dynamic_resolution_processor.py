@@ -122,7 +122,7 @@ class DynamicResolutionProcessor(ProcessorMixin):
         """
         reduction_factor = int(1 / self.downsample_ratio)
         num_patches = (height // self.patch_size) * (width // self.patch_size)
-        return num_patches // (reduction_factor ** 2)
+        return num_patches // (reduction_factor**2)
 
     def compute_target_resolution(self, image: Image.Image) -> tuple[int, int]:
         """Compute dynamic target resolution for an image.
@@ -150,18 +150,27 @@ class DynamicResolutionProcessor(ProcessorMixin):
             rem_h = target_patch_height % required_divisor
             if rem_h != 0:
                 inc_h = required_divisor - rem_h
-                if (target_patch_height + inc_h) * target_patch_width <= self.max_num_patches:
+                if (
+                    target_patch_height + inc_h
+                ) * target_patch_width <= self.max_num_patches:
                     target_patch_height += inc_h
                 else:
-                    target_patch_height = max(required_divisor, target_patch_height - rem_h)
+                    target_patch_height = max(
+                        required_divisor, target_patch_height - rem_h
+                    )
 
             rem_w = target_patch_width % required_divisor
             if rem_w != 0:
                 inc_w = required_divisor - rem_w
-                if target_patch_height * (target_patch_width + inc_w) <= self.max_num_patches:
+                if (
+                    target_patch_height * (target_patch_width + inc_w)
+                    <= self.max_num_patches
+                ):
                     target_patch_width += inc_w
                 else:
-                    target_patch_width = max(required_divisor, target_patch_width - rem_w)
+                    target_patch_width = max(
+                        required_divisor, target_patch_width - rem_w
+                    )
 
         target_height = target_patch_height * self.patch_size
         target_width = target_patch_width * self.patch_size
@@ -268,9 +277,7 @@ class DynamicResolutionProcessor(ProcessorMixin):
                             images.append(img)
 
         if not tokenize:
-            return super().apply_chat_template(
-                conversation, tokenize=False, **kwargs
-            )
+            return super().apply_chat_template(conversation, tokenize=False, **kwargs)
 
         add_generation_prompt = kwargs.pop("add_generation_prompt", False)
         rendered_text = super().apply_chat_template(

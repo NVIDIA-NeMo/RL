@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import tempfile
 from unittest.mock import MagicMock
 
 import pytest
@@ -86,7 +84,10 @@ class TestFormatMMPRTinyDataset:
 
         assert len(image_items) == 4
         assert [c["image"] for c in image_items] == [
-            "/img/a.png", "/img/b.png", "/img/c.png", "/img/d.png"
+            "/img/a.png",
+            "/img/b.png",
+            "/img/c.png",
+            "/img/d.png",
         ]
         assert all("<image>" not in t["text"] for t in text_items)
 

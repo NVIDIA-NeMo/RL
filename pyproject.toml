@@ -59,7 +59,7 @@ dependencies = [
   # nvidia-resiliency-ext removed: no Python 3.13 wheels available (v0.5.0 only has cp310-cp312)
   "setuptools_scm",
   "mathruler",
-  "pylatexenc",                                                                                          # transitive dep of mathruler (not declared in its metadata)
+  "pylatexenc",     # transitive dep of mathruler (not declared in its metadata)
 ]
 
 [project.optional-dependencies]
@@ -77,7 +77,16 @@ automodel = [
   "transformer-engine[pytorch]>=2.9.0a0,<2.12.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
 ]
-vllm = ["cuda-python", "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c", "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480", "num2words>=0.5.14", "flashinfer-python==0.6.7", "flashinfer-cubin==0.6.7", "nvidia-cutlass-dsl>=4.4.0.dev1", "vllm==0.20.0"]
+vllm = [
+  "cuda-python",
+  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  "num2words>=0.5.14",
+  "flashinfer-python==0.6.7",
+  "flashinfer-cubin==0.6.7",
+  "nvidia-cutlass-dsl>=4.4.0.dev1",
+  "vllm==0.20.0",
+]
 sglang = [
   "sglang",
   "sglang-kernel", # Must be a direct dep so [tool.uv.sources] VCS override applies (transitive deps don't use sources)

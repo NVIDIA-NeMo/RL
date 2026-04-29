@@ -108,10 +108,10 @@ class VllmInternalWorkerExtension:
             return
 
         # FP8 KV cache: process KV scales after weight loading
+        from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.utils import (
             process_weights_after_loading,
         )
-        from vllm.config import set_current_vllm_config
 
         # Get target device for processing
         target_device = next(self.model_runner.model.parameters()).device
@@ -182,10 +182,10 @@ class VllmInternalWorkerExtension:
 
                 if payload == IPCProtocol.COMPLETE:
                     # means the update is done
+                    from vllm.config import set_current_vllm_config
                     from vllm.model_executor.model_loader.utils import (
                         process_weights_after_loading,
                     )
-                    from vllm.config import set_current_vllm_config
 
                     with set_current_vllm_config(self.model_runner.vllm_config):
                         process_weights_after_loading(

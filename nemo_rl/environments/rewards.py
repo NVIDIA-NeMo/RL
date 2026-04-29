@@ -196,7 +196,9 @@ def verl_geo3k_reward(
         acc_reward_value = 0.0
         is_correct = False
 
-    final_reward = (1.0 - format_score) * acc_reward_value + format_score * format_reward_value
+    final_reward = (
+        1.0 - format_score
+    ) * acc_reward_value + format_score * format_reward_value
     return final_reward, is_correct
 
 
