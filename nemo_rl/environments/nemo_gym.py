@@ -14,7 +14,7 @@
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
 import ray
 import torch
@@ -64,6 +64,7 @@ class NemoGymConfig(TypedDict):
     initial_global_config_dict: Dict[str, Any]
     invalid_tool_call_patterns: Optional[List[str]]  # Substrings in assistant text content that indicate an invalid tool call (default: ["<tool_call>", "</tool_call>", "<function_call>", "</function_call>"])
     thinking_tags: Optional[List[str]]  # Thinking tags to check for malformed usage (default: ["<think>", "</think>"])
+    enforce_monotonicity: NotRequired[bool]
 
 
 class GenRMCompareConfig(TypedDict, total=False):
@@ -285,7 +286,7 @@ Depending on your data shape, you may want to change these values."""
         )
 
         nemo_rl_message_log = []
-        seen_token_ids = torch.tensor([])
+        seen_token_ids = torch.tensor([], dtype=torch.int64)
 
         batch_decode_items = []  # Collect (output_item_dict, prompt_token_ids, generation_token_ids) for batch decode
         for output_item_dict in nemo_gym_result["response"]["output"]:
@@ -299,7 +300,7 @@ Depending on your data shape, you may want to change these values."""
 
             prompt_token_ids_tensor = torch.tensor(output_item_dict["prompt_token_ids"])
             n_seen = len(seen_token_ids)
-            if n_seen > 0:
+            if n_seen > 0 and self.cfg.get("enforce_monotonicity", True):
                 assert torch.equal(
                     seen_token_ids, prompt_token_ids_tensor[:n_seen]
                 ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
@@ -311,10 +312,10 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 
             # Create tensors for new tokens
             new_prompt_token_ids = torch.tensor(
-                output_item_dict["prompt_token_ids"][n_seen:]
+                output_item_dict["prompt_token_ids"][n_seen:], dtype=torch.int64
             )
             generation_token_ids = torch.tensor(
-                output_item_dict["generation_token_ids"]
+                output_item_dict["generation_token_ids"], dtype=torch.int64
             )
             generation_logprobs = torch.tensor(output_item_dict["generation_log_probs"])
 
