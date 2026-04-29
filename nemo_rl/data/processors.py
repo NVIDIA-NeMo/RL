@@ -36,15 +36,21 @@ TokenizerType = PreTrainedTokenizerBase
 
 def _normalize_nemo_gym_message_content(
     content: str | list[dict[str, Any]] | None,
-) -> str | list[dict[str, Any]] | None:
+) -> list[dict[str, Any]] | None:
     """Convert NeMo-Gym Responses-style content into NeMo-RL VLM content.
 
     NeMo-Gym uses OpenAI Responses-style content parts such as `input_text` and
     `input_image`. NeMo-RL's processor-backed VLM path expects `text` and
     `image` items instead.
     """
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
     if not isinstance(content, list):
-        return content
+        raise NotImplementedError(
+            f"Unsupported NeMo-Gym VLM content value: {type(content).__name__}"
+        )
 
     normalized_content = []
     for part in content:
@@ -85,8 +91,10 @@ def build_nemo_gym_vlm_prompt_message(
     """Build a processor-backed NeMo-RL prompt message from NeMo-Gym input.
 
     This helper bridges NeMo-Gym's Responses-style prompt schema to NeMo-RL's
-    VLM training representation. It also validates that the reconstructed
-    processor prompt matches NeMo-Gym's canonical `prompt_token_ids`.
+    VLM training representation. For prompts without media, it also validates
+    that the reconstructed processor prompt matches NeMo-Gym's canonical
+    `prompt_token_ids`. Multimodal vLLM prompt token IDs may use compact image
+    placeholders, while the processor returns the expanded training input IDs.
     """
     from nemo_rl.data.multimodal_utils import (
         PackedTensor,
@@ -125,7 +133,9 @@ def build_nemo_gym_vlm_prompt_message(
         [int(token_id) for token_id in prompt_token_ids], dtype=torch.long
     )
     actual_prompt_token_ids = processed_prompt["input_ids"][0].to(torch.long)
-    if not torch.equal(actual_prompt_token_ids.cpu(), expected_prompt_token_ids):
+    if not _nemo_gym_prompt_contains_media(input_messages) and not torch.equal(
+        actual_prompt_token_ids.cpu(), expected_prompt_token_ids
+    ):
         raise ValueError(
             "NeMo-Gym VLM prompt reconstruction does not match Gym prompt_token_ids. "
             f"Expected {len(expected_prompt_token_ids)} prompt tokens but reconstructed "

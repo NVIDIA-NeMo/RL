@@ -1029,16 +1029,18 @@ def rebuild_nemo_gym_vlm_message_log(
 
     input_message_log: VLMMessageLogType = [copy.deepcopy(prompt_message)]
     message_log: VLMMessageLogType = [prompt_message]
-    seen_token_ids = prompt_message["token_ids"].tolist()
+    rollout_seen_token_ids = _to_int_list(first_generation["prompt_token_ids"])
 
     for output_item in generation_items:
         prompt_token_ids = _to_int_list(output_item["prompt_token_ids"])
-        assert seen_token_ids == prompt_token_ids[: len(seen_token_ids)], (
+        assert rollout_seen_token_ids == prompt_token_ids[
+            : len(rollout_seen_token_ids)
+        ], (
             "Non-contiguous prompt tokens found while rebuilding a NeMo-Gym VLM "
             "message log. This indicates prompt reconstruction drift."
         )
 
-        prompt_delta = prompt_token_ids[len(seen_token_ids) :]
+        prompt_delta = prompt_token_ids[len(rollout_seen_token_ids) :]
         if prompt_delta:
             message_log.append(
                 {
@@ -1047,7 +1049,7 @@ def rebuild_nemo_gym_vlm_message_log(
                     "token_ids": torch.tensor(prompt_delta, dtype=torch.long),
                 }
             )
-            seen_token_ids.extend(prompt_delta)
+            rollout_seen_token_ids.extend(prompt_delta)
 
         generation_token_ids = _to_int_list(output_item["generation_token_ids"])
         message_log.append(
@@ -1060,7 +1062,7 @@ def rebuild_nemo_gym_vlm_message_log(
                 ),
             }
         )
-        seen_token_ids.extend(generation_token_ids)
+        rollout_seen_token_ids.extend(generation_token_ids)
 
     return input_message_log, message_log
 

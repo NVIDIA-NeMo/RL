@@ -173,7 +173,7 @@ def test_build_nemo_gym_vlm_prompt_message_normalizes_responses_input() -> None:
     )
 
     assert processor.last_messages == [
-        {"role": "system", "content": "You are helpful."},
+        {"role": "system", "content": [{"type": "text", "text": "You are helpful."}]},
         {
             "role": "user",
             "content": [
@@ -251,6 +251,56 @@ def test_rebuild_nemo_gym_vlm_message_log_preserves_later_prompt_deltas() -> Non
         message_log[1]["generation_logprobs"],
         torch.tensor([-0.1, -0.2]),
     )
+    assert message_log[2]["token_ids"].tolist() == [31]
+    assert message_log[3]["token_ids"].tolist() == [41]
+
+
+def test_rebuild_nemo_gym_vlm_message_log_allows_expanded_processor_prompt() -> None:
+    rollout_prompt_token_ids = [11, 12, 13]
+    processor_prompt_token_ids = [101, 102, 103, 104, 105, 106]
+    processor = _FakeVLMProcessor(processor_prompt_token_ids)
+    full_result = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                        {"type": "input_text", "text": "Click the red circle."},
+                    ],
+                }
+            ],
+        },
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": rollout_prompt_token_ids,
+                    "generation_token_ids": [21, 22],
+                    "generation_log_probs": [-0.1, -0.2],
+                },
+                {
+                    "prompt_token_ids": rollout_prompt_token_ids + [21, 22, 31],
+                    "generation_token_ids": [41],
+                    "generation_log_probs": [-0.3],
+                },
+            ]
+        },
+    }
+
+    input_message_log, message_log = rebuild_nemo_gym_vlm_message_log(
+        full_result, processor
+    )
+
+    assert input_message_log[0]["token_ids"].tolist() == processor_prompt_token_ids
+    assert message_log[0]["token_ids"].tolist() == processor_prompt_token_ids
+    assert isinstance(message_log[0]["pixel_values"], PackedTensor)
+    assert [message["role"] for message in message_log] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert message_log[1]["token_ids"].tolist() == [21, 22]
     assert message_log[2]["token_ids"].tolist() == [31]
     assert message_log[3]["token_ids"].tolist() == [41]
 
