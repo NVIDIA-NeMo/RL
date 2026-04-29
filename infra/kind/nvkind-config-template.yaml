@@ -1,0 +1,52 @@
+# Custom nvkind config template with support for extraMounts.
+# Based on the default nvkind template, extended to mount host directories
+# into kind nodes (e.g., for local code development).
+#
+# Usage:
+#   nvkind cluster create \
+#     --config-template nvkind-config-template.yaml \
+#     --config-values nvkind-config-values-dev.yaml
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+{{- if hasKey $ "name" }}
+name: {{ $.name }}
+{{- end }}
+nodes:
+- role: control-plane
+  {{- if hasKey $ "image" }}
+  image: {{ $.image }}
+  {{- end }}
+  {{- if hasKey $ "extraMounts" }}
+  extraMounts:
+    {{- range $.extraMounts }}
+    - hostPath: {{ .hostPath }}
+      containerPath: {{ .containerPath }}
+    {{- end }}
+  {{- end }}
+{{- range $.workers }}
+- role: worker
+  {{- if hasKey $ "image" }}
+  image: {{ $.image }}
+  {{- end }}
+
+  {{- if hasKey . "devices" }}
+  {{- $devices := .devices }}
+  {{- if not (kindIs "slice" $devices) }}
+    {{- $devices = list .devices }}
+  {{- end }}
+  extraMounts:
+    # GPU device injection
+    {{- range $d := $devices }}
+    - hostPath: /dev/null
+      containerPath: /var/run/nvidia-container-devices/{{ $d }}
+    {{- end }}
+    # Additional host mounts
+    {{- if hasKey $ "extraMounts" }}
+    {{- range $.extraMounts }}
+    - hostPath: {{ .hostPath }}
+      containerPath: {{ .containerPath }}
+    {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}
