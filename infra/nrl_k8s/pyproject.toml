@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nrl-k8s"
+version = "0.1.0"
+description = "Config-driven launcher that runs NeMo-RL recipes on Kubernetes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "NVIDIA NeMo-RL" }]
+dependencies = [
+  "click>=8.1",
+  "pydantic>=2.5",
+  "omegaconf>=2.3",
+  "pyyaml>=6.0",
+  "kubernetes>=29.0",
+  "ray[default]>=2.52",
+  "tenacity>=8.2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.4", "pytest-mock>=3.12"]
+all = ["nrl-k8s[test]"]
+
+[project.scripts]
+nrl-k8s = "nrl_k8s.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["nrl_k8s*"]
+
+[tool.setuptools.package-data]
+nrl_k8s = ["defaults/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "kind: integration tests that require a kind cluster with KubeRay installed",
+]

@@ -1,0 +1,215 @@
+# Prod-mode infra for grpo-qwen3-30ba3b-4n4g-async-1off on a GB300 NVL72 cluster.
+#
+# Topology: 4 workers × 4 GPUs = 16 GPUs in a single RayCluster, scheduled by
+# KAI as one gang. NVLink/MNNVL spans all 16 GPUs via a ComputeDomain channel,
+# and NCCL rides 4× RoCE NICs per node — both attached through DRA. The CLI
+# auto-creates and auto-deletes the ComputeDomain + RoCE ResourceClaimTemplate
+# based on the resourceClaims in the worker pod spec.
+#
+# Submission is prod-shaped (mirrors qwen3_4b_if_single.gb300.prod.infra.yaml):
+#   submit.submitter    portForward   — Ray Job SDK via kubectl port-forward.
+#   launch.runMode      batch          — CLI returns after Ray accepts the job.
+#   launch.codeSource   image          — no working_dir upload.
+#   launch.codePath     /opt/nemo-rl   — RL repo served off the shared FSx
+#                                        Lustre PVC at subPath=${user:}/nemo-rl.
+# Edits on Lustre take effect without rebuilding the image.
+#
+# Prereqs (onboarding §3–§5 already applied in `default`):
+#   - rl-workspace PVC bound (shared FSx Lustre, 2.4 TiB, RWX).
+#   - /mnt/rl-workspace/${user:}/nemo-rl contains a git checkout of
+#     https://github.com/NVIDIA-NeMo/RL on branch main.
+#   - nvcr-secret, ${user:}-secrets (via nrl-k8s dev setup-secrets),
+#     nemo-rl-endpoint-registry SA all present.
+#   - KAI topology `gb300-topology` is registered and advertises
+#     nvidia.com/gpu.clique as a placement key.
+#
+# Usage:
+#   RECIPE=examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off.yaml
+#   INFRA=infra/nrl_k8s/examples/qwen3_30b_math_4n_4gpu.gb300.infra.yaml
+#
+#   # One-shot with auto-teardown (default):
+#   nrl-k8s run $RECIPE --infra $INFRA --wait
+#
+#   # Long-lived cluster for iterating:
+#   nrl-k8s cluster up $RECIPE --infra $INFRA --role training --wait
+#   nrl-k8s run $RECIPE --infra $INFRA --raycluster --wait
+
+_shared:
+  headNodeSelector: &head_node_selector
+    nodeGroup: customer-cpu
+  workerNodeSelector: &worker_node_selector
+    nvidia.com/gpu.product: NVIDIA-GB300
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    # Uncomment to force offline mode once all HF assets are pre-cached.
+    # Without the cached assets, these will cause download errors.
+    # - {name: HF_HUB_OFFLINE,                 value: "1"}
+    # - {name: TRANSFORMERS_OFFLINE,           value: "1"}
+    - {name: NCCL_DEBUG,                     value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    # - {name: HF_HUB_OFFLINE,                 value: "1"}
+    # - {name: TRANSFORMERS_OFFLINE,           value: "1"}
+    - {name: NCCL_DEBUG,                     value: WARN}
+    - {name: NCCL_MNNVL_ENABLE,              value: "1"}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+  headResources: &head_resources
+    limits:   {cpu: "60", memory: "240Gi"}
+    requests: {cpu: "48", memory: "200Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    # NVL72 GB300 node allocatable: ~140 CPU / ~924 GiB / 4 GPUs.
+    # Claim 120/132 CPU + 850/900 GiB to leave headroom for dgxc/device-plugin.
+    limits:
+      cpu: "132"
+      memory: "900Gi"
+      nvidia.com/gpu: "4"
+    requests:
+      cpu: "120"
+      memory: "850Gi"
+      nvidia.com/gpu: "4"
+    claims:
+      - {name: compute-domain-channel}
+      - {name: roce-channel}
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+  # Lustre PVC at /opt/nemo-rl (subPath ${user:}/nemo-rl) for code; at
+  # /mnt/rl-workspace (no subPath) for datasets, checkpoints, HF cache.
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm, name: dshm}
+    - {mountPath: /opt/nemo-rl, name: rl-workspace, subPath: "${user:}/nemo-rl"}
+    - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 32Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+  workerVolumes: &worker_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 64Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+
+# namespace auto-inferred from kube context (default).
+image: nvcr.io/nvidian/nemo-rl:664d29c-49528955
+imagePullSecrets: [nvcr-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+submit:
+  submitter: portForward
+
+launch:
+  mode: attach
+  runMode: batch
+  codeSource: image
+  codePath: /opt/nemo-rl
+  attach:
+    training: ${user:}-raycluster-qwen3-30b-math-gb300
+  peerWatcher: false
+  env: {}
+  # Runs inside the training head pod under Ray's Job SDK. Megatron's optimizer
+  # config doesn't carry `foreach/fused`, so the deletions used in the 4B gym
+  # example don't apply here.
+  #
+  # Hydra overrides flip wandb on at runtime so the recipe on disk doesn't
+  # need to hardcode `logger.wandb_enabled=true`.
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted — is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
+    export RAY_enable_infeasible_task_early_exit=true
+    export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM
+    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    LOG=\${LOG_DIR}/${user:}-raycluster-qwen3-30b-math-gb300-training-\${TIMESTAMP}.log
+    mkdir -p "\${LOG_DIR}"
+
+    python -u examples/run_grpo.py \
+      --config examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off.yaml \
+      grpo.max_num_steps=5 \
+      grpo.val_period=5 \
+      checkpointing.save_period=5 \
+      logger.wandb_enabled=true \
+      logger.tensorboard_enabled=true \
+      logger.monitor_gpus=true \
+      logger.wandb.project=nemorl-single-k8s \
+      logger.wandb.name=qwen3-30b-math-gb300 \
+      2>&1 | tee "\${LOG}"
+
+clusters:
+  training:
+    name: ${user:}-raycluster-qwen3-30b-math-gb300
+    labels:
+      disagg.nemo-rl/cluster: qwen3-30b-math-gb300
+      disagg.nemo-rl/run: qwen3-30b-math-gb300
+      kai.scheduler/queue: default-queue
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          no-monitor: "true"
+          num-gpus: "0"
+          object-store-memory: "200000000"
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            containers:
+              - name: ray-head
+                env: *shared_head_env
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 4
+          minReplicas: 4
+          maxReplicas: 4
+          numOfHosts: 1
+          rayStartParams:
+            num-gpus: "4"
+            object-store-memory: "200000000"
+          template:
+            metadata:
+              annotations:
+                # KAI co-schedules the 4 workers in a single gb300-topology
+                # domain so the ComputeDomain NVLink channel spans all 16 GPUs.
+                kai.scheduler/topology: gb300-topology
+                kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+            spec:
+              schedulerName: kai-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              resourceClaims:
+                - name: compute-domain-channel
+                  resourceClaimTemplateName: compute-domain-qwen3-30b-math
+                - name: roce-channel
+                  resourceClaimTemplateName: roce-qwen3-30b-math
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_worker_resources
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK]
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes
