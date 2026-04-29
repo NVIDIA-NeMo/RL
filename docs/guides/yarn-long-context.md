@@ -15,7 +15,7 @@ YaRN is configured through `policy.hf_config_overrides.rope_scaling`. All YaRN f
 
 ```yaml
 policy:
-  max_total_sequence_length: 65536
+  max_total_sequence_length: 131072
   megatron_cfg:
     enabled: true
   dtensor_cfg:
@@ -24,7 +24,7 @@ policy:
     rope_scaling:
       rope_type: yarn
       rope_theta: 1000000
-      factor: 1.6
+      factor: 3.2
       original_max_position_embeddings: 40960
       truncate: true
       beta_fast: 32
@@ -80,14 +80,14 @@ This re-runs the HF → Megatron conversion and overwrites the cached checkpoint
 
 Two end-to-end YaRN recipes ship with NeMo RL:
 
-- **SFT, 64K context**: [`examples/configs/recipes/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-64k.yaml`](../../examples/configs/recipes/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-64k.yaml) — Qwen3-0.6B fine-tuned to a 64K sequence length on Nemotron-Cascade-2-SFT-Math using `factor: 1.6` (64K / 40960).
+- **SFT, 128K context**: [`examples/configs/recipes/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-128k.yaml`](../../examples/configs/recipes/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-128k.yaml) — Qwen3-0.6B fine-tuned to a 128K sequence length on Nemotron-Cascade-2-SFT-Math using `factor: 3.2` (128K / 40960).
 - **GRPO, 256K context**: [`examples/configs/recipes/llm/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.yaml`](../../examples/configs/recipes/llm/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.yaml) — Qwen2.5-1.5B trained at 256K sequence length with `factor` derived from `max_total_sequence_length / original_max_position_embeddings`.
 
 Launch them the same way as any other recipe:
 
 ```bash
 uv run examples/run_sft.py \
-    --config examples/configs/recipes/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-64k.yaml
+    --config examples/configs/recipes/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-128k.yaml
 
 uv run examples/run_grpo_math.py \
     --config examples/configs/recipes/llm/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.yaml
@@ -95,7 +95,7 @@ uv run examples/run_grpo_math.py \
 
 ## Practical Tips
 
-- **Set context parallelism appropriately.** Long sequences typically require `policy.megatron_cfg.context_parallel_size > 1`. The 256K recipe uses `context_parallel_size: 32`; the 64K recipe uses `8`.
+- **Set context parallelism appropriately.** Long sequences typically require `policy.megatron_cfg.context_parallel_size > 1`. The 256K recipe uses `context_parallel_size: 32`; the 128K recipe uses `8`.
 - **Check `make_sequence_length_divisible_by`.** Long-context recipes usually need a larger divisor (e.g. `64` at 256K) so sequences align with CP/TP shapes.
 - **Keep override configs identical across trainer and generator.** Because `hf_config_overrides` flows into both Megatron and vLLM, editing only one side will cause mismatched RoPE behavior.
 - **Reconvert after changing overrides.** Cached checkpoints are keyed by override hash, so a new hash produces a new cache entry — but if you deliberately mutate an existing cache path, use `force_reconvert_from_hf: true`.
