@@ -51,6 +51,10 @@ class ReplayBufferProtocol(Protocol):
         """
         ...
 
+    def get_target_weight_counts(self) -> dict[int, int]:
+        """Get counts of buffered trajectory groups per target weight."""
+        ...
+
     def size(self) -> int:
         """Return current buffer size."""
         ...
