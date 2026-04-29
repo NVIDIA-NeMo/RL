@@ -65,6 +65,14 @@ else
     uv run --extra sglang bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --sglang-only
 fi
 
+# Check and run nemo_gym tests
+exit_code=$(cd ${PROJECT_ROOT}/tests && uv run --extra nemo_gym pytest "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --collect-only --nemo-gym-only -q >/dev/null 2>&1; echo $?)
+if [[ $exit_code -eq 5 ]]; then
+    echo "No nemo_gym tests to run"
+else
+    uv run --extra nemo_gym bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --nemo-gym-only -vv
+fi
+
 # Skip research tests in fast mode
 if [[ "${FAST:-0}" != "1" ]]; then
     for i in research/*/tests/unit; do
