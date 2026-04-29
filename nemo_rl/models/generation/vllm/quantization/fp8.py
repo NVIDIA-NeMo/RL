@@ -302,21 +302,73 @@ def _get_params_in_layers(param_names, layers):
     return params
 
 
-def _get_module_from_param_name(model, name: str):
-    # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
-    # The module path is all but the last part (the parameter's own name)
-    path_parts = name.split(".")
-    module_path = path_parts[:-1]
-    # Replace with the fused model name
-    packed_modules_mapping = model.packed_modules_mapping
-    reversed_mapping = {
-        original_name: fused_name
-        for fused_name, original_names_list in packed_modules_mapping.items()
-        for original_name in original_names_list
-    }
-    if module_path[-1] in reversed_mapping.keys():
-        module_path[-1] = reversed_mapping[module_path[-1]]
+def _get_packed_modules_mapping(model) -> dict[str, list[str]]:
+    packed_modules_mapping = dict(getattr(model, "packed_modules_mapping", {}) or {})
 
+    if type(model).__name__ == "DeepseekV4ForCausalLM":
+        # DeepSeek-V4 uses stacked/fused params in load_weights(), but does not
+        # expose packed_modules_mapping on the model class.
+        packed_modules_mapping.update(
+            {
+                "attn.fused_wqa_wkv": ["attn.wq_a", "attn.wkv"],
+                "compressor.fused_wkv_wgate": [
+                    "compressor.wkv",
+                    "compressor.wgate",
+                ],
+                "shared_experts.gate_up_proj": [
+                    "shared_experts.w1",
+                    "shared_experts.w3",
+                ],
+                "shared_experts.down_proj": ["shared_experts.w2"],
+            }
+        )
+
+    return packed_modules_mapping
+
+
+def _replace_packed_module_suffix(
+    module_path: list[str], packed_modules_mapping: dict[str, list[str]]
+) -> list[str]:
+    for fused_name, original_names_list in packed_modules_mapping.items():
+        fused_parts = fused_name.split(".")
+        for original_name in original_names_list:
+            original_parts = original_name.split(".")
+            if module_path[-len(original_parts) :] == original_parts:
+                return module_path[: -len(original_parts)] + fused_parts
+
+    return module_path
+
+
+def _candidate_module_paths(model, name: str) -> list[list[str]]:
+    candidate_names = [name]
+    hf_to_vllm_mapper = getattr(model, "hf_to_vllm_mapper", None)
+    if hf_to_vllm_mapper is not None:
+        map_name = getattr(hf_to_vllm_mapper, "_map_name", None)
+        if map_name is not None:
+            mapped_name = map_name(name)
+            if mapped_name != name:
+                candidate_names.append(mapped_name)
+
+    packed_modules_mapping = _get_packed_modules_mapping(model)
+    module_paths = []
+    for candidate_name in candidate_names:
+        path_parts = candidate_name.split(".")
+        if len(path_parts) < 2:
+            continue
+
+        module_path = path_parts[:-1]
+        module_path = _replace_packed_module_suffix(
+            module_path, packed_modules_mapping
+        )
+        module_paths.append(module_path)
+
+        if module_path[0] != "model" and hasattr(model, "model"):
+            module_paths.append(["model", *module_path])
+
+    return module_paths
+
+
+def _resolve_module_path(model, module_path: list[str]):
     current_module = model
     try:
         # Traverse the model hierarchy
@@ -327,9 +379,19 @@ def _get_module_from_param_name(model, name: str):
                 current_module = current_module[int(part)]
             else:
                 current_module = getattr(current_module, part)
-    except (AttributeError, IndexError, ValueError) as e:
-        print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
+    except (AttributeError, IndexError, ValueError):
+        return None
     return current_module
+
+
+def _get_module_from_param_name(model, name: str):
+    for module_path in _candidate_module_paths(model, name):
+        module = _resolve_module_path(model, module_path)
+        if module is not None:
+            return module
+
+    print(f"Warning: Could not find module for parameter '{name}'.")
+    return None
 
 
 def _is_fp8_weight(name, model):
@@ -340,8 +402,10 @@ def _is_fp8_weight(name, model):
             module = _get_module_from_param_name(model, name)
             # We currently only quantize linear layers
             if (
-                isinstance(module, LinearBase)
-                and module.weight.dtype == torch.float8_e4m3fn
+                (
+                    isinstance(module, LinearBase)
+                    and module.weight.dtype == torch.float8_e4m3fn
+                )
                 or (
                     isinstance(module, FusedMoE)
                     and module.w13_weight.dtype == torch.float8_e4m3fn
@@ -350,6 +414,158 @@ def _is_fp8_weight(name, model):
             ):
                 fp8_state.fp8_param_names.add(name)
     return name in fp8_state.fp8_param_names
+
+
+def _format_tensor_for_weight_load_debug(tensor) -> str:
+    if not isinstance(tensor, torch.Tensor):
+        return repr(type(tensor))
+    return f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device}"
+
+
+def _get_param_module_name(param_name: str) -> str | None:
+    for suffix in (".weight_scale_inv", ".weight_scale", ".weight"):
+        if param_name.endswith(suffix):
+            return param_name[: -len(suffix)]
+    return None
+
+
+def _copy_deepseek_v4_bmm_weight(param, loaded_weight: torch.Tensor) -> bool:
+    if param.data.ndim != 3 or loaded_weight.ndim != 2:
+        return False
+
+    num_groups, rows_per_group, hidden_size = param.data.shape
+    local_rows = num_groups * rows_per_group
+    tp_rank = getattr(param, "tp_rank", 0)
+    start = tp_rank * local_rows
+    if loaded_weight.shape[0] < start + local_rows:
+        return False
+    if loaded_weight.shape[1] != hidden_size:
+        return False
+
+    local_weight = loaded_weight.narrow(0, start, local_rows)
+    local_weight = local_weight.view(num_groups, rows_per_group, hidden_size)
+    param.data.copy_(local_weight)
+    return True
+
+
+def _copy_deepseek_v4_bmm_scale(layer, param, loaded_weight: torch.Tensor) -> bool:
+    if loaded_weight.ndim != 2:
+        return False
+    if not hasattr(layer, "weight") or layer.weight.data.ndim != 3:
+        return False
+
+    num_groups, rows_per_group, hidden_size = layer.weight.data.shape
+    block_m, block_n = tuple(layer.weight_block_size)
+    local_scale_rows = (num_groups * rows_per_group + block_m - 1) // block_m
+    tp_rank = getattr(param, "tp_rank", getattr(layer.weight, "tp_rank", 0))
+    start = tp_rank * local_scale_rows
+    if loaded_weight.shape[0] < start + local_scale_rows:
+        return False
+
+    local_scale = loaded_weight.narrow(0, start, local_scale_rows)
+    if local_scale.shape == param.data.shape:
+        param.data.copy_(local_scale)
+        return True
+
+    if hidden_size % block_n != 0:
+        return False
+    if rows_per_group % block_m != 0:
+        return False
+
+    scale_groups = local_scale.view(
+        num_groups,
+        rows_per_group // block_m,
+        hidden_size // block_n,
+    )
+
+    from vllm.utils.deep_gemm import transform_sf_into_required_layout
+
+    scale_groups = transform_sf_into_required_layout(
+        sf=scale_groups,
+        mn=rows_per_group,
+        k=hidden_size,
+        recipe=(1, block_m, block_n),
+        num_groups=num_groups,
+        is_sfa=False,
+    )
+    if scale_groups.shape != param.data.shape:
+        return False
+
+    param.data.copy_(scale_groups)
+    return True
+
+
+def _try_load_deepseek_v4_bmm_param(
+    module_map: dict[str, torch.nn.Module],
+    param_name: str,
+    param,
+    loaded_weight,
+) -> bool:
+    if not isinstance(loaded_weight, torch.Tensor):
+        return False
+
+    module_name = _get_param_module_name(param_name)
+    if module_name is None:
+        return False
+
+    layer = module_map.get(module_name)
+    if not getattr(layer, "is_bmm", False):
+        return False
+
+    if param_name.endswith(".weight"):
+        return _copy_deepseek_v4_bmm_weight(param, loaded_weight)
+    if param_name.endswith((".weight_scale", ".weight_scale_inv")):
+        return _copy_deepseek_v4_bmm_scale(layer, param, loaded_weight)
+
+    return False
+
+
+def _wrap_weight_loaders_for_refit(model):
+    """Wrap vLLM parameter loaders during FP8 refit.
+
+    The wrapper keeps the original vLLM loading path for normal parameters, adds
+    a DeepSeek-V4 BMM loader for 3D DeepGEMM weights/scales, and prints tensor
+    shape/dtype/device context before re-raising any loader failure.
+    """
+    original_weight_loaders = []
+    module_map = dict(model.named_modules())
+
+    for param_name, param in model.named_parameters():
+        weight_loader = getattr(param, "weight_loader", None)
+        if weight_loader is None:
+            continue
+
+        def refit_weight_loader(
+            *args,
+            _param_name=param_name,
+            _param=param,
+            _weight_loader=weight_loader,
+            **kwargs,
+        ):
+            loaded_weight = args[1] if len(args) > 1 else kwargs.get("loaded_weight")
+            try:
+                if _try_load_deepseek_v4_bmm_param(
+                    module_map, _param_name, _param, loaded_weight
+                ):
+                    return None
+                return _weight_loader(*args, **kwargs)
+            except Exception:
+                print(
+                    "NRL FP8 refit failed while loading vLLM parameter "
+                    f"{_param_name}: param {_format_tensor_for_weight_load_debug(_param)}, "
+                    f"loaded {_format_tensor_for_weight_load_debug(loaded_weight)}"
+                )
+                raise
+
+        original_weight_loaders.append((param, weight_loader))
+        setattr(param, "weight_loader", refit_weight_loader)
+
+    return original_weight_loaders
+
+
+def _restore_weight_loaders(original_weight_loaders) -> None:
+    for param, weight_loader in original_weight_loaders:
+        setattr(param, "weight_loader", weight_loader)
 
 
 def load_weights(weights, model_runner):
@@ -369,7 +585,11 @@ def load_weights(weights, model_runner):
         weights_quantized.append([k, param_lp])
         weights_quantized.append([k + "_scale_inv", param_scale])
     # Finally load the weights into vllm
-    model.load_weights(weights_quantized)
+    original_weight_loaders = _wrap_weight_loaders_for_refit(model)
+    try:
+        model.load_weights(weights_quantized)
+    finally:
+        _restore_weight_loaders(original_weight_loaders)
 
 
 def cast_tensor_to_fp8_blockwise(
