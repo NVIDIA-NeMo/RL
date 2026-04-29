@@ -1,7 +1,5 @@
 # Adding to .gitignore helps reduce the size of your working_dir
-CLAUDE.local.md
-.claude/*
-3rdparty/*
+
 /.git
 *.out
 *.log
@@ -24,7 +22,6 @@ mlruns/
 # Test
 coverage.json
 .coverage*
-.testmondata*
 unit_results.json
 unit_results/
 test_assets/
@@ -51,8 +48,5 @@ code_snapshots*/
 *runtime_env.yaml
 !default_runtime_env.yaml
 
-# Claude Code / Codex / Humanize (local only)
+# Claude Code review memory (local only)
 .claude/review-memory/
-.claude/settings.local.json
-.codex
-.humanize/
