@@ -411,7 +411,10 @@ def setup_model_config(
         # validate_model_paths, so no conversion step is needed.
         from transformers import AutoConfig
 
-        hf_cfg = AutoConfig.from_pretrained(hf_model_name, trust_remote_code=True)
+        hf_config_overrides = config.get("hf_config_overrides", {}) or {}
+        hf_cfg = AutoConfig.from_pretrained(
+            hf_model_name, trust_remote_code=True, **hf_config_overrides
+        )
         bridge_obj = AutoBridge.from_hf_config(hf_cfg)
         model_cfg = bridge_obj.to_megatron_provider(load_weights=False)
     else:
@@ -421,6 +424,15 @@ def setup_model_config(
         # - HF (converted): pretrained_path is the cache root; the conversion
         #   always writes to iter_0000000/.
         if fmt == "megatron_bridge":
+            hf_config_overrides = config.get("hf_config_overrides", {}) or {}
+            if hf_config_overrides:
+                warnings.warn(
+                    "hf_config_overrides is set but will be ignored for megatron_bridge "
+                    "format. The model architecture is read directly from the checkpoint's "
+                    "run_config.yaml and cannot be overridden at load time.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             pretrained_run_config = os.path.join(pretrained_path, "run_config.yaml")
         else:
             pretrained_run_config = os.path.join(
