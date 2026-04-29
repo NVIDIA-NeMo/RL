@@ -523,6 +523,10 @@ class AsyncTrajectoryCollector:
             is_async_engine = generation_cfg.get("mcore_generation_config", {}).get(
                 "async_engine", False
             )
+        elif backend == "trtllm":
+            is_async_engine = generation_cfg.get("trtllm_cfg", {}).get(
+                "async_engine", False
+            )
         else:
             is_async_engine = False
         in_flight_weight_updates = self.master_config.grpo.get("async_grpo", {}).get(
@@ -540,9 +544,10 @@ class AsyncTrajectoryCollector:
                 f"   {len(self._inflight_threads)} ongoing generations will complete with current weights"
             )
         else:
-            # For non-async engines, wait for all pending generations to complete
+            # Sync engine or in-flight refit disabled: wait for all pending
+            # generations to complete before refit.
             print(
-                "⏸️ Non-async engine: waiting for all pending generations to complete..."
+                "⏸️ Waiting for all pending generations to complete..."
             )
             self.wait_for_pending_generations()
 

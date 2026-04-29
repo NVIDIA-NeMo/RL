@@ -53,7 +53,15 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 
 
 class PY_EXECUTABLES:
+    # Driver's own interpreter (under `uv run` this is the uv-managed venv).
     SYSTEM = sys.executable
+
+    # Interpreter for TRT-LLM actors. Override with NEMO_RL_PY_EXECUTABLES_TRTLLM
+    # to pin to the base image's system Python (where tensorrt_llm is baked into
+    # /usr/local/lib/python3.12/dist-packages). Can't reuse SYSTEM: under
+    # `uv run`, sys.executable is the uv-managed venv whose site-packages
+    # doesn't include tensorrt_llm — and uv has no wheel for it to install.
+    TRTLLM = os.environ.get("NEMO_RL_PY_EXECUTABLES_TRTLLM", sys.executable)
 
     # Use NeMo-RL direct dependencies.
     BASE = f"uv run --locked --directory {git_root}"
