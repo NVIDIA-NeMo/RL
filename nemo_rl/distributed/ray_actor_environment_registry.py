@@ -49,12 +49,9 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.environments.nemo_gym.NemoGym": PY_EXECUTABLES.NEMO_GYM,
 }
 
-try:
-    from nemo_rl.modelopt.registry import MODELOPT_ACTOR_REGISTRY
+from nemo_rl.modelopt.registry import MODELOPT_ACTOR_REGISTRY
 
-    ACTOR_ENVIRONMENT_REGISTRY.update(MODELOPT_ACTOR_REGISTRY)
-except ImportError:
-    pass
+ACTOR_ENVIRONMENT_REGISTRY.update(MODELOPT_ACTOR_REGISTRY)
 
 
 def get_actor_python_env(actor_class_fqn: str) -> str:
