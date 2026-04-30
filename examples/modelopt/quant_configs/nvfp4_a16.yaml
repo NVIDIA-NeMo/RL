@@ -1,24 +1,30 @@
-# Example custom quantization recipe for QARL.
+# NVFP4 weight-only (W4A16) custom quantization recipe for QARL.
 #
 # Reference this file from a NeMo-RL YAML config via:
 #
 #     policy:
-#       quant_cfg: "examples/modelopt/quant_configs/example_w8a8.yaml"
+#       quant_cfg: "examples/modelopt/quant_configs/nvfp4_a16.yaml"
 #
 # This recipe uses ModelOpt's standard PTQ recipe layout (see
 # ``modelopt_recipes/general/ptq/`` in the TensorRT-Model-Optimizer repo).
 # Only the ``quantize:`` section is consumed by ``mtq.quantize``; the
 # ``metadata:`` section is informational.
 #
-# This example defines W8A8 (FP8 per-tensor weights, FP8 per-tensor
-# activations). Sensitive layers (lm_head, MoE gate layers, BatchNorm, etc.)
-# are disabled to match the built-in defaults.
+# Defines W4A16: NVFP4 (e2m1, dynamic e4m3 micro-block scales) on weights
+# only; activations stay in the model's native dtype (BF16/FP16). Sensitive
+# layers (lm_head, MoE gate/router, BatchNorm, etc.) are disabled to match
+# the built-in defaults.
+#
+# Recommended for QA-GRPO, where W4A4 (NVFP4 on both weights and
+# activations) has shown convergence issues. For QA-Distillation, the
+# built-in ``NVFP4_DEFAULT_CFG`` (W4A4) converges fine and remains the
+# default choice.
 #
 # See https://github.com/NVIDIA/Model-Optimizer for the full set of
 # supported quantizer options and built-in PTQ recipes.
 metadata:
   recipe_type: ptq
-  description: Example W8A8 (FP8 per-tensor weight + activation) recipe.
+  description: NVFP4 weight-only (W4A16) recipe.
 quantize:
   algorithm: max
   quant_cfg:
@@ -27,13 +33,11 @@ quantize:
     - quantizer_name: '*weight_quantizer'
       enable: true
       cfg:
-        num_bits: e4m3
-        axis:
-    - quantizer_name: '*input_quantizer'
-      enable: true
-      cfg:
-        num_bits: e4m3
-        axis:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
     - quantizer_name: '*lm_head*'
       enable: false
     - quantizer_name: '*output_layer*'
