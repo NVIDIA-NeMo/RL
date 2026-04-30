@@ -124,6 +124,7 @@ ARG SKIP_SGLANG_BUILD
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
+ENV UV_PYTHON_PREFERENCE=only-system
 
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
@@ -138,6 +139,9 @@ ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
+# The NGC base image ships Python 3.12 (cp312); lower the project constraint so uv
+# uses the system Python rather than downloading an incompatible managed Python.
+RUN sed -i 's/requires-python = ">=3\.13\.13"/requires-python = ">=3.12"/' pyproject.toml uv.lock
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
 COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
