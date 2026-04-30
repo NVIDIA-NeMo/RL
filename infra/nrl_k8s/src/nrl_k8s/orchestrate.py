@@ -284,12 +284,12 @@ def ensure_deployment(
 
     if dep.healthCheckUrl:
         log(f"[deployment:{dep_key}] waiting for Deployment {name} to be ready ...")
+        t0 = time.monotonic()
         k8s.wait_for_deployment_ready(
             name, namespace, timeout_s=dep.healthCheckTimeoutS
         )
-        _wait_for_http(
-            dep.healthCheckUrl, dep.healthCheckTimeoutS, log, f"deployment:{dep_key}"
-        )
+        remaining = max(10, dep.healthCheckTimeoutS - int(time.monotonic() - t0))
+        _wait_for_http(dep.healthCheckUrl, remaining, log, f"deployment:{dep_key}")
 
     return name
 
@@ -657,7 +657,7 @@ def _wait_job_stopped(
     )
 
 
-def _wait_for_http(url: str, timeout_s: int, log: callable, role: Role) -> None:
+def _wait_for_http(url: str, timeout_s: int, log: callable, role: str) -> None:
     log(f"[{role}] waiting for health-check {url} (timeout {timeout_s}s)")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
