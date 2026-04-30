@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import os
 import threading
 import time
 import uuid
@@ -41,6 +42,48 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+
+
+def _resolve_chat_template(chat_template: Any) -> Any:
+    """Resolve chat template config, loading from file when a path is provided.
+
+    vLLM expects ``chat_template`` to be a Jinja template string.
+    In NeMo-RL configs, users may naturally provide a filesystem path to a
+    ``.jinja2`` file. Without this conversion, the path itself is interpreted as
+    the template body and gets tokenized literally.
+    """
+    if not isinstance(chat_template, str) or not chat_template:
+        return chat_template
+
+    # Inline templates should pass through unchanged.
+    if "\n" in chat_template or "{%" in chat_template or "{{" in chat_template:
+        return chat_template
+
+    expanded_path = os.path.abspath(os.path.expanduser(chat_template))
+    if os.path.isfile(expanded_path):
+        with open(expanded_path, encoding="utf-8") as f:
+            resolved_template = f.read()
+
+        if not resolved_template.strip():
+            raise ValueError(
+                f"Configured chat_template file '{expanded_path}' is empty."
+            )
+
+        print(f"Loaded chat template from file: {expanded_path}")
+        return resolved_template
+
+    looks_like_path = (
+        "/" in chat_template
+        or "\\\\" in chat_template
+        or chat_template.endswith((".jinja", ".jinja2", ".j2"))
+    )
+    if looks_like_path:
+        raise FileNotFoundError(
+            "Configured chat_template looks like a file path, but it was not found: "
+            f"{chat_template}"
+        )
+
+    return chat_template
 
 
 def _replace_prefix_tokens(
@@ -597,6 +640,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         )
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
+        )
+        serving_chat_kwargs["chat_template"] = _resolve_chat_template(
+            serving_chat_kwargs.get("chat_template")
         )
         serving_chat_kwargs.update(
             dict(
