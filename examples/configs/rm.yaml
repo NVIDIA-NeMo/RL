@@ -38,6 +38,7 @@ policy:
   activation_checkpointing_enabled: false
 
   offload_optimizer_for_logprob: false
+  use_pinned_optimizer_offload: false # Use pinned memory for optimizer D2H/H2D transfers
 
   reward_model_cfg:
     enabled: true  # loads model as a Reward Model (do not change)
