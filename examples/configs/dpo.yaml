@@ -53,6 +53,7 @@ policy:
   precision: "bfloat16"
 
   offload_optimizer_for_logprob: false
+  use_pinned_optimizer_offload: false # Use pinned memory for optimizer D2H/H2D transfers
 
   dtensor_cfg:
     env_vars:
