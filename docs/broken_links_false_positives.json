@@ -2,3 +2,6 @@
 {"uri": "https://platform.openai.com/docs/guides/function-calling"}
 {"uri": "https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForCausalLM"}
 {"uri": "https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForImageTextToText"}
+{"uri": "https://docs.nvidia.com/nsight-systems/InstallationGuide/index.html#package-manager-installation"}
+{"uri": "https://docs.pytorch.org/docs/stable/notes/cuda.html#reduced-precision-reduction-in-bf16-gemms"}
+{"uri": "https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf"}
