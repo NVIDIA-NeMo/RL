@@ -158,8 +158,15 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     Returns:
         str: Path to the python executable in the created virtual environment
     """
-    # Determine the number of alive Ray nodes
-    nodes = [n for n in ray.nodes() if n.get("Alive", False)]
+    # Determine the number of alive GPU Ray nodes (skip head/CPU-only nodes
+    # that have no GPUs — venvs are only needed on GPU workers, and including
+    # nodes with 0 CPUs makes the STRICT_SPREAD placement group infeasible).
+    nodes = [
+        n for n in ray.nodes()
+        if n.get("Alive", False)
+        and n.get("Resources", {}).get("CPU", 0) > 0
+        and n.get("Resources", {}).get("GPU", 0) > 0
+    ]
     num_nodes = len(nodes)
     # Reserve one CPU on each node using a STRICT_SPREAD placement group
     bundles = [{"CPU": 1} for _ in range(num_nodes)]
