@@ -244,6 +244,42 @@ def test_world_size_validation_dtensor(
         mock_ray_worker_group.assert_not_called()
 
 
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_dtensor_dp_replicate_size_sets_batching_dp(
+    mock_ray_worker_group,
+    tiny_llama_model_path,
+):
+    """Test that dp_replicate_size is separated from the batching DP axis."""
+    cluster = create_mock_cluster(world_size=8)
+    tokenizer = create_mock_tokenizer()
+    config = create_dtensor_config(tiny_llama_model_path, tp=1)
+    config["dtensor_cfg"]["dp_replicate_size"] = 2
+
+    policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+
+    assert policy.sharding_annotations.shape["data_parallel_replicate"] == 2
+    assert policy.sharding_annotations.shape["data_parallel"] == 4
+    assert policy.sharding_annotations.get_axis_size("data_parallel") == 4
+    mock_ray_worker_group.assert_called_once()
+
+
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_dtensor_dp_replicate_size_requires_divisible_dp(
+    mock_ray_worker_group,
+    tiny_llama_model_path,
+):
+    """Test that dp_replicate_size must divide the inferred data parallel size."""
+    cluster = create_mock_cluster(world_size=6)
+    tokenizer = create_mock_tokenizer()
+    config = create_dtensor_config(tiny_llama_model_path, tp=1)
+    config["dtensor_cfg"]["dp_replicate_size"] = 4
+
+    with pytest.raises(ValueError, match="dp_replicate_size"):
+        Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+
+    mock_ray_worker_group.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "world_size,tp,pp,cp,should_pass,expected_error_type,description",
     [

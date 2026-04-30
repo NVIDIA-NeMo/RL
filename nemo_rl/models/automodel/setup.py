@@ -472,7 +472,7 @@ def setup_distributed(
     )
 
     # Derive sizes from mesh
-    resolved_dp_size = device_mesh["dp"].size()
+    resolved_dp_size = device_mesh["dp_shard"].size()
     resolved_tp_size = device_mesh["tp"].size()
     resolved_cp_size = device_mesh["cp"].size()
 

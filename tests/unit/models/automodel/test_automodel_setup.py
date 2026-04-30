@@ -622,6 +622,8 @@ class TestSetupDistributed:
         # Configure dimension subscript access
         dp_dim = MagicMock()
         dp_dim.size.return_value = 4
+        dp_shard_dim = MagicMock()
+        dp_shard_dim.size.return_value = 4
         tp_dim = MagicMock()
         tp_dim.size.return_value = 1
         cp_dim = MagicMock()
@@ -629,6 +631,7 @@ class TestSetupDistributed:
 
         mock_mesh.__getitem__ = lambda self, key: {
             "dp": dp_dim,
+            "dp_shard": dp_shard_dim,
             "tp": tp_dim,
             "cp": cp_dim,
         }[key]
@@ -765,6 +768,7 @@ class TestSetupDistributed:
         mock_fsdp2_config.return_value = MagicMock()
         mock_moe_config.return_value = MagicMock()
         mock_create_mesh.return_value = (mock_device_mesh, None)
+        mock_config["dtensor_cfg"]["dp_replicate_size"] = 2
 
         setup_distributed(mock_config, mock_runtime_config)
 
@@ -780,6 +784,7 @@ class TestSetupDistributed:
         assert mesh_call_kwargs["pp_size"] == 1
         assert mesh_call_kwargs["cp_size"] == 1
         assert mesh_call_kwargs["ep_size"] == 1
+        assert mesh_call_kwargs["dp_replicate_size"] == 2
         assert mesh_call_kwargs["world_size"] == 4
 
 

@@ -165,6 +165,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
         actual_world_size = cluster.world_size()
+        dp_replicate_size = (
+            config["dtensor_cfg"].get("dp_replicate_size", 1)
+            if dtensor_enable
+            else 1
+        )
+        if dp_replicate_size is None or dp_replicate_size <= 0:
+            dp_replicate_size = 1
 
         if (
             not bool(os.environ.get("NRL_IGNORE_TP_ACCURACY_CHECK"))
@@ -202,20 +209,48 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 f"Please adjust your cluster size or parallelism parameters."
             )
 
-        self.sharding_annotations = NamedSharding(
-            layout=np.arange(cluster.world_size()).reshape(
-                pp_size,  # PP
-                -1,  # DP
-                cp_size,  # CP
-                tp_size,  # TP
-            ),
-            names=[
-                "pipeline_parallel",
-                "data_parallel",
-                "context_parallel",
-                "tensor_parallel",
-            ],
-        )
+        dp_size = actual_world_size // model_parallel_size
+        if dp_size % dp_replicate_size != 0:
+            raise ValueError(
+                f"Data parallel size ({dp_size}) must be divisible by "
+                f"dp_replicate_size ({dp_replicate_size}). "
+                "Please adjust your cluster size or parallelism parameters."
+            )
+
+        if dp_replicate_size > 1:
+            self.sharding_annotations = NamedSharding(
+                layout=np.arange(cluster.world_size()).reshape(
+                    pp_size,  # PP
+                    dp_replicate_size,  # DP replicate
+                    -1,  # DP shard
+                    cp_size,  # CP
+                    tp_size,  # TP
+                ),
+                names=[
+                    "pipeline_parallel",
+                    "data_parallel_replicate",
+                    "data_parallel",
+                    "context_parallel",
+                    "tensor_parallel",
+                ],
+            )
+            self._replicate_axes = ["data_parallel_replicate"]
+        else:
+            self.sharding_annotations = NamedSharding(
+                layout=np.arange(cluster.world_size()).reshape(
+                    pp_size,  # PP
+                    -1,  # DP
+                    cp_size,  # CP
+                    tp_size,  # TP
+                ),
+                names=[
+                    "pipeline_parallel",
+                    "data_parallel",
+                    "context_parallel",
+                    "tensor_parallel",
+                ],
+            )
+            self._replicate_axes = []
 
         pre_init_queue = RayQueue()
 
@@ -419,11 +454,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 data=sharded_data,
                 in_sharded_axes=["data_parallel"],
                 replicate_on_axes=[
+                    *self._replicate_axes,
                     "context_parallel",
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
                 output_is_replicated=[
+                    *self._replicate_axes,
                     "context_parallel",
                     "tensor_parallel",
                     "pipeline_parallel",
@@ -494,11 +531,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 data=sharded_data,
                 in_sharded_axes=["data_parallel"],
                 replicate_on_axes=[
+                    *self._replicate_axes,
                     "context_parallel",
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
                 output_is_replicated=[
+                    *self._replicate_axes,
                     "context_parallel",
                     "tensor_parallel",
                     "pipeline_parallel",
@@ -565,11 +604,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 data=sharded_data,
                 in_sharded_axes=["data_parallel"],
                 replicate_on_axes=[
+                    *self._replicate_axes,
                     "context_parallel",
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
                 output_is_replicated=[
+                    *self._replicate_axes,
                     "context_parallel",
                     "tensor_parallel",
                     "pipeline_parallel",
@@ -647,11 +688,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 data=sharded_data,
                 in_sharded_axes=["data_parallel"],
                 replicate_on_axes=[
+                    *self._replicate_axes,
                     "context_parallel",
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
                 output_is_replicated=[
+                    *self._replicate_axes,
                     "context_parallel",
                     "tensor_parallel",
                     "pipeline_parallel",
@@ -713,8 +756,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "generate",
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
-            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
-            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
+            replicate_on_axes=[
+                *self._replicate_axes,
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                *self._replicate_axes,
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
             common_kwargs={"greedy": greedy},
         )
         assert self.cfg["generation"] is not None, "Generation config is not set"
@@ -757,11 +808,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
+                *self._replicate_axes,
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
             output_is_replicated=[
+                *self._replicate_axes,
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
@@ -865,11 +918,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
+                *self._replicate_axes,
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
             output_is_replicated=[
+                *self._replicate_axes,
                 "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
