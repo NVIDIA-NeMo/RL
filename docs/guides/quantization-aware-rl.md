@@ -6,27 +6,39 @@ Quantization-Aware RL (QARL) integrates [NVIDIA Model Optimizer (ModelOpt)](http
 
 In a standard NeMo RL loop, model weights are trained in full precision and refitted into vLLM for generation. QARL applies fake quantization so that both the policy forward pass (training) and the rollout forward pass (vLLM generation) use quantized weights and activations. The policy backward pass remains in full precision, using the straight-through estimator to propagate gradients through the quantization nodes.
 
-See [Supported Quantization Formats](#supported-quantization-formats) for details on which formats are available. The examples below use NVFP4 (`NVFP4_DEFAULT_CFG`), which offers strong compression while maintaining accuracy through quantization-aware training.
+See [Verified Configurations](#verified-configurations) for the workflow + recipe combinations that have been empirically validated, and [Supported Quantization Formats](#supported-quantization-formats) for the full set of available formats. W4A4 (`NVFP4_DEFAULT_CFG`) converges for on-policy distillation but has been observed to have convergence issues on GRPO; W4A16 (NVFP4 weights, native-dtype activations) works for GRPO.
+
+## Verified Configurations
+
+The following workflow + quantization recipe combinations have been validated end-to-end (Megatron training + NVFP4-quantized vLLM generation + held-out validation):
+
+| Workflow | Quantization | Recipe | Status | Example Config |
+|---|---|---|---|---|
+| QA-Distillation | W4A4 | `NVFP4_DEFAULT_CFG` (NVFP4 weights + NVFP4 activations) | ✅ Converges | `examples/modelopt/qa_distillation_math_megatron.yaml` |
+| QA-GRPO | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16.yaml` (NVFP4 weights, native-dtype activations) | ✅ Converges | `examples/modelopt/qa_grpo_llama8b_megatron.yaml` |
+| QA-GRPO | W4A4 | `NVFP4_DEFAULT_CFG` | ⚠️ Known convergence issue | `examples/modelopt/qa_grpo_math_megatron.yaml` |
+
+The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation.
 
 ## Quantization-Aware GRPO (QA-GRPO)
 
 ### Configuration
 
-The QA-GRPO config extends the standard Megatron GRPO config by adding quantization parameters:
+The QA-GRPO config extends the standard Megatron GRPO config by adding quantization parameters. See [Verified Configurations](#verified-configurations) for the status of W4A4 vs W4A16 on GRPO.
 
 ```yaml
-# examples/modelopt/qa_grpo_math_megatron.yaml
-defaults: "../configs/grpo_math_1B_megatron.yaml"
+# examples/modelopt/qa_grpo_llama8b_megatron.yaml
+defaults: "../configs/grpo_math_8B_megatron.yaml"
 
 policy:
-  quant_cfg: "NVFP4_DEFAULT_CFG"
+  quant_cfg: "examples/modelopt/quant_configs/nvfp4_a16.yaml"
   quant_calib_data: "cnn_dailymail"
   quant_calib_size: 512
   quant_batch_size: 1
   quant_sequence_length: 2048
 
   generation:
-    quant_cfg: "NVFP4_DEFAULT_CFG"
+    quant_cfg: "examples/modelopt/quant_configs/nvfp4_a16.yaml"
 ```
 
 ### Running QA-GRPO
@@ -35,16 +47,16 @@ policy:
 
 ```bash
 uv run examples/run_grpo.py \
-  --config examples/modelopt/qa_grpo_math_megatron.yaml \
-  policy.model_name=Qwen/Qwen3-1.7B
+  --config examples/modelopt/qa_grpo_llama8b_megatron.yaml \
+  policy.model_name=meta-llama/Llama-3.1-8B-Instruct
 ```
 
 **Via Slurm:**
 
 ```bash
 COMMAND="uv run examples/run_grpo.py \
-  --config examples/modelopt/qa_grpo_math_megatron.yaml \
-  policy.model_name=Qwen/Qwen3-1.7B \
+  --config examples/modelopt/qa_grpo_llama8b_megatron.yaml \
+  policy.model_name=meta-llama/Llama-3.1-8B-Instruct \
   checkpointing.checkpoint_dir=results/qa_grpo" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
