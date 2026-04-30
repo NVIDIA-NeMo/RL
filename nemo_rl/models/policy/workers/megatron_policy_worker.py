@@ -1469,7 +1469,7 @@ class MegatronPolicyWorkerImpl(
         else:
             optimizer_state = self.optimizer._get_state()
 
-        use_pinned = self.cfg.get("use_pinned_optimizer_offload", False)
+        use_pinned = self.cfg["use_pinned_optimizer_offload"]
 
         if device == "cpu":
             if use_pinned:
@@ -1511,6 +1511,11 @@ class MegatronPolicyWorkerImpl(
             )
             setattr(self, attr_name, buf)
         return buf
+
+    def _delete_pinned_buf(self, attr_name: str) -> None:
+        """Free a cached pinned CPU buffer allocated by _get_or_alloc_pinned_buf."""
+        if hasattr(self, attr_name):
+            delattr(self, attr_name)
 
     def _coalesced_optimizer_to_cpu(self, optimizer_state):
         """Offload all optimizer state tensors to CPU via a cached pinned buffer.
