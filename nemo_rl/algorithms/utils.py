@@ -652,7 +652,7 @@ def print_performance_metrics(
     refit_time = (
         timing_metrics["weight_sync"]
         if "weight_sync" in timing_metrics
-        else timing_metrics["prepare_for_generation/total"]
+        else timing_metrics.get("prepare_for_generation/total", 0.0)
     )
     if "generation" in timing_metrics:  # Sync GRPO
         generation_time = timing_metrics["generation"]

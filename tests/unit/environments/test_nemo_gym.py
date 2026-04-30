@@ -44,6 +44,55 @@ except ImportError:
     NEMO_GYM_INSTALLED = False
 
 
+class _DummyTokenizer:
+    def apply_chat_template(self, input_messages, tokenize=True):
+        assert tokenize
+        return [101, 102]
+
+    def decode(self, token_ids):
+        return str(token_ids)
+
+
+def test_postprocess_nemo_gym_empty_generation_error_is_diagnosable():
+    env = NemoGym.__new__(NemoGym)
+    tokenizer = _DummyTokenizer()
+    nemo_gym_result = {
+        "responses_create_params": {
+            "input": [{"role": "user", "content": "hello"}],
+        },
+        "response": {
+            "id": "resp_123",
+            "model": "dummy-model",
+            "status": "incomplete",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "incomplete",
+                    "finish_reason": "length",
+                    "content": [{"type": "output_text", "text": ""}],
+                }
+            ],
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "usage": {"input_tokens": 2, "output_tokens": 0},
+        },
+    }
+
+    with pytest.raises(ValueError, match="no generation data") as exc_info:
+        env._postprocess_nemo_gym_to_nemo_rl_result(nemo_gym_result, tokenizer)
+
+    error_text = str(exc_info.value)
+    assert "Prompt length: 2 tokens." in error_text
+    assert "Response summary:" in error_text
+    assert '"response_status": "incomplete"' in error_text
+    assert '"finish_reason": "length"' in error_text
+    assert '"output_count": 1' in error_text
+    assert (
+        "This typically means the prompt for the first turn already exceeds the vLLM max_model_len"
+        not in error_text
+    )
+
+
 @pytest.mark.skipif(
     not NEMO_GYM_INSTALLED,
     reason="Skipping NeMo-Gym test since NeMo-Gym is not installed!",

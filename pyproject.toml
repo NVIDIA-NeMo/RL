@@ -54,8 +54,8 @@ dependencies = [
   "cuda-bindings",                                                                                                    # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
   "nvidia-cudnn-cu12==9.19.0.56",                                                                                     # for transformer-engine no build isolation
-  "ai-dynamo @ file:///opt/nemo-rl/ai_dynamo-1.0.0-py3-none-any.whl",
-  "ai-dynamo-runtime @ file:///opt/nemo-rl/ai_dynamo_runtime-1.0.0-cp310-abi3-manylinux_2_39_x86_64.whl",
+  "ai-dynamo @ file:///opt/nemo-rl/ai_dynamo-1.1.0-py3-none-any.whl",
+  "ai-dynamo-runtime @ file:///opt/nemo-rl/ai_dynamo_runtime-1.1.0-cp310-abi3-manylinux_2_39_x86_64.whl",
   "nixl==0.10.1",
   "aiconfigurator[webapp]",
   "aiofiles<=25.1.0",

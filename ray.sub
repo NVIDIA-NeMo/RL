@@ -28,6 +28,11 @@ set -eoux pipefail
 # Function to detect if SLURM cluster uses GRES
 ########################################################
 maybe_gres_arg() {
+  if [[ "${DISABLE_RAY_GRES:-0}" == "1" ]]; then
+    echo ""
+    return
+  fi
+
   # Check if any nodes in the partition have GRES configured
   # Assumes a homogeneous allocation (not a heterogeneous job)
   if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
@@ -50,6 +55,7 @@ maybe_gres_arg() {
 CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
+SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
@@ -108,7 +114,7 @@ fi
 
 # Create logs directory
 BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
-LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
+LOG_DIR=${LOG_DIR:-"$BASE_LOG_DIR/$SLURM_JOB_ID-logs"}
 mkdir -p $LOG_DIR
 
 # Number of GPUs per worker node
@@ -119,7 +125,7 @@ GRES_ARG=$(maybe_gres_arg)
 if [[ -n "$GRES_ARG" ]]; then
   echo "[INFO] GRES support detected. Using: $GRES_ARG"
 else
-  echo "[INFO] No GRES support detected. Running without --gres flag."
+  echo "[INFO] No GRES support detected or GRES explicitly disabled. Running without --gres flag."
 fi
 
 COMMON_SRUN_ARGS="$GRES_ARG"
@@ -295,6 +301,7 @@ chmod +x /launch-head.sh
 
 count=0
 while [[ \$count -lt $num_retries ]]; do
+  $SETUP_COMMAND
   bash /launch-head.sh
   count=\$((count+1))
   echo "Head node failed \$count/$num_retries times, restarting in 5 seconds..."
@@ -307,6 +314,7 @@ EOF
 srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
 SRUN_PIDS["ray-head"]=$!
 
+sleep 100s
 NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
 
 # Start Ray worker nodes
@@ -394,6 +402,7 @@ EOFINNER
 
 count=0
 while [[ \$count -lt $num_retries ]]; do
+  $SETUP_COMMAND
   bash /launch-worker.sh
   count=\$((count+1))
   echo "Worker failed \$count/$num_retries times, restarting in 5 seconds..."

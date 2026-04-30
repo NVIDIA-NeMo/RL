@@ -14,6 +14,7 @@
 
 import threading as _threading
 import time
+from collections import Counter
 from typing import Any, Optional
 
 import ray
@@ -30,6 +31,8 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation.interfaces import GenerationInterface
 
 TokenizerType = PreTrainedTokenizerBase
+
+ASYNC_DEBUG_PREFIX = "[ASYNC_DEBUG]"
 
 
 @ray.remote  # pragma: no cover
@@ -48,6 +51,7 @@ class ReplayBuffer:
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
         self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
         self.target_weight_versions = []  # it is the weight-version of the trainer where this trajectory will be used.
+        self.failed_prompt_groups: list[dict[str, Any]] = []
 
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
@@ -81,14 +85,60 @@ class ReplayBuffer:
             )
             return "success"
 
+    def record_failed_prompt_group(
+        self,
+        weight_version: int,
+        target_weight_version: int,
+        prompt_idx: int,
+        worker_id: int,
+        reason: str,
+    ) -> str:
+        """Record a prompt group that failed before it produced a trainable batch."""
+        with self._lock:
+            failure_record = {
+                "weight_version": weight_version,
+                "target_weight_version": target_weight_version,
+                "prompt_idx": prompt_idx,
+                "worker_id": worker_id,
+                "reason": reason,
+                "timestamp": time.time(),
+            }
+            self.failed_prompt_groups.append(failure_record)
+            self.last_target_weight_already_generated = max(
+                self.last_target_weight_already_generated, target_weight_version
+            )
+            print(
+                f"{ASYNC_DEBUG_PREFIX} recorded_failed_prompt_group "
+                f"target={target_weight_version} generation_weight={weight_version} "
+                f"prompt_idx={prompt_idx} worker_id={worker_id} reason={reason} "
+                f"failed_target_counts={dict(Counter(r['target_weight_version'] for r in self.failed_prompt_groups))}"
+            )
+            return "success"
+
     def get_debug_info(self) -> dict:
         """Get debug information about buffer state."""
-        return {
-            "total_trajectories": len(self.trajectories),
-            "trajectory_versions": self.trajectory_versions,
-            "target_weight_versions": self.target_weight_versions,
-            "max_size": self.max_size,
-        }
+        with self._lock:
+            failed_target_versions = [
+                r["target_weight_version"] for r in self.failed_prompt_groups
+            ]
+            failed_generation_versions = [
+                r["weight_version"] for r in self.failed_prompt_groups
+            ]
+            return {
+                "total_trajectories": len(self.trajectories),
+                "trajectory_versions": list(self.trajectory_versions),
+                "target_weight_versions": list(self.target_weight_versions),
+                "trajectory_version_counts": dict(Counter(self.trajectory_versions)),
+                "target_weight_counts": dict(Counter(self.target_weight_versions)),
+                "failed_prompt_groups": list(self.failed_prompt_groups),
+                "failed_prompt_group_count": len(self.failed_prompt_groups),
+                "failed_generation_version_counts": dict(
+                    Counter(failed_generation_versions)
+                ),
+                "failed_target_weight_counts": dict(Counter(failed_target_versions)),
+                "last_target_weight_already_generated": self.last_target_weight_already_generated,
+                "max_size": self.max_size,
+            }
 
     def get_last_target_weight_already_generated(self) -> int:
         with self._lock:
@@ -98,6 +148,36 @@ class ReplayBuffer:
         """Get set of target weight versions that already have trajectories."""
         with self._lock:
             return set(self.target_weight_versions)
+
+    def get_target_weight_counts(self) -> dict[int, int]:
+        """Get counts of buffered trajectory groups per target weight."""
+        with self._lock:
+            return dict(Counter(self.target_weight_versions))
+
+    def get_failed_target_weight_counts(self) -> dict[int, int]:
+        """Get counts of failed prompt groups per target weight."""
+        with self._lock:
+            return dict(
+                Counter(r["target_weight_version"] for r in self.failed_prompt_groups)
+            )
+
+    def get_target_completion_counts(self) -> dict[int, dict[str, int]]:
+        """Get buffered and failed prompt-group counts by target weight."""
+        with self._lock:
+            buffered_counts = Counter(self.target_weight_versions)
+            failed_counts = Counter(
+                r["target_weight_version"] for r in self.failed_prompt_groups
+            )
+            target_weights = set(buffered_counts) | set(failed_counts)
+            return {
+                target_weight: {
+                    "buffered": buffered_counts.get(target_weight, 0),
+                    "failed": failed_counts.get(target_weight, 0),
+                    "accounted": buffered_counts.get(target_weight, 0)
+                    + failed_counts.get(target_weight, 0),
+                }
+                for target_weight in target_weights
+            }
 
     def sample(
         self,
@@ -116,7 +196,12 @@ class ReplayBuffer:
             Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
         """
         with self._lock:
-            if not self.trajectories:
+            failed_for_current = [
+                r
+                for r in self.failed_prompt_groups
+                if r["target_weight_version"] == current_weight_version
+            ]
+            if not self.trajectories and not failed_for_current:
                 return None
 
             total_trajectories = len(self.trajectories)
@@ -124,11 +209,14 @@ class ReplayBuffer:
             print(f"   {current_weight_version=}, {max_age_steps=}")
             print(f"   {self.trajectory_versions=}")
 
-            # For debugging: check for unexpected old trajectories
-            from collections import Counter
-
             version_counts = Counter(self.trajectory_versions)
+            target_counts = Counter(self.target_weight_versions)
+            failed_target_counts = Counter(
+                r["target_weight_version"] for r in self.failed_prompt_groups
+            )
             print(f"   {version_counts=}")
+            print(f"   {target_counts=}")
+            print(f"   {failed_target_counts=}")
 
             # Compute minimum valid version based on age window
             # max_age_steps=1 means trajectories from the last 1 step are valid
@@ -153,15 +241,8 @@ class ReplayBuffer:
             print(
                 f"   valid_indices: {len(valid_indices)}/{total_trajectories} trajectories within age window"
             )
-            if not valid_indices:
+            if not valid_indices and not failed_for_current:
                 print("No trajectories available for sampling.")
-                return None
-
-            # Enforce exact number of groups if available; otherwise, signal to wait
-            if len(valid_indices) < num_prompt_groups:
-                print(
-                    f"Insufficient valid groups: have {len(valid_indices)}, need {num_prompt_groups}. Waiting for buffer to fill."
-                )
                 return None
 
             # Only select trajectories intended for the current training step
@@ -176,23 +257,40 @@ class ReplayBuffer:
                 f"   🎯 Found {len(intended_indices)} trajectories intended for current step {current_weight_version}"
             )
 
-            # Stall training if we don't have enough trajectories intended for this step
-            if len(intended_indices) < num_prompt_groups:
+            accounted_for_current = len(intended_indices) + len(failed_for_current)
+
+            # Stall training if we don't have enough successful or explicitly failed
+            # prompt groups intended for this step.
+            if accounted_for_current < num_prompt_groups:
                 print(
                     f"   ⏸️ STALLING: Need {num_prompt_groups} trajectories for step {current_weight_version}, but only {len(intended_indices)} are ready"
                 )
                 print(
-                    f"   ⏸️ Training will wait for remaining {num_prompt_groups - len(intended_indices)} trajectories to be generated"
+                    f"   ⏸️ Training will wait for remaining {num_prompt_groups - accounted_for_current} trajectories to be generated or fail"
+                )
+                print(
+                    f"{ASYNC_DEBUG_PREFIX} replay_buffer_stall current_weight={current_weight_version} "
+                    f"needed={num_prompt_groups} intended_ready={len(intended_indices)} "
+                    f"failed_for_current={len(failed_for_current)} "
+                    f"target_counts={dict(target_counts)} failed_target_counts={dict(failed_target_counts)} "
+                    f"version_counts={dict(version_counts)}"
                 )
                 return None
 
+            if not intended_indices:
+                raise RuntimeError(
+                    f"All {num_prompt_groups} prompt groups for step {current_weight_version} failed before buffering; no trainable trajectories are available."
+                )
+
             # Select exactly the trajectories intended for this step (FIFO within same target)
             selected: list[int] = intended_indices[:num_prompt_groups]
-            print(
-                f"   ✅ Selected {len(selected)} trajectories all intended for step {current_weight_version}"
+            skipped_failed_prompt_groups = min(
+                len(failed_for_current), num_prompt_groups - len(selected)
             )
-
-            from collections import Counter
+            print(
+                f"   ✅ Selected {len(selected)} trajectories for step {current_weight_version}; "
+                f"skipping {skipped_failed_prompt_groups} failed prompt groups"
+            )
 
             sampled_weights = [self.trajectory_versions[i] for i in selected]
             avg_trajectory_age = current_weight_version - sum(sampled_weights) / len(
@@ -207,19 +305,39 @@ class ReplayBuffer:
             )
 
             sampled_items = [self.trajectories[i] for i in selected]
+            consumed_failures = failed_for_current[:skipped_failed_prompt_groups]
+            consumed_failure_ids = {id(r) for r in consumed_failures}
 
             # Remove selected items in reverse order to maintain correct indices
             for idx in sorted(selected, reverse=True):
                 self.trajectory_versions.pop(idx)
                 self.target_weight_versions.pop(idx)
                 self.trajectories.pop(idx)
+
+            # The current training step has accounted for these failed prompt groups.
+            # Remove all failure records for the step so they cannot affect later debug
+            # state or target-completion accounting.
+            self.failed_prompt_groups = [
+                r for r in self.failed_prompt_groups if id(r) not in consumed_failure_ids
+            ]
             print(
                 f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
             )
+            if skipped_failed_prompt_groups:
+                print(
+                    f"{ASYNC_DEBUG_PREFIX} replay_buffer_skipped_failed_prompt_groups "
+                    f"current_weight={current_weight_version} skipped={skipped_failed_prompt_groups} "
+                    f"selected={len(selected)} requested={num_prompt_groups} "
+                    f"failures={consumed_failures}"
+                )
 
             return {
                 "trajectories": sampled_items,
                 "avg_trajectory_age": avg_trajectory_age,
+                "requested_prompt_groups": num_prompt_groups,
+                "sampled_prompt_groups": len(sampled_items),
+                "skipped_failed_prompt_groups": skipped_failed_prompt_groups,
+                "failed_prompt_groups": consumed_failures,
             }
 
     def size(self) -> int:
@@ -233,6 +351,7 @@ class ReplayBuffer:
             self.trajectories.clear()
             self.trajectory_versions.clear()
             self.target_weight_versions.clear()
+            self.failed_prompt_groups.clear()
 
 
 @ray.remote  # pragma: no cover
@@ -284,12 +403,78 @@ class AsyncTrajectoryCollector:
             int(self.master_config["grpo"]["num_prompts_per_step"])
             * int(self.master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"])
         ) or 1
+        self._max_inflight = max_inflight
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
         # Simple lock to prevent race conditions when checking/spawning workers
         self._generation_check_lock: _threading.Lock = _threading.Lock()
-        # Track which target weights are currently being generated (globally)
-        self._generating_targets: set[int] = set()
+        # Track how many prompt-group workers are still in flight per target weight.
+        self._generating_target_counts: dict[int, int] = {}
+        self._worker_id = 0
+
+        print(
+            f"{ASYNC_DEBUG_PREFIX} collector_init current_weight={self.current_weight_version} "
+            f"initial_weight={self.initial_weight_version} max_inflight={self._max_inflight} "
+            f"num_prompts_per_step={self.master_config['grpo']['num_prompts_per_step']} "
+            f"num_generations_per_prompt={self.master_config['grpo']['num_generations_per_prompt']} "
+            f"max_age={self.master_config['grpo']['async_grpo']['max_trajectory_age_steps']}"
+        )
+
+    def _active_thread_count_unlocked(self) -> int:
+        return sum(1 for thread in self._inflight_threads if thread.is_alive())
+
+    def _next_worker_id(self) -> int:
+        with self._generation_check_lock:
+            self._worker_id += 1
+            return self._worker_id
+
+    def _generation_state_for_log(
+        self,
+        target_weights: Optional[list[int]] = None,
+        target_completion_counts: Optional[dict[int, dict[str, int]]] = None,
+    ) -> dict[str, Any]:
+        if target_weights is None:
+            target_weights = self._calculate_target_weights(self.current_weight_version)
+        if target_completion_counts is None:
+            target_completion_counts = ray.get(
+                self.replay_buffer.get_target_completion_counts.remote()
+            )
+
+        required_groups = int(self.master_config["grpo"]["num_prompts_per_step"])
+        with self._generation_check_lock:
+            inflight_counts = dict(self._generating_target_counts)
+        with self._threads_lock:
+            active_threads = self._active_thread_count_unlocked()
+
+        per_target = {}
+        for target_weight in target_weights:
+            completion_counts = target_completion_counts.get(target_weight, {})
+            buffered = completion_counts.get("buffered", 0)
+            failed = completion_counts.get("failed", 0)
+            inflight = inflight_counts.get(target_weight, 0)
+            per_target[target_weight] = {
+                "buffered": buffered,
+                "failed": failed,
+                "inflight": inflight,
+                "missing": required_groups - buffered - failed - inflight,
+            }
+
+        return {
+            "current_weight_version": self.current_weight_version,
+            "required_groups": required_groups,
+            "max_inflight": self._max_inflight,
+            "active_threads": active_threads,
+            "inflight_counts": inflight_counts,
+            "target_completion_counts": dict(target_completion_counts),
+            "candidate_targets": target_weights,
+            "per_candidate_target": per_target,
+        }
+
+    def get_debug_state(self) -> dict[str, Any]:
+        """Return collector and replay-buffer state useful for diagnosing stalls."""
+        state = self._generation_state_for_log()
+        state["replay_buffer"] = ray.get(self.replay_buffer.get_debug_info.remote())
+        return state
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
@@ -321,23 +506,62 @@ class AsyncTrajectoryCollector:
         return [generation_weight_version + i for i in range(1, max_trajectory_age + 1)]
 
     def _get_next_target_for_generation(
-        self, generation_weight_version: int
-    ) -> Optional[int]:
+        self, generation_weight_version: int, max_prompt_groups: int
+    ) -> Optional[tuple[int, int]]:
         """Get the next target weight that needs generation (if any)."""
         target_weights = self._calculate_target_weights(generation_weight_version)
-        last_target_weight_already_generated = ray.get(
-            self.replay_buffer.get_last_target_weight_already_generated.remote()
+        target_completion_counts = ray.get(
+            self.replay_buffer.get_target_completion_counts.remote()
         )
+        required_groups = int(self.master_config["grpo"]["num_prompts_per_step"])
 
         with self._generation_check_lock:
+            candidate_states = []
             for target_weight in target_weights:
-                if (
-                    target_weight > last_target_weight_already_generated
-                    and target_weight not in self._generating_targets
-                ):
-                    self._generating_targets.add(target_weight)
-                    print(f"🎯 Reserved target weight {target_weight} for generation")
-                    return target_weight
+                completion_counts = target_completion_counts.get(target_weight, {})
+                buffered_groups = completion_counts.get("buffered", 0)
+                failed_groups = completion_counts.get("failed", 0)
+                inflight_groups = self._generating_target_counts.get(target_weight, 0)
+                missing_groups = (
+                    required_groups
+                    - buffered_groups
+                    - failed_groups
+                    - inflight_groups
+                )
+                candidate_states.append(
+                    {
+                        "target": target_weight,
+                        "buffered": buffered_groups,
+                        "failed": failed_groups,
+                        "inflight": inflight_groups,
+                        "missing": missing_groups,
+                    }
+                )
+                if missing_groups > 0:
+                    prompt_groups_to_launch = min(missing_groups, max_prompt_groups)
+                    self._generating_target_counts[target_weight] = (
+                        inflight_groups + prompt_groups_to_launch
+                    )
+                    print(
+                        f"🎯 Reserved {prompt_groups_to_launch} prompt groups for target weight {target_weight}"
+                    )
+                    print(
+                        f"{ASYNC_DEBUG_PREFIX} reserve target={target_weight} "
+                        f"launch={prompt_groups_to_launch} buffered={buffered_groups} "
+                        f"failed={failed_groups} "
+                        f"previous_inflight={inflight_groups} "
+                        f"new_inflight={self._generating_target_counts[target_weight]} "
+                        f"required={required_groups} candidates={candidate_states}"
+                    )
+                    return target_weight, prompt_groups_to_launch
+
+            print(
+                f"{ASYNC_DEBUG_PREFIX} no_reservation generation_weight={generation_weight_version} "
+                f"targets={target_weights} required={required_groups} "
+                f"target_completion_counts={target_completion_counts} "
+                f"inflight_counts={dict(self._generating_target_counts)} "
+                f"candidates={candidate_states}"
+            )
 
         return None
 
@@ -356,21 +580,32 @@ class AsyncTrajectoryCollector:
         """Check if collection should be paused due to generation limits."""
         try:
             target_weights = self._calculate_target_weights(self.current_weight_version)
-            last_target_weight_already_generated = ray.get(
-                self.replay_buffer.get_last_target_weight_already_generated.remote()
+            target_completion_counts = ray.get(
+                self.replay_buffer.get_target_completion_counts.remote()
             )
+            required_groups = int(self.master_config["grpo"]["num_prompts_per_step"])
 
             # Check if any target weight in our range needs generation
             with self._generation_check_lock:
                 for target_weight in target_weights:
+                    completion_counts = target_completion_counts.get(target_weight, {})
+                    buffered_groups = completion_counts.get("buffered", 0)
+                    failed_groups = completion_counts.get("failed", 0)
+                    inflight_groups = self._generating_target_counts.get(
+                        target_weight, 0
+                    )
                     if (
-                        target_weight > last_target_weight_already_generated
-                        and target_weight not in self._generating_targets
+                        buffered_groups + failed_groups + inflight_groups
+                        < required_groups
                     ):
                         return False  # Found a target that needs generation
 
             print(
-                f"⏸️ All target weights {target_weights} already generated or in progress, pausing"
+                f"⏸️ All target weights {target_weights} are full or in progress, pausing"
+            )
+            print(
+                f"{ASYNC_DEBUG_PREFIX} pause_decision "
+                f"{self._generation_state_for_log(target_weights, target_completion_counts)}"
             )
             return True
         except Exception:
@@ -410,25 +645,25 @@ class AsyncTrajectoryCollector:
                 if self._should_pause_for_generation_limits() and self.running:
                     # Only log warning once per weight version
                     if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.get("grpo", {}).get(
-                            "async_grpo", {}
+                        target_weights = self._calculate_target_weights(
+                            self.current_weight_version
                         )
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
 
                         print(
                             f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
+                            f"are full or already in progress. Waiting for weight update..."
                         )
                         self._last_limit_warning_version = self.current_weight_version
 
                         self._generation_limit_cleared.clear()  # Clear the event to pause
 
-                    # Efficiently wait for generation limits to be cleared (no polling!)
-                    self._generation_limit_cleared.wait()
+                    # Efficiently wait for generation limits to be cleared, with a
+                    # periodic diagnostic so a stuck run shows whether workers remain.
+                    while self.running and not self._generation_limit_cleared.wait(30):
+                        print(
+                            f"{ASYNC_DEBUG_PREFIX} collection_paused_waiting "
+                            f"{self._generation_state_for_log()}"
+                        )
 
                     # Double-check we're still running after being woken up
                     if not self.running:
@@ -454,24 +689,30 @@ class AsyncTrajectoryCollector:
             generation_weight_version = self.current_weight_version
             num_generations = self.master_config["grpo"]["num_generations_per_prompt"]
             num_prompts = batch.size
-
-            # Get the next target weight that needs generation
-            target_weight = self._get_next_target_for_generation(
-                generation_weight_version
+            print(
+                f"{ASYNC_DEBUG_PREFIX} process_batch generation_weight={generation_weight_version} "
+                f"batch_size={num_prompts} num_generations={num_generations} "
+                f"state={self._generation_state_for_log()}"
             )
 
-            if target_weight is None:
+            # Get the next target weight that needs generation
+            target_reservation = self._get_next_target_for_generation(
+                generation_weight_version, num_prompts
+            )
+
+            if target_reservation is None:
                 print(
                     f"🔄 No targets need generation for weight {generation_weight_version}"
                 )
                 return
 
+            target_weight, num_prompt_groups_to_launch = target_reservation
             print(
-                f"🎯 Generating for target weight {target_weight} from generation_weight_version {generation_weight_version}"
+                f"🎯 Generating {num_prompt_groups_to_launch} prompt groups for target weight {target_weight} from generation_weight_version {generation_weight_version}"
             )
 
-            # Generate for all prompts in this batch for the target weight
-            for prompt_idx in range(num_prompts):
+            # Generate only the missing prompt groups for this target.
+            for prompt_idx in range(num_prompt_groups_to_launch):
                 # Wait for refit to complete if in progress
                 if not self._refit_pause_cleared.is_set() and self.running:
                     with self._threads_lock:
@@ -490,10 +731,27 @@ class AsyncTrajectoryCollector:
                 single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
                 repeated_batch = single_prompt_batch.repeat_interleave(num_generations)
 
-                self._inflight_sema.acquire()
+                worker_id = self._next_worker_id()
+                acquire_start = time.time()
+                while not self._inflight_sema.acquire(timeout=30):
+                    print(
+                        f"{ASYNC_DEBUG_PREFIX} worker_waiting_for_slot "
+                        f"worker_id={worker_id} target={target_weight} prompt_idx={prompt_idx} "
+                        f"wait_s={time.time() - acquire_start:.1f} "
+                        f"state={self._generation_state_for_log()}"
+                    )
+                acquire_elapsed = time.time() - acquire_start
+                if acquire_elapsed > 1:
+                    print(
+                        f"{ASYNC_DEBUG_PREFIX} worker_acquired_slot_after_wait "
+                        f"worker_id={worker_id} target={target_weight} prompt_idx={prompt_idx} "
+                        f"wait_s={acquire_elapsed:.1f}"
+                    )
+
                 worker = _threading.Thread(
                     target=self._run_prompt_group_worker,
                     args=(
+                        worker_id,
                         repeated_batch,
                         generation_weight_version,
                         target_weight,
@@ -503,6 +761,12 @@ class AsyncTrajectoryCollector:
                 )
                 with self._threads_lock:
                     self._inflight_threads.add(worker)
+                    active_threads = self._active_thread_count_unlocked()
+                print(
+                    f"{ASYNC_DEBUG_PREFIX} worker_thread_started worker_id={worker_id} "
+                    f"target={target_weight} prompt_idx={prompt_idx} "
+                    f"generation_weight={generation_weight_version} active_threads={active_threads}"
+                )
                 worker.start()
 
             self._cleanup_finished_threads()
@@ -636,11 +900,20 @@ class AsyncTrajectoryCollector:
 
     def _run_prompt_group_worker(
         self,
+        worker_id: int,
         repeated_batch: BatchedDataDict[DatumSpec],
         generation_weight_version: int,
         target_weight_version: int,
         prompt_idx: int,
     ) -> None:
+        worker_start = time.time()
+        outcome = "unknown"
+        failure_reason: Optional[str] = None
+        print(
+            f"{ASYNC_DEBUG_PREFIX} worker_start worker_id={worker_id} "
+            f"target={target_weight_version} prompt_idx={prompt_idx} "
+            f"generation_weight={generation_weight_version} repeated_batch_size={repeated_batch.size}"
+        )
         try:
             # Import here to avoid circular dependency
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
@@ -666,6 +939,12 @@ class AsyncTrajectoryCollector:
                 )
                 final_batch = nemo_gym_rollout_result.final_batch
                 rollout_metrics = nemo_gym_rollout_result.rollout_metrics
+                print(
+                    f"{ASYNC_DEBUG_PREFIX} worker_rollout_done worker_id={worker_id} "
+                    f"target={target_weight_version} prompt_idx={prompt_idx} "
+                    f"elapsed_s={time.time() - worker_start:.1f} "
+                    f"metric_keys={sorted(rollout_metrics.keys())[:16]}"
+                )
             else:
                 final_batch, rollout_metrics = run_async_multi_turn_rollout(
                     policy_generation=self.policy_generation,
@@ -677,6 +956,12 @@ class AsyncTrajectoryCollector:
                     ],
                     max_rollout_turns=self.master_config["grpo"]["max_rollout_turns"],
                     greedy=False,
+                )
+                print(
+                    f"{ASYNC_DEBUG_PREFIX} worker_rollout_done worker_id={worker_id} "
+                    f"target={target_weight_version} prompt_idx={prompt_idx} "
+                    f"elapsed_s={time.time() - worker_start:.1f} "
+                    f"metric_keys={sorted(rollout_metrics.keys())[:16]}"
                 )
 
             # Move to CPU and push to buffer (avoid blocking on GC/push)
@@ -692,6 +977,7 @@ class AsyncTrajectoryCollector:
             # Use exponential backoff when buffer is full
             try:
                 backoff_delay = 0.01
+                last_full_log = 0.0
                 while self.running:
                     status = ray.get(
                         self.replay_buffer.push_with_wait_signal.remote(
@@ -701,45 +987,97 @@ class AsyncTrajectoryCollector:
                         )
                     )
                     if status == "success":
+                        outcome = "buffered"
                         print(
                             f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, target_weight {target_weight_version})"
                         )
+                        print(
+                            f"{ASYNC_DEBUG_PREFIX} worker_buffered worker_id={worker_id} "
+                            f"target={target_weight_version} prompt_idx={prompt_idx} "
+                            f"generation_weight={generation_weight_version} "
+                            f"elapsed_s={time.time() - worker_start:.1f}"
+                        )
 
-                        # Release reservation when FIRST prompt group for this target is successfully buffered
-                        if prompt_idx == 0:
-                            with self._generation_check_lock:
-                                if target_weight_version in self._generating_targets:
-                                    self._generating_targets.discard(
-                                        target_weight_version
-                                    )
-                                    print(
-                                        f"🧹 Released reservation for target weight {target_weight_version} (first prompt buffered)"
-                                    )
                         break
                     elif status == "full":
+                        now = time.time()
+                        if last_full_log == 0.0 or now - last_full_log >= 30:
+                            last_full_log = now
+                            print(
+                                f"{ASYNC_DEBUG_PREFIX} worker_buffer_full worker_id={worker_id} "
+                                f"target={target_weight_version} prompt_idx={prompt_idx} "
+                                f"elapsed_s={time.time() - worker_start:.1f}"
+                            )
                         # Exponential backoff up to 0.5 second
                         time.sleep(min(backoff_delay, 0.5))
                         backoff_delay *= 1.5
                     else:
                         # Unexpected status, wait briefly
                         time.sleep(0.01)
+                if outcome == "unknown":
+                    outcome = "stopped_before_buffer"
             except Exception as e:
+                outcome = "buffer_enqueue_error"
+                failure_reason = f"{type(e).__name__}: {e}"
                 print(f"❌ Failed to enqueue per-prompt group to buffer: {e}")
                 import traceback
 
                 traceback.print_exc()
         except Exception as e:
+            outcome = "worker_error"
+            failure_reason = f"{type(e).__name__}: {e}"
             print(f"❌ Error in prompt group worker: {e}")
             import traceback
 
             traceback.print_exc()
         finally:
-            # Clean up reservation in case of error (if not already cleaned up)
-            with self._generation_check_lock:
-                if target_weight_version in self._generating_targets:
-                    self._generating_targets.discard(target_weight_version)
+            if outcome in {"worker_error", "buffer_enqueue_error"}:
+                try:
+                    ray.get(
+                        self.replay_buffer.record_failed_prompt_group.remote(
+                            generation_weight_version,
+                            target_weight_version,
+                            prompt_idx,
+                            worker_id,
+                            (failure_reason or outcome)[:1024],
+                        )
+                    )
                     print(
-                        f"🧹 Emergency cleanup: Released reservation for target weight {target_weight_version}"
+                        f"{ASYNC_DEBUG_PREFIX} worker_failure_recorded "
+                        f"worker_id={worker_id} target={target_weight_version} "
+                        f"prompt_idx={prompt_idx} outcome={outcome}"
+                    )
+                except Exception as e:
+                    print(
+                        f"{ASYNC_DEBUG_PREFIX} worker_failure_record_failed "
+                        f"worker_id={worker_id} target={target_weight_version} "
+                        f"prompt_idx={prompt_idx} outcome={outcome} error={e}"
+                    )
+
+            # Track worker completion for this target. When all workers launched for a target
+            # have finished (success or error), the target becomes eligible for rescheduling
+            # if it is still incomplete in the replay buffer.
+            with self._generation_check_lock:
+                remaining = self._generating_target_counts.get(target_weight_version, 0)
+                if remaining > 1:
+                    self._generating_target_counts[target_weight_version] = remaining - 1
+                    print(
+                        f"{ASYNC_DEBUG_PREFIX} worker_release_partial worker_id={worker_id} "
+                        f"target={target_weight_version} remaining_inflight={remaining - 1}"
+                    )
+                elif remaining == 1:
+                    self._generating_target_counts.pop(target_weight_version, None)
+                    print(
+                        f"🧹 Released reservation for target weight {target_weight_version}"
+                    )
+                    print(
+                        f"{ASYNC_DEBUG_PREFIX} worker_release_final worker_id={worker_id} "
+                        f"target={target_weight_version}"
+                    )
+                else:
+                    print(
+                        f"{ASYNC_DEBUG_PREFIX} worker_release_missing_reservation "
+                        f"worker_id={worker_id} target={target_weight_version}"
                     )
 
             # Detach thread record when finished
@@ -747,9 +1085,16 @@ class AsyncTrajectoryCollector:
                 current = _threading.current_thread()
                 if current in self._inflight_threads:
                     self._inflight_threads.remove(current)
+                active_threads = self._active_thread_count_unlocked()
             try:
                 self._inflight_sema.release()
             except Exception:
                 import traceback
 
                 traceback.print_exc()
+            print(
+                f"{ASYNC_DEBUG_PREFIX} worker_done worker_id={worker_id} "
+                f"target={target_weight_version} prompt_idx={prompt_idx} "
+                f"outcome={outcome} elapsed_s={time.time() - worker_start:.1f} "
+                f"active_threads={active_threads}"
+            )

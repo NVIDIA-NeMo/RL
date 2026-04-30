@@ -2682,14 +2682,22 @@ def async_grpo_train(
     wait_iterations = 0
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
+        target_completion_counts = ray.get(
+            replay_buffer.get_target_completion_counts.remote()
+        )
+        current_target_counts = target_completion_counts.get(weight_version, {})
+        current_target_accounted = current_target_counts.get("accounted", 0)
 
         print(
-            f"  Wait iteration {wait_iterations}: buffer_filled_ratio={buffer_size_current}/{min_trajectories_needed}"
+            f"  Wait iteration {wait_iterations}: buffer_filled_ratio={buffer_size_current}/{min_trajectories_needed}, "
+            f"current_target_accounted={current_target_accounted}/{min_trajectories_needed}, "
+            f"current_target_counts={current_target_counts}"
         )
 
-        if buffer_size_current >= min_trajectories_needed:
+        if current_target_accounted >= min_trajectories_needed:
             break
 
+        wait_iterations += 1
         time.sleep(1.0)
 
     print("✅ Buffer ready! Starting training loop...")
@@ -2725,10 +2733,20 @@ def async_grpo_train(
                         )
                     )
 
+                    sampled_prompt_groups = (
+                        len(sample_result["trajectories"])
+                        if sample_result is not None
+                        else 0
+                    )
+                    skipped_failed_prompt_groups = (
+                        sample_result.get("skipped_failed_prompt_groups", 0)
+                        if sample_result is not None
+                        else 0
+                    )
                     if (
                         sample_result is None
-                        or len(sample_result["trajectories"])
-                        != num_prompt_groups_needed
+                        or sampled_prompt_groups + skipped_failed_prompt_groups
+                        < num_prompt_groups_needed
                     ):
                         print(
                             "⏳ Buffer empty or not enough groups to form a full step, waiting..."
@@ -2754,10 +2772,22 @@ def async_grpo_train(
                     # Extract trajectories and metadata from sample result
                     trajectories = sample_result["trajectories"]
                     avg_trajectory_age = sample_result["avg_trajectory_age"]
+                    if not trajectories:
+                        raise RuntimeError(
+                            f"All {num_prompt_groups_needed} prompt groups for weight version {weight_version} failed; no trainable trajectories are available."
+                        )
 
                     print(
-                        f"✅ Sampled {len(trajectories)} trajectory groups from buffer (avg age: {avg_trajectory_age:.2f} steps)"
+                        f"✅ Sampled {len(trajectories)} trajectory groups from buffer "
+                        f"(skipped_failed={skipped_failed_prompt_groups}, avg age: {avg_trajectory_age:.2f} steps)"
                     )
+                    if skipped_failed_prompt_groups:
+                        print(
+                            f"⚠️ Proceeding with incomplete async GRPO batch: "
+                            f"sampled={len(trajectories)}, skipped_failed={skipped_failed_prompt_groups}, "
+                            f"requested={num_prompt_groups_needed}, "
+                            f"failed_prompt_groups={sample_result.get('failed_prompt_groups', [])}"
+                        )
 
                     # Concatenate per-prompt groups into a single training batch
                     per_prompt_batches = [t["batch"] for t in trajectories]
@@ -2772,12 +2802,17 @@ def async_grpo_train(
                         k: (sum(v) / len(v) if isinstance(v[0], (int, float)) else v)
                         for k, v in rollout_metrics.items()
                     }
+                    rollout_metrics["async/requested_prompt_groups"] = (
+                        num_prompt_groups_needed
+                    )
+                    rollout_metrics["async/sampled_prompt_groups"] = len(trajectories)
+                    rollout_metrics["async/skipped_failed_prompt_groups"] = (
+                        skipped_failed_prompt_groups
+                    )
 
-                # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
-                expected_batch_size = (
-                    master_config["grpo"]["num_prompts_per_step"]
-                    * master_config["grpo"]["num_generations_per_prompt"]
-                )
+                expected_batch_size = len(trajectories) * master_config["grpo"][
+                    "num_generations_per_prompt"
+                ]
                 if repeated_batch.size != expected_batch_size:
                     print(
                         f"❌ Unexpected training batch size: got {repeated_batch.size}, expected {expected_batch_size}. Skipping step and waiting for correct buffer content."
@@ -2789,7 +2824,7 @@ def async_grpo_train(
                 dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
                 if expected_batch_size % dp_size != 0:
                     raise AssertionError(
-                        f"Configuration error: (num_prompts_per_step * num_generations_per_prompt) = {expected_batch_size} must be divisible by data_parallel size {dp_size}."
+                        f"Configuration error: actual async train batch size {expected_batch_size} must be divisible by data_parallel size {dp_size}."
                     )
 
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
@@ -2923,6 +2958,7 @@ def async_grpo_train(
                         train_data,
                         loss_fn,
                         timer=timer,
+                        gbs=expected_batch_size,
                     )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")

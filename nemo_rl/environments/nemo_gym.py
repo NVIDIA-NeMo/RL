@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
+import json
+import time
 from pathlib import Path
 from typing import Any, Dict, List, TypedDict
 
@@ -27,6 +30,154 @@ class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+
+
+def _truncate_error_value(value: Any, max_len: int = 256) -> str:
+    text = str(value)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _summarize_nemo_gym_output_item(output_item: Any) -> dict[str, Any]:
+    if not isinstance(output_item, dict):
+        return {
+            "python_type": type(output_item).__name__,
+            "repr": _truncate_error_value(output_item),
+        }
+
+    summary: dict[str, Any] = {
+        "keys": sorted(output_item.keys()),
+    }
+
+    for key in (
+        "type",
+        "role",
+        "status",
+        "finish_reason",
+        "stop_reason",
+        "id",
+    ):
+        if key in output_item:
+            summary[key] = output_item[key]
+
+    for key, summary_key in (
+        ("prompt_token_ids", "prompt_token_count"),
+        ("generation_token_ids", "generation_token_count"),
+        ("generation_log_probs", "generation_logprob_count"),
+    ):
+        value = output_item.get(key)
+        if isinstance(value, list):
+            summary[summary_key] = len(value)
+
+    content = output_item.get("content")
+    if isinstance(content, list):
+        summary["content_len"] = len(content)
+        summary["content_types"] = [
+            item.get("type", type(item).__name__) if isinstance(item, dict) else type(item).__name__
+            for item in content[:8]
+        ]
+    elif content is not None:
+        summary["content_type"] = type(content).__name__
+        summary["content_preview"] = _truncate_error_value(content)
+
+    if "refusal" in output_item and output_item["refusal"] is not None:
+        summary["refusal"] = _truncate_error_value(output_item["refusal"])
+
+    return summary
+
+
+def _summarize_nemo_gym_empty_generation_result(nemo_gym_result: dict[str, Any]) -> dict[str, Any]:
+    response = nemo_gym_result.get("response")
+    if not isinstance(response, dict):
+        return {
+            "response_python_type": type(response).__name__,
+            "response_repr": _truncate_error_value(response),
+        }
+
+    output_items = response.get("output")
+    if isinstance(output_items, list):
+        output_summary = [
+            _summarize_nemo_gym_output_item(item) for item in output_items[:8]
+        ]
+        output_count = len(output_items)
+    else:
+        output_summary = [
+            {
+                "python_type": type(output_items).__name__,
+                "repr": _truncate_error_value(output_items),
+            }
+        ]
+        output_count = None
+
+    summary = {
+        "response_keys": sorted(response.keys()),
+        "response_status": response.get("status"),
+        "response_finish_reason": response.get("finish_reason"),
+        "response_incomplete_details": response.get("incomplete_details"),
+        "response_error": response.get("error"),
+        "usage": response.get("usage"),
+        "output_count": output_count,
+        "output_summary": output_summary,
+    }
+
+    if "id" in response:
+        summary["response_id"] = response["id"]
+    if "model" in response:
+        summary["response_model"] = response["model"]
+
+    return summary
+
+
+def _summarize_nemo_gym_row(row: Any) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {"python_type": type(row).__name__, "repr": _truncate_error_value(row)}
+
+    summary: dict[str, Any] = {
+        "rowidx": row.get("_rowidx"),
+        "keys": sorted(row.keys()),
+    }
+    for key in ("instance_id", "task_id", "repo", "problem_id"):
+        if key in row:
+            summary[key] = _truncate_error_value(row[key])
+
+    agent_ref = row.get("agent_ref")
+    if isinstance(agent_ref, dict):
+        summary["agent"] = agent_ref.get("name")
+
+    responses_create_params = row.get("responses_create_params")
+    if isinstance(responses_create_params, dict):
+        summary["model"] = responses_create_params.get("model")
+        input_messages = responses_create_params.get("input")
+        if isinstance(input_messages, list):
+            summary["input_messages"] = len(input_messages)
+        if "max_output_tokens" in responses_create_params:
+            summary["max_output_tokens"] = responses_create_params["max_output_tokens"]
+
+    return summary
+
+
+async def _await_nemo_gym_task_with_debug(
+    task: Any,
+    *,
+    trial: int,
+    max_attempts: int,
+    attempt_start: float,
+    completed_count: int,
+    total_count: int,
+) -> Any:
+    """Await the next completed Gym rollout while emitting periodic stall context."""
+    pending_task = asyncio.ensure_future(task)
+    while True:
+        try:
+            return await asyncio.wait_for(asyncio.shield(pending_task), timeout=30)
+        except asyncio.TimeoutError:
+            print(
+                "[NEMO_GYM_DEBUG] run_rollouts_waiting_for_result "
+                f"trial={trial}/{max_attempts} "
+                f"elapsed_s={time.perf_counter() - attempt_start:.1f} "
+                f"completed={completed_count}/{total_count}"
+            )
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -56,6 +207,10 @@ class NemoGym(EnvironmentInterface):
             "dummy_key"  # No key necessary for training.
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
+        # In multinode runs, Gym-managed service configs must advertise a real node IP
+        # rather than falling back to localhost, or remote workers will connect to
+        # their own loopback interface instead of the actor-hosted service.
+        initial_global_config_dict.setdefault("default_host", self.node_ip)
 
         initial_global_config_dict.setdefault(
             "global_aiohttp_connector_limit_per_host", 16_384
@@ -122,6 +277,13 @@ Depending on your data shape, you may want to change these values."""
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
         while trial < max_attempts:
             nemo_gym_num_rows = len(nemo_gym_examples)
+            attempt_start = time.perf_counter()
+            print(
+                "[NEMO_GYM_DEBUG] run_rollouts_start "
+                f"trial={trial + 1}/{max_attempts} rows={nemo_gym_num_rows} "
+                "row_summaries="
+                f"{json.dumps([_summarize_nemo_gym_row(row) for row in nemo_gym_examples[:16]], default=str)}"
+            )
             nemo_gym_result_iterator = self.rch.run_examples(
                 examples=nemo_gym_examples, head_server_config=self.head_server_config
             )
@@ -130,12 +292,52 @@ Depending on your data shape, you may want to change these values."""
             nemo_rl_results = []
             for task in nemo_gym_result_iterator:
                 with timer.time(label=f"{timer_prefix}/await_results"):
-                    nemo_gym_row, nemo_gym_result = await task
+                    nemo_gym_row, nemo_gym_result = await _await_nemo_gym_task_with_debug(
+                        task,
+                        trial=trial + 1,
+                        max_attempts=max_attempts,
+                        attempt_start=attempt_start,
+                        completed_count=len(nemo_rl_results),
+                        total_count=nemo_gym_num_rows,
+                    )
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_result, tokenizer
+                    row_summary = _summarize_nemo_gym_row(nemo_gym_row)
+                    response = (
+                        nemo_gym_result.get("response")
+                        if isinstance(nemo_gym_result, dict)
+                        else None
                     )
+                    output = response.get("output") if isinstance(response, dict) else None
+                    output_count = len(output) if isinstance(output, list) else None
+                    print(
+                        "[NEMO_GYM_DEBUG] run_rollouts_result_received "
+                        f"trial={trial + 1}/{max_attempts} "
+                        f"elapsed_s={time.perf_counter() - attempt_start:.1f} "
+                        f"row={json.dumps(row_summary, default=str)} "
+                        f"response_status={response.get('status') if isinstance(response, dict) else None} "
+                        f"output_count={output_count}"
+                    )
+                    try:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_result, tokenizer
+                        )
+                    except Exception:
+                        result_summary = (
+                            _summarize_nemo_gym_empty_generation_result(nemo_gym_result)
+                            if isinstance(nemo_gym_result, dict)
+                            else {
+                                "python_type": type(nemo_gym_result).__name__,
+                                "repr": _truncate_error_value(nemo_gym_result),
+                            }
+                        )
+                        print(
+                            "[NEMO_GYM_DEBUG] run_rollouts_postprocess_failed "
+                            f"trial={trial + 1}/{max_attempts} "
+                            f"row={json.dumps(row_summary, default=str)} "
+                            f"result_summary={json.dumps(result_summary, default=str)}"
+                        )
+                        raise
 
                 nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
                 nemo_rl_results.append(nemo_rl_result)
@@ -158,6 +360,11 @@ Depending on your data shape, you may want to change these values."""
                 )
                 continue
             else:
+                print(
+                    "[NEMO_GYM_DEBUG] run_rollouts_attempt_complete "
+                    f"trial={trial + 1}/{max_attempts} rows={nemo_gym_num_rows} "
+                    f"elapsed_s={time.perf_counter() - attempt_start:.1f}"
+                )
                 break
 
         nemo_rl_sort_results = [None] * nemo_gym_num_rows
@@ -232,13 +439,14 @@ Depending on your data shape, you may want to change these values."""
             prompt_token_ids = tokenizer.apply_chat_template(
                 input_messages, tokenize=True
             )
+            response_summary = _summarize_nemo_gym_empty_generation_result(
+                nemo_gym_result
+            )
             raise ValueError(
-                f"NeMo Gym returned a result with no generation data. "
-                f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
-                f"so vLLM rejected the request before any tokens could be generated.\n"
+                "NeMo Gym returned a result with no generation data.\n"
                 f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
-                f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"to a value larger than {len(prompt_token_ids)}."
+                "  Response summary:\n"
+                f"  {json.dumps(response_summary, indent=2, sort_keys=True, default=str)}"
             )
 
         return {

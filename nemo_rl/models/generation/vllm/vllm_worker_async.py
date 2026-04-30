@@ -107,18 +107,10 @@ def _replace_prefix_tokens(
         if model_prefix_token_ids[-1] == eos_token_id:
             model_cut_end -= 1
 
-    # Assert here to prepare for the logic below
-    assert len(template_token_ids) > len(
-        template_prefix_token_ids
-    ), f"""Found possibly non-monotonically increasing trajectory!
-Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
-
-Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
-
-Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
-
-Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
-"""
+    # WAR: skip prefix replacement when template isn't strictly longer than its prefix
+    # (can happen with certain chat templates in multi-turn NeMo-Gym rollouts).
+    if len(template_token_ids) <= len(template_prefix_token_ids):
+        return template_token_ids
 
     # We take everything starting with the EOS token ID.
     template_cut_start = -1
@@ -316,6 +308,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         from vllm.entrypoints.openai.models.protocol import BaseModelPath
         from vllm.entrypoints.openai.models.serving import OpenAIServingModels
         from vllm.entrypoints.serve.tokenize.protocol import (
+            DetokenizeRequest,
+            DetokenizeResponse,
             TokenizeChatRequest,
             TokenizeCompletionRequest,
             TokenizeResponse,
@@ -475,11 +469,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingMixin, OpenAIServingChat):
             pass
 
+        from vllm.entrypoints.logger import RequestLogger
+
         serving_chat_default_kwargs = dict(
             response_role="assistant",
-            request_logger=None,
+            # Emit "Received request ...: params: SamplingParams(...)" so we can
+            # verify the engine-side sampling params (esp. top_k) in the logs.
+            request_logger=RequestLogger(max_log_len=None),
             chat_template=None,
             chat_template_content_format="auto",
+            # Populate usage.prompt_tokens_details.cached_tokens on responses
+            # so per-request prefix-cache hits show up in PERF logs.
+            enable_prompt_tokens_details=True,
         )
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
@@ -500,18 +501,33 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
-            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
-            # Right now we explicitly assert set this to -1.
-            assert request.top_k in (None, -1), (
-                f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
-            )
-            request.top_k = -1
+            import time
+
+            # If policy.generation.top_k is explicitly set, enforce it here so the
+            # HTTP path matches the direct-generate path in
+            # nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params.
+            # When it's unset (None) we leave request.top_k alone; vLLM's
+            # to_sampling_params will then fall back to default_sampling_params
+            # (from the model's generation_config.json), matching Dynamo's
+            # behavior for the NeMo-Gym path where top_k cannot be plumbed
+            # through the config (see rollouts.py::run_async_nemo_gym_rollout).
+            yaml_top_k = generation_config.get("top_k")
+            if yaml_top_k is not None:
+                assert request.top_k in (None, yaml_top_k), (
+                    f"Top k sampling parameter must be unset or {yaml_top_k}. Got `{request.top_k}`"
+                )
+                request.top_k = yaml_top_k
 
             # The request sampling params need to exactly match those as are set in NeMo RL.
             # If they do not match, the inference will be off policy and destroy training stability.
             assert request.temperature == generation_config["temperature"]
             assert request.top_p == generation_config["top_p"]
 
+            # Server-side timing: wall-time (FastAPI-side) bracket around the
+            # engine call. Paired with vLLM's RequestLogger timestamps (which
+            # bracket engine submission -> first output), lets us split
+            # FastAPI overhead from engine work.
+            handler_enter_ts = time.monotonic()
             generator = await openai_serving_chat.create_chat_completion(
                 request, raw_request
             )
@@ -522,6 +538,15 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
+                handler_exit_ts = time.monotonic()
+                print(
+                    f"[PERF_SERVER rid={generator.id} "
+                    f"duration_ms={(handler_exit_ts - handler_enter_ts) * 1000:.0f} "
+                    f"prompt_tokens={generator.usage.prompt_tokens if generator.usage else -1} "
+                    f"completion_tokens={generator.usage.completion_tokens if generator.usage else -1} "
+                    f"cached_tokens={getattr(getattr(generator.usage, 'prompt_tokens_details', None), 'cached_tokens', None)}]",
+                    flush=True,
+                )
                 return JSONResponse(content=generator.model_dump())
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
@@ -573,6 +598,26 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 return JSONResponse(content=generator.model_dump())
 
         ########################################
+        # /detokenize endpoint
+        ########################################
+        # Mirrors vllm/entrypoints/serve/tokenize/api_router.py::detokenize.
+        # Without this our custom FastAPI app returns 404 for /detokenize,
+        # which breaks the NeMo-Gym client's PERF_DEBUG (B)/(C) diagnostics
+        # that Dynamo's Rust frontend supports natively.
+        @app.post("/detokenize")
+        async def detokenize(request: DetokenizeRequest, raw_request: Request):
+            generator = await openai_serving_tokenization.create_detokenize(
+                request, raw_request
+            )
+
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(
+                    content=generator.model_dump(), status_code=generator.error.code
+                )
+            elif isinstance(generator, DetokenizeResponse):
+                return JSONResponse(content=generator.model_dump())
+
+        ########################################
         # Logging
         ########################################
         print(
@@ -615,16 +660,38 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         return app
 
     def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
+        import asyncio
         import threading
+        from contextlib import asynccontextmanager
         from logging import Filter as LoggingFilter
         from logging import LogRecord, getLogger
 
         import uvicorn
+        import vllm.envs as vllm_envs
         from fastapi import FastAPI
 
-        # We initialize the FastAPI app here in case we want to do some generic configuration before the subsequent server inits
-        # e.g. last-run middleware.
-        app = FastAPI()
+        # Mirror vllm.entrypoints.openai.server_utils.lifespan: periodically
+        # call engine_client.do_log_stats() so the AsyncLLM's LoggingStatLogger
+        # emits "Engine N: Avg prompt throughput: ... Running: X reqs ..."
+        # lines. Without this, our custom FastAPI app never triggers the
+        # engine's stats output.
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            async def _force_log():
+                while True:
+                    await asyncio.sleep(vllm_envs.VLLM_LOG_STATS_INTERVAL)
+                    try:
+                        await self.llm.do_log_stats()
+                    except Exception:
+                        pass
+
+            task = asyncio.create_task(_force_log())
+            try:
+                yield
+            finally:
+                task.cancel()
+
+        app = FastAPI(lifespan=lifespan)
 
         app = self._setup_vllm_openai_api_server(app)
 

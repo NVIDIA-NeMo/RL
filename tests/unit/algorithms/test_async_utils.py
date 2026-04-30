@@ -100,6 +100,8 @@ class TestReplayBuffer:
         assert debug_info["max_size"] == 10
         assert debug_info["trajectory_versions"] == []
         assert debug_info["target_weight_versions"] == []
+        assert debug_info["failed_prompt_group_count"] == 0
+        assert debug_info["failed_target_weight_counts"] == {}
 
         ray.kill(buffer)
 
@@ -343,6 +345,120 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
+    def test_replay_buffer_get_target_weight_counts(self):
+        """Test counting buffered trajectory groups by target weight."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        trajectories = [
+            ({"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}, 0, 2),
+            ({"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}, 1, 2),
+            ({"batch": {"data": "test3"}, "rollout_metrics": {"reward": 3.0}}, 1, 3),
+        ]
+        for trajectory, weight_version, target_weight_version in trajectories:
+            ray.get(
+                buffer.push_with_wait_signal.remote(
+                    trajectory,
+                    weight_version=weight_version,
+                    target_weight_version=target_weight_version,
+                )
+            )
+
+        target_counts = ray.get(buffer.get_target_weight_counts.remote())
+        assert target_counts == {2: 2, 3: 1}
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_records_failed_prompt_groups(self):
+        """Test counting failed prompt groups by target weight."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        ray.get(
+            buffer.record_failed_prompt_group.remote(
+                weight_version=0,
+                target_weight_version=1,
+                prompt_idx=0,
+                worker_id=123,
+                reason="test failure",
+            )
+        )
+        ray.get(
+            buffer.record_failed_prompt_group.remote(
+                weight_version=0,
+                target_weight_version=2,
+                prompt_idx=1,
+                worker_id=124,
+                reason="test failure",
+            )
+        )
+        ray.get(
+            buffer.record_failed_prompt_group.remote(
+                weight_version=1,
+                target_weight_version=2,
+                prompt_idx=2,
+                worker_id=125,
+                reason="test failure",
+            )
+        )
+
+        failed_counts = ray.get(buffer.get_failed_target_weight_counts.remote())
+        assert failed_counts == {1: 1, 2: 2}
+
+        completion_counts = ray.get(buffer.get_target_completion_counts.remote())
+        assert completion_counts[1] == {"buffered": 0, "failed": 1, "accounted": 1}
+        assert completion_counts[2] == {"buffered": 0, "failed": 2, "accounted": 2}
+
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        assert debug_info["failed_prompt_group_count"] == 3
+        assert debug_info["failed_target_weight_counts"] == {1: 1, 2: 2}
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_sampling_skips_failed_prompt_groups(self):
+        """Test sampling unblocks when missing prompt groups have explicit failures."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        trajectory = {
+            "batch": {"data": "successful_group"},
+            "rollout_metrics": {"reward": 1.0},
+        }
+        ray.get(
+            buffer.push_with_wait_signal.remote(
+                trajectory, weight_version=0, target_weight_version=1
+            )
+        )
+        ray.get(
+            buffer.record_failed_prompt_group.remote(
+                weight_version=0,
+                target_weight_version=1,
+                prompt_idx=1,
+                worker_id=456,
+                reason="forced failure",
+            )
+        )
+
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=2,
+                current_weight_version=1,
+                max_age_steps=1,
+            )
+        )
+
+        assert sample_result is not None
+        assert len(sample_result["trajectories"]) == 1
+        assert sample_result["trajectories"][0]["batch"]["data"] == "successful_group"
+        assert sample_result["requested_prompt_groups"] == 2
+        assert sample_result["sampled_prompt_groups"] == 1
+        assert sample_result["skipped_failed_prompt_groups"] == 1
+        assert len(sample_result["failed_prompt_groups"]) == 1
+        assert sample_result["failed_prompt_groups"][0]["reason"] == "forced failure"
+
+        completion_counts = ray.get(buffer.get_target_completion_counts.remote())
+        assert completion_counts == {}
+        assert ray.get(buffer.size.remote()) == 0
+
+        ray.kill(buffer)
+
     def test_replay_buffer_clear(self):
         """Test clearing the buffer."""
         buffer = ReplayBuffer.remote(max_size=10)
@@ -370,6 +486,7 @@ class TestReplayBuffer:
         assert debug_info["total_trajectories"] == 0
         assert debug_info["trajectory_versions"] == []
         assert debug_info["target_weight_versions"] == []
+        assert debug_info["failed_prompt_group_count"] == 0
 
         ray.kill(buffer)
 
