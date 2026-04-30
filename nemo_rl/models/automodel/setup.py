@@ -428,6 +428,7 @@ def setup_distributed(
     tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
     cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
     ep_size = config["dtensor_cfg"].get("expert_parallel_size", 1)
+    dp_replicate_size = config["dtensor_cfg"].get("dp_replicate_size", 1)
     sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
 
     # Build tp_plan from custom_parallel_plan config if set, else None (auto-select)
@@ -462,6 +463,7 @@ def setup_distributed(
     # Create device meshes (dp_size is derived from world_size / (tp * cp * ep))
     device_mesh, moe_mesh = create_device_mesh(
         fsdp2_config,
+        dp_replicate_size=dp_replicate_size,
         tp_size=tp_size,
         pp_size=1,
         cp_size=cp_size,

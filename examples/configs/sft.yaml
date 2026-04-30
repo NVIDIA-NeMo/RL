@@ -46,6 +46,7 @@ policy:
     activation_checkpointing: false
     tensor_parallel_size: 1
     context_parallel_size: 1
+    dp_replicate_size: 1
     custom_parallel_plan: null
 
     # Automodel kwargs passed to from_pretrained.
