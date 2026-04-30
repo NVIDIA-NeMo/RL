@@ -21,6 +21,7 @@ DRY_RUN="${DRY_RUN:-false}"
 EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
 # Optional: path to directory containing .sif images for SWE-bench (Stage 2.2).
 SIF_DIR="${SIF_DIR:-}"
+CONTAINER_FORMATTER="${CONTAINER_FORMATTER:-}"
 
 # ---- Derived paths ----
 CODE_DIR=$(realpath "$PWD")
@@ -123,6 +124,10 @@ export COMMAND="date ; \
 
 if [[ -n "$SIF_DIR" ]]; then
     COMMAND="$COMMAND sif_dir=${SIF_DIR}"
+fi
+
+if [[ -n "$CONTAINER_FORMATTER" ]]; then
+    COMMAND="$COMMAND container_formatter=${CONTAINER_FORMATTER}"
 fi
 
 export CONTAINER
