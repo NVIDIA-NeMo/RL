@@ -12,6 +12,9 @@ policy:
     moe_token_dispatcher_type: flex
     moe_flex_dispatcher_backend: hybridep
     moe_hybridep_num_sms: 32
+  generation:
+    vllm_cfg:
+      gpu_memory_utilization: 0.3
 logger:
   log_dir: logs/grpo-deepseek-v3-32n4g
   wandb:
