@@ -76,6 +76,7 @@ from nemo_rl.models.policy.workers.patches import (
     apply_transformer_engine_patch,
 )
 from nemo_rl.utils.automodel_checkpoint import AutomodelCheckpointManager
+from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
@@ -479,6 +480,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     grad_norm = torch.tensor(
                         grad_norm, device="cpu", dtype=torch.float32
                     )
+                    warn_if_inf_grad_norm(grad_norm)
 
                     # Update parameters
                     self.optimizer.step()
