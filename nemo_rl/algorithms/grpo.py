@@ -17,7 +17,6 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -544,13 +543,7 @@ def setup(
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
 
-    # Prepare checkpoint paths
-    if last_checkpoint_path:
-        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
-        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
-    else:
-        weights_path = None
-        optimizer_path = None
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
@@ -687,7 +680,7 @@ def setup(
             )
 
         ## make vllm hf overrides match the training policy
-        generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
+        generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
             "hf_config_overrides", {}
         )
 
@@ -1063,11 +1056,6 @@ def _create_advantage_estimator(master_config: MasterConfig):
 
     adv_estimator_name = adv_estimator_config["name"]
     if adv_estimator_name == "gdpo":
-        assert not _should_use_async_rollouts(master_config), (
-            "GDPO is not supported for async rollouts, "
-            "please set policy.generation.vllm_cfg.async_engine to false in your config. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/2061 for more details."
-        )
         adv_estimator = GDPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GDPO advantage estimator (multi-reward)")
     elif adv_estimator_name == "grpo":
@@ -2042,7 +2030,9 @@ def grpo_train(
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            ),
+                            )
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
@@ -2142,6 +2132,8 @@ def grpo_train(
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
+            if "draft_loss" in metrics:
+                print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
             print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
             if master_config["grpo"]["use_dynamic_sampling"]:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
@@ -2497,12 +2489,16 @@ def async_grpo_train(
             "nemo_rl.algorithms.async_utils.ReplayBuffer",
         )
 
+    _replay_py_venv = os.path.dirname(
+        os.path.dirname(_replay_py_exec)
+    )  # to remove the "bin/python" suffix
+
     _replay_runtime_env = {
         "py_executable": _replay_py_exec,
         "env_vars": {
             **os.environ,
-            "VIRTUAL_ENV": _replay_py_exec,
-            "UV_PROJECT_ENVIRONMENT": _replay_py_exec,
+            "VIRTUAL_ENV": _replay_py_venv,
+            "UV_PROJECT_ENVIRONMENT": _replay_py_venv,
         },
     }
 
@@ -2528,12 +2524,16 @@ def async_grpo_train(
             "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
         )
 
+    _tc_py_venv = os.path.dirname(
+        os.path.dirname(_tc_py_exec)
+    )  # to remove the "bin/python" suffix
+
     _tc_runtime_env = {
         "py_executable": _tc_py_exec,
         "env_vars": {
             **os.environ,
-            "VIRTUAL_ENV": _tc_py_exec,
-            "UV_PROJECT_ENVIRONMENT": _tc_py_exec,
+            "VIRTUAL_ENV": _tc_py_venv,
+            "UV_PROJECT_ENVIRONMENT": _tc_py_venv,
         },
     }
 
@@ -2848,6 +2848,7 @@ def async_grpo_train(
                             "seq_logprob_error_threshold"
                         ],
                     )
+
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
@@ -3043,8 +3044,6 @@ def async_grpo_train(
                 if master_config["checkpointing"]["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
-                    policy.prepare_for_training()
-
                     grpo_save_state["current_step"] = step + 1
                     grpo_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
@@ -3093,7 +3092,9 @@ def async_grpo_train(
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            ),
+                            )
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
@@ -3108,7 +3109,6 @@ def async_grpo_train(
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
-                    policy.offload_after_refit()
 
             # Logging
             # Log training data (match sync GRPO logging payload for parity)
@@ -3171,6 +3171,8 @@ def async_grpo_train(
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")
+            if "draft_loss" in metrics:
+                print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
             print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(f"  • Buffer Size: {buffer_size_current}")

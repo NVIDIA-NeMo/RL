@@ -440,6 +440,8 @@ def run_multi_turn_rollout(
             generation_input_data["vllm_images"] = active_batch["vllm_images"]
         if "vllm_videos" in active_batch:
             generation_input_data["vllm_videos"] = active_batch["vllm_videos"]
+        if "vllm_audios" in active_batch:
+            generation_input_data["vllm_audios"] = active_batch["vllm_audios"]
 
         # generate_responses updates active_batch["message_log"] in-place
         active_batch, generated_ids, gen_metrics = generate_responses(
@@ -960,6 +962,31 @@ def run_async_multi_turn_rollout(
                 ),
             }
         )
+
+        # Expose per-component rewards (reward1, reward2, ...) for multi-reward envs for GDPO advantage calculation.
+        # Collect all reward component keys from any sample state (samples may come from different envs).
+        reward_component_keys = sorted(
+            set(
+                k
+                for state in final_sample_states
+                for k in state
+                if isinstance(k, str)
+                and k.startswith("reward")
+                and len(k) > 6
+                and k[6:].isdigit()
+            ),
+            key=lambda k: int(k[6:]),
+        )
+        for key in reward_component_keys:
+            # Stack per-sample values; use 0.0 for samples that did not have this component (e.g. single-reward env)
+            final_batch[key] = torch.stack(
+                [
+                    state[key]
+                    if key in state
+                    else torch.tensor(0.0, dtype=torch.float32)
+                    for state in final_sample_states
+                ]
+            )
 
         # Preserve additional fields from the original input_batch
         for key in input_batch.keys():

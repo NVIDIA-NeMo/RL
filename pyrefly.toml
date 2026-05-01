@@ -1,4 +1,4 @@
-python-version = "3.12.0"
+python-version = "3.13.13"
 replace-imports-with-any = [
   "nemo_automodel.*",
   "pynvml.*",
@@ -33,6 +33,7 @@ project-includes = [
   "docs/conf.py",
   "docs/helpers.py",
   "examples/converters/convert_dcp_to_hf.py",
+  "examples/converters/convert_lora_to_hf.py",
   "examples/converters/convert_megatron_to_hf.py",
   "examples/custom_dataloader/custom_dataloader.py",
   "examples/custom_parallel/custom_parallel.py",
@@ -55,6 +56,7 @@ project-includes = [
   "nemo_rl/data/datasets/eval_datasets/gpqa.py",
   "nemo_rl/data/datasets/eval_datasets/local_math_dataset.py",
   "nemo_rl/data/datasets/eval_datasets/math.py",
+  "nemo_rl/data/datasets/eval_datasets/mmau.py",
   "nemo_rl/data/datasets/eval_datasets/mmlu.py",
   "nemo_rl/data/datasets/eval_datasets/mmlu_pro.py",
   "nemo_rl/data/datasets/preference_datasets/__init__.py",
@@ -73,6 +75,7 @@ project-includes = [
   "nemo_rl/data/datasets/response_datasets/gsm8k.py",
   "nemo_rl/data/datasets/response_datasets/helpsteer3.py",
   "nemo_rl/data/datasets/response_datasets/nemogym_dataset.py",
+  "nemo_rl/data/datasets/response_datasets/nemotron_cascade2_sft.py",
   "nemo_rl/data/datasets/response_datasets/oai_format_dataset.py",
   "nemo_rl/data/datasets/response_datasets/oasst.py",
   "nemo_rl/data/datasets/response_datasets/openmathinstruct2.py",
@@ -125,7 +128,6 @@ project-includes = [
   "nemo_rl/models/policy/workers/__init__.py",
   "nemo_rl/models/policy/workers/patches.py",
   "nemo_rl/utils/__init__.py",
-  "nemo_rl/utils/automodel_checkpoint.py",
   "nemo_rl/utils/checkpoint.py",
   "nemo_rl/utils/config.py",
   "nemo_rl/utils/native_checkpoint.py",

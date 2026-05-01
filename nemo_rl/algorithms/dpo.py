@@ -15,7 +15,6 @@ import os
 import warnings
 from collections import defaultdict
 from functools import partial
-from pathlib import Path
 from typing import Optional, TypedDict, cast
 
 import numpy as np
@@ -136,10 +135,21 @@ def setup(
         "See https://github.com/NVIDIA-NeMo/RL/issues/719"
     )
 
+    policy_config = master_config["policy"]
+    # Add a guardrail for linear CE fusion loss: if sequence packing is enabled for DPO in the future,
+    # we need to validate the fusion path with cu_seqlens-based logprob aggregation first and then remove this guardrail.
+    if policy_config["sequence_packing"]["enabled"]:
+        assert not (
+            policy_config["megatron_cfg"]["enabled"]
+            and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"]
+        ), (
+            "Linear CE fusion loss is not supported with sequence packing in DPO. "
+            "The fusion path has not been validated with cu_seqlens-based logprob aggregation."
+        )
+
     set_seed(master_config["dpo"]["seed"])
 
     # Extract individual configs for easier access
-    policy_config = master_config["policy"]
     data_config = master_config["data"]
     logger_config = master_config["logger"]
     cluster_config = master_config["cluster"]
@@ -236,23 +246,25 @@ def setup(
                 if "iters" in k:
                     policy_config["megatron_cfg"]["scheduler"][k] *= 2
 
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+
     policy = Policy(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
-        weights_path=Path(last_checkpoint_path) / "policy" / "weights"
-        if last_checkpoint_path
-        else None,
-        optimizer_path=Path(last_checkpoint_path) / "policy" / "optimizer"
-        if last_checkpoint_path
-        else None,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=True,
     )
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = DPOLossFn(master_config["dpo"])
+    loss_fn = DPOLossFn(
+        master_config["dpo"],
+        use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
+        and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"],
+    )
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
@@ -700,7 +712,9 @@ def dpo_train(
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            ),
+                            )
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),

@@ -4,10 +4,10 @@
 #     docker buildx build -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
 #
 #   Self-contained build (specific git ref):
-#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push .
+#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.6.0 --tag <registry>/nemo-rl:r0.6.0 --push .
 #
 #   Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL):
-#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push https://github.com/NVIDIA-NeMo/RL.git
+#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.6.0 --tag <registry>/nemo-rl:r0.6.0 --push https://github.com/NVIDIA-NeMo/RL.git
 #
 #   Local NeMo RL source override:
 #     docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
@@ -69,8 +69,8 @@ RUN GITHUB_ARTIFACTORY=github.com \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Install uv and python
-ARG UV_VERSION=0.9.7
-ARG PYTHON_VERSION=3.12
+ARG UV_VERSION=0.11.6
+ARG PYTHON_VERSION=3.13.13
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
     uv python install ${PYTHON_VERSION}
@@ -155,6 +155,15 @@ EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+# Point TE at the pip-installed cuDNN (nvidia-cudnn-cu12) instead of the system one.
+# The container's system cuDNN (/lib/x86_64-linux-gnu/libcudnn*.so.9) may be a different
+# version than what pip installed. TE prioritizes system libraries by default, causing a
+# version mismatch crash (e.g. system 9.10.1 vs pip 9.19.0). CUDNN_HOME makes TE's Python
+# code find the pip version first, and LD_LIBRARY_PATH makes the dynamic linker resolve
+# cuDNN sub-libraries from pip when loading libtransformer_engine.so.
+ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
+ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
+# Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 
 WORKDIR /opt/nemo-rl
 

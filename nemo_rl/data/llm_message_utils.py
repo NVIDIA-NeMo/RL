@@ -433,6 +433,7 @@ def get_formatted_message_log(
     add_eos_token: bool = True,
     add_generation_prompt: bool = False,
     tools: Optional[list[dict[str, Any]]] = None,
+    debug: bool = False,
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -444,6 +445,7 @@ def get_formatted_message_log(
         add_eos_token: Whether to add eos token to last message if it is not already present. Default: True
         add_generation_prompt: Whether to include assistant's generation prompt in user messages. Default: False
         tools: Optional list of tool/function definitions to pass to the chat template. Default: None
+        debug: Whether to print debug information showing each message turn. Default: False
     Returns:
         The message log with updated 'token_ids' and 'content' fields.
     """
@@ -537,8 +539,8 @@ def get_formatted_message_log(
         ## pull out the chunk corresponding to the current message
         message_chunk = formatted_message[prev_message_len_no_eos:]
 
-        # Debug: Print each message turn separately (only once for the first sample)
-        if not hasattr(get_formatted_message_log, "_debug_printed"):
+        # Debug: Print each message turn separately
+        if debug:
             if i == 0:
                 # Print header only at the start of first message
                 print("\n" + "=" * 80)
@@ -554,8 +556,6 @@ def get_formatted_message_log(
             print("-" * 40)
 
             if i == len(message_log_strs) - 1:
-                # Mark as printed after processing all turns of the first sample
-                get_formatted_message_log._debug_printed = True
                 print("\n" + "=" * 80)
                 print("DEBUG: Complete formatted conversation:")
                 print("-" * 80)
@@ -623,10 +623,17 @@ def get_formatted_message_log(
             # add all vlm keys to the message
             for key in multimodal_keys:
                 if key in processed_chunk:
-                    new_message[key] = PackedTensor(
-                        processed_chunk[key],
-                        dim_to_pack=get_dim_to_pack_along(tokenizer, key),
-                    )
+                    # token_type_ids and mm_token_type_ids are sequence-length tensors
+                    # (one label per token), not visual patch tensors. They must be
+                    # stored as plain tensors and padded like input_ids rather than
+                    # packed as multimodal data. This mirrors processors.py behavior.
+                    if key in ("token_type_ids", "mm_token_type_ids"):
+                        new_message[key] = processed_chunk[key][0]
+                    else:
+                        new_message[key] = PackedTensor(
+                            processed_chunk[key],
+                            dim_to_pack=get_dim_to_pack_along(tokenizer, key),
+                        )
 
         if len(new_message["token_ids"]) == 0:
             # if there is an empty message, the empty `token_ids` tensor ends up being in fp32,

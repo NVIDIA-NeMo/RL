@@ -45,7 +45,10 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
-from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
+from transformers.models.gemma3.modeling_gemma3 import (
+    Gemma3ForCausalLM,
+    Gemma3ForConditionalGeneration,
+)
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -83,13 +86,32 @@ from nemo_rl.models.policy.utils import (
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
-from nemo_rl.models.policy.workers.patches import apply_torch_aten_alias_tensor_patch
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+
+def _attach_context_parallel_hooks(model: nn.Module) -> None:
+    """Attach forward pre-hooks to self_attn modules for context parallelism.
+
+    CP shards Q/K/V on the sequence dimension as DTensors, so explicit 4D
+    attention masks cause shape mismatches. This registers a hook on every
+    ``self_attn`` sub-module that strips ``attention_mask`` and sets
+    ``is_causal=True``, letting SDPA handle causal masking internally.
+    """
+
+    def _hook(_module, module_args, module_kwargs):
+        if "attention_mask" in module_kwargs:
+            module_kwargs["attention_mask"] = None
+            module_kwargs["is_causal"] = True
+        return module_args, module_kwargs
+
+    for name, module in model.named_modules():
+        if name.endswith("self_attn"):
+            module.register_forward_pre_hook(_hook, with_kwargs=True, prepend=True)
 
 
 @contextmanager
@@ -164,9 +186,6 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
-        # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
-        apply_torch_aten_alias_tensor_patch()
-
         """Initialize the DTensorPolicyWorker."""
         self.tokenizer = tokenizer
         self.processor = processor
@@ -296,7 +315,9 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                 trust_remote_code=True,
             )
 
-        if self.model.config.pad_token_id is None:
+        # Some model configs (e.g. Gemma3 in transformers v5) don't have pad_token_id
+        # as a direct attribute. Use getattr to handle missing attribute gracefully.
+        if getattr(self.model.config, "pad_token_id", None) is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
 
         tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
@@ -316,9 +337,12 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                 "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
             )
 
+        self.is_gemma3 = isinstance(self.model, Gemma3ForCausalLM) or isinstance(
+            self.model, Gemma3ForConditionalGeneration
+        )
         if cp_size > 1:
-            assert not isinstance(self.model, Gemma3ForCausalLM), (
-                "Context parallel is not supported for Gemma3ForCausalLM. Torch context parallel has many limitations. "
+            assert not self.is_gemma3, (
+                "Context parallel is not supported for Gemma3 models. Torch context parallel has many limitations. "
                 "Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
             )
 
@@ -372,6 +396,13 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
             custom_parallel_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
         )
 
+        # Attach CP attention-mask hooks (strip mask, set is_causal=True).
+        # CP shards Q/K/V as DTensors on the sequence dimension, so explicit
+        # attention masks cause shape mismatches. These hooks ensure SDPA uses
+        # is_causal=True instead.
+        if self.cp_size > 1:
+            _attach_context_parallel_hooks(self.model)
+
         print(f"[Rank {self.rank}] Loading state dict from rank 0...")
         # This will broadcast the state dict from rank 0 to all other ranks
         # and load it into the FSDP model.
@@ -390,17 +421,13 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
             getattr(self.model, "config", {}), "tie_word_embeddings", False
         )
         if is_tied_lm_head:
-            embed_tokens_weight = None
-            for name, param in self.model.named_parameters():
-                if "embed_tokens" in name and name.endswith(".weight"):
-                    embed_tokens_weight = param
-                    break
+            self.model.tie_weights()
 
-            if embed_tokens_weight is not None:
-                self.model.lm_head.weight = embed_tokens_weight
-
-        # Manually broadcast buffers
-        for _, buf in self.model.named_buffers():
+        # Manually broadcast buffers in a deterministic order
+        buf_dict = dict(self.model.named_buffers())
+        ordered_names = sorted(buf_dict.keys())
+        for name in ordered_names:
+            buf = buf_dict[name]
             torch.distributed.broadcast(to_local_if_dtensor(buf), src=0)
 
         if self.cpu_offload:
@@ -679,11 +706,22 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                             input_ids = mb.get("input_ids").cuda()
                             batch_size, seq_len = input_ids.shape
 
-                            attention_mask = torch.ones(
-                                (batch_size, seq_len),
-                                dtype=torch.bool,
-                                device=input_ids.device,
-                            )
+                            # When sequence parallelism is enabled, hidden states are
+                            # sharded along the sequence dimension after the embedding layer.
+                            # Passing a full-size attention mask causes a shape mismatch in
+                            # both SDPA and eager attention. Pass None instead — the model
+                            # will use its built-in causal mask.
+                            if (
+                                self.cfg["dtensor_cfg"]["sequence_parallel"]
+                                or self.cp_size > 1
+                            ):
+                                attention_mask = None
+                            else:
+                                attention_mask = torch.ones(
+                                    (batch_size, seq_len),
+                                    dtype=torch.bool,
+                                    device=input_ids.device,
+                                )
                             position_ids = torch.arange(
                                 seq_len, device=input_ids.device
                             ).repeat(batch_size, 1)
@@ -731,6 +769,13 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 flash_attn_kwargs=flash_attn_kwargs,
                                 **vlm_kwargs,
                             )
+
+                            # Gemma3 requires token_type_ids when model.training=True.
+                            # For text-only inputs, default to zeros (text tokens).
+                            if self.is_gemma3 and "token_type_ids" not in model_args:
+                                model_args["token_type_ids"] = torch.zeros_like(
+                                    input_ids
+                                )
 
                             if self._is_reward_model:
                                 # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.
@@ -1028,11 +1073,15 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # yet our attention mask above is not always all 1s
                     # this is fine because we mask with the actual attention mask
                     # later, but for input it has to be all 1s
-                    attention_mask = torch.ones(
-                        (batch_size, seq_len),
-                        dtype=torch.bool,
-                        device=input_ids.device,
-                    )
+                    if self.cp_size > 1:
+                        # CP doesn't support attention_mask — SDPA uses is_causal=True
+                        attention_mask = None
+                    else:
+                        attention_mask = torch.ones(
+                            (batch_size, seq_len),
+                            dtype=torch.bool,
+                            device=input_ids.device,
+                        )
 
                 # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
                 if len(vlm_kwargs) > 0:

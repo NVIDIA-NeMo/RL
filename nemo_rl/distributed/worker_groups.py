@@ -531,8 +531,11 @@ class RayWorkerGroup:
                     "env_vars": worker_env_vars,
                     "py_executable": py_executable,
                 }
-                runtime_env["env_vars"]["VIRTUAL_ENV"] = py_executable
-                runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_executable
+                py_venv = os.path.dirname(
+                    os.path.dirname(py_executable)
+                )  # to remove the "bin/python" suffix
+                runtime_env["env_vars"]["VIRTUAL_ENV"] = py_venv
+                runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_venv
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 
@@ -1016,10 +1019,11 @@ class RayWorkerGroup:
                 print(
                     f"Error during graceful shutdown: {e}. Falling back to force termination."
                 )
-                force = True
 
-        # Force kill any remaining workers
-        if force or cleanup_method is None:
+        # Always kill actors to release named actor registrations and resources.
+        # Even after successful graceful cleanup, actors remain alive in Ray's registry
+        # which prevents creating new actors with the same name.
+        if True:
             initializers_to_kill = []
             for worker in self._workers:
                 if hasattr(worker, "_RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC"):

@@ -19,6 +19,7 @@ import torch
 import torch.distributed
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
@@ -95,20 +96,33 @@ class SequencePackingLossWrapper:
                 else:
                     unpadded_seq_data[k] = v
 
-            # get next_token_logits
             cp_size = (
                 1
                 if self.context_parallel_group is None
                 else torch.distributed.get_world_size(self.context_parallel_group)
             )
-            logit_start = seq_start // cp_size
-            logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
-            logit_length = logit_end - logit_start
-            next_token_logits_slice = next_token_logits.narrow(
-                1, logit_start, logit_length
-            )
-
             # prepare data for loss function
+            if (
+                hasattr(self.loss_fn, "use_linear_ce_fusion")
+                and self.loss_fn.use_linear_ce_fusion
+            ):
+                # Linear CE fusion returns precomputed token logprobs where shape
+                # can be shorter by 1 token than padded sequence metadata.
+                # Use slicing (clamped end) to avoid narrow() OOB on packed tails.
+                logit_start = seq_start // cp_size
+                logit_end = min(
+                    (seq_start + padded_seq_lengths[seq_idx]) // cp_size,
+                    next_token_logits.shape[1],
+                )
+                logit_slice_idxs = slice(logit_start, logit_end)
+                next_token_logits_slice = next_token_logits[:, logit_slice_idxs]
+            else:
+                logit_start = seq_start // cp_size
+                logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
+                logit_length = logit_end - logit_start
+                next_token_logits_slice = next_token_logits.narrow(
+                    1, logit_start, logit_length
+                )
             loss_input, unpadded_seq_data = self.prepare_fn(
                 logits=next_token_logits_slice,
                 data=unpadded_seq_data,
@@ -150,6 +164,129 @@ class SequencePackingLossWrapper:
                     metrics_accum[k] += val
 
         return loss_accum, metrics_accum
+
+
+class SequencePackingFusionLossWrapper:
+    """Fused sequence packing loss wrapper that processes all sequences in one forward pass.
+
+    Unlike SequencePackingLossWrapper which iterates over sequences one at a time,
+    this wrapper calls prepare_fn once on the packed logits to compute log
+    probabilities in a single shot, then calls the loss function once with the
+    pre-computed result.
+
+    This avoids per-sequence kernel launches and TP/CP communication overhead while
+    producing numerically identical results.
+
+    The prepare_fn should be prepare_packed_loss_input (from nemo_rl.algorithms.loss.utils),
+    which currently only supports LossInputType.LOGPROB.
+    """
+
+    def __init__(
+        self,
+        loss_fn: LossFunction,
+        prepare_fn: Callable[..., Any],
+        cu_seqlens_q: Tensor,
+        cu_seqlens_q_padded: Optional[Tensor] = None,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        self.loss_fn = loss_fn
+        self.prepare_fn = prepare_fn
+        self.cu_seqlens_q = cu_seqlens_q
+        self.cu_seqlens_q_padded = (
+            cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
+        )
+        self.vocab_parallel_rank = vocab_parallel_rank
+        self.vocab_parallel_group = vocab_parallel_group
+        self.context_parallel_group = context_parallel_group
+
+    def __call__(
+        self,
+        next_token_logits: Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: Tensor | None,
+        global_valid_toks: Tensor | None,
+    ) -> tuple[Tensor, dict[str, Any]]:
+        """Compute loss for all packed sequences in one forward pass."""
+        loss_input, prepared_data = self.prepare_fn(
+            logits=next_token_logits,
+            data=data,
+            loss_fn=self.loss_fn,
+            cu_seqlens_q=self.cu_seqlens_q,
+            cu_seqlens_q_padded=self.cu_seqlens_q_padded,
+            vocab_parallel_rank=self.vocab_parallel_rank,
+            vocab_parallel_group=self.vocab_parallel_group,
+            context_parallel_group=self.context_parallel_group,
+        )
+
+        return self.loss_fn(
+            data=prepared_data,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            **loss_input,
+        )
+
+
+class DraftLossWrapper:
+    """Combine policy loss with draft soft cross-entropy loss."""
+
+    def __init__(
+        self,
+        loss_fn: Callable[..., tuple[torch.Tensor, dict[str, Any]]],
+        prepare_fn: Callable[Any, Any],
+        data_dict: BatchedDataDict[Any],
+        loss_weight: float = 1.0,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        self.loss_fn = loss_fn
+        self.prepare_fn = prepare_fn
+        self.data_dict = data_dict
+        self.loss_weight = loss_weight
+        self.vocab_parallel_rank = vocab_parallel_rank
+        self.vocab_parallel_group = vocab_parallel_group
+        self.context_parallel_group = context_parallel_group
+        self.draft_loss_fn = DraftCrossEntropyLossFn(
+            vocab_parallel_group=vocab_parallel_group,
+        )
+
+    def __call__(
+        self,
+        next_token_logits: torch.Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: torch.Tensor | None,
+        global_valid_toks: torch.Tensor | None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if global_valid_toks is None:
+            raise ValueError("global_valid_toks is required for DraftLossWrapper.")
+        policy_loss, metrics = self.loss_fn(
+            next_token_logits,
+            data,
+            global_valid_seqs,
+            global_valid_toks,
+            **kwargs,
+        )
+
+        loss_input, data = self.prepare_fn(
+            logits=next_token_logits,
+            data=data,
+            loss_fn=self.draft_loss_fn,
+            vocab_parallel_rank=self.vocab_parallel_rank,
+            vocab_parallel_group=self.vocab_parallel_group,
+            context_parallel_group=self.context_parallel_group,
+        )
+        draft_loss = self.draft_loss_fn(
+            data=data,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            **loss_input,
+        )
+        combined_loss = policy_loss + self.loss_weight * draft_loss
+        metrics["draft_loss"] = float(draft_loss.detach().item())
+        return combined_loss, metrics
 
 
 def wrap_loss_fn_with_input_preparation(

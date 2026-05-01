@@ -38,20 +38,26 @@ run_test() {
 run_test      bash ./tests/functional/grpo_frozen_env.sh
 run_test      bash ./tests/functional/test_frozen_env.sh
 
+run_test fast uv run --no-sync bash ./tests/functional/audio_grpo_megatron.sh
 run_test fast uv run --no-sync bash ./tests/functional/distillation.sh
 run_test      uv run --no-sync bash ./tests/functional/distillation_megatron.sh
 run_test fast uv run --no-sync bash ./tests/functional/dpo.sh
 run_test      uv run --no-sync bash ./tests/functional/dpo_automodel_lora.sh
+run_test fast uv run --no-sync bash ./tests/functional/dpo_megatron_lora.sh
 run_test      uv run --no-sync bash ./tests/functional/dpo_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/eval.sh
 run_test      uv run --no-sync bash ./tests/functional/eval_async.sh
+run_test fast uv run --no-sync bash ./tests/functional/eval_audio.sh
 run_test fast uv run --no-sync bash ./tests/functional/gdpo.sh
+run_test fast uv run --no-sync bash ./tests/functional/gdpo_async_grpo.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora_async.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora_non_colocated.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_fsdp2.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_megatron.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_eagle3_online.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_lora.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_lora_async.sh
@@ -71,6 +77,7 @@ run_test      uv run --no-sync bash ./tests/functional/sft_megatron_lora.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_resume_diamond.sh
 run_test      uv run --no-sync bash ./tests/functional/test_automodel_extra_installed_correctly.sh
 run_test fast uv run --no-sync bash ./tests/functional/test_converters.sh
+run_test      uv run --no-sync bash ./tests/functional/test_decode_vs_prefill.sh
 run_test      uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh
 run_test      uv run --no-sync bash ./tests/functional/vlm_grpo.sh
 

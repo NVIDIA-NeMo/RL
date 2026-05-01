@@ -75,6 +75,9 @@ def import_model_from_hf_name(
         ]
         model_provider.pipeline_dtype = megatron_config["pipeline_dtype"]
         model_provider.sequence_parallel = megatron_config["sequence_parallel"]
+        model_provider.gradient_accumulation_fusion = megatron_config[
+            "gradient_accumulation_fusion"
+        ]
     model_provider.finalize()
 
     from megatron.core import parallel_state
@@ -116,6 +119,7 @@ def export_model_from_megatron(
     hf_tokenizer_path: str,
     overwrite: bool = False,
     hf_overrides: Optional[dict[str, Any]] = {},
+    strict: bool = True,
 ):
     if os.path.exists(output_path) and not overwrite:
         raise FileExistsError(
@@ -146,7 +150,7 @@ def export_model_from_megatron(
         )
 
         # Save in HuggingFace format
-        bridge.save_hf_pretrained(megatron_model, output_path)
+        bridge.save_hf_pretrained(megatron_model, output_path, strict=strict)
 
     # resetting mcore state
     import megatron.core.rerun_state_machine

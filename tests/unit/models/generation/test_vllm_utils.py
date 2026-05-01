@@ -119,20 +119,16 @@ def test_vllm_utils_vlm_with_none_content_fallback_to_tokens_and_sample_idx():
 
 
 @pytest.mark.vllm
-def test_vllm_speculative_decoding_patch_still_needed():
-    # This test reminds to remove the vLLM patch when no longer needed.
-    # The patch was fixed upstream: https://github.com/vllm-project/vllm/pull/30319
-    # When this test fails, remove _patch_vllm_speculative_decoding_post_step()
-    # from nemo_rl/models/generation/vllm/vllm_worker.py
-    from importlib.metadata import version
+def test_vllm_speculative_decoding_patch_removed():
+    # The speculative decoding patch was fixed upstream in vLLM >= 0.14.0:
+    # https://github.com/vllm-project/vllm/pull/30319
+    # Verify the patch function has been removed from the codebase.
+    import importlib
 
-    from packaging.version import Version
-
-    assert Version(version("vllm")) < Version("0.14.0"), (
-        "vLLM >= 0.14.0 includes the speculative decoding fix from "
-        "https://github.com/vllm-project/vllm/pull/30319. "
-        "Please remove the _patch_vllm_speculative_decoding_post_step() function "
-        "from nemo_rl/models/generation/vllm/vllm_worker.py"
+    vllm_worker = importlib.import_module("nemo_rl.models.generation.vllm.vllm_worker")
+    assert not hasattr(vllm_worker, "_patch_vllm_speculative_decoding_post_step"), (
+        "_patch_vllm_speculative_decoding_post_step still exists in vllm_worker.py "
+        "but vLLM >= 0.14.0 includes the upstream fix. Please remove it."
     )
 
 

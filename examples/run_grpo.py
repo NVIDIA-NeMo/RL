@@ -84,8 +84,11 @@ def main() -> None:
     assert config["policy"]["generation"] is not None, (
         "A generation config is required for GRPO"
     )
+    has_refit_draft_weights = bool(config["policy"]["draft"]["enabled"])
     config["policy"]["generation"] = configure_generation_config(
-        config["policy"]["generation"], tokenizer
+        config["policy"]["generation"],
+        tokenizer,
+        has_refit_draft_weights=has_refit_draft_weights,
     )
 
     # setup data
@@ -137,14 +140,6 @@ def main() -> None:
         if config["data"]["use_multiple_dataloader"]:
             raise NotImplementedError(
                 "use_multiple_dataloader is not supported with async GRPO"
-            )
-
-        # Async GDPO is not supported
-        if config["grpo"]["adv_estimator"]["name"] == "gdpo":
-            raise NotImplementedError(
-                "GDPO is not supported for async training, "
-                "please set grpo.async_grpo.enabled to false in your config. "
-                "See https://github.com/NVIDIA-NeMo/RL/issues/2061 for more details."
             )
 
         from nemo_rl.algorithms.grpo import async_grpo_train

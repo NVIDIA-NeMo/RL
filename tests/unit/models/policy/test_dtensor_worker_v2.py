@@ -27,6 +27,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.policy import AutomodelKwargs, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
 
 try:
@@ -52,7 +53,6 @@ def create_test_config(
     dtensor_v2: bool = False,
     precision: str = "float32",
     expert_parallel_size: int = 1,
-    use_hf_tp_plan: bool = False,
     sequence_packing_enabled: bool = False,
     automodel_kwargs: AutomodelKwargs | None = None,
     checkpointing: dict | None = None,
@@ -93,7 +93,6 @@ def create_test_config(
             "context_parallel_size": cp,
             "custom_parallel_plan": custom_parallel_plan,
             "expert_parallel_size": expert_parallel_size,
-            "use_hf_tp_plan": use_hf_tp_plan,
         },
         "dynamic_batching": {
             "enabled": True,
@@ -216,6 +215,7 @@ def compare_model_configs(config_v1: dict, config_v2: dict) -> list[str]:
 
 
 @pytest.mark.hf_gated
+@pytest.mark.automodel
 @pytest.mark.parametrize(
     "model_fixture_name,tp,cp,sp,cpu_offload,activation_checkpointing",
     [
@@ -304,6 +304,11 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
     config_v1_dict.pop("pad_token_id", None)
     config_v2_dict.pop("pad_token_id", None)
 
+    # if head_dim doesn't exist in raw HF model config, automodel (dtensor v2 worker) updates model config in-place
+    # so we need to remove the head_dim key from the v2 config
+    if "head_dim" not in config_v1_dict and "head_dim" in config_v2_dict:
+        config_v2_dict.pop("head_dim", None)
+
     discrepancies = compare_model_configs(config_v1_dict, config_v2_dict)
     assert not discrepancies, (
         f"Model configurations differ between v1 and v2 approaches for {model_name}"
@@ -311,10 +316,13 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
 
 
 @pytest.mark.hf_gated
+@pytest.mark.automodel
 @pytest.mark.timeout(360)
+@pytest.mark.parametrize("save_optimizer", [True, False])
 def test_dtensor_v2_checkpoint_save_and_load(
     two_gpu_virtual_cluster,
     tiny_llama_model_path,
+    save_optimizer,
 ):
     with tempfile.TemporaryDirectory() as tmpdir:
         checkpointing_config = {
@@ -325,6 +333,7 @@ def test_dtensor_v2_checkpoint_save_and_load(
             "keep_top_k": 2,
             "save_period": 30,
             "checkpoint_must_save_by": None,
+            "save_optimizer": save_optimizer,
         }
 
         config = create_test_config(
@@ -345,8 +354,10 @@ def test_dtensor_v2_checkpoint_save_and_load(
         )
 
         try:
-            weights_path = os.path.join(tmpdir, "weights")
-            optimizer_path = os.path.join(tmpdir, "optimizer")
+            weights_path = os.path.join(tmpdir, "policy", "weights")
+            optimizer_path = (
+                os.path.join(tmpdir, "policy", "optimizer") if save_optimizer else None
+            )
 
             # Save checkpoint
             policy.save_checkpoint(
@@ -370,6 +381,13 @@ def test_dtensor_v2_checkpoint_save_and_load(
             # Shutdown original policy first to free GPU memory
             policy.shutdown()
             policy = None
+
+            # Check if the optimizer exists in the checkpoint
+            weights_path, optimizer_path = CheckpointManager.get_resume_paths(tmpdir)
+            if save_optimizer:
+                assert optimizer_path is not None, "Optimizer path should not be None"
+            else:
+                assert optimizer_path is None, "Optimizer path should be None"
 
             policy2 = Policy(
                 tokenizer=get_tokenizer(config2["tokenizer"]),
@@ -396,6 +414,7 @@ def test_dtensor_v2_checkpoint_save_and_load(
 
 
 @pytest.mark.hf_gated
+@pytest.mark.automodel
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("precision", ["bfloat16", "float16"])
 def test_dtensor_v2_mixed_precision_training_and_logprobs(

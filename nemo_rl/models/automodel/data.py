@@ -274,6 +274,12 @@ def process_microbatch(
         assert len(vlm_kwargs) == 0, (
             f"multimodal kwargs={vlm_kwargs} are not supported for context parallel"
         )
+        # CP doesn't support attention_mask — torch's CP SDPA handler requires
+        # is_causal=True (no explicit mask). Passing an unsplit mask causes a
+        # DTensor redistribution assertion because the mask isn't in cp_buffers
+        # and therefore keeps the full sequence length while Q/K/V are split.
+        # Matches Automodel's cp_utils.py which does batch.pop("attention_mask").
+        attention_mask = None
         seq_index = torch.arange(seq_len, device=input_ids.device).repeat(1, 1)
         cp_buffers = [input_ids, position_ids, seq_index]
 

@@ -47,7 +47,7 @@ class TestAutoModelBackendConfig:
         backend_keys = {k for k in keys if k != "_target_"}
 
         config_dict: AutomodelBackendConfig = {
-            "_target_": "nemo_automodel.components.moe.utils.BackendConfig",
+            "_target_": "nemo_automodel.components.models.common.utils.BackendConfig",
             "attn": "te",
             "linear": "te",
             "rms_norm": "te",

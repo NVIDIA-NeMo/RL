@@ -2,14 +2,14 @@
 
 This guide covers the ProRLv2 configuration pattern in NeMo RL, based on the example config [`examples/configs/prorlv2.yaml`](../../examples/configs/prorlv2.yaml).
 
-ProRLv2 (as used in this repo) is best thought of as **GRPO and a bundle of stability/efficiency techniques** commonly used for long-horizon RL fine-tuning
+ProRLv2 is best thought of as **GRPO plus a bundle of stability/efficiency techniques** commonly used for long-horizon RL fine-tuning:
 
 - **DAPO dynamic sampling**: skip prompt-groups with zero reward variance
 - **Decoupled (asymmetric) clipping**: `ratio_clip_max > ratio_clip_min`
 - **Token-level policy gradient loss**
-- **Importance sampling correction and TIS/ICE-POP** (especially helpful for MoE/backend-mismatch scenarios)
-- **Reinforce++: Decoupled local/global advantage normalization** (`reinforce_plus_plus`)
-- **“Stop properly” penalty** for truncated responses
+- **Importance sampling correction**: Token-level mask (ICE-POP) / Seq-level mask (seq-mask-tis) for backend-mismatch filtering; Pure Online training recommended for MoE
+- **Reinforce++-Baseline**: decoupled local/global advantage normalization (`reinforce_plus_plus` + `minus_baseline: true`)
+- **"Stop properly" penalty** for truncated responses
 
 This document focuses on ProRLv2-specific knobs and gotchas. For foundational concepts on GRPO (data, environments, generation backends, loss/metrics), see the [NeMo RL GRPO Guide](grpo.md). For the original DAPO motivation behind dynamic sampling/overlong shaping, see the [NeMo RL DAPO Guide](dapo.md).
 
@@ -23,25 +23,26 @@ uv run examples/run_grpo_math.py --config examples/configs/prorlv2.yaml {overrid
 
 `prorlv2.yaml` inherits from [`examples/configs/grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml) and only overrides a small set of fields under `grpo` and `loss_fn`, plus output directories.
 
-**Reminder**: Don’t forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You’ll need to do a `huggingface-cli login` as well for gated models.
+**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for gated models.
 
 ## DAPO: Dynamic Sampling
 
-Standard GRPO will train on all generated responses, even when a prompt’s `num_generations_per_prompt` responses all receive the same reward (no per-prompt learning signal). **Dynamic sampling** filters to keep only prompt-groups with diverse rewards (`std > 0`), and can accumulate across multiple generation batches until it reaches the target rollout batch size.
+Standard GRPO will train on all generated responses, even when a prompt's `num_generations_per_prompt` responses all receive the same reward (no per-prompt learning signal). **Dynamic sampling** filters to keep only prompt-groups with diverse rewards (`std > 0`), and can accumulate across multiple generation batches until it reaches the target rollout batch size.
 
 - **Config**: enable with `grpo.use_dynamic_sampling: true` and tune:
   - `grpo.batch_multiplier`: how many extra prompts to generate to compensate filtering
   - `grpo.dynamic_sampling_max_gen_batches`: upper bound before raising an error
 - **Implementation**: see `dynamic_sampling()` in [`nemo_rl/algorithms/grpo.py`](../../nemo_rl/algorithms/grpo.py).
 
-## Advantage Estimator: Reinforce++
+## Decoupled local/global advantage normalization
 
-The ProRLv2 recipe uses **Reinforce++** advantage estimation instead of the standard GRPO-style group baseline.
+The ProRLv2 recipe uses **Reinforce++-Baseline** advantage estimation instead of the standard GRPO-style group baseline.
 
 Quick intuition:
 
-- Reinforce++ uses **decoupled local + global normalization**.
+- Reinforce++-Baseline uses **decoupled local + global normalization**: per-prompt baseline subtraction (local), then batch-wide normalization (global).
 - Compared to GRPO-style **local-only normalization**, this decoupling can be **more stable** in longer runs (less sensitivity to per-batch scale/variance shifts).
+- Setting `minus_baseline: false` gives plain Reinforce++ (global normalization only, no per-prompt baseline).
 
 Computation (as implemented in this repo, with the ProRLv2 example defaults):
 
@@ -51,7 +52,7 @@ Defaults in examples/configs/prorlv2.yaml:
   loss_fn.use_kl_in_reward          = false
 
 Steps:
-  1) Per prompt-group, compute mean reward, then subtract it:
+  1) Per prompt-group, compute mean reward, then subtract it (minus_baseline=true):
        a_i = r_i - mean_{j in same prompt} r_j
 
   2) Global normalize across *all valid response tokens* in the batch:
@@ -64,16 +65,16 @@ grpo:
     name: "reinforce_plus_plus"
     normalize_rewards: true
     use_leave_one_out_baseline: false
-    minus_baseline: true
+    minus_baseline: true    # true = Reinforce++-Baseline; false = plain Reinforce++
 ```
 
-- **Config**: `grpo.adv_estimator.name: "reinforce_plus_plus"`
-- **Implementation**: the training loop wires this via `ReinforcePlusPlusAdvantageEstimator` in [`nemo_rl/algorithms/grpo.py`](../../nemo_rl/algorithms/grpo.py).
+- **Config**: `grpo.adv_estimator.name: "reinforce_plus_plus"` with `minus_baseline: true`
+- **Implementation**: `ReinforcePlusPlusAdvantageEstimator` in [`nemo_rl/algorithms/advantage_estimator.py`](../../nemo_rl/algorithms/advantage_estimator.py).
 - **Reference**: [REINFORCE++ paper](https://arxiv.org/abs/2501.03262)
 
-## Reward Shaping: “Stop properly” Penalty (Truncation Penalty)
+## Reward Shaping: "Stop properly" Penalty (Truncation Penalty)
 
-When a generation hits the max length without emitting EOS, many pipelines mark it as **truncated**. The “stop properly” penalty scales the reward for truncated samples:
+When a generation hits the max length without emitting EOS, many pipelines mark it as **truncated**. The "stop properly" penalty scales the reward for truncated samples:
 
 - `stop_properly_penalty_coef = 0.0`: truncated samples get **zero reward**
 - `stop_properly_penalty_coef = 1.0`: **no penalty** (keep original rewards)
@@ -96,7 +97,7 @@ In the current implementation, if `stop_properly_penalty_coef` is set (not `null
 
 ## Loss: Decoupled (Asymmetric) Clipping
 
-ProRLv2 uses DAPO’s “decoupled clipping” idea by setting different lower/upper clip bounds:
+ProRLv2 uses DAPO's "decoupled clipping" idea by setting different lower/upper clip bounds:
 
 ```yaml
 loss_fn:
@@ -119,76 +120,102 @@ loss_fn:
 
 This computes the policy gradient loss per token (under masking) instead of aggregating per sequence, which is often helpful for long CoT/variable-length rollouts.
 
-## Truncated Importance Sampling
+## Importance Sampling Correction and MoE Stability
 
-When training and generation backends differ (e.g., numerics, precision, MoE routing, or vLLM vs training framework), you may see a mismatch between:
+When training and generation backends differ (e.g., FSDP vs vLLM, BF16 vs FP8), the logprobs they produce can disagree. NeMo RL captures this disagreement as an IS correction weight:
 
-- `generation_logprobs` (logprobs under the generation backend that produced samples)
-- `prev_logprobs` (logprobs under the training framework policy)
+$$\rho_t = \exp(\texttt{prev\_logprobs}_t - \texttt{generation\_logprobs}_t)$$
 
-NeMo RL supports **importance sampling correction**, and ProRLv2’s example config turns it on together with **truncated importance sampling**.
+For dense models $\rho_t$ stays close to 1.0. For **MoE models**, even tiny floating-point differences can flip the router's expert selection, causing $\rho_t$ to spike. This is one of two sources of instability that MoE models face under RL:
 
-Quick intuition:
+| Source | Cause | Solution |
+|--------|-------|----------|
+| **Router Shift** (algorithmic) | Multi mini-batch updates change the router too fast. | **Pure Online Training** — set `max_num_epochs: 1` (default in `grpo_math_1B.yaml`). |
+| **Backend Mismatch** (engineering) | FSDP and vLLM compute different logits; small differences flip expert selection. | **IS Correction + Filtering** — ICE-POP or seq-mask-tis (see below). |
 
-- This is mainly useful for **MoE/backend mismatch** cases, where the generation backend and the training policy can disagree on logprobs.
-- We compute an importance weight from `prev_logprobs` (training policy) vs `generation_logprobs` (generator). **ICE-POP** drops outliers by zeroing weights outside \([min, max]\).
-- In the common setup of **one policy update per rollout batch** (i.e., minibatch equals the per-step rollout batch; no PPO multi-epoch reuse), the PPO/GRPO likelihood ratio term is effectively **1.0** at update time, so the main stability issue is the MoE/backend-mismatch importance weights.
-- “Online ICE-POP” here just means applying that ICE-POP filtering **during loss computation** on the current training batch.
+Pure Online training eliminates router shift by ensuring the policy is updated only once per rollout. This leaves backend mismatch as the remaining source of instability, which is handled by filtering.
 
-- **Reference**: [The Online IcePop Solution for MoE models](https://hijkzzz.notion.site/online-ice-pop)
+### Filtering Strategies
+
+All filtering modes require `use_importance_sampling_correction: true`. ICE-POP and seq-mask-tis are both designed for MoE stability; **seq-mask-tis is recommended for reasoning tasks**.
+
+- **Implementation**: `ClippedPGLossFn` in [`nemo_rl/algorithms/loss/loss_functions.py`](../../nemo_rl/algorithms/loss/loss_functions.py).
+
+---
+
+**`"tis"` — Clamp to Max**
+
+Clamp IS weights to `<= truncated_importance_sampling_ratio`. Simple but retains biased signal from router-flipped tokens.
+
+---
+
+**`"icepop"` — Token-Level Masking**
+
+**Zeros out** any token whose IS weight falls outside \([min, max]\). Unlike clamping, this discards noisy tokens entirely — the model only updates on tokens where the two backends agree.
 
 ```yaml
 loss_fn:
   use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "icepop"
   truncated_importance_sampling_ratio: 5.0
   truncated_importance_sampling_ratio_min: 0.5
-  truncated_importance_sampling_type: "icepop"
 ```
 
-- **`use_importance_sampling_correction`**: enable token-level importance weights (must be `true` for truncated IS)
-- **`truncated_importance_sampling_ratio`**: upper bound (or upper threshold)
-- **`truncated_importance_sampling_ratio_min`**: lower bound used by ICE-POP filtering
-- **`truncated_importance_sampling_type`**:
-  - `"tis"`: clamp weights to `<= truncated_importance_sampling_ratio`
-  - `"icepop"`: set weights outside \([min, max]\) to zero (filter outliers)
-  - `"seq-mask-tis"`: sequence-level geometric-mean mask + non-truncated token-level IS correction (see below)
+- **Reference**: [Conquering the RL Stability Challenge in MoE with the Icepop Discrepancy Reduction Method](https://hijkzzz.notion.site/online-ice-pop)
 
-- **Implementation**: see `ClippedPGLossFn` init-time checks and logic in [`nemo_rl/algorithms/loss/loss_functions.py`](../../nemo_rl/algorithms/loss/loss_functions.py).
+---
 
-### Seq-mask-tis: Sequence-level Geometric-Mean Mask
+**`"seq-mask-tis"` — Sequence-Level Masking (Recommended)**
 
-`seq-mask-tis` is an alternative to ICE-POP that operates at the **sequence level** instead of per-token:
+Token-level masking can break the logical coherence of Chain-of-Thought gradients. `seq-mask-tis` operates at the **sequence level** instead:
 
-1. For each sequence, compute the **geometric mean** of per-token IS ratios: \(\text{geo\_mean}_i = \exp\!\bigl(\frac{1}{T_i}\sum_t \log \frac{\pi_{\text{train}}(a_t)}{\pi_{\text{gen}}(a_t)}\bigr)\)
-2. **Mask out** entire sequences whose geometric mean falls outside \([min, max]\).
-3. For retained sequences, apply the **non-truncated** (raw) token-level IS ratios to correct per-token gradients — no clamping, no per-token filtering.
-
-Key differences from ICE-POP:
-
-| | ICE-POP | seq-mask-tis |
-|---|---|---|
-| Filtering granularity | per token | per sequence |
-| IS correction weights | filtered (zeroed outside bounds) | raw / non-truncated |
-| Reference bounds | min=0.5, max=5 | min=0.999, max=1.002 |
+1. Compute the **geometric mean** of per-token IS ratios for each sequence.
+2. **Discard entire sequences** whose geometric mean falls outside a tight tolerance window.
+3. For retained sequences, use the **raw, non-truncated** token-level IS ratios — no clamping, no per-token filtering.
 
 ```yaml
 loss_fn:
-  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "seq-mask-tis"
   truncated_importance_sampling_ratio: 1.002
   truncated_importance_sampling_ratio_min: 0.999
-  truncated_importance_sampling_type: "seq-mask-tis"
 ```
 
-Both ICE-POP and seq-mask-tis report a shared metric **`is_oob_ratio`** — the fraction of tokens (ICE-POP) or sequences (seq-mask-tis) that were filtered out.
+:::{note}
+Under Pure Online training (single update per rollout), the PPO policy ratio is ~1.0, so the effective loss simplifies to $L(\theta) \approx -\mathbb{E}_t[M_{\text{seq}} \cdot \rho_t \cdot A_t]$.
+:::
 
 - **Reference**: [When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda)
 
-## Full Example Config (Annotated)
+---
 
-The ProRLv2 example config is intentionally small and relies on defaults from `grpo_math_1B.yaml`.
+**Comparison**
 
-- **Example config**: [`examples/configs/prorlv2.yaml`](../../examples/configs/prorlv2.yaml)
-- **Base defaults**: [`examples/configs/grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml)
+| | ICE-POP | seq-mask-tis |
+|---|---|---|
+| Granularity | per token | per sequence |
+| IS weights for retained data | filtered (zeroed outside bounds) | raw / non-truncated |
+| Typical bounds | \[0.5, 5.0\] | \[0.999, 1.002\] |
+| Best for | General MoE stability | Long-horizon reasoning (preserves CoT coherence) |
+
+:::{tip}
+**ProRL v2.1** targets MoE stability with three changes on top of ProRLv2:
+
+- **Pure Online Policy Gradient** (`force_on_policy_ratio: true`) — forces the PPO ratio to 1.0, eliminating clipping entirely. This removes Router Shift as a source of instability.
+- **Seq-mask-tis** — sequence-level filtering instead of token-level ICE-POP.
+- **No DAPO dynamic sampling** (`use_dynamic_sampling: false`).
+
+Use [`examples/configs/prorlv2_1_moe.yaml`](../../examples/configs/prorlv2_1_moe.yaml) directly. See the [ProRL v2.1 blog post](https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/) for the full motivation.
+:::
+
+```bash
+# Launch ProRL v2.1 for MoE models
+uv run examples/run_grpo_math.py --config examples/configs/prorlv2_1_moe.yaml {overrides}
+```
+
+## Full Example Configs
+
+- **ProRLv2** (ICE-POP, DAPO, clipping): [`examples/configs/prorlv2.yaml`](../../examples/configs/prorlv2.yaml) — inherits from [`grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml)
+- **ProRL v2.1** (seq-mask-tis, pure online, MoE): [`examples/configs/prorlv2_1_moe.yaml`](../../examples/configs/prorlv2_1_moe.yaml) — inherits from `prorlv2.yaml`, adds `force_on_policy_ratio`, switches to seq-mask-tis, disables dynamic sampling
 
 ## Practical Overrides
 
@@ -221,6 +248,7 @@ In addition to task rewards/accuracy, a few stability signals are particularly u
 
 - **Dynamic sampling efficiency**: if enabled, watch how often batches need multiple generation rounds (see `dapo.md` for detailed guidance).
 - **Training–generation mismatch**: `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error` are computed in `ClippedPGLossFn` (see the [GRPO metrics section](grpo.md#metrics)).
+- **IS out-of-bounds ratio** (`is_oob_ratio`): the fraction of tokens (ICE-POP) or sequences (seq-mask-tis) filtered out by truncated IS. A persistently high value suggests large backend mismatch — check precision settings or relax the bounds.
 - **Truncation rate**: if high, either increase `policy.max_total_sequence_length`/`policy.generation.max_model_len` or relax truncation penalty (`stop_properly_penalty_coef`).
 
 ## References
@@ -228,8 +256,9 @@ In addition to task rewards/accuracy, a few stability signals are particularly u
 - **ProRLv2 blog**: [Scaling LLM Reinforcement Learning with Prolonged Training using ProRL v2](https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/)
 - **DAPO**: [Decoupled Clip and Dynamic Sampling Policy Optimization](https://arxiv.org/pdf/2503.14476)
 - **GRPO**: [Group Relative Policy Optimization](https://arxiv.org/abs/2402.03300)
-- **REINFORCE++**: [REINFORCE++](https://arxiv.org/abs/2501.03262)
+- **REINFORCE++**: [REINFORCE++: A Simple and Efficient Approach for RLHF](https://arxiv.org/abs/2501.03262)
 - **DLER (stop properly penalty explanation)**: [DLER](https://arxiv.org/pdf/2510.15110)
+- **Online ICE-POP**: [Conquering the RL Stability Challenge in MoE with the Icepop Discrepancy Reduction Method](https://hijkzzz.notion.site/online-ice-pop)
 - **seq-mask-tis blog**: [When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda)
 - **[NeMo RL GRPO Guide](grpo.md)**
 - **[NeMo RL DAPO Guide](dapo.md)**

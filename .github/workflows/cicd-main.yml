@@ -39,7 +39,7 @@ on:
         default: ""
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -62,7 +62,7 @@ jobs:
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -174,7 +174,7 @@ jobs:
           echo "image_tag=$IMAGE_TAG" | tee -a "$GITHUB_OUTPUT"
 
   org-member-pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.78.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.80.1
     with:
       default_runner_prefix: ${{ vars.DEFAULT_RUNNER_PREFIX }}
       non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
@@ -182,6 +182,7 @@ jobs:
       non_nvidia_test_data_path: ${{ vars.NON_NVIDIA_TEST_DATA_PATH }}
       default_registry: ${{ vars.DEFAULT_CONTAINER_REGISTRY }}
       non_nvidia_registry: ${{ vars.NON_NVIDIA_CONTAINER_REGISTRY }}
+      sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
     secrets:
       NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
 
@@ -243,7 +244,7 @@ jobs:
           pip cache purge || true
           sudo npm cache clean --force || true
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: "recursive"
       - name: Install uv
@@ -254,7 +255,7 @@ jobs:
           prune-cache: false
       # Faster than uv python install since it caches python alongside runner
       - name: "Set up Python"
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version-file: ".python-version"
       - name: Check lint
@@ -312,7 +313,7 @@ jobs:
       ${{
         (
           always() &&
-          contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) &&
+          contains('docs Lfast L0 L1 L2', needs.pre-flight.outputs.test_level) &&
           needs.pre-flight.result == 'success' &&
           (needs.build-container.result == 'success' || needs.build-container.result == 'skipped')
         ) && !cancelled()
@@ -322,7 +323,7 @@ jobs:
     environment: nemo-ci
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/test-template
         with:
@@ -363,7 +364,7 @@ jobs:
     name: ${{ matrix.script }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/test-template
         env:
@@ -393,7 +394,7 @@ jobs:
     environment: nemo-ci
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/test-template
         env:
@@ -420,7 +421,7 @@ jobs:
     environment: nemo-ci
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/test-template
         env:
@@ -479,6 +480,24 @@ jobs:
           SUMMARY=$(echo $JOB_RESULTS | jq 'to_entries[] | .key + ": " + .value.result' | tr -d '"')
           echo '🤖: CICD Result for test level: ${{ needs.pre-flight.outputs.test_level }}' >> $GITHUB_STEP_SUMMARY
           echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$TEST_LEVEL" == "none" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **No tests were run.** This PR does not have a CI label." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "To trigger tests, add one of the following labels to your PR:" >> $GITHUB_STEP_SUMMARY
+            echo "| Label | What it runs |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------|-------------|" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:docs\` | Doc tests only |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:Lfast\` | Fast subset (reuses main container) |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:L0\` | Unit tests + docs + lint |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:L1\` | L0 + functional tests |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:L2\` | L1 + convergence tests |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "This check will remain failed until a CI label is added." >> $GITHUB_STEP_SUMMARY
+          fi
+
           test "$ALL_SUCCESS" = "true" || test "$CI_SKIP" = "true"
 
   notify-nightly-failure:
@@ -518,19 +537,25 @@ jobs:
       matrix:
         flag: [doc-test, unit-test, e2e]
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download coverage reports of current branch
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: coverage-${{ matrix.flag }}-*
+          path: coverage-downloads
 
       - name: Check if artifacts were downloaded
         id: check-artifacts
         run: |
-          # Check if any coverage directories were downloaded
-          if ls coverage-* 1> /dev/null 2>&1; then
+          # Check if any .coverage files were downloaded
+          if find coverage-downloads -name ".coverage" -type f 2>/dev/null | grep -q .; then
             echo "artifacts-found=true" >> $GITHUB_OUTPUT
             echo "Found coverage artifacts for ${{ matrix.flag }}"
           else
@@ -544,12 +569,10 @@ jobs:
         run: |
           pip install coverage
 
-          ls -al .
-          ls -al coverage-*/
-          coverage combine --keep $(ls coverage-*/.coverage)
+          find coverage-downloads -name ".coverage" -type f
+          coverage combine --keep $(find coverage-downloads -name ".coverage" -type f)
           coverage report -i --show-missing
-          rm -rf coverage-*
-          ls -al
+          rm -rf coverage-downloads
 
       - name: Skip coverage processing
         if: ${{ steps.check-artifacts.outputs.artifacts-found == 'false' }}
@@ -563,10 +586,11 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
+          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
         if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-${{ matrix.flag }}-aggregated
           path: |

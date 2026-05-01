@@ -21,6 +21,7 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
+  save_optimizer: true
 
 policy:
   model_name: "meta-llama/Llama-3.2-1B"
@@ -46,7 +47,14 @@ policy:
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
-  
+
+    # Automodel kwargs passed to from_pretrained.
+    # Uncomment force_hf if the custom model's adapter doesn't support per-tensor
+    # weight conversion (e.g. Qwen2, Llama). Auto-detected if not set.
+    # See https://github.com/NVIDIA-NeMo/RL/issues/2072
+    automodel_kwargs: {}
+      # force_hf: true
+
     # LoRA (Low-Rank Adaptation) Configuration
     lora_cfg:
       enabled: False  # Set to True to enable LoRA fine-tuning
@@ -91,6 +99,9 @@ policy:
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false
+    use_linear_ce_fusion_loss: false
+    linear_ce_fusion_chunk_size: 256
+    force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     env_vars: {}
     empty_unused_memory_level: 1
     activation_checkpointing: false
@@ -107,7 +118,7 @@ policy:
     moe_router_dtype: null
     moe_router_load_balancing_type: "aux_loss"
     moe_router_bias_update_rate: 1e-3
-    moe_permute_fusion: false
+    moe_permute_fusion: true
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
@@ -117,6 +128,7 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
 
     peft:
       enabled: false
@@ -250,6 +262,7 @@ logger:
   mlflow:
     experiment_name: "sft-dev"
     run_name: "sft-dev-${data.train.dataset_name}"
+    tracking_uri: "http://localhost:5000"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

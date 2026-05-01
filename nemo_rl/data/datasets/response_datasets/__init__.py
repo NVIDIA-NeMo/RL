@@ -14,6 +14,7 @@
 
 from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
+from nemo_rl.data.datasets.response_datasets.avqa import AVQADataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.daily_omni import DailyOmniDataset
 from nemo_rl.data.datasets.response_datasets.dapo_math import (
@@ -28,6 +29,9 @@ from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.gsm8k import GSM8KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
+from nemo_rl.data.datasets.response_datasets.nemotron_cascade2_sft import (
+    NemotronCascade2SFTMathDataset,
+)
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     OpenAIFormatDataset,
 )
@@ -42,6 +46,7 @@ from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
 
 DATASET_REGISTRY = {
     # built-in datasets
+    "avqa": AVQADataset,
     "AIME2024": AIME2024Dataset,
     "clevr-cogent": CLEVRCoGenTDataset,
     "daily-omni": DailyOmniDataset,
@@ -57,6 +62,7 @@ DATASET_REGISTRY = {
     "squad": SquadDataset,
     "tulu3_sft_mixture": Tulu3SftMixtureDataset,
     "gsm8k": GSM8KDataset,
+    "Nemotron-Cascade-2-SFT-Math": NemotronCascade2SFTMathDataset,
     # load from local JSONL file or HuggingFace
     "openai_format": OpenAIFormatDataset,
     "NemoGymDataset": NemoGymDataset,
@@ -90,6 +96,7 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
 
 
 __all__ = [
+    "AVQADataset",
     "AIME2024Dataset",
     "CLEVRCoGenTDataset",
     "DailyOmniDataset",
@@ -101,6 +108,7 @@ __all__ = [
     "Geometry3KDataset",
     "HelpSteer3Dataset",
     "NemoGymDataset",
+    "NemotronCascade2SFTMathDataset",
     "OasstDataset",
     "OpenAIFormatDataset",
     "OpenMathInstruct2Dataset",

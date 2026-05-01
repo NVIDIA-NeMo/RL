@@ -232,98 +232,185 @@ class BaseVllmGenerationWorker:
             with open(file_to_patch, "w") as f:
                 f.write(content)
 
-        def _patch_vllm_vit_flash_attn_backend():
-            """Patch vLLM vision attention backend selection logic.
-
-            Modify the CUDA branch of maybe_get_vit_flash_attn_backend in
-            vllm.attention.layer to avoid overriding the backend when it
-            is already set to XFORMERS. This avoids flash attention related
-            errors when the ViT head dimension is not a multiple of 32.
-
-            Related issues:
-            - https://github.com/vllm-project/vllm/issues/27562
-            - https://github.com/vllm-project/vllm/issues/26989
-
-            This is properly fixed in https://github.com/vllm-project/vllm/pull/28763. We can remove this patch once we upgrade to a version of vllm that contains this fix.
-            """
-            file_to_patch = _get_vllm_file("attention/layer.py")
-            with open(file_to_patch, "r") as f:
-                content = f.read()
-
-            old_snippet = (
-                "    elif current_platform.is_cuda():\n"
-                "        if (\n"
-                "            attn_backend != AttentionBackendEnum.FLASH_ATTN\n"
-                "            and check_upstream_fa_availability(torch.get_default_dtype())\n"
-                "        ):\n"
-                "            attn_backend = AttentionBackendEnum.FLASH_ATTN\n"
-                "            use_upstream_fa = True\n"
-            )
-
-            new_snippet = (
-                "    elif current_platform.is_cuda():\n"
-                "        if (\n"
-                "            attn_backend != AttentionBackendEnum.FLASH_ATTN\n"
-                "            and attn_backend != AttentionBackendEnum.XFORMERS\n"
-                "            and check_upstream_fa_availability(torch.get_default_dtype())\n"
-                "        ):\n"
-                "            attn_backend = AttentionBackendEnum.FLASH_ATTN\n"
-                "            use_upstream_fa = True\n"
-            )
-
-            # Only patch if the file still has the old snippet and
-            # hasn't been patched already.
-            if new_snippet in content or old_snippet not in content:
+        def _patch_vllm_llama_eagle3_own_lm_head():
+            """Patch LlamaEagle3 to keep truncated draft lm_head ownership."""
+            try:
+                file_to_patch = _get_vllm_file("model_executor/models/llama_eagle3.py")
+            except RuntimeError:
+                logger.warning(
+                    "Could not locate llama_eagle3.py for lm_head ownership patch."
+                )
                 return
-
-            content = content.replace(old_snippet, new_snippet)
-
-            with open(file_to_patch, "w") as f:
-                f.write(content)
-
-        def _patch_vllm_speculative_decoding_post_step():
-            """Patch vLLM speculative decoding post_step call.
-
-            Related PR:
-            - https://github.com/vllm-project/vllm/pull/30319
-
-            This patch fixes the InprocessClient.get_output method to properly
-            call post_step with the model_executed flag from step_fn.
-            """
-            file_to_patch = _get_vllm_file("v1/engine/core_client.py")
 
             with open(file_to_patch, "r") as f:
                 content = f.read()
 
+            if "self.has_own_lm_head = (" in content:
+                logger.info("llama_eagle3 lm_head ownership patch already applied.")
+                return
+
             old_snippet = (
-                "    def get_output(self) -> EngineCoreOutputs:\n"
-                "        outputs, _ = self.engine_core.step_fn()\n"
-                "        return outputs and outputs.get(0) or EngineCoreOutputs()"
+                "        self.lm_head = ParallelLMHead(\n"
+                "            self.config.draft_vocab_size,\n"
+                "            self.config.hidden_size,\n"
+                '            prefix=maybe_prefix(prefix, "lm_head"),\n'
+                "        )\n"
+                "        self.logits_processor = LogitsProcessor(\n"
             )
 
             new_snippet = (
-                "    def get_output(self) -> EngineCoreOutputs:\n"
-                "        outputs, model_executed = self.engine_core.step_fn()\n"
-                "        self.engine_core.post_step(model_executed=model_executed)\n"
-                "        return outputs and outputs.get(0) or EngineCoreOutputs()"
+                "        self.lm_head = ParallelLMHead(\n"
+                "            self.config.draft_vocab_size,\n"
+                "            self.config.hidden_size,\n"
+                '            prefix=maybe_prefix(prefix, "lm_head"),\n'
+                "        )\n"
+                "        self.has_own_lm_head = (\n"
+                "            self.config.draft_vocab_size != self.config.vocab_size\n"
+                "        )\n"
+                "        self.logits_processor = LogitsProcessor(\n"
             )
 
-            if new_snippet in content or old_snippet not in content:
+            if old_snippet not in content:
+                logger.warning(
+                    "Could not apply llama_eagle3 lm_head ownership patch: "
+                    "expected code snippet not found in %s. "
+                    "The vLLM version may have changed.",
+                    file_to_patch,
+                )
                 return
 
-            content = content.replace(old_snippet, new_snippet)
+            content = content.replace(old_snippet, new_snippet, 1)
 
             with open(file_to_patch, "w") as f:
                 f.write(content)
-            logger.info("Successfully patched vllm speculative decoding post_step.")
+
+            logger.info("Successfully patched llama_eagle3 lm_head ownership.")
+
+        def _patch_vllm_hermes_tool_parser_thread_safety():
+            """Patch Hermes2ProToolParser.__init__ to cache tokenizer calls.
+
+            The HuggingFace tokenizer's Rust backend does not support concurrent
+            access. When multiple async requests call _preprocess_chat concurrently,
+            each one constructs a new Hermes2ProToolParser which calls
+            tokenizer.encode() and tokenizer.decode() in __init__, causing
+            "RuntimeError: Already borrowed".
+
+            A lock alone is insufficient because the tool parser's encode() can
+            race with render_chat_async() in another concurrent request — two
+            different codepaths sharing the same tokenizer instance.
+
+            This patch caches the encode/decode results so only the first
+            instantiation (protected by a lock) touches the tokenizer. All
+            subsequent instantiations read from cache without any tokenizer
+            access.
+
+            Related:
+            - https://github.com/vllm-project/vllm/pull/30264
+            - https://github.com/huggingface/tokenizers/issues/537
+            - https://github.com/PrimeIntellect-ai/prime-rl/pull/1837
+            """
+            file_to_patch = _get_vllm_file("tool_parsers/hermes_tool_parser.py")
+
+            with open(file_to_patch, "r") as f:
+                content = f.read()
+
+            if "_tokenizer_cache" in content:
+                logger.info("Hermes tool parser thread-safety patch already applied.")
+                return
+
+            old_import = "import json\nfrom collections.abc import Sequence"
+            new_import = (
+                "import json\nimport threading\nfrom collections.abc import Sequence"
+            )
+
+            old_class_line = "class Hermes2ProToolParser(ToolParser):"
+            new_class_line = (
+                "class Hermes2ProToolParser(ToolParser):\n"
+                "    _tokenizer_lock = threading.Lock()\n"
+                "    _tokenizer_cache = {}"
+            )
+
+            old_init_snippet = (
+                "        self.tool_call_start_token_ids = self.model_tokenizer.encode(\n"
+                "            self.tool_call_start_token, add_special_tokens=False\n"
+                "        )\n"
+                "        self.tool_call_end_token_ids = self.model_tokenizer.encode(\n"
+                "            self.tool_call_end_token, add_special_tokens=False\n"
+                "        )\n"
+                "\n"
+                "        self.tool_call_start_token_array = [\n"
+                "            self.model_tokenizer.decode([token_id])\n"
+                "            for token_id in self.tool_call_start_token_ids\n"
+                "        ]\n"
+                "\n"
+                "        self.tool_call_end_token_array = [\n"
+                "            self.model_tokenizer.decode([token_id])\n"
+                "            for token_id in self.tool_call_end_token_ids\n"
+                "        ]"
+            )
+
+            new_init_snippet = (
+                "        _tid = id(self.model_tokenizer)\n"
+                "        if _tid in Hermes2ProToolParser._tokenizer_cache:\n"
+                "            _cached = Hermes2ProToolParser._tokenizer_cache[_tid]\n"
+                "            self.tool_call_start_token_ids = _cached['start_ids']\n"
+                "            self.tool_call_end_token_ids = _cached['end_ids']\n"
+                "            self.tool_call_start_token_array = _cached['start_array']\n"
+                "            self.tool_call_end_token_array = _cached['end_array']\n"
+                "        else:\n"
+                "            with Hermes2ProToolParser._tokenizer_lock:\n"
+                "                if _tid in Hermes2ProToolParser._tokenizer_cache:\n"
+                "                    _cached = Hermes2ProToolParser._tokenizer_cache[_tid]\n"
+                "                    self.tool_call_start_token_ids = _cached['start_ids']\n"
+                "                    self.tool_call_end_token_ids = _cached['end_ids']\n"
+                "                    self.tool_call_start_token_array = _cached['start_array']\n"
+                "                    self.tool_call_end_token_array = _cached['end_array']\n"
+                "                else:\n"
+                "                    self.tool_call_start_token_ids = self.model_tokenizer.encode(\n"
+                "                        self.tool_call_start_token, add_special_tokens=False\n"
+                "                    )\n"
+                "                    self.tool_call_end_token_ids = self.model_tokenizer.encode(\n"
+                "                        self.tool_call_end_token, add_special_tokens=False\n"
+                "                    )\n"
+                "                    self.tool_call_start_token_array = [\n"
+                "                        self.model_tokenizer.decode([token_id])\n"
+                "                        for token_id in self.tool_call_start_token_ids\n"
+                "                    ]\n"
+                "                    self.tool_call_end_token_array = [\n"
+                "                        self.model_tokenizer.decode([token_id])\n"
+                "                        for token_id in self.tool_call_end_token_ids\n"
+                "                    ]\n"
+                "                    Hermes2ProToolParser._tokenizer_cache[_tid] = {\n"
+                "                        'start_ids': self.tool_call_start_token_ids,\n"
+                "                        'end_ids': self.tool_call_end_token_ids,\n"
+                "                        'start_array': self.tool_call_start_token_array,\n"
+                "                        'end_array': self.tool_call_end_token_array,\n"
+                "                    }"
+            )
+
+            if old_init_snippet not in content:
+                logger.warning(
+                    "Could not apply hermes tool parser thread-safety patch: "
+                    "expected code snippet not found in %s. "
+                    "The vLLM version may have changed.",
+                    file_to_patch,
+                )
+                return
+
+            content = content.replace(old_import, new_import, 1)
+            content = content.replace(old_class_line, new_class_line, 1)
+            content = content.replace(old_init_snippet, new_init_snippet, 1)
+
+            with open(file_to_patch, "w") as f:
+                f.write(content)
+
+            logger.info("Successfully patched hermes tool parser for thread-safety.")
 
         _patch_vllm_init_workers_ray()
         logger.info("Successfully patched vllm _init_workers_ray.")
 
-        _patch_vllm_vit_flash_attn_backend()
-        logger.info("Successfully patched vllm vit flash attention backend.")
-
-        _patch_vllm_speculative_decoding_post_step()
+        _patch_vllm_llama_eagle3_own_lm_head()
+        _patch_vllm_hermes_tool_parser_thread_safety()
 
         try:
             import vllm
@@ -412,9 +499,6 @@ class BaseVllmGenerationWorker:
 
         if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}
-        vllm_kwargs["hf_overrides"].update(
-            self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
-        )
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
@@ -426,12 +510,29 @@ class BaseVllmGenerationWorker:
                 )
                 # disable quantization
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
-        elif "Gemma3ForConditionalGeneration" in getattr(
-            hf_config, "architectures", []
+        elif any(
+            arch in getattr(hf_config, "architectures", [])
+            for arch in (
+                "Gemma3ForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            )
         ):
+            detected_arch = [
+                arch
+                for arch in getattr(hf_config, "architectures", [])
+                if arch
+                in (
+                    "Gemma3ForConditionalGeneration",
+                    "Qwen3_5ForConditionalGeneration",
+                    "Qwen3_5MoeForConditionalGeneration",
+                )
+            ]
             if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
                 print(
-                    "Gemma3ForConditionalGeneration models may crash when skip_tokenizer_init is True. NeMo-RL is forcing it to False for this architecture. See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
+                    f"Detected {detected_arch} which may crash when skip_tokenizer_init is True. "
+                    "NeMo-RL is forcing it to False for this architecture. "
+                    "See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
 
@@ -445,7 +546,9 @@ class BaseVllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
+            enable_prefix_caching=self.cfg["vllm_cfg"].get(
+                "enable_prefix_caching", torch.cuda.get_device_capability()[0] >= 8
+            ),
             dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
@@ -893,6 +996,16 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
         self.llm.llm_engine.reset_prefix_cache()
+        # Clear the renderer's multimodal processor cache (sender side) so it
+        # stays in sync with the receiver cache that vLLM clears internally
+        # during sleep.  Without this, the sender thinks images are already
+        # cached on the receiver and sends data=None, causing an assertion
+        # error.  We only clear the renderer (sender) cache here — the
+        # receiver and worker-level caches are reset by sleep() internally.
+        if hasattr(self.llm, "renderer") and hasattr(
+            self.llm.renderer, "clear_mm_cache"
+        ):
+            self.llm.renderer.clear_mm_cache()
         self.llm.sleep(level=1)
 
         gc.collect()

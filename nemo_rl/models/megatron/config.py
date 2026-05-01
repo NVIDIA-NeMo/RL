@@ -25,7 +25,7 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 
 
 class MegatronGenerationConfig(TypedDict):
-    # Total GPU memory (in GB) allocated for KV cache buffers
+    # Total buffer size is 2x this value (active requests + paused requests)
     buffer_size_gb: int
     # Number of CUDA graphs to pre-compile for different batch sizes
     num_cuda_graphs: int
@@ -75,3 +75,4 @@ class ModelAndOptimizerState(NamedTuple):
     scheduler: OptimizerParamScheduler
     checkpointing_context: dict[str, Any]
     param_sync_func: Optional[Callable]
+    draft_model: Optional[MegatronModule] = None

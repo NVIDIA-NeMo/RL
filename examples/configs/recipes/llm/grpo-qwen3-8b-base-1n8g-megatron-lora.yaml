@@ -11,13 +11,13 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    activation_checkpointing: true
     peft:
       enabled: true
       dim: 128
       alpha: 128
     scheduler:
       lr_warmup_iters: 50
-
   sequence_packing:
     enabled: false
 logger:

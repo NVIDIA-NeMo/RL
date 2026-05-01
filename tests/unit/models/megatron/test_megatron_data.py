@@ -725,6 +725,7 @@ def pack_sequences_setup(request):
             cluster.shutdown()
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize("pack_sequences_setup", [1], indirect=True, ids=["cp1"])
 def test_pack_sequences_comprehensive(pack_sequences_setup):
     """Comprehensive test of pack sequences functionality without context parallelism."""
@@ -749,6 +750,7 @@ def test_pack_sequences_comprehensive(pack_sequences_setup):
                     print(f"    Error: {test_result['error']}")
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize("pack_sequences_setup", [2], indirect=True, ids=["cp2"])
 def test_pack_sequences_with_context_parallel(pack_sequences_setup):
     """Test pack sequences functionality with context parallelism."""
@@ -859,6 +861,7 @@ def get_pack_sequence_parameters_setup(request):
             cluster.shutdown()
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize(
     "get_pack_sequence_parameters_setup", [1], indirect=True, ids=["cp1"]
 )

@@ -36,21 +36,23 @@ TEST_ASSETS_DIR = os.path.join(TESTS_DIR, "test_assets")
 def build_tiny_nemotron5_h_checkpoint(model_path: str) -> None:
     import shutil
 
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers.models.nemotron_h import NemotronHConfig
 
-    config = AutoConfig.from_pretrained(
-        "nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True
+    config = NemotronHConfig(
+        layers_block_type=["mamba", "attention", "mamba"],
+        num_hidden_layers=3,
+        intermediate_size=32,
+        hidden_size=256,
+        num_attention_heads=8,
+        mamba_num_heads=8,
+        num_key_value_heads=8,
+        n_groups=1,
+        vocab_size=131072,
     )
-    config.hybrid_override_pattern = "M*-"
-    config.num_hidden_layers = 3
-    config.intermediate_size = 32
-    config.hidden_size = 256
-    config.num_attention_heads = 8
-    config.mamba_num_heads = 8
-    config.num_key_value_heads = 8
-    config.n_groups = 1
 
-    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_config(config)
+
     tokenizer = AutoTokenizer.from_pretrained(
         "nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True
     )

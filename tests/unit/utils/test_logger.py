@@ -357,7 +357,7 @@ class TestWandbLogger:
 
         # Check that config.update was called with params
         mock_run = mock_wandb.init.return_value
-        mock_run.config.update.assert_called_once_with(params)
+        mock_run.config.update.assert_called_once_with(params, allow_val_change=True)
 
 
 class TestSwanlabLogger:
@@ -476,7 +476,7 @@ class TestSwanlabLogger:
 
         # Check that config.update was called with params
         mock_run = mock_swanlab.init.return_value
-        mock_run.config.update.assert_called_once_with(params)
+        mock_run.config.update.assert_called_once_with(params, allow_val_change=True)
 
 
 class TestMLflowLogger:

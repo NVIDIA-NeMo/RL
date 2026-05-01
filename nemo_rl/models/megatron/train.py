@@ -34,8 +34,11 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
+    DraftLossWrapper,
+    SequencePackingFusionLossWrapper,
     SequencePackingLossWrapper,
     prepare_loss_input,
+    prepare_packed_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
@@ -47,7 +50,11 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
 )
+from nemo_rl.models.megatron.config import MegatronModule
 from nemo_rl.models.megatron.data import ProcessedMicrobatch
+from nemo_rl.models.megatron.draft.hidden_capture import (
+    get_capture_context,
+)
 from nemo_rl.models.policy import PolicyConfig
 
 # Union type for any post-processing function (defined after classes below)
@@ -67,19 +74,20 @@ def model_forward(
     packed_seq_params: Optional[PackedSeqParams] = None,
     defer_fp32_logits: Optional[bool] = False,
     straggler_timer: Optional[StragglerDetector] = None,
+    use_linear_ce_fusion_loss: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
     Args:
         model: The model to run forward pass on
         data_dict: Dictionary containing batch data
-        cfg: Policy configuration dictionary
         input_ids_cp_sharded: Context-parallel sharded input token IDs
         position_ids: Position IDs for tokens
         attention_mask: Attention mask for the sequence
         packed_seq_params: Parameters for packed sequences (optional)
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
         straggler_timer: Straggler detector for profiling the forward pass
+        use_linear_ce_fusion_loss: Whether to use linear CE fusion loss
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -96,6 +104,11 @@ def model_forward(
         additional_kwargs["packed_seq_params"] = packed_seq_params
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
+    if use_linear_ce_fusion_loss:
+        additional_kwargs["labels"] = input_ids_cp_sharded
+        # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
+        # GPTModel.forward signatures do not accept it.
+        additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
 
     with straggler_timer() if straggler_timer is not None else nullcontext():
         output_tensor = model(
@@ -135,6 +148,9 @@ def forward_with_post_processing_fn(
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
+    draft_model: Optional[MegatronModule] = None,
+    enable_hidden_capture: Optional[bool] = False,
+    use_linear_ce_fusion_loss: bool = False,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -151,6 +167,8 @@ def forward_with_post_processing_fn(
         global_valid_toks: Global valid token count for loss normalization
         sampling_params: Sampling parameters (top-k, top-p, temperature)
         straggler_timer: Straggler detector for profiling the forward pass
+        draft_model: Draft model for online draft model training
+        enable_hidden_capture: Whether to enable hidden state capture for draft model training
 
     Returns:
         tuple: (output_tensor, post_processing_fn_wrapped)
@@ -169,16 +187,36 @@ def forward_with_post_processing_fn(
     packed_seq_params = processed_mb.packed_seq_params
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
 
-    output_tensor = model_forward(
-        model=model,
-        data_dict=data_dict,
-        input_ids_cp_sharded=input_ids_cp_sharded,
-        position_ids=position_ids,
-        attention_mask=attention_mask,
-        packed_seq_params=packed_seq_params,
-        defer_fp32_logits=defer_fp32_logits,
-        straggler_timer=straggler_timer,
-    )
+    # Insert hook to capture hidden states and embeddings for draft model training if draft_model is provided
+    capture_context, capture = get_capture_context(model, enable_hidden_capture)
+    with capture_context:
+        output_tensor = model_forward(
+            model=model,
+            data_dict=data_dict,
+            input_ids_cp_sharded=input_ids_cp_sharded,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
+            defer_fp32_logits=defer_fp32_logits,
+            straggler_timer=straggler_timer,
+            use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
+        )
+
+    if capture is not None:
+        from megatron.core.transformer.multi_token_prediction import roll_tensor
+
+        captured_states = capture.get_captured_states()
+        shifted_input_embeds = roll_tensor(
+            captured_states.inputs_embeds,
+            shifts=-1,
+            dims=0,
+            cp_group=get_context_parallel_group(),
+        )[0]
+        data_dict["student_logits"] = draft_model(
+            hidden_states=captured_states.hidden_states,
+            input_embeds=shifted_input_embeds,
+            attention_mask=attention_mask,
+        )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
     # Loss computation should use unscaled logits.
@@ -231,6 +269,9 @@ def megatron_forward_backward(
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
+    draft_model: Optional[MegatronModule] = None,
+    enable_hidden_capture: Optional[bool] = False,
+    use_linear_ce_fusion_loss: bool = False,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -251,6 +292,8 @@ def megatron_forward_backward(
         global_valid_toks: Global valid token count for loss normalization
         sampling_params: Sampling parameters (top-k, top-p, temperature)
         straggler_timer: Straggler detector for profiling the forward pass
+        draft_model: Draft model for online draft model training
+        enable_hidden_capture: Whether to enable hidden state capture for draft model training
 
     Returns:
         Results from the forward/backward execution
@@ -263,6 +306,9 @@ def megatron_forward_backward(
         global_valid_toks=global_valid_toks,
         sampling_params=sampling_params,
         straggler_timer=straggler_timer,
+        draft_model=draft_model,
+        enable_hidden_capture=enable_hidden_capture,
+        use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
     )
     forward_backward_func = get_forward_backward_func()
     return forward_backward_func(
@@ -285,12 +331,17 @@ class LossPostProcessor:
         num_microbatches: int = 1,
         cp_normalize: bool = True,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        draft_model: Optional[MegatronModule] = None,
     ):
         self.loss_fn = loss_fn
         self.cfg = cfg
         self.num_microbatches = num_microbatches
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
+        if draft_model is not None and draft_model.eagle_module is not None:
+            self.d2t = getattr(draft_model.eagle_module, "d2t", None)
+        else:
+            self.d2t = None
 
     def __call__(
         self,
@@ -314,17 +365,27 @@ class LossPostProcessor:
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
-        # wrap prepare_loss_input with sampling_params
+        # wrap prepare_loss_input with sampling_params and optional d2t mapping
         prepare_loss_input_wrapped = partial(
-            prepare_loss_input, sampling_params=self.sampling_params
+            prepare_loss_input, sampling_params=self.sampling_params, d2t=self.d2t
         )
 
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
-            loss_fn_wrapped = SequencePackingLossWrapper(
+            fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
+            if fuse_loss:
+                wrapper_cls = SequencePackingFusionLossWrapper
+                prepare_fn = partial(
+                    prepare_packed_loss_input, sampling_params=self.sampling_params
+                )
+            else:
+                wrapper_cls = SequencePackingLossWrapper
+                prepare_fn = prepare_loss_input_wrapped
+
+            loss_fn_wrapped = wrapper_cls(
                 loss_fn=self.loss_fn,
-                prepare_fn=prepare_loss_input_wrapped,
+                prepare_fn=prepare_fn,
                 cu_seqlens_q=packed_seq_params.cu_seqlens_q,
                 cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
@@ -340,6 +401,16 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
+            if "student_logits" in data_dict:
+                loss_fn_wrapped = DraftLossWrapper(
+                    loss_fn=loss_fn_wrapped,
+                    prepare_fn=prepare_loss_input_wrapped,
+                    data_dict=data_dict,
+                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
+                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                    vocab_parallel_group=get_tensor_model_parallel_group(),
+                    context_parallel_group=get_context_parallel_group(),
+                )
 
         loss_fn_wrapped = partial(
             loss_fn_wrapped,
@@ -378,9 +449,11 @@ class LogprobsPostProcessor:
         self,
         cfg: PolicyConfig,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        use_linear_ce_fusion: bool = False,
     ):
         self.cfg = cfg
         self.sampling_params = sampling_params
+        self.use_linear_ce_fusion = use_linear_ce_fusion
 
     def __call__(
         self,
@@ -405,10 +478,13 @@ class LogprobsPostProcessor:
         original_seq_length = unpacked_input_ids.shape[1]
 
         def processor_fn_inner(output_tensor):
-            tp_grp = get_tensor_model_parallel_group()
-            tp_rank = get_tensor_model_parallel_rank()
-            logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
-            if self.cfg["sequence_packing"]["enabled"]:
+            if self.use_linear_ce_fusion:
+                token_logprobs = output_tensor.to(torch.float32)
+                token_logprobs = token_logprobs[:, : original_seq_length - 1]
+            elif self.cfg["sequence_packing"]["enabled"]:
+                tp_grp = get_tensor_model_parallel_group()
+                tp_rank = get_tensor_model_parallel_rank()
+                logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
                 token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
                     output_tensor,
                     target=input_ids,
@@ -423,6 +499,9 @@ class LogprobsPostProcessor:
                     sampling_params=self.sampling_params,
                 )
             else:
+                tp_grp = get_tensor_model_parallel_group()
+                tp_rank = get_tensor_model_parallel_rank()
+                logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
                 token_logprobs = from_parallel_logits_to_logprobs(
                     output_tensor,
                     target=unpacked_input_ids,

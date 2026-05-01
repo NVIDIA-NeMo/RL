@@ -26,7 +26,7 @@ policy:
   generation:
     vllm_kwargs:
       compilation_config:
-        use_inductor: false
+        backend: eager
 data:
   train:
     dataset_name: DeepScaler
