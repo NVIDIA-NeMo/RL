@@ -32,7 +32,12 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_PORT_RANGE_HIGH,
+    DEFAULT_PORT_RANGE_LOW,
+    ClusterConfig,
+    RayVirtualCluster,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -169,6 +174,7 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...")
+    generation_config = policy_config.get("generation", {})
     cluster = RayVirtualCluster(
         name="sft_cluster",
         bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
@@ -176,6 +182,10 @@ def setup(
         use_gpus=True,
         num_gpus_per_node=cluster_config["gpus_per_node"],
         max_colocated_worker_groups=1,
+        port_range_low=generation_config.get("port_range_low", DEFAULT_PORT_RANGE_LOW),
+        port_range_high=generation_config.get(
+            "port_range_high", DEFAULT_PORT_RANGE_HIGH
+        ),
     )
     print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
 
