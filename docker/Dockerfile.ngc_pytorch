@@ -134,7 +134,7 @@ ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 
 # Do not reinstall torch and related dependencies when using the NGC PyTorch base image
-ARG UV_NO_INSTALL_PACKAGES="--no-install-package torch --no-install-package torchvision --no-install-package triton --no-install-package nvidia-cublas --no-install-package nvidia-cuda-cupti --no-install-package nvidia-cuda-nvrtc --no-install-package nvidia-cuda-runtime --no-install-package nvidia-cudnn-cu13 --no-install-package nvidia-cufft --no-install-package nvidia-cufile --no-install-package nvidia-curand --no-install-package nvidia-cusolver --no-install-package nvidia-cusparse --no-install-package nvidia-cusparselt-cu13 --no-install-package nvidia-nccl-cu13 --no-install-package vllm --no-install-package flash-attn --no-install-package numpy"
+ARG UV_NO_INSTALL_PACKAGES="--no-install-package torch --no-install-package torchvision --no-install-package triton --no-install-package nvidia-cublas --no-install-package nvidia-cuda-cupti --no-install-package nvidia-cuda-nvrtc --no-install-package nvidia-cuda-runtime --no-install-package nvidia-cudnn-cu13 --no-install-package nvidia-cufft --no-install-package nvidia-cufile --no-install-package nvidia-curand --no-install-package nvidia-cusolver --no-install-package nvidia-cusparse --no-install-package nvidia-cusparselt-cu13 --no-install-package nvidia-nccl-cu13 --no-install-package vllm --no-install-package flash-attn --no-install-package numpy --no-install-package cuda-bindings --no-install-package cuda-python"
 ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
 
 # First copy only the dependency files
@@ -148,7 +148,8 @@ COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 # The NGC base image ships Python 3.12 (cp312); lower the project constraint in all
 # workspace members so uv uses system Python rather than downloading an incompatible one.
 RUN find . -name "pyproject.toml" -exec sed -i 's/requires-python = ">=3\.13\.13"/requires-python = ">=3.12"/' {} \; && \
-    sed -i 's/requires-python = ">=3\.13\.13"/requires-python = ">=3.12"/' uv.lock
+    sed -i 's/requires-python = ">=3\.13\.13"/requires-python = ">=3.12"/' uv.lock && \
+    find . -name ".python-version" -exec sed -i 's/3\.13\.13/3.12.3/' {} \;
 
 RUN --mount=type=ssh \
     --mount=type=bind,from=build_vllm,source=/opt,target=/tmp/build_vllm,readonly \
@@ -203,6 +204,7 @@ ARG TARGETARCH
 ENV NEMO_RL_COMMIT=${NEMO_RL_COMMIT:-<unknown>}
 ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
 ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
+ENV UV_NO_SYNC=1
 ENV NEMO_RL_PY_EXECUTABLES_SYSTEM=1
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
