@@ -50,9 +50,19 @@ from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_
 # an automodel factory for loading the huggingface models from correct class
 
 AUTOMODEL_FACTORY: Dict[str, Any] = {
+    # Add an entry here when a model (1) uses HF's standard loading path
+    # (no custom NeMo automodel impl) AND (2) its architecture isn't
+    # loadable via AutoModelForCausalLM (e.g. VLMs using
+    # ForConditionalGeneration / ForImageTextToText). Models with a
+    # custom NeMo automodel impl (e.g. qwen3_5_moe) don't need an entry
+    # — the custom impl intercepts from_pretrained regardless of the
+    # parent AutoModel class. Check MODEL_ARCH_MAPPING in the NeMo
+    # automodel registry to see which architectures have custom impls:
+    # https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
     "qwen2_5_vl": AutoModelForImageTextToText,
     "qwen2_vl": AutoModelForImageTextToText,
     "qwen2_5_omni": AutoModelForTextToWaveform,
+    "qwen3_5": AutoModelForImageTextToText,
     "llava": AutoModelForImageTextToText,
     "internvl": AutoModelForImageTextToText,
     "gemma3": AutoModelForImageTextToText,
@@ -63,9 +73,12 @@ AUTOMODEL_FACTORY: Dict[str, Any] = {
 
 if NEMO_AUTOMODEL_AVAILABLE:
     AUTOMODEL_FACTORY = {
+        # NeMo wrappers — keep in sync with the vanilla HF dict above.
+        # See comment above for when to add entries.
         "qwen2_5_vl": NeMoAutoModelForImageTextToText,
         "qwen2_vl": NeMoAutoModelForImageTextToText,
         "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
+        "qwen3_5": NeMoAutoModelForImageTextToText,
         "llava": NeMoAutoModelForImageTextToText,
         "internvl": NeMoAutoModelForImageTextToText,
         "gemma3": NeMoAutoModelForImageTextToText,
@@ -80,102 +93,6 @@ class IPCProtocol(Enum):
 
     COMPLETE = "complete"
     ACK = "ack"
-
-
-def apply_top_k_top_p(
-    logits: torch.Tensor,
-    top_k: Optional[int] = None,
-    top_p: Optional[float] = None,
-) -> torch.Tensor:
-    """Apply top-k and top-p masks to the logits.
-
-    Simplified version of VLLM's implementation for scalar parameters.
-
-    Based on VLLM's implementation:
-    https://github.com/vllm-project/vllm/blob/34a20c49b3f81f64133428b3a0d62309db1256f9/vllm/v1/sample/ops/topk_topp_sampler.py
-    SPDX-License-Identifier: Apache-2.0
-    Copyright contributors to the vLLM project
-
-    Args:
-        logits: Input logits tensor of shape [batch_size, seq_len, vocab_size]
-        top_k: Top-k sampling parameter. Set to -1 to consider all tokens.
-        top_p: Top-p (nucleus) sampling parameter. Must be in (0, 1]. Set to 1 to consider all tokens.
-
-    Returns:
-        Filtered logits with sampling parameters applied
-    """
-    if top_p is None or top_p == 1.0:
-        if top_k is None or top_k == -1:
-            return logits
-        # Avoid sorting vocab for top-k only case
-        return apply_top_k_only(logits, top_k)
-
-    # Apply top-p (requires sorting)
-    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
-
-    if top_k is not None and top_k != -1:
-        # Apply top-k first
-        top_k_index = logits_sort.size(-1) - top_k
-        # Get all the top_k values - need to broadcast the index across all dimensions
-        index_tensor = torch.full(
-            logits_sort.shape[:-1],
-            top_k_index,
-            device=logits_sort.device,
-            dtype=torch.long,
-        )
-        top_k_threshold = logits_sort.gather(-1, index_tensor.unsqueeze(-1))
-        top_k_mask = logits_sort < top_k_threshold
-        logits_sort.masked_fill_(top_k_mask, -float("inf"))
-
-    # Apply top-p
-    probs_sort = logits_sort.softmax(dim=-1)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    top_p_mask = probs_sum <= 1 - top_p
-    # at least one
-    top_p_mask[..., -1] = False
-    logits_sort.masked_fill_(top_p_mask, -float("inf"))
-
-    # Re-sort the probabilities
-    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
-    return logits
-
-
-def apply_top_k_only(
-    logits: torch.Tensor,
-    top_k: int,
-) -> torch.Tensor:
-    """Apply top-k mask to the logits.
-
-    Simplified version of VLLM's implementation for scalar parameters.
-    This implementation doesn't involve sorting the entire vocab.
-
-    Based on VLLM's implementation:
-    https://github.com/vllm-project/vllm/blob/34a20c49b3f81f64133428b3a0d62309db1256f9/vllm/v1/sample/ops/topk_topp_sampler.py
-    SPDX-License-Identifier: Apache-2.0
-    Copyright contributors to the vLLM project
-
-    Args:
-        logits: Input logits tensor of shape [batch_size, seq_len, vocab_size]
-        top_k: Top-k sampling parameter.
-
-    Returns:
-        Filtered logits with top-k applied
-    """
-    if top_k >= logits.shape[-1] or top_k == -1:
-        return logits
-
-    # Get top-k values and create mask
-    top_k_values, _ = torch.topk(logits, top_k, dim=-1)
-    threshold = top_k_values[..., -1:].expand_as(logits)
-    mask = logits >= threshold
-
-    # Apply mask: keep top-k values, set others to -inf
-    logits = torch.where(
-        mask,
-        logits,
-        torch.tensor(-float("inf"), device=logits.device, dtype=logits.dtype),
-    )
-    return logits
 
 
 def resolve_model_class(model_name: str) -> Any:

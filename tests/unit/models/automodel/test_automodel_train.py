@@ -24,6 +24,8 @@ try:
 except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
@@ -63,6 +65,7 @@ def mock_model():
 def mock_loss_fn():
     loss_fn = MagicMock()
     loss_fn.return_value = (torch.tensor(0.5), {"loss": 0.5})
+    loss_fn.input_type = LossInputType.LOGIT
     return loss_fn
 
 
@@ -93,7 +96,7 @@ def base_cfg():
     return {
         "dtensor_cfg": {"sequence_parallel": False},
         "sequence_packing": {"train_mb_tokens": 256},
-        "generation": {"temperature": 1.0},
+        "generation": {"temperature": 1.0, "top_p": 1.0, "top_k": None},
     }
 
 
@@ -232,34 +235,38 @@ class TestExtractLogits:
 # =====================
 @pytest.mark.automodel
 class TestApplyTemperatureScaling:
-    def test_temperature_scaling_applied(self):
+    """Tests for apply_temperature_scaling function."""
+
+    def test_temperature_scaling_sampling_params_is_none(self):
+        """Test that logits are unchanged when sampling_params is None."""
         logits = torch.randn(4, 64, 32000)
         original_logits = logits.clone()
-        cfg = {"generation": {"temperature": 2.0}}
 
-        result = apply_temperature_scaling(logits, cfg)
+        result = apply_temperature_scaling(logits, None)
+
+        assert torch.equal(result, original_logits)
+
+    def test_temperature_scaling_with_temperature_one(self):
+        """Test that temperature=1.0 leaves logits unchanged."""
+        logits = torch.randn(4, 64, 32000)
+        original_logits = logits.clone()
+        sampling_params = TrainingSamplingParams(temperature=1.0)
+
+        result = apply_temperature_scaling(logits, sampling_params)
+
+        assert torch.equal(result, original_logits)
+
+    def test_temperature_scaling_with_temperature_two(self):
+        """Test that logits are divided by the configured temperature=2.0."""
+        logits = torch.randn(4, 64, 32000)
+        original_logits = logits.clone()
+        sampling_params = TrainingSamplingParams(temperature=2.0)
+
+        result = apply_temperature_scaling(logits, sampling_params)
 
         # Should be divided by temperature
         expected = original_logits / 2.0
         assert torch.allclose(result, expected)
-
-    def test_no_scaling_without_generation_config(self):
-        logits = torch.randn(4, 64, 32000)
-        original_logits = logits.clone()
-        cfg = {}
-
-        result = apply_temperature_scaling(logits, cfg)
-
-        assert torch.equal(result, original_logits)
-
-    def test_no_scaling_with_none_generation(self):
-        logits = torch.randn(4, 64, 32000)
-        original_logits = logits.clone()
-        cfg = {"generation": None}
-
-        result = apply_temperature_scaling(logits, cfg)
-
-        assert torch.equal(result, original_logits)
 
 
 # =====================
@@ -291,7 +298,7 @@ class TestLossPostProcessor:
         vocab_size = 32000
 
         logits = torch.randn(batch_size, seq_len, vocab_size)
-        mb = BatchedDataDict(
+        data_dict = BatchedDataDict(
             {
                 "input_ids": torch.randint(0, vocab_size, (batch_size, seq_len)),
                 "sample_mask": torch.ones(batch_size, dtype=torch.bool),
@@ -300,9 +307,9 @@ class TestLossPostProcessor:
         global_valid_seqs = torch.tensor(8)
         global_valid_toks = torch.tensor(512)
 
-        loss, metrics = processor(
+        processor(
             logits=logits,
-            mb=mb,
+            data_dict=data_dict,
             processed_inputs=processed_inputs_no_flash,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
@@ -310,10 +317,10 @@ class TestLossPostProcessor:
 
         # Verify loss function was called
         mock_loss_fn.assert_called_once()
-        call_args = mock_loss_fn.call_args[0]
-        assert torch.is_tensor(call_args[0])  # logits
-        assert call_args[2] == global_valid_seqs  # global_valid_seqs
-        assert call_args[3] == global_valid_toks  # global_valid_toks
+        call_kwargs = mock_loss_fn.call_args[1]
+        assert torch.is_tensor(call_kwargs["logits"])
+        assert call_kwargs["global_valid_seqs"] == global_valid_seqs
+        assert call_kwargs["global_valid_toks"] == global_valid_toks
 
     @patch("nemo_rl.models.automodel.train.SequencePackingLossWrapper")
     def test_loss_with_sequence_packing(
@@ -347,7 +354,7 @@ class TestLossPostProcessor:
         vocab_size = 32000
 
         logits = torch.randn(batch_size, seq_len, vocab_size)
-        mb = BatchedDataDict(
+        data_dict = BatchedDataDict(
             {
                 "input_ids": torch.randint(0, vocab_size, (batch_size, seq_len)),
                 "sample_mask": torch.ones(batch_size, dtype=torch.bool),
@@ -356,9 +363,9 @@ class TestLossPostProcessor:
         global_valid_seqs = torch.tensor(4)
         global_valid_toks = torch.tensor(128)
 
-        loss, metrics = processor(
+        processor(
             logits=logits,
-            mb=mb,
+            data_dict=data_dict,
             processed_inputs=processed_inputs_with_flash,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
@@ -444,6 +451,7 @@ class TestLogprobsPostProcessor:
         logits = torch.randn(batch_size, seq_len, vocab_size)
         input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
         input_lengths = torch.full((batch_size,), seq_len)
+        data_dict = BatchedDataDict({"input_lengths": input_lengths})
 
         processed_inputs = ProcessedInputs(
             input_ids=input_ids,
@@ -458,8 +466,8 @@ class TestLogprobsPostProcessor:
 
         result = processor(
             logits=logits,
+            data_dict=data_dict,
             processed_inputs=processed_inputs,
-            input_lengths=input_lengths,
             original_batch_size=batch_size,
             original_seq_len=seq_len,
         )
@@ -485,6 +493,7 @@ class TestLogprobsPostProcessor:
         logits = torch.randn(batch_size, seq_len, vocab_size)
         input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
         input_lengths = torch.full((batch_size,), seq_len)
+        data_dict = BatchedDataDict({"input_lengths": input_lengths})
 
         processed_inputs = ProcessedInputs(
             input_ids=input_ids,
@@ -499,8 +508,8 @@ class TestLogprobsPostProcessor:
 
         result = processor(
             logits=logits,
+            data_dict=data_dict,
             processed_inputs=processed_inputs,
-            input_lengths=input_lengths,
             original_batch_size=batch_size,
             original_seq_len=seq_len,
         )
@@ -530,6 +539,7 @@ class TestTopkLogitsPostProcessor:
 
         logits = torch.randn(batch_size, seq_len, vocab_size)
         input_lengths = torch.full((batch_size,), seq_len)
+        data_dict = BatchedDataDict({"input_lengths": input_lengths})
 
         processed_inputs = ProcessedInputs(
             input_ids=torch.randint(0, vocab_size, (batch_size, seq_len)),
@@ -544,8 +554,8 @@ class TestTopkLogitsPostProcessor:
 
         vals, idx = processor(
             logits=logits,
+            data_dict=data_dict,
             processed_inputs=processed_inputs,
-            input_lengths=input_lengths,
             original_batch_size=batch_size,
             original_seq_len=seq_len,
         )
@@ -773,9 +783,8 @@ class TestForwardWithPostProcessingFn:
         )
 
         # Call forward_with_post_processing_fn
-        result, metrics, returned_mb = forward_with_post_processing_fn(
+        _, _, returned_mb = forward_with_post_processing_fn(
             model=mock_model,
-            cfg=base_cfg,
             post_processing_fn=loss_post_processor,
             processed_mb=processed_mb,
             global_valid_seqs=torch.tensor(batch_size),
@@ -837,9 +846,8 @@ class TestForwardWithPostProcessingFn:
         score_post_processor = ScorePostProcessor(cfg=base_cfg)
 
         # Call forward_with_post_processing_fn
-        result, metrics, returned_mb = forward_with_post_processing_fn(
+        result, metrics, _ = forward_with_post_processing_fn(
             model=mock_model,
-            cfg=base_cfg,
             post_processing_fn=score_post_processor,
             processed_mb=processed_mb,
             is_reward_model=True,
@@ -917,7 +925,6 @@ class TestAutomodelForwardBackward:
         # Call automodel_forward_backward in forward_only mode
         results = automodel_forward_backward(
             model=mock_model,
-            cfg=base_cfg,
             data_iterator=iter([processed_mb]),
             post_processing_fn=loss_post_processor,
             forward_only=True,
@@ -992,7 +999,6 @@ class TestAutomodelForwardBackward:
         # Call automodel_forward_backward in forward_only mode
         results = automodel_forward_backward(
             model=mock_model,
-            cfg=base_cfg,
             data_iterator=iter(processed_mbs),
             post_processing_fn=loss_post_processor,
             forward_only=True,
@@ -1082,7 +1088,6 @@ class TestAutomodelForwardBackward:
         # Call automodel_forward_backward with train_context_fn
         results = automodel_forward_backward(
             model=mock_model,
-            cfg=base_cfg,
             data_iterator=iter([processed_mb]),
             post_processing_fn=loss_post_processor,
             forward_only=True,
@@ -1162,7 +1167,6 @@ class TestAutomodelForwardBackward:
         # Call automodel_forward_backward with on_microbatch_start
         results = automodel_forward_backward(
             model=mock_model,
-            cfg=base_cfg,
             data_iterator=iter(processed_mbs),
             post_processing_fn=loss_post_processor,
             forward_only=True,
@@ -1237,7 +1241,6 @@ class TestAutomodelForwardBackward:
         # Call automodel_forward_backward with num_valid_microbatches
         results = automodel_forward_backward(
             model=mock_model,
-            cfg=base_cfg,
             data_iterator=iter(processed_mbs),
             post_processing_fn=loss_post_processor,
             forward_only=True,
@@ -1316,7 +1319,6 @@ class TestForwardWithPostProcessingFnAdditional:
         # Call forward_with_post_processing_fn
         result, metrics, returned_mb = forward_with_post_processing_fn(
             model=mock_model,
-            cfg=base_cfg,
             post_processing_fn=logprobs_post_processor,
             processed_mb=processed_mb,
         )
@@ -1388,9 +1390,8 @@ class TestForwardWithPostProcessingFnAdditional:
         )
 
         # Call forward_with_post_processing_fn
-        result, metrics, returned_mb = forward_with_post_processing_fn(
+        result, metrics, _ = forward_with_post_processing_fn(
             model=mock_model,
-            cfg=base_cfg,
             post_processing_fn=topk_post_processor,
             processed_mb=processed_mb,
         )
@@ -1457,7 +1458,6 @@ class TestForwardWithPostProcessingFnAdditional:
         with pytest.raises(TypeError, match="Unknown post-processing function type"):
             forward_with_post_processing_fn(
                 model=mock_model,
-                cfg=base_cfg,
                 post_processing_fn=unknown_post_processor,
                 processed_mb=processed_mb,
             )
@@ -1518,9 +1518,8 @@ class TestForwardWithPostProcessingFnAdditional:
         )
 
         # Call forward_with_post_processing_fn with processed_mb directly (no iterator)
-        result, metrics, returned_mb = forward_with_post_processing_fn(
+        _, _, returned_mb = forward_with_post_processing_fn(
             model=mock_model,
-            cfg=base_cfg,
             post_processing_fn=loss_post_processor,
             processed_mb=processed_mb,  # Directly provided
             global_valid_seqs=torch.tensor(batch_size),
@@ -1692,6 +1691,7 @@ class TestLogprobsPostProcessorSeqPacking:
         logits = torch.randn(1, packed_seq_len, vocab_size)
         input_ids = torch.randint(0, vocab_size, (1, packed_seq_len))
         input_lengths = torch.tensor([32, 32, 32, 32])
+        data_dict = BatchedDataDict({"input_lengths": input_lengths})
 
         @dataclass
         class MockFlashAttnKwargs:
@@ -1714,8 +1714,8 @@ class TestLogprobsPostProcessorSeqPacking:
 
         result = processor(
             logits=logits,
+            data_dict=data_dict,
             processed_inputs=processed_inputs,
-            input_lengths=input_lengths,
             original_batch_size=original_batch_size,
             original_seq_len=original_seq_len,
         )
@@ -1741,8 +1741,8 @@ class TestLogprobsPostProcessorSeqPacking:
 
         logits = torch.randn(batch_size, seq_len, vocab_size)
         input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
-        # Variable length sequences
         input_lengths = torch.tensor([32, 48, 64, 16])
+        data_dict = BatchedDataDict({"input_lengths": input_lengths})
 
         processed_inputs = ProcessedInputs(
             input_ids=input_ids,
@@ -1757,8 +1757,8 @@ class TestLogprobsPostProcessorSeqPacking:
 
         result = processor(
             logits=logits,
+            data_dict=data_dict,
             processed_inputs=processed_inputs,
-            input_lengths=input_lengths,
             original_batch_size=batch_size,
             original_seq_len=seq_len,
         )
@@ -1799,6 +1799,7 @@ class TestTopkLogitsPostProcessorSeqPacking:
 
         logits = torch.randn(1, packed_seq_len, vocab_size)
         input_lengths = torch.tensor([32, 32, 32, 32])
+        data_dict = BatchedDataDict({"input_lengths": input_lengths})
 
         @dataclass
         class MockFlashAttnKwargs:
@@ -1821,8 +1822,8 @@ class TestTopkLogitsPostProcessorSeqPacking:
 
         vals, idx = processor(
             logits=logits,
+            data_dict=data_dict,
             processed_inputs=processed_inputs,
-            input_lengths=input_lengths,
             original_batch_size=original_batch_size,
             original_seq_len=original_seq_len,
         )
@@ -1896,9 +1897,11 @@ class TestAutomodelForwardBackwardWithGradients:
         )
 
         # Create loss function that returns requires_grad tensor
-        def loss_fn(logits, mb, global_valid_seqs, global_valid_toks):
+        def loss_fn(logits, data, global_valid_seqs, global_valid_toks):
             loss = logits.mean()
             return loss, {"loss": loss.item()}
+
+        loss_fn.input_type = LossInputType.LOGIT
 
         # Create loss post-processor
         loss_post_processor = LossPostProcessor(
@@ -1917,7 +1920,6 @@ class TestAutomodelForwardBackwardWithGradients:
         # Call automodel_forward_backward with forward_only=False
         results = automodel_forward_backward(
             model=model,
-            cfg=base_cfg,
             data_iterator=iter([processed_mb]),
             post_processing_fn=loss_post_processor,
             forward_only=False,  # Enable backward pass

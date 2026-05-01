@@ -115,7 +115,7 @@ def helpsteer3_data_processor(
     extra_env_info = {"ground_truth": ground_truth}
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # Truncate if too long
         for chat_message in message_log:
             chat_message["token_ids"] = chat_message["token_ids"][
@@ -169,7 +169,7 @@ def sft_processor(
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # make smaller and mask out
         for message in message_log:
             message["token_ids"] = message["token_ids"][
@@ -216,9 +216,7 @@ def preference_preprocessor(
         ...     ]
         ... }
         >>>
-        >>> processed = preference_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)  # doctest: +ELLIPSIS
-        <BLANKLINE>
-        ...
+        >>> processed = preference_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)
         >>> len(processed["message_log_chosen"])
         2
         >>> processed["message_log_chosen"][0]["content"]
@@ -361,7 +359,7 @@ def math_data_processor(
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # make smaller and mask out
         for indiv_message in message_log:
             indiv_message["token_ids"] = indiv_message["token_ids"][
@@ -393,33 +391,40 @@ def math_hf_data_processor(
     problem = user_message[0]["content"]
     extra_env_info = {"ground_truth": user_message[1]["content"]}
 
-    message_log: LLMMessageLogType = []
+    # merge system prompt and user prompt
+    message_list = []
+    if task_data_spec.system_prompt:
+        message_list.append(
+            {
+                "role": "system",
+                "content": task_data_spec.system_prompt,
+            }
+        )
     formatted_content = (
         task_data_spec.prompt.format(problem) if task_data_spec.prompt else problem
     )
-    user_message = {
-        "role": "user",
-        "content": formatted_content,
-    }
-    message: list[str] = tokenizer.apply_chat_template(  # type: ignore
-        [user_message],
+    message_list.append({"role": "user", "content": formatted_content})
+
+    message: str = tokenizer.apply_chat_template(  # type: ignore
+        message_list,
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
     )
 
-    user_message["token_ids"] = tokenizer(
+    token_ids = tokenizer(
         message,
         return_tensors="pt",
         add_special_tokens=False,
     )["input_ids"][0]
-    user_message["content"] = message
-    message_log.append(user_message)
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
 
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # make smaller and mask out
         for chat_message in message_log:
             chat_message["token_ids"] = chat_message["token_ids"][
@@ -467,29 +472,30 @@ def vlm_hf_data_processor(
         datum_dict = format_refcoco_dataset(datum_dict)
     elif datum_dict["task_name"] == "geometry3k":
         datum_dict = format_geometry3k_dataset(datum_dict)
+    elif datum_dict["task_name"] == "avqa":
+        pass  # AVQA data is already formatted by AVQADataset.format_data
+    elif datum_dict["task_name"] == "mmau":
+        pass  # MMAU data is already formatted by MMAUDataset.format_data
     else:
         raise ValueError(f"No data processor for task {datum_dict['task_name']}")
 
     user_message = datum_dict["messages"]
     problem = user_message[0]["content"]
     extra_env_info = {"ground_truth": user_message[1]["content"]}
+    if "choices" in datum_dict:
+        extra_env_info["choices"] = datum_dict["choices"]
 
     message_log: VLMMessageLogType = []
     ### only one round of interaction is assumed, this can easily be extended to a conversational setting
     user_message: dict[str, Any] = {"role": "user", "content": []}
     #
     images = []
+    audios = []
     if isinstance(problem, list):
         for content in problem:
-            # for image, video, just append it
+            # for image, video, audio, just append it
             # for text, format the prompt to the problem
-            if content["type"] != "text":
-                user_message["content"].append(content)
-                if content["type"] == "image":
-                    images.append(content["image"])
-                else:
-                    raise ValueError(f"Unsupported content type: {content['type']}")
-            elif content["type"] == "text":
+            if content["type"] == "text":
                 user_message["content"].append(
                     {
                         "type": "text",
@@ -498,6 +504,17 @@ def vlm_hf_data_processor(
                         else content["text"],
                     }
                 )
+            elif content["type"] == "image":
+                user_message["content"].append(content)
+                images.append(content["image"])
+            elif content["type"] == "audio":
+                user_message["content"].append(content)
+                # Store as (audio_array, sample_rate) tuple for vLLM
+                audios.append(
+                    (content["audio"], processor.feature_extractor.sampling_rate)
+                )
+            else:
+                raise ValueError(f"Unsupported content type: {content['type']}")
     else:
         # conversation consists of a text-only message
         user_message["content"] = task_data_spec.prompt.format(problem)
@@ -542,6 +559,10 @@ def vlm_hf_data_processor(
     if "token_type_ids" in message:
         user_message["token_type_ids"] = message["token_type_ids"][0]
 
+    # for qwen2.5-vl (transformers>=5.3), mm_token_type_ids tells the model which tokens are text/image/video for 3D RoPE
+    if "mm_token_type_ids" in message:
+        user_message["mm_token_type_ids"] = message["mm_token_type_ids"][0]
+
     ### append to user message
     message_log.append(user_message)
 
@@ -552,6 +573,7 @@ def vlm_hf_data_processor(
         vllm_kwargs = {
             "vllm_content": None,
             "vllm_images": [],
+            "vllm_audios": [],
         }
 
         # make smaller and mask out
@@ -564,11 +586,11 @@ def vlm_hf_data_processor(
                     chat_message[key] = PackedTensor.empty_like(value)
         loss_multiplier = 0.0
     else:
-        # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images) for the entire conversation
-        # add images for vllm serving
+        # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images/audios) for the entire conversation
         vllm_kwargs = {
             "vllm_content": string_formatted_dialog,
             "vllm_images": images,
+            "vllm_audios": audios,
         }
 
     output: DatumSpec = {

@@ -55,7 +55,6 @@ Limitations and tips:
 - The remote-aware selection uses a conservative static import map (no dynamic import resolution). If a test loads code dynamically that isn’t visible via imports, you may need to run it explicitly once to seed the map.
 - The helper is test-only and does not alter library behavior. It activates automatically when you pass `--testmon`.
 
-Refreshing remote-selection artifacts
 ### Refreshing Remote-Selection Artifacts
 If you change test layout or significantly refactor imports, the remote-selection artifacts may become stale.
 To rebuild them, delete the following files at the repo root and re-run with `--testmon` to seed again:
@@ -68,9 +67,7 @@ rm .nrl_remote_map.json .nrl_remote_state.json
 
 ### Run Unit Tests in a Hermetic Environment
 
-For environments lacking necessary dependencies (e.g., `gcc`, `nvcc`)
-or where environmental configuration may be problematic, tests can be run
-in Docker with this script:
+For environments lacking necessary dependencies (e.g., `gcc`, `nvcc`) or where environmental configuration may be problematic, tests can be run in Docker with this script:
 
 ```sh
 CONTAINER=... bash tests/run_unit_in_docker.sh
@@ -155,7 +152,6 @@ Functional tests are located under `tests/functional/`.
 uv run bash tests/functional/sft.sh
 ```
 
-At the end of each functional test, the metric checks will be printed as well as
 At the end of each functional test, the metric checks will be printed as well as whether they pass or fail. Here is an example:
 
 ```text
@@ -169,8 +165,6 @@ At the end of each functional test, the metric checks will be printed as well as
 
 ### Run Functional Tests in a Hermetic Environment
 
-For environments lacking necessary dependencies (e.g., `gcc`, `nvcc`)
-or where environmental configuration may be problematic, tests can be run
 For environments lacking necessary dependencies (e.g., `gcc`, `nvcc`) or where environmental configuration may be problematic, tests can be run in Docker with this script:
 
 ```sh

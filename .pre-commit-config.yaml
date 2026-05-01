@@ -77,4 +77,4 @@ repos:
           - -lc
           - |
             set -euo pipefail
-            for f in examples/configs/recipes/{llm,vlm}/*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$f"; done
+            ./tools/config_cli.py minimize-check examples/configs/recipes/{llm,vlm}/*.yaml

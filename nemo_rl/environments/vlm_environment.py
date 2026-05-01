@@ -15,7 +15,7 @@ import contextlib
 import io
 import logging
 from functools import partial
-from typing import Any, Callable, List, Optional, TypedDict
+from typing import Any, Callable, List, NotRequired, Optional, TypedDict
 
 import ray
 import torch
@@ -41,7 +41,7 @@ from nemo_rl.environments.utils import chunk_list_to_workers
 
 class VLMEnvConfig(TypedDict):
     num_workers: int
-    stop_strings: Optional[list[str]]  # Default stop strings for this env
+    stop_strings: NotRequired[Optional[list[str]]]  # Default stop strings for this env
     reward_functions: List[dict[str, Any]]  # list of reward functions and their weights
 
 
@@ -144,6 +144,7 @@ class VLMEnvironment(EnvironmentInterface):
         self,
         message_log_batch: list[list[dict[str, str]]],
         metadata: list[VLMEnvironmentMetadata],
+        return_extracted_answer: bool = False,
     ) -> EnvironmentReturn:
         """Runs a step in the vlm environment.
 

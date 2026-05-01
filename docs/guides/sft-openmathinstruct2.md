@@ -4,7 +4,7 @@ This guide explains how to use NeMo RL to run SFT on the [nvidia/OpenMathInstruc
 
 
 ## Train the Model
-To train the model using NeMo RL, use the `examples/configs/recipes/tutorials/sft/sft_openmathinstruct2.yaml` config file. This file closely matches the experiment settings in the [original OpenMathInstruct-2 paper](https://arxiv.org/abs/2410.01560).
+To train the model using NeMo RL, use the `examples/configs/sft_openmathinstruct2.yaml` config file. This file closely matches the experiment settings in the [original OpenMathInstruct-2 paper](https://arxiv.org/abs/2410.01560).
 
 ```
 uv run examples/run_sft.py --config=examples/configs/sft_openmathinstruct2.yaml

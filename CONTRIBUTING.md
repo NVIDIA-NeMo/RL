@@ -144,6 +144,16 @@ If you have write access to the repository (NVIDIA contributors):
 
 6. Create a pull request from your branch to the `main` branch.
 
+7. Run CI tests. CI tests do not run automatically when a pull request is opened.
+   - Apply a CI label based on the test suite to run.
+      - CI:docs - Runs doctests only
+      - CI:L0 - Runs doctests and unit tests
+      - CI:L1 - Runs doctests, unit tests, and functional tests
+      - CI:Lfast - Runs fast unit tests and functional tests only. Skips the container build.
+   - Comment `/ok to test commit-sha`. Replace `commit-sha` with the most recent commit to test such as `/ok to test 7166bce`.
+      - A bot will acknowledge the comment with a thumbs-up and begin the CI.
+      - It is possible to simplify the comment to `/ok to test` without the commit-sha. However, this is only allowed if all commits are from a trusted Nvidia developer and [cryptographically signed](https://docs.github.com/en/authentication/managing-commit-signature-verification).
+
 ### Design Documentation Requirement
 
 **Important**: All new key features (ex: enabling a new parallelization technique, enabling a new RL algorithm) must include documentation update (either a new doc or updating an existing one). This document update should:
@@ -162,7 +172,7 @@ Quality documentation is essential for both the usability of Nemo-RL and its abi
 
 ## Code Quality
 
-- Follow the existing code style and conventions
+- Follow the coding guidelines in [`.claude/skills/`](.claude/skills/) — each skill covers a specific topic (style, config conventions, error handling, testing, copyright, docs)
 - Write tests for new features
 - Update documentation to reflect your changes
 - Ensure all tests pass before submitting a PR

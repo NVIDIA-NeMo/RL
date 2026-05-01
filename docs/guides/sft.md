@@ -67,7 +67,7 @@ NeMo RL SFT uses Hugging Face chat templates to format the individual examples. 
     tokenizer:
       chat_template: NULL
     ```
-3. Use a custom template: If you would like to use a custom template, create a string template in [Jinja format](https://huggingface.co/docs/transformers/v4.34.0/en/chat_templating#how-do-i-create-a-chat-template), and add that string to the config. For example,
+3. Use a custom template: If you would like to use a custom template, create a string template in [Jinja format](https://huggingface.co/docs/transformers/en/chat_templating_writing), and add that string to the config. For example,
 
     ```yaml
     tokenizer:
@@ -171,7 +171,7 @@ data:
 
 #### Data Format
 
-Your JSONL files should contain one JSON object per line with the following structure:
+Your JSONL files should contain one JSON object per line following the [OpenAI Chat Completions function calling format](https://platform.openai.com/docs/guides/function-calling):
 
 ```json
 {
@@ -179,23 +179,38 @@ Your JSONL files should contain one JSON object per line with the following stru
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "What's the weather in Paris?"},
     {"role": "assistant", "content": "I'll check the weather for you.", "tool_calls": [
-      {"name": "get_weather", "arguments": {"city": "Paris", "unit": "celsius"}}
+      {
+        "id": "call_123",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": {"city": "Paris", "unit": "celsius"}
+        }
+      }
     ]},
     {"role": "tool", "content": "22°C, sunny", "tool_call_id": "call_123"},
     {"role": "assistant", "content": "The weather in Paris is currently 22°C and sunny."}
   ],
   "tools": [
     {
+      "type": "function",
       "name": "get_weather",
       "description": "Get current weather for a city",
       "parameters": {
-        "city": {"type": "string", "description": "City name"},
-        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+        "type": "object",
+        "properties": {
+          "city": {"type": "string", "description": "City name"},
+          "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+        },
+        "required": ["city"]
       }
     }
   ]
 }
 ```
+
+> [!NOTE]
+> NeMo RL passes `messages` and `tools` directly to the tokenizer's `apply_chat_template()`, so correct tool call rendering also depends on the model's chat template supporting this format.
 
 #### Tool Calling with Heterogeneous Schemas
 
@@ -321,3 +336,41 @@ uv run examples/run_sft.py \
 ```
 
 For more details on LoRA, see [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685).
+
+### Exporting a LoRA Checkpoint to Hugging Face Format
+
+After training with LoRA on the Megatron backend, the `convert_lora_to_hf.py` script supports two export modes:
+
+- **Merged**: fold the adapter into the base model and export a single standalone HuggingFace checkpoint for inference or evaluation.
+- **Adapter-only**: export only the adapter weights in HuggingFace PEFT format, keeping the base model separate (e.g. for use with vLLM's LoRA support).
+
+See the [Checkpointing documentation](../design-docs/checkpointing.md#converting-megatron-lora-adapter-checkpoints-to-hugging-face-format) for full usage details and examples.
+
+## Optimizations
+
+### Chunked Linear Cross-Entropy Fusion Loss
+
+During standard SFT training the model materializes a full logit tensor of shape `[batch_size, seq_length, vocab_size]`, which can cause out-of-memory (OOM) errors for long sequences or large vocabularies. The **chunked linear cross-entropy fusion loss** avoids this by computing the loss directly from the hidden states: it chunks the sequence dimension, projects each chunk to logits on the fly, computes per-token log probabilities, and discards the logits before moving to the next chunk.
+
+**Benefits:**
+
+- Extends the maximum trainable sequence length significantly (e.g. from <65K to >100K tokens) by eliminating the large logit tensor from GPU memory.
+- Produces numerically equivalent loss values to the standard path.
+
+**How to enable:**
+
+Add the following to your Megatron config in your YAML file:
+
+```yaml
+policy:
+  megatron_cfg:
+    enabled: true
+    use_linear_ce_fusion_loss: true
+    linear_ce_fusion_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
+```
+
+**Notes:**
+
+- This optimization applies to SFT training with `NLLLoss` and DPO training. See the [DPO guide](dpo.md#chunked-linear-cross-entropy-fusion-loss) for DPO-specific details.
+- Context parallelism is not supported when linear CE fusion is enabled.
+- The `linear_ce_fusion_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.

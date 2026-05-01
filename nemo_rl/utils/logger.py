@@ -50,6 +50,7 @@ _rich_logging_configured = False
 class WandbConfig(TypedDict):
     project: NotRequired[str]
     name: NotRequired[str]
+    entity: NotRequired[str]
 
 
 class SwanlabConfig(TypedDict):
@@ -381,7 +382,7 @@ class WandbLogger(LoggerInterface):
         Args:
             params: Dict of hyperparameters to log
         """
-        self.run.config.update(params)
+        self.run.config.update(params, allow_val_change=True)
 
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a plot to wandb.
@@ -400,7 +401,12 @@ class WandbLogger(LoggerInterface):
             step: Global step value
             name: Name of the metric
         """
-        self.run.log({name: wandb.Histogram(histogram)}, step=step)
+        try:
+            self.run.log({name: wandb.Histogram(histogram)}, step=step)
+        except ValueError:
+            # When all values are identical, numpy cannot create finite-sized bins.
+            # Log the scalar value instead.
+            self.run.log({name: histogram[0] if len(histogram) > 0 else 0}, step=step)
 
 
 class SwanlabLogger(LoggerInterface):
@@ -448,7 +454,7 @@ class SwanlabLogger(LoggerInterface):
         Parameters:
             params (Mapping[str, Any]): Mapping of hyperparameter names to values to store in the run configuration.
         """
-        self.run.config.update(params)
+        self.run.config.update(params, allow_val_change=True)
 
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a plot to swanlab.
@@ -1002,7 +1008,10 @@ class Logger(LoggerInterface):
                 for key, value in sample.items():
                     if isinstance(value, torch.Tensor):
                         sample[key] = value.tolist()
-                f.write(json.dumps({**sample, "idx": i}) + "\n")
+                    elif isinstance(value, np.ndarray):
+                        sample[key] = value.tolist()
+                # default=str is a fallback for non-JSON-serializable types (e.g., datetime, custom objects)
+                f.write(json.dumps({**sample, "idx": i}, default=str) + "\n")
 
         print(f"Logged data to {filepath}")
 

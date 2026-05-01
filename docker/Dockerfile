@@ -4,10 +4,10 @@
 #     docker buildx build -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
 #
 #   Self-contained build (specific git ref):
-#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push .
+#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.6.0 --tag <registry>/nemo-rl:r0.6.0 --push .
 #
 #   Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL):
-#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push https://github.com/NVIDIA-NeMo/RL.git
+#     docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.6.0 --tag <registry>/nemo-rl:r0.6.0 --push https://github.com/NVIDIA-NeMo/RL.git
 #
 #   Local NeMo RL source override:
 #     docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
@@ -45,7 +45,7 @@ apt-get install -y --no-install-recommends \
 # Nsight
 apt install -y --no-install-recommends gnupg
 echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list
-apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub
+apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(uname -m | sed 's/aarch64/sbsa/')/7fa2af80.pub
 apt update
 apt install -y nsight-systems-cli
 
@@ -69,8 +69,8 @@ RUN GITHUB_ARTIFACTORY=github.com \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Install uv and python
-ARG UV_VERSION=0.9.7
-ARG PYTHON_VERSION=3.12
+ARG UV_VERSION=0.11.6
+ARG PYTHON_VERSION=3.13.13
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
     uv python install ${PYTHON_VERSION}
@@ -95,6 +95,13 @@ ARG MAX_JOBS
 ARG NVTE_BUILD_THREADS_PER_JOB
 # Only use for custom vllm installs. Learn more at https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
 ARG BUILD_CUSTOM_VLLM
+ARG BUILD_CUSTOM_VLLM_URL
+ARG BUILD_CUSTOM_VLLM_REF
+ARG BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION
+# Only use for custom flashinfer installs.
+ARG BUILD_CUSTOM_FLASHINFER
+ARG BUILD_CUSTOM_FLASHINFER_URL
+ARG BUILD_CUSTOM_FLASHINFER_REF
 # Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
@@ -110,14 +117,18 @@ COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
 COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
+COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh <<"EOF" bash -exu
 uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
-    bash tools/build-custom-vllm.sh
+    bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
     source 3rdparty/vllm/nemo-rl.env
+fi
+if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
+    bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL} ${BUILD_CUSTOM_FLASHINFER_REF}
 fi
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
@@ -144,6 +155,15 @@ EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+# Point TE at the pip-installed cuDNN (nvidia-cudnn-cu12) instead of the system one.
+# The container's system cuDNN (/lib/x86_64-linux-gnu/libcudnn*.so.9) may be a different
+# version than what pip installed. TE prioritizes system libraries by default, causing a
+# version mismatch crash (e.g. system 9.10.1 vs pip 9.19.0). CUDNN_HOME makes TE's Python
+# code find the pip version first, and LD_LIBRARY_PATH makes the dynamic linker resolve
+# cuDNN sub-libraries from pip when loading libtransformer_engine.so.
+ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
+ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
+# Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 
 WORKDIR /opt/nemo-rl
 

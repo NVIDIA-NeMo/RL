@@ -1,0 +1,14 @@
+defaults: grpo-llama3.2-1b-instruct-1n8g-fsdp2tp1.v3.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.2-1b-instruct-1n8g-fsdp2tp2-temp0.8-topp0.9-topk50
+policy:
+  dtensor_cfg:
+    tensor_parallel_size: 2
+  generation:
+    temperature: 0.8
+    top_p: 0.9
+    top_k: 50
+logger:
+  log_dir: logs/grpo-llama3.2-1b-instruct-1n8g-fsdp2tp2-temp0.8-topp0.9-topk50
+  wandb:
+    name: grpo-llama3.2-1b-instruct-1n8g-fsdp2tp2-temp0.8-topp0.9-topk50

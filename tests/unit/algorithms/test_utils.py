@@ -228,10 +228,13 @@ def _base_master_config(colocated: bool):
         "cluster": {"num_nodes": 2, "gpus_per_node": 8},
         "policy": {
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "colocated": {
                     "enabled": colocated,
                     "resources": {"num_nodes": 1, "gpus_per_node": 8},
-                }
+                },
             }
         },
         "grpo": {"num_prompts_per_step": 8, "num_generations_per_prompt": 10},

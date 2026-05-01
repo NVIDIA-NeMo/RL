@@ -219,7 +219,7 @@ def main():
     ) = get_logprobs(
         LLM(
             enforce_eager=False,
-            compilation_config={"use_inductor": False},
+            compilation_config={"backend": "eager"},
             **common_llm_kwargs,
         ),
         prompts,
@@ -229,12 +229,12 @@ def main():
     assert_logprobs_close(
         cuda_graph_prompt_lps_w_inductor_disabled,
         eager_prompt_lps,
-        "Eager and cuda graph mode lps with use_inductor disabled (prompt lps)",
+        "Eager and cuda graph mode lps with backend=eager (prompt lps)",
     )
     assert_logprobs_close(
         cuda_graph_generation_lps_w_inductor_disabled,
         eager_generation_lps,
-        "Eager and cuda graph mode lps with use_inductor disabled (generation lps)",
+        "Eager and cuda graph mode lps with backend=eager (generation lps)",
     )
 
 

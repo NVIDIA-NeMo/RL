@@ -8,12 +8,14 @@ checkpointing:
 policy:
   model_name: Qwen/Qwen3-30B-A3B
   train_micro_batch_size: 1
+  logprob_batch_size: 4
   max_total_sequence_length: 40960
   dtensor_cfg:
     enabled: false
   optimizer: null
   scheduler: null
-  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
