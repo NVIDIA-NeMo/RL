@@ -97,4 +97,4 @@ if "milestones" in scheduler_cfg:
     configure_milestones(scheduler_cfg["milestones"])
 ```
 
-See also: [TypedDict and Configuration Defaults](docs/design-docs/design-and-philosophy.md#typeddict-and-configuration-defaults).
+See also: @docs/design-docs/design-and-philosophy.md (TypedDict and Configuration Defaults section).

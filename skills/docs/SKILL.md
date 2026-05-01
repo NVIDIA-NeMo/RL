@@ -7,7 +7,7 @@ description: Documentation conventions for NeMo-RL. Covers docs/index.md updates
 
 ## Keep docs/index.md Up to Date
 
-When a new markdown doc is added under `docs/**/*.md` or a markdown file is renamed, ensure that `docs/index.md` is updated and the document appears in the most appropriate section.
+When a new markdown doc is added under `docs/**/*.md` or a markdown file is renamed, ensure that @docs/index.md is updated and the document appears in the most appropriate section.
 
 ## Docstring Format
 
@@ -17,6 +17,6 @@ For interfaces that may be used outside a file, prefer docstrings over comments.
 
 ## Document New Features
 
-When a new feature is added, update or create documentation in the `docs/` directory that most closely matches the feature. Look at existing docs to find the best fit — if none exists, create a new doc and add it to `docs/index.md`.
+When a new feature is added, update or create documentation in the `docs/` directory that most closely matches the feature. Look at existing docs to find the best fit — if none exists, create a new doc and add it to @docs/index.md.
 
 Documentation changes are **not required** for bug fixes or CI-related changes.
