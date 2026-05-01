@@ -147,7 +147,6 @@ class GRPOConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     max_val_samples: int
-    skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
     overlong_filtering: NotRequired[bool]
@@ -1336,10 +1335,9 @@ def grpo_train(
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
 
-    if master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
-        assert master_config["loss_fn"]["reference_policy_kl_penalty"] == 0
+    if master_config["loss_fn"]["reference_policy_kl_penalty"] == 0:
         print(
-            "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
+            "Reference policy logprob calculation will be skipped since `loss_fn.reference_policy_kl_penalty` is 0."
         )
 
     # Check if we need to sync KV cache scales
@@ -1731,8 +1729,8 @@ def grpo_train(
                     "force_on_policy_ratio", False
                 )
                 skip_prev_logprobs = force_on_policy_ratio
-                skip_reference_policy_logprobs = master_config["grpo"].get(
-                    "skip_reference_policy_logprobs_calculation", False
+                skip_reference_policy_logprobs = (
+                    master_config["loss_fn"]["reference_policy_kl_penalty"] == 0
                 )
                 if skip_prev_logprobs:
                     print(
@@ -2807,8 +2805,8 @@ def async_grpo_train(
                     "force_on_policy_ratio", False
                 )
                 skip_prev_logprobs = force_on_policy_ratio
-                skip_reference_policy_logprobs = master_config["grpo"].get(
-                    "skip_reference_policy_logprobs_calculation", False
+                skip_reference_policy_logprobs = (
+                    master_config["loss_fn"]["reference_policy_kl_penalty"] == 0
                 )
                 if skip_prev_logprobs:
                     print(
