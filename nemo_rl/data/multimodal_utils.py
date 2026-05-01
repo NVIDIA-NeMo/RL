@@ -214,7 +214,7 @@ def get_multimodal_keys_from_processor(processor) -> list[str]:
         all_keys.update(processor.video_processor.model_input_names)
     if hasattr(processor, "feature_extractor"):
         all_keys.update(processor.feature_extractor.model_input_names)
-    # all_keys.update(processor.model_input_names)
+    all_keys.update(processor.model_input_names)
     all_keys.difference_update(set(processor.tokenizer.model_input_names))
     return list(all_keys)
 
