@@ -174,10 +174,18 @@ fi
 # The venv is symlinked to avoid bloating the layer size
 uv sync --inexact --link-mode symlink --locked --no-install-project $UV_NO_INSTALL_PACKAGES
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    MAX_JOBS=2 CMAKE_BUILD_PARALLEL_LEVEL=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1" uv sync --inexact --link-mode symlink --locked --extra sglang --no-install-project $UV_NO_INSTALL_PACKAGES
+    # sglang-kernel declares torch as a build dep with match-runtime=true, but torch is
+    # excluded from the UV resolution via UV_NO_INSTALL_PACKAGES (uv >=0.11.6 now requires
+    # it to be in the resolution). --no-build-isolation-package lets it build against the
+    # system torch available via --system-site-packages instead.
+    MAX_JOBS=2 CMAKE_BUILD_PARALLEL_LEVEL=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1" uv sync --inexact --link-mode symlink --locked --extra sglang --no-install-project --no-build-isolation-package sglang-kernel $UV_NO_INSTALL_PACKAGES
 fi
-uv sync --inexact --link-mode symlink --locked --extra mcore --no-install-project $UV_NO_INSTALL_PACKAGES
-uv sync --inexact --link-mode symlink --locked --extra automodel --no-install-project $UV_NO_INSTALL_PACKAGES
+# transformer-engine, transformer-engine-torch, flash-attn, deep_ep all have match-runtime=true
+NO_BUILD_ISO_MCORE="--no-build-isolation-package flash-attn --no-build-isolation-package deep_ep --no-build-isolation-package transformer-engine --no-build-isolation-package transformer-engine-torch"
+uv sync --inexact --link-mode symlink --locked --extra mcore --no-install-project $NO_BUILD_ISO_MCORE $UV_NO_INSTALL_PACKAGES
+# flash-attn, mamba-ssm, causal-conv1d, nv-grouped-gemm, transformer-engine, transformer-engine-torch, deep_ep all have match-runtime=true
+NO_BUILD_ISO_AUTOMODEL="--no-build-isolation-package flash-attn --no-build-isolation-package mamba-ssm --no-build-isolation-package causal-conv1d --no-build-isolation-package nv-grouped-gemm --no-build-isolation-package transformer-engine --no-build-isolation-package transformer-engine-torch --no-build-isolation-package deep_ep"
+uv sync --inexact --link-mode symlink --locked --extra automodel --no-install-project $NO_BUILD_ISO_AUTOMODEL $UV_NO_INSTALL_PACKAGES
 uv sync --inexact --link-mode symlink --locked --extra nemo_gym --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --inexact --link-mode symlink --locked --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 
