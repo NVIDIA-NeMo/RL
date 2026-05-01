@@ -144,16 +144,20 @@ From within the NeMo RL container:
 ```bash
 cd /opt/nemo-rl
 
+PYTHONPATH=$PWD/3rdparty/Megatron-LM-workspace/Megatron-LM:${PYTHONPATH:-} \
 uv run --extra mcore --extra modelopt \
-  torchrun --nproc_per_node <NUM_GPUS> \
+  torchrun --nproc_per_node <pipeline-parallel-size> \
   3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/examples/quantization/export.py \
   --hf-model-id <hf-model-name-or-path> \
   --megatron-load-path <path-to-megatron-checkpoint>/policy/weights \
   --export-dir <output-hf-directory> \
-  --tp <tensor-parallel-size> --pp <pipeline-parallel-size>
+  --tp 1 --pp <pipeline-parallel-size>
 ```
 
 - `--hf-model-id` should point to the original (pre-training) HuggingFace model so that the exporter knows the model architecture and tokenizer.
+- The `PYTHONPATH` prefix exposes Megatron-LM's `megatron.training` to the bridge script.
+- **`--tp 1` is required**: modelopt currently does not support TP>1 at export time. Training at TP>1 is fine; the bridge re-shards on load via `mp_overrides`.
+- **`--pp` can be >1** for large models that don't fit on one GPU. `--nproc_per_node` must equal `--pp` (since `--tp` is fixed at 1).
 
 ## Limitations
 

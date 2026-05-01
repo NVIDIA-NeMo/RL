@@ -77,21 +77,30 @@ uv run tests/check_metrics.py $JSON_METRICS \
   'data["train/loss"]["1"] > 0'
 
 # ============================================================================
-# Stage 2: export the quantized checkpoint to HuggingFace format.
+# Stage 2: export the quantized checkpoint to HuggingFace format via
+# Megatron-Bridge's quantization export script — the only path that produces
+# real low-precision weights. PYTHONPATH exposes megatron.training to the
+# bridge script. Export uses --tp 1 (modelopt currently does not support TP>1
+# at export; the bridge re-shards on load via mp_overrides). Stage 1 still
+# trains at TP=2 to exercise the cross-TP load path.
 # ============================================================================
-WEIGHTS_DIR=$CKPT_DIR/step_1/policy/weights
-test -d $WEIGHTS_DIR || { echo "[FAIL] expected checkpoint at $WEIGHTS_DIR"; exit 1; }
+STEP_DIR=$CKPT_DIR/step_1
+test -d $STEP_DIR || { echo "[FAIL] expected checkpoint at $STEP_DIR"; exit 1; }
+WEIGHTS_DIR=$STEP_DIR/policy/weights
+test -d $WEIGHTS_DIR || { echo "[FAIL] no policy/weights under $STEP_DIR"; exit 1; }
 
 rm -rf $EXPORT_DIR
 mkdir -p $EXPORT_DIR
 
+MEGATRON_LM_SRC=$PROJECT_ROOT/3rdparty/Megatron-LM-workspace/Megatron-LM
+PYTHONPATH=$MEGATRON_LM_SRC:${PYTHONPATH:-} \
 uv run --extra mcore --extra modelopt \
-    torchrun --nproc_per_node 2 \
+    torchrun --nproc_per_node 1 \
     $PROJECT_ROOT/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/examples/quantization/export.py \
     --hf-model-id $HF_MODEL \
     --megatron-load-path $WEIGHTS_DIR \
     --export-dir $EXPORT_DIR \
-    --tp 2 --pp 1 \
+    --tp 1 --pp 1 \
     2>&1 | tee -a $RUN_LOG
 
 # Sanity-check the export produced expected artifacts
