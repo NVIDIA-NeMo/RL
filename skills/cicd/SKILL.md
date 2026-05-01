@@ -36,6 +36,35 @@ Use `git rev-parse HEAD` (not the short form) to get the full SHA.
 
 ---
 
+## CI Labels
+
+Every PR **must** have exactly one `CI:*` label — the quality-check job stays
+red until one is attached. Labels control which test tier runs and whether a
+new container image is built.
+
+| Label | What runs | Container |
+|-------|-----------|-----------|
+| `CI:docs` | Doc tests only | Reuses main container |
+| `CI:Lfast` | Fast test subset | Reuses main container |
+| `CI:L0` | Unit tests + docs + lint | Builds new image |
+| `CI:L1` | L0 + functional tests | Builds new image |
+| `CI:L2` | L1 + convergence tests | Builds new image |
+| `Skip CICD` | Nothing (skips all tests) | — |
+
+**Default on merge group / push to main**: L1.
+
+**Which label to attach when opening a PR:**
+
+| Changed paths / nature of change | Label |
+|----------------------------------|-------|
+| Docs only (`docs/`, `*.md`, docstrings) | `CI:docs` |
+| Trivial fix, no logic change | `CI:Lfast` |
+| New code, bug fix, refactor | `CI:L0` |
+| Changes that could affect model behaviour | `CI:L1` |
+| Changes that could affect convergence | `CI:L2` |
+
+---
+
 ## CI Failure Investigation
 
 ```bash
