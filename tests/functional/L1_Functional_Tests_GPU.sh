@@ -41,6 +41,7 @@ run_test      bash ./tests/functional/test_frozen_env.sh
 run_test fast uv run --no-sync bash ./tests/functional/audio_grpo_megatron.sh
 run_test fast uv run --no-sync bash ./tests/functional/distillation.sh
 run_test      uv run --no-sync bash ./tests/functional/distillation_megatron.sh
+run_test      uv run --no-sync bash ./tests/functional/qa_distillation_megatron.sh
 run_test fast uv run --no-sync bash ./tests/functional/dpo.sh
 run_test      uv run --no-sync bash ./tests/functional/dpo_automodel_lora.sh
 run_test fast uv run --no-sync bash ./tests/functional/dpo_megatron_lora.sh
