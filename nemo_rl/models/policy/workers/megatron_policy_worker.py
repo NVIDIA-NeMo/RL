@@ -581,7 +581,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 )
 
                 submodule_path = state_dict_key.rsplit("._extra_state", 1)[0]
-                base_module = getattr(self.model, "module", self.model)
+                base_module = getattr(chunk, "module", chunk)
                 # Unwrap Float16Module/MoEFloat16Module: state_dict keys are relative to inner .module
                 top_level_name = submodule_path.split(".", 1)[0]
                 if not hasattr(base_module, top_level_name):

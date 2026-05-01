@@ -14,7 +14,9 @@
 import os
 import tempfile
 import time
+from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -2887,3 +2889,236 @@ def test_megatron_policy_flops_range_check(tiny_llama_model_path):
     finally:
         policy.shutdown()
         cluster.shutdown()
+
+
+def _new_worker_impl():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    return MegatronPolicyWorkerImpl.__new__(MegatronPolicyWorkerImpl)
+
+
+def test_policy_sequence_packing_vpp_sets_microbatch_bin_constraints(monkeypatch):
+    """Policy init should request microbatch counts divisible by DP * PP for VPP."""
+    import nemo_rl.models.policy.lm_policy as lm_policy_module
+
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "9.0")
+    cluster = SimpleNamespace(
+        world_size=lambda: 4,
+        _sorted_bundle_indices=None,
+        num_gpus_per_node=4,
+    )
+    config = create_megatron_test_config("dummy-model", pp=2, vpp=2)
+    config["sequence_packing"] = {
+        "enabled": True,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+    config["dynamic_batching"]["enabled"] = False
+
+    with (
+        patch.object(lm_policy_module, "RayQueue", return_value=object()),
+        patch.object(lm_policy_module, "RayWorkerBuilder"),
+        patch.object(lm_policy_module, "RayWorkerGroup"),
+        patch.object(lm_policy_module, "get_default_hf_config", return_value={}),
+        patch.object(
+            lm_policy_module.FLOPTracker,
+            "from_config",
+            side_effect=ValueError("unsupported model"),
+        ),
+    ):
+        policy = Policy(cluster=cluster, config=config, tokenizer=MagicMock())
+
+    assert policy.use_sequence_packing is True
+    assert policy.sequence_packing_args["min_bin_count"] == 4
+    assert policy.sequence_packing_args["bin_count_multiple"] == 4
+
+
+def test_worker_forward_pre_hooks_apply_to_all_model_chunks(monkeypatch):
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    class FakeDDP:
+        def __init__(self):
+            self.enable_forward_pre_hook = MagicMock()
+            self.disable_forward_pre_hook = MagicMock()
+
+    monkeypatch.setattr(worker_module, "DistributedDataParallel", FakeDDP)
+    worker = _new_worker_impl()
+    worker.model = [FakeDDP(), FakeDDP()]
+
+    worker.enable_forward_pre_hook()
+    worker.disable_forward_pre_hook(param_sync=False)
+
+    for chunk in worker.model:
+        chunk.enable_forward_pre_hook.assert_called_once_with()
+        chunk.disable_forward_pre_hook.assert_called_once_with(param_sync=False)
+
+
+def test_worker_apply_state_dict_updates_all_model_chunks():
+    class Chunk0(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer0 = torch.nn.Linear(1, 1, bias=False)
+
+    class Chunk1(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer1 = torch.nn.Linear(1, 1, bias=False)
+
+    worker = _new_worker_impl()
+    worker.model = [Chunk0(), Chunk1()]
+    source_state_dict = {
+        "layer0.weight": torch.tensor([[3.0]]),
+        "layer1.weight": torch.tensor([[7.0]]),
+    }
+
+    worker._apply_state_dict_to_model(source_state_dict, raise_if_key_missing=True)
+
+    torch.testing.assert_close(worker.model[0].layer0.weight, torch.tensor([[3.0]]))
+    torch.testing.assert_close(worker.model[1].layer1.weight, torch.tensor([[7.0]]))
+
+
+def test_worker_apply_extra_state_uses_current_model_chunk():
+    class ExtraStateModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.extra_state = None
+
+        def get_extra_state(self):
+            return torch.zeros(1)
+
+        def set_extra_state(self, state):
+            self.extra_state = state
+
+    class Chunk(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block = ExtraStateModule()
+
+    worker = _new_worker_impl()
+    worker.model = [Chunk()]
+    extra_state = torch.tensor([1.0, 2.0])
+
+    worker._apply_state_dict_to_model({"block._extra_state": extra_state})
+
+    assert worker.model[0].block.extra_state is extra_state
+
+
+def test_worker_use_reference_model_restores_all_model_chunks():
+    class Chunk0(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer0 = torch.nn.Linear(1, 1, bias=False)
+
+    class Chunk1(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer1 = torch.nn.Linear(1, 1, bias=False)
+
+    worker = _new_worker_impl()
+    worker.model = [Chunk0(), Chunk1()]
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.should_disable_forward_pre_hook = False
+    worker.sampling_params = None
+    with torch.no_grad():
+        worker.model[0].layer0.weight.fill_(1.0)
+        worker.model[1].layer1.weight.fill_(2.0)
+    worker.reference_state_dict = {
+        "layer0.weight": torch.tensor([[10.0]]),
+        "layer1.weight": torch.tensor([[20.0]]),
+    }
+
+    with worker.use_reference_model():
+        torch.testing.assert_close(
+            worker.model[0].layer0.weight, torch.tensor([[10.0]])
+        )
+        torch.testing.assert_close(
+            worker.model[1].layer1.weight, torch.tensor([[20.0]])
+        )
+
+    torch.testing.assert_close(worker.model[0].layer0.weight, torch.tensor([[1.0]]))
+    torch.testing.assert_close(worker.model[1].layer1.weight, torch.tensor([[2.0]]))
+
+
+def test_worker_prepare_for_training_moves_and_trains_each_model_chunk():
+    worker = _new_worker_impl()
+    worker.model = [MagicMock(), MagicMock()]
+    worker.move_model = MagicMock(side_effect=lambda model, *args, **kwargs: model)
+    worker.optimizer = None
+    worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_logprob = False
+    worker.is_generation_colocated = False
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+
+    worker.prepare_for_training()
+
+    assert worker.move_model.call_count == 2
+    for chunk in worker.model:
+        chunk.train.assert_called_once_with()
+
+
+def test_worker_move_model_recurses_over_model_chunks():
+    worker = _new_worker_impl()
+    model_chunks = [torch.nn.Linear(1, 1), torch.nn.Linear(1, 1)]
+
+    moved_chunks = worker.move_model(model_chunks, "cpu")
+
+    assert moved_chunks == model_chunks
+
+
+def test_worker_check_tensor_parallel_attributes_reads_all_chunks():
+    worker = _new_worker_impl()
+    tp_chunk = torch.nn.Linear(2, 2, bias=False)
+    tp_chunk.weight.tensor_model_parallel = True
+    tp_chunk.weight.partition_dim = 0
+    tp_chunk.weight.partition_stride = 1
+    non_tp_chunk = torch.nn.Linear(2, 1, bias=False)
+    worker.model = [tp_chunk, non_tp_chunk]
+    worker.megatron_cfg = SimpleNamespace(
+        model=SimpleNamespace(tensor_model_parallel_size=2)
+    )
+
+    result = worker.check_tensor_parallel_attributes()
+
+    assert result["total_params"] == 2
+    assert result["tp_size"] == 2
+    assert len(result["tp_params"]) == 1
+    assert len(result["non_tp_params"]) == 1
+
+
+def test_worker_refit_conversion_tasks_use_model_chunk_list():
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = _new_worker_impl()
+    worker.model = [MagicMock(), MagicMock()]
+    worker.dtype = torch.float32
+    mapping = SimpleNamespace(tp_size=2, ep_size=1, is_expert=False)
+    task = SimpleNamespace(
+        param_name="layer.weight",
+        param_weight=torch.ones(4, dtype=torch.float32),
+        mapping=mapping,
+    )
+    worker.megatron_bridge = MagicMock()
+    worker.megatron_bridge.get_conversion_tasks.return_value = [task]
+
+    with patch.object(
+        worker_module, "broadcast_obj_from_pp_rank", side_effect=lambda value: value
+    ):
+        result = worker._calculate_refit_param_info()
+
+    worker.megatron_bridge.get_conversion_tasks.assert_called_once_with(worker.model)
+    assert result == [("layer.weight", 32)]
+
+
+def test_worker_get_gpu_info_uses_first_model_chunk():
+    worker = _new_worker_impl()
+    worker.model = [MagicMock(), MagicMock()]
+
+    with patch(
+        "nemo_rl.models.policy.utils.get_gpu_info",
+        return_value={"name": "test-gpu"},
+    ) as mock_get_gpu_info:
+        result = worker.get_gpu_info()
+
+    mock_get_gpu_info.assert_called_once_with(worker.model[0])
+    assert result == {"name": "test-gpu"}
