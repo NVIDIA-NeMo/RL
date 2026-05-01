@@ -172,6 +172,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         if dp_replicate_size is None or dp_replicate_size <= 0:
             dp_replicate_size = 1
+        if (
+            dtensor_enable
+            and dp_replicate_size > 1
+            and not config["dtensor_cfg"].get("_v2", False)
+        ):
+            raise ValueError(
+                "dp_replicate_size > 1 requires policy.dtensor_cfg._v2: true "
+                "(Automodel DTensor v2 backend). HSDP is not supported with the "
+                "V1 DTensor worker."
+            )
 
         if (
             not bool(os.environ.get("NRL_IGNORE_TP_ACCURACY_CHECK"))
