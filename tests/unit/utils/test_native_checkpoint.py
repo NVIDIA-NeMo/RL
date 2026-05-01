@@ -43,6 +43,7 @@ simple_policy_config = {
     "max_total_sequence_length": 1024,
     "precision": "float32",
     "offload_optimizer_for_logprob": False,
+    "use_pinned_optimizer_offload": False,
     "optimizer": {
         "name": "torch.optim.AdamW",
         "kwargs": {
