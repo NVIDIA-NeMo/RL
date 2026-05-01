@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict, Union
+from typing import Any, Literal, NotRequired, Optional, TypedDict, Union
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
@@ -149,6 +149,18 @@ class MegatronDDPConfig(TypedDict):
     overlap_param_gather: bool
     use_custom_fsdp: bool
     data_parallel_sharding_strategy: str
+    # Number of DDP gradient-reduce buckets (matches --ddp-num-buckets N in MLM).
+    # bucket_size is computed automatically as total_params // ddp_num_buckets using
+    # the raw (pre-DDP) model parameter count, mirroring MLM's approach exactly.
+    # Takes precedence over bucket_size when set.
+    ddp_num_buckets: NotRequired[int]
+    # Maximum parameters per DDP bucket. None uses MCore default: max(40M, 1M * dp_size).
+    # Larger buckets → fewer all-reduces → better NCCL efficiency over IB at large DP counts.
+    # Prefer ddp_num_buckets to let nemo-rl auto-compute this from the model.
+    bucket_size: NotRequired[Optional[int]]
+    # If True, pad each bucket size to a power of 2 (2^16) for high NCCL bus bandwidth.
+    # Matches --ddp-pad-buckets-for-high-nccl-busbw in MLM.
+    ddp_pad_buckets_for_high_nccl_busbw: NotRequired[bool]
 
 
 # Type exists to be lax if not specified
@@ -197,6 +209,27 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Attention backend to use. Options: 'flash', 'fused', 'unfused', 'local', 'auto'.
+    # 'flash' uses FlashAttention and can significantly improve throughput.
+    attention_backend: NotRequired[str | None]
+    # CUDA graph capture scope. List of module types to capture.
+    # Options: 'mamba', 'attn', 'mlp', 'moe', 'moe_router', 'moe_preprocess', 'full_iteration'.
+    # Example: ["mamba", "attn", "moe_router"]
+    cuda_graph_scope: NotRequired[list[str] | None]
+    # Use fused weighted squared ReLU kernel for MoE activation. Improves throughput.
+    use_fused_weighted_squared_relu: NotRequired[bool]
+    # Communicator groups that should use high-priority CUDA streams.
+    # High-priority streams minimize exposed communication latency when overlapped with compute.
+    # Example: ["ep"] to prioritize expert-parallel communication.
+    high_priority_stream_groups: NotRequired[list[str] | None]
+    # If False, skip creating gloo process groups (matches --disable-gloo-process-groups in MLM).
+    # Recommended: False for pure NCCL setups (faster optimizer steps).
+    use_gloo_process_groups: NotRequired[bool]
+    # Use Transformer Engine RNG tracker. Required for correct CUDA graph operation.
+    # Matches --te-rng-tracker in MLM.
+    te_rng_tracker: NotRequired[bool]
+    # Enable fused cross-entropy loss kernel. Matches --cross-entropy-loss-fusion in MLM.
+    cross_entropy_loss_fusion: NotRequired[bool]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig

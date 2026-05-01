@@ -32,8 +32,10 @@ from megatron.bridge.training.config import (
     CheckpointConfig,
     ConfigContainer,
     DistributedDataParallelConfig,
+    DistributedInitConfig,
     LoggerConfig,
     OptimizerConfig,
+    RNGConfig,
     SchedulerConfig,
     TokenizerConfig,
     TrainingConfig,
@@ -52,6 +54,7 @@ from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
+from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
@@ -516,6 +519,28 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.apply_rope_fusion = config["megatron_cfg"]["apply_rope_fusion"]
     model_cfg.bias_activation_fusion = config["megatron_cfg"]["bias_activation_fusion"]
 
+    # Attention backend (e.g. 'flash', 'fused', 'unfused', 'local', 'auto')
+    attention_backend = config["megatron_cfg"].get("attention_backend", None)
+    if attention_backend is not None:
+        model_cfg.attention_backend = AttnBackend[attention_backend]
+
+    # CUDA graph scope (list of strings, e.g. ["mamba", "attn", "moe_router"])
+    cuda_graph_scope = config["megatron_cfg"].get("cuda_graph_scope", None)
+    if cuda_graph_scope is not None:
+        model_cfg.cuda_graph_scope = [CudaGraphScope[scope] for scope in cuda_graph_scope]
+
+    # Fused weighted squared ReLU for MoE
+    use_fused_weighted_squared_relu = config["megatron_cfg"].get(
+        "use_fused_weighted_squared_relu", None
+    )
+    if use_fused_weighted_squared_relu is not None:
+        model_cfg.use_fused_weighted_squared_relu = use_fused_weighted_squared_relu
+
+    # Cross-entropy loss fusion (matches --cross-entropy-loss-fusion in MLM)
+    cross_entropy_loss_fusion = config["megatron_cfg"].get("cross_entropy_loss_fusion", False)
+    if cross_entropy_loss_fusion:
+        model_cfg.cross_entropy_loss_fusion = True
+
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
     if fp8_cfg is not None and fp8_cfg.get("enabled", False):
@@ -640,6 +665,22 @@ def _create_megatron_config(
     dtype: torch.dtype,
 ) -> ConfigContainer:
     """Create the final Megatron configuration container."""
+    ddp_cfg = config["megatron_cfg"]["distributed_data_parallel_config"]
+
+    high_priority_stream_groups = config["megatron_cfg"].get(
+        "high_priority_stream_groups", None
+    )
+    # Matches --disable-gloo-process-groups in MLM. Default False for pure-NCCL setups.
+    use_gloo_process_groups = config["megatron_cfg"].get("use_gloo_process_groups", False)
+    dist_config = DistributedInitConfig(
+        high_priority_stream_groups=high_priority_stream_groups,
+        use_gloo_process_groups=use_gloo_process_groups,
+    )
+
+    # te_rng_tracker: required for correct CUDA graph operation (matches --te-rng-tracker in MLM).
+    te_rng_tracker = config["megatron_cfg"].get("te_rng_tracker", False)
+    rng_config = RNGConfig(te_rng_tracker=te_rng_tracker)
+
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
@@ -651,25 +692,22 @@ def _create_megatron_config(
         ),
         optimizer=OptimizerConfig(**config["megatron_cfg"]["optimizer"]),
         ddp=DistributedDataParallelConfig(
-            check_for_nan_in_grad=True,
-            grad_reduce_in_fp32=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["grad_reduce_in_fp32"],
-            overlap_grad_reduce=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["overlap_grad_reduce"],
-            overlap_param_gather=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["overlap_param_gather"],
+            check_for_nan_in_grad=False,
+            grad_reduce_in_fp32=ddp_cfg["grad_reduce_in_fp32"],
+            overlap_grad_reduce=ddp_cfg["overlap_grad_reduce"],
+            overlap_param_gather=ddp_cfg["overlap_param_gather"],
             # we need to set average_in_collective=False with calculate_per_token_loss=T
             # otherwise, mcore throws an assertion error.
             average_in_collective=False,  # Required with calculate_per_token_loss=True
             use_distributed_optimizer=config["megatron_cfg"]["optimizer"][
                 "use_distributed_optimizer"
             ],
-            data_parallel_sharding_strategy=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["data_parallel_sharding_strategy"],
+            data_parallel_sharding_strategy=ddp_cfg["data_parallel_sharding_strategy"],
+            # bucket_size: matches --ddp-num-buckets / --ddp-bucket-size in MLM.
+            # None uses MCore default: max(40M, 1M * dp_size).
+            bucket_size=ddp_cfg.get("bucket_size", None),
+            # Pad buckets for high NCCL bus bandwidth (matches --ddp-pad-buckets-for-high-nccl-busbw).
+            pad_buckets_for_high_nccl_busbw=ddp_cfg.get("ddp_pad_buckets_for_high_nccl_busbw", False),
         ),
         scheduler=SchedulerConfig(**config["megatron_cfg"]["scheduler"]),
         dataset=None,
@@ -677,6 +715,8 @@ def _create_megatron_config(
             tokenizer_type="HuggingFaceTokenizer",
             tokenizer_model=hf_model_name,
         ),
+        dist=dist_config,
+        rng=rng_config,
     )
 
 
@@ -746,6 +786,24 @@ def setup_model_and_optimizer(
     torch.distributed.barrier()
 
     pre_wrap_hook = []
+
+    # If ddp_num_buckets is configured, compute bucket_size from the raw (pre-DDP) model
+    # parameter count, mirroring MLM's --ddp-num-buckets flag exactly.
+    _ddp_cfg = policy_cfg["megatron_cfg"]["distributed_data_parallel_config"]
+    _ddp_num_buckets = _ddp_cfg.get("ddp_num_buckets", None)
+    if _ddp_num_buckets is not None:
+        def _bucket_size_hook(models, _num_buckets=_ddp_num_buckets):
+            total_params = sum(
+                sum(p.numel() for p in model_module.parameters())
+                for model_module in models
+            )
+            megatron_cfg.ddp.bucket_size = total_params // _num_buckets
+            print(
+                f"[DDP] ddp_num_buckets={_num_buckets}, total_params={total_params:,}, "
+                f"bucket_size={megatron_cfg.ddp.bucket_size:,}"
+            )
+            return models
+        pre_wrap_hook.append(_bucket_size_hook)
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
 

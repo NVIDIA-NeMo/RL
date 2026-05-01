@@ -29,14 +29,14 @@ checkpointing:
   metric_name: null
   higher_is_better: false
   keep_top_k: null
-  save_period: 100  # matches --save-interval 100
+  save_period: 50 #100  # matches --save-interval 100
   checkpoint_must_save_by: null
 
 policy:
   # TODO: Provide the path to the Super V3 HF-format pretrained model.
   # This should be a converted version of the Megatron checkpoint at:
   #   /lustre/fsw/portfolios/llmservice/users/jjennings/runs/super-sft/checkpoints/super-reinit-embeddings-iter-80k/checkpoints
-  model_name: /mnt/superv3_pretrained
+  model_name: /mnt/superv3_pretrained #_mlm
   tokenizer:
     # TODO: Verify this points to the correct Super V3 tokenizer.
     # MLM uses: /lustre/fsw/portfolios/llmservice/users/jjennings/workspace/megatron-sft-right-truncation/tokenizers
@@ -108,7 +108,7 @@ policy:
       NCCL_P2P_NET_CHUNKSIZE: "2097152"
       NCCL_DEBUG: "WARN"
       TORCHINDUCTOR_WORKER_START: "fork"
-    empty_unused_memory_level: 1
+    empty_unused_memory_level: 0 #1
     activation_checkpointing: false  # ignored when recompute_granularity is set
     # Selective recompute on MoE modules — matches MLM's
     # --recompute-granularity selective --recompute-modules moe
@@ -133,6 +133,19 @@ policy:
     bias_activation_fusion: False
     defer_fp32_logits: False
     moe_per_layer_logging: False
+    # Attention backend: 'flash' uses FlashAttention for improved throughput
+    attention_backend: "flash"          # matches --attention-backend flash
+    # CUDA graph scope: capture specific module types to reduce Python overhead
+    cuda_graph_scope: ["mamba", "attn", "moe_router"]  # matches --cuda-graph-scope mamba attn moe_router
+    # Fused weighted squared ReLU activation kernel for MoE
+    use_fused_weighted_squared_relu: True  # matches --use-fused-weighted-squared-relu
+    # High-priority CUDA streams for expert-parallel communication
+    high_priority_stream_groups: ["ep"]  # matches --high-priority-stream-groups ep
+    use_gloo_process_groups: false
+    # TE RNG tracker required for correct CUDA graph operation (matches --te-rng-tracker in MLM)
+    te_rng_tracker: true
+    # Fused cross-entropy loss kernel (matches --cross-entropy-loss-fusion in MLM)
+    # cross_entropy_loss_fusion: true  # disabled: causes NCCL collective ordering deadlock in MoE selective recompute backward
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"  # matches --moe-token-dispatcher-type alltoall
     moe_shared_expert_overlap: False    # Super uses --moe-shared-expert-compute-before-router (not overlap)
@@ -180,7 +193,7 @@ policy:
       clip_grad: ${policy.max_grad_norm}  # matches --clip-grad 1.0
 
       # optimizer cpu offload
-      optimizer_cpu_offload: false
+      optimizer_cpu_offload: false #true
       optimizer_offload_fraction: 1.0
 
     scheduler:
@@ -198,6 +211,12 @@ policy:
       overlap_param_gather: true        # matches --overlap-param-gather
       data_parallel_sharding_strategy: "no_shard"
       use_custom_fsdp: false
+      # Number of DDP buckets (matches --ddp-num-buckets 10 in MLM).
+      # nemo-rl auto-computes bucket_size = total_params // ddp_num_buckets from the raw model.
+      #ddp_num_buckets: 10
+      # Pad bucket sizes to a power of 2 for high NCCL bus bandwidth over IB.
+      # Matches --ddp-pad-buckets-for-high-nccl-busbw in MLM.
+      ddp_pad_buckets_for_high_nccl_busbw: true
 
     fp8_cfg:
       enabled: false
