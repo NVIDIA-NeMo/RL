@@ -883,7 +883,7 @@ class RayWorkerGroup:
             [self.sharding_annotations.get_axis_size(ax) for ax in replicate_on_axes]
         )
         if replicate_degrees > 1:
-            # Use ray.put to serialize all the arguments. This can reduce the cost 
+            # Use ray.put to serialize all the arguments. This can reduce the cost
             # of repeated serialization when we send same arguments to multiple workers.
             _args = []
             for arg in args:
