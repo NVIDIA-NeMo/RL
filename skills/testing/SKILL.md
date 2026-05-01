@@ -38,7 +38,7 @@ Create a shell script in the matching domain (`tests/test_suites/llm/` or `tests
 
 ### 3. Add to nightly list
 
-Append the driver script path (relative to `tests/test_suites/`) to `tests/test_suites/nightly.txt`.
+Append the driver script path (relative to `tests/test_suites/`) to @tests/test_suites/nightly.txt.
 
 ## Recipe Naming Rules
 

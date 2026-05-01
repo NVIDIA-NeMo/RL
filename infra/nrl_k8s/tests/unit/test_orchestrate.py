@@ -47,7 +47,7 @@ def _infra_payload(
         "namespace": "ns-a",
         "image": "img:1",
         "launch": {"entrypoint": training_entrypoint},
-        "clusters": {
+        "kuberay": {
             "training": {
                 "name": "rc-train",
                 "spec": {
@@ -59,7 +59,7 @@ def _infra_payload(
         },
     }
     if gym_entrypoint is not None:
-        base["clusters"]["gym"] = {
+        base["kuberay"]["gym"] = {
             "name": "rc-gym",
             "spec": {
                 "headGroupSpec": {
@@ -295,7 +295,7 @@ class TestEnsureCluster:
         log_fn, lines = log
         loaded = _loaded()
         rendered = orchestrate.build_raycluster_manifest(
-            loaded.infra.clusters.training, loaded.infra
+            loaded.infra.kuberay.training, loaded.infra
         )
         live = {
             "metadata": {
@@ -325,7 +325,7 @@ class TestEnsureCluster:
         loaded = _loaded()
         # Start from the rendered spec, mutate one field to simulate drift.
         rendered = orchestrate.build_raycluster_manifest(
-            loaded.infra.clusters.training, loaded.infra
+            loaded.infra.kuberay.training, loaded.infra
         )
         drifted = {"metadata": {"name": "rc-train"}, "spec": dict(rendered["spec"])}
         drifted["spec"]["rayVersion"] = "drifted"
@@ -348,7 +348,7 @@ class TestEnsureCluster:
         log_fn, lines = log
         loaded = _loaded()
         rendered = orchestrate.build_raycluster_manifest(
-            loaded.infra.clusters.training, loaded.infra
+            loaded.infra.kuberay.training, loaded.infra
         )
         drifted = {"metadata": {"name": "rc-train"}, "spec": dict(rendered["spec"])}
         drifted["spec"]["rayVersion"] = "drifted"

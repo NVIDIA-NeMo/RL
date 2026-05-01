@@ -148,9 +148,11 @@ launch:
       logger.wandb.name=qwen3-30b-math-gb300 \
       2>&1 | tee "\${LOG}"
 
-clusters:
+kuberay:
   training:
     name: ${user:}-raycluster-qwen3-30b-math-gb300
+    # Not optimal — segmentSize=1 is equivalent to no topology/rack constraint. On NVL72 can go up to 18. Usually tuned to EP size
+    segmentSize: 1
     labels:
       disagg.nemo-rl/cluster: qwen3-30b-math-gb300
       disagg.nemo-rl/run: qwen3-30b-math-gb300

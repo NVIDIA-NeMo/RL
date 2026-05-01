@@ -48,8 +48,10 @@ from . import k8s, submit, workdir
 from .config import LoadedConfig, get_username
 from .manifest import (
     build_compute_domain_manifest,
+    build_deployment_manifest,
     build_raycluster_manifest,
     build_roce_template_manifest,
+    build_service_for_deployment,
     dra_resources_for_cluster,
 )
 from .schema import ClusterSpec, CodeSource, InfraConfig, SubmitterMode
@@ -246,6 +248,68 @@ def delete_dra_resources(
             k8s.delete_compute_domain(name, namespace)
 
 
+def ensure_deployment(
+    dep_key: str,
+    loaded: LoadedConfig,
+    *,
+    log: callable,
+) -> str:
+    """Apply a Kubernetes Deployment + auto-created ClusterIP Service."""
+    dep = _require_deployment(loaded.infra, dep_key)
+    manifest = build_deployment_manifest(dep, loaded.infra)
+    name = dep.name
+    namespace = loaded.infra.namespace
+
+    live = k8s.get_deployment(name, namespace)
+    if live is not None:
+        live_owner = ""
+        if hasattr(live, "metadata") and live.metadata and live.metadata.labels:
+            live_owner = live.metadata.labels.get("nrl-k8s/owner", "")
+        me = get_username()
+        if live_owner and live_owner != me:
+            raise RuntimeError(
+                f"Deployment {name} in namespace {namespace} is owned by "
+                f"'{live_owner}' (you are '{me}'). Use a different deployment "
+                f"name or ask {live_owner} to tear it down."
+            )
+
+    log(f"[deployment:{dep_key}] applying Deployment {name} in namespace {namespace}")
+    k8s.apply_deployment(manifest, namespace)
+
+    svc_manifest = build_service_for_deployment(dep, loaded.infra)
+    if svc_manifest is not None:
+        log(f"[deployment:{dep_key}] applying ClusterIP Service {name}")
+        k8s.apply_service(svc_manifest, namespace)
+        log(f"[deployment:{dep_key}] DNS: {name}.{namespace}.svc.cluster.local")
+
+    if dep.healthCheckUrl:
+        log(f"[deployment:{dep_key}] waiting for Deployment {name} to be ready ...")
+        t0 = time.monotonic()
+        k8s.wait_for_deployment_ready(
+            name, namespace, timeout_s=dep.healthCheckTimeoutS
+        )
+        remaining = max(10, dep.healthCheckTimeoutS - int(time.monotonic() - t0))
+        _wait_for_http(dep.healthCheckUrl, remaining, log, f"deployment:{dep_key}")
+
+    return name
+
+
+def delete_deployment(
+    dep_key: str,
+    loaded: LoadedConfig,
+    *,
+    log: callable,
+) -> None:
+    """Delete a managed Deployment and its auto-created Service."""
+    dep = _require_deployment(loaded.infra, dep_key)
+    name = dep.name
+    namespace = loaded.infra.namespace
+    log(f"[deployment:{dep_key}] deleting Service {name}")
+    k8s.delete_service(name, namespace)
+    log(f"[deployment:{dep_key}] deleting Deployment {name}")
+    k8s.delete_deployment(name, namespace)
+
+
 def submit_daemon(
     role: Role,
     loaded: LoadedConfig,
@@ -285,7 +349,7 @@ def submit_daemon(
         if existing in (JobStatus.FAILED, JobStatus.STOPPED) and not replace:
             raise RuntimeError(
                 f"daemon {daemon.submissionId} is {existing.value} — "
-                f"re-run with --replace (or bump infra.clusters.{role}.daemon.submissionId)"
+                f"re-run with --replace (or bump infra.kuberay.{role}.daemon.submissionId)"
             )
 
         # Ray refuses to re-use a submissionId even after terminal state, so
@@ -406,7 +470,7 @@ def submit_training(
         with submit.dashboard_url(name, infra.namespace) as dash:
             client = JobSubmissionClient(dash)
             for job in client.list_jobs():
-                if job.status is JobStatus.RUNNING:
+                if job.status is JobStatus.RUNNING and job.submission_id:
                     log(
                         f"[training] --replace: stopping running job {job.submission_id}"
                     )
@@ -482,6 +546,9 @@ def run(
     if replace:
         _reset_endpoint_registry(loaded, log=log)
 
+    for dep_key in loaded.infra.deployments:
+        ensure_deployment(dep_key, loaded, log=log)
+
     for role in ALL_ROLES:
         if _get_cluster(loaded.infra, role) is None:
             log(f"[{role}] not defined in recipe — skipping")
@@ -508,7 +575,7 @@ def _infer_disagg_job_id(infra: InfraConfig) -> str | None:
     ``vllm_base_urls``. We parse the id from the gym daemon entrypoint so
     ``--replace`` can delete the ConfigMap without a dedicated config key.
     """
-    gym = infra.clusters.gym
+    gym = infra.kuberay.gym
     if gym is None or gym.daemon is None:
         return None
     m = _JOB_ID_RE.search(gym.daemon.entrypoint)
@@ -535,14 +602,25 @@ def _reset_endpoint_registry(loaded: LoadedConfig, *, log: callable) -> None:
 
 
 def _get_cluster(infra: InfraConfig, role: Role) -> ClusterSpec | None:
-    return getattr(infra.clusters, role)
+    return getattr(infra.kuberay, role)
 
 
 def _require_cluster(infra: InfraConfig, role: Role) -> ClusterSpec:
     cluster = _get_cluster(infra, role)
     if cluster is None:
-        raise ValueError(f"infra.clusters.{role} is not defined")
+        raise ValueError(f"infra.kuberay.{role} is not defined")
     return cluster
+
+
+def _get_deployment(infra: InfraConfig, key: str):
+    return infra.deployments.get(key)
+
+
+def _require_deployment(infra: InfraConfig, key: str):
+    dep = _get_deployment(infra, key)
+    if dep is None:
+        raise ValueError(f"infra.deployments.{key} is not defined")
+    return dep
 
 
 def _upload_paths(infra: InfraConfig) -> list[str]:
@@ -579,7 +657,7 @@ def _wait_job_stopped(
     )
 
 
-def _wait_for_http(url: str, timeout_s: int, log: callable, role: Role) -> None:
+def _wait_for_http(url: str, timeout_s: int, log: callable, role: str) -> None:
     log(f"[{role}] waiting for health-check {url} (timeout {timeout_s}s)")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -599,7 +677,9 @@ __all__ = [
     "RunResult",
     "bring_up_cluster",
     "default_run_id",
+    "delete_deployment",
     "ensure_cluster",
+    "ensure_deployment",
     "run",
     "submit_daemon",
     "submit_training",

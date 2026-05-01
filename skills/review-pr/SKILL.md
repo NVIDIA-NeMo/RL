@@ -66,7 +66,7 @@ No MCP calls needed.
 
 ### Both modes — local reads
 
-7. Read `CLAUDE.md` from repo root for review philosophy
+7. Read @CLAUDE.md from repo root for review philosophy
 8. Read all `.claude/skills/*/SKILL.md` files (except `review-pr`) for guideline rules
 9. Glob `.claude/review-memory/*.md` — if any exist, read them for learned patterns
 
