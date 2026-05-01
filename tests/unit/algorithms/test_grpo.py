@@ -1360,6 +1360,7 @@ def mock_grpo_components():
             },
         },
         "loss_fn": {
+            "reference_policy_kl_penalty": 0.01,
             "use_importance_sampling_correction": True,  # Required for async mode
         },
         "checkpointing": {
