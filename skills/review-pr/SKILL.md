@@ -1,6 +1,7 @@
 ---
 name: review-pr
 description: Interactive code review for NVIDIA-NeMo/RL pull requests. Checks out PR locally, reads existing comments, applies coding guidelines from skills, previews findings, and posts review comments. Also supports reviewing the current branch locally.
+when_to_use: Reviewing a PR; '/review-pr <number>'; 'review this PR', 'check PR', 'code review for PR'.
 argument-hint: [<pr-number>] [update] [--deep]
 allowed-tools: [AskUserQuestion, Bash, Read, Glob, Grep, Agent, mcp__github__pull_request_read, mcp__github__pull_request_review_write, mcp__github__add_comment_to_pending_review, mcp__github__add_reply_to_pull_request_comment, mcp__github__add_issue_comment]
 ---

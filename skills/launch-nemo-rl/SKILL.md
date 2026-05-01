@@ -1,6 +1,6 @@
 ---
 name: launch-nemo-rl
-description: Playbook for launching, monitoring, stopping, and debugging NeMo-RL recipes on a Kubernetes cluster via the nrl-k8s CLI. Use when asked to run/launch/submit/test a recipe on k8s, bring up or tear down a RayCluster, choose between ephemeral (default `nrl-k8s run`, auto-teardown) and long-lived (`nrl-k8s run --raycluster`) modes, iterate on an existing run, debug a hung or failed training job, or structure a new recipe+infra pair for a new hardware profile.
+description: Playbook for launching, monitoring, stopping, and debugging NeMo-RL recipes on a Kubernetes cluster via the nrl-k8s CLI. Covers ephemeral vs long-lived RayCluster modes, iterating on runs, and debugging hung or failed training jobs.
 when_to_use: "run this recipe on k8s", "launch on the cluster", "submit a training job", "tear down the cluster", "resubmit as rayjob", "why is the run stuck", "how do I get logs for job X", "bring the cluster back up".
 allowed-tools: Bash Read Grep Glob Edit Write
 ---
