@@ -166,9 +166,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         model_parallel_size = pp_size * cp_size * tp_size
         actual_world_size = cluster.world_size()
         dp_replicate_size = (
-            config["dtensor_cfg"].get("dp_replicate_size", 1)
-            if dtensor_enable
-            else 1
+            config["dtensor_cfg"].get("dp_replicate_size", 1) if dtensor_enable else 1
         )
         if dp_replicate_size is None or dp_replicate_size <= 0:
             dp_replicate_size = 1
