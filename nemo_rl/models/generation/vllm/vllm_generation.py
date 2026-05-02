@@ -642,10 +642,7 @@ class VllmGeneration(GenerationInterface):
                 f"{int(timeout_seconds * 2)}"
             )
 
-        # sample_result is a tuple: (original_idx, BatchedDataDict). Tag the
-        # result with the worker index so downstream code can attribute
-        # per-sample tokens to the worker that produced them. Use a length-one
-        # list so BatchedDataDict.from_batches can merge without shape errors.
+        # sample_result is a tuple: (original_idx, BatchedDataDict).
         original_idx, result_batch = sample_result
         result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
         yield (original_idx, result_batch)
