@@ -284,6 +284,7 @@ class SGLangGenerationWorker:
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
+        self.server_base_url = f"http://{self.server_host}:{self.server_port}"
 
         self._init_normal(server_args_dict)
 
@@ -297,7 +298,7 @@ class SGLangGenerationWorker:
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
             payload = {
-                "url": f"http://{self.server_host}:{self.server_port}",
+                "url": self.server_base_url,
                 "worker_type": "regular",
             }
             response = requests.post(
@@ -319,7 +320,7 @@ class SGLangGenerationWorker:
         if self.node_rank != 0:
             return
 
-        url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
+        url = f"{self.server_base_url}/{endpoint}"
         response = requests.post(url, json=payload or {})
         try:
             response.raise_for_status()
@@ -350,7 +351,7 @@ class SGLangGenerationWorker:
             return True
 
         response = requests.get(
-            f"http://{self.server_host}:{self.server_port}/health_generate",
+            f"{self.server_base_url}/health_generate",
             timeout=timeout,
         )
         response.raise_for_status()
@@ -387,9 +388,7 @@ class SGLangGenerationWorker:
         # flush cache will not return status_code 200 when there are pending requests
         for _ in range(60):
             try:
-                response = requests.get(
-                    f"http://{self.server_host}:{self.server_port}/flush_cache"
-                )
+                response = requests.get(f"{self.server_base_url}/flush_cache")
                 if response.status_code == 200:
                     break
             except NewConnectionError as e:
@@ -408,7 +407,7 @@ class SGLangGenerationWorker:
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         if self.node_rank == 0:
-            worker_url = f"http://{self.server_host}:{self.server_port}"
+            worker_url = self.server_base_url
             response = None
             try:
                 all_workers = requests.get(
@@ -435,10 +434,9 @@ class SGLangGenerationWorker:
     def get_weight_version(self):
         if self.node_rank != 0:
             return
-        base = f"http://{self.server_host}:{self.server_port}"
         # new sglang change api from /get_weight_version to /model_info
         for endpoint in ("/model_info", "/get_weight_version"):
-            response = requests.get(f"{base}{endpoint}")
+            response = requests.get(f"{self.server_base_url}{endpoint}")
             if response.status_code == 200:
                 return response.json()["weight_version"]
         response.raise_for_status()
@@ -543,7 +541,7 @@ class SGLangGenerationWorker:
 
     def pause_generation(self, mode: str = "retract"):
         response = requests.post(
-            f"http://{self.server_host}:{self.server_port}/pause_generation",
+            f"{self.server_base_url}/pause_generation",
             json={"mode": mode},
         )
         response.raise_for_status()
@@ -551,7 +549,7 @@ class SGLangGenerationWorker:
 
     def continue_generation(self):
         response = requests.post(
-            f"http://{self.server_host}:{self.server_port}/continue_generation", json={}
+            f"{self.server_base_url}/continue_generation", json={}
         )
         response.raise_for_status()
         return response
@@ -593,7 +591,7 @@ class SGLangGenerationWorker:
         record_shapes: bool | None = None,
     ):
         response = requests.post(
-            f"http://{self.server_host}:{self.server_port}/start_profile",
+            f"{self.server_base_url}/start_profile",
             json={
                 "output_dir": output_dir,
                 "start_step": start_step,
@@ -609,7 +607,7 @@ class SGLangGenerationWorker:
 
     def stop_profile(self):
         response = requests.post(
-            f"http://{self.server_host}:{self.server_port}/stop_profile", json={}
+            f"{self.server_base_url}/stop_profile", json={}
         )
         response.raise_for_status()
         return response
@@ -636,7 +634,7 @@ class SGLangGenerationWorker:
         """
         if self.node_rank != 0:
             return None
-        return f"http://{self.server_host}:{self.server_port}"
+        return self.server_base_url
 
     def invalidate_kv_cache(self) -> bool:
         """Flush the cache of the server.
@@ -658,9 +656,7 @@ class SGLangGenerationWorker:
         # flush cache will not return status_code 200 when there are pending requests
         for _ in range(60):
             try:
-                response = requests.get(
-                    f"http://{self.server_host}:{self.server_port}/flush_cache"
-                )
+                response = requests.get(f"{self.server_base_url}/flush_cache")
                 if response.status_code == 200:
                     return True
             except NewConnectionError:
