@@ -25,10 +25,9 @@ RayVirtualCluster), we test each component that __init__ wires together:
 import pytest
 import ray
 import requests
+from helpers import create_worker
 
 from nemo_rl.models.generation.sglang.utils.ray_utils import Lock
-
-from helpers import create_worker
 
 pytestmark = pytest.mark.sglang
 
@@ -57,9 +56,7 @@ def test_multiple_workers_init(two_workers):
 
 def test_workers_register_with_router(two_workers, router):
     """Both workers appear in the router's /workers list."""
-    resp = requests.get(
-        f"http://{router['ip']}:{router['port']}/workers", timeout=10
-    )
+    resp = requests.get(f"http://{router['ip']}:{router['port']}/workers", timeout=10)
     assert resp.status_code == 200
     workers_list = resp.json().get("workers", [])
     assert len(workers_list) >= 2

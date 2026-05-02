@@ -23,19 +23,3 @@ class AsyncLoopThread:
             self._thread.join(timeout=timeout)
         if not self.loop.is_closed():
             self.loop.close()
-
-
-# Create one global instance
-async_loop = None
-
-
-def get_async_loop():
-    global async_loop
-    if async_loop is None:
-        async_loop = AsyncLoopThread()
-    return async_loop
-
-
-def run(coro):
-    """Run a coroutine in the background event loop."""
-    return get_async_loop().run(coro)

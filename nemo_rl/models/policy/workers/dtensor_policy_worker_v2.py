@@ -911,7 +911,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
     def stream_weights_via_http(
         self,
-        rollout_engine_urls,
+        rollout_engine_urls: list[str],
         num_gpus_per_engine: int,
         buffer_size_bytes: int = 512 * 1024 * 1024,
     ) -> None:

@@ -191,7 +191,7 @@ def get_reordered_bundle(
     """Return bundle indices and GPU IDs sorted by (node_id, gpu_id).
 
     Uses ``GetGPUIDActor`` to discover the physical GPU ID assigned to each
-    bundle, then sorts identically to the pattern in ``pg.py``.
+    bundle.
 
     Returns:
         (reordered_bundle_indices, reordered_gpu_ids)

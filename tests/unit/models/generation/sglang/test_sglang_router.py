@@ -22,8 +22,8 @@ import pytest
 import ray
 import requests
 
-from nemo_rl.models.generation.sglang.utils.ray_utils import find_available_port
 from nemo_rl.models.generation.sglang.sglang_router import RouterActor
+from nemo_rl.models.generation.sglang.utils.ray_utils import find_available_port
 
 pytestmark = pytest.mark.sglang
 

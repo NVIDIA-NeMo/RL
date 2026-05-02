@@ -884,7 +884,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
     def stream_weights_via_http(
         self,
-        rollout_engine_urls,
+        rollout_engine_urls: list[str],
         num_gpus_per_engine: int,
     ) -> list[ray.ObjectRef]:
         """Send the weights to colocated SGLang engines via CUDA IPC over HTTP.

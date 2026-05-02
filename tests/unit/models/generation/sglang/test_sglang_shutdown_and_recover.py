@@ -23,7 +23,6 @@ import time
 import pytest
 import ray
 import requests
-
 from helpers import create_worker
 
 pytestmark = pytest.mark.sglang
@@ -31,9 +30,7 @@ pytestmark = pytest.mark.sglang
 
 def _get_worker_count(router):
     """Get the number of workers registered with the router."""
-    resp = requests.get(
-        f"http://{router['ip']}:{router['port']}/workers", timeout=10
-    )
+    resp = requests.get(f"http://{router['ip']}:{router['port']}/workers", timeout=10)
     return len(resp.json().get("workers", []))
 
 
@@ -87,6 +84,6 @@ def test_new_worker_after_shutdown(ray_cluster, router):
 
 
 def test_simulate_crash(ray_cluster, router):
-    """simulate_crash (which calls shutdown) does not raise."""
+    """_simulate_crash (which calls shutdown) does not raise."""
     worker = create_worker(router, base_gpu_id=0, tp_size=1, rank=0)
-    ray.get(worker.simulate_crash.remote())
+    ray.get(worker._simulate_crash.remote())

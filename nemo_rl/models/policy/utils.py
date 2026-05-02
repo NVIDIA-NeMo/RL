@@ -16,7 +16,7 @@ import gc
 import os
 import traceback
 from enum import Enum
-from typing import Any, Dict, Iterable, Optional, cast
+from typing import Any, Dict, Iterable
 
 import requests
 import torch
@@ -465,9 +465,7 @@ def _flush_bucket(
             "flush_cache": False,
             "weight_version": str(weight_version),
         }
-        response = requests.post(
-            f"{engine_url}/update_weights_from_tensor", json=body
-        )
+        response = requests.post(f"{engine_url}/update_weights_from_tensor", json=body)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -475,8 +473,8 @@ def _flush_bucket(
             raise
         result = response.json()
         success = result.get("success", True)
-        error_msg = (
-            result.get("error_message") or result.get("message", "unknown error")
+        error_msg = result.get("error_message") or result.get(
+            "message", "unknown error"
         )
         if not success:
             raise RuntimeError(
@@ -496,12 +494,6 @@ def stream_weights_via_http_impl(
     worker_state: dict,
 ) -> None:
     """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
-
-    Implementation mirrors miles' ``UpdateWeightFromTensor``: size-bounded
-    buckets over the caller-provided ``params_generator``, dtype-grouped
-    ``FlattenedTensorBucket`` per bucket, per-engine Gloo subgroup gather to a
-    source rank, and a single ``requests.post`` per (bucket, dtype) directly to
-    the colocated SGLang HTTP server (skipping the Ray actor proxy).
 
     Args:
         params_generator: Iterable yielding ``(name, tensor)`` pairs to stream.
@@ -546,6 +538,13 @@ def stream_weights_via_http_impl(
         if start <= rank < end:
             engine_url = candidate
             break
+    if engine_url is None:
+        raise RuntimeError(
+            f"No rollout engine matched rank={rank} with "
+            f"num_gpus_per_engine={num_gpus_per_engine} and "
+            f"{len(rollout_engine_urls)} engine URL(s); "
+            f"rank must fall within [0, {num_gpus_per_engine * len(rollout_engine_urls)})."
+        )
 
     try:
         bucket: list = []

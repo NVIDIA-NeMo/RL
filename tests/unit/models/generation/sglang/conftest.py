@@ -20,6 +20,7 @@ dependencies but lets sglang imports resolve naturally against the installed
 package.
 """
 
+import importlib.machinery
 import os
 import sys
 from unittest.mock import MagicMock
@@ -30,6 +31,10 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "4,5,6,7")
 
 # Use system Python for all Ray actors (uv not configured in container).
 os.environ.setdefault("NEMO_RL_PY_EXECUTABLES_SYSTEM", "1")
+
+# Disable sglang's per-GPU memory imbalance check — when running tests on a
+# shared host other processes may already hold memory on some of our GPUs.
+os.environ.setdefault("SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", "false")
 
 # Ensure the test directory is on sys.path so helpers.py is importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -47,7 +52,13 @@ _STUB_MODULES = [
     "wandb",
 ]
 for _mod in _STUB_MODULES:
-    sys.modules.setdefault(_mod, MagicMock())
+    if _mod in sys.modules:
+        continue
+    stub = MagicMock()
+    # importlib.util.find_spec requires __spec__ to be a real ModuleSpec.
+    stub.__spec__ = importlib.machinery.ModuleSpec(_mod, loader=None)
+    stub.__name__ = _mod
+    sys.modules[_mod] = stub
 
 import pytest
 import ray

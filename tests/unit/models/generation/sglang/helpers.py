@@ -22,12 +22,12 @@ import os
 
 import ray
 
-from nemo_rl.models.generation.sglang.utils.misc import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 from nemo_rl.models.generation.sglang.utils.ray_utils import (
+    NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
     find_available_port,
     get_host_info,
 )
-from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -46,8 +46,7 @@ QKV_OUTPUT_DIM = NUM_ATTENTION_HEADS * HEAD_DIM + 2 * NUM_KV_HEADS * HEAD_DIM  #
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
-def make_cluster_cfg(gpus_per_node=4):
-    return {"gpus_per_node": gpus_per_node}
+DEFAULT_GPUS_PER_NODE = 4
 
 
 def make_sglang_cfg(
@@ -69,6 +68,8 @@ def make_sglang_cfg(
             "context_length": 1024,
             "log_level": "warning",
             "disable_piecewise_cuda_graph": True,
+            "disable_cuda_graph": True,
+            "mem_fraction_static": 0.3,
         },
         "sglang_server": {
             "num_gpus": num_gpus,
@@ -76,6 +77,7 @@ def make_sglang_cfg(
             "needs_offload": True,
             "cpu_weight_backup": False,
             "sglang_server_concurrency": 64,
+            "pause_generation_mode": "retract",
         },
         "sglang_router": {
             "sglang_router_ip": router_ip,
@@ -98,7 +100,7 @@ def create_worker(router_info, base_gpu_id=0, tp_size=1, rank=0):
 
     Returns the actor handle after ``init`` completes.
     """
-    cluster_cfg = make_cluster_cfg()
+    gpus_per_node = DEFAULT_GPUS_PER_NODE
     sglang_cfg = make_sglang_cfg(
         tp_size=tp_size,
         router_ip=router_info["ip"],
@@ -110,7 +112,7 @@ def create_worker(router_info, base_gpu_id=0, tp_size=1, rank=0):
         num_gpus=0.2,
         runtime_env={"env_vars": make_actor_env_vars()},
     ).remote(
-        cluster_cfg,
+        gpus_per_node,
         sglang_cfg,
         rank=rank,
         base_gpu_id=base_gpu_id,
@@ -135,7 +137,10 @@ def create_worker(router_info, base_gpu_id=0, tp_size=1, rank=0):
 
 
 def make_generation_sampling_params(
-    max_new_tokens=16, temperature=0.0, top_p=1.0, stop=None,
+    max_new_tokens=16,
+    temperature=0.0,
+    top_p=1.0,
+    stop=None,
 ):
     """Build sampling_params dict for generate_one_sample / router /generate."""
     params = {

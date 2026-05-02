@@ -1,19 +1,7 @@
-import io
 import logging
 import multiprocessing
 
 logger = logging.getLogger(__name__)
-
-
-NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
-    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
-    "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
-    "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES",
-    "RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES",
-    "RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES",
-    "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
-    "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR",
-]
 
 
 def run_router(args):
@@ -24,9 +12,12 @@ def run_router(args):
         if router is None:
             return 1
         return 0
-    except Exception as e:
-        logger.info(e)
-        return 1
+    except Exception:
+        # Runs inside a subprocess; surface the full traceback at ERROR level
+        # so it isn't filtered by INFO config, and re-raise so the subprocess
+        # exits non-zero (caller asserts on ``_process.is_alive()``).
+        logger.exception("sglang router failed to launch")
+        raise
 
 
 def terminate_process(process: multiprocessing.Process, timeout: float = 1.0) -> None:

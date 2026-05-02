@@ -45,6 +45,7 @@ policy:
       needs_offload: true
       cpu_weight_backup: true
       sglang_server_concurrency: 1024
+      pause_generation_mode: retract
       num_gpus: 2
       num_gpus_per_engine: 2
     sglang_router: {}

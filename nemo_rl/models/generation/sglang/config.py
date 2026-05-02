@@ -16,6 +16,7 @@ from typing import Any, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
+
 class SglangSpecificArgs(TypedDict):
     """SGLang-specific configuration arguments.
 
@@ -98,14 +99,15 @@ class SglangSpecificArgs(TypedDict):
     rollout_health_check_timeout: NotRequired[int]
     rollout_health_check_first_wait: NotRequired[int]
 
+
 class SGLangServer(TypedDict):
     # needs_offload true --> enable_memory_saver true
     needs_offload: bool
     # for testing purpose. memory_saver
     cpu_weight_backup: bool
     sglang_server_concurrency: int
-    # for pause/continue gen
-    pause_generation_mode: NotRequired[str]
+    # for pause/continue gen ("retract" or "kill"); required in YAML.
+    pause_generation_mode: str
     # When true, refit bookends every weight update with a check_weights
     # snapshot + reset (pre-refit) and compare (post-refit) to assert that
     # streamed weights actually land on the engine.
@@ -114,14 +116,18 @@ class SGLangServer(TypedDict):
     num_gpus: NotRequired[int]
     num_gpus_per_engine: NotRequired[int]
 
+
 class SGLangRouter(TypedDict):
     sglang_router_ip: NotRequired[str]
     sglang_router_port: NotRequired[int]
     router_policy: NotRequired[str]
     use_distributed_post: NotRequired[bool]
+    sglang_router_request_timeout_secs: NotRequired[int]
+
 
 class SGLangConfig(GenerationConfig):
     """Configuration for SGLang runtime."""
+
     sglang_cfg: SglangSpecificArgs
     sglang_server: SGLangServer
     sglang_router: SGLangRouter

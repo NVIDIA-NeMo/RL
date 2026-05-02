@@ -5,6 +5,20 @@ import socket
 
 import ray
 
+# Env vars Ray uses to gate its visible-device manipulation. Setting any of
+# these to "1" tells Ray not to override the corresponding *_VISIBLE_DEVICES
+# in actor processes — used by sglang workers that want to manage CUDA
+# visibility themselves.
+NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
+    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+    "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
+    "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES",
+    "RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES",
+    "RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES",
+    "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
+    "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR",
+]
+
 
 class RayActor:
     """Base class for Ray actors providing node IP / free port helpers."""
@@ -25,9 +39,10 @@ class Lock(RayActor):
         self._locked = False  # False: unlocked, True: locked
 
     def acquire(self):
-        """
-        Try to acquire the lock. Returns True if acquired, False otherwise.
-        Caller should retry until it returns True.
+        """Try to acquire the lock.
+
+        Returns True if acquired, False otherwise. Caller should retry until
+        it returns True.
         """
         if not self._locked:
             self._locked = True
@@ -50,6 +65,7 @@ def find_available_port(base_port: int):
         else:
             port -= 43
 
+
 def is_port_available(port):
     """Return whether a port is available."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -63,6 +79,7 @@ def is_port_available(port):
         except OverflowError:
             return False
 
+
 def get_host_info():
     hostname = socket.gethostname()
 
@@ -70,11 +87,10 @@ def get_host_info():
         return ip.startswith("127.") or ip == "::1"
 
     def _resolve_ip(family, test_target_ip):
-        """
-        Attempt to get the local LAN IP for the specific family (IPv4/IPv6).
-        Strategy: UDP Probe (Preferred) -> Hostname Resolution (Fallback) -> None
-        """
+        """Attempt to get the local LAN IP for the specific family (IPv4/IPv6).
 
+        Strategy: UDP Probe (Preferred) -> Hostname Resolution (Fallback) -> None.
+        """
         # Strategy 1: UDP Connect Probe (Most accurate, relies on routing table)
         # Useful when the machine has a default gateway or internet access.
         try:
@@ -92,7 +108,9 @@ def get_host_info():
         try:
             # getaddrinfo allows specifying the family (AF_INET or AF_INET6)
             # Result format: [(family, type, proto, canonname, sockaddr), ...]
-            infos = socket.getaddrinfo(hostname, None, family=family, type=socket.SOCK_STREAM)
+            infos = socket.getaddrinfo(
+                hostname, None, family=family, type=socket.SOCK_STREAM
+            )
 
             for info in infos:
                 ip = info[4][0]  # The first element of sockaddr is the IP
@@ -125,11 +143,13 @@ def get_host_info():
 
     return hostname, local_ip or final_fallback
 
+
 def get_current_node_ip():
     address = ray._private.services.get_node_ip_address()
     # strip ipv6 address
     address = address.strip("[]")
     return address
+
 
 def get_free_port(start_port=10000, consecutive=1):
     # find the port where port, port + 1, port + 2, ... port + consecutive - 1 are all available
@@ -137,6 +157,7 @@ def get_free_port(start_port=10000, consecutive=1):
     while not all(is_port_available(port + i) for i in range(consecutive)):
         port += 1
     return port
+
 
 def _wrap_ipv6(host):
     """Wrap IPv6 address in [] if needed."""

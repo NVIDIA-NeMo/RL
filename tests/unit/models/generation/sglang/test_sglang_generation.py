@@ -27,23 +27,20 @@ Model: Qwen/Qwen3-0.6B
 
 import asyncio
 import gc
-from copy import deepcopy
 
 import pytest
 import ray
 import torch
+from helpers import (
+    make_generation_sampling_params,
+    post_and_assert_200,
+)
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.sglang.sglang_generation import (
     SGLangGeneration,
     generate_one_sample,
-)
-from nemo_rl.models.generation.interfaces import GenerationDatumSpec
-
-from helpers import (
-    make_generation_sampling_params,
-    post_and_assert_200,
 )
 
 MODEL_PATH = "Qwen/Qwen3-4B"
@@ -85,6 +82,8 @@ def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID, tp_size=1):
             "pp_size": 1,
             "ep_size": 1,
             "disable_piecewise_cuda_graph": True,
+            "disable_cuda_graph": True,
+            "mem_fraction_static": 0.3,
         },
         "sglang_server": {
             "num_gpus": 4,
@@ -92,6 +91,7 @@ def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID, tp_size=1):
             "needs_offload": True,
             "cpu_weight_backup": True,
             "sglang_server_concurrency": 64,
+            "pause_generation_mode": "retract",
         },
         "sglang_router": {
             "sglang_router_ip": None,
@@ -132,12 +132,12 @@ def sglang_gen(request, ray_cluster, tokenizer):
         num_gpus_per_node=4,
         name=f"gen-test-{request.param['num_servers']}srv-tp{tp_size}",
     )
-    cluster_cfg = {"gpus_per_node": 4, "num_nodes": 1}
     sglang_cfg = _make_sglang_generation_cfg(
-        pad_token_id=tokenizer.pad_token_id, tp_size=tp_size,
+        pad_token_id=tokenizer.pad_token_id,
+        tp_size=tp_size,
     )
 
-    gen = SGLangGeneration(cluster, cluster_cfg, sglang_cfg)
+    gen = SGLangGeneration(cluster, sglang_cfg)
     yield gen
     try:
         gen.shutdown()
@@ -204,8 +204,13 @@ def test_generate_returns_batched_data_dict(sglang_gen, tokenizer):
     data = _make_input(tokenizer, "Hello")
     result = sglang_gen.generate(data, greedy=True)
 
-    for key in ["output_ids", "logprobs", "generation_lengths",
-                "unpadded_sequence_lengths", "truncated"]:
+    for key in [
+        "output_ids",
+        "logprobs",
+        "generation_lengths",
+        "unpadded_sequence_lengths",
+        "truncated",
+    ]:
         assert key in result, f"Missing key: {key}"
 
 
@@ -254,7 +259,7 @@ def test_generate_logprobs_valid(sglang_gen, tokenizer):
 
     gen_len = result["generation_lengths"][0].item()
     input_len = data["input_lengths"][0].item()
-    lps = result["logprobs"][0, input_len:input_len + gen_len]
+    lps = result["logprobs"][0, input_len : input_len + gen_len]
 
     assert torch.isfinite(lps).all(), "Logprobs contain NaN or Inf"
     assert (lps <= 0.0).all(), "Logprobs should be non-positive"
@@ -356,8 +361,8 @@ def test_generate_async_output_matches_generate(sglang_gen, tokenizer):
     assert sync_len == async_len, f"sync={sync_len} vs async={async_len}"
 
     input_len = data["input_lengths"][0].item()
-    sync_tokens = sync_result["output_ids"][0, input_len:input_len + sync_len]
-    async_tokens = async_result["output_ids"][0, input_len:input_len + async_len]
+    sync_tokens = sync_result["output_ids"][0, input_len : input_len + sync_len]
+    async_tokens = async_result["output_ids"][0, input_len : input_len + async_len]
     assert torch.equal(sync_tokens, async_tokens), (
         "generate() and generate_async() produced different tokens"
     )
@@ -409,8 +414,7 @@ def test_generate_after_memory_cycle(sglang_gen, tokenizer):
 
 
 def test_generate_after_memory_cycle_via_http_200(sglang_gen, tokenizer):
-    """Generate → offload/onload via direct HTTP (asserting 200) → generate → same greedy output.
-    """
+    """Generate → offload/onload via direct HTTP (asserting 200) → generate → same greedy output."""
     data = _make_input(tokenizer, "Two plus two equals")
     r_before = sglang_gen.generate(data, greedy=True)
 
@@ -431,9 +435,7 @@ def test_generate_after_memory_cycle_via_http_200(sglang_gen, tokenizer):
             {"tags": ["kv_cache", "cuda_graph"]},
         )
         # Resume weights
-        post_and_assert_200(
-            base_url, "resume_memory_occupation", {"tags": ["weights"]}
-        )
+        post_and_assert_200(base_url, "resume_memory_occupation", {"tags": ["weights"]})
         # Resume KV cache + CUDA graphs
         post_and_assert_200(
             base_url,
@@ -449,8 +451,7 @@ def test_generate_after_memory_cycle_via_http_200(sglang_gen, tokenizer):
 
 
 def test_generate_after_memory_cycle_top_level_api(sglang_gen, tokenizer):
-    """Generate -> top-level offload/onload -> generate -> same greedy output.
-    """
+    """Generate -> top-level offload/onload -> generate -> same greedy output."""
     data = _make_input(tokenizer, "Two plus two equals")
 
     r_before = sglang_gen.generate(data, greedy=True)
@@ -479,3 +480,25 @@ def test_generate_after_memory_cycle_top_level_api(sglang_gen, tokenizer):
     assert torch.equal(r_before["output_ids"], r_after["output_ids"]), (
         "Generation output changed after top-level offload/onload cycle"
     )
+
+
+def test_invalidate_kv_cache_aggregator(sglang_gen):
+    """SGLangGeneration.invalidate_kv_cache() fans out to every engine and
+    reduces with ``all(results)``. Verifies True on a healthy cluster
+    (single-engine TP=4 and two-engine TP=2 variants both covered via the
+    fixture parametrization).
+    """
+    assert sglang_gen.invalidate_kv_cache() is True
+
+
+def test_invalidate_kv_cache_after_generate(sglang_gen, tokenizer):
+    """invalidate_kv_cache after a generate() call still returns True.
+
+    Exercises the path most likely to surface the flush_cache pacing bug:
+    sglang's /flush_cache endpoint may return non-200 transiently while
+    draining the just-completed generation's queue, so the worker's retry
+    loop must actually wait between attempts.
+    """
+    data = _make_input(tokenizer, "Two plus two equals")
+    sglang_gen.generate(data, greedy=True)
+    assert sglang_gen.invalidate_kv_cache() is True

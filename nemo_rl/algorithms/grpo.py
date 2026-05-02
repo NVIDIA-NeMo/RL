@@ -439,10 +439,6 @@ def setup(
         )
         train_cluster = cluster
         inference_cluster = cluster
-        inference_cluster_cfg: ClusterConfig = {
-            "gpus_per_node": policy_gpus_per_node,
-            "num_nodes": policy_nodes,
-        }
         print(
             f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
             flush=True,
@@ -531,10 +527,6 @@ def setup(
             num_gpus_per_node=inference_gpus_per_node,
             max_colocated_worker_groups=1,
         )
-        inference_cluster_cfg: ClusterConfig = {
-            "gpus_per_node": inference_gpus_per_node,
-            "num_nodes": inference_nodes,
-        }
         print(
             f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
             flush=True,
@@ -589,7 +581,6 @@ def setup(
         t0 = time.perf_counter()
         pg = SGLangGeneration(
             cluster=inference_cluster,
-            cluster_cfg=inference_cluster_cfg,
             sglang_cfg=generation_config,
         )
         if generation_config["sglang_server"].get("check_weight_update_equal", False):
@@ -1176,10 +1167,7 @@ def refit_policy_generation(
                 # Resolve node-0 engine HTTP URLs once on the driver so every
                 # FSDP rank doesn't redo the Ray RPC.
                 rollout_engine_urls = ray.get(
-                    [
-                        e.get_base_url.remote()
-                        for e in policy_generation.rollout_engines
-                    ]
+                    [e.get_base_url.remote() for e in policy_generation.rollout_engines]
                 )
                 futures_train = policy.stream_weights_via_http(
                     rollout_engine_urls=rollout_engine_urls,

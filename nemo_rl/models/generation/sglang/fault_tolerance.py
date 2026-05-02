@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 
+
 class RolloutHealthMonitor:
     """Health monitor for rollout engines.
 
@@ -28,7 +29,9 @@ class RolloutHealthMonitor:
         self._pause_event = None  # When set, health checking is paused
         self._check_interval = sglang_cfg["sglang_cfg"]["rollout_health_check_interval"]
         self._check_timeout = sglang_cfg["sglang_cfg"]["rollout_health_check_timeout"]
-        self._check_first_wait = sglang_cfg["sglang_cfg"]["rollout_health_check_first_wait"]
+        self._check_first_wait = sglang_cfg["sglang_cfg"][
+            "rollout_health_check_first_wait"
+        ]
         self._need_first_wait = True  # Need to wait after each resume
         self._is_checking_enabled = False  # Track if health checking should be active
 
@@ -72,7 +75,9 @@ class RolloutHealthMonitor:
         timeout = self._check_timeout + self._check_interval + 5
         self._thread.join(timeout=timeout)
         if self._thread.is_alive():
-            logging.warning("Rollout health monitor thread did not terminate within %.1fs", timeout)
+            logging.warning(
+                "Rollout health monitor thread did not terminate within %.1fs", timeout
+            )
         else:
             logger.info("RolloutHealthMonitor stopped.")
 
@@ -116,13 +121,17 @@ class RolloutHealthMonitor:
 
             # Do first wait after each resume (for large MoE models to be ready)
             if self._need_first_wait:
-                logger.info(f"Health monitor doing first wait after resume: {self._check_first_wait}s")
+                logger.info(
+                    f"Health monitor doing first wait after resume: {self._check_first_wait}s"
+                )
                 if self._stop_event.wait(self._check_first_wait):
                     logger.info("Health monitor stopped during first wait.")
                     break
                 if self._pause_event.is_set():
                     # Got paused during first wait, skip this round and wait again next resume
-                    logger.info("Health monitor paused during first wait, will wait again next resume.")
+                    logger.info(
+                        "Health monitor paused during first wait, will wait again next resume."
+                    )
                     continue
                 self._need_first_wait = False
 

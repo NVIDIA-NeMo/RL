@@ -35,14 +35,15 @@ import pytest
 import ray
 import torch
 import torch.distributed as dist
-
+from helpers import make_actor_env_vars, post_and_assert_200
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.generation.sglang.utils.ray_utils import find_available_port, get_host_info
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
-
-from helpers import make_actor_env_vars, post_and_assert_200
+from nemo_rl.models.generation.sglang.utils.ray_utils import (
+    find_available_port,
+    get_host_info,
+)
 
 pytestmark = pytest.mark.sglang
 
@@ -79,6 +80,8 @@ def _make_sglang_cfg(tp_size, pad_token_id=PAD_TOKEN_ID):
             "pp_size": 1,
             "ep_size": 1,
             "disable_piecewise_cuda_graph": True,
+            "disable_cuda_graph": True,
+            "mem_fraction_static": 0.3,
         },
         "sglang_server": {
             "num_gpus": 4,
@@ -86,6 +89,7 @@ def _make_sglang_cfg(tp_size, pad_token_id=PAD_TOKEN_ID):
             "needs_offload": True,
             "cpu_weight_backup": False,
             "sglang_server_concurrency": 64,
+            "pause_generation_mode": "retract",
         },
         "sglang_router": {
             "sglang_router_ip": None,
@@ -124,7 +128,9 @@ class MockFSDPWorker:
 
         device = torch.device(f"cuda:{gpu_index}")
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=self.dtype, trust_remote_code=True,
+            model_path,
+            torch_dtype=self.dtype,
+            trust_remote_code=True,
         ).to(device)
 
         from nemo_rl.utils.nvml import get_device_uuid
@@ -189,10 +195,9 @@ def sglang_gen(request, ray_cluster):
         num_gpus_per_node=4,
         name="weight-update-test",
     )
-    cluster_cfg = {"gpus_per_node": 4, "num_nodes": 1}
     sglang_cfg = _make_sglang_cfg(tp_size)
 
-    gen = SGLangGeneration(cluster, cluster_cfg, sglang_cfg)
+    gen = SGLangGeneration(cluster, sglang_cfg)
     yield gen
 
     try:
@@ -238,17 +243,19 @@ def mock_trainer(ray_cluster, sglang_gen):
         workers.append(w)
 
     # All workers must init simultaneously (gloo rendezvous).
-    ray.get([
-        w.init.remote(
-            rank=rank,
-            world_size=4,
-            master_addr=host_ip,
-            master_port=master_port,
-            model_path=MODEL_PATH,
-            gpu_index=rank,
-        )
-        for rank, w in enumerate(workers)
-    ])
+    ray.get(
+        [
+            w.init.remote(
+                rank=rank,
+                world_size=4,
+                master_addr=host_ip,
+                master_port=master_port,
+                model_path=MODEL_PATH,
+                gpu_index=rank,
+            )
+            for rank, w in enumerate(workers)
+        ]
+    )
 
     yield workers
 
@@ -295,13 +302,18 @@ def test_weight_update_roundtrip(sglang_gen, mock_trainer):
     print("[STEP 4/7] Onload weights complete.", flush=True)
 
     # 5. All 4 mock FSDP workers stream weights simultaneously via CUDA IPC over HTTP.
-    print("[STEP 5/7] Streaming weights from mock FSDP workers via CUDA IPC...", flush=True)
+    print(
+        "[STEP 5/7] Streaming weights from mock FSDP workers via CUDA IPC...",
+        flush=True,
+    )
     rollout_engines = sglang_gen.rollout_engines
     num_gpus_per_engine = sglang_gen.num_gpus_per_engine
-    ray.get([
-        w.stream_weights.remote(rollout_engines, num_gpus_per_engine)
-        for w in mock_trainer
-    ])
+    ray.get(
+        [
+            w.stream_weights.remote(rollout_engines, num_gpus_per_engine)
+            for w in mock_trainer
+        ]
+    )
     print("[STEP 5/7] Weight streaming complete.", flush=True)
 
     # 6. Compare current weights against snapshot - raises on mismatch.
@@ -378,9 +390,7 @@ def test_weight_update_roundtrip_with_router_generation(sglang_gen, mock_trainer
         """Flush cache + POST /release_memory_occupation(tags=[weights]) per worker."""
         for engine, url in zip(engines, base_urls):
             ray.get(engine.flush_cache.remote())
-            post_and_assert_200(
-                url, "release_memory_occupation", {"tags": ["weights"]}
-            )
+            post_and_assert_200(url, "release_memory_occupation", {"tags": ["weights"]})
 
     def _http_release_kv_all():
         """Flush cache + POST /release_memory_occupation(tags=[kv_cache, cuda_graph])."""
@@ -395,9 +405,7 @@ def test_weight_update_roundtrip_with_router_generation(sglang_gen, mock_trainer
     def _http_resume_weights_all():
         """POST /resume_memory_occupation(tags=[weights]) per worker."""
         for url in base_urls:
-            post_and_assert_200(
-                url, "resume_memory_occupation", {"tags": ["weights"]}
-            )
+            post_and_assert_200(url, "resume_memory_occupation", {"tags": ["weights"]})
 
     def _http_resume_kv_all():
         """POST /resume_memory_occupation(tags=[kv_cache, cuda_graph]) per worker."""
@@ -422,10 +430,17 @@ def test_weight_update_roundtrip_with_router_generation(sglang_gen, mock_trainer
 
     def _generate(tag):
         result = sglang_gen.generate(data, greedy=True)
-        for key in ("output_ids", "generation_lengths", "unpadded_sequence_lengths", "logprobs"):
+        for key in (
+            "output_ids",
+            "generation_lengths",
+            "unpadded_sequence_lengths",
+            "logprobs",
+        ):
             assert key in result, f"[{tag}] generate() output missing key: {key}"
         gen_len = int(result["generation_lengths"][0].item())
-        assert gen_len > 0, f"[{tag}] generate() returned 0 tokens (no new tokens generated)"
+        assert gen_len > 0, (
+            f"[{tag}] generate() returned 0 tokens (no new tokens generated)"
+        )
         tokens = result["output_ids"][0, input_len : input_len + gen_len].tolist()
         assert all(isinstance(t, int) for t in tokens), (
             f"[{tag}] output tokens should be ints, got {tokens!r}"
@@ -440,37 +455,60 @@ def test_weight_update_roundtrip_with_router_generation(sglang_gen, mock_trainer
     tokens_before = _generate("PRE")
 
     # --- Steps 1-7, every HTTP call asserted 200 ------------------------------
-    print("[STEP 1/7] Snapshotting original weights (HTTP weights_checker×workers)...", flush=True)
+    print(
+        "[STEP 1/7] Snapshotting original weights (HTTP weights_checker×workers)...",
+        flush=True,
+    )
     _http_check_weights_all("snapshot")
     print("[STEP 1/7] Snapshot complete.", flush=True)
 
-    print("[STEP 2/7] Randomizing weights (HTTP weights_checker reset_tensors×workers)...", flush=True)
+    print(
+        "[STEP 2/7] Randomizing weights (HTTP weights_checker reset_tensors×workers)...",
+        flush=True,
+    )
     _http_check_weights_all("reset_tensors")
     print("[STEP 2/7] Reset complete.", flush=True)
 
-    print("[STEP 3/7] Offloading weights + KV (HTTP release_memory_occupation×workers)...", flush=True)
+    print(
+        "[STEP 3/7] Offloading weights + KV (HTTP release_memory_occupation×workers)...",
+        flush=True,
+    )
     _http_release_weights_all()
     _http_release_kv_all()
     print("[STEP 3/7] Offload complete.", flush=True)
 
-    print("[STEP 4/7] Onloading weights (HTTP resume_memory_occupation weights×workers)...", flush=True)
+    print(
+        "[STEP 4/7] Onloading weights (HTTP resume_memory_occupation weights×workers)...",
+        flush=True,
+    )
     _http_resume_weights_all()
     print("[STEP 4/7] Onload weights complete.", flush=True)
 
-    print("[STEP 5/7] Streaming weights from mock FSDP workers via CUDA IPC...", flush=True)
+    print(
+        "[STEP 5/7] Streaming weights from mock FSDP workers via CUDA IPC...",
+        flush=True,
+    )
     rollout_engines = sglang_gen.rollout_engines
     num_gpus_per_engine = sglang_gen.num_gpus_per_engine
-    ray.get([
-        w.stream_weights.remote(rollout_engines, num_gpus_per_engine)
-        for w in mock_trainer
-    ])
+    ray.get(
+        [
+            w.stream_weights.remote(rollout_engines, num_gpus_per_engine)
+            for w in mock_trainer
+        ]
+    )
     print("[STEP 5/7] Weight streaming complete.", flush=True)
 
-    print("[STEP 6/7] Compare vs snapshot (HTTP weights_checker compare×workers)...", flush=True)
+    print(
+        "[STEP 6/7] Compare vs snapshot (HTTP weights_checker compare×workers)...",
+        flush=True,
+    )
     _http_check_weights_all("compare")
     print("[STEP 6/7] Compare passed.", flush=True)
 
-    print("[STEP 7/7] Onloading KV (HTTP resume_memory_occupation kv×workers)...", flush=True)
+    print(
+        "[STEP 7/7] Onloading KV (HTTP resume_memory_occupation kv×workers)...",
+        flush=True,
+    )
     _http_resume_kv_all()
     print("[STEP 7/7] Roundtrip complete.", flush=True)
 

@@ -1,14 +1,12 @@
-import dataclasses
 import ipaddress
 import logging
 import multiprocessing
 import os
 import time
-from urllib.parse import quote
+from collections.abc import Callable
 
 import ray
 import requests
-from packaging.version import parse
 from urllib3.exceptions import NewConnectionError
 
 from nemo_rl.models.generation.sglang.utils.ray_utils import (
@@ -27,9 +25,6 @@ def _get_sglang_file(relative_path: str) -> str:
     if spec is None or not spec.submodule_search_locations:
         raise RuntimeError(
             f"sglang package not found while attempting to patch '{relative_path}'. "
-            "SGLangGenerationWorker requires sglang to be installed in the "
-            "SGLANG_EXECUTABLE venv; weight streaming will fail at SGLang's "
-            "SafeUnpickler boundary without the compat patch."
         )
 
     base_dir = next(iter(spec.submodule_search_locations))
@@ -75,9 +70,7 @@ def _patch_sglang_safe_unpickler() -> None:
     if anchor not in content:
         raise RuntimeError(
             f"SafeUnpickler allowlist anchor '{anchor.strip()}' not found in "
-            f"{file_to_patch}. The sglang version may have changed its "
-            "ALLOWED_MODULE_PREFIXES layout; weight streaming would be rejected "
-            "by SafeUnpickler. Update the anchor in _patch_sglang_safe_unpickler."
+            f"{file_to_patch}."
         )
 
     content = content.replace(anchor, insertion, 1)
@@ -103,17 +96,13 @@ def _patch_sglang_weight_checker() -> None:
     new_snippet = (
         "    def _reset_tensors(self):\n"
         "        for name, param in self._model_state():\n"
-        "            if \"cos_sin_cache\" in name or \"freqs_cis\" in name or \"_weight_fp32\" in name:\n"
+        '            if "cos_sin_cache" in name or "freqs_cis" in name or "_weight_fp32" in name:\n'
         "                continue\n"
         "            param.copy_(_random_like(param))\n"
     )
     if old_snippet not in content:
         raise RuntimeError(
             f"WeightChecker._reset_tensors anchor not found in {file_to_patch}. "
-            "The sglang version may have changed this function; WeightChecker "
-            "would clobber derived buffers (cos_sin_cache / freqs_cis / _weight_fp32) "
-            "and the compare step would never converge. Update the anchor in "
-            "_patch_sglang_weight_checker."
         )
 
     content = content.replace(old_snippet, new_snippet, 1)
@@ -121,15 +110,32 @@ def _patch_sglang_weight_checker() -> None:
     logger.info("Patched WeightChecker._reset_tensors in %s.", file_to_patch)
 
 
+def _override_sglang_imbalance_check_env() -> None:
+    """Force-disable sglang's per-GPU memory imbalance check.
+
+    Pop the legacy names so the shim has nothing to copy, then set
+    ``ENABLE=false`` directly. Inherited env reaches the subprocesses
+    cleaned, so the shim no longer overwrites our ENABLE on re-import.
+    """
+    for legacy in (
+        "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
+        "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK",
+    ):
+        os.environ.pop(legacy, None)
+    os.environ["SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"] = "false"
+
+
 def _apply_sglang_compat_patches() -> None:
     _patch_sglang_safe_unpickler()
     _patch_sglang_weight_checker()
+    _override_sglang_imbalance_check_env()
 
 
-def get_base_gpu_id(cluster_cfg, sglang_cfg, rank):
-    num_gpus = min(cluster_cfg["gpus_per_node"], sglang_cfg["sglang_server"]["num_gpus_per_engine"])
-    start_index = (rank * num_gpus) % cluster_cfg["gpus_per_node"]
+def get_base_gpu_id(gpus_per_node: int, sglang_cfg, rank):
+    num_gpus = min(gpus_per_node, sglang_cfg["sglang_server"]["num_gpus_per_engine"])
+    start_index = (rank * num_gpus) % gpus_per_node
     return start_index
+
 
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -145,8 +151,9 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
         return physical_gpu_id
     raise RuntimeError(
         f"GPU id {physical_gpu_id} is not valid under CUDA_VISIBLE_DEVICES={cvd}. "
-        f"Expected one of {visible} (physical) or 0..{len(visible)-1} (local)."
+        f"Expected one of {visible} (physical) or 0..{len(visible) - 1} (local)."
     )
+
 
 def launch_server_process(server_args) -> multiprocessing.Process:
     from sglang.srt.entrypoints.http_server import launch_server
@@ -162,13 +169,17 @@ def launch_server_process(server_args) -> multiprocessing.Process:
     _wait_server_healthy(
         base_url=server_args.url(),
         api_key=server_args.api_key,
-        is_process_alive=lambda: p.is_alive(),
+        process_alive_fn=lambda: p.is_alive(),
     )
 
     return p
 
 
-def _wait_server_healthy(base_url, api_key, is_process_alive):
+def _wait_server_healthy(
+    base_url: str,
+    api_key: str | None,
+    process_alive_fn: Callable[[], bool],
+) -> None:
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Authorization": f"Bearer {api_key}",
@@ -183,7 +194,7 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
             except requests.RequestException:
                 pass
 
-            if not is_process_alive():
+            if not process_alive_fn():
                 raise Exception("Server process terminated unexpectedly.")
 
             time.sleep(2)
@@ -198,23 +209,24 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
             except requests.RequestException:
                 pass
 
-            if not is_process_alive():
+            if not process_alive_fn():
                 raise Exception("Server process terminated unexpectedly.")
 
             time.sleep(2)
+
 
 @ray.remote  # pragma: no cover
 class SGLangGenerationWorker:
     def __init__(
         self,
-        cluster_cfg,
+        gpus_per_node: int,
         sglang_cfg,
         rank: int,
         base_gpu_id: int | None = None,
         num_gpus_per_engine: int | None = None,
     ):
         _apply_sglang_compat_patches()
-        self.cluster_cfg = cluster_cfg
+        self.gpus_per_node = gpus_per_node
         self.sglang_cfg = sglang_cfg
         self.rank = rank
         self.base_gpu_id = base_gpu_id
@@ -230,8 +242,16 @@ class SGLangGenerationWorker:
         router_port=None,
     ):
 
-        self.router_ip = router_ip if router_ip is not None else self.sglang_cfg["sglang_router"]["sglang_router_ip"]
-        self.router_port = router_port if router_port is not None else self.sglang_cfg["sglang_router"]["sglang_router_port"]
+        self.router_ip = (
+            router_ip
+            if router_ip is not None
+            else self.sglang_cfg["sglang_router"]["sglang_router_ip"]
+        )
+        self.router_port = (
+            router_port
+            if router_port is not None
+            else self.sglang_cfg["sglang_router"]["sglang_router_port"]
+        )
 
         host = host or get_host_info()[1]
 
@@ -250,7 +270,7 @@ class SGLangGenerationWorker:
         dist_init_addr = f"{_format_v6_uri(ip_part)}:{port_part}"
 
         server_args_dict = _compute_server_args(
-            self.cluster_cfg,
+            self.gpus_per_node,
             self.sglang_cfg,
             self.rank,
             dist_init_addr,
@@ -267,28 +287,23 @@ class SGLangGenerationWorker:
 
         self._init_normal(server_args_dict)
 
-
     def _init_normal(self, server_args_dict):
-        import sglang_router
         from sglang.srt.server_args import ServerArgs
 
-        logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
+        logger.info(
+            f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}"
+        )
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
-            if parse(sglang_router.__version__) <= parse("0.2.1"):
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
-                )
-            else:
-                payload = {
-                    "url": f"http://{self.server_host}:{self.server_port}",
-                    "worker_type": "regular",
-                }
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/workers",
-                    json=payload,
-                )
+            payload = {
+                "url": f"http://{self.server_host}:{self.server_port}",
+                "worker_type": "regular",
+            }
+            response = requests.post(
+                f"http://{self.router_ip}:{self.router_port}/workers",
+                json=payload,
+            )
             response.raise_for_status()
 
     def _make_request(self, endpoint: str, payload: dict | None = None):
@@ -315,7 +330,9 @@ class SGLangGenerationWorker:
 
     @staticmethod
     def _get_current_node_ip_and_free_port(start_port=10000, consecutive=1):
-        return get_current_node_ip(), get_free_port(start_port=start_port, consecutive=consecutive)
+        return get_current_node_ip(), get_free_port(
+            start_port=start_port, consecutive=consecutive
+        )
 
     def health_generate(self, timeout: float = 5.0) -> bool:
         """Run /health_generate on the underlying SGLang HTTP server.
@@ -346,8 +363,7 @@ class SGLangGenerationWorker:
         flush_cache: bool = False,
         weight_version: str | None = None,
     ):
-        """
-        Update model weights from tensor data. The HTTP server will only post meta data, and the real weights will be copied directly from GPUs.
+        """Update model weights from tensor data. The HTTP server will only post meta data, and the real weights will be copied directly from GPUs.
 
         Note: The model should be on GPUs rather than CPU for this functionality to work properly.
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
@@ -371,47 +387,46 @@ class SGLangGenerationWorker:
         # flush cache will not return status_code 200 when there are pending requests
         for _ in range(60):
             try:
-                response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
+                response = requests.get(
+                    f"http://{self.server_host}:{self.server_port}/flush_cache"
+                )
                 if response.status_code == 200:
                     break
             except NewConnectionError as e:
                 raise e
             except Exception as e:
                 logger.info(f"Error flushing cache: {e}")
-                time.sleep(1)
-                continue
+            # Pace retries on both non-200 and exception paths; otherwise the
+            # 60 iterations fly by in milliseconds and timeout before sglang
+            # has a chance to drain its queue.
+            time.sleep(1)
         else:
             raise TimeoutError("Timeout while flushing cache.")
 
     def shutdown(self):
-        import sglang_router
         from sglang.srt.utils import kill_process_tree
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         if self.node_rank == 0:
             worker_url = f"http://{self.server_host}:{self.server_port}"
             response = None
-            if parse(sglang_router.__version__) <= parse("0.2.1"):
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}"
-                )
-            elif parse(sglang_router.__version__) < parse("0.3.0"):
-                worker_url = quote(worker_url, safe="")
-                response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_url}")
-            else:
-                try:
-                    all_workers = requests.get(f"http://{self.router_ip}:{self.router_port}/workers").json()["workers"]
-                    for worker in all_workers:
-                        if worker["url"] == worker_url:
-                            worker_id = worker["id"]
-                            response = requests.delete(
-                                f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}"
-                            )
-                            break
-                    else:
-                        logger.warning(f"Worker {worker_url} not found in router during shutdown.")
-                except Exception as e:
-                    logger.warning(f"Failed to fetch workers list or remove worker: {e}")
+            try:
+                all_workers = requests.get(
+                    f"http://{self.router_ip}:{self.router_port}/workers"
+                ).json()["workers"]
+                for worker in all_workers:
+                    if worker["url"] == worker_url:
+                        worker_id = worker["id"]
+                        response = requests.delete(
+                            f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}"
+                        )
+                        break
+                else:
+                    logger.warning(
+                        f"Worker {worker_url} not found in router during shutdown."
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to fetch workers list or remove worker: {e}")
 
             if response is not None:
                 response.raise_for_status()
@@ -428,7 +443,7 @@ class SGLangGenerationWorker:
                 return response.json()["weight_version"]
         response.raise_for_status()
 
-    def release_memory_occupation(self, tags: list[str] = None):
+    def release_memory_occupation(self, tags: list[str] | None = None):
         """Release memory occupation. Available tags: weights, kv_cache."""
         self.flush_cache()
         return self._make_request(
@@ -436,10 +451,8 @@ class SGLangGenerationWorker:
             {"tags": tags},
         )
 
-    def resume_memory_occupation(self, tags: list[str] = None):
-        """
-        Available tags for multi-stage resume: weights, kv_cache
-        """
+    def resume_memory_occupation(self, tags: list[str] | None = None):
+        """Available tags for multi-stage resume: weights, kv_cache."""
         return self._make_request(
             "resume_memory_occupation",
             {"tags": tags},
@@ -447,20 +460,30 @@ class SGLangGenerationWorker:
 
     def release_memory_weights(self):
         from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+
         return self.release_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     def release_memory_kv_cache_and_cuda_graph(self):
-        from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE
+        from sglang.srt.constants import (
+            GPU_MEMORY_TYPE_CUDA_GRAPH,
+            GPU_MEMORY_TYPE_KV_CACHE,
+        )
+
         return self.release_memory_occupation(
             tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
         )
 
     def resume_memory_weights(self):
         from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+
         return self.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     def resume_memory_kv_cache_and_cuda_graph(self):
-        from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE
+        from sglang.srt.constants import (
+            GPU_MEMORY_TYPE_CUDA_GRAPH,
+            GPU_MEMORY_TYPE_KV_CACHE,
+        )
+
         return self.resume_memory_occupation(
             tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
         )
@@ -468,7 +491,9 @@ class SGLangGenerationWorker:
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
 
-    def init_weights_update_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
+    def init_weights_update_group(
+        self, master_address, master_port, rank_offset, world_size, group_name, backend
+    ):
         return self._make_request(
             "init_weights_update_group",
             {
@@ -494,7 +519,13 @@ class SGLangGenerationWorker:
             pass
 
     def update_weights_from_distributed(
-        self, names, dtypes, shapes, group_name, flush_cache=False, weight_version: str | None = None
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        flush_cache=False,
+        weight_version: str | None = None,
     ):
         payload = {
             "names": names,
@@ -519,7 +550,9 @@ class SGLangGenerationWorker:
         return response
 
     def continue_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/continue_generation", json={})
+        response = requests.post(
+            f"http://{self.server_host}:{self.server_port}/continue_generation", json={}
+        )
         response.raise_for_status()
         return response
 
@@ -528,12 +561,15 @@ class SGLangGenerationWorker:
         restore_weights_before_load: bool = False,
         post_process_quantization: bool = False,
     ):
-        """
-        Update model weights from tensor data. The HTTP server will only post meta data, and the real weights will be copied directly from GPUs.
-        Note: The model should be on GPUs rather than CPU for this functionality to work properly.
-        If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
-        """
+        """Update model weights from tensor data.
 
+        The HTTP server will only post meta data, and the real weights will be
+        copied directly from GPUs.
+
+        Note: The model should be on GPUs rather than CPU for this functionality
+        to work properly. If you encounter issues, ensure your model is loaded
+        on GPU devices rather than CPU.
+        """
         return self._make_request(
             "post_process_weights",
             {
@@ -572,17 +608,26 @@ class SGLangGenerationWorker:
         return response
 
     def stop_profile(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/stop_profile", json={})
+        response = requests.post(
+            f"http://{self.server_host}:{self.server_port}/stop_profile", json={}
+        )
         response.raise_for_status()
         return response
 
-    def simulate_crash(self):
-        logger.info(f"Simulating crash on engine {self.server_host}:{self.server_port}...")
+    def _simulate_crash(self):
+        """Test-only: tear the engine down to simulate a crash.
+
+        Underscore-prefixed to signal this is **not** part of the public
+        worker API; production code should never call it.
+        """
+        logger.info(
+            f"Simulating crash on engine {self.server_host}:{self.server_port}..."
+        )
         self.shutdown()
 
-# ---------------------------------------------------------------------------
-# Compatible with parent class or old interfaces 
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Compatible with parent class or old interfaces
+    # ---------------------------------------------------------------------------
     def get_base_url(self) -> str | None:
         """Return the ``http://host:port`` base URL of this SGLang server.
 
@@ -597,33 +642,43 @@ class SGLangGenerationWorker:
         """Flush the cache of the server.
 
         Returns:
-            True on a successful flush, False on timeout / error. Peer
-            (non-node-0) ranks return True since they do not own the HTTP
-            server.
+            ``True`` on a successful flush. Peer (non-node-0) ranks return
+            ``True`` since they do not own the HTTP server.
+
+        Raises:
+            NewConnectionError: if the engine HTTP server is unreachable
+                (engine likely crashed); the caller cannot make progress
+                with stale KV state, so we surface the failure rather than
+                swallowing it.
+            TimeoutError: if the server keeps replying non-200 for the full
+                retry window — equivalent to a hang we shouldn't ignore.
         """
         if self.node_rank != 0:
             return True
         # flush cache will not return status_code 200 when there are pending requests
         for _ in range(60):
             try:
-                response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
+                response = requests.get(
+                    f"http://{self.server_host}:{self.server_port}/flush_cache"
+                )
                 if response.status_code == 200:
                     return True
-            except NewConnectionError as e:
-                logger.error(f"Connection error flushing cache: {e}")
-                return False
+            except NewConnectionError:
+                logger.exception("Connection error flushing cache")
+                raise
             except Exception as e:
                 logger.info(f"Error flushing cache: {e}")
-                time.sleep(1)
-                continue
-        logger.error("Timeout while flushing cache.")
-        return False
+            # Pace retries on both non-200 and exception paths; otherwise
+            # the 60 iterations fly by in milliseconds.
+            time.sleep(1)
+        raise TimeoutError("Timeout while flushing cache.")
+
 
 # ----------------------------------------------------------------------------
 # Compute Server args
 # ----------------------------------------------------------------------------
 def _compute_server_args(
-    cluster_cfg,
+    gpus_per_node: int,
     sglang_cfg,
     rank,
     dist_init_addr,
@@ -633,10 +688,16 @@ def _compute_server_args(
     base_gpu_id: int | None = None,
     num_gpus_per_engine: int | None = None,
 ):
-    _gpus_per_engine = num_gpus_per_engine or sglang_cfg["sglang_server"]["num_gpus_per_engine"]
-    nnodes = max(1, _gpus_per_engine // cluster_cfg["gpus_per_node"])
+    _gpus_per_engine = (
+        num_gpus_per_engine or sglang_cfg["sglang_server"]["num_gpus_per_engine"]
+    )
+    nnodes = max(1, _gpus_per_engine // gpus_per_node)
     node_rank = rank % nnodes
-    base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(cluster_cfg, sglang_cfg, rank)
+    base = (
+        base_gpu_id
+        if base_gpu_id is not None
+        else get_base_gpu_id(gpus_per_node, sglang_cfg, rank)
+    )
     base = _to_local_gpu_id(base)
     kwargs = {
         "model_path": sglang_cfg["sglang_cfg"]["model_path"],

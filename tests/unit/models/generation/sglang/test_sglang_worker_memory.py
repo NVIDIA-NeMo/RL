@@ -29,7 +29,6 @@ state it found it.
 
 import pytest
 import ray
-
 from helpers import create_worker, post_and_assert_200
 
 pytestmark = pytest.mark.sglang
@@ -80,6 +79,32 @@ def worker(request, ray_cluster, router):
 def test_flush_cache_success(worker):
     """flush_cache returns without error on a healthy server."""
     ray.get(worker.flush_cache.remote())
+
+
+# ------------------------------------------------------------------
+# invalidate_kv_cache (worker-level)
+# ------------------------------------------------------------------
+def test_invalidate_kv_cache_success(worker):
+    """invalidate_kv_cache returns True on a healthy server."""
+    assert ray.get(worker.invalidate_kv_cache.remote()) is True
+
+
+def test_invalidate_kv_cache_after_resume(worker):
+    """invalidate_kv_cache succeeds after a release → resume round-trip.
+
+    Exercises the same retry path that flush_cache hits — sglang's
+    /flush_cache endpoint can return non-200 transiently while the queue
+    drains, so the loop must pace its retries.
+    """
+    ray.get(worker.release_memory_weights.remote())
+    ray.get(worker.resume_memory_weights.remote())
+    assert ray.get(worker.invalidate_kv_cache.remote()) is True
+
+
+def test_invalidate_kv_cache_repeated(worker):
+    """Back-to-back invalidate_kv_cache calls all return True (no state leak)."""
+    for _ in range(3):
+        assert ray.get(worker.invalidate_kv_cache.remote()) is True
 
 
 # ------------------------------------------------------------------
@@ -142,18 +167,14 @@ def test_offload_onload_via_http_200(worker):
 
     # Release weights (flush_cache first, mirroring release_memory_occupation)
     ray.get(worker.flush_cache.remote())
-    post_and_assert_200(
-        base_url, "release_memory_occupation", {"tags": ["weights"]}
-    )
+    post_and_assert_200(base_url, "release_memory_occupation", {"tags": ["weights"]})
     # Release KV cache + CUDA graphs
     ray.get(worker.flush_cache.remote())
     post_and_assert_200(
         base_url, "release_memory_occupation", {"tags": ["kv_cache", "cuda_graph"]}
     )
     # Resume weights
-    post_and_assert_200(
-        base_url, "resume_memory_occupation", {"tags": ["weights"]}
-    )
+    post_and_assert_200(base_url, "resume_memory_occupation", {"tags": ["weights"]})
     # Resume KV cache + CUDA graphs
     post_and_assert_200(
         base_url, "resume_memory_occupation", {"tags": ["kv_cache", "cuda_graph"]}
@@ -182,9 +203,7 @@ def test_double_offload_onload_cycle(worker):
             "release_memory_occupation",
             {"tags": ["kv_cache", "cuda_graph"]},
         )
-        post_and_assert_200(
-            base_url, "resume_memory_occupation", {"tags": ["weights"]}
-        )
+        post_and_assert_200(base_url, "resume_memory_occupation", {"tags": ["weights"]})
         post_and_assert_200(
             base_url,
             "resume_memory_occupation",

@@ -22,7 +22,6 @@ in this file.
 import pytest
 import ray
 import requests
-
 from helpers import create_worker
 
 pytestmark = pytest.mark.sglang
@@ -55,9 +54,7 @@ def test_init_sets_base_url(worker):
 
 def test_init_registers_with_router(worker, router):
     """The worker registers itself with the session router on init."""
-    resp = requests.get(
-        f"http://{router['ip']}:{router['port']}/workers", timeout=10
-    )
+    resp = requests.get(f"http://{router['ip']}:{router['port']}/workers", timeout=10)
     assert resp.status_code == 200
     workers_list = resp.json().get("workers", [])
     # At least one worker should be registered

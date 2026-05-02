@@ -13,12 +13,12 @@
 # ==============================================================================
 import io
 from dataclasses import dataclass
+from multiprocessing.reduction import ForkingPickler
 from typing import Callable, List, Tuple, Union
 
+import pybase64
 import torch
 from torch.multiprocessing import reductions
-from multiprocessing.reduction import ForkingPickler
-import pybase64
 
 
 class MultiprocessingSerializer:  # pragma: no cover
@@ -71,8 +71,7 @@ class MultiprocessingSerializer:  # pragma: no cover
 
 
 def monkey_patch_torch_reductions():
-    """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed"""
-
+    """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed."""
     if hasattr(reductions, "_reduce_tensor_original"):
         return
     reductions._reduce_tensor_original = reductions.reduce_tensor
@@ -83,10 +82,10 @@ def monkey_patch_torch_reductions():
     reductions.init_reductions()
 
 
-
 # The signature has not been changed for years, and we will not need this when the next version is released,
 # so it looks safe to use a constant.
 _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
+
 
 def _reduce_tensor_modified(*args, **kwargs):
     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
@@ -124,7 +123,7 @@ def _modify_tuple(t, index: int, modifier: Callable):
 
 @dataclass
 class FlattenedTensorMetadata:
-    """Metadata for a tensor in a flattened bucket"""
+    """Metadata for a tensor in a flattened bucket."""
 
     name: str
     shape: torch.Size
@@ -133,10 +132,12 @@ class FlattenedTensorMetadata:
     end_idx: int
     numel: int
 
+
 class FlattenedTensorBucket:
-    """
-    A bucket that flattens multiple tensors into a single tensor for efficient processing
-    while preserving all metadata needed for reconstruction.
+    """A bucket that flattens multiple tensors into a single tensor.
+
+    Provides efficient batched processing while preserving all metadata
+    needed for reconstruction.
     """
 
     # This field is solely for users of to check whether the class supports this feature
@@ -148,8 +149,8 @@ class FlattenedTensorBucket:
         flattened_tensor: torch.Tensor = None,
         metadata: List[FlattenedTensorMetadata] = None,
     ):
-        """
-        Initialize a tensor bucket from a list of named tensors OR from pre-flattened data.
+        """Initialize a tensor bucket from a list of named tensors OR from pre-flattened data.
+
         Args:
             named_tensors: List of (name, tensor) tuples (for creating new bucket)
             flattened_tensor: Pre-flattened tensor (for reconstruction)
@@ -197,16 +198,16 @@ class FlattenedTensorBucket:
             self.metadata = metadata
 
     def get_flattened_tensor(self) -> torch.Tensor:
-        """Get the flattened tensor containing all bucket tensors"""
+        """Get the flattened tensor containing all bucket tensors."""
         return self.flattened_tensor
 
     def get_metadata(self) -> List[FlattenedTensorMetadata]:
-        """Get metadata for all tensors in the bucket"""
+        """Get metadata for all tensors in the bucket."""
         return self.metadata
 
     def reconstruct_tensors(self) -> List[Tuple[str, torch.Tensor]]:
-        """
-        Reconstruct original tensors from flattened tensor with optimized performance.
+        """Reconstruct original tensors from flattened tensor with optimized performance.
+
         Uses memory-efficient operations to minimize allocations and copies.
         """
         # preallocate the result list
