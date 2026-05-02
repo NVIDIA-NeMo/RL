@@ -267,6 +267,7 @@ docker.md
 :caption: Development
 :hidden:
 
+ci-cd.md
 testing.md
 documentation.md
 debugging.md

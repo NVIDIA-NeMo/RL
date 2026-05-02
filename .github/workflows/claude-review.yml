@@ -16,9 +16,15 @@ jobs:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@v0.79.0
     with:
       prompt: |
-        You are doing a light code review. Keep it concise and actionable.
+        Mandatory workflow — never skip or reorder:
+        1. Read the PR diff first.
+        2. Based on the changed files and areas, identify relevant skills from skills/<name>/SKILL.md.
+           Common skill names: linting-and-formatting, testing, cicd, build-and-dependency,
+           contributing, copyright, docs, error-handling, config-conventions, launch-nemo-rl.
+        3. Read the SKILL.md files for all relevant areas using the Read tool.
+        4. Only then perform the review using the skill context.
 
-        Read and follow the review guidelines in CLAUDE.md and the coding guideline skills in .claude/skills/ at the repository root.
+        You are doing a light code review. Keep it concise and actionable.
 
         Focus ONLY on:
         - Critical bugs or logic errors

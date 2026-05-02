@@ -1,6 +1,7 @@
 ---
 name: docs
-description: Documentation conventions for NeMo-RL. Covers docs/index.md updates and docstring format. Auto-invoked during code review.
+description: Documentation conventions for NeMo-RL. Covers docs/index.md updates and docstring format.
+when_to_use: Adding or updating documentation; adding a new markdown file; reviewing docstrings; 'docs/index.md', 'docstring format', 'Sphinx', 'where do I add docs', during code review.
 ---
 
 # Documentation Conventions
