@@ -189,6 +189,85 @@ class TestValidateModelPaths:
         assert pretrained_path == str(iter_new)
         assert pt_checkpoint_exists is True
 
+    def test_pretrained_checkpoint_megatron_bridge_tracker_file_resolves_iteration(
+        self, tmp_path
+    ):
+        """megatron_bridge format: latest_checkpointed_iteration.txt resolves to the named iter dir."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        ckpt_root = tmp_path / "mbridge_ckpt"
+        ckpt_root.mkdir(parents=True)
+        iter_dir = ckpt_root / "iter_0007000"
+        iter_dir.mkdir()
+        (iter_dir / "run_config.yaml").touch()
+        (ckpt_root / "latest_checkpointed_iteration.txt").write_text("7000")
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(ckpt_root),
+                "format": "megatron_bridge",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        assert pretrained_path == str(iter_dir)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_bridge_tracker_file_release_resolves(
+        self, tmp_path
+    ):
+        """megatron_bridge format: tracker containing 'release' resolves to the release/ subdir."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        ckpt_root = tmp_path / "mbridge_ckpt"
+        ckpt_root.mkdir(parents=True)
+        release_dir = ckpt_root / "release"
+        release_dir.mkdir()
+        (release_dir / "run_config.yaml").touch()
+        (ckpt_root / "latest_checkpointed_iteration.txt").write_text("release")
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(ckpt_root),
+                "format": "megatron_bridge",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        assert pretrained_path == str(release_dir)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_bridge_tracker_file_invalid_value_raises(
+        self, tmp_path
+    ):
+        """megatron_bridge format: non-integer, non-'release' tracker content raises ValueError."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        ckpt_root = tmp_path / "mbridge_ckpt"
+        ckpt_root.mkdir(parents=True)
+        (ckpt_root / "latest_checkpointed_iteration.txt").write_text("not_a_number")
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(ckpt_root),
+                "format": "megatron_bridge",
+            },
+        }
+
+        with pytest.raises(ValueError, match="latest_checkpointed_iteration.txt"):
+            validate_model_paths(config)
+
     def test_pretrained_checkpoint_megatron_bridge_root_dir_missing_run_config_raises(
         self, tmp_path
     ):
@@ -312,6 +391,56 @@ class TestValidateModelPaths:
         assert hf_model_name == "meta-llama/Llama-3.2-1B"
         assert pretrained_path == str(iter_dir)
         assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_lm_tracker_file_release_resolves(
+        self, tmp_path
+    ):
+        """megatron_lm format: tracker containing 'release' resolves to the release/ subdir."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        mlm_root = tmp_path / "my_mlm_ckpt"
+        mlm_root.mkdir(parents=True)
+        release_dir = mlm_root / "release"
+        release_dir.mkdir()
+        (release_dir / "metadata.json").touch()
+        (mlm_root / "latest_checkpointed_iteration.txt").write_text("release")
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(mlm_root),
+                "format": "megatron_lm",
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "meta-llama/Llama-3.2-1B"
+        assert pretrained_path == str(release_dir)
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_checkpoint_megatron_lm_tracker_file_invalid_value_raises(
+        self, tmp_path
+    ):
+        """megatron_lm format: tracker content that is not an integer or 'release' raises ValueError."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        mlm_root = tmp_path / "my_mlm_ckpt"
+        mlm_root.mkdir(parents=True)
+        (mlm_root / "latest_checkpointed_iteration.txt").write_text("not_a_number")
+
+        config = {
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "pretrained_checkpoint": {
+                "path": str(mlm_root),
+                "format": "megatron_lm",
+            },
+        }
+
+        with pytest.raises(ValueError, match="latest_checkpointed_iteration.txt"):
+            validate_model_paths(config)
 
     def test_pretrained_checkpoint_megatron_lm_no_iter_subdirs_raises(self, tmp_path):
         """megatron_lm format: root dir with no metadata.json, tracker, or iter_* subdirs raises."""
