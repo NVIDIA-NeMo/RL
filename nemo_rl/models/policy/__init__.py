@@ -315,6 +315,7 @@ class DynamicBatchingConfig(TypedDict):
 
 class PolicyConfig(TypedDict):
     model_name: str
+    is_vlm: NotRequired[bool]
     tokenizer: TokenizerConfig
     train_global_batch_size: int
     train_micro_batch_size: int
@@ -346,3 +347,4 @@ class PolicyConfig(TypedDict):
         | SchedulerMilestones
         | None
     ]
+    is_vlm: NotRequired[bool]

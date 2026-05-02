@@ -78,6 +78,7 @@ def collect_trajectories(
     val_task_to_env: dict[str, EnvironmentInterface],
     logger: Logger,
     master_config: MasterConfig,
+    processor=None,
 ) -> None:
     """Run trajectory collection."""
     # common config/state items
@@ -96,6 +97,7 @@ def collect_trajectories(
             task_to_env=val_task_to_env,
             max_seq_len=None,
             generation_config=generation_config,
+            processor=processor,
             max_rollout_turns=None,
             greedy=False,
         )
@@ -147,14 +149,31 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
         )
 
-    # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+    # setup tokenizer / processor
+    processor = None
+    use_processor = config["policy"].get("is_vlm", False) or config["policy"][
+        "tokenizer"
+    ].get("use_processor", False)
+    if use_processor:
+        processor = get_tokenizer(config["policy"]["tokenizer"], get_processor=True)
+        tokenizer = processor.tokenizer
+        config["policy"]["is_vlm"] = True
+        config["policy"]["tokenizer"]["use_processor"] = True
+    else:
+        tokenizer = get_tokenizer(config["policy"]["tokenizer"])
     assert config["policy"]["generation"] is not None, (
         "A generation config is required for GRPO"
     )
     config["policy"]["generation"] = configure_generation_config(
         config["policy"]["generation"], tokenizer
     )
+    if processor is not None and "vllm_cfg" in config["policy"]["generation"]:
+        assert (
+            config["policy"]["generation"]["vllm_cfg"]["skip_tokenizer_init"] == False
+        ), (
+            "VLMs require tokenizer to be initialized before generation, so "
+            "skip_tokenizer_init must be set to False."
+        )
 
     # NeMo-Gym specific config setup.
     setup_nemo_gym_config(config, tokenizer)
@@ -165,7 +184,9 @@ def main() -> None:
     # NeMo-Gym environment needs to get dp_openai_server_base_urls from policy_generation, so we don't setup env here.
     print("\n▶ Setting up data...")
     train_dataset, val_dataset = setup_response_data(
-        tokenizer, config["data"], env_configs=None
+        processor if processor is not None else tokenizer,
+        config["data"],
+        env_configs=None,
     )
 
     # Validation dataset config setup.
@@ -202,7 +223,7 @@ The validation set you pass in will directly be used for validation with no addi
         checkpointer,
         grpo_state,
         master_config,
-    ) = setup(config, tokenizer, train_dataset, val_dataset)
+    ) = setup(config, tokenizer, train_dataset, val_dataset, processor=processor)
 
     is_trajectory_collection = (
         config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False
@@ -230,6 +251,7 @@ The validation set you pass in will directly be used for validation with no addi
             val_task_to_env=val_task_to_env,
             logger=logger,
             master_config=master_config,
+            processor=processor,
         )
     # Check if async mode is enabled
     elif "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:
@@ -281,6 +303,7 @@ The validation set you pass in will directly be used for validation with no addi
             grpo_save_state=grpo_state,
             master_config=master_config,
             max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+            processor=processor,
         )
     else:
         print("🚀 Running synchronous GRPO training")
@@ -299,6 +322,7 @@ The validation set you pass in will directly be used for validation with no addi
             checkpointer,
             grpo_state,
             master_config,
+            processor=processor,
         )
 
 

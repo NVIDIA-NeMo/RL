@@ -61,6 +61,7 @@ AUTOMODEL_FACTORY: Dict[str, Any] = {
     # https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
     "qwen2_5_vl": AutoModelForImageTextToText,
     "qwen2_vl": AutoModelForImageTextToText,
+    "qwen3_vl": AutoModelForImageTextToText,
     "qwen2_5_omni": AutoModelForTextToWaveform,
     "qwen3_5": AutoModelForImageTextToText,
     "llava": AutoModelForImageTextToText,
@@ -77,6 +78,7 @@ if NEMO_AUTOMODEL_AVAILABLE:
         # See comment above for when to add entries.
         "qwen2_5_vl": NeMoAutoModelForImageTextToText,
         "qwen2_vl": NeMoAutoModelForImageTextToText,
+        "qwen3_vl": NeMoAutoModelForImageTextToText,
         "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
         "qwen3_5": NeMoAutoModelForImageTextToText,
         "llava": NeMoAutoModelForImageTextToText,

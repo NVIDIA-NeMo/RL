@@ -1316,6 +1316,7 @@ def grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    processor: Optional[AutoProcessor] = None,
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer()
@@ -1389,6 +1390,7 @@ def grpo_train(
             step=0,
             master_config=master_config,
             logger=logger,
+            processor=processor,
         )
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
@@ -1519,6 +1521,7 @@ def grpo_train(
                             task_to_env=task_to_env,
                             max_seq_len=None,
                             generation_config=generation_config,
+                            processor=processor,
                             max_rollout_turns=None,
                             greedy=False,
                         )
@@ -1860,6 +1863,7 @@ def grpo_train(
                         step=total_steps + 1,
                         master_config=master_config,
                         logger=logger,
+                        processor=processor,
                     )
                     policy_generation.finish_generation()
                     logger.log_metrics(
@@ -2218,6 +2222,7 @@ def validate(
     step: int,
     master_config: MasterConfig,
     logger: Optional[Logger] = None,
+    processor: Optional[AutoProcessor] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -2256,6 +2261,7 @@ def validate(
                     task_to_env=val_task_to_env,
                     max_seq_len=None,
                     generation_config=generation_config,
+                    processor=processor,
                     max_rollout_turns=None,
                     greedy=False,
                 )
@@ -2376,6 +2382,7 @@ def async_grpo_train(
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
     max_trajectory_age_steps: int = 1,
+    processor: Optional[AutoProcessor] = None,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
 
@@ -2589,6 +2596,7 @@ def async_grpo_train(
                 step=0,
                 master_config=master_config,
                 logger=logger,
+                processor=processor,
             )
             policy_generation.finish_generation()
             logger.log_metrics(val_metrics, step, prefix="validation")
@@ -2917,6 +2925,7 @@ def async_grpo_train(
                         step=step + 1,
                         master_config=master_config,
                         logger=logger,
+                        processor=processor,
                     )
                     policy_generation.finish_generation()
                     logger.log_metrics(
