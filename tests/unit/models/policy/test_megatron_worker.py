@@ -268,9 +268,9 @@ class TestMegatronTwoGPU:
                         config_updates["precision"] == "float16"
                     )
                 if "activation_checkpointing" in config_updates:
-                    config["megatron_cfg"]["activation_checkpointing"] = (
-                        config_updates["activation_checkpointing"]
-                    )
+                    config["megatron_cfg"]["activation_checkpointing"] = config_updates[
+                        "activation_checkpointing"
+                    ]
                 if "sequence_parallel" in config_updates:
                     config["megatron_cfg"]["sequence_parallel"] = config_updates[
                         "sequence_parallel"
@@ -537,9 +537,9 @@ class TestMegatronTwoGPU:
                 results["total_flops"], (int, float)
             ), "training backend should report total_flops"
             assert results["total_flops"] > 0, "total_flops should be positive"
-            assert "num_ranks" in results and isinstance(
-                results["num_ranks"], int
-            ), "training backend should report num_ranks"
+            assert "num_ranks" in results and isinstance(results["num_ranks"], int), (
+                "training backend should report num_ranks"
+            )
             assert results["num_ranks"] > 0, "num_ranks should be positive"
 
             if "theoretical_tflops" in results:
@@ -631,16 +631,12 @@ class TestMegatronTwoGPU:
             f"Logprobs shape {policy_logprobs.shape} should match input shape {data.get('input_ids').shape}"
         )
 
-        assert torch.all(
-            policy_logprobs[:, 0] == 0
-        ), "First token logprobs should be zero"
+        assert torch.all(policy_logprobs[:, 0] == 0), (
+            "First token logprobs should be zero"
+        )
 
-        assert not torch.isnan(policy_logprobs).any(), (
-            "Logprobs should not contain NaN"
-        )
-        assert not torch.isinf(policy_logprobs).any(), (
-            "Logprobs should not contain Inf"
-        )
+        assert not torch.isnan(policy_logprobs).any(), "Logprobs should not contain NaN"
+        assert not torch.isinf(policy_logprobs).any(), "Logprobs should not contain Inf"
 
 
 @pytest.mark.timeout(240)
@@ -1331,7 +1327,6 @@ def test_megatron_dpo_training(tiny_llama_model_path):
     finally:
         policy.shutdown()
         cluster.shutdown()
-
 
     @pytest.fixture
     def topk_setup(self, request, two_gpu_cluster):
