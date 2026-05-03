@@ -144,7 +144,6 @@ class HttpClient:
 
         self._post_actors = created
 
-    # TODO may generalize the name since it now contains http DELETE/GET etc (with retries and remote-execution)
     async def post(self, url, payload, max_retries=10, action="post"):
         if self._distributed_post_enabled and self._post_actors:
             try:
@@ -163,7 +162,6 @@ class HttpClient:
 
         return await _post(self._get_client(), url, payload, max_retries, action=action)
 
-    # TODO unify w/ `post` to add retries and remote-execution
     async def get(self, url):
         response = await self._get_client().get(url)
         response.raise_for_status()
@@ -195,21 +193,3 @@ class HttpClient:
 def init_http_client(args: SGLangConfig) -> HttpClient:
     """Create an HTTP client for SGLang requests."""
     return HttpClient(args)
-
-
-async def post(url, payload, max_retries=10, action="post"):
-    """Issue a one-off HTTP request without shared module-level state."""
-    client = HttpClient()
-    try:
-        return await client.post(url, payload, max_retries, action=action)
-    finally:
-        await client.aclose()
-
-
-async def get(url):
-    """Issue a one-off GET request without shared module-level state."""
-    client = HttpClient()
-    try:
-        return await client.get(url)
-    finally:
-        await client.aclose()
