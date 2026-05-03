@@ -211,6 +211,15 @@ runs:
           ${{ github.workspace }}/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl/tests/.coverage
         include-hidden-files: true
 
+    - name: Upload test duration reports
+      uses: actions/upload-artifact@v6
+      if: always()
+      with:
+        name: test-durations-${{ inputs.script }}-${{ github.run_id }}
+        path: |
+          ${{ github.workspace }}/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl/tests/*_durations.xml
+        if-no-files-found: ignore
+
     - name: Upload nemo_gym actual test data
       uses: actions/upload-artifact@v6
       if: always()
