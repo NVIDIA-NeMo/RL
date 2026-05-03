@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import os
+from pathlib import Path
 from typing import Any, Optional
 
+import torch
 from megatron.bridge import AutoBridge
 
 from nemo_rl.models.policy import MegatronConfig
@@ -156,3 +158,61 @@ def export_model_from_megatron(
     import megatron.core.rerun_state_machine
 
     megatron.core.rerun_state_machine.destroy_rerun_state_machine()
+
+
+def extract_value_head_from_hf_checkpoint(
+    hf_model_path: str,
+) -> dict[str, torch.Tensor]:
+    """Extract value head weights (score.*) from an HF checkpoint.
+
+    Supports both safetensors and pytorch_model.bin formats.
+
+    Args:
+        hf_model_path: Path to a HuggingFace checkpoint directory.
+
+    Returns:
+        Dict mapping score key names to tensors, e.g.
+        {"score.weight": tensor, "score.bias": tensor}.
+
+    Raises:
+        FileNotFoundError: If no checkpoint files are found.
+        ValueError: If no score.* keys are found in the checkpoint.
+    """
+    model_path = Path(hf_model_path)
+    score_weights: dict[str, torch.Tensor] = {}
+
+    # Try safetensors first
+    try:
+        from safetensors import safe_open
+
+        safetensor_files = sorted(model_path.glob("*.safetensors"))
+        if safetensor_files:
+            for sf_file in safetensor_files:
+                with safe_open(str(sf_file), framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        if key.startswith("score."):
+                            score_weights[key] = f.get_tensor(key)
+            if score_weights:
+                return score_weights
+    except ImportError:
+        pass
+
+    # Fall back to pytorch_model.bin
+    bin_path = model_path / "pytorch_model.bin"
+    if bin_path.exists():
+        state_dict = torch.load(str(bin_path), map_location="cpu", weights_only=True)
+        for key, tensor in state_dict.items():
+            if key.startswith("score."):
+                score_weights[key] = tensor
+        if score_weights:
+            return score_weights
+
+    if not list(model_path.glob("*.safetensors")) and not bin_path.exists():
+        raise FileNotFoundError(
+            f"No checkpoint files found in {hf_model_path}"
+        )
+
+    raise ValueError(
+        f"No score.* keys found in checkpoint at {hf_model_path}. "
+        "The checkpoint may not contain value head weights."
+    )

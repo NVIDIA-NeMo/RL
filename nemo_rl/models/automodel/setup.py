@@ -22,7 +22,10 @@ from typing import Any, Optional, Union
 
 import torch
 from hydra.utils import get_class
-from nemo_automodel import NeMoAutoModelForSequenceClassification
+from nemo_automodel import (
+    NeMoAutoModelForSequenceClassification,
+    NeMoAutoModelForTokenClassification,
+)
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components._peft.lora import PeftConfig
@@ -337,6 +340,15 @@ def validate_and_prepare_config(
                     "for the linear head of Bradley-Terry reward models."
                 )
                 model_config.num_labels = 1
+        elif rm_type == "regression":
+            model_class = NeMoAutoModelForTokenClassification
+            if model_config.num_labels != 1:
+                print(
+                    "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
+                    "for the linear head of regression reward models."
+                )
+                model_config.num_labels = 1
+            model_config.classifier_dropout = 0.0
         else:
             raise ValueError(f"Unknown reward model type: {rm_type}")
     else:
@@ -495,6 +507,7 @@ def setup_model_and_optimizer(
     init_optimizer: bool = True,
     weights_path: Optional[str] = None,
     optimizer_path: Optional[str] = None,
+    optimizer_module_filter: Optional[list[str]] = None,
 ) -> ModelAndOptimizerState:
     """Set up model, parallelization, and optimizer.
 
@@ -511,6 +524,7 @@ def setup_model_and_optimizer(
         init_optimizer: Whether to initialize optimizer
         weights_path: Optional path to checkpoint weights to load
         optimizer_path: Optional path to optimizer state to load
+        optimizer_module_filter: Optional list of module names to filter optimizer parameters
 
     Returns:
         ModelAndOptimizerState containing model, optimizer, scheduler, and metadata
@@ -641,6 +655,10 @@ def setup_model_and_optimizer(
     if is_reward_model and model_config.num_labels == 1:
         from_pretrained_kwargs["num_labels"] = 1
 
+    if is_reward_model and config["reward_model_cfg"].get("reward_model_type", None) == "regression":
+        from_pretrained_kwargs["config"] = model_config
+        from_pretrained_kwargs.pop("num_labels")
+
     # Auto-set force_hf if the custom model's adapter doesn't support per-tensor
     # HF conversion (required for weight syncing).
     _maybe_set_force_hf(automodel_kwargs, model_config)
@@ -711,7 +729,16 @@ def setup_model_and_optimizer(
     optimizer = None
     if init_optimizer:
         optimizer_cls = get_class(config["optimizer"]["name"])
-        optimizer = optimizer_cls(model.parameters(), **config["optimizer"]["kwargs"])
+
+        if optimizer_module_filter is not None:
+            parameters = [
+                p
+                for n, p in model.named_parameters()
+                if any(x in n for x in optimizer_module_filter)
+            ]
+        else:
+            parameters = model.parameters()
+        optimizer = optimizer_cls(parameters, **config["optimizer"]["kwargs"])
 
     # Initialize scheduler
     scheduler = None

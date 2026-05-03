@@ -23,14 +23,12 @@ from nemo_rl.algorithms.loss.loss_functions import (
     DPOLossDataDict,
     DPOLossFn,
     DraftCrossEntropyLossFn,
+    MseValueLossFn,
     NLLLossFn,
     PreferenceLossDataDict,
     PreferenceLossFn,
 )
-from nemo_rl.algorithms.loss.utils import (
-    prepare_loss_input,
-    prepare_packed_loss_input,
-)
+from nemo_rl.algorithms.loss.utils import prepare_loss_input, prepare_packed_loss_input
 from nemo_rl.algorithms.loss.wrapper import (
     DraftLossWrapper,
     SequencePackingFusionLossWrapper,
@@ -56,5 +54,6 @@ __all__ = [
     "SequencePackingFusionLossWrapper",
     "SequencePackingLossWrapper",
     "DraftLossWrapper",
+    "MseValueLossFn",
     "wrap_loss_fn_with_input_preparation",
 ]
