@@ -1316,6 +1316,57 @@ class MegatronPolicyWorkerImpl(
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
 
+        # Clear RotaryEmbedding's @lru_cache(maxsize=32). The cache accumulates one
+        # entry per unique (max_seq_len, offset, packed_seq) seen, and each entry is
+        # a GPU tensor (the concatenated sin/cos embedding). With training + logprob
+        # runs at different sequence lengths, the cache fills quickly and the tensors
+        # anchor large CUDA segments. Memory snapshot confirmed 32 blocks (~53 MB)
+        # locking 14 segments (5.46 GB reserved).
+        try:
+            from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+            RotaryEmbedding.forward.cache_clear()
+        except Exception:
+            pass
+
+        # Clear MoE token dispatcher persistent routing tensors.
+        #
+        # MoETokenDispatcher is a plain Python class (NOT an nn.Module), so iterating
+        # self.model.modules() never yields it. We must access it via the token_dispatcher
+        # attribute on MoELayer nn.Module objects.
+        #
+        # Why this matters for fragmentation: when recompute_mlp=True and fp8=True,
+        # transformer_layer._forward_mlp wraps self.mlp (the MoE layer) with te_checkpoint.
+        # te_checkpoint._CheckpointFunction.backward recomputes the forward with
+        # torch.enable_grad(), which causes dispatch_preprocess to store
+        #   dispatcher.probs = routing_probs   (with grad_fn, under enable_grad)
+        # This creates a reference cycle:
+        #   _CheckpointFunctionBackward → ctx → ctx.run_function=mlp
+        #   → mlp.token_dispatcher.probs → probs.grad_fn → ... → _CheckpointFunctionBackward
+        #
+        # Breaking this cycle by nulling dispatcher.probs frees BOTH:
+        #   - the routing tensors (probs ~3 MB × 48 layers, routing_map ~0.38 MB × 48,
+        #     permutation ~0.19 MB × 48, total ~175 MB)
+        #   - the te_checkpoint ctx saved tensors (pre_mlp_layernorm_output ~12 MB × 48
+        #     = ~576 MB) that become collectable once the cycle is broken
+        try:
+            for module in self.model.modules():
+                if not hasattr(module, "token_dispatcher"):
+                    continue
+                dispatcher = module.token_dispatcher
+                if dispatcher is None:
+                    continue
+                for attr in (
+                    "probs",                                    # AllToAll + AllGather
+                    "routing_map",                              # AllToAll
+                    "reversed_local_input_permutation_mapping", # AllToAll
+                    "local_probs",                              # AllGather
+                    "local_map",                                # AllGather
+                ):
+                    if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
+                        setattr(dispatcher, attr, None)
+        except Exception:
+            pass
+
         gc.collect()
         torch.cuda.empty_cache()
 
