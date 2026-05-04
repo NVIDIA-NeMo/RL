@@ -2114,6 +2114,7 @@ class MegatronPolicyWorkerImpl(
                 - topk_logits: Tensor of top-k logits for each position in the sequence
                 - topk_indices: Tensor of top-k indices for each position in the sequence
         """
+        self._assert_weights_on_device("get_topk_logits")
         no_grad = torch.no_grad()
         no_grad.__enter__()
 
