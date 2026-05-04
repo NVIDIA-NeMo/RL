@@ -125,10 +125,89 @@ def _override_sglang_imbalance_check_env() -> None:
     os.environ["SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"] = "false"
 
 
+def _get_megatron_file(subpackage: str, relative_path: str) -> str | None:
+    """Locate a file inside ``megatron.<subpackage>`` (e.g. ``core``, ``training``).
+
+    Returns ``None`` if megatron isn't importable so callers can treat that
+    as "nothing to patch". Raises if the package is present but the
+    expected file is missing (signals a megatron version mismatch).
+    """
+    from importlib.util import find_spec
+
+    full_pkg = f"megatron.{subpackage}"
+    try:
+        spec = find_spec(full_pkg)
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+
+    base_dir = next(iter(spec.submodule_search_locations))
+    file_path = os.path.join(base_dir, *relative_path.split("/"))
+    if not os.path.exists(file_path):
+        raise RuntimeError(
+            f"Expected megatron file '{full_pkg}/{relative_path}' not found at "
+            f"'{file_path}'. The megatron version may have moved this file; "
+            "compat patch cannot be applied."
+        )
+    return file_path
+
+
+def _patch_megatron_hook_mode_in(file_path: str) -> None:
+    """Comment out ``torch_memory_saver.hook_mode = "torch"`` in a megatron file.
+
+    Megatron sets ``tms.hook_mode = "torch"`` at module import time on the
+    global ``torch_memory_saver`` singleton. That mutation breaks sglang's
+    pauseable CUDA graph path, which asserts ``_hook_mode == "preload"``
+    inside ``TorchMemorySaver.cuda_graph(...)``. Commenting the line out
+    leaves the singleton at its default ``"preload"`` mode that sglang
+    expects.
+    """
+    with open(file_path, "r") as f:
+        content = f.read()
+
+    sentinel = '# torch_memory_saver.hook_mode = "torch"'
+    if sentinel in content:
+        return
+
+    anchor = '    torch_memory_saver.hook_mode = "torch"\n'
+    if anchor not in content:
+        raise RuntimeError(
+            f"Megatron hook_mode anchor '{anchor.strip()}' not found in "
+            f"{file_path}; the megatron version may have moved or removed it."
+        )
+
+    replacement = (
+        '    # torch_memory_saver.hook_mode = "torch"  '
+        "# patched by nemo_rl: conflicts with sglang pauseable CUDA Graph\n"
+    )
+    content = content.replace(anchor, replacement, 1)
+    _write_and_verify(file_path, content, sentinel)
+    logger.info("Patched megatron tms.hook_mode mutation in %s.", file_path)
+
+
+def _patch_megatron_dynamic_context_hook_mode() -> None:
+    file_path = _get_megatron_file(
+        "core", "inference/contexts/dynamic_context.py"
+    )
+    if file_path is None:
+        return
+    _patch_megatron_hook_mode_in(file_path)
+
+
+def _patch_megatron_training_hook_mode() -> None:
+    file_path = _get_megatron_file("training", "training.py")
+    if file_path is None:
+        return
+    _patch_megatron_hook_mode_in(file_path)
+
+
 def _apply_sglang_compat_patches() -> None:
     _patch_sglang_safe_unpickler()
     _patch_sglang_weight_checker()
     _override_sglang_imbalance_check_env()
+    _patch_megatron_dynamic_context_hook_mode()
+    _patch_megatron_training_hook_mode()
 
 
 def get_base_gpu_id(gpus_per_node: int, sglang_cfg, rank):

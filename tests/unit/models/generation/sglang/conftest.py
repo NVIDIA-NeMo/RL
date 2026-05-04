@@ -50,6 +50,11 @@ _STUB_MODULES = [
     "vllm.lora",
     "vllm.lora.request",
     "wandb",
+    # TE meta package raises RuntimeError on import in this venv; stub to
+    # bypass so the sglang import chain can complete without real TE.
+    "transformer_engine",
+    "transformer_engine.common",
+    "transformer_engine.pytorch",
 ]
 for _mod in _STUB_MODULES:
     if _mod in sys.modules:
