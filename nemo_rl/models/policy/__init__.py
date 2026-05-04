@@ -269,6 +269,15 @@ class MegatronConfig(TypedDict):
     # Verbosity level forwarded to Megatron-LM's LoggerConfig (0 = quiet).
     # Defaults to 0 when unset.
     logging_level: NotRequired[int]
+    # When True, checkpoint save/load uses Megatron-Core's fully-parallel
+    # path. Defaults to True when unset (matching the historical behavior).
+    # Setting to False can simplify debugging at the cost of throughput.
+    fully_parallel_save: NotRequired[bool]
+    fully_parallel_load: NotRequired[bool]
+    # When True, RNG state is included in saved checkpoints and restored on
+    # load — needed for bit-exact resume. Defaults to False when unset
+    # (matching the historical behavior).
+    load_rng: NotRequired[bool]
 
 
 class DraftConfigDisabled(TypedDict):

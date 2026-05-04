@@ -570,18 +570,22 @@ def _create_checkpoint_config(
 ) -> CheckpointConfig:
     """Create checkpoint configurations.
 
-    The ``async_save`` flag is read from ``config["megatron_cfg"]`` when set,
-    so that users can opt in to non-blocking checkpoint writes (the
-    underlying Megatron-Core plumbing already supports it). When the key is
-    absent, async saving is left disabled — matching the historical default.
+    The ``async_save``, ``fully_parallel_save``, ``fully_parallel_load``, and
+    ``load_rng`` flags are read from ``config["megatron_cfg"]`` when set, so
+    users can override Megatron-Core's checkpoint I/O behavior without
+    patching this module. When a key is absent, the historical hard-coded
+    default is used.
     """
-    async_save: bool = False
-    if (
-        config is not None
-        and "megatron_cfg" in config
-        and "async_save" in config["megatron_cfg"]
-    ):
-        async_save = config["megatron_cfg"]["async_save"]
+    megatron_cfg = config["megatron_cfg"] if config and "megatron_cfg" in config else {}
+
+    async_save: bool = megatron_cfg.get("async_save", False) if megatron_cfg else False
+    fully_parallel_save: bool = (
+        megatron_cfg.get("fully_parallel_save", True) if megatron_cfg else True
+    )
+    fully_parallel_load: bool = (
+        megatron_cfg.get("fully_parallel_load", True) if megatron_cfg else True
+    )
+    load_rng: bool = megatron_cfg.get("load_rng", False) if megatron_cfg else False
 
     return CheckpointConfig(
         save_interval=100,
@@ -590,9 +594,9 @@ def _create_checkpoint_config(
         load_optim=optimizer_path is not None,
         pretrained_checkpoint=pretrained_path,
         async_save=async_save,
-        fully_parallel_save=True,
-        fully_parallel_load=True,
-        load_rng=False,
+        fully_parallel_save=fully_parallel_save,
+        fully_parallel_load=fully_parallel_load,
+        load_rng=load_rng,
     )
 
 
@@ -1031,13 +1035,20 @@ def setup_reference_model_state(
     config: PolicyConfig, megatron_cfg: ConfigContainer, pretrained_path: str
 ) -> dict:
     """Setup the reference model for inference and return its state dict."""
+    # Mirror the user-overridable knobs from _create_checkpoint_config so the
+    # reference model honors the same checkpoint-I/O preferences. When a key
+    # is absent, the historical hard-coded default is used.
+    user_megatron_cfg = config.get("megatron_cfg", {}) or {}
+    fully_parallel_load: bool = user_megatron_cfg.get("fully_parallel_load", True)
+    load_rng: bool = user_megatron_cfg.get("load_rng", False)
+
     # Create reference checkpoint config
     ref_checkpoint_config = CheckpointConfig(
         pretrained_checkpoint=pretrained_path,
         save=None,
         load=None,
-        fully_parallel_load=True,
-        load_rng=False,
+        fully_parallel_load=fully_parallel_load,
+        load_rng=load_rng,
     )
 
     ref_ckpt_context = init_checkpointing_context(ref_checkpoint_config)

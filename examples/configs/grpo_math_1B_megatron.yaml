@@ -88,6 +88,9 @@ policy:
     # async_save: false                 # Set true to write checkpoints asynchronously
     # check_for_nan_in_grad: true       # Set false to skip the per-step NaN/Inf grad check in steady-state training
     # logging_level: 0                  # Megatron-LM LoggerConfig verbosity (0 = quiet)
+    # fully_parallel_save: true         # Set false to simplify debugging at the cost of throughput
+    # fully_parallel_load: true         # Set false to simplify debugging at the cost of throughput
+    # load_rng: false                   # Set true to include/restore RNG state for bit-exact resume
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1

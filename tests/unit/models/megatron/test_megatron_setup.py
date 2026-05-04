@@ -602,6 +602,43 @@ class TestCreateCheckpointConfig:
         )
         assert checkpoint_config.async_save is True
 
+    def test_parallelism_and_rng_flags_default_when_absent(self, tmp_path):
+        """When the new parallelism/RNG keys are absent the historical
+        defaults must hold — fully_parallel_save/load default True,
+        load_rng defaults False."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            {"megatron_cfg": {}},
+        )
+        assert checkpoint_config.fully_parallel_save is True
+        assert checkpoint_config.fully_parallel_load is True
+        assert checkpoint_config.load_rng is False
+
+    def test_parallelism_and_rng_flags_overridable_via_config(self, tmp_path):
+        """User config can flip the parallelism/RNG knobs — issue #2229."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        config = {
+            "megatron_cfg": {
+                "fully_parallel_save": False,
+                "fully_parallel_load": False,
+                "load_rng": True,
+            }
+        }
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            config,
+        )
+        assert checkpoint_config.fully_parallel_save is False
+        assert checkpoint_config.fully_parallel_load is False
+        assert checkpoint_config.load_rng is True
+
 
 @pytest.mark.mcore
 class TestSetupDistributedTimeout:
