@@ -914,6 +914,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         rollout_engine_urls: list[str],
         num_gpus_per_engine: int,
         buffer_size_bytes: int = 512 * 1024 * 1024,
+        engine_gpu_counts: Optional[list[int]] = None,
+        engine_gpu_offsets: Optional[list[int]] = None,
     ) -> None:
         """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
 
@@ -922,9 +924,14 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 engine's ``node_rank=0`` SGLang HTTP server. The driver
                 resolves these once via ``engine.get_base_url`` and passes
                 them down so every FSDP rank doesn't redo the Ray RPC.
-            num_gpus_per_engine: TP size per SGLang engine. Engine ``i`` is
-                assumed to own global ranks ``[i*K, (i+1)*K)``.
+            num_gpus_per_engine: TP size per SGLang engine. Used as the
+                fallback when ``engine_gpu_counts`` is not provided (dense
+                layout: engine ``i`` owns ranks ``[i*K, (i+1)*K)``).
             buffer_size_bytes: Max bucket size in bytes before flushing.
+            engine_gpu_counts: Optional explicit per-engine GPU count.
+            engine_gpu_offsets: Optional explicit per-engine GPU start
+                offset. Use together with ``engine_gpu_counts`` to express
+                placeholder gaps or heterogeneous TP sizes.
         """
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
@@ -944,6 +951,8 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             worker_name=str(self),
             buffer_size_bytes=buffer_size_bytes,
             worker_state=self._ipc_worker_state,
+            engine_gpu_counts=engine_gpu_counts,
+            engine_gpu_offsets=engine_gpu_offsets,
         )
 
     @torch.no_grad()
@@ -1146,3 +1155,71 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 )  # pragma: no cover
 class DTensorPolicyWorkerV2(DTensorPolicyWorkerV2Impl):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Driver-side SGLang weight-update dispatch (FSDP backend)
+# ---------------------------------------------------------------------------
+def refit_sglang_colocated(
+    *,
+    policy: Any,
+    policy_generation: Any,
+    buffer_size_bytes: int,  # noqa: ARG001 — accepted for dispatch parity
+) -> bool:
+    """Refit colocated SGLang engines from the FSDP/DTensor policy.
+
+    Reuses the existing ``stream_weights_via_http`` path, which embeds its
+    own pause + flush_cache lifecycle inside the SGLang HTTP gateway. The
+    ``buffer_size_bytes`` argument is accepted for parity with the Megatron
+    dispatch but is not consumed here — the FSDP path uses the worker-side
+    fixed buffer size. Includes the optional fault-tolerance recover prelude.
+    """
+    from nemo_rl.models.policy.utils import fetch_updatable_engines_with_recover
+
+    (
+        rollout_engines,
+        _rollout_engine_lock,
+        num_new_engines,
+        engine_gpu_counts,
+        engine_gpu_offsets,
+    ) = fetch_updatable_engines_with_recover(policy_generation)
+
+    if num_new_engines > 0:
+        # Topology refresh runs lazily inside ``stream_weights_via_http_impl``
+        # the first time a covered rank enters it after the layout changes.
+        policy_generation.clear_updatable_num_new_engines()
+        assert policy_generation.num_new_engines == 0, (
+            "clear_updatable_num_new_engines did not zero num_new_engines"
+        )
+
+    rollout_engine_urls = ray.get(
+        [e.get_base_url.remote() for e in rollout_engines]
+    )
+    futures_train = policy.stream_weights_via_http(
+        rollout_engine_urls=rollout_engine_urls,
+        num_gpus_per_engine=policy_generation.num_gpus_per_engine,
+        engine_gpu_counts=engine_gpu_counts,
+        engine_gpu_offsets=engine_gpu_offsets,
+    )
+    ray.get(futures_train)
+    return True
+
+
+def refit_sglang_distributed(
+    *,
+    policy: Any,  # noqa: ARG001 — accepted for dispatch parity
+    policy_generation: Any,  # noqa: ARG001
+    buffer_size_bytes: int,  # noqa: ARG001
+) -> bool:
+    """SGLang disaggregate broadcast is not currently supported for FSDP.
+
+    Per the design, only the Megatron backend implements the distributed
+    refit path (it depends on AutoBridge restoring full HF tensors on
+    trainer rank 0). FSDP non-colocated refits should keep using the
+    legacy ``broadcast_weights_for_collective`` flow with a non-SGLang
+    generation backend.
+    """
+    raise NotImplementedError(
+        "SGLang weight_transfer_mode='broadcast' is currently only supported "
+        "for the Megatron policy backend."
+    )

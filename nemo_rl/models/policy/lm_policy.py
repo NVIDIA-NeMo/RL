@@ -886,6 +886,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self,
         rollout_engine_urls: list[str],
         num_gpus_per_engine: int,
+        engine_gpu_counts: Optional[list[int]] = None,
+        engine_gpu_offsets: Optional[list[int]] = None,
     ) -> list[ray.ObjectRef]:
         """Send the weights to colocated SGLang engines via CUDA IPC over HTTP.
 
@@ -894,12 +896,89 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 engine's ``node_rank=0`` SGLang HTTP server. The caller
                 resolves these once (via ``engine.get_base_url``) and passes
                 them in, so every FSDP rank doesn't redo the Ray RPC.
-            num_gpus_per_engine: TP size per SGLang engine.
+            num_gpus_per_engine: TP size per SGLang engine. Used as the
+                fallback dense layout when ``engine_gpu_counts`` is None.
+            engine_gpu_counts: Optional explicit per-engine GPU count.
+            engine_gpu_offsets: Optional explicit per-engine GPU offset.
         """
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_http",
             rollout_engine_urls=rollout_engine_urls,
             num_gpus_per_engine=num_gpus_per_engine,
+            engine_gpu_counts=engine_gpu_counts,
+            engine_gpu_offsets=engine_gpu_offsets,
+        )
+        return futures
+
+    def connect_sglang_rollout_engines(
+        self,
+        *,
+        engine_gpu_counts: list[int],
+        engine_gpu_offsets: Optional[list[int]] = None,
+    ) -> None:
+        """Set up the colocate Gloo gather topology for SGLang weight refit.
+
+        Megatron-only entry point. The FSDP path runs the same setup lazily
+        from inside ``stream_weights_via_http``.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "connect_sglang_rollout_engines",
+            engine_gpu_counts=engine_gpu_counts,
+            engine_gpu_offsets=engine_gpu_offsets,
+        )
+        ray.get(futures)
+
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Send Megatron-restored HF tensors to colocated SGLang via Ray IPC."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_weights_to_sglang_colocated",
+            rollout_engines=rollout_engines,
+            buffer_size_bytes=buffer_size_bytes,
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+        )
+        return futures
+
+    def connect_sglang_rollout_engines_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        engine_gpu_counts: list[int],
+        group_name: Optional[str] = None,
+    ) -> None:
+        """Bring up the trainer-rank-0 NCCL group for SGLang disaggregate refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "connect_sglang_rollout_engines_distributed",
+            rollout_engines=rollout_engines,
+            engine_gpu_counts=engine_gpu_counts,
+            group_name=group_name,
+        )
+        ray.get(futures)
+
+    def update_weights_to_sglang_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        rollout_engine_lock: ray.actor.ActorHandle,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Broadcast Megatron-restored HF tensors to SGLang via NCCL (rank 0 only)."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_weights_to_sglang_distributed",
+            rollout_engines=rollout_engines,
+            rollout_engine_lock=rollout_engine_lock,
+            buffer_size_bytes=buffer_size_bytes,
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
         )
         return futures
 

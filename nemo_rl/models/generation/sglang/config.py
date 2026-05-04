@@ -17,6 +17,25 @@ from typing import Any, NotRequired, TypedDict
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
+class SglangQuantizationConfig(TypedDict, total=False):
+    """SGLang weight-precision config.
+
+    ``scheme="bf16"`` (or omitting the block) means BF16 rollout/refit. Set
+    ``scheme="mxfp8"`` to boot SGLang from an MXFP8 HF checkpoint and to send
+    MXFP8 HF tensors during online refit.
+    """
+
+    scheme: str  # "bf16" | "mxfp8"
+    weight_block_size: list[int]
+    scale_fmt: str
+    modules_to_not_convert: list[str]
+    extra_high_precision_layers_hf: list[str]
+    num_layers_at_start_in_bf16: int
+    num_layers_at_end_in_bf16: int
+    converted_model_path: str
+    cache_root: str
+
+
 class SglangSpecificArgs(TypedDict):
     """SGLang-specific configuration arguments.
 
@@ -98,6 +117,8 @@ class SglangSpecificArgs(TypedDict):
     rollout_health_check_interval: NotRequired[int]
     rollout_health_check_timeout: NotRequired[int]
     rollout_health_check_first_wait: NotRequired[int]
+    # Weight precision and (when scheme=mxfp8) offline-conversion knobs.
+    quantization: NotRequired[SglangQuantizationConfig]
 
 
 class SGLangServer(TypedDict):
@@ -115,6 +136,10 @@ class SGLangServer(TypedDict):
     # total num gpus for inference
     num_gpus: NotRequired[int]
     num_gpus_per_engine: NotRequired[int]
+    # "ipc" -> CUDA-IPC over the colocated SGLang HTTP server (default for
+    # colocated inference). "broadcast" -> NCCL broadcast over a shared
+    # weight-update group (used when SGLang engines run on disaggregate GPUs).
+    weight_transfer_mode: NotRequired[str]
 
 
 class SGLangRouter(TypedDict):

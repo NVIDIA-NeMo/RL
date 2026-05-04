@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Optional
 
 import ray
 import torch
@@ -377,16 +377,23 @@ class SGLangGeneration(GenerationInterface):
             ]
         )
 
-    def pause_generation(self) -> None:
-        """Pause generation on every node-0 engine using the configured mode."""
+    def pause_generation(self, mode: Optional[str] = None) -> None:
+        """Pause generation on every node-0 engine.
+
+        Args:
+            mode: Pause mode override. When ``None`` (default), the mode
+                configured in ``sglang_server.pause_generation_mode`` is
+                used. Callers (e.g. the SGLang refit dispatch helpers)
+                pass an explicit mode when they also need to gate
+                follow-up steps such as ``flush_cache`` on the same value.
+        """
         engines = [e for e in self.engines if e is not None]
         if not engines:
             return
+        if mode is None:
+            mode = self.pause_generation_mode
         ray.get(
-            [
-                e.pause_generation.remote(mode=self.pause_generation_mode)
-                for e in engines
-            ]
+            [e.pause_generation.remote(mode=mode) for e in engines]
         )
 
     def continue_generation(self) -> None:
