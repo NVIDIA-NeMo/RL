@@ -2,8 +2,8 @@
 requires = ["setuptools>=42", "wheel>=0.46.2"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["nemo_rl"]
+[tool.setuptools.packages.find]
+include = ["nemo_rl*"]
 
 [tool.setuptools.dynamic]
 version = { attr = "nemo_rl.__version__" }                      # any module attribute compatible with ast.literal_eval
@@ -61,6 +61,12 @@ dependencies = [
   "cuda-bindings; sys_platform != 'darwin'",                                                                          # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                           # for transformer-engine no build isolation
+  # Data-plane stack — promoted to base so worker venvs (built by
+  # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
+  # automatically include them. Removes the need for a `[data-plane]`
+  # extra and the corresponding plumbing in the per-worker venv builder.
+  "tensordict",
+  "TransferQueue==0.1.6",
 ]
 
 [project.optional-dependencies]
@@ -299,6 +305,11 @@ override-dependencies = [
   "outlines>=0.2.0",
   # Upgrade pytest to 9.0.3
   "pytest>=9.0.3",
+  # TransferQueue (data-plane extra) pins numpy<2.0.0; megatron-core needs
+  # numpy>=2.1.0 via onnx → ml-dtypes. Override globally so the data-plane
+  # extra composes with mcore/automodel without version-mirroring TQ's
+  # requirements.txt. Forward-compatible across TQ minor bumps.
+  "numpy>=2.1.0",
 ]
 
 # CVE fixes

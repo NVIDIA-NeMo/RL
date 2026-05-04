@@ -631,6 +631,35 @@ Trainer worker calls `materialize(layout="packed")` directly and skips the padde
 
 ---
 
+### Observability (sublayer, opt-in)
+
+Independent layer over `DataPlaneClient`. Wraps any adapter with a
+`MetricsDataPlaneClient` middleware that records `op | partition_id |
+n_keys | n_bytes | wall_ms | status | fields` per call to a pluggable
+`MetricsSink`. The trainer pulls a flat metrics dict via
+`dp_client.snapshot()` once per step and merges into its existing
+`logger.log_metrics(...)` payload. Off by default; one config flag opts
+in.
+
+```yaml
+data_plane:
+  observability:
+    enabled: true
+    sink: memory   # or 'log'
+```
+
+Layered design: the middleware is itself a `DataPlaneClient` and stacks
+with future layers (integrity check, distributed tracing) without
+touching the ABC or the TQ adapter. Future Layer 2 (server-side
+controller introspection — `list_partitions`, `partition_stats`,
+`queue_depth`) would extend the ABC; Layer 3 (integrity check) would
+add a sibling middleware.
+
+Full design: [`data_plane_observability.md`](./data_plane_observability.md).
+Code: `nemo_rl/data_plane/observability/`.
+
+---
+
 ## 4. Risks (and Mitigations)
 
 ### High — sequence packing & DP sharding
