@@ -306,7 +306,7 @@ def setup_model_config(
 
     try:
         cfg_from_pretrained = ConfigContainer.from_yaml(
-            pretrained_run_config, mode=InstantiationMode.STRICT
+            pretrained_run_config, mode=InstantiationMode.LENIENT
         )
     except Exception as e:
         # Add helpful context as a note to the exception

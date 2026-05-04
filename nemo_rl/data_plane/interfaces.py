@@ -1,0 +1,229 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Stable boundary between NeMo-RL and any data-plane implementation.
+
+All call sites in ``nemo_rl/algorithms``, ``nemo_rl/experience`` and
+``nemo_rl/models`` go through :class:`DataPlaneClient` — never
+``import transfer_queue`` directly. This is what makes the implementation
+swappable (G2 in the integration plan).
+
+See ``research/data_plane_integration_plan.md`` for the full design.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Literal, NotRequired, TypedDict
+
+from tensordict import TensorDict
+
+
+class DataPlaneConfig(TypedDict):
+    """Feature-gated config; defaults to disabled.
+
+    ``backend`` is the storage backend *inside* TransferQueue; it is owned by
+    the TQ adapter, not by NeMo-RL. ``impl`` selects which adapter we go
+    through.
+    """
+
+    enabled: bool
+    impl: Literal["transfer_queue"]
+    backend: NotRequired[Literal["simple", "mooncake_cpu"]]
+    controller_address: NotRequired[str]
+    storage_capacity: NotRequired[int]
+    num_storage_units: NotRequired[int]
+    get_meta_poll_interval_s: NotRequired[float]
+    ack_timeout_ms: NotRequired[int]
+    observability: NotRequired["ObservabilityConfig"]
+
+
+class ObservabilityConfig(TypedDict):
+    """Optional middleware that records per-op metrics on the client.
+
+    Off by default. When ``enabled=True`` the factory wraps the chosen
+    adapter with :class:`MetricsDataPlaneClient`. See
+    ``research/data_plane_observability.md`` for the design.
+    """
+
+    enabled: bool
+    sink: NotRequired[Literal["memory", "log"]]
+
+
+@dataclass
+class KVBatchMeta:
+    """1:1 mirror of ``transfer_queue.metadata.KVBatchMeta``.
+
+    Attribute names match TransferQueue exactly so the adapter does not need
+    a rename layer and TQ's own ``select_fields`` validation works against
+    our object unmodified.
+
+    Two roles:
+      * Result type returned by :meth:`DataPlaneClient.get_meta` — callers
+        extract ``.keys`` / ``.partition_id`` and pass them to
+        :meth:`kv_batch_get` / :meth:`get_data`.
+      * Argument type for the per-DP-rank fetch entrypoints introduced in
+        Stage 4. ``sequence_lengths`` lets the driver compute a balanced
+        per-rank shard from metadata only (control plane), without ever
+        materializing tensor data.
+    """
+
+    partition_id: str
+    task_name: str | None
+    keys: list[str]
+    fields: list[str] | None = None
+    sequence_lengths: list[int] | None = None
+    extra_info: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def size(self) -> int:
+        return len(self.keys)
+
+
+class DataPlaneClient(ABC):
+    """Stable, swappable data-plane boundary.
+
+    The methods are split into three groups by intent. Argument order
+    mirrors the underlying ``transfer_queue`` API 1:1 so a future adapter
+    (e.g. ``nv-dataplane``) is a thin pass-through too.
+
+    A. *Task-mediated* — used by stages that wait for upstream production
+       via the per-task consumer counter:
+       :meth:`register_partition`, :meth:`get_meta`, :meth:`get_data`,
+       :meth:`check_consumption_status`.
+    B. *Direct-by-key* — used by stages that already know the exact uids
+       (e.g. driver-side fan-out to DP ranks):
+       :meth:`kv_batch_put`, :meth:`kv_batch_get`, :meth:`kv_clear`.
+    C. *Lifecycle* — :meth:`close`.
+
+    Stage-completion signal: there is intentionally no ``mark_consumed``.
+    The authoritative signal in TransferQueue is *field production* —
+    when a stage calls :meth:`kv_batch_put` for a new field, the controller
+    flips ``production_status[sample, field] = 1``. Downstream consumers
+    waiting on that field only see those samples once produced. See R13 of
+    the design document.
+    """
+
+    # ── (A) task-mediated ───────────────────────────────────────────────
+
+    @abstractmethod
+    def register_partition(
+        self,
+        partition_id: str,
+        fields: list[str],
+        num_samples: int,
+        consumer_tasks: list[str],
+        grpo_group_size: int | None = None,
+        enums: dict[str, list[str]] | None = None,
+    ) -> None:
+        """Declare the partition schema and consumer tasks.
+
+        ``fields`` is the *superset* of fields any producer may write to
+        this partition (R4 — multimodal-tolerant). ``enums`` ships fixed-
+        vocab string codecs to the controller once at register time
+        rather than per-sample (P3, Tier 2).
+        """
+
+    @abstractmethod
+    def get_meta(
+        self,
+        partition_id: str,
+        task_name: str,
+        required_fields: list[str],
+        batch_size: int,
+        dp_rank: int | None = None,
+        blocking: bool = True,
+        timeout_s: float = 60.0,
+    ) -> KVBatchMeta:
+        """Discover samples ready for ``task_name``.
+
+        Advances TQ's per-task consumption counter as a side effect of the
+        underlying ``mode='fetch'`` call. ``dp_rank`` is preserved on the
+        ABC for forward compatibility but Phase 1 uses driver-side
+        balancing (see Stage 4) instead of ``RankAwareSampler``.
+        """
+
+    @abstractmethod
+    def get_data(
+        self,
+        meta: KVBatchMeta,
+        select_fields: list[str] | None = None,
+    ) -> TensorDict:
+        """Resolve a meta to tensor data.
+
+        Resolution order for the field set:
+          1. Explicit ``select_fields`` argument.
+          2. ``meta.fields`` if non-None.
+          3. *Fail loudly* — never silently fetch all fields (P2).
+        """
+
+    @abstractmethod
+    def check_consumption_status(
+        self, partition_id: str, task_names: list[str]
+    ) -> bool:
+        """True iff every task in ``task_names`` has consumed all samples.
+
+        Authoritative across workers — uses TQ's controller-side counter,
+        not the per-process client cache.
+        """
+
+    # ── (B) direct-by-key (TQ-aligned signatures) ──────────────────────
+
+    @abstractmethod
+    async def kv_batch_put(
+        self,
+        keys: list[str],
+        partition_id: str,
+        fields: TensorDict | None = None,
+        tags: list[dict[str, Any]] | None = None,
+    ) -> KVBatchMeta:
+        """Producer entrypoint.
+
+        Writing a field flips the controller's ``production_status`` bit
+        for ``(sample, field)`` — that flip *is* the "stage finished for
+        these keys" signal that downstream consumers wait on. Returns the
+        meta downstream consumers can use for direct
+        :meth:`kv_batch_get`.
+
+        The adapter MUST reject non-tensor leaves in ``fields`` (P3 —
+        no pickle on the bus).
+        """
+
+    @abstractmethod
+    def kv_batch_get(
+        self,
+        keys: list[str],
+        partition_id: str,
+        select_fields: list[str] | None = None,
+    ) -> TensorDict:
+        """Direct fetch by uids.
+
+        Used by per-DP-rank slice fetches in Stage 4. Does NOT advance any
+        per-task consumption counter — that only happens via
+        :meth:`get_meta`.
+        """
+
+    @abstractmethod
+    def kv_clear(
+        self,
+        keys: list[str] | None,
+        partition_id: str,
+    ) -> None:
+        """Drop key-value pairs. ``keys=None`` clears the whole partition."""
+
+    # ── (C) lifecycle ──────────────────────────────────────────────────
+
+    @abstractmethod
+    def close(self) -> None:
+        """Release controller / storage handles. Idempotent."""

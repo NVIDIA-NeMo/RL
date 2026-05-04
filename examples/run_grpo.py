@@ -164,10 +164,22 @@ def main() -> None:
             max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
         )
     else:
-        print("🚀 Running synchronous GRPO training")
+        # Two parallel synchronous trainers (verl-style — main_ppo.py vs
+        # main_ppo_sync.py). data_plane.enabled selects which one runs:
+        # the legacy in-memory path or the TransferQueue-mediated fork.
+        # Same model, same data, same seed → diff the wandb runs to
+        # validate parity.
+        dp_cfg = master_config.get("data_plane", {})
+        if dp_cfg.get("enabled", False):
+            from nemo_rl.algorithms.grpo_sync import grpo_train_sync
 
-        # Run standard GRPO training
-        grpo_train(
+            print("🚀 Running synchronous GRPO training (TransferQueue)")
+            trainer = grpo_train_sync
+        else:
+            print("🚀 Running synchronous GRPO training (legacy)")
+            trainer = grpo_train
+
+        trainer(
             policy,
             policy_generation,
             dataloader,

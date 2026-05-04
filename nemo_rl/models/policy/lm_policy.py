@@ -24,6 +24,7 @@ from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data_plane import dp_dispatch, shard_keys_by_seqlen
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -55,6 +56,47 @@ from nemo_rl.utils.flops_tracker import (
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Per-stage aggregators for @dp_dispatch. Each one assembles the per-rank
+# result list that workers return into the shape the legacy method's
+# in-memory path returns. Kept at module scope so they're easy to grep.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "loss": results[0]["global_loss"],
+        "grad_norm": results[0]["grad_norm"],
+    }
+    if "moe_metrics" in results[0]:
+        out["moe_metrics"] = results[0]["moe_metrics"]
+    all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
+    for r in results:
+        for k, v in r["all_mb_metrics"].items():
+            all_mb_metrics[k].extend(v)
+    out["all_mb_metrics"] = dict(all_mb_metrics)
+    return out
+
+
+def _aggregate_logprob_results(
+    results: list[BatchedDataDict[Any]],
+) -> BatchedDataDict[Any]:
+    return BatchedDataDict.from_batches(
+        results, pad_value_dict={"logprobs": 0.0}
+    )
+
+
+def _aggregate_reference_logprob_results(
+    results: list[BatchedDataDict[Any]],
+) -> BatchedDataDict[Any]:
+    return BatchedDataDict.from_batches(
+        results, pad_value_dict={"reference_logprobs": 0.0}
+    )
+
+
+_DP_REPLICATE_AXES = ["context_parallel", "tensor_parallel", "pipeline_parallel"]
 
 
 class Policy(ColocatablePolicyInterface, GenerationInterface):
@@ -358,6 +400,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
 
+    @dp_dispatch(
+        sharder=shard_keys_by_seqlen,
+        sharded_axes=["data_parallel"],
+        replicate_axes=_DP_REPLICATE_AXES,
+        worker_method="get_logprobs_presharded",
+        aggregate=_aggregate_logprob_results,
+    )
     def get_logprobs(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -431,6 +480,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return logprobs
 
+    @dp_dispatch(
+        sharder=shard_keys_by_seqlen,
+        sharded_axes=["data_parallel"],
+        replicate_axes=_DP_REPLICATE_AXES,
+        worker_method="get_reference_policy_logprobs_presharded",
+        aggregate=_aggregate_reference_logprob_results,
+    )
     def get_reference_policy_logprobs(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -582,6 +638,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return stacked
 
+    @dp_dispatch(
+        sharder=shard_keys_by_seqlen,
+        sharded_axes=["data_parallel"],
+        replicate_axes=_DP_REPLICATE_AXES,
+        worker_method="train_presharded",
+        aggregate=_aggregate_train_results,
+    )
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -685,6 +748,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         aggregated_results["all_mb_metrics"] = dict(all_mb_metrics)
 
         return aggregated_results
+
+    def setup_data_plane(self, cfg: dict) -> None:
+        """Tell every worker to attach to the existing TQ controller.
+
+        Driver calls this once after worker construction when
+        ``master_config['data_plane']['enabled'] = True``. Workers attach
+        with ``bootstrap=False`` so they don't try to recreate the
+        controller named actor.
+        """
+        futures = [
+            getattr(w, "setup_data_plane").remote(cfg)
+            for w in self.worker_group._workers
+        ]
+        ray.get(futures)
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
