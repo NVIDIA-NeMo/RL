@@ -82,6 +82,12 @@ policy:
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false
     converter_type: "Qwen2ForCausalLM"
+    # Optional infrastructure knobs (issue #2229). When unset, the historical
+    # hard-coded defaults are used.
+    # distributed_timeout_minutes: 120  # Increase NCCL init timeout for very large checkpoint conversions
+    # async_save: false                 # Set true to write checkpoints asynchronously
+    # check_for_nan_in_grad: true       # Set false to skip the per-step NaN/Inf grad check in steady-state training
+    # logging_level: 0                  # Megatron-LM LoggerConfig verbosity (0 = quiet)
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
