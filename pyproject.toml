@@ -28,7 +28,7 @@ dependencies = [
   "datasets>=4.0.0",
   "rich",
   "math-verify",
-  "accelerate>=1.1.0",
+  "accelerate>=1.13.0",
   "tensorboard",
   "omegaconf",
   "torchdata",
