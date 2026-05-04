@@ -373,6 +373,36 @@ class DTensorPolicyWorkerV2Impl(
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
+        # Tracks the explicit phase-level offload performed by
+        # offload_after_refit(). The entry-guard on train()/get_logprobs()/
+        # score() turns the otherwise-opaque CUDA "illegal memory access"
+        # crash into a clear RuntimeError pointing at the missing prepare
+        # step (issue #1141). Distinct from dtensor_cfg.cpu_offload, which
+        # transparently shuttles weights per-layer and stays compatible
+        # with the same guard.
+        self._weights_offloaded: bool = False
+
+    def _assert_weights_on_device(self, method_name: str) -> None:
+        """Surface a clear error when weights are still offloaded to CPU.
+
+        Without this guard, a follow-up CUDA op against the CPU-resident
+        weights crashes with an opaque "illegal memory access" — see
+        issue #1141.
+        """
+        if self._weights_offloaded:
+            prepare_method = (
+                "prepare_for_training()"
+                if method_name == "train"
+                else "prepare_for_lp_inference()"
+            )
+            raise RuntimeError(
+                f"{method_name}() was called while the policy weights are "
+                "offloaded to CPU. This usually means a custom training loop "
+                f"forgot to call {prepare_method} after offload_after_refit(). "
+                "Call the appropriate prepare step before invoking "
+                f"{method_name}(); otherwise the underlying CUDA op will fail "
+                'with "illegal memory access". See issue #1141.'
+            )
     def _update_moe_gate_bias_if_supported(self) -> None:
         """Update the non-gradient MoE routing bias after the optimizer step."""
         update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
@@ -400,6 +430,7 @@ class DTensorPolicyWorkerV2Impl(
         check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        self._assert_weights_on_device("train")
         self.timer.start("train")
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
@@ -581,6 +612,7 @@ class DTensorPolicyWorkerV2Impl(
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        self._assert_weights_on_device("get_logprobs")
         self.timer.start("get_logprobs")
         logprob_batch_size = (
             micro_batch_size
@@ -659,6 +691,7 @@ class DTensorPolicyWorkerV2Impl(
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/score")
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
+        self._assert_weights_on_device("score")
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
         # Validate sequence dimension
@@ -1253,9 +1286,15 @@ class DTensorPolicyWorkerV2Impl(
 
         gc.collect()
         torch.cuda.empty_cache()
+        self._weights_offloaded = False
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
+        """Onload weights and optimizer state to GPU and switch to train mode.
+
+        Must be called before ``train()`` whenever the worker has been
+        offloaded by ``offload_after_refit()`` (issue #1141).
+        """
         # onload models and optimizer state to cuda
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
@@ -1272,6 +1311,7 @@ class DTensorPolicyWorkerV2Impl(
             self.move_optimizer_to_device("cuda")
 
         torch.cuda.empty_cache()
+        self._weights_offloaded = False
 
     def finish_inference(self) -> None:
         """Offload model params to CPU after inference. Only used in PPO."""
@@ -1295,7 +1335,14 @@ class DTensorPolicyWorkerV2Impl(
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_after_refit")
     def offload_after_refit(self) -> None:
-        """Offload as much as possible on the CPU."""
+        """Offload as much as possible on the CPU.
+
+        After this returns, weights live on CPU. Callers must invoke
+        ``prepare_for_training()`` or ``prepare_for_lp_inference()`` before
+        any subsequent ``train()``/``get_logprobs()``/``score()`` call;
+        otherwise the entry-guard on those methods raises a clear
+        ``RuntimeError`` (issue #1141).
+        """
         self.model = self.move_to_cpu(self.model)
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
@@ -1307,6 +1354,7 @@ class DTensorPolicyWorkerV2Impl(
         print(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
+        self._weights_offloaded = True
 
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
         for state in self.optimizer.state.values():
