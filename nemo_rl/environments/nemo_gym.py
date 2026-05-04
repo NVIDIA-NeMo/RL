@@ -140,6 +140,24 @@ Depending on your data shape, you may want to change these values."""
                 nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
                 nemo_rl_results.append(nemo_rl_result)
 
+            # If the Gym agent dies mid-rollout (commonly: CPU OOM during
+            # rollout collection when num_prompts_per_step *
+            # num_generations_per_prompt is too large for the host) the
+            # iterator silently runs out and we'd otherwise return a list
+            # full of ``None`` rollouts and continue training on empty
+            # epochs. Surface a hard failure pointing at the most likely
+            # cause instead — see issue #2305.
+            if len(nemo_rl_results) < nemo_gym_num_rows:
+                raise RuntimeError(
+                    f"NeMo Gym returned only {len(nemo_rl_results)} rollouts "
+                    f"but {nemo_gym_num_rows} were requested. The Gym agent "
+                    "likely crashed or was killed mid-rollout (commonly: CPU "
+                    "OOM during rollout collection when num_prompts_per_step "
+                    "* num_generations_per_prompt is too large for the host). "
+                    "Check the Gym agent's logs for the underlying error and "
+                    "consider lowering num_prompts_per_step. See issue #2305."
+                )
+
             # determine if generation_logprobs contain NaN; if not, break;
             logprob_contains_nan = False
             for nemo_rl_result in nemo_rl_results:
