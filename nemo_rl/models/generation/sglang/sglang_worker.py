@@ -187,9 +187,7 @@ def _patch_megatron_hook_mode_in(file_path: str) -> None:
 
 
 def _patch_megatron_dynamic_context_hook_mode() -> None:
-    file_path = _get_megatron_file(
-        "core", "inference/contexts/dynamic_context.py"
-    )
+    file_path = _get_megatron_file("core", "inference/contexts/dynamic_context.py")
     if file_path is None:
         return
     _patch_megatron_hook_mode_in(file_path)
@@ -627,9 +625,7 @@ class SGLangGenerationWorker:
         return response
 
     def continue_generation(self):
-        response = requests.post(
-            f"{self.server_base_url}/continue_generation", json={}
-        )
+        response = requests.post(f"{self.server_base_url}/continue_generation", json={})
         response.raise_for_status()
         return response
 
@@ -685,9 +681,7 @@ class SGLangGenerationWorker:
         return response
 
     def stop_profile(self):
-        response = requests.post(
-            f"{self.server_base_url}/stop_profile", json={}
-        )
+        response = requests.post(f"{self.server_base_url}/stop_profile", json={})
         response.raise_for_status()
         return response
 
