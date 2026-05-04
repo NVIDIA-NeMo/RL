@@ -576,16 +576,16 @@ def _create_checkpoint_config(
     patching this module. When a key is absent, the historical hard-coded
     default is used.
     """
-    megatron_cfg = config["megatron_cfg"] if config and "megatron_cfg" in config else {}
+    megatron_cfg = (
+        config["megatron_cfg"]
+        if config is not None and "megatron_cfg" in config
+        else {}
+    )
 
-    async_save: bool = megatron_cfg.get("async_save", False) if megatron_cfg else False
-    fully_parallel_save: bool = (
-        megatron_cfg.get("fully_parallel_save", True) if megatron_cfg else True
-    )
-    fully_parallel_load: bool = (
-        megatron_cfg.get("fully_parallel_load", True) if megatron_cfg else True
-    )
-    load_rng: bool = megatron_cfg.get("load_rng", False) if megatron_cfg else False
+    async_save: bool = megatron_cfg.get("async_save", False)
+    fully_parallel_save: bool = megatron_cfg.get("fully_parallel_save", True)
+    fully_parallel_load: bool = megatron_cfg.get("fully_parallel_load", True)
+    load_rng: bool = megatron_cfg.get("load_rng", False)
 
     return CheckpointConfig(
         save_interval=100,
