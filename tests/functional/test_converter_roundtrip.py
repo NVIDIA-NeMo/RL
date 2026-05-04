@@ -28,9 +28,11 @@ import copy
 import gc
 import importlib.util
 import os
+import sys
 import tempfile
 import time
 from typing import Any, Dict
+from unittest import mock
 
 import torch
 import yaml
@@ -45,16 +47,40 @@ from nemo_rl.models.megatron.community_import import (
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf
 
-_CONVERTER_PATH = os.path.normpath(
-    os.path.join(
-        os.path.dirname(__file__), "../../examples/converters/convert_lora_to_hf.py"
+
+def _load_converter_script(filename: str):
+    """Load a converter script under ``examples/converters/`` as a module.
+
+    The converter scripts are not part of the ``nemo_rl`` package, so we
+    pull them in by file path. Each call returns a fresh module so tests
+    that patch ``sys.argv`` cannot leak state into one another.
+    """
+    path = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "../../examples/converters", filename)
     )
-)
-_spec = importlib.util.spec_from_file_location("convert_lora_to_hf", _CONVERTER_PATH)
-_convert_lora_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_convert_lora_mod)
+    spec = importlib.util.spec_from_file_location(
+        f"_converter_{filename.replace('.', '_')}", path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_convert_lora_mod = _load_converter_script("convert_lora_to_hf.py")
 merge_lora_to_hf = _convert_lora_mod.merge_lora_to_hf
 export_lora_adapter_to_hf = _convert_lora_mod.export_lora_adapter_to_hf
+
+
+def _run_script_main(module, argv: list) -> None:
+    """Invoke ``module.main()`` with a patched ``sys.argv``.
+
+    Importing argparse-driven scripts and calling their ``main()``
+    in-process keeps the test in a single Ray/CUDA context and exercises
+    the exact ``parse_args() + main()`` code paths a user would hit on
+    the command line.
+    """
+    with mock.patch.object(sys, "argv", argv):
+        module.main()
 
 
 def create_test_config() -> Dict[str, Any]:
@@ -726,9 +752,165 @@ def main():
             "✓ Dtensor V1 and Dtensor V2 DCP, Megatron, and LoRA merged models can perform forward passes"
         )
 
+        # ------------------------------------------------------------------
+        # STEP 10: Exercise the converter scripts' CLI entry points end-to-end
+        #
+        # The steps above only call the underlying *library* functions
+        # (convert_dcp_to_hf, export_model_from_megatron, merge_lora_to_hf).
+        # The argparse + main() shells of the converter scripts are what
+        # users actually invoke from the command line; without exercising
+        # them in CI, regressions (for example a missing flag or a broken
+        # config-vs-CLI override) ship silently. We invoke each script's
+        # main() in-process via sys.argv patching so the parse_args + main
+        # code paths are covered against real model artifacts produced
+        # earlier in this test.
+        # ------------------------------------------------------------------
+        print("\n" + "=" * 60)
+        print("STEP 10: Exercising converter CLI entry points (parse_args + main)")
+        print("=" * 60)
+
+        cli_config_path = os.path.join(temp_dir, "cli_config.yaml")
+        with open(cli_config_path, "w") as f:
+            yaml.safe_dump(
+                {
+                    "policy": {
+                        "model_name": model_name,
+                        "tokenizer": {"name": model_name},
+                    }
+                },
+                f,
+            )
+
+        # 10a) convert_dcp_to_hf.py CLI on the v1 DCP checkpoint.
+        # Save a tokenizer next to the DCP ckpt so the script also
+        # exercises the local-tokenizer-path branch (the common path
+        # users hit after a real training run).
+        cli_tokenizer_dir = os.path.join(temp_dir, "tokenizer")
+        original_tokenizer.save_pretrained(cli_tokenizer_dir)
+
+        cli_dcp_to_hf_path = os.path.join(temp_dir, "cli_dcp_to_hf_v1")
+        dcp_to_hf_module = _load_converter_script("convert_dcp_to_hf.py")
+        _run_script_main(
+            dcp_to_hf_module,
+            [
+                "convert_dcp_to_hf.py",
+                "--config",
+                cli_config_path,
+                "--dcp-ckpt-path",
+                dcp_checkpoint_path_v1,
+                "--hf-ckpt-path",
+                cli_dcp_to_hf_path,
+            ],
+        )
+        cli_dcp_model = AutoModelForCausalLM.from_pretrained(
+            cli_dcp_to_hf_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+        )
+        assert_state_dicts_equal(
+            get_model_state_dict(cli_dcp_model),
+            original_state_dict,
+            "convert_dcp_to_hf.py CLI output",
+            "Original HF model",
+        )
+        del cli_dcp_model
+        gc.collect()
+        print("✓ convert_dcp_to_hf.py CLI matches the original model")
+
+        # 10b) convert_megatron_to_hf.py CLI on the Megatron checkpoint.
+        cli_megatron_to_hf_path = os.path.join(temp_dir, "cli_megatron_to_hf")
+        megatron_to_hf_module = _load_converter_script("convert_megatron_to_hf.py")
+        _run_script_main(
+            megatron_to_hf_module,
+            [
+                "convert_megatron_to_hf.py",
+                "--config",
+                cli_config_path,
+                "--hf-model-name",
+                model_name,
+                "--megatron-ckpt-path",
+                megatron_checkpoint_path,
+                "--hf-ckpt-path",
+                cli_megatron_to_hf_path,
+            ],
+        )
+        cli_megatron_model = AutoModelForCausalLM.from_pretrained(
+            cli_megatron_to_hf_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
+        assert_state_dicts_equal(
+            get_model_state_dict(cli_megatron_model),
+            original_state_dict,
+            "convert_megatron_to_hf.py CLI output",
+            "Original HF model",
+        )
+        del cli_megatron_model
+        gc.collect()
+        print("✓ convert_megatron_to_hf.py CLI matches the original model")
+
+        # 10c) convert_lora_to_hf.py CLI — merged-model branch (no --adapter-only).
+        cli_lora_merged_path = os.path.join(temp_dir, "cli_lora_merged")
+        _run_script_main(
+            _convert_lora_mod,
+            [
+                "convert_lora_to_hf.py",
+                "--base-ckpt",
+                megatron_checkpoint_path,
+                "--adapter-ckpt",
+                lora_adapter_path,
+                "--hf-model-name",
+                model_name,
+                "--hf-ckpt-path",
+                cli_lora_merged_path,
+            ],
+        )
+        cli_lora_merged_model = AutoModelForCausalLM.from_pretrained(
+            cli_lora_merged_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+        )
+        assert_state_dicts_equal(
+            get_model_state_dict(cli_lora_merged_model),
+            lora_merged_state_dict,
+            "convert_lora_to_hf.py CLI (merged) output",
+            "Step 7c lora merged",
+        )
+        del cli_lora_merged_model
+        gc.collect()
+        print("✓ convert_lora_to_hf.py CLI (merged branch) matches Step 7c output")
+
+        # 10d) convert_lora_to_hf.py CLI — adapter-only branch (--adapter-only).
+        cli_lora_adapter_path = os.path.join(temp_dir, "cli_lora_adapter")
+        _run_script_main(
+            _convert_lora_mod,
+            [
+                "convert_lora_to_hf.py",
+                "--base-ckpt",
+                megatron_checkpoint_path,
+                "--adapter-ckpt",
+                lora_adapter_path,
+                "--hf-model-name",
+                model_name,
+                "--hf-ckpt-path",
+                cli_lora_adapter_path,
+                "--adapter-only",
+            ],
+        )
+        adapter_cfg = os.path.join(cli_lora_adapter_path, "adapter_config.json")
+        assert os.path.exists(adapter_cfg), (
+            f"convert_lora_to_hf.py --adapter-only did not produce {adapter_cfg}"
+        )
+        cli_adapter_weight_found = any(
+            os.path.exists(os.path.join(cli_lora_adapter_path, f))
+            for f in ("adapter_model.safetensors", "adapter_model.bin")
+        )
+        assert cli_adapter_weight_found, (
+            "convert_lora_to_hf.py --adapter-only did not produce a weight file"
+        )
+        print(
+            "✓ convert_lora_to_hf.py CLI (adapter-only branch) produced expected PEFT layout"
+        )
+
         print("\n" + "=" * 80)
         print(
-            "✓ ALL TESTS PASSED (DCP v1, DCP v2, Megatron, LoRA merge, LoRA adapter-only PEFT)!"
+            "✓ ALL TESTS PASSED (DCP v1, DCP v2, Megatron, LoRA merge, LoRA adapter-only PEFT, CLI entry points)!"
         )
         print("=" * 80)
 
