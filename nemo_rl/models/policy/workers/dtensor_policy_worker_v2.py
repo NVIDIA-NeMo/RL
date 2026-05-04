@@ -715,6 +715,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
+        self._assert_weights_on_device("get_topk_logits")
         topk_batch_size = (
             micro_batch_size
             if micro_batch_size is not None

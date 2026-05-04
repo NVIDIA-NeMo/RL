@@ -46,10 +46,11 @@ def test_assert_weights_on_device_passes_when_weights_on_gpu() -> None:
     """When weights are on GPU, the guard is a no-op for any caller."""
     worker = _make_worker_under_test(weights_offloaded=False)
 
-    # All three known callers must pass without raising.
+    # All four known GPU-bound callers must pass without raising.
     worker._assert_weights_on_device("train")
     worker._assert_weights_on_device("get_logprobs")
     worker._assert_weights_on_device("score")
+    worker._assert_weights_on_device("get_topk_logits")
 
 
 def test_assert_weights_on_device_train_raises_with_helpful_message() -> None:
@@ -70,7 +71,7 @@ def test_assert_weights_on_device_train_raises_with_helpful_message() -> None:
     assert "#1141" in msg
 
 
-@pytest.mark.parametrize("method_name", ["get_logprobs", "score"])
+@pytest.mark.parametrize("method_name", ["get_logprobs", "score", "get_topk_logits"])
 def test_assert_weights_on_device_inference_raises_with_helpful_message(
     method_name: str,
 ) -> None:
