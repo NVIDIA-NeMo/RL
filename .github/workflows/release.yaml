@@ -57,7 +57,7 @@ jobs:
     if: |
       !cancelled()
       && (github.event_name == 'workflow_dispatch' || vars.BUILD_TEST_PUBLISH_WHEEL == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@3b0712dad3432c02762f637ef546446103cdd2fd
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@070b4e6c5ed961ad5c0cd896c5316e45f111a7b3
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       python-package: nemo_rl
@@ -67,6 +67,7 @@ jobs:
       version-bump-branch: ${{ inputs.version-bump-branch || github.ref_name }}
       create-gh-release: ${{ inputs.create-gh-release || true }}
       packaging: uv
+      skip-wheel-build: true
       submodules: recursive
       publish-docs: false
       restrict-to-admins: true
