@@ -40,7 +40,7 @@ class ReplayBuffer:
     grpo.num_generations_per_prompt (required to compute per-prompt advantages).
     """
 
-    def __init__(self, max_size: int):
+    def __init__(self, max_size: int, dp_cfg: Optional[dict[str, Any]] = None):
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
@@ -51,6 +51,25 @@ class ReplayBuffer:
 
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
+
+        # Optional data-plane wiring. When set, sampled ``KVBatchMeta`` entries
+        # have their TQ keys cleared on consumption — closes Race 1 from
+        # research/data_plane_async_rl_limitations.md §5.9 (every consumed
+        # trajectory must clear its TQ payload, otherwise TQ leaks at
+        # training-throughput rate). Lazy-built on first need so the in-memory
+        # path (dp_cfg=None) never imports the data-plane module.
+        self._dp_cfg = dp_cfg
+        self._dp_client = None
+
+    def _ensure_dp_client(self):
+        """Lazily build a data-plane client. None when ``dp_cfg`` not set."""
+        if self._dp_client is None and self._dp_cfg is not None:
+            # ``bootstrap=False`` — the controller is already running on the
+            # driver; this client only needs to attach to it for ``kv_clear``.
+            from nemo_rl.data_plane import build_data_plane_client
+
+            self._dp_client = build_data_plane_client(self._dp_cfg, bootstrap=False)
+        return self._dp_client
 
     def push_with_wait_signal(
         self,
@@ -216,6 +235,19 @@ class ReplayBuffer:
             print(
                 f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
             )
+
+            # Race 1 fix (data_plane_async_rl_limitations.md §5.9): clear the
+            # TQ payload of any KVBatchMeta-shaped trajectories we just popped.
+            # Done UNDER the lock — sub-ms RPC, and releasing for the clear
+            # opens a footgun where a fresh push could race the in-flight
+            # delete (Race 5 in the same doc).
+            client = self._ensure_dp_client()
+            if client is not None:
+                from nemo_rl.data_plane.interfaces import KVBatchMeta
+
+                for item in sampled_items:
+                    if isinstance(item, KVBatchMeta):
+                        client.kv_clear(item.keys, item.partition_id)
 
             return {
                 "trajectories": sampled_items,
