@@ -1,6 +1,6 @@
 # GRPO training for Nemotron-Omni (MoE ~30B) on CLEVR-CoGenT
 # Based on vlm_grpo_3B.yaml with automodel EP=8 for MoE
-defaults: "../../examples/configs/vlm_grpo_3B.yaml"
+defaults: "vlm_grpo_3B.yaml"
 
 grpo:
   num_prompts_per_step: 32
@@ -10,7 +10,7 @@ grpo:
 
 checkpointing:
   checkpoint_dir: results/vlm_grpo_nemotron_omni
-  save_optimizer: false
+  save_optimizer: true
 
 policy:
   model_name: /lustre/fsw/portfolios/coreai/users/yuekaiz/HF/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
@@ -50,13 +50,21 @@ policy:
       tensor_parallel_size: 8
       enforce_eager: true
       max_model_len: 8192
-      gpu_memory_utilization: 0.2
+      gpu_memory_utilization: 0.5
+      enable_prefix_caching: false
     vllm_kwargs:
       limit_mm_per_prompt: {"image": 2}
-      max_num_batched_tokens: 8192
+      max_num_batched_tokens: 16384
       mm_processor_cache_gb: 0
       mamba_ssm_cache_dtype: "float32"
       skip_mm_profiling: true
+      # Disable flashinfer MoE autotuner: tactic 36 fails with "Invalid activation
+      # type" on V3 + bf16 + tp=8, leaving GPU in a bad state → CUDA illegal
+      # instruction during generation. (Repro: yuekai_scripts/../../../vllm/repro_v2.py)
+      # Force triton MoE backend to avoid illegal-instruction in default backend
+      # post-refit; disable prefix caching so cached KV from old weights can't
+      # leak into the next step.
+      kernel_config: {"enable_flashinfer_autotune": false, "moe_backend": "triton"}
 
 data:
   train:
