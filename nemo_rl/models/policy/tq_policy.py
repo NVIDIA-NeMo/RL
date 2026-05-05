@@ -46,6 +46,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.preshard import (
     DP_SEED_FIELDS,
+    LP_SEED_FIELDS,
     fan_out_per_rank_metas,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -62,14 +63,6 @@ from nemo_rl.models.policy.lm_policy import (
 )
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
-
-
-_LP_SEED_FIELDS = (
-    "input_ids",
-    "input_lengths",
-    "token_mask",
-    "sample_mask",
-)
 
 
 class TQPolicy(Policy):
@@ -176,7 +169,7 @@ class TQPolicy(Policy):
             partition_id=self._tq_partition_id,
             task_name=task_name,
             key_prefix=self._next_key_prefix(prefix_tag),
-            seed_fields=_LP_SEED_FIELDS,
+            seed_fields=LP_SEED_FIELDS,
         )
 
     def _fan_out_train_metas(
@@ -326,59 +319,65 @@ class TQPolicy(Policy):
             sharded_data = self._shard_for_train(data, batch_size)
             dp_metas = self._fan_out_train_metas(sharded_data, prefix_tag="step")
 
-        if self.flops_tracker is not None:
-            self.flops_tracker.reset()
-            for shard in sharded_data:
-                input_lengths = shard["input_lengths"]
-                self.flops_tracker.track_batch(input_lengths.tolist())
+        # Drain in finally so a worker exception doesn't leak staged tensors
+        # into the next step. Per-instance ``tq_call_idx`` keeps keys unique
+        # across calls so we never collide pre-drain, but unbounded growth
+        # is wasteful and would eventually evict good data.
+        try:
+            if self.flops_tracker is not None:
+                self.flops_tracker.reset()
+                for shard in sharded_data:
+                    input_lengths = shard["input_lengths"]
+                    self.flops_tracker.track_batch(input_lengths.tolist())
 
-        with (
-            timer.time("policy_training/submit_training_futures")
-            if timer
-            else nullcontext()
-        ):
-            futures = self.worker_group.run_all_workers_sharded_data(
-                "train_presharded",
-                meta=dp_metas,
-                in_sharded_axes=["data_parallel"],
-                replicate_on_axes=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                common_kwargs={
-                    "loss_fn": loss_fn,
-                    "eval_mode": eval_mode,
-                    "gbs": batch_size,
-                    "mbs": micro_batch_size,
-                },
-            )
-        results = self.worker_group.get_all_worker_results(futures)
-        aggregated_results = _aggregate_train_results(results)
+            with (
+                timer.time("policy_training/submit_training_futures")
+                if timer
+                else nullcontext()
+            ):
+                futures = self.worker_group.run_all_workers_sharded_data(
+                    "train_presharded",
+                    meta=dp_metas,
+                    in_sharded_axes=["data_parallel"],
+                    replicate_on_axes=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    output_is_replicated=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    common_kwargs={
+                        "loss_fn": loss_fn,
+                        "eval_mode": eval_mode,
+                        "gbs": batch_size,
+                        "mbs": micro_batch_size,
+                    },
+                )
+            results = self.worker_group.get_all_worker_results(futures)
+            aggregated_results = _aggregate_train_results(results)
 
-        if self.flops_tracker is not None:
-            aggregated_results["total_flops"] = self.flops_tracker.total_flops
-            aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
-            gpus_per_worker = self.worker_group.cluster.world_size() / max(
-                len(results), 1
-            )
+            if self.flops_tracker is not None:
+                aggregated_results["total_flops"] = self.flops_tracker.total_flops
+                aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
+                gpus_per_worker = self.worker_group.cluster.world_size() / max(
+                    len(results), 1
+                )
+                try:
+                    aggregated_results["theoretical_tflops"] = gpus_per_worker * sum(
+                        get_theoretical_tflops(r["gpu_name"], r["model_dtype"])
+                        for r in results
+                    )
+                except Exception as e:
+                    warnings.warn(f"Error getting theoretical flops: {e}")
+
+            return aggregated_results
+        finally:
             try:
-                aggregated_results["theoretical_tflops"] = gpus_per_worker * sum(
-                    get_theoretical_tflops(r["gpu_name"], r["model_dtype"])
-                    for r in results
+                self._dp_client.kv_clear(
+                    keys=None, partition_id=self._tq_partition_id,
                 )
             except Exception as e:
-                warnings.warn(f"Error getting theoretical flops: {e}")
-
-        # Drain the partition before next step's fan-out reuses prefixes —
-        # the per-instance ``tq_call_idx`` keeps keys unique across calls
-        # within a partition lifecycle, but unbounded growth is wasteful.
-        # Done here so trainers don't need to know about TQ lifecycle.
-        self._dp_client.kv_clear(keys=None, partition_id=self._tq_partition_id)
-
-        return aggregated_results
+                warnings.warn(f"Error draining TQ partition after train: {e}")
