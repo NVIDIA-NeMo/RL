@@ -355,109 +355,6 @@ class SGLangGenerationWorker:
             )
             return False
 
-    def dump_param_fingerprints(
-        self,
-        names: list[str],
-        out_path: Optional[str] = None,
-        seed: int = 0xC0FFEE,
-        proj_dim: int = 8192,
-    ) -> dict:
-        """Compute (numel, dtype, sum, abs_max, projection) per HF parameter name.
-
-        Calls SGLang's ``/get_weights_by_name`` endpoint per name; each call
-        all-gathers the parameter across the engine's TP group and returns
-        the full HF-shape tensor. Compares against the train-side fingerprints
-        produced by ``MegatronPolicyWorker.broadcast_weights_via_nccl_to_sglang``
-        when ``NRL_BRIDGE_VERIFY=1``.
-        """
-        if not self.is_model_owner or self.base_url is None:
-            return {}
-        try:
-            import torch
-        except ImportError:
-            return {}
-
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        proj_vec = torch.randn(proj_dim, generator=rng, dtype=torch.float64)
-        fp: dict = {}
-
-        with requests.Session() as session:
-            for i, name in enumerate(names):
-                try:
-                    resp = session.post(
-                        f"{self.base_url}/get_weights_by_name",
-                        json={"name": name, "truncate_size": 0},
-                        timeout=180,
-                    )
-                except Exception as e:
-                    fp[name] = {"error": f"http exception: {e!r}"}
-                    continue
-                if resp.status_code != 200:
-                    fp[name] = {
-                        "error": (
-                            f"status={resp.status_code} "
-                            f"body={resp.text[:200]}"
-                        )
-                    }
-                    continue
-                try:
-                    body = resp.json()
-                except Exception:
-                    fp[name] = {"error": "non-JSON response"}
-                    continue
-                # SGLang returns the all-gathered weight; payload shape varies
-                # across versions: a flat list, a dict like ``{"weight": [...]}``
-                # or even a base64-encoded blob. Probe in order.
-                weight_data = (
-                    body.get("weight")
-                    if isinstance(body, dict)
-                    else None
-                )
-                if weight_data is None and isinstance(body, dict):
-                    weight_data = body.get("weights")
-                if weight_data is None:
-                    weight_data = body  # plain list response
-                if weight_data is None:
-                    fp[name] = {"error": f"empty body keys={list(body) if isinstance(body, dict) else type(body)}"}
-                    continue
-                try:
-                    flat = (
-                        torch.as_tensor(weight_data, dtype=torch.float64)
-                        .flatten()
-                    )
-                except Exception as e:
-                    fp[name] = {"error": f"tensor convert failed: {e!r}"}
-                    continue
-                n = int(flat.numel())
-                rep = (n + proj_vec.numel() - 1) // proj_vec.numel()
-                pv = proj_vec.repeat(rep)[:n]
-                fp[name] = {
-                    "numel": n,
-                    "dtype": (
-                        body.get("dtype") if isinstance(body, dict) else None
-                    ),
-                    "sum": float(flat.sum().item()),
-                    "abs_max": float(flat.abs().max().item()),
-                    "projection": float(torch.dot(flat, pv).item()),
-                }
-                # Periodic progress log; this is slow (HTTP per-tensor).
-                if (i + 1) % 100 == 0:
-                    logger.info(
-                        f"[SGLang Worker] Rank {self.global_rank} "
-                        f"verify: {i + 1}/{len(names)} fingerprints"
-                    )
-
-        if out_path:
-            import json as _json
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            with open(out_path, "w") as f:
-                _json.dump(fp, f, sort_keys=True)
-            logger.info(
-                f"[SGLang Worker] Rank {self.global_rank} "
-                f"verify: wrote {len(fp)} fingerprints to {out_path}"
-            )
-        return fp
-
     def get_gpu_uuids(self) -> list[str]:
         """Get list of GPU UUIDs used by this SGLang server.
 
@@ -642,9 +539,7 @@ class SGLangGenerationWorker:
         last_exc: Optional[BaseException] = None
         for attempt in range(1, max_attempts + 1):
             try:
-                async with session.post(
-                    url, json=payload, headers=headers
-                ) as response:
+                async with session.post(url, json=payload, headers=headers) as response:
                     response.raise_for_status()
                     result = await response.json()
                 break

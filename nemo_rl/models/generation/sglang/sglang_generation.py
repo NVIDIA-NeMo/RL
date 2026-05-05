@@ -281,32 +281,6 @@ class SGLangGeneration(GenerationInterface):
             logger.error(f"[sglang-bridge] init_weights_update_group raised: {e}")
             return False
 
-    def dump_param_fingerprints(
-        self,
-        names: list[str],
-        out_path: Optional[str] = None,
-    ) -> dict:
-        """Per-tensor (numel, dtype, sum, abs_max, projection) fingerprint by HF name.
-
-        Dispatches to engine 0's master worker (each engine has identical
-        weights; one engine is enough). Used by the bridge verifier
-        (``NRL_BRIDGE_VERIFY=1``).
-        """
-        if not self.worker_group or not self.worker_group.workers:
-            raise RuntimeError("Worker group is not initialized")
-        futures = self.worker_group.run_all_workers_single_data(
-            "dump_param_fingerprints",
-            names=names,
-            out_path=out_path,
-            run_rank_0_only_axes=["tensor_parallel"],
-        )
-        results = ray.get(futures)
-        # Pick the first non-empty result (engines are replicas).
-        for r in results:
-            if isinstance(r, dict) and r:
-                return r
-        return {}
-
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:

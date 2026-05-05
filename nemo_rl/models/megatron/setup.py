@@ -86,9 +86,7 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
     silently reverts to default init. This helper propagates BF16 → all FP32
     copies right after the checkpoint load to avoid that reversion.
     """
-    rank = (
-        torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    )
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     def _sync_distrib_opt(distrib_opt):
         try:
@@ -97,7 +95,9 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
             )
         except ImportError:
             return False
-        if not isinstance(getattr(distrib_opt, "optimizer", None), HybridDeviceOptimizer):
+        if not isinstance(
+            getattr(distrib_opt, "optimizer", None), HybridDeviceOptimizer
+        ):
             return False
 
         hdo = distrib_opt.optimizer
@@ -137,6 +137,7 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
             "params (HybridDeviceOptimizer — synced GPU shards + CPU clones + "
             "FP32 copies)"
         )
+
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
