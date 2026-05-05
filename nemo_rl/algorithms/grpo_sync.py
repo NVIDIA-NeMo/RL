@@ -525,19 +525,114 @@ def grpo_train_sync(
                             **extra_multimodal_data,
                         }
                     )
-                    train_data["prev_logprobs"] = policy.get_logprobs(
-                        logprob_data, timer=timer
-                    )["logprobs"]
+
+                    # Driver-side policy-aware sharding for the TQ path —
+                    # mirrors lm_policy.get_logprobs(BatchedDataDict) lines
+                    # 426-450 but feeds the @dp_dispatch list[KVBatchMeta]
+                    # path so workers fetch their slice from TQ rather than
+                    # via Ray's in-memory object store. NOTE: logprob
+                    # inference has no cross-DP collectives (forward-only,
+                    # no gradient sync), so we don't need the
+                    # ``bin_count_multiple=DP_world`` invariant from
+                    # ``a085559c`` — workers' local re-pack inside ``_fetch``
+                    # is fine here.
+                    _policy_cfg = master_config["policy"]
+                    _dp_world = policy.sharding_annotations.get_axis_size(
+                        "data_parallel"
+                    )
+                    _seqpack_cfg = _policy_cfg.get("sequence_packing", {}) or {}
+                    _dynbatch_cfg = _policy_cfg.get("dynamic_batching", {}) or {}
+                    _use_seqpack = _seqpack_cfg.get("enabled", False)
+                    _use_dynbatch = _dynbatch_cfg.get("enabled", False)
+
+                    _unsorted_data_indices = None
+                    if _use_dynbatch:
+                        _dba = {
+                            "input_key": "input_ids",
+                            "input_lengths_key": "input_lengths",
+                            "sequence_length_round": _dynbatch_cfg[
+                                "sequence_length_round"
+                            ],
+                            "max_tokens_per_microbatch": _dynbatch_cfg[
+                                "logprob_mb_tokens"
+                            ],
+                        }
+                        _sharded_lp, _unsorted_data_indices = (
+                            logprob_data.shard_by_batch_size(
+                                _dp_world,
+                                batch_size=None,
+                                dynamic_batching_args=_dba,
+                            )
+                        )
+                    elif _use_seqpack:
+                        _spa = {
+                            "algorithm": _seqpack_cfg["algorithm"],
+                            "input_key": "input_ids",
+                            "input_lengths_key": "input_lengths",
+                            "sequence_length_pad_multiple": _policy_cfg[
+                                "make_sequence_length_divisible_by"
+                            ],
+                            "max_tokens_per_microbatch": _seqpack_cfg[
+                                "logprob_mb_tokens"
+                            ],
+                        }
+                        _sharded_lp, _unsorted_data_indices = (
+                            logprob_data.shard_by_batch_size(
+                                _dp_world,
+                                batch_size=None,
+                                sequence_packing_args=_spa,
+                            )
+                        )
+                    else:
+                        _sharded_lp = logprob_data.shard_by_batch_size(
+                            _dp_world, batch_size=None,
+                        )
+
+                    # Fan out shards into TQ partition "train" under a
+                    # distinct key prefix so they don't collide with the
+                    # train-step fan-out at line ~605 (``f"step{N}_dp{r}"``)
+                    # later in this same step. Same partition reuse =
+                    # one ``kv_clear`` at end of step wipes everything.
+                    _LP_SEED_FIELDS = (
+                        "input_ids", "input_lengths", "token_mask", "sample_mask",
+                    )
+                    _lp_metas = fan_out_per_rank_metas(
+                        _sharded_lp,
+                        dp_client=dp_client,
+                        partition_id="train",
+                        task_name="prev_lp",
+                        key_prefix=f"step{total_steps}_lp",
+                        seed_fields=_LP_SEED_FIELDS,
+                    )
+                    _prev_lp = policy.get_logprobs(_lp_metas, timer=timer)
+                    if _use_seqpack or _use_dynbatch:
+                        _prev_lp.reorder_data(_unsorted_data_indices)
+                    train_data["prev_logprobs"] = _prev_lp["logprobs"]
 
                     if not master_config["grpo"].get(
                         "skip_reference_policy_logprobs_calculation"
                     ):
-                        train_data["reference_policy_logprobs"] = (
-                            policy.get_reference_policy_logprobs(
-                                logprob_data,
-                                timer=timer,
-                            )["reference_logprobs"]
+                        # Re-fan-out under a different task_name + prefix —
+                        # the workers' write-back path (``_put_back_under_keys``
+                        # is dormant today; the @dp_dispatch list path here
+                        # just dispatches and aggregates) doesn't collide
+                        # with the prev_lp fan-out's keys.
+                        _ref_lp_metas = fan_out_per_rank_metas(
+                            _sharded_lp,
+                            dp_client=dp_client,
+                            partition_id="train",
+                            task_name="ref_lp",
+                            key_prefix=f"step{total_steps}_reflp",
+                            seed_fields=_LP_SEED_FIELDS,
                         )
+                        _ref_lp = policy.get_reference_policy_logprobs(
+                            _ref_lp_metas, timer=timer,
+                        )
+                        if _use_seqpack or _use_dynbatch:
+                            _ref_lp.reorder_data(_unsorted_data_indices)
+                        train_data["reference_policy_logprobs"] = _ref_lp[
+                            "reference_logprobs"
+                        ]
 
                     del logprob_data
                     del extra_multimodal_data
