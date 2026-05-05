@@ -201,6 +201,12 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         else:
             return f"{self.__class__.__qualname__}"
 
+    def _get_replica_group(self) -> Optional[Any]:
+        """Replica group = flattened (cp, tp) sub-mesh — see V1 worker."""
+        if getattr(self, "cp_size", 1) <= 1:
+            return None
+        return self.device_mesh[("cp", "tp")]._flatten().get_group()
+
     def __init__(
         self,
         config: PolicyConfig,

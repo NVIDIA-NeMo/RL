@@ -17,14 +17,14 @@ Cheap regex-level tests. Run in milliseconds. Catch entire classes of
 drift around the verl-style sibling-trainer split:
 
   * legacy ``grpo.py`` is fully untouched by the data plane,
-  * ``grpo_sync.py`` is TQ-only with no feature-gate temptation,
+  * ``grpo_sync.py`` requires a TQPolicy with no feature-gate temptation,
   * the production factory has no NoOp escape hatch,
   * ``examples/run_grpo.py`` dispatches both trainers explicitly.
 
 Plan §4.8 was written assuming a ``train_from_dp_meta`` separate-method
-design. We chose decorator-based polymorphism (``@dp_dispatch`` makes
-``policy.train`` accept both BatchedDataDict and KVBatchMeta), so the
-specific regex patterns differ — the underlying invariants do not.
+design. We instead chose subclass-based polymorphism: ``TQPolicy``
+overrides ``Policy`` methods, and ``examples/run_grpo.py`` selects
+which policy + trainer pair is constructed.
 """
 
 from __future__ import annotations
@@ -88,48 +88,42 @@ def test_no_data_plane_in_master_config():
     )
 
 
-# ─── R-C9 — sync trainer engages the data plane (decorator design) ───────
+# ─── R-C9 — sync trainer engages the data plane (TQPolicy design) ────────
 
 
-def test_grpo_sync_constructs_kvbatchmeta():
-    """Adapted for decorator design.
+def test_grpo_sync_engages_tq_policy():
+    """Sync trainer must require a TQ-mediated policy.
 
-    The plan's original check ``"policy.train(" not in cleaned`` assumed
-    a separate ``train_from_dp_meta`` method. With ``@dp_dispatch``,
-    ``policy.train(meta)`` IS the TQ-mediated dispatch — the
-    polymorphism is by argument type, not method name.
+    The TQ engagement is now encapsulated in
+    :class:`nemo_rl.models.policy.tq_policy.TQPolicy` — the trainer's job
+    is to enforce that the policy in hand actually carries the TQ
+    transport (``policy.dp_cfg`` is the public marker set by
+    ``TQPolicy.__init__``). Without this guard, a misconfiguration could
+    silently route through the legacy in-memory dispatch.
 
-    The right invariant: ``grpo_sync.py`` must produce ``KVBatchMeta``
-    objects so its ``policy.train(...)`` call goes through the
-    decorator's TQ branch, not the legacy passthrough. After the
-    PR 0 refactor (commit extracting ``preshard.py``) the construction
-    moved into the ``fan_out_per_rank_metas`` helper; ``grpo_sync.py``
-    delegates rather than constructing inline. Either path is valid as
-    long as the trainer engages the data plane.
+    The TQ wire-level constructs (``KVBatchMeta``, ``fan_out_per_rank_metas``,
+    ``build_data_plane_client``) belong inside ``tq_policy.py`` /
+    ``preshard.py``, not in the trainer.
     """
     src = _strip_comments_and_docstrings(_read("nemo_rl/algorithms/grpo_sync.py"))
-    constructs_or_delegates = (
-        "KVBatchMeta(" in src or "fan_out_per_rank_metas(" in src
+    assert 'hasattr(policy, "dp_cfg")' in src or "hasattr(policy, 'dp_cfg')" in src, (
+        "grpo_sync.py must guard on `hasattr(policy, 'dp_cfg')` so a "
+        "non-TQ Policy instance is rejected with a clear error."
     )
-    assert constructs_or_delegates, (
-        "grpo_sync.py neither constructs KVBatchMeta directly nor "
-        "delegates to fan_out_per_rank_metas. Without one of those, the "
-        "@dp_dispatch decorator falls through to the legacy "
-        "BatchedDataDict path — silently bypassing the data plane."
+    # TQ engagement happens through the policy's overridden methods —
+    # check that the chain reaches a real KVBatchMeta construction.
+    helper_src = _strip_comments_and_docstrings(
+        _read("nemo_rl/data_plane/preshard.py")
     )
-    # If delegation is used, the helper itself must construct KVBatchMeta.
-    if "fan_out_per_rank_metas(" in src and "KVBatchMeta(" not in src:
-        helper_src = _strip_comments_and_docstrings(
-            _read("nemo_rl/data_plane/preshard.py")
-        )
-        assert "KVBatchMeta(" in helper_src, (
-            "grpo_sync.py delegates to fan_out_per_rank_metas but the "
-            "helper in nemo_rl/data_plane/preshard.py does not construct "
-            "KVBatchMeta — the chain to the TQ branch is broken."
-        )
-    assert "build_data_plane_client(" in src, (
-        "grpo_sync.py does not call build_data_plane_client. The "
-        "TQ-mediated trainer must construct a real client."
+    assert "KVBatchMeta(" in helper_src, (
+        "preshard.py must still construct KVBatchMeta — TQPolicy "
+        "delegates here on each fan-out."
+    )
+    tq_policy_src = _strip_comments_and_docstrings(
+        _read("nemo_rl/models/policy/tq_policy.py")
+    )
+    assert "build_data_plane_client(" in tq_policy_src, (
+        "TQPolicy must construct the data-plane client in __init__."
     )
 
 
