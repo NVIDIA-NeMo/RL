@@ -525,48 +525,6 @@ def vlm_hf_data_processor(
     )
     _uses_image_placeholder = type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSORS
 
-    # For Nemotron-Omni with dynamic-resolution vision config
-    # (vision_config.args has min_num_patches/max_num_patches), the checkpoint's
-    # bundled tile-based NemotronNanoVLV2Processor disagrees with vLLM's
-    # DynamicResolutionImageTiler on tile count → severe logprob mismatch.
-    # Swap to our DynamicResolutionProcessor (matches vLLM byte-for-byte).
-    _use_dynamic_resolution = False
-    _dyn_processor = None
-    if _uses_image_placeholder and images:
-        try:
-            from nemo_rl.data.dynamic_resolution_processor import (
-                DynamicResolutionProcessor,
-                is_dynamic_resolution_model,
-            )
-
-            model_config = getattr(processor, "config", None) or getattr(
-                getattr(processor, "tokenizer", None), "config", None
-            )
-            if model_config is None:
-                # Fall back to loading the checkpoint config on the fly.
-                from transformers import AutoConfig
-
-                model_path = getattr(processor.tokenizer, "name_or_path", None)
-                if model_path is not None:
-                    try:
-                        model_config = AutoConfig.from_pretrained(
-                            model_path, trust_remote_code=True
-                        )
-                    except Exception:
-                        model_config = None
-            if model_config is not None and is_dynamic_resolution_model(model_config):
-                _use_dynamic_resolution = True
-                _dyn_processor = DynamicResolutionProcessor(
-                    tokenizer=processor.tokenizer,
-                    config=model_config,
-                )
-        except Exception:
-            # If anything goes wrong detecting/constructing the dynamic processor,
-            # fall back silently to the tile-based path. The tile-based path is
-            # known to work, just with worse logprob alignment.
-            _use_dynamic_resolution = False
-            _dyn_processor = None
-
     if _uses_image_placeholder and images:
         # Convert content list to <image> placeholder text format
         image_token = getattr(processor, "image_token", "<image>")
@@ -597,42 +555,25 @@ def vlm_hf_data_processor(
 
     # this is the id-tokenized and image processed conversation template for the policy
     if _uses_image_placeholder and images:
-        if _use_dynamic_resolution and _dyn_processor is not None:
-            # Dynamic-resolution path: matches vLLM's DynamicResolutionImageTiler
-            # exactly, eliminates tile-count mismatch between rollout and
-            # logprob recompute. Produces `pixel_values` + `imgs_sizes` (no
-            # image_flags). The model.forward dispatches on imgs_sizes.
-            message: dict = _dyn_processor(
-                text=string_formatted_dialog,
-                images=images,
-                return_tensors="pt",
-            )
-        else:
-            # Tile-based fallback: uses checkpoint's bundled
-            # NemotronNanoVLV2Processor. Works correctly only when tile counts
-            # happen to align between rollout and training (e.g., CLEVR small
-            # uniform images). Large varied images (MMPR-Tiny) should take the
-            # dynamic_resolution branch above.
-            message: dict = processor(
-                text=string_formatted_dialog,
-                images=images,
-                return_tensors="pt",
-            )
+        message: dict = processor(
+            text=string_formatted_dialog,
+            images=images,
+            return_tensors="pt",
+        )
         if "pixel_values" in message:
-            if _use_dynamic_resolution:
-                # Keep pixel_values in float32 through dataset-load. vLLM also
-                # stores/normalizes pixel_values in float32 and only casts at
-                # the vision_model boundary — matching that rounding order
-                # tightens the rollout/train logprob agreement (closes the
-                # residual `sampling_importance_ratio` gap vs mbridge).
-                # The model forward (extract_feature_dynamic) handles the
-                # dtype cast to bf16 as needed.
+            if "imgs_sizes" in message:
+                # Dynamic-resolution path (NemotronH_Nano_Omni_Reasoning_V3Processor):
+                # matches vLLM's DynamicResolutionImageTiler bit-for-bit. Keep
+                # pixel_values in float32 — vLLM also stores/normalizes in float32
+                # and only casts at the vision_model boundary, and matching that
+                # rounding order tightens rollout/train logprob agreement. The
+                # model forward dispatches on imgs_sizes and handles the bf16 cast.
                 pass
             else:
-                # Tile-based fallback needs bf16 pre-cast: without image_flags
-                # on the crash-recovery path, autograd through the vision
-                # encoder has tripped CUDA illegal memory access; pre-casting
-                # keeps that legacy path working.
+                # Tile-based path (legacy NemotronNanoVLV2Processor): pre-cast to
+                # bf16 and synthesize image_flags. Without image_flags on the
+                # crash-recovery path, autograd through the vision encoder has
+                # tripped CUDA illegal memory access.
                 message["pixel_values"] = message["pixel_values"].to(torch.bfloat16)
                 if "image_flags" not in message:
                     num_tiles = message["pixel_values"].shape[0]
