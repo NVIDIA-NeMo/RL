@@ -155,6 +155,14 @@ def apply_fp8_patches(self, fp8_config):
     for p in fp8_state.vllm_patches:
         p.start()
 
+    # DSV4-Flash-Base ships swiglu_limit=10 but vLLM's DeepGemmExperts._act_mul_quant
+    # drops it on the FP8 MoE path. Inject the clamp via a Python monkey-patch when
+    # NRL_SWIGLU_LIMIT is set in the environment. No-op otherwise.
+    from nemo_rl.models.generation.vllm.quantization.swiglu_clamp import (
+        apply_swiglu_clamp_patch,
+    )
+    apply_swiglu_clamp_patch()
+
     fp8_patches_applied = True
 
 
@@ -202,6 +210,16 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     else:
         # if not async, just directly monkey patch the ray executor
         monkey_patch_vllm_ray_executor(global_fp8_config)
+
+    # Also apply the SwiGLU clamp patch eagerly in the main process. For the
+    # multiprocessing (mp) executor used by standalone vllm.LLM(...) calls
+    # (TP>1, no Ray), forked worker processes inherit the patched module
+    # state. For Ray executors, workers re-run apply_fp8_patches via
+    # collective_rpc, which will idempotently re-apply this patch.
+    from nemo_rl.models.generation.vllm.quantization.swiglu_clamp import (
+        apply_swiglu_clamp_patch,
+    )
+    apply_swiglu_clamp_patch()
 
     # create fp8 kwargs for vllm's LLM(...)
     num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
