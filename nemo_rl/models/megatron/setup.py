@@ -73,6 +73,71 @@ try:
 except ImportError:
     HAVE_FSDP2 = False
 
+
+def _force_sync_optimizer_fp32_from_model(optimizer, model):
+    """Force-sync the distributed optimizer's FP32 master copies from the BF16 model params.
+
+    With HybridDeviceOptimizer (optimizer_cpu_offload=True), three levels of
+    parameter copies exist that all need pretrained values after a checkpoint
+    load: ``shard_fp32_from_float16`` (GPU FP32 shards), ``gpu_params_map_cpu_copy``
+    (CPU clones used by the CPU sub-optimizers), and ``param_to_fp32_param``.
+    ``load_checkpoint`` only refreshes the BF16 model params, so the first
+    optimizer step writes the stale CPU FP32 init back into BF16 and the model
+    silently reverts to default init. This helper propagates BF16 → all FP32
+    copies right after the checkpoint load to avoid that reversion.
+    """
+    rank = (
+        torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    )
+
+    def _sync_distrib_opt(distrib_opt):
+        try:
+            from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
+                HybridDeviceOptimizer,
+            )
+        except ImportError:
+            return False
+        if not isinstance(getattr(distrib_opt, "optimizer", None), HybridDeviceOptimizer):
+            return False
+
+        hdo = distrib_opt.optimizer
+
+        for model_group, shard_main_group in zip(
+            distrib_opt.model_float16_groups,
+            distrib_opt.shard_fp32_from_float16_groups,
+        ):
+            for model_param, shard_main_param in zip(model_group, shard_main_group):
+                if shard_main_param is None:
+                    continue
+                param_range_map = distrib_opt._get_model_param_range_map(model_param)
+                param_range = param_range_map["param"]
+                shard_model_param = model_param.view(-1)[
+                    param_range.start : param_range.end
+                ]
+                shard_main_param.data.copy_(shard_model_param)
+
+        if hasattr(hdo, "gpu_params_map_cpu_copy"):
+            for gpu_param, cpu_clone in hdo.gpu_params_map_cpu_copy.items():
+                cpu_clone.data.copy_(gpu_param.data)
+
+        if hasattr(hdo, "update_fp32_param_by_new_param"):
+            hdo.update_fp32_param_by_new_param()
+        return True
+
+    applied = False
+    if hasattr(optimizer, "chained_optimizers"):
+        for sub_opt in optimizer.chained_optimizers:
+            applied |= _sync_distrib_opt(sub_opt)
+    else:
+        applied = _sync_distrib_opt(optimizer)
+
+    if applied and rank == 0:
+        print(
+            "WORKAROUND: force-synced optimizer FP32 copies from BF16 model "
+            "params (HybridDeviceOptimizer — synced GPU shards + CPU clones + "
+            "FP32 copies)"
+        )
+
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
@@ -927,6 +992,12 @@ def setup_model_and_optimizer(
             skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
         )
         print("Checkpoint loaded")
+
+        # See _force_sync_optimizer_fp32_from_model: needed when
+        # optimizer_cpu_offload=True so the first optimizer step doesn't
+        # write a stale init copy back into BF16 model params.
+        if optimizer is not None:
+            _force_sync_optimizer_fp32_from_model(optimizer, model)
     torch.distributed.barrier()
 
     draft_model = get_attached_draft_model(model)

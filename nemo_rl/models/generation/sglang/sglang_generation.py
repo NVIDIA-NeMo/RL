@@ -281,52 +281,31 @@ class SGLangGeneration(GenerationInterface):
             logger.error(f"[sglang-bridge] init_weights_update_group raised: {e}")
             return False
 
-    def update_weights_via_nccl_bridge(
+    def dump_param_fingerprints(
         self,
         names: list[str],
-        dtypes: list[str],
-        shapes: list[list[int]],
-        group_name: str = "nrl-sglang-bridge",
-        flush_cache: bool = False,
-        load_format: Optional[str] = None,
-    ) -> list[ray.ObjectRef]:
-        """Ask every SGLang engine to receive the next batch via the bridge group.
+        out_path: Optional[str] = None,
+    ) -> dict:
+        """Per-tensor (numel, dtype, sum, abs_max, projection) fingerprint by HF name.
 
-        Returns Ray futures so the caller can issue the matching
-        ``dist.broadcast(send=...)`` in parallel before awaiting (the engine-side
-        recv blocks until the broadcast lands). Used as a Ray-actor-call
-        alternative to the train-side direct-HTTP path.
+        Dispatches to engine 0's master worker (each engine has identical
+        weights; one engine is enough). Used by the bridge verifier
+        (``NRL_BRIDGE_VERIFY=1``).
         """
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
-        return self.worker_group.run_all_workers_single_data(
-            "update_weights_from_distributed",
+        futures = self.worker_group.run_all_workers_single_data(
+            "dump_param_fingerprints",
             names=names,
-            dtypes=dtypes,
-            shapes=shapes,
-            group_name=group_name,
-            flush_cache=flush_cache,
-            load_format=load_format,
+            out_path=out_path,
             run_rank_0_only_axes=["tensor_parallel"],
         )
-
-    def destroy_collective_nccl_bridge(
-        self, group_name: str = "nrl-sglang-bridge"
-    ) -> bool:
-        """Best-effort teardown of the bridge group on all engines (idempotent)."""
-        if not self.worker_group or not self.worker_group.workers:
-            return True
-        try:
-            futures = self.worker_group.run_all_workers_single_data(
-                "destroy_weights_update_group",
-                group_name=group_name,
-                run_rank_0_only_axes=["tensor_parallel"],
-            )
-            results = ray.get(futures)
-            return all(r for r in results if r is not None)
-        except Exception as e:
-            logger.warning(f"[sglang-bridge] destroy raised: {e}")
-            return False
+        results = ray.get(futures)
+        # Pick the first non-empty result (engines are replicas).
+        for r in results:
+            if isinstance(r, dict) and r:
+                return r
+        return {}
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

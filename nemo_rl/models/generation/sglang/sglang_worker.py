@@ -355,110 +355,108 @@ class SGLangGenerationWorker:
             )
             return False
 
-    def update_weights_from_distributed(
+    def dump_param_fingerprints(
         self,
         names: list[str],
-        dtypes: list[str],
-        shapes: list[list[int]],
-        group_name: str = "nrl-sglang-bridge",
-        flush_cache: bool = False,
-        load_format: Optional[str] = None,
-    ) -> bool:
-        """POST to ``/update_weights_from_distributed`` so this engine receives a batch of weights.
+        out_path: Optional[str] = None,
+        seed: int = 0xC0FFEE,
+        proj_dim: int = 8192,
+    ) -> dict:
+        """Compute (numel, dtype, sum, abs_max, projection) per HF parameter name.
 
-        ``load_format="flattened_bucket"`` selects the engine's bucketed recv
-        path (one ``dist.broadcast`` per RPC on a flat ``uint8`` buffer);
-        ``None`` selects the per-tensor path. Returns True iff the engine
-        reports body-level ``success=True``.
+        Calls SGLang's ``/get_weights_by_name`` endpoint per name; each call
+        all-gathers the parameter across the engine's TP group and returns
+        the full HF-shape tensor. Compares against the train-side fingerprints
+        produced by ``MegatronPolicyWorker.broadcast_weights_via_nccl_to_sglang``
+        when ``NRL_BRIDGE_VERIFY=1``.
         """
         if not self.is_model_owner or self.base_url is None:
-            return True
-        url = f"{self.base_url}/update_weights_from_distributed"
-        body = {
-            "names": names,
-            "dtypes": dtypes,
-            "shapes": shapes,
-            "group_name": group_name,
-            "flush_cache": bool(flush_cache),
-        }
-        if load_format is not None:
-            body["load_format"] = load_format
+            return {}
         try:
-            # Blocks engine-side until the matching broadcasts from train rank 0
-            # land; 7200s is a generous upper bound (typical 1-GiB bucket
-            # round-trips in seconds on EFA).
-            timeout_s = float(
-                os.environ.get("NRL_SGLANG_UPDATE_DIST_TIMEOUT_S", "7200")
-            )
-            response = requests.post(url, json=body, timeout=timeout_s)
-            if response.status_code != 200:
-                logger.warning(
-                    f"[SGLang Worker] Rank {self.global_rank} "
-                    f"update_weights_from_distributed (n={len(names)}, "
-                    f"first={names[0] if names else None}) returned status "
-                    f"{response.status_code}: {response.text[:200]}"
+            import torch
+        except ImportError:
+            return {}
+
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        proj_vec = torch.randn(proj_dim, generator=rng, dtype=torch.float64)
+        fp: dict = {}
+
+        with requests.Session() as session:
+            for i, name in enumerate(names):
+                try:
+                    resp = session.post(
+                        f"{self.base_url}/get_weights_by_name",
+                        json={"name": name, "truncate_size": 0},
+                        timeout=180,
+                    )
+                except Exception as e:
+                    fp[name] = {"error": f"http exception: {e!r}"}
+                    continue
+                if resp.status_code != 200:
+                    fp[name] = {
+                        "error": (
+                            f"status={resp.status_code} "
+                            f"body={resp.text[:200]}"
+                        )
+                    }
+                    continue
+                try:
+                    body = resp.json()
+                except Exception:
+                    fp[name] = {"error": "non-JSON response"}
+                    continue
+                # SGLang returns the all-gathered weight; payload shape varies
+                # across versions: a flat list, a dict like ``{"weight": [...]}``
+                # or even a base64-encoded blob. Probe in order.
+                weight_data = (
+                    body.get("weight")
+                    if isinstance(body, dict)
+                    else None
                 )
-                return False
-            try:
-                payload = response.json()
-            except Exception:
-                payload = {}
-            body_success = payload.get("success", True)
-            if not body_success:
-                logger.warning(
-                    f"[SGLang Worker] Rank {self.global_rank} "
-                    f"update_weights_from_distributed body success=False "
-                    f"message={payload.get('message', '')[:300]!r}"
-                )
-                return False
+                if weight_data is None and isinstance(body, dict):
+                    weight_data = body.get("weights")
+                if weight_data is None:
+                    weight_data = body  # plain list response
+                if weight_data is None:
+                    fp[name] = {"error": f"empty body keys={list(body) if isinstance(body, dict) else type(body)}"}
+                    continue
+                try:
+                    flat = (
+                        torch.as_tensor(weight_data, dtype=torch.float64)
+                        .flatten()
+                    )
+                except Exception as e:
+                    fp[name] = {"error": f"tensor convert failed: {e!r}"}
+                    continue
+                n = int(flat.numel())
+                rep = (n + proj_vec.numel() - 1) // proj_vec.numel()
+                pv = proj_vec.repeat(rep)[:n]
+                fp[name] = {
+                    "numel": n,
+                    "dtype": (
+                        body.get("dtype") if isinstance(body, dict) else None
+                    ),
+                    "sum": float(flat.sum().item()),
+                    "abs_max": float(flat.abs().max().item()),
+                    "projection": float(torch.dot(flat, pv).item()),
+                }
+                # Periodic progress log; this is slow (HTTP per-tensor).
+                if (i + 1) % 100 == 0:
+                    logger.info(
+                        f"[SGLang Worker] Rank {self.global_rank} "
+                        f"verify: {i + 1}/{len(names)} fingerprints"
+                    )
+
+        if out_path:
+            import json as _json
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w") as f:
+                _json.dump(fp, f, sort_keys=True)
             logger.info(
-                f"[SGLang Worker] Rank {self.global_rank} received "
-                f"{len(names)} tensors via NCCL group={group_name!r} "
-                f"at {self.base_url}"
-            )
-            return True
-        except Exception as e:
-            logger.warning(
                 f"[SGLang Worker] Rank {self.global_rank} "
-                f"update_weights_from_distributed raised: {e}"
+                f"verify: wrote {len(fp)} fingerprints to {out_path}"
             )
-            return False
-
-    def destroy_weights_update_group(
-        self, group_name: str = "nrl-sglang-bridge"
-    ) -> bool:
-        """POST to ``/destroy_weights_update_group`` to tear down the bridge group.
-
-        Idempotent and tolerant of "no such group" (4xx); only WARNs on 5xx.
-        Safe to omit on hot paths since the engine cleans up at process exit.
-        """
-        if not self.is_model_owner or self.base_url is None:
-            return True
-        url = f"{self.base_url}/destroy_weights_update_group"
-        try:
-            response = requests.post(url, json={"group_name": group_name}, timeout=120)
-            if response.status_code == 200:
-                logger.info(
-                    f"[SGLang Worker] Rank {self.global_rank} destroyed "
-                    f"NCCL bridge group={group_name!r} at {self.base_url}"
-                )
-                return True
-            # 4xx is OK (group might not exist); only WARN for 5xx
-            if 400 <= response.status_code < 500:
-                return True
-            logger.warning(
-                f"[SGLang Worker] Rank {self.global_rank} "
-                f"destroy_weights_update_group group={group_name!r} "
-                f"returned {response.status_code}: {response.text[:200]}"
-            )
-            return False
-        except Exception as e:
-            logger.warning(
-                f"[SGLang Worker] Rank {self.global_rank} "
-                f"destroy_weights_update_group group={group_name!r} "
-                f"raised: {e}"
-            )
-            return True  # tolerant on shutdown
+        return fp
 
     def get_gpu_uuids(self) -> list[str]:
         """Get list of GPU UUIDs used by this SGLang server.
@@ -626,20 +624,59 @@ class SGLangGenerationWorker:
 
         session = await self._ensure_session()
 
-        try:
-            async with session.post(url, json=payload, headers=headers) as response:
-                response.raise_for_status()
-                result = await response.json()
-        except Exception as e:
-            # Surface the exception TYPE explicitly: many aiohttp
-            # exceptions (e.g. ``asyncio.TimeoutError``) have empty
-            # ``__str__``, so the original log was useless.
-            logger.error(
-                f"[SGLang Worker] Rank {self.global_rank} Request failed "
-                f"for input_len={len(input_ids)}: "
-                f"{type(e).__name__}({e!r})"
-            )
-            raise
+        # Retry on transient HTTP errors. SGLang's HTTP server (FastAPI/uvicorn)
+        # can drop idle connections under high concurrent request load (e.g.
+        # 480-sample AIME validation), which surfaces here as
+        # ServerDisconnectedError / ConnectionResetError without an actual
+        # server crash. Without retry, a single transient blip kills the
+        # whole training job. Exponential backoff up to ~3 attempts.
+        max_attempts = int(os.environ.get("NRL_SGLANG_HTTP_MAX_RETRIES", "3"))
+        transient_errors = (
+            aiohttp.ServerDisconnectedError,
+            aiohttp.ServerTimeoutError,
+            aiohttp.ClientConnectionError,
+            ConnectionResetError,
+            asyncio.TimeoutError,
+        )
+        result = None
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with session.post(
+                    url, json=payload, headers=headers
+                ) as response:
+                    response.raise_for_status()
+                    result = await response.json()
+                break
+            except transient_errors as e:
+                last_exc = e
+                if attempt < max_attempts:
+                    backoff_s = min(2.0 ** (attempt - 1), 8.0)
+                    logger.warning(
+                        f"[SGLang Worker] Rank {self.global_rank} transient "
+                        f"HTTP error on attempt {attempt}/{max_attempts} "
+                        f"(input_len={len(input_ids)}): "
+                        f"{type(e).__name__}({e!r}); retrying in "
+                        f"{backoff_s:.1f}s"
+                    )
+                    await asyncio.sleep(backoff_s)
+                    continue
+                logger.error(
+                    f"[SGLang Worker] Rank {self.global_rank} request failed "
+                    f"after {max_attempts} attempts "
+                    f"(input_len={len(input_ids)}): "
+                    f"{type(e).__name__}({e!r})"
+                )
+                raise
+            except Exception as e:
+                # Non-transient: surface immediately with type info.
+                logger.error(
+                    f"[SGLang Worker] Rank {self.global_rank} request failed "
+                    f"for input_len={len(input_ids)}: "
+                    f"{type(e).__name__}({e!r})"
+                )
+                raise
+        assert result is not None, "unreachable: loop above either set result or raised"
 
         # Extract generated tokens and logprobs
         meta_info = result.get("meta_info", {})

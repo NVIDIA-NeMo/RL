@@ -1168,6 +1168,67 @@ def _extract_prompt_only_messages(message_logs: list) -> list:
     return prompt_only_message_logs
 
 
+def _bridge_verify_compare(policy_generation: GenerationInterface) -> None:
+    """Read train-side fingerprints, query SGLang, diff, print summary.
+
+    Gated by NRL_BRIDGE_VERIFY=1. Slow (one HTTP per parameter); intended
+    for debugging only. Errors here never fail the run — they only print.
+    """
+    try:
+        import json as _json
+
+        train_path = os.environ.get(
+            "NRL_BRIDGE_VERIFY_TRAIN_PATH", "/tmp/bridge_verify/train_fp.json"
+        )
+        sglang_path = os.environ.get(
+            "NRL_BRIDGE_VERIFY_SGLANG_PATH",
+            "/tmp/bridge_verify/sglang_fp.json",
+        )
+        if not os.path.exists(train_path):
+            print(
+                f"[bridge-verify] train fingerprints missing at {train_path}; "
+                f"skipping",
+                flush=True,
+            )
+            return
+        with open(train_path) as f:
+            train_fp = _json.load(f)
+        if not train_fp:
+            return
+        names = list(train_fp.keys())
+        print(
+            f"[bridge-verify] querying SGLang for {len(names)} param "
+            f"fingerprints (this is slow: one HTTP per tensor)...",
+            flush=True,
+        )
+        t0 = time.perf_counter()
+        sglang_fp = policy_generation.dump_param_fingerprints(  # type: ignore[attr-defined]
+            names=names, out_path=sglang_path
+        )
+        dt = time.perf_counter() - t0
+        # Use the same diff helper as the train worker.
+        from nemo_rl.models.policy.workers.megatron_policy_worker import (
+            _bridge_diff_fingerprints,
+        )
+
+        bad = _bridge_diff_fingerprints(train_fp, sglang_fp)
+        print(
+            f"[bridge-verify] {len(sglang_fp)}/{len(names)} sglang "
+            f"fingerprints in {dt:.1f}s; {len(bad)} mismatches",
+            flush=True,
+        )
+        for entry in bad[:30]:
+            print(f"  {entry}", flush=True)
+        if len(bad) > 30:
+            print(f"  ... and {len(bad) - 30} more (see {sglang_path})", flush=True)
+    except Exception as e:
+        # Never let the verifier break training; just log.
+        print(
+            f"[bridge-verify] verification raised (non-fatal): {e!r}",
+            flush=True,
+        )
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -1255,6 +1316,13 @@ def refit_policy_generation(
                     if results_train
                     else True
                 )
+                # Optional per-tensor fingerprint diff. Trigger after the
+                # bridge call when ``NRL_BRIDGE_VERIFY=1`` is set; the
+                # train side has already dumped fingerprints to JSON.
+                if update_success and bool(
+                    int(os.environ.get("NRL_BRIDGE_VERIFY", "0"))
+                ):
+                    _bridge_verify_compare(policy_generation)
             else:
                 futures_train = policy.broadcast_weights_for_collective(
                     kv_scales=kv_scales

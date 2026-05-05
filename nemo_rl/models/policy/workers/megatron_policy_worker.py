@@ -96,6 +96,64 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+def _bridge_fingerprint(t: torch.Tensor, proj_vec: torch.Tensor) -> dict:
+    """Compute a 5-tuple fingerprint (numel, dtype, sum, abs_max, projection).
+
+    Same shape on both train and SGLang sides so a JSON-level diff is
+    enough to localise weight-transfer bugs to a specific tensor name.
+    Projection against a fixed pseudo-random vector catches single-bit
+    flips that would be invisible in mean / abs_max alone.
+    """
+    flat = t.detach().to(torch.float64).flatten().cpu()
+    n = int(flat.numel())
+    rep = (n + proj_vec.numel() - 1) // proj_vec.numel()
+    pv = proj_vec.repeat(rep)[:n]
+    return {
+        "numel": n,
+        "dtype": str(t.dtype).removeprefix("torch."),
+        "sum": float(flat.sum().item()),
+        "abs_max": float(flat.abs().max().item()),
+        "projection": float(torch.dot(flat, pv).item()),
+    }
+
+
+def _bridge_diff_fingerprints(
+    train: dict, sglang: dict, atol: float = 1e-2, rtol: float = 1e-3
+) -> list[str]:
+    """Return human-readable mismatch list between train and sglang fingerprints."""
+    bad: list[str] = []
+    for name in sorted(train):
+        if name not in sglang:
+            bad.append(f"{name}: missing on sglang")
+            continue
+        ts, ss = train[name], sglang[name]
+        if "error" in ss:
+            bad.append(f"{name}: sglang error: {ss['error']}")
+            continue
+        if ts["numel"] != ss["numel"]:
+            bad.append(
+                f"{name}: numel: train={ts['numel']} sglang={ss['numel']}"
+            )
+        if ts.get("dtype") and ss.get("dtype") and ts["dtype"] != ss["dtype"]:
+            bad.append(
+                f"{name}: dtype: train={ts['dtype']!r} sglang={ss['dtype']!r}"
+            )
+        for field in ("sum", "abs_max", "projection"):
+            tv, sv = ts.get(field), ss.get(field)
+            if tv is None or sv is None:
+                continue
+            tol = atol + rtol * max(abs(tv), abs(sv))
+            if abs(tv - sv) > tol:
+                bad.append(
+                    f"{name}: {field}: train={tv:.6e} sglang={sv:.6e} "
+                    f"delta={tv - sv:.3e}"
+                )
+    for name in sorted(sglang):
+        if name not in train:
+            bad.append(f"{name}: extra on sglang (not broadcast by train)")
+    return bad
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
@@ -1234,6 +1292,18 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 flush=True,
             )
 
+            # Optional per-tensor fingerprint dump for bridge correctness debugging.
+            # Enable with NRL_BRIDGE_VERIFY=1; output goes to
+            # NRL_BRIDGE_VERIFY_TRAIN_PATH (default /tmp/bridge_verify/train_fp.json).
+            verify = bool(int(os.environ.get("NRL_BRIDGE_VERIFY", "0")))
+            train_fp: dict[str, dict] = {}
+            verify_proj_vec: Optional[torch.Tensor] = None
+            if verify:
+                _g = torch.Generator(device="cpu").manual_seed(0xC0FFEE)
+                verify_proj_vec = torch.randn(
+                    8192, generator=_g, dtype=torch.float64
+                )
+
             cur_bucket: list[tuple[str, torch.Tensor]] = []
             cur_bytes = 0
             tensor_count = 0
@@ -1336,6 +1406,10 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 ):
                     cur_bucket.append((name, tensor.contiguous().cuda()))
                     cur_bytes += tensor.numel() * tensor.element_size()
+                    if verify and verify_proj_vec is not None:
+                        train_fp[name] = _bridge_fingerprint(
+                            tensor, verify_proj_vec
+                        )
                     if cur_bytes >= BUCKET_BYTES:
                         _flush(is_last=False)
                         now = _time.perf_counter()
@@ -1362,6 +1436,33 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     f"({tensor_count / max(send_dt, 1e-9):.1f} tensors/s)",
                     flush=True,
                 )
+
+                if verify and train_fp:
+                    import json as _json
+
+                    # Dump a stable "latest" copy for the driver-side comparator
+                    # to consume after each refit, AND a step-stamped copy so
+                    # we can diff across refits offline (helpful when the
+                    # SGLang side comparison is unavailable for any reason).
+                    base_dir = os.path.dirname(
+                        os.environ.get(
+                            "NRL_BRIDGE_VERIFY_TRAIN_PATH",
+                            "/tmp/bridge_verify/train_fp.json",
+                        )
+                    )
+                    os.makedirs(base_dir, exist_ok=True)
+                    latest = os.path.join(base_dir, "train_fp.json")
+                    stamp = int(_time.time())
+                    history = os.path.join(base_dir, f"train_fp_t{stamp}.json")
+                    with open(latest, "w") as _f:
+                        _json.dump(train_fp, _f, sort_keys=True)
+                    with open(history, "w") as _f:
+                        _json.dump(train_fp, _f, sort_keys=True)
+                    print(
+                        f"[sglang-bridge] verify: wrote {len(train_fp)} "
+                        f"train fingerprints to {latest} and {history}",
+                        flush=True,
+                    )
 
                 return True
             finally:
