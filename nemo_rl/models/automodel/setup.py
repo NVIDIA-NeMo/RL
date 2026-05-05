@@ -740,6 +740,20 @@ def setup_model_and_optimizer(
             if rank == 0:
                 print(f"Froze {attr} parameters (image-only training)")
 
+    # NemotronOmni RADIO: patch_generator.video_embedder is only called for
+    # video inputs; image-only training never exercises it. Without freezing,
+    # it sits in the optimizer without state (no grad → no lazy init), so
+    # dcp.load on resume raises "Missing key in checkpoint state_dict:
+    # optim.state.vision_model.radio_model.model.patch_generator.video_embedder.
+    # weight.step". The image encoder itself stays trainable.
+    frozen_dead_params = 0
+    for name, param in model.named_parameters():
+        if "patch_generator.video_embedder" in name:
+            param.requires_grad_(False)
+            frozen_dead_params += 1
+    if frozen_dead_params and rank == 0:
+        print(f"Froze {frozen_dead_params} video_embedder params (image-only training)")
+
     # CPU offload if needed
     if cpu_offload:
         # Move buffers to CPU for FSDP modules
