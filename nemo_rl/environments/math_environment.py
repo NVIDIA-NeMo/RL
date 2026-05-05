@@ -13,6 +13,7 @@
 # limitations under the License.
 import contextlib
 import io
+import itertools
 import logging
 import re
 from typing import Any, NotRequired, TypedDict, Union
@@ -347,7 +348,7 @@ class BaseMathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
     def __init__(self, cfg: MathEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
-        self._worker_assigned_index = 0
+        self._worker_counter = itertools.count()
         verifier_type = cfg.get("verifier_type", "math")
         assert isinstance(verifier_type, str), (
             f"{verifier_type=} must be a string but was {type(verifier_type)}"
@@ -459,8 +460,7 @@ class MathEnvironment(BaseMathEnvironment):
         # Round-robin the starting worker index.
         # Without the rotation, all the requests will be sent to workers[0] if this function
         # is called per-sample.
-        worker_index = self._worker_assigned_index % self.num_workers
-        self._worker_assigned_index = worker_index + 1
+        worker_index = next(self._worker_counter) % self.num_workers
 
         # Process each chunk in parallel
         futures = [
@@ -564,8 +564,7 @@ class MathMultiRewardEnvironment(BaseMathEnvironment):
         # Round-robin the starting worker index.
         # Without the rotation, all the requests will be sent to workers[0] if this function
         # is called per-sample.
-        worker_index = self._worker_assigned_index % self.num_workers
-        self._worker_assigned_index = worker_index + 1
+        worker_index = next(self._worker_counter) % self.num_workers
 
         # Process each chunk in parallel
         futures = [
