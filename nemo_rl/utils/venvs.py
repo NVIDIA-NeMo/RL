@@ -161,9 +161,9 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     # Skip nodes with 0 CPUs (e.g. unschedulable head nodes) — including them
     # makes the STRICT_SPREAD placement group infeasible.
     nodes = [
-        n for n in ray.nodes()
-        if n.get("Alive", False)
-        and n.get("Resources", {}).get("CPU", 0) > 0
+        n
+        for n in ray.nodes()
+        if n.get("Alive", False) and n.get("Resources", {}).get("CPU", 0) > 0
     ]
     num_nodes = len(nodes)
     # Reserve one CPU on each node using a STRICT_SPREAD placement group
