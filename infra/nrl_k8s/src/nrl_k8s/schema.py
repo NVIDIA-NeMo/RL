@@ -418,6 +418,11 @@ class ClusterSpec(_StrictModel):
     # Labels/annotations to attach to metadata (useful for KAI/Kyverno).
     labels: dict[str, str] = Field(default_factory=dict)
     annotations: dict[str, str] = Field(default_factory=dict)
+    # Topology-aware worker group splitting for KAI scheduling on GB300.
+    # When set, each worker group with replicas > segmentSize is split into
+    # replicas/segmentSize identical groups so KAI can place each segment
+    # on a single rack (clique). Smaller values are easier to schedule.
+    segmentSize: int | None = Field(default=None, gt=0)
     # Daemon to start on the cluster once Ready (e.g. the gen/gym server).
     daemon: DaemonSpec | None = None
 
@@ -428,6 +433,23 @@ class ClustersSpec(_StrictModel):
     training: ClusterSpec | None = None
     generation: ClusterSpec | None = None
     gym: ClusterSpec | None = None
+
+
+class DeploymentSpec(_StrictModel):
+    """A Kubernetes Deployment managed alongside RayClusters.
+
+    ``spec`` is the inline Deployment ``.spec`` body — the CLI wraps it in
+    ``apiVersion: apps/v1``, ``kind: Deployment``, ``metadata.name/namespace``
+    and patches cross-cutting fields (image, imagePullSecrets, serviceAccount)
+    from the top-level ``infra`` keys before applying.
+    """
+
+    name: str
+    spec: dict[str, Any]
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+    healthCheckUrl: str | None = None
+    healthCheckTimeoutS: int = 300
 
 
 # =============================================================================
@@ -455,7 +477,8 @@ class InfraConfig(_StrictModel):
     submit: SubmitSpec = Field(default_factory=SubmitSpec)
     launch: LaunchSpec = Field(default_factory=LaunchSpec)
     resources: ResourcesSpec = Field(default_factory=ResourcesSpec)
-    clusters: ClustersSpec = Field(default_factory=ClustersSpec)
+    kuberay: ClustersSpec = Field(default_factory=ClustersSpec)
+    deployments: dict[str, DeploymentSpec] = Field(default_factory=dict)
 
     # Opaque extra labels / annotations the platform may require (Kyverno-enforced, etc.)
     labels: dict[str, str] = Field(default_factory=dict)
@@ -477,6 +500,7 @@ __all__ = [
     "ClustersSpec",
     "CodeSource",
     "DaemonSpec",
+    "DeploymentSpec",
     "DevPodMode",
     "HFCacheKind",
     "HFCacheSpec",

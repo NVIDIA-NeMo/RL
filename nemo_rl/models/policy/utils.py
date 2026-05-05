@@ -95,6 +95,29 @@ class IPCProtocol(Enum):
     ACK = "ack"
 
 
+# TODO: Replace this hard-coded map with a generic plugin-registration
+# hook on ``Policy`` (e.g. a ``worker_cls_overrides`` registry populated by
+# ``nemo_rl.modelopt`` on import) so core has no knowledge of ModelOpt-specific
+# worker classes.
+POLICY_WORKER_OVERRIDES = {
+    "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
+    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker",
+    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
+}
+
+
+def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
+    """Return the quantized policy worker FQN if ``quant_cfg`` is set, else ``default_cls``.
+
+    Safe to call even when ModelOpt is not installed — returns ``default_cls``
+    unchanged whenever ``quant_cfg`` is ``None``, so the core policy path stays
+    import-free of ModelOpt.
+    """
+    if config.get("quant_cfg") is None:
+        return default_cls
+    return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
+
+
 def resolve_model_class(model_name: str) -> Any:
     """Resolve the appropriate model class for a given model name."""
     if NEMO_AUTOMODEL_AVAILABLE:

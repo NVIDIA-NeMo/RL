@@ -61,7 +61,7 @@ def collect_status(loaded: LoadedConfig) -> list[ClusterStatus]:
     out: list[ClusterStatus] = []
     infra = loaded.infra
     for role in ALL_ROLES:
-        cluster: ClusterSpec | None = getattr(infra.clusters, role)
+        cluster: ClusterSpec | None = getattr(infra.kuberay, role)
         if cluster is None:
             continue
         out.append(_status_for(role, cluster, infra))

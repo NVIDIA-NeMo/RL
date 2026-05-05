@@ -1,6 +1,6 @@
 ---
 name: launch-nemo-rl
-description: Playbook for launching, monitoring, stopping, and debugging NeMo-RL recipes on a Kubernetes cluster via the nrl-k8s CLI. Use when asked to run/launch/submit/test a recipe on k8s, bring up or tear down a RayCluster, choose between ephemeral (default `nrl-k8s run`, auto-teardown) and long-lived (`nrl-k8s run --raycluster`) modes, iterate on an existing run, debug a hung or failed training job, or structure a new recipe+infra pair for a new hardware profile.
+description: Playbook for launching, monitoring, stopping, and debugging NeMo-RL recipes on a Kubernetes cluster via the nrl-k8s CLI. Covers ephemeral vs long-lived RayCluster modes, iterating on runs, and debugging hung or failed training jobs.
 when_to_use: "run this recipe on k8s", "launch on the cluster", "submit a training job", "tear down the cluster", "resubmit as rayjob", "why is the run stuck", "how do I get logs for job X", "bring the cluster back up".
 allowed-tools: Bash Read Grep Glob Edit Write
 ---
@@ -40,7 +40,7 @@ nrl-k8s run infra/nrl_k8s/examples/<recipe>.yaml \
 ```
 
 - **Recipe** (e.g. `qwen3_30b_math_8n_4gpu.yaml`) — NeMo-RL config: model, GRPO/SFT knobs, `cluster.{gpus_per_node,num_nodes}`. Uses `defaults:` to inherit from `examples/configs/recipes/llm/...`.
-- **Infra** (e.g. `*.<profile>.infra.yaml`) — K8s/Ray shape: namespace, image, service account, RayCluster spec, `submit.submitter`, `launch.{mode,codeSource,codePath,entrypoint}`. Pair names follow `<recipe>.<profile>[.prod].infra.yaml` where `<profile>` names the hardware target (e.g. `gb300`).
+- **Infra** (e.g. `*.<profile>.infra.yaml`) — K8s/Ray shape: namespace, image, service account, RayCluster spec under `kuberay:`, optional Deployments under `deployments:`, `submit.submitter`, `launch.{mode,codeSource,codePath,entrypoint}`. Pair names follow `<recipe>.<profile>[.prod].infra.yaml` where `<profile>` names the hardware target (e.g. `gb300`).
 
 Example pairs in `infra/nrl_k8s/examples/` — read the neighbouring files to see the current conventions for the target profile.
 
@@ -146,12 +146,25 @@ nrl-k8s run <recipe> --infra <disagg-infra> --mode batch --code-source image
 
 ### 7d. Cluster-only lifecycle
 ```bash
-nrl-k8s cluster up   <recipe> --infra <infra> --role training --wait
-nrl-k8s cluster up   <recipe> --infra <infra> --role training --dry-run   # render manifest
-nrl-k8s cluster down <recipe> --infra <infra> --role training --wait
+nrl-k8s cluster up   <recipe> --infra <infra> --target kuberay.training --wait
+nrl-k8s cluster up   <recipe> --infra <infra> --target kuberay.training --dry-run   # render manifest
+nrl-k8s cluster down <recipe> --infra <infra> --target kuberay.training --wait
+nrl-k8s cluster down <recipe> --infra <infra>                                       # tear down all
 nrl-k8s cluster list -n default
 nrl-k8s cluster dashboard <cluster-name>                                  # port-forward + browser
 ```
+
+### 7e. Deployments (e.g. nemo-skills sandbox)
+```bash
+# Bring up just the deployment
+nrl-k8s cluster up <recipe> --infra <infra> --target deployments.nemo_skills
+# Tear down just the deployment
+nrl-k8s cluster down <recipe> --infra <infra> --target deployments.nemo_skills
+# Tear down everything (RayClusters + Deployments)
+nrl-k8s cluster down <recipe> --infra <infra>
+```
+
+The `deployments:` section in infra YAML declares Kubernetes Deployments managed alongside RayClusters. The CLI patches image, imagePullSecrets, and serviceAccountName from the top-level infra keys (same as RayClusters). Deployments start in parallel with cluster bring-up — no ordering dependency.
 
 ## 8. Monitoring a run
 
@@ -185,7 +198,7 @@ Wandb URL appears in the driver log on the first `wandb.init` call; grep `grep -
 | :------------------------------- | :----------------------------------------------------------------------------------- |
 | One training run                 | `nrl-k8s job stop <run-id> <recipe> --infra <infra> --role training`                 |
 | All running Ray jobs on a cluster (+ submit new) | `nrl-k8s run <recipe> --infra <infra> --replace`                         |
-| A long-lived RayCluster          | `nrl-k8s cluster down <recipe> --infra <infra> --role training --wait`               |
+| A long-lived RayCluster          | `nrl-k8s cluster down <recipe> --infra <infra> --target kuberay.training --wait`     |
 | A RayJob (ephemeral)             | `kubectl delete rayjob <name> -n default` — only if `shutdownAfterJobFinishes` didn't fire |
 
 Confirm before deleting shared infra. The cost of `cluster down` on someone else's cluster is high.

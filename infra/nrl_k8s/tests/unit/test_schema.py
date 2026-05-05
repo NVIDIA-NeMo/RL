@@ -27,6 +27,7 @@ import pytest
 from nrl_k8s.schema import (
     CheckpointsKind,
     CheckpointsSpec,
+    ClusterSpec,
     CodeSource,
     HFCacheKind,
     HFCacheSpec,
@@ -271,3 +272,26 @@ class TestTolerations:
                     }
                 }
             )
+
+
+# =============================================================================
+# ClusterSpec.segmentSize
+# =============================================================================
+
+
+class TestClusterSpecSegmentSize:
+    def test_defaults_to_none(self) -> None:
+        cs = ClusterSpec.model_validate({"name": "x", "spec": {}})
+        assert cs.segmentSize is None
+
+    def test_positive_accepted(self) -> None:
+        cs = ClusterSpec.model_validate({"name": "x", "spec": {}, "segmentSize": 16})
+        assert cs.segmentSize == 16
+
+    def test_zero_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ClusterSpec.model_validate({"name": "x", "spec": {}, "segmentSize": 0})
+
+    def test_negative_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ClusterSpec.model_validate({"name": "x", "spec": {}, "segmentSize": -1})
