@@ -1,0 +1,101 @@
+# GRPO training for Nemotron-Omni (MoE ~30B) on MMPR-Tiny
+# Inherits from vlm_grpo_3B.yaml; encodes all Nemotron-Omni MoE EP=8 settings
+# plus the MMPR-Tiny dataset recipe.
+defaults: "vlm_grpo_3B.yaml"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  val_at_start: true
+  reward_shaping:
+    overlong_buffer_length: 512
+
+checkpointing:
+  checkpoint_dir: results/vlm_grpo_nemotron_omni_mmpr
+  save_optimizer: false
+  checkpoint_must_save_by: "00:03:45:00"
+
+policy:
+  model_name: /lustre/fsw/portfolios/coreai/users/yuekaiz/HF/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 10000
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  optimizer:
+    kwargs:
+      lr: 3.0e-06
+  dtensor_cfg:
+    expert_parallel_size: 8
+    activation_checkpointing: true
+    moe_parallelizer:
+      ignore_router_for_ac: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      NRL_DEBUG_PICKLE: "1"
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: sdpa
+        linear: torch
+        rms_norm: torch_fp32
+        enable_deepep: true
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+  generation:
+    max_new_tokens: 10000
+    bad_words: ["<image>", "<img>", "</img>", "<so_embedding>", "<so_start>", "<so_end>"]
+    vllm_cfg:
+      skip_tokenizer_init: false
+      tensor_parallel_size: 8
+      enforce_eager: true
+      max_model_len: ${policy.max_total_sequence_length}
+      gpu_memory_utilization: 0.5
+      enable_prefix_caching: false
+    vllm_kwargs:
+      limit_mm_per_prompt: {"image": 2}
+      max_num_batched_tokens: 16384
+      mm_processor_cache_gb: 0
+      mamba_ssm_cache_dtype: "float32"
+      skip_mm_profiling: true
+      # Disable flashinfer MoE autotuner: tactic 36 fails with "Invalid activation
+      # type" on V3 + bf16 + tp=8, leaving GPU in a bad state → CUDA illegal
+      # instruction during generation. Force triton MoE backend to avoid the
+      # illegal-instruction in default backend post-refit; disable prefix caching
+      # so cached KV from old weights can't leak into the next step.
+      kernel_config: {"enable_flashinfer_autotune": false, "moe_backend": "triton"}
+
+data:
+  train:
+    dataset_name: mmpr-tiny
+    download_dir: /lustre/fs1/portfolios/coreai/users/aroshanghias/data/mmpr_tiny/processed
+    split_validation_size: 0.008
+    seed: 42
+  default:
+    prompt_file: null
+    processor: vlm_hf_data_processor
+    env_name: mmpr-tiny
+
+env:
+  mmpr-tiny:
+    num_workers: 8
+    reward_functions:
+    - name: verl_geo3k
+      weight: 1.0
+      kwargs:
+        format_score: 0.1
+
+logger:
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb_enabled: true
+  wandb:
+    project: grpo-vlm
+    name: nemotron-omni-grpo-mmpr
+
+cluster:
+  gpus_per_node: 8
