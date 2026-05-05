@@ -1,0 +1,48 @@
+# KAI Scheduler queue hierarchy for a 2-GPU kind cluster.
+#
+# Queue hierarchy:
+#   org (root, unlimited)
+#   ├── high-prio (1 GPU guaranteed, burst to 2, priority 200, weight 2)
+#   └── low-prio  (0 GPU guaranteed, burst to 2, priority 50, weight 1)
+#
+# high-prio: gets its guaranteed GPU first, gets surplus before low-prio,
+#   and is reclaimed last. Jobs protected from preemption for 4 hours.
+# low-prio: best-effort — uses idle GPUs, first to be reclaimed.
+
+apiVersion: scheduling.run.ai/v2
+kind: Queue
+metadata:
+  name: root-org
+spec:
+  resources:
+    gpu:    { quota: -1, limit: -1, overQuotaWeight: 1 }
+    cpu:    { quota: -1, limit: -1, overQuotaWeight: 1 }
+    memory: { quota: -1, limit: -1, overQuotaWeight: 1 }
+---
+apiVersion: scheduling.run.ai/v2
+kind: Queue
+metadata:
+  name: high-prio
+spec:
+  parentQueue: root-org
+  priority: 200
+  preemptMinRuntime: "4h"
+  reclaimMinRuntime: "15m"
+  resources:
+    gpu:    { quota: 1, limit: 2, overQuotaWeight: 2 }
+    cpu:    { quota: -1, limit: -1, overQuotaWeight: 2 }
+    memory: { quota: -1, limit: -1, overQuotaWeight: 2 }
+---
+apiVersion: scheduling.run.ai/v2
+kind: Queue
+metadata:
+  name: low-prio
+spec:
+  parentQueue: root-org
+  priority: 50
+  preemptMinRuntime: "4h"
+  reclaimMinRuntime: "15m"
+  resources:
+    gpu:    { quota: 0, limit: 2, overQuotaWeight: 1 }
+    cpu:    { quota: -1, limit: -1, overQuotaWeight: 1 }
+    memory: { quota: -1, limit: -1, overQuotaWeight: 1 }
