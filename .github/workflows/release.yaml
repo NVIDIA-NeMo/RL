@@ -67,6 +67,7 @@ jobs:
       version-bump-branch: ${{ inputs.version-bump-branch || github.ref_name }}
       create-gh-release: ${{ inputs.create-gh-release || true }}
       packaging: uv
+      submodules: recursive
       publish-docs: false
       restrict-to-admins: true
     secrets:
