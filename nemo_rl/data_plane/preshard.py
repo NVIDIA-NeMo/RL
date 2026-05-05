@@ -34,10 +34,13 @@ from tensordict import TensorDict
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-# Tensor fields the data plane carries between driver and DP workers. The
-# canonical schema for the ``train`` partition. Producers (sync trainer fan-out,
-# async trainer fan-out) write only the subset they have computed; consumers
-# (``train_presharded`` workers) fetch what they need via ``select_fields``.
+# Required tensor fields for the ``train`` partition schema. These are the
+# fields ``register_partition`` declares; ``fan_out_per_rank_metas`` writes
+# any additional tensor fields present in the shard (e.g. multimodal image
+# tensors) on top, so VLM workloads aren't silently dropped. Producers (sync
+# / async trainer fan-out) write only the subset they have computed;
+# consumers (``train_presharded`` workers) fetch what they need via
+# ``select_fields``.
 DP_SEED_FIELDS = (
     "input_ids",
     "input_lengths",
@@ -45,6 +48,15 @@ DP_SEED_FIELDS = (
     "prev_logprobs",
     "reference_policy_logprobs",
     "advantages",
+    "token_mask",
+    "sample_mask",
+)
+
+# Subset used by ``get_logprobs`` / ``get_reference_policy_logprobs`` —
+# logprob workers only need the input + masks, not the full train fields.
+LP_SEED_FIELDS = (
+    "input_ids",
+    "input_lengths",
     "token_mask",
     "sample_mask",
 )
@@ -111,6 +123,95 @@ def driver_balanced_preshards(
     return pre_shards
 
 
+def _build_shard_payload(
+    dp_rank: int,
+    shard: BatchedDataDict,
+    *,
+    partition_id: str,
+    task_name: str,
+    key_prefix: str,
+    seed_fields: Sequence[str],
+) -> tuple[list[str], TensorDict, KVBatchMeta]:
+    """Pure-Python prep for one shard: keys, TensorDict payload, KVBatchMeta.
+
+    Field selection: union of ``seed_fields`` (the schema-declared set) with
+    every tensor key present in the shard. The latter ensures VLM /
+    multimodal extras (e.g. ``pixel_values``) ride along instead of being
+    silently dropped — the legacy in-memory path passes the full
+    BatchedDataDict, so the TQ path must too.
+    """
+    n_shard = int(shard["sample_mask"].shape[0])
+    shard_keys = [f"{key_prefix}_dp{dp_rank}_s{i}" for i in range(n_shard)]
+    declared = [
+        f for f in seed_fields
+        if f in shard and isinstance(shard[f], torch.Tensor)
+    ]
+    extras = [
+        f for f in shard.keys()
+        if f not in seed_fields and isinstance(shard[f], torch.Tensor)
+    ]
+    shard_field_names = declared + extras
+    shard_fields = TensorDict(
+        {f: shard[f].detach().contiguous() for f in shard_field_names},
+        batch_size=[n_shard],
+    )
+    extra: dict[str, Any] = {}
+    if (
+        getattr(shard, "micro_batch_indices", None) is not None
+        and getattr(shard, "micro_batch_lengths", None) is not None
+    ):
+        extra["micro_batch_indices"] = shard.micro_batch_indices
+        extra["micro_batch_lengths"] = shard.micro_batch_lengths
+        ecpg = getattr(shard, "elem_counts_per_gb", None)
+        if ecpg is not None:
+            extra["elem_counts_per_gb"] = ecpg
+    meta = KVBatchMeta(
+        partition_id=partition_id,
+        task_name=task_name,
+        keys=shard_keys,
+        fields=shard_field_names,
+        sequence_lengths=[int(s) for s in shard["input_lengths"].tolist()],
+        extra_info=extra,
+    )
+    return shard_keys, shard_fields, meta
+
+
+async def fan_out_per_rank_metas_async(
+    pre_shards: Sequence[BatchedDataDict],
+    *,
+    dp_client: DataPlaneClient,
+    partition_id: str,
+    task_name: str,
+    key_prefix: str,
+    seed_fields: Sequence[str],
+) -> list[KVBatchMeta]:
+    """Async variant — issues all per-rank ``kv_batch_put`` calls concurrently.
+
+    The sync ``fan_out_per_rank_metas`` wraps this with ``asyncio.run``. The
+    O(DP) RPC latency previously serialized through one event loop per shard
+    is now O(1) under ``asyncio.gather``.
+    """
+    payloads = [
+        _build_shard_payload(
+            r, s,
+            partition_id=partition_id,
+            task_name=task_name,
+            key_prefix=key_prefix,
+            seed_fields=seed_fields,
+        )
+        for r, s in enumerate(pre_shards)
+    ]
+    await asyncio.gather(*[
+        dp_client.kv_batch_put(
+            keys=keys,
+            partition_id=partition_id,
+            fields=fields,
+        )
+        for keys, fields, _ in payloads
+    ])
+    return [meta for _, _, meta in payloads]
+
+
 def fan_out_per_rank_metas(
     pre_shards: Sequence[BatchedDataDict],
     *,
@@ -120,7 +221,7 @@ def fan_out_per_rank_metas(
     key_prefix: str,
     seed_fields: Sequence[str],
 ) -> list[KVBatchMeta]:
-    """For each pre-shard: ``kv_batch_put`` seed fields, return per-rank meta.
+    """For each pre-shard: ``kv_batch_put`` tensor fields, return per-rank meta.
 
     Each shard's key list is ``f"{key_prefix}_dp{r}_s{i}"`` for ``i in
     range(n_shard)``. Pre-computed packing metadata
@@ -128,51 +229,17 @@ def fan_out_per_rank_metas(
     ``elem_counts_per_gb``) rides on ``KVBatchMeta.extra_info`` so
     ``train_presharded`` can reattach it post-fetch and skip a local repack.
 
-    The caller chooses ``key_prefix`` to namespace keys: ``f"step{N}"`` for
-    sync GRPO, ``f"v{wv}_step{N}"`` for the planned async path.
+    Sync façade over :func:`fan_out_per_rank_metas_async`. The caller chooses
+    ``key_prefix`` to namespace keys: ``f"step{N}"`` for sync GRPO,
+    ``f"v{wv}_step{N}"`` for the planned async path.
     """
-    dp_metas: list[KVBatchMeta] = []
-    for dp_rank, shard in enumerate(pre_shards):
-        n_shard = int(shard["sample_mask"].shape[0])
-        shard_keys = [
-            f"{key_prefix}_dp{dp_rank}_s{i}" for i in range(n_shard)
-        ]
-        shard_field_names = [
-            f
-            for f in seed_fields
-            if f in shard and isinstance(shard[f], torch.Tensor)
-        ]
-        shard_fields = TensorDict(
-            {f: shard[f].detach().contiguous() for f in shard_field_names},
-            batch_size=[n_shard],
+    return asyncio.run(
+        fan_out_per_rank_metas_async(
+            pre_shards,
+            dp_client=dp_client,
+            partition_id=partition_id,
+            task_name=task_name,
+            key_prefix=key_prefix,
+            seed_fields=seed_fields,
         )
-        asyncio.run(
-            dp_client.kv_batch_put(
-                keys=shard_keys,
-                partition_id=partition_id,
-                fields=shard_fields,
-            )
-        )
-        extra: dict[str, Any] = {}
-        if (
-            getattr(shard, "micro_batch_indices", None) is not None
-            and getattr(shard, "micro_batch_lengths", None) is not None
-        ):
-            extra["micro_batch_indices"] = shard.micro_batch_indices
-            extra["micro_batch_lengths"] = shard.micro_batch_lengths
-            ecpg = getattr(shard, "elem_counts_per_gb", None)
-            if ecpg is not None:
-                extra["elem_counts_per_gb"] = ecpg
-        dp_metas.append(
-            KVBatchMeta(
-                partition_id=partition_id,
-                task_name=task_name,
-                keys=shard_keys,
-                fields=shard_field_names,
-                sequence_lengths=[
-                    int(s) for s in shard["input_lengths"].tolist()
-                ],
-                extra_info=extra,
-            )
-        )
-    return dp_metas
+    )
