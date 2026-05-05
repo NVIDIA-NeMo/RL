@@ -2368,20 +2368,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         except Exception:
             pass
 
-        # Clear deferred wgrad/activation buffers on the output_layer and embedding
-        # (populated when defer_embedding_wgrad_compute=True).
-        try:
-            for module in self.model.modules():
-                if hasattr(module, "grad_output_buffer") and module.grad_output_buffer is not None:
-                    module.grad_output_buffer.clear()
-                if (
-                    hasattr(module, "embedding_activation_buffer")
-                    and module.embedding_activation_buffer is not None
-                ):
-                    module.embedding_activation_buffer.clear()
-        except Exception:
-            pass
-
         # Clear RotaryEmbedding's @lru_cache(maxsize=32). The cache accumulates one
         # entry per unique (max_seq_len, offset, packed_seq) seen, and each entry is
         # a GPU tensor (the concatenated sin/cos embedding). With training + logprob
@@ -2433,34 +2419,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         except Exception:
             pass
 
-        # Submit a dummy all-reduce on each relevant process group to force PyTorch's
-        # ProcessGroupNCCL to flush its completed-work list. Each NCCL process group
-        # maintains its OWN work queue; a collective on the WORLD group only flushes
-        # the world-group queue. The 33 MB grad_input tensor from layers.py:535 comes
-        # from a TP-group reduce-scatter, so we must submit a dummy collective on the
-        # TP group to flush it. We also flush the world group for any other lingering
-        # NCCL work (e.g., the logprob forward logit tensor on EP group).
-        try:
-            from megatron.core.parallel_state import get_tensor_model_parallel_group
-            tp_group = get_tensor_model_parallel_group()
-            _dummy = torch.zeros(1, device="cuda")
-            torch.distributed.all_reduce(_dummy, group=tp_group)
-            del _dummy
-        except Exception:
-            pass
-        try:
-            _dummy = torch.zeros(1, device="cuda")
-            torch.distributed.all_reduce(_dummy)
-            del _dummy
-        except Exception:
-            pass
-
-        # Run gc.collect() twice: a single pass may miss objects that become
-        # collectable only after the first pass frees their referents.  This is
-        # particularly important for clearing te_checkpoint autograd ctxs that hold
-        # the 48 × ~12 MB FP8 pre-MLP LayerNorm outputs (576 MB total) — these ctxs
-        # are in reference cycles that the cycle-detector needs two passes to collect.
-        gc.collect()
         gc.collect()
         torch.cuda.empty_cache()
 
