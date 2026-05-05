@@ -19,21 +19,17 @@ detail of a specific adapter.
 """
 
 from nemo_rl.data_plane.codec import materialize
-from nemo_rl.data_plane.dispatch import dp_dispatch
 from nemo_rl.data_plane.factory import build_data_plane_client
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
     DataPlaneConfig,
     KVBatchMeta,
 )
-from nemo_rl.data_plane.sharding import shard_keys_by_seqlen
 
 __all__ = [
     "DataPlaneClient",
     "DataPlaneConfig",
     "KVBatchMeta",
     "build_data_plane_client",
-    "dp_dispatch",
     "materialize",
-    "shard_keys_by_seqlen",
 ]

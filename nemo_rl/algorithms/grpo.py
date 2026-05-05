@@ -17,7 +17,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
@@ -219,6 +219,7 @@ def setup(
     dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
     val_dataset: Optional[AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
+    policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
@@ -554,10 +555,15 @@ def setup(
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Define initialization functions that will be used in all paths
+    # ``policy_factory`` lets the caller pick a Policy subclass (e.g.
+    # a TQ-mediated variant) without grpo.py needing to know about its
+    # specific dependencies. Defaults to the legacy in-memory Policy.
+    _make_policy = policy_factory if policy_factory is not None else Policy
+
     def init_policy():
         """Initialize policy training workers."""
         t0 = time.perf_counter()
-        p = Policy(
+        p = _make_policy(
             cluster=train_cluster,
             config=policy_config,
             tokenizer=tokenizer,
@@ -2497,30 +2503,11 @@ def async_grpo_train(
         num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
     )
 
-    # Optional data-plane wiring for async-on-TQ. When data_plane.enabled is
-    # set, the producer (AsyncTrajectoryCollector) writes rollouts into the TQ
-    # ``rollouts`` partition; the buffer holds KVBatchMeta references and
-    # materializes back to BatchedDataDict on consume; the trainer then re-
-    # fans-out via the preshard helpers so policy.train(list[KVBatchMeta])
-    # exercises the @dp_dispatch list path with driver-side balanced packing
-    # (bin_count_multiple=DP_world — same invariant as grpo_sync, prevents
-    # cross-DP collective desync at step 4 with sequence packing). See
-    # research/data_plane_async_rl_limitations.md §5.4 + commit a085559c.
-    # Bootstrap the controller here on the driver — actors attach with
-    # bootstrap=False.
-    _dp_cfg = master_config.get("data_plane")
-    _dp_client = None
-    if _dp_cfg and _dp_cfg.get("enabled", False):
-        from nemo_rl.data_plane import build_data_plane_client
-        from nemo_rl.data_plane.preshard import (
-            DP_SEED_FIELDS as _DP_SEED_FIELDS,
-            driver_balanced_preshards,
-            fan_out_per_rank_metas,
-        )
-
-        _dp_client = build_data_plane_client(_dp_cfg, bootstrap=True)
-    else:
-        _dp_cfg = None
+    # When a TQ-mediated policy is in use, ``policy.dp_cfg`` carries the
+    # config the producer + ReplayBuffer need to attach as clients. For
+    # the legacy in-memory path, this attribute is absent and ``_dp_cfg``
+    # stays ``None``.
+    _dp_cfg = getattr(policy, "dp_cfg", None)
 
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
         max_size=optimal_buffer_size,
@@ -2880,44 +2867,11 @@ def async_grpo_train(
 
                 print("▶ Training policy...")
                 with timer.time("policy_training"):
-                    if _dp_client is not None:
-                        # Driver-side balanced packing — mirror grpo_sync.
-                        # Pre-shards by DP world with bin_count_multiple=DP_world
-                        # so per-rank n_microbatches stay uniform under sequence
-                        # packing / dynamic batching. Without this, async +
-                        # seqpack would deadlock at the first cross-DP
-                        # collective the same way sync did pre-a085559c. See
-                        # research/data_plane_async_rl_limitations.md §5.4.
-                        _dp_world = policy.sharding_annotations.get_axis_size(
-                            "data_parallel"
-                        )
-                        _pre_shards = driver_balanced_preshards(
-                            train_data,
-                            dp_world=_dp_world,
-                            policy_cfg=master_config["policy"],
-                        )
-                        _dp_metas = fan_out_per_rank_metas(
-                            _pre_shards,
-                            dp_client=_dp_client,
-                            partition_id="train",
-                            task_name="train",
-                            key_prefix=f"v{weight_version}_s{step}",
-                            seed_fields=_DP_SEED_FIELDS,
-                        )
-                        train_results = policy.train(
-                            _dp_metas,
-                            loss_fn=loss_fn,
-                            timer=timer,
-                        )
-                        # Drain the train partition before next step's fan-out
-                        # reuses key prefixes — same lifecycle as grpo_sync.
-                        _dp_client.kv_clear(keys=None, partition_id="train")
-                    else:
-                        train_results = policy.train(
-                            train_data,
-                            loss_fn,
-                            timer=timer,
-                        )
+                    train_results = policy.train(
+                        train_data,
+                        loss_fn,
+                        timer=timer,
+                    )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None

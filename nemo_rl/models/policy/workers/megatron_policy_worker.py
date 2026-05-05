@@ -108,6 +108,55 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         else:
             return f"{self.__class__.__qualname__}"
 
+    def _get_replica_group(self) -> Optional[Any]:
+        """Replica group = TP × CP × PP siblings within this DP rank.
+
+        Gated on CP > 1: returns ``None`` when CP=1 so ``_fetch`` keeps
+        using the proven independent path (matches the qwen3-mcore TP=2
+        baseline). Once CP > 1, broadcasting the full BatchedDataDict to
+        (TP, CP, PP) siblings amortizes the TQ read.
+
+        mcore exposes per-axis groups (``get_tensor_model_parallel_group``,
+        ``get_context_parallel_group``, ``get_pipeline_model_parallel_group``)
+        but no single combined group. We build the combined NCCL group
+        once on first call by enumerating coordinates that share this
+        rank's ``dp_rank``.
+        """
+        if not torch.distributed.is_initialized():
+            return None
+        cached = getattr(self, "_replica_group_cache", "uninit")
+        if cached != "uninit":
+            return cached
+
+        cp = parallel_state.get_context_parallel_world_size()
+        if cp <= 1:
+            self._replica_group_cache = None
+            return None
+
+        world_size = torch.distributed.get_world_size()
+        my_dp_rank = parallel_state.get_data_parallel_rank()
+        # Collect global ranks that share this DP rank — they form the
+        # replica group. Done collectively so every rank ends up with
+        # the same ranks list and can pass it to new_group().
+        my_replica_ranks_t = torch.full(
+            (world_size,), -1, dtype=torch.long, device="cuda",
+        )
+        my_replica_ranks_t[torch.distributed.get_rank()] = my_dp_rank
+        torch.distributed.all_reduce(my_replica_ranks_t, op=torch.distributed.ReduceOp.MAX)
+        all_dp_ranks = my_replica_ranks_t.tolist()
+
+        # Every (dp_rank → ranks) bucket must call new_group on its own
+        # ranks list, but new_group itself must be called collectively
+        # across the full world. Sort by dp_rank to keep call order
+        # consistent across processes.
+        groups: dict[int, Any] = {}
+        for dp in sorted(set(all_dp_ranks)):
+            ranks = [r for r, d in enumerate(all_dp_ranks) if d == dp]
+            grp = torch.distributed.new_group(ranks=ranks, backend="nccl")
+            groups[dp] = grp
+        self._replica_group_cache = groups[my_dp_rank]
+        return self._replica_group_cache
+
     def __init__(
         self,
         config: PolicyConfig,

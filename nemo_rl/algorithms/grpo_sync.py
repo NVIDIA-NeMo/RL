@@ -68,12 +68,6 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-from nemo_rl.data_plane import build_data_plane_client
-from nemo_rl.data_plane.preshard import (
-    DP_SEED_FIELDS as _DP_SEED_FIELDS,
-    driver_balanced_preshards,
-    fan_out_per_rank_metas,
-)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
@@ -105,20 +99,16 @@ def grpo_train_sync(
 ) -> None:
     """Run GRPO training algorithm — TransferQueue-mediated.
 
-    Lifecycle per training step:
-      1. ``register_partition`` once we have a complete batch.
-      2. After ``train_data`` is assembled, ``kv_batch_put`` seeds the
-         partition; build a ``KVBatchMeta`` carrying keys + per-sample
-         seqlens.
-      3. ``policy.train_from_dp_meta(meta)`` — driver fans out the
-         per-rank meta only; each worker fetches its own slice from TQ
-         (1-hop, no tensor data through the driver).
-      4. ``kv_clear`` at end of step before the next register reuses the
-         partition.
+    Body mirrors :func:`nemo_rl.algorithms.grpo.grpo_train` with TQ-mediated
+    Policy methods substituting the in-memory dispatch. The TQ lifecycle
+    (controller bootstrap, worker attach, partition register, fan-out,
+    drain, close) is fully encapsulated in
+    :class:`nemo_rl.models.policy.tq_policy.TQPolicy` — this trainer just
+    calls ``policy.prepare_step``, ``policy.get_logprobs``,
+    ``policy.get_reference_policy_logprobs``, and ``policy.train``.
 
-    Drops the legacy ``policy.train(BatchedDataDict)`` call entirely —
-    parity test runs this trainer alongside ``grpo.grpo_train`` for the
-    baseline.
+    Parity with the legacy path is verified by running the same config
+    against both entrypoints and diffing the wandb runs.
     """
     timer = Timer()
     timeout = TimeoutChecker(
@@ -161,6 +151,11 @@ def grpo_train_sync(
     adv_estimator = _create_advantage_estimator(master_config)
 
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
+    # Sync trainer requires a TQ-mediated policy. The TQPolicy ctor
+    # bootstraps the controller and attaches workers; ``policy.dp_cfg``
+    # is the public marker. The explicit master_config check is the
+    # entry-guard so users running this trainer with the legacy policy
+    # see a clear error rather than an opaque AttributeError.
     dp_cfg = master_config.get("data_plane")
     if not dp_cfg or not dp_cfg.get("enabled", False):
         raise ValueError(
@@ -168,11 +163,12 @@ def grpo_train_sync(
             "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer if you don't "
             "want TransferQueue."
         )
-    dp_client = build_data_plane_client(dp_cfg)
-    if hasattr(policy, "setup_data_plane"):
-        # Workers attach to the (already-bootstrapped) controller via
-        # bootstrap=False; train_from_dp_meta below relies on this.
-        policy.setup_data_plane(dp_cfg)
+    if not hasattr(policy, "dp_cfg"):
+        raise ValueError(
+            "grpo_train_sync requires a TQ-mediated policy "
+            "(nemo_rl.models.policy.tq_policy.TQPolicy). examples/run_grpo.py "
+            "constructs it via the policy_factory when data_plane.enabled=True."
+        )
 
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
@@ -425,15 +421,10 @@ def grpo_train_sync(
                     if not is_batch_complete:
                         continue
 
-                    # ── Stage 0/Stage 1: register the per-step partition.
-                    # Static "train" id (verl-style); cleared and reused
-                    # each step.
-                    dp_client.register_partition(
-                        partition_id="train",
-                        fields=list(_DP_SEED_FIELDS),
+                    # Per-step TQ partition register — encapsulated in TQPolicy.
+                    policy.prepare_step(
                         num_samples=int(repeated_batch["loss_multiplier"].shape[0]),
-                        consumer_tasks=["prev_lp", "ref_lp", "train"],
-                        grpo_group_size=master_config["grpo"][
+                        group_size=master_config["grpo"][
                             "num_generations_per_prompt"
                         ],
                     )
@@ -526,110 +517,17 @@ def grpo_train_sync(
                         }
                     )
 
-                    # Driver-side policy-aware sharding for the TQ path —
-                    # mirrors lm_policy.get_logprobs(BatchedDataDict) lines
-                    # 426-450 but feeds the @dp_dispatch list[KVBatchMeta]
-                    # path so workers fetch their slice from TQ rather than
-                    # via Ray's in-memory object store. NOTE: logprob
-                    # inference has no cross-DP collectives (forward-only,
-                    # no gradient sync), so we don't need the
-                    # ``bin_count_multiple=DP_world`` invariant from
-                    # ``a085559c`` — workers' local re-pack inside ``_fetch``
-                    # is fine here.
-                    _policy_cfg = master_config["policy"]
-                    _dp_world = policy.sharding_annotations.get_axis_size(
-                        "data_parallel"
-                    )
-                    _seqpack_cfg = _policy_cfg.get("sequence_packing", {}) or {}
-                    _dynbatch_cfg = _policy_cfg.get("dynamic_batching", {}) or {}
-                    _use_seqpack = _seqpack_cfg.get("enabled", False)
-                    _use_dynbatch = _dynbatch_cfg.get("enabled", False)
-
-                    _unsorted_data_indices = None
-                    if _use_dynbatch:
-                        _dba = {
-                            "input_key": "input_ids",
-                            "input_lengths_key": "input_lengths",
-                            "sequence_length_round": _dynbatch_cfg[
-                                "sequence_length_round"
-                            ],
-                            "max_tokens_per_microbatch": _dynbatch_cfg[
-                                "logprob_mb_tokens"
-                            ],
-                        }
-                        _sharded_lp, _unsorted_data_indices = (
-                            logprob_data.shard_by_batch_size(
-                                _dp_world,
-                                batch_size=None,
-                                dynamic_batching_args=_dba,
-                            )
-                        )
-                    elif _use_seqpack:
-                        _spa = {
-                            "algorithm": _seqpack_cfg["algorithm"],
-                            "input_key": "input_ids",
-                            "input_lengths_key": "input_lengths",
-                            "sequence_length_pad_multiple": _policy_cfg[
-                                "make_sequence_length_divisible_by"
-                            ],
-                            "max_tokens_per_microbatch": _seqpack_cfg[
-                                "logprob_mb_tokens"
-                            ],
-                        }
-                        _sharded_lp, _unsorted_data_indices = (
-                            logprob_data.shard_by_batch_size(
-                                _dp_world,
-                                batch_size=None,
-                                sequence_packing_args=_spa,
-                            )
-                        )
-                    else:
-                        _sharded_lp = logprob_data.shard_by_batch_size(
-                            _dp_world, batch_size=None,
-                        )
-
-                    # Fan out shards into TQ partition "train" under a
-                    # distinct key prefix so they don't collide with the
-                    # train-step fan-out at line ~605 (``f"step{N}_dp{r}"``)
-                    # later in this same step. Same partition reuse =
-                    # one ``kv_clear`` at end of step wipes everything.
-                    _LP_SEED_FIELDS = (
-                        "input_ids", "input_lengths", "token_mask", "sample_mask",
-                    )
-                    _lp_metas = fan_out_per_rank_metas(
-                        _sharded_lp,
-                        dp_client=dp_client,
-                        partition_id="train",
-                        task_name="prev_lp",
-                        key_prefix=f"step{total_steps}_lp",
-                        seed_fields=_LP_SEED_FIELDS,
-                    )
-                    _prev_lp = policy.get_logprobs(_lp_metas, timer=timer)
-                    if _use_seqpack or _use_dynbatch:
-                        _prev_lp.reorder_data(_unsorted_data_indices)
+                    # TQPolicy.get_logprobs handles shard/fan-out/reorder
+                    # internally — same call site as legacy.
+                    _prev_lp = policy.get_logprobs(logprob_data, timer=timer)
                     train_data["prev_logprobs"] = _prev_lp["logprobs"]
 
                     if not master_config["grpo"].get(
                         "skip_reference_policy_logprobs_calculation"
                     ):
-                        # Re-fan-out under a different task_name + prefix —
-                        # the workers' write-back path (``_put_back_under_keys``
-                        # is dormant today; the @dp_dispatch list path here
-                        # just dispatches and aggregates) doesn't collide
-                        # with the prev_lp fan-out's keys.
-                        _ref_lp_metas = fan_out_per_rank_metas(
-                            _sharded_lp,
-                            dp_client=dp_client,
-                            partition_id="train",
-                            task_name="ref_lp",
-                            key_prefix=f"step{total_steps}_reflp",
-                            seed_fields=_LP_SEED_FIELDS,
-                        )
                         _ref_lp = policy.get_reference_policy_logprobs(
-                            _ref_lp_metas, timer=timer,
+                            logprob_data, timer=timer,
                         )
-                        if _use_seqpack or _use_dynbatch:
-                            _ref_lp.reorder_data(_unsorted_data_indices)
                         train_data["reference_policy_logprobs"] = _ref_lp[
                             "reference_logprobs"
                         ]
@@ -674,25 +572,6 @@ def grpo_train_sync(
                     )
                     del baseline_for_log
 
-                # Driver-side balanced packing + per-rank fan-out — see
-                # nemo_rl/data_plane/preshard.py for the bin_count_multiple
-                # rationale and the failure mode it prevents.
-                pre_shards = driver_balanced_preshards(
-                    train_data,
-                    dp_world=policy.sharding_annotations.get_axis_size(
-                        "data_parallel"
-                    ),
-                    policy_cfg=master_config["policy"],
-                )
-                dp_metas = fan_out_per_rank_metas(
-                    pre_shards,
-                    dp_client=dp_client,
-                    partition_id="train",
-                    task_name="train",
-                    key_prefix=f"step{total_steps}",
-                    seed_fields=_DP_SEED_FIELDS,
-                )
-
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -701,12 +580,10 @@ def grpo_train_sync(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
-                    # 1-hop: driver fans out the per-rank pre-balanced meta
-                    # list; the @dp_dispatch decorator on Policy.train detects
-                    # the list[KVBatchMeta] input and routes through worker
-                    # `train_presharded`, which fetches its slice from TQ.
+                    # TQPolicy.train shards, fans out via TQ, dispatches
+                    # to ``train_presharded`` workers, aggregates, drains.
                     train_results = policy.train(
-                        dp_metas,
+                        train_data,
                         loss_fn=loss_fn,
                         timer=timer,
                     )
@@ -1057,17 +934,12 @@ def grpo_train_sync(
             if "val_metrics" in dir():
                 del val_metrics
 
-            # Stage 7: clear the partition before the next step's register
-            # reuses the same id.
-            dp_client.kv_clear(keys=None, partition_id="train")
-
             timer.reset()
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
-                dp_client.close()
                 return
             if total_steps >= max_num_steps:
                 memory_tracker.snapshot_start_of_stage("", dir())
@@ -1075,10 +947,7 @@ def grpo_train_sync(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
                 )
-                dp_client.close()
                 return
 
         current_epoch += 1
         current_step = 0
-
-    dp_client.close()

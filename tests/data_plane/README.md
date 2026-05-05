@@ -82,19 +82,20 @@ should stay decoupled.
 | §5.1 TQ lifecycle | smoke test only (`test_tq_lifecycle.py`); full plan items pending |
 | §5.6 Multinode | smoke test only (`test_tq_multinode.py`) |
 
-## Notes — decorator-design adaptation
+## Notes — TQPolicy subclass design
 
 The plan's §4.8 was written assuming we'd ship `policy.train_from_dp_meta`
-as a separate method. We chose `@dp_dispatch` for polymorphism — same
-method name (`policy.train`), different argument types. The architecture
-invariants are adjusted:
+as a separate method. We instead use subclass polymorphism:
+`TQPolicy(Policy)` overrides `train` / `get_logprobs` /
+`get_reference_policy_logprobs`, and `examples/run_grpo.py` constructs
+the right policy + trainer pair based on `data_plane.enabled`. The
+architecture invariants are adjusted accordingly:
 
-  * **Plan check** "grpo_sync.py must NOT contain `policy.train(`" — dropped.
-    With the decorator, `policy.train(meta)` IS the TQ-mediated dispatch.
-  * **Replacement check** `test_grpo_sync_constructs_kvbatchmeta` —
-    asserts that `grpo_sync.py` constructs `KVBatchMeta` objects, which
-    is what makes the decorator's TQ branch fire instead of falling
-    through to legacy.
+  * **Replacement check** `test_grpo_sync_engages_tq_policy` — asserts
+    that `grpo_sync.py` guards on `hasattr(policy, "dp_cfg")` (the
+    public TQPolicy marker) and that the wire-level helpers
+    (`KVBatchMeta`, `build_data_plane_client`) live inside
+    `tq_policy.py` / `preshard.py` rather than the trainer.
 
 The underlying invariant (sibling-trainer separation, no cross-trainer
 gates, factory-as-bouncer) is the same.
