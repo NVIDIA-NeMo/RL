@@ -638,6 +638,50 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return stacked
 
+    def _dp_post_train(
+        self,
+        aggregated: dict[str, Any],
+        raw_results: list[dict[str, Any]],
+        *,
+        shards: Any,
+    ) -> dict[str, Any]:
+        """Post-aggregate hook for the @dp_dispatch TQ path.
+
+        The legacy ``train(BatchedDataDict)`` body records FLOPs and
+        theoretical-TFLOPs alongside the aggregated metrics
+        (lm_policy.py around the ``flops_tracker`` block). The TQ path
+        bypasses that body — it dispatches via the decorator's own
+        ``run_all_workers_sharded_data`` and returns ``aggregate(results)``
+        directly. Without this hook, training via ``KVBatchMeta`` /
+        ``list[KVBatchMeta]`` silently drops FLOPs reporting (Issue #4
+        from the PR review).
+
+        Recovers the same fields from ``meta.sequence_lengths`` on each
+        shard (driver-pre-balanced for ``list[KVBatchMeta]``,
+        sharder-strided for single ``KVBatchMeta``).
+        """
+        if self.flops_tracker is None:
+            return aggregated
+        from nemo_rl.data_plane.interfaces import KVBatchMeta
+
+        self.flops_tracker.reset()
+        for shard in shards:
+            if isinstance(shard, KVBatchMeta) and shard.sequence_lengths:
+                self.flops_tracker.track_batch(list(shard.sequence_lengths))
+        aggregated["total_flops"] = self.flops_tracker.total_flops
+        aggregated["num_ranks"] = self.worker_group.cluster.world_size()
+        gpus_per_worker = self.worker_group.cluster.world_size() / max(
+            len(raw_results), 1
+        )
+        try:
+            aggregated["theoretical_tflops"] = gpus_per_worker * sum(
+                get_theoretical_tflops(r["gpu_name"], r["model_dtype"])
+                for r in raw_results
+            )
+        except Exception as e:
+            warnings.warn(f"Error getting theoretical flops: {e}")
+        return aggregated
+
     @dp_dispatch(
         sharder=shard_keys_by_seqlen,
         sharded_axes=["data_parallel"],
