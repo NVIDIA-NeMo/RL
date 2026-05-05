@@ -99,16 +99,34 @@ def test_grpo_sync_constructs_kvbatchmeta():
     ``policy.train(meta)`` IS the TQ-mediated dispatch — the
     polymorphism is by argument type, not method name.
 
-    The right invariant: ``grpo_sync.py`` must construct ``KVBatchMeta``
+    The right invariant: ``grpo_sync.py`` must produce ``KVBatchMeta``
     objects so its ``policy.train(...)`` call goes through the
-    decorator's TQ branch, not the legacy passthrough.
+    decorator's TQ branch, not the legacy passthrough. After the
+    PR 0 refactor (commit extracting ``preshard.py``) the construction
+    moved into the ``fan_out_per_rank_metas`` helper; ``grpo_sync.py``
+    delegates rather than constructing inline. Either path is valid as
+    long as the trainer engages the data plane.
     """
     src = _strip_comments_and_docstrings(_read("nemo_rl/algorithms/grpo_sync.py"))
-    assert "KVBatchMeta(" in src, (
-        "grpo_sync.py does not construct any KVBatchMeta. Without one, "
-        "the @dp_dispatch decorator falls through to the legacy "
+    constructs_or_delegates = (
+        "KVBatchMeta(" in src or "fan_out_per_rank_metas(" in src
+    )
+    assert constructs_or_delegates, (
+        "grpo_sync.py neither constructs KVBatchMeta directly nor "
+        "delegates to fan_out_per_rank_metas. Without one of those, the "
+        "@dp_dispatch decorator falls through to the legacy "
         "BatchedDataDict path — silently bypassing the data plane."
     )
+    # If delegation is used, the helper itself must construct KVBatchMeta.
+    if "fan_out_per_rank_metas(" in src and "KVBatchMeta(" not in src:
+        helper_src = _strip_comments_and_docstrings(
+            _read("nemo_rl/data_plane/preshard.py")
+        )
+        assert "KVBatchMeta(" in helper_src, (
+            "grpo_sync.py delegates to fan_out_per_rank_metas but the "
+            "helper in nemo_rl/data_plane/preshard.py does not construct "
+            "KVBatchMeta — the chain to the TQ branch is broken."
+        )
     assert "build_data_plane_client(" in src, (
         "grpo_sync.py does not call build_data_plane_client. The "
         "TQ-mediated trainer must construct a real client."
