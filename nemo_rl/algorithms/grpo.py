@@ -2497,8 +2497,34 @@ def async_grpo_train(
         num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
     )
 
+    # Optional data-plane wiring for async-on-TQ. When data_plane.enabled is
+    # set, the producer (AsyncTrajectoryCollector) writes rollouts into the TQ
+    # ``rollouts`` partition; the buffer holds KVBatchMeta references and
+    # materializes back to BatchedDataDict on consume; the trainer then re-
+    # fans-out via the preshard helpers so policy.train(list[KVBatchMeta])
+    # exercises the @dp_dispatch list path with driver-side balanced packing
+    # (bin_count_multiple=DP_world — same invariant as grpo_sync, prevents
+    # cross-DP collective desync at step 4 with sequence packing). See
+    # research/data_plane_async_rl_limitations.md §5.4 + commit a085559c.
+    # Bootstrap the controller here on the driver — actors attach with
+    # bootstrap=False.
+    _dp_cfg = master_config.get("data_plane")
+    _dp_client = None
+    if _dp_cfg and _dp_cfg.get("enabled", False):
+        from nemo_rl.data_plane import build_data_plane_client
+        from nemo_rl.data_plane.preshard import (
+            DP_SEED_FIELDS as _DP_SEED_FIELDS,
+            driver_balanced_preshards,
+            fan_out_per_rank_metas,
+        )
+
+        _dp_client = build_data_plane_client(_dp_cfg, bootstrap=True)
+    else:
+        _dp_cfg = None
+
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
-        max_size=optimal_buffer_size
+        max_size=optimal_buffer_size,
+        dp_cfg=_dp_cfg,
     )
 
     _tc_py_exec = get_actor_python_env(
@@ -2533,6 +2559,7 @@ def async_grpo_train(
         master_config=master_config,
         replay_buffer=replay_buffer,
         start_step=step,
+        dp_cfg=_dp_cfg,
     )
 
     # Start trajectory collection in background
@@ -2853,11 +2880,44 @@ def async_grpo_train(
 
                 print("▶ Training policy...")
                 with timer.time("policy_training"):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    if _dp_client is not None:
+                        # Driver-side balanced packing — mirror grpo_sync.
+                        # Pre-shards by DP world with bin_count_multiple=DP_world
+                        # so per-rank n_microbatches stay uniform under sequence
+                        # packing / dynamic batching. Without this, async +
+                        # seqpack would deadlock at the first cross-DP
+                        # collective the same way sync did pre-a085559c. See
+                        # research/data_plane_async_rl_limitations.md §5.4.
+                        _dp_world = policy.sharding_annotations.get_axis_size(
+                            "data_parallel"
+                        )
+                        _pre_shards = driver_balanced_preshards(
+                            train_data,
+                            dp_world=_dp_world,
+                            policy_cfg=master_config["policy"],
+                        )
+                        _dp_metas = fan_out_per_rank_metas(
+                            _pre_shards,
+                            dp_client=_dp_client,
+                            partition_id="train",
+                            task_name="train",
+                            key_prefix=f"v{weight_version}_s{step}",
+                            seed_fields=_DP_SEED_FIELDS,
+                        )
+                        train_results = policy.train(
+                            _dp_metas,
+                            loss_fn=loss_fn,
+                            timer=timer,
+                        )
+                        # Drain the train partition before next step's fan-out
+                        # reuses key prefixes — same lifecycle as grpo_sync.
+                        _dp_client.kv_clear(keys=None, partition_id="train")
+                    else:
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None

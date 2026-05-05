@@ -236,18 +236,44 @@ class ReplayBuffer:
                 f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
             )
 
-            # Race 1 fix (data_plane_async_rl_limitations.md §5.9): clear the
-            # TQ payload of any KVBatchMeta-shaped trajectories we just popped.
-            # Done UNDER the lock — sub-ms RPC, and releasing for the clear
-            # opens a footgun where a fresh push could race the in-flight
-            # delete (Race 5 in the same doc).
+            # Data-plane consumption: materialize any KVBatchMeta entries into
+            # the dict format ``async_grpo_train`` expects, then clear their TQ
+            # payload (Race 1 fix from research/data_plane_async_rl_limitations
+            # .md §5.9). The materialize+clear sequence is held under the
+            # buffer lock — Race 5: releasing between fetch and clear opens a
+            # window where a stale-version push could race the in-flight
+            # delete; keys are versioned (PR 3 uses f"v{wv}_p{pid}_g{i}") so
+            # collisions are unlikely, but the lock is the cheap correctness
+            # invariant.
             client = self._ensure_dp_client()
             if client is not None:
+                from nemo_rl.data_plane.codec import materialize as _dp_materialize
                 from nemo_rl.data_plane.interfaces import KVBatchMeta
 
+                rebuilt: list[Any] = []
+                metas_to_clear: list[KVBatchMeta] = []
                 for item in sampled_items:
                     if isinstance(item, KVBatchMeta):
-                        client.kv_clear(item.keys, item.partition_id)
+                        td = client.kv_batch_get(
+                            item.keys,
+                            item.partition_id,
+                            select_fields=item.fields,
+                        )
+                        bdd = _dp_materialize(td, layout="padded")
+                        extra = item.extra_info or {}
+                        rebuilt.append(
+                            {
+                                "batch": bdd,
+                                "rollout_metrics": extra.get("rollout_metrics", {}),
+                                "timestamp": extra.get("timestamp"),
+                            }
+                        )
+                        metas_to_clear.append(item)
+                    else:
+                        rebuilt.append(item)
+                for m in metas_to_clear:
+                    client.kv_clear(m.keys, m.partition_id)
+                sampled_items = rebuilt
 
             return {
                 "trajectories": sampled_items,
