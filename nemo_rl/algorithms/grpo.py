@@ -265,9 +265,6 @@ def setup(
     # ==========================
     #         Logger
     # ==========================
-    if logger_config.get("mongodb_enabled", False) and "mongodb" in logger_config:
-        logger_config["mongodb"]["_backend_hint"] = generation_config.get("backend", "unknown")
-        logger_config["mongodb"]["_model_name"] = policy_config.get("model_name", "")
     logger = Logger(logger_config)
     logger.log_hyperparams(master_config)
 

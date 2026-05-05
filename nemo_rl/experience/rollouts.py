@@ -111,11 +111,6 @@ def generate_responses(
                 i, input_length:total_length
             ]
 
-        if "spec_token_origins" in generation_outputs:
-            assistant_message["spec_token_origins"] = generation_outputs[
-                "spec_token_origins"
-            ][i, input_length:total_length]
-
         batch["message_log"][i].append(assistant_message)
 
     # Generation metrics

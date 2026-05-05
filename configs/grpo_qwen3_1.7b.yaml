@@ -237,11 +237,6 @@ logger:
   mlflow:
     experiment_name: "grpo-trtllm-v2"
     run_name: "v2-test"
-  mongodb_enabled: true
-  mongodb:
-    uri: "mongodb://127.0.0.1:27017"
-    database: "nemo_rl"
-    db_path: "/tmp/v2/mongodb"
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10

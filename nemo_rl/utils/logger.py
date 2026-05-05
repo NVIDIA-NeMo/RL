@@ -42,7 +42,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.utils.mongodb_logger import MongoDBLogger, MongoDBLoggerConfig
 
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
@@ -82,12 +81,10 @@ class LoggerConfig(TypedDict):
     swanlab_enabled: bool
     tensorboard_enabled: bool
     mlflow_enabled: bool
-    mongodb_enabled: NotRequired[bool]
     wandb: WandbConfig
     tensorboard: NotRequired[TensorboardConfig]
     swanlab: NotRequired[SwanlabConfig]
     mlflow: NotRequired[MLflowConfig]
-    mongodb: NotRequired["MongoDBLoggerConfig"]
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
     num_val_samples_to_print: NotRequired[int]
@@ -938,18 +935,6 @@ class Logger(LoggerInterface):
             mlflow_logger = MLflowLogger(cfg["mlflow"], log_dir=mlflow_log_dir)
             self.loggers.append(mlflow_logger)
 
-        self.mongodb_logger: MongoDBLogger | None = None
-        if cfg.get("mongodb_enabled", False):
-            gen_cfg = cfg.get("mongodb", {})
-            backend = gen_cfg.get("_backend_hint", "unknown")
-            run_metadata = {
-                "backend": backend,
-                "model_name": gen_cfg.get("_model_name", ""),
-            }
-            self.mongodb_logger = MongoDBLogger(cfg["mongodb"], run_metadata=run_metadata)
-            if self.mongodb_logger.enabled:
-                self.loggers.append(self.mongodb_logger)  # type: ignore[arg-type]
-
         # Initialize GPU monitoring if requested
         self.gpu_monitor = None
         if cfg["monitor_gpus"]:
@@ -1252,8 +1237,6 @@ class Logger(LoggerInterface):
         """Clean up resources when the logger is destroyed."""
         if self.gpu_monitor:
             self.gpu_monitor.stop()
-        if self.mongodb_logger:
-            self.mongodb_logger.close()
 
 
 def flatten_dict(d: Mapping[str, Any], sep: str = ".") -> dict[str, Any]:

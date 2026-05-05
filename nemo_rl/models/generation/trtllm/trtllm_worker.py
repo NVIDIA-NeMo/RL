@@ -36,41 +36,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
-from nemo_rl.models.generation.trtllm.config import SpeculativeDecodingArgs, TrtllmConfig
-
-
-
-def _build_speculative_config(spec_cfg: SpeculativeDecodingArgs):
-    """Instantiate a tensorrt_llm speculative decoding config from our YAML dict."""
-    from tensorrt_llm.llmapi import (
-        DraftTargetDecodingConfig,
-        EagleDecodingConfig,
-        MTPDecodingConfig,
-        NGramDecodingConfig,
-    )
-
-    try:
-        from tensorrt_llm.llmapi import Eagle3DecodingConfig
-    except ImportError:
-        Eagle3DecodingConfig = EagleDecodingConfig
-
-    cls_map = {
-        "ngram": NGramDecodingConfig,
-        "mtp": MTPDecodingConfig,
-        "eagle3": Eagle3DecodingConfig,
-        "eagle": EagleDecodingConfig,
-        "draft_target": DraftTargetDecodingConfig,
-    }
-
-    method = spec_cfg.get("method", "")
-    if method not in cls_map:
-        raise ValueError(
-            f"Unknown speculative decoding method '{method}'. "
-            f"Supported: {list(cls_map)}"
-        )
-
-    kwargs = {k: v for k, v in spec_cfg.items() if k != "method"}
-    return cls_map[method](**kwargs)
+from nemo_rl.models.generation.trtllm.config import TrtllmConfig
 
 
 @ray.remote(num_cpus=0)
@@ -143,17 +109,6 @@ class TrtllmGenerationWorker:
         max_batch_size = trtllm_cfg.get("max_batch_size", 64)
         max_num_tokens = trtllm_cfg.get("max_num_tokens", 8192)
 
-        spec_dec_cfg = trtllm_cfg.get("speculative_decoding")
-        speculative_config = None
-        disable_overlap = False
-        if spec_dec_cfg:
-            speculative_config = _build_speculative_config(spec_dec_cfg)
-            method = spec_dec_cfg.get("method", "")
-            disable_overlap = method != "mtp"
-            print(f"[TrtllmWorker] Speculative decoding enabled: method={method}, "
-                  f"max_draft_len={spec_dec_cfg.get('max_draft_len')}, "
-                  f"disable_overlap_scheduler={disable_overlap}", flush=True)
-
         llm_kwargs: dict[str, Any] = dict(
             model=self.model_name,
             backend="pytorch",
@@ -166,10 +121,6 @@ class TrtllmGenerationWorker:
             ray_worker_extension_cls="nemo_rl.models.generation.trtllm.trtllm_backend.NcclExtension",
             trust_remote_code=True,
         )
-        if speculative_config is not None:
-            llm_kwargs["speculative_config"] = speculative_config
-        if disable_overlap:
-            llm_kwargs["disable_overlap_scheduler"] = True
 
         self.llm = tensorrt_llm.LLM(**llm_kwargs)
 
@@ -316,7 +267,6 @@ class TrtllmGenerationWorker:
         logprobs_list = []
         generation_lengths = []
         unpadded_sequence_lengths = []
-        spec_origins_list = []
 
         max_gen_len = max(len(o.outputs[0].token_ids) for o in outputs)
 
@@ -346,12 +296,6 @@ class TrtllmGenerationWorker:
                             full_logprobs[pos] = float(lp)
             logprobs_list.append(full_logprobs)
 
-            origins = getattr(gen, "spec_token_origins", None) or []
-            full_origins = torch.zeros(total_length, dtype=torch.int32)
-            for idx, origin in enumerate(origins[:len(gen_tokens)]):
-                full_origins[seq_len + idx] = origin
-            spec_origins_list.append(full_origins)
-
             resp_len = seq_len + len(gen_tokens)
             generation_lengths.append(len(gen_tokens))
             unpadded_sequence_lengths.append(resp_len)
@@ -362,8 +306,6 @@ class TrtllmGenerationWorker:
             "generation_lengths": torch.tensor(generation_lengths, dtype=torch.long),
             "unpadded_sequence_lengths": torch.tensor(unpadded_sequence_lengths, dtype=torch.long),
         }
-        if any(o.sum() > 0 for o in spec_origins_list):
-            result["spec_token_origins"] = torch.stack(spec_origins_list)
 
         return BatchedDataDict[GenerationOutputSpec](result)
 
