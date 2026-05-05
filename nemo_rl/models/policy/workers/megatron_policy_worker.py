@@ -549,23 +549,26 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         Args:
             source_state_dict: State dict to apply (e.g. reference_state_dict or saved model_state_dict).
+                Keys must be prefixed with the chunk index (e.g. "0/decoder.layers.0...") to
+                avoid collisions between VPP chunks that share identical local layer names.
             raise_if_key_missing: If True, raise when a key in self.model.state_dict() is missing
                 from source_state_dict; if False, skip such keys.
         """
-        for chunk in self.model:
+        for chunk_idx, chunk in enumerate(self.model):
             for state_dict_key, param_or_buf in chunk.state_dict().items():
                 if (
                     not isinstance(param_or_buf, torch.Tensor)
                     or "draft_model." in state_dict_key
                 ):
                     continue
-                if state_dict_key not in source_state_dict:
+                lookup_key = f"{chunk_idx}/{state_dict_key}"
+                if lookup_key not in source_state_dict:
                     if raise_if_key_missing:
                         raise ValueError(
-                            f"Key '{state_dict_key}' not in source state_dict."
+                            f"Key '{lookup_key}' not in source state_dict."
                         )
                     continue
-                source_value = source_state_dict[state_dict_key]
+                source_value = source_state_dict[lookup_key]
 
                 # Case 1: Same shape → in-place copy (parameters / buffers)
                 if (
@@ -603,17 +606,18 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
-            # Save original per-chunk state dicts
+            # Save original per-chunk state dicts. Keys are prefixed with the chunk
+            # index to avoid collisions: multiple VPP chunks share identical local
+            # layer indices (e.g. "decoder.layers.0") so a flat merge would silently
+            # overwrite earlier chunks' weights with later chunks' weights.
             model_state_dict = dict()
-            for chunk in self.model:
-                chunk_sd = {}
+            for chunk_idx, chunk in enumerate(self.model):
                 for name, item in chunk.state_dict().items():
                     if isinstance(item, torch.Tensor):
                         item = item.detach().to(
                             device="cpu", non_blocking=True, copy=True
                         )
-                    chunk_sd[name] = item
-                model_state_dict.update(chunk_sd)
+                    model_state_dict[f"{chunk_idx}/{name}"] = item
 
             # Swap reference model state_dict into self.model (reference weights + optional FP8 extra_state)
             self._apply_state_dict_to_model(

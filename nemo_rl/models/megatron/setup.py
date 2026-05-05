@@ -1096,9 +1096,8 @@ def setup_reference_model_state(
     reference_state_dict = {}
 
     if should_load_checkpoint or use_peft:
-        for chunk in reference_model:
+        for chunk_idx, chunk in enumerate(reference_model):
             chunk.eval()
-            chunk_state_dict = {}
             for name, item in chunk.state_dict().items():
                 if isinstance(item, torch.Tensor):
                     cpu_item = item.detach().to(
@@ -1107,8 +1106,9 @@ def setup_reference_model_state(
                     del item
                 else:
                     cpu_item = item
-                chunk_state_dict[name] = cpu_item
-            reference_state_dict.update(chunk_state_dict)
+                # Prefix with chunk index to avoid key collisions when multiple VPP
+                # chunks share identical local layer indices (e.g. decoder.layers.0).
+                reference_state_dict[f"{chunk_idx}/{name}"] = cpu_item
         print("Reference model loaded")
     else:
         print("Reference model not loaded")

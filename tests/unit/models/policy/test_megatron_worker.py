@@ -2968,8 +2968,8 @@ def test_worker_apply_state_dict_updates_all_model_chunks():
     worker = _new_worker_impl()
     worker.model = [Chunk0(), Chunk1()]
     source_state_dict = {
-        "layer0.weight": torch.tensor([[3.0]]),
-        "layer1.weight": torch.tensor([[7.0]]),
+        "0/layer0.weight": torch.tensor([[3.0]]),
+        "1/layer1.weight": torch.tensor([[7.0]]),
     }
 
     worker._apply_state_dict_to_model(source_state_dict, raise_if_key_missing=True)
@@ -2999,7 +2999,7 @@ def test_worker_apply_extra_state_uses_current_model_chunk():
     worker.model = [Chunk()]
     extra_state = torch.tensor([1.0, 2.0])
 
-    worker._apply_state_dict_to_model({"block._extra_state": extra_state})
+    worker._apply_state_dict_to_model({"0/block._extra_state": extra_state})
 
     assert worker.model[0].block.extra_state is extra_state
 
@@ -3024,8 +3024,8 @@ def test_worker_use_reference_model_restores_all_model_chunks():
         worker.model[0].layer0.weight.fill_(1.0)
         worker.model[1].layer1.weight.fill_(2.0)
     worker.reference_state_dict = {
-        "layer0.weight": torch.tensor([[10.0]]),
-        "layer1.weight": torch.tensor([[20.0]]),
+        "0/layer0.weight": torch.tensor([[10.0]]),
+        "1/layer1.weight": torch.tensor([[20.0]]),
     }
 
     with worker.use_reference_model():
@@ -3038,6 +3038,39 @@ def test_worker_use_reference_model_restores_all_model_chunks():
 
     torch.testing.assert_close(worker.model[0].layer0.weight, torch.tensor([[1.0]]))
     torch.testing.assert_close(worker.model[1].layer1.weight, torch.tensor([[2.0]]))
+
+
+def test_worker_use_reference_model_restores_vpp_chunks_with_colliding_keys():
+    """VPP chunks share identical local layer names; all chunks must be restored correctly."""
+
+    class VppChunk(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # Both chunks intentionally have a parameter named "layer.weight",
+            # mimicking VPP where every chunk has decoder.layers.0, decoder.layers.1, ...
+            self.layer = torch.nn.Linear(1, 1, bias=False)
+
+    worker = _new_worker_impl()
+    worker.model = [VppChunk(), VppChunk()]
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.should_disable_forward_pre_hook = False
+    worker.sampling_params = None
+    with torch.no_grad():
+        worker.model[0].layer.weight.fill_(1.0)
+        worker.model[1].layer.weight.fill_(2.0)
+    # reference_state_dict uses chunk-indexed keys
+    worker.reference_state_dict = {
+        "0/layer.weight": torch.tensor([[10.0]]),
+        "1/layer.weight": torch.tensor([[20.0]]),
+    }
+
+    with worker.use_reference_model():
+        torch.testing.assert_close(worker.model[0].layer.weight, torch.tensor([[10.0]]))
+        torch.testing.assert_close(worker.model[1].layer.weight, torch.tensor([[20.0]]))
+
+    # Both chunks must be restored to their own original weights, not the last chunk's.
+    torch.testing.assert_close(worker.model[0].layer.weight, torch.tensor([[1.0]]))
+    torch.testing.assert_close(worker.model[1].layer.weight, torch.tensor([[2.0]]))
 
 
 def test_worker_prepare_for_training_moves_and_trains_each_model_chunk():
