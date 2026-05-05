@@ -14,16 +14,13 @@
 """Driver-side balanced packing + per-rank fan-out helpers.
 
 Extracted from the ``grpo_sync`` inline block (commit a085559c) so the same
-two operations can be reused by the planned async data-plane trainer
-(see ``research/data_plane_async_rl_limitations.md`` §5.4).
+two operations can be reused across both sync and async data-plane trainers.
 
-This module is *distinct* from :mod:`nemo_rl.data_plane.sharding`, which
-operates on metadata only (``list[str] + list[int]``) and powers the
-``@dp_dispatch`` default fan-out. The helpers here operate on full
-``BatchedDataDict``s and rely on ``shard_by_batch_size``'s
-``bin_count_multiple=DP_world`` behavior to keep per-rank microbatch counts
-uniform — without that, sequence packing / dynamic batching produce variable
-per-rank bin counts and Megatron deadlocks at the first cross-DP collective.
+These helpers operate on full ``BatchedDataDict``s and rely on
+``shard_by_batch_size``'s ``bin_count_multiple=DP_world`` behavior to keep
+per-rank microbatch counts uniform — without that, sequence packing /
+dynamic batching produce variable per-rank bin counts and Megatron
+deadlocks at the first cross-DP collective.
 """
 
 from __future__ import annotations

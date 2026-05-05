@@ -31,6 +31,78 @@ from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
+def _broadcast_batched_data_dict(
+    data: Optional[BatchedDataDict[Any]],
+    *,
+    src: int,
+    group: Any,
+) -> BatchedDataDict[Any]:
+    """Broadcast a BatchedDataDict from ``src`` to all ranks in ``group``.
+
+    Two-phase to avoid pickling tensor payloads on the hot path:
+      1. ``broadcast_object_list`` ships a tiny shape descriptor
+         (per-key dtype + shape for tensors, raw value for non-tensors).
+      2. ``broadcast`` ships each tensor's data on its current device.
+
+    The leader's ``data`` argument supplies the source. Non-leaders pass
+    ``None``; an empty :class:`BatchedDataDict` is returned with tensor
+    fields filled in-place. Tensors are placed on the current CUDA
+    device — callers that want CPU tensors must ``.to("cpu")`` after.
+    """
+    is_leader = torch.distributed.get_rank() == src
+    # NCCL groups can only broadcast CUDA tensors; gloo can do either.
+    # Pick the broadcast device from the group backend so CPU-side TQ
+    # outputs (input_ids, masks, etc.) are moved to GPU before NCCL
+    # broadcast. Non-leaders allocate buffers on the same device.
+    backend = torch.distributed.get_backend(group)
+    bcast_device: Any = (
+        torch.cuda.current_device() if backend == "nccl" else "cpu"
+    )
+
+    if is_leader:
+        assert data is not None, "leader must provide non-None data"
+        descriptor: list[Any] = []
+        for k, v in data.items():
+            if isinstance(v, torch.Tensor):
+                descriptor.append(
+                    (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
+                )
+            else:
+                descriptor.append((k, "raw", v))
+        payload: list[Any] = [descriptor]
+    else:
+        payload = [None]
+
+    torch.distributed.broadcast_object_list(payload, src=src, group=group)
+    descriptor = payload[0]
+    assert descriptor is not None
+
+    out: BatchedDataDict[Any] = data if is_leader else BatchedDataDict()
+    for entry in descriptor:
+        key = entry[0]
+        kind = entry[1]
+        if kind == "tensor":
+            dtype_str, shape, src_device = entry[2], entry[3], entry[4]
+            if is_leader:
+                tensor = out[key]
+                if tensor.device.type != torch.device(bcast_device).type:
+                    tensor = tensor.to(bcast_device)
+                    out[key] = tensor
+            else:
+                dtype = getattr(torch, dtype_str.split(".")[-1])
+                tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
+                out[key] = tensor
+            torch.distributed.broadcast(tensor, src=src, group=group)
+            # Restore non-leader tensors to the leader's original device
+            # so downstream code sees the same layout it had pre-broadcast.
+            if not is_leader and torch.device(src_device).type != torch.device(bcast_device).type:
+                out[key] = tensor.to(src_device)
+        else:
+            if not is_leader:
+                out[key] = entry[2]
+    return out
+
+
 class AbstractPolicyWorker:
     """Base class for policy workers with shared functionality."""
 
@@ -162,14 +234,11 @@ class AbstractPolicyWorker:
         pass
 
     # ──────────────────────────────────────────────────────────────────
-    # Data-plane (TransferQueue) integration — Stage 4 per-rank fetch.
+    # Data-plane (TransferQueue) integration — per-rank fetch.
     #
-    # Pairs with ``@dp_dispatch(...)`` on the driver-side Policy methods.
-    # The driver fans out per-rank ``KVBatchMeta``; each worker calls
-    # ``self._fetch(meta, ...)`` to pull its slice from TQ, then runs
-    # the existing legacy method body. No decorator is used here on
-    # purpose — keeping the worker side as straight Python makes
-    # debugging the fetch path obvious.
+    # Driver-side ``TQPolicy`` fans out per-rank ``KVBatchMeta``; each
+    # worker calls ``self._fetch(meta, ...)`` to pull its slice from TQ
+    # and then runs the existing per-rank method body.
     # ──────────────────────────────────────────────────────────────────
 
     _dp_client: Optional[DataPlaneClient] = None
@@ -201,49 +270,88 @@ class AbstractPolicyWorker:
             )
         return self._dp_client
 
+    def _get_replica_group(self) -> Optional[Any]:
+        """NCCL group of TP×CP×PP siblings within this DP rank.
+
+        ``None`` means "no siblings" — TP=CP=PP=1. Backend subclasses
+        override (DTensor uses ``device_mesh``, Megatron composes from
+        ``parallel_state``). Returning ``None`` makes ``_fetch`` use the
+        cheap independent-fetch path; returning a real group makes it
+        use leader-fetch + NCCL broadcast.
+        """
+        return None
+
     def _fetch(
         self,
         meta: "KVBatchMeta",
         *,
         layout: str = "padded",
-        fetch_policy: str = "independent",
+        fetch_policy: str = "auto",
         preprocess: Optional[Any] = None,
     ) -> BatchedDataDict[Any]:
         """Fetch this rank's slice from TQ and return a BatchedDataDict.
 
         Args:
             meta: per-DP-rank shard produced by the driver's
-                :func:`shard_keys_by_seqlen`.
+                :func:`nemo_rl.data_plane.preshard.fan_out_per_rank_metas`.
             layout: codec layout. Phase 1 always ``"padded"`` — the
                 wire format is already padded. Stage 2 will introduce
                 ``"jagged"``.
-            fetch_policy: who calls ``kv_batch_get`` when this rank has
-                TP/CP/PP siblings sharing the same ``meta``:
-                  * ``"independent"`` — every sibling fetches (Phase 1
-                    default; correct because Phase 1 is FSDP2 only with
-                    TP=CP=PP=1, so there are no siblings).
-                  * ``"leader_broadcast"`` — rank-zero of the replicated
-                    axes fetches and broadcasts via NCCL inside the
-                    sibling group. To be implemented when mcore TP/CP/PP
-                    lands; see plan §Stage 4 TP/CP/PP subsection.
+            fetch_policy: how the rank obtains its slice when TP/CP/PP
+                siblings share the same ``meta``:
+                  * ``"auto"`` (default) — leader-fetch + NCCL broadcast
+                    when ``_get_replica_group()`` returns a group
+                    (TP/CP/PP > 1); otherwise every rank fetches
+                    independently from TQ (TP=CP=PP=1, the cheapest
+                    path).
+                  * ``"independent"`` — force every sibling to fetch
+                    from TQ. Useful when TQ is local-RAM and broadcast
+                    overhead would exceed the duplicated read.
+                  * ``"leader_broadcast"`` — force the broadcast path.
+                    Asserts a replica group exists. Mostly for testing.
+                CP slicing of the fetched/broadcast data happens later
+                in the worker's forward prep — ``_fetch`` stays
+                parallelism-agnostic.
             preprocess: optional ``(worker, td) -> td`` callable applied
                 between fetch+materialize and the user method. Useful for
                 per-step transforms that need worker state (config,
                 tokenizer). Default ``None`` (identity).
         """
-        if fetch_policy not in {"independent", "leader_broadcast"}:
+        if fetch_policy not in {"auto", "independent", "leader_broadcast"}:
             raise ValueError(f"unknown fetch_policy: {fetch_policy!r}")
-        if fetch_policy == "leader_broadcast":
-            # Phase 2 / mcore. Defer until siblings actually exist.
-            raise NotImplementedError(
-                "fetch_policy='leader_broadcast' will land with mcore "
-                "TP/CP/PP support — see plan §Stage 4. Phase 1 (FSDP2 "
-                "with TP=CP=PP=1) uses 'independent', which is correct "
-                "because there are no siblings to share work with."
+
+        from nemo_rl.data_plane import materialize
+
+        replica_group = (
+            self._get_replica_group()
+            if fetch_policy in {"auto", "leader_broadcast"}
+            else None
+        )
+        if fetch_policy == "leader_broadcast" and replica_group is None:
+            raise RuntimeError(
+                "_fetch(fetch_policy='leader_broadcast') requires a "
+                "replica group, but _get_replica_group() returned None. "
+                "Either configure TP/CP/PP > 1 or use fetch_policy='auto'."
             )
 
-        # Lazy import — see setup_data_plane().
-        from nemo_rl.data_plane import materialize
+        if replica_group is not None:
+            leader = torch.distributed.get_global_rank(replica_group, 0)
+            is_leader = torch.distributed.get_rank() == leader
+            if is_leader:
+                td = self._require_dp_client().kv_batch_get(
+                    keys=meta.keys,
+                    partition_id=meta.partition_id,
+                    select_fields=list(meta.fields) if meta.fields else None,
+                )
+                data = materialize(td, layout=layout)
+            else:
+                data = None
+            data = _broadcast_batched_data_dict(
+                data, src=leader, group=replica_group,
+            )
+            if preprocess is not None:
+                data = preprocess(self, data)
+            return data
 
         client = self._require_dp_client()
         td = client.kv_batch_get(
@@ -263,55 +371,20 @@ class AbstractPolicyWorker:
         The legacy DP path computes ``micro_batch_indices`` /
         ``micro_batch_lengths`` as a *side effect* of
         ``shard_by_batch_size(shards=dp, ..., sequence_packing_args=...)``.
-        Our TQ presharded path does the DP-split via
-        :func:`shard_keys_by_seqlen` (control-plane only), so the
-        per-rank ``BatchedDataDict`` returned from ``_fetch`` arrives
-        without those attrs set — and the worker's ``train`` body crashes
-        on ``micro_batch_indices[0]`` (NoneType not subscriptable).
+        The TQ presharded path receives a per-rank ``BatchedDataDict``
+        without those attrs set; without re-deriving them the worker's
+        ``train`` body crashes on ``micro_batch_indices[0]`` (NoneType
+        not subscriptable).
 
         Re-run ``shard_by_batch_size`` with ``shards=1`` on the local
         slice to compute the packing/batching metadata without further
-        DP-splitting. Reads packing config from ``self.cfg`` (set in
-        the worker's ``__init__``); no extra plumbing through the
-        decorator.
+        DP-splitting. Reads packing config from ``self.cfg``.
         """
         cfg = getattr(self, "cfg", None)
         if not isinstance(cfg, dict):
             return data
         seqpack = cfg.get("sequence_packing", {}) or {}
         dynbatch = cfg.get("dynamic_batching", {}) or {}
-
-        # Worker-local step counter for [DP_DEBUG] correlation across
-        # ranks. Same-call-index across ranks should produce the same
-        # packing layout under DP=1; divergence is the smoking gun for
-        # the seqpack-TQ step-4 hang.
-        if not hasattr(self, "_dp_debug_call_idx"):
-            self._dp_debug_call_idx = 0
-        self._dp_debug_call_idx += 1
-        idx = self._dp_debug_call_idx
-
-        def _dp_log(stage: str, **fields: Any) -> None:
-            try:
-                import torch.distributed as _dist
-                rank = _dist.get_rank() if _dist.is_initialized() else -1
-            except Exception:
-                rank = -1
-            kvs = " ".join(f"{k}={v}" for k, v in fields.items())
-            print(f"[DP_DEBUG rank={rank} call={idx} stage={stage}] {kvs}", flush=True)
-
-        # Pre-pack snapshot (after _fetch, before packing).
-        try:
-            il = data.get("input_lengths")
-            il_summary = (
-                il.tolist() if hasattr(il, "tolist") else list(il)
-            )[:8]
-            n_samples = (
-                il.shape[0] if hasattr(il, "shape") else len(data["input_lengths"])
-            )
-        except Exception as e:
-            il_summary = f"err:{e}"
-            n_samples = -1
-        _dp_log("pre_pack", n_samples=n_samples, input_lengths_first8=il_summary)
 
         if seqpack.get("enabled", False):
             spa = {
@@ -323,16 +396,6 @@ class AbstractPolicyWorker:
             }
             packed, _ = data.shard_by_batch_size(
                 shards=1, batch_size=None, sequence_packing_args=spa,
-            )
-            packed0 = packed[0]
-            mbi = getattr(packed0, "micro_batch_indices", None)
-            mbl = getattr(packed0, "micro_batch_lengths", None)
-            _dp_log(
-                "post_seqpack",
-                n_microbatches=(len(mbi[0]) if mbi else "None"),
-                mbi_shape=(len(mbi) if mbi else "None"),
-                mbl_first8=(mbl[0][:8] if mbl else "None"),
-                spa_max_tokens=spa["max_tokens_per_microbatch"],
             )
             return packed[0]
 
@@ -346,19 +409,35 @@ class AbstractPolicyWorker:
             sharded, _ = data.shard_by_batch_size(
                 shards=1, batch_size=None, dynamic_batching_args=dba,
             )
-            sh0 = sharded[0]
-            mbi = getattr(sh0, "micro_batch_indices", None)
-            mbl = getattr(sh0, "micro_batch_lengths", None)
-            _dp_log(
-                "post_dynbatch",
-                n_microbatches=(len(mbi[0]) if mbi else "None"),
-                mbi_shape=(len(mbi) if mbi else "None"),
-                mbl_first8=(mbl[0][:8] if mbl else "None"),
-                dba_max_tokens=dba["max_tokens_per_microbatch"],
-            )
-            return sh0
+            return sharded[0]
 
         return data
+
+    def _attach_or_repack_pack_metadata(
+        self,
+        data: BatchedDataDict[Any],
+        meta: "KVBatchMeta",
+    ) -> BatchedDataDict[Any]:
+        """Reattach driver-side packing metadata or re-derive locally.
+
+        When the driver pre-balanced packing across DP ranks it ships
+        per-shard ``micro_batch_indices``/``micro_batch_lengths`` (and
+        optionally ``elem_counts_per_gb``) in ``meta.extra_info``.  Trust
+        those instead of re-packing locally — local
+        ``shard_by_batch_size(shards=1, ...)`` produces variable bin counts
+        across DP groups and desyncs Megatron's per-microbatch collectives.
+
+        Falls back to :meth:`_apply_packing_prep` when the driver did not
+        populate ``extra_info`` (e.g. legacy in-memory tests).
+        """
+        extra = meta.extra_info or {}
+        if "micro_batch_indices" in extra and "micro_batch_lengths" in extra:
+            data.micro_batch_indices = extra["micro_batch_indices"]
+            data.micro_batch_lengths = extra["micro_batch_lengths"]
+            if "elem_counts_per_gb" in extra:
+                data.elem_counts_per_gb = extra["elem_counts_per_gb"]
+            return data
+        return self._apply_packing_prep(data)
 
     @wrap_with_nvtx_name("policy_worker/train_presharded")
     def train_presharded(
@@ -369,27 +448,9 @@ class AbstractPolicyWorker:
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
-        """Per-rank training entrypoint. Fetch → packing prep → delegate.
-
-        When the driver pre-balanced packing across DP ranks (Option 1 fix
-        for the seqpack/dynbatch step-4 NCCL hang), it ships per-shard
-        ``micro_batch_indices``/``micro_batch_lengths`` in ``meta.extra_info``.
-        Trust those instead of re-packing locally — local
-        ``shard_by_batch_size(shards=1, ...)`` produces variable bin counts
-        across DP groups and desyncs Megatron's per-microbatch collectives.
-        """
+        """Per-rank training entrypoint. Fetch → packing prep → delegate."""
         data = self._fetch(meta)
-        extra = meta.extra_info or {}
-        if (
-            "micro_batch_indices" in extra
-            and "micro_batch_lengths" in extra
-        ):
-            data.micro_batch_indices = extra["micro_batch_indices"]
-            data.micro_batch_lengths = extra["micro_batch_lengths"]
-            if "elem_counts_per_gb" in extra:
-                data.elem_counts_per_gb = extra["elem_counts_per_gb"]
-        else:
-            data = self._apply_packing_prep(data)
+        data = self._attach_or_repack_pack_metadata(data, meta)
         return self.train(  # type: ignore[attr-defined]
             data, loss_fn=loss_fn, eval_mode=eval_mode, gbs=gbs, mbs=mbs,
         )
@@ -400,8 +461,9 @@ class AbstractPolicyWorker:
         meta: KVBatchMeta,
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[Any]:
-        """Per-rank logprob entrypoint."""
+        """Per-rank logprob entrypoint. Fetch → packing prep → delegate."""
         data = self._fetch(meta)
+        data = self._attach_or_repack_pack_metadata(data, meta)
         return self.get_logprobs(  # type: ignore[attr-defined]
             data=data, micro_batch_size=micro_batch_size,
         )
@@ -412,8 +474,9 @@ class AbstractPolicyWorker:
         meta: KVBatchMeta,
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
-        """Per-rank reference-policy logprob entrypoint."""
+        """Per-rank reference-policy logprob entrypoint. Fetch → packing prep → delegate."""
         data = self._fetch(meta)
+        data = self._attach_or_repack_pack_metadata(data, meta)
         return self.get_reference_policy_logprobs(
             data=data, micro_batch_size=micro_batch_size,
         )

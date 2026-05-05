@@ -175,6 +175,18 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
         else:
             return f"{self.__class__.__qualname__}"
 
+    def _get_replica_group(self) -> Optional[Any]:
+        """Replica group = flattened (cp, tp) sub-mesh, gated on CP > 1.
+
+        Returns ``None`` for CP=1 so ``_fetch`` keeps using the proven
+        independent path (matches the qwen3-mcore-seqpack TP=2 baseline).
+        Once CP > 1, broadcasting the full BatchedDataDict to (CP, TP)
+        siblings amortizes the TQ read across siblings that need it.
+        """
+        if getattr(self, "cp_size", 1) <= 1:
+            return None
+        return self.device_mesh[("cp", "tp")]._flatten().get_group()
+
     def __init__(
         self,
         config: PolicyConfig,
