@@ -293,6 +293,38 @@ class TestStreamWeightsViaIPC:
             (name, torch.randn(*shape, dtype=dtype))
             for name, shape, dtype in tensor_specs
         ]
+        self._run_stream_weights_roundtrip(test_case, known_tensors, buffer_size_bytes)
+
+    def test_stream_weights_via_ipc_zmq_impl_non_contiguous(self):
+        """Regression: tensors yielded by the params iterator may be non-contiguous.
+
+        For example, ``Megatron-Bridge``'s ``QKVMapping.megatron_to_hf`` returns
+        Q/K/V shards via advanced indexing + ``reshape`` that can produce views
+        with non-canonical strides. Before the fix, ``pack_tensor`` called
+        ``view(-1)`` which raises ``RuntimeError: view size is not compatible
+        with input tensor's size and stride``.
+        """
+        # transpose(): non-contiguous, contains all elements
+        t1 = torch.randn(8, 16, dtype=torch.float32).t()
+        # slicing with stride: non-contiguous
+        t2 = torch.randn(40, 60, dtype=torch.float32)[:, ::2]
+        # permute on 3D: non-contiguous
+        t3 = torch.randn(4, 8, 12, dtype=torch.bfloat16).permute(2, 0, 1)
+        for t in (t1, t2, t3):
+            assert not t.is_contiguous(), "test tensor must be non-contiguous"
+
+        known_tensors = [("qkv_q_proj", t1), ("qkv_k_proj", t2), ("qkv_v_proj", t3)]
+        self._run_stream_weights_roundtrip(
+            "non_contiguous", known_tensors, buffer_size_bytes=100 * 1024
+        )
+
+    def _run_stream_weights_roundtrip(
+        self,
+        test_case: str,
+        known_tensors: list[tuple[str, torch.Tensor]],
+        buffer_size_bytes: int,
+    ) -> None:
+        """Shared driver: spawn server/client and validate the round-trip."""
         known_tensors_data = [
             (name, list(t.shape), t.dtype, t) for name, t in known_tensors
         ]
