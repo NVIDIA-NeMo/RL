@@ -776,7 +776,6 @@ class RayWorkerGroup:
             "See https://github.com/NVIDIA-NeMo/RL/issues/582 for more details."
         )
 
-        args = [ray.put(arg) for arg in args]
         kwargs = {key: ray.put(value) for key, value in kwargs.items()}
 
         futures = []
@@ -862,11 +861,6 @@ class RayWorkerGroup:
         if replicate_degrees > 1:
             # Use ray.put to serialize all the arguments. This can reduce the cost
             # of repeated serialization when we send same arguments to multiple workers.
-            _args = []
-            for arg in args:
-                _args = [ray.put(a) for a in arg]
-                _args.append(_args)
-            args = tuple(_args)
             _kwargs = dict()
             for key, value in kwargs.items():
                 _values = [ray.put(v) for v in value]
