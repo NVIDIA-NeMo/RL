@@ -196,7 +196,6 @@ launch:
       logger.wandb.name=\${WANDB_NAME} \
       logger.wandb.project=grpo-ultra-v3-pipeclean \
       2>&1 | tee -a "\${LOG}"
-      #+env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.vllm_serve_kwargs.enforce_eager=True \
 
 kuberay:
   training:
