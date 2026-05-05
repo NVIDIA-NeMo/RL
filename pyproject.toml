@@ -15,6 +15,12 @@ dynamic = ["version", "readme"]
 description = "NeMo RL: A Scalable and Efficient Post-Training Library for Models Ranging from 1 GPU to 1000s, and from Tiny to >100B Parameters"
 requires-python = ">=3.12"
 license = { text = "Apache 2.0" }
+maintainers = [
+  { name = "Yi-Fu Wu", email = "yifuw@nvidia.com" },
+  { name = "Terry Kong", email = "terryk@nvidia.com" },
+  { name = "Yuki Huang", email = "yukih@nvidia.com" },
+  { name = "NVIDIA", email = "nemo-toolkit@nvidia.com" },
+]
 dependencies = [
   "setuptools",
   "pip",                                                                                                              # Required for frozen environments; uv venv --seed may not reliably install pip
