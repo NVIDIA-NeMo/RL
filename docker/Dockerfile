@@ -176,6 +176,12 @@ LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
+# Add AWS EFA and OFI plugin library paths to the dynamic linker search path so
+# that NCCL discovers libnccl-net-ofi.so at runtime on AWS instances (P4d/P5/P5en).
+# Without this, NCCL silently falls back to the Socket transport even when the
+# EFA userspace + aws-ofi-nccl plugin are mounted into the container. Closes #1973.
+ENV LD_LIBRARY_PATH="/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
+
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
 COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl

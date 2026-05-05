@@ -1,0 +1,58 @@
+# AWS EFA worked-example GRPO recipe for Qwen3-30B-A3B on 2-node p5en.48xlarge (H200).
+#
+# This recipe exercises the DeepEP flex token dispatcher on the EFA-backed OFI transport.
+# It is a smoke-shaped GRPO run: small batch, short sequence, minimal validation. The goal
+# is to flex the dispatch/combine path, not to converge on a reward.
+#
+# Prerequisites (must be set on the pod before launch):
+#   FI_PROVIDER=efa
+#   NCCL_NET_PLUGIN=ofi             # AWS OFI plugin
+#   NCCL_GIN_TYPE=2                 # NCCL GIN Type 2 CPU proxy
+#   DEEP_EP_BACKEND=nccl            # DeepEP routes via NCCL GIN on EFA
+#   EP_EFA_MAX_QPS=2                # Conservative per deepseek-ai/DeepEP PR #612
+#   EP_EFA_RDMA_GBS=25.0            # EFA per-NIC bandwidth budget
+#
+# Ensure `docker/Dockerfile` has `ENV LD_LIBRARY_PATH=...` extended with
+# `/opt/amazon/aws-ofi-nccl/lib:/opt/amazon/efa/lib`, otherwise NCCL silently falls back
+# to sockets and EFA is never touched. See issue #1973.
+#
+# Recommended DeepEP: deepseek-ai/DeepEP PR #612 (or dmvevents/DeepEP-1@aws-efa-auto-qp-cap-v2)
+# provides EFA-aware auto-QP cap, get_rdma_gbs() fast path, and kScaleoutUpdateInterval
+# tuning. Vanilla DeepEP still runs; PR #612 gives approximately a 22% D+C speedup on EFA.
+defaults: ./grpo-qwen3-30ba3b-8n8g-megatron.yaml
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/aws-efa-grpo-qwen3-30ba3b-2n8g-megatron
+policy:
+  train_micro_batch_size: 1
+  max_total_sequence_length: 2048
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    expert_model_parallel_size: 2
+    sequence_parallel: true
+    # DeepEP flex dispatcher enables the EFA-backed MoE fast path.
+    moe_enable_deepep: true
+    moe_token_dispatcher_type: flex
+    # moe_shared_expert_overlap must stay false when moe_enable_deepep is true
+    # (see nemo_rl/models/policy/__init__.py comment on moe_enable_deepep).
+    moe_shared_expert_overlap: false
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.7
+logger:
+  log_dir: logs/aws-efa-grpo-qwen3-30ba3b-2n8g-megatron
+  wandb_enabled: false
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: aws-efa-grpo-qwen3-30ba3b-2n8g-megatron
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
