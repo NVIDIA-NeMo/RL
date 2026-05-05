@@ -57,11 +57,12 @@ jobs:
     if: |
       !cancelled()
       && (github.event_name == 'workflow_dispatch' || vars.BUILD_TEST_PUBLISH_WHEEL == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@5b29b9b39f7b38952bafe8fbbd81a6a9e3ea4029
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@2643bfeee2bcdccf1bb3a83d0eda888ca5d9f8ac
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       python-package: nemo_rl
       library-name: NeMo-RL
+      app-id: ${{ vars.BOT_ID }}
       validate-only: ${{ github.event_name != 'workflow_dispatch' }}
       dry-run: ${{ inputs.dry-run || false }}
       version-bump-branch: ${{ inputs.version-bump-branch || github.ref_name }}
@@ -76,7 +77,7 @@ jobs:
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
       SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
-      PAT: ${{ secrets.PAT }}
+      BOT_KEY: ${{ secrets.BOT_KEY }}
 
   release-summary:
     needs: [release]
