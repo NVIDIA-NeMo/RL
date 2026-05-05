@@ -24,7 +24,6 @@ nemo_rl.models.megatron.setup, focusing on:
 - Model path validation
 """
 
-import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1385,7 +1384,9 @@ class TestSetupModelConfig:
                 "format": "megatron_bridge",
                 "path": str(tmp_path),
             },
-            "hf_config_overrides": {"rope_scaling": {"rope_type": "yarn", "factor": 4.0}},
+            "hf_config_overrides": {
+                "rope_scaling": {"rope_type": "yarn", "factor": 4.0}
+            },
             "megatron_cfg": {},
         }
 
@@ -1394,7 +1395,9 @@ class TestSetupModelConfig:
 
         with patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_cc:
             mock_cc.from_yaml.return_value = mock_cfg
-            with pytest.warns(UserWarning, match="hf_config_overrides is set but will be ignored"):
+            with pytest.warns(
+                UserWarning, match="hf_config_overrides is set but will be ignored"
+            ):
                 setup_model_config(
                     config,
                     rank=0,
@@ -1974,5 +1977,3 @@ class TestDraftSetup:
             restored_chunk.draft_model.weight,
             owner_chunk.draft_model.weight,
         )
-
-

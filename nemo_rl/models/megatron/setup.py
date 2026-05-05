@@ -316,7 +316,8 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
                     iter_subdirs = sorted(
                         d
                         for d in os.listdir(path)
-                        if d.startswith("iter_") and os.path.isdir(os.path.join(path, d))
+                        if d.startswith("iter_")
+                        and os.path.isdir(os.path.join(path, d))
                     )
                 except (FileNotFoundError, NotADirectoryError):
                     iter_subdirs = []
@@ -368,7 +369,9 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
                         resolved = os.path.join(path, "release")
                     else:
                         try:
-                            resolved = os.path.join(path, f"iter_{int(iteration_str):07d}")
+                            resolved = os.path.join(
+                                path, f"iter_{int(iteration_str):07d}"
+                            )
                         except ValueError:
                             raise ValueError(
                                 f"pretrained_checkpoint.path={path!r}: "
@@ -379,7 +382,8 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
                     iter_subdirs = sorted(
                         d
                         for d in os.listdir(path)
-                        if d.startswith("iter_") and os.path.isdir(os.path.join(path, d))
+                        if d.startswith("iter_")
+                        and os.path.isdir(os.path.join(path, d))
                     )
                     if not iter_subdirs:
                         raise FileNotFoundError(
