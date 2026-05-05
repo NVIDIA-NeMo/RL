@@ -1301,15 +1301,38 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
                 meta = param_info["_moe_meta"]
                 if "gate_entries" in meta:
-                    # w13: fuse gate + up per expert, then stack
+                    # w13: fuse gate + up per expert, then stack.
+                    # vLLM expects per-rank w13[:, :P] = gate[r*P:(r+1)*P] and
+                    # w13[:, P:2P] = up[r*P:(r+1)*P] (P = intermediate / gen_tp_size).
+                    # Build the global tensor so that contiguous Shard(1) slicing
+                    # by gen TP yields that layout: dim 1 must be
+                    # [gate[0:P], up[0:P], gate[P:2P], up[P:2P], ...].
                     prefix = fused_name.rsplit(".w13_weight", 1)[0]
                     gate_group = groups.get((prefix, "gate_proj"), [])
                     up_group = groups.get((prefix, "up_proj"), [])
+                    gen_tp_size = self.nccl_reshard_refit_info.get("gen_tp_size", 1)
                     expert_tensors = []
                     for (_, gn), (_, un) in zip(gate_group, up_group):
-                        expert_tensors.append(
-                            torch.cat([self._param_map[gn], self._param_map[un]], dim=0)
-                        )
+                        gate = self._param_map[gn]
+                        up = self._param_map[un]
+                        if gen_tp_size > 1:
+                            inter, hidden = gate.shape
+                            assert inter % gen_tp_size == 0, (
+                                f"intermediate {inter} not divisible by gen_tp_size {gen_tp_size}"
+                            )
+                            P = inter // gen_tp_size
+                            stacked = torch.cat(
+                                [
+                                    gate.view(gen_tp_size, P, hidden),
+                                    up.view(gen_tp_size, P, hidden),
+                                ],
+                                dim=1,
+                            )  # [gen_tp_size, 2P, hidden]
+                            expert_tensors.append(
+                                stacked.reshape(2 * inter, hidden).contiguous()
+                            )
+                        else:
+                            expert_tensors.append(torch.cat([gate, up], dim=0))
                     if expert_tensors:
                         self._fused_expert_map[fused_name] = torch.stack(expert_tensors)
                 elif "down_entries" in meta:
