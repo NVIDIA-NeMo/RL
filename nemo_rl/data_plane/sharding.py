@@ -57,6 +57,11 @@ def shard_keys_by_seqlen(
     shards: list[KVBatchMeta] = []
     for r in range(dp_world_size):
         idx = order[r::dp_world_size]
+        # Record original indices in extra_info so ``dp_dispatch`` can invert
+        # the seqlen-strided permutation when aggregating per-rank results
+        # back into a single output. Without this, ``policy.get_logprobs(meta)``
+        # returns rows in [rank0 samples..., rank1 samples...] order rather
+        # than the caller's ``meta.keys`` order — silent correctness bug.
         shards.append(
             KVBatchMeta(
                 partition_id=meta.partition_id,
@@ -64,7 +69,10 @@ def shard_keys_by_seqlen(
                 keys=[meta.keys[i] for i in idx],
                 fields=list(meta.fields) if meta.fields is not None else None,
                 sequence_lengths=[seqlens[i] for i in idx],
-                extra_info=dict(meta.extra_info),
+                extra_info={
+                    **dict(meta.extra_info),
+                    "_dp_original_indices": list(idx),
+                },
             )
         )
     return shards

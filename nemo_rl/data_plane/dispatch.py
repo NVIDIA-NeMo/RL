@@ -128,6 +128,36 @@ def dp_dispatch(
                 else:
                     shards = sharder(data, dp_size)
 
+            # Issue #4: at minimum, enforce DP divisibility on the TQ path.
+            # The legacy in-memory path enforces this via
+            # ``shard_by_batch_size(batch_size=gbs)``; the TQ path skips that
+            # call site, so we add the basic safety check here.
+            total_size = sum(getattr(s, "size", 0) for s in shards)
+            if total_size > 0 and total_size % dp_size != 0:
+                raise ValueError(
+                    f"{method_name}: total meta size {total_size} is not "
+                    f"divisible by DP world size {dp_size}. The TQ-mediated "
+                    f"dispatch path requires DP-uniform shards."
+                )
+
+            # Issue #3: capture the per-shard permutation so we can reorder
+            # aggregate output back to input key order. Only meaningful for
+            # the single-meta path (the seqlen-stride sharder reorders rows);
+            # ``is_meta_list`` is the driver's responsibility — caller controls
+            # ordering and the decorator must not undo it.
+            permutation: list[int] | None = None
+            if is_meta and not is_meta_list:
+                permutation = []
+                for shard in shards:
+                    extra = getattr(shard, "extra_info", None) or {}
+                    indices = extra.get("_dp_original_indices")
+                    if indices is None:
+                        permutation = None
+                        break
+                    permutation.extend(indices)
+                if permutation is not None and len(permutation) != data.size:
+                    permutation = None  # sharder gave partial info; skip reorder
+
             with timer.time(f"policy_{method_name}/dispatch") if timer else nullcontext():
                 futures = self.worker_group.run_all_workers_sharded_data(
                     worker_method,
@@ -140,7 +170,25 @@ def dp_dispatch(
                     common_kwargs=kwargs,
                 )
             results = self.worker_group.get_all_worker_results(futures)
-            return aggregate(results)
+            result = aggregate(results)
+
+            # Issue #3: invert the seqlen-stride permutation. Output row at
+            # ``inv[input_idx]`` is what corresponds to ``meta.keys[input_idx]``.
+            if permutation is not None and hasattr(result, "reorder_data"):
+                inv = [0] * len(permutation)
+                for k, input_idx in enumerate(permutation):
+                    inv[input_idx] = k
+                result = result.reorder_data(inv)
+
+            # Issue #4: post-aggregate hook so Policy methods can recover
+            # the legacy-path semantics that ``aggregate(results)`` alone
+            # can't express (FLOPs, num_ranks, theoretical_tflops). Hook
+            # convention: ``self._dp_post_<method_name>(aggregated, raw,
+            # shards=...)``. Skip silently if the policy doesn't define one.
+            post_hook = getattr(self, f"_dp_post_{method_name}", None)
+            if post_hook is not None:
+                result = post_hook(result, results, shards=shards)
+            return result
 
         wrapper.__dp_dispatch__ = {  # introspection hook
             "worker_method": worker_method,
