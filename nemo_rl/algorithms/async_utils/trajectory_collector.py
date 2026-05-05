@@ -44,6 +44,7 @@ class AsyncTrajectoryCollector:
         master_config: MasterConfig,
         replay_buffer: Any,
         start_step: int = 0,
+        dp_cfg: Optional[dict[str, Any]] = None,
     ):
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
@@ -51,6 +52,14 @@ class AsyncTrajectoryCollector:
         self.master_config = master_config
         self.replay_buffer = replay_buffer
         self.running = False
+
+        # Optional data-plane wiring (mirrors ReplayBuffer.dp_cfg). When set,
+        # rollouts are tensorized into the TQ partition ``rollouts`` before a
+        # ``KVBatchMeta`` reference is pushed onto the buffer — see
+        # research/data_plane_async_rl_limitations.md §5.4. Lazy-built so the
+        # in-memory path (dp_cfg=None) never imports the data-plane module.
+        self._dp_cfg = dp_cfg
+        self._dp_client = None
 
         self._pg_lock: _threading.Lock = _threading.Lock()
 
@@ -148,6 +157,14 @@ class AsyncTrajectoryCollector:
             print(f"🔄 Updated weight version to {version}, resuming collection")
         else:
             print(f"🔄 Updated weight version to {version}")
+
+    def _ensure_dp_client(self):
+        """Lazily build a data-plane client. None when ``dp_cfg`` not set."""
+        if self._dp_client is None and self._dp_cfg is not None:
+            from nemo_rl.data_plane import build_data_plane_client
+
+            self._dp_client = build_data_plane_client(self._dp_cfg, bootstrap=False)
+        return self._dp_client
 
     def _should_pause_for_generation_limits(self) -> bool:
         """Check if collection should be paused due to generation limits."""
@@ -472,6 +489,63 @@ class AsyncTrajectoryCollector:
                 "rollout_metrics": rollout_metrics,
                 "timestamp": time.time(),
             }
+
+            # When the data plane is enabled, replace the in-memory dict
+            # trajectory with a KVBatchMeta reference: tensors land in the
+            # ``rollouts`` partition; the buffer holds only the meta. The
+            # trainer (PR 4 — grpo_async_dp) materializes per consumed batch.
+            # See research/data_plane_async_rl_limitations.md §5.4 (1).
+            client = self._ensure_dp_client()
+            if client is not None:
+                import asyncio
+
+                import torch
+                from tensordict import TensorDict
+
+                from nemo_rl.data_plane.interfaces import KVBatchMeta
+
+                n_samples = int(final_batch_cpu["sample_mask"].shape[0])
+                keys = [
+                    f"v{generation_weight_version}_p{prompt_idx}_g{i}"
+                    for i in range(n_samples)
+                ]
+                # Write whatever tensor fields the rollout produced; trainer
+                # decides which subset to fetch via ``select_fields``.
+                tensor_fields = [
+                    f
+                    for f in final_batch_cpu.keys()
+                    if isinstance(final_batch_cpu[f], torch.Tensor)
+                ]
+                fields = TensorDict(
+                    {
+                        f: final_batch_cpu[f].detach().contiguous()
+                        for f in tensor_fields
+                    },
+                    batch_size=[n_samples],
+                )
+                # `_collection_loop` runs in a worker thread (no enclosing
+                # event loop here), so ``asyncio.run`` is safe — Race 3.
+                asyncio.run(
+                    client.kv_batch_put(
+                        keys=keys,
+                        partition_id="rollouts",
+                        fields=fields,
+                        tags=[{"version": generation_weight_version}] * n_samples,
+                    )
+                )
+                trajectory_group = KVBatchMeta(
+                    partition_id="rollouts",
+                    task_name="train",
+                    keys=keys,
+                    fields=tensor_fields,
+                    sequence_lengths=[
+                        int(s) for s in final_batch_cpu["input_lengths"].tolist()
+                    ],
+                    extra_info={
+                        "rollout_metrics": rollout_metrics,
+                        "timestamp": time.time(),
+                    },
+                )
 
             # Use exponential backoff when buffer is full
             try:
