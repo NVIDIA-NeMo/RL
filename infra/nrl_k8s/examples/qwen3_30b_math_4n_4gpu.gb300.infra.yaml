@@ -156,7 +156,7 @@ kuberay:
     labels:
       disagg.nemo-rl/cluster: qwen3-30b-math-gb300
       disagg.nemo-rl/run: qwen3-30b-math-gb300
-      kai.scheduler/queue: default-queue
+      kai.scheduler/queue: rl
     spec:
       rayVersion: "2.52.0"
       headGroupSpec:

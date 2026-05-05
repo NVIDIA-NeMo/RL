@@ -1,18 +1,19 @@
-# KAI Scheduler queue hierarchy for a 2-GPU kind cluster.
+# Example KAI Scheduler queue hierarchy for a 2-GPU kind cluster.
+# Adapt the queue names, quotas, and priorities to match your cluster.
 #
 # Queue hierarchy:
-#   org (root, unlimited)
-#   ├── high-prio (1 GPU guaranteed, burst to 2, priority 200, weight 2)
-#   └── low-prio  (0 GPU guaranteed, burst to 2, priority 50, weight 1)
+#   root (root, unlimited)
+#   ├── rl       (1 GPU guaranteed, burst to 2, priority 200, weight 2)
+#   └── backfill (0 GPU guaranteed, burst to 2, priority 50, weight 1)
 #
-# high-prio: gets its guaranteed GPU first, gets surplus before low-prio,
+# rl: gets its guaranteed GPU first, gets surplus before backfill,
 #   and is reclaimed last. Jobs protected from preemption for 4 hours.
-# low-prio: best-effort — uses idle GPUs, first to be reclaimed.
+# backfill: best-effort — uses idle GPUs, first to be reclaimed.
 
 apiVersion: scheduling.run.ai/v2
 kind: Queue
 metadata:
-  name: root-org
+  name: root
 spec:
   resources:
     gpu:    { quota: -1, limit: -1, overQuotaWeight: 1 }
@@ -22,9 +23,9 @@ spec:
 apiVersion: scheduling.run.ai/v2
 kind: Queue
 metadata:
-  name: high-prio
+  name: rl
 spec:
-  parentQueue: root-org
+  parentQueue: root
   priority: 200
   preemptMinRuntime: "4h"
   reclaimMinRuntime: "15m"
@@ -36,9 +37,9 @@ spec:
 apiVersion: scheduling.run.ai/v2
 kind: Queue
 metadata:
-  name: low-prio
+  name: backfill
 spec:
-  parentQueue: root-org
+  parentQueue: root
   priority: 50
   preemptMinRuntime: "4h"
   reclaimMinRuntime: "15m"
