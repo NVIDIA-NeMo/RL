@@ -1,6 +1,6 @@
 ---
 name: bump-dependency
-description: Bump a pinned dependency (TransformerEngine, vLLM, SGLang, Megatron-LM / Megatron-Bridge / Automodel / Gym submodules, etc.), regenerate the lockfile, open a PR, and drive it to green by attaching a watchdog to the "CICD NeMo RL" workflow and quarantining failing functional tests in `tests/test_suites/disabled.txt` until the run is green.
+description: Bump a pinned dependency (TransformerEngine, vLLM, SGLang, Megatron-LM / Megatron-Bridge / Automodel / Gym submodules, etc.), regenerate the lockfile, open a PR, and drive it to green by attaching a watchdog to the `CICD NeMo RL` workflow and quarantining failing functional tests in `tests/test_suites/disabled.txt` until the run is green.
 when_to_use: Bumping a dependency pin in `pyproject.toml` or one of the `3rdparty/*` submodules and shepherding the PR to green. 'bump TE', 'bump transformer-engine', 'update TE pin', 'bump vLLM', 'bump SGLang', 'bump submodule', 'bump Megatron-LM', 'bump Megatron-Bridge', 'bump Automodel', 'update lock file', 'bump dependency PR', 'watch CI for a bump', 'quarantine flaky tests after bump', 'run all tests for this bump'.
 ---
 
@@ -16,9 +16,7 @@ The pipeline is always: **edit → relock → push → /ok to test → watchdog
 
 ## When to reach for this skill
 
-- Bumping a git-source pin in `pyproject.toml` (e.g. the
-  `transformer-engine[pytorch,core_cu12] @ git+...@<ref>` line, or
-  `vllm`, `sglang`, etc.).
+- Bumping a git-source pin in `pyproject.toml` (TE, vLLM, SGLang, ...).
 - Bumping any of the `3rdparty/*` submodules — `Megatron-LM`,
   `Megatron-Bridge`, `Automodel`, `Gym`.
 - Any change that touches `uv.lock` and needs the full L1 (functional) +
@@ -31,26 +29,32 @@ For pure dep additions/removals without a CI loop, the
 
 Read first, then follow the steps below:
 
-- @skills/contributing/SKILL.md — Conventional Commits PR title, DCO sign-off
-- @skills/build-and-dependency/SKILL.md — `uv lock` mechanics, container choice
-- @skills/cicd/SKILL.md — how `copy-pr-bot`, `/ok to test`, and the `CI:*` labels work
-- @skills/testing/SKILL.md — recipe naming and the `tests/test_suites/` layout
+- @skills/contributing/SKILL.md — Conventional Commits PR title (bare,
+  no `[area]` prefix), DCO sign-off.
+- @skills/build-and-dependency/SKILL.md — `uv lock` mechanics, container
+  choice (`nemo-rl:latest`).
+- @skills/cicd/SKILL.md — `copy-pr-bot`, `/ok to test`, the `CI:L0|L1|L2`
+  label (no label → `test_level=none` → quality-check stays red).
+- @skills/testing/SKILL.md — recipe naming, the `tests/test_suites/`
+  layout. The `disabled.txt` quarantine surface is documented here in
+  Step 7 (it's not yet in the testing skill).
 
 ## Step 1 — Worktree and edit
 
+Create a worktree off `main` per @skills/contributing/SKILL.md. **Before
+any `uv lock`** for a submodule bump:
+
 ```bash
-# From the NeMo-RL repo root
-git worktree add .claude/worktrees/<slug> -b <branch-name> origin/main
-git submodule update --init --recursive   # required before `uv lock` for submodule bumps
+git submodule update --init --recursive
 ```
 
 Edit the pin. Two common shapes:
 
-**Git-source override** (TE, etc.) — edit the matching line in
-`pyproject.toml`. There are usually two places to keep in sync (the
-runtime override-dependencies block and the build-time helper list near
-the bottom of the file). Search for the package name and update *every*
-occurrence of the SHA so they don't drift:
+**Git-source override** (TE, vLLM, ...) — edit the matching line in
+`pyproject.toml`. There are usually **two places** to keep in sync (the
+runtime `override-dependencies` block and the build-time helper list
+near the bottom of the file). Search for the package name and update
+*every* occurrence so they don't drift:
 
 ```bash
 grep -n "TransformerEngine.git@" pyproject.toml
@@ -65,65 +69,53 @@ moving tip; use a full SHA for reproducibility. TE branches use
 `release_vX.Y` (underscore), not `release/vX.Y`. Verify with
 `git ls-remote https://github.com/NVIDIA/TransformerEngine.git`.
 
-**Submodule bump** (`3rdparty/Megatron-LM-workspace/Megatron-LM`,
-`3rdparty/Megatron-Bridge-workspace/Megatron-Bridge`,
-`3rdparty/Automodel-workspace/Automodel`,
-`3rdparty/Gym-workspace/Gym`):
+**Submodule bump** (e.g. `3rdparty/Megatron-LM-workspace/Megatron-LM`):
 
 ```bash
 cd 3rdparty/<name>-workspace/<name>
-git fetch origin
-git checkout <new-ref>
+git fetch origin && git checkout <new-ref>
 cd -
 git add 3rdparty/<name>-workspace/<name>
 ```
 
 ## Step 2 — Regenerate the lockfile
 
-`uv.lock` is Linux + CUDA only. Run inside the project image (see
-@skills/build-and-dependency/SKILL.md for image build):
-
-```bash
-docker run --rm \
-  -v $(pwd):/opt/nemo-rl \
-  -v $HOME/.cache/uv:/root/.cache/uv \
-  -w /opt/nemo-rl \
-  nemo-rl:latest \
-  bash -c 'uv lock'
-```
-
-Confirm only the intended packages moved:
+Run `uv lock` inside the project container per
+@skills/build-and-dependency/SKILL.md. Then confirm only the intended
+packages moved:
 
 ```bash
 git diff --stat pyproject.toml uv.lock
 git diff uv.lock | grep -E '^\+\+\+|^---|name = ' | head -50
 ```
 
-If the diff carries changes you didn't ask for (transitive movements you
-can't explain), stop and investigate before pushing.
+If the diff carries changes you didn't ask for (transitive movements
+you can't explain), stop and investigate before pushing.
 
 ## Step 3 — Commit and push
 
+Sign-off + signed-commit + commit-title format per
+@skills/contributing/SKILL.md and @skills/cicd/SKILL.md. **Bare
+Conventional Commits — no `[area]` prefix** (NeMo-RL's
+`semantic-pull-request` job rejects bracket-prefixed titles):
+
 ```bash
-git add pyproject.toml uv.lock 3rdparty/  # 3rdparty/ only if a submodule moved
+git add pyproject.toml uv.lock 3rdparty/   # 3rdparty/ only if a submodule moved
 git commit -S -s -m "build: bump <package> to <ref>"
 git push -u origin <branch-name>
 ```
 
-PR title format per @skills/contributing/SKILL.md: Conventional Commits,
-`build:` (or `chore:`) — **no `[area]` prefix** (NeMo-RL's
-`semantic-pull-request` job rejects bracket-prefixed titles). Sign-off
-(`-s`) is mandatory; signed commits (`-S`) let `copy-pr-bot` mirror the
-push to `pull-request/<N>` without a maintainer needing to post
-`/ok to test` for every push.
-
 ## Step 4 — Open the PR
 
-PR body goes through a tmpfile to preserve formatting. Wrap it in a
-`<details>` block:
+Title and labels per @skills/contributing/SKILL.md +
+@skills/cicd/SKILL.md. The bump-specific requirement: **`CI:L2` is
+mandatory** — it's the only way to expand the matrix to L1 (functional)
++ L2 (convergence). Without any `CI:*` label, `pre-flight` resolves
+`test_level=none` and the quality-check job stays red.
 
-```bash
-cat > /tmp/pr-body.md <<'EOF'
+The PR body template — durable record of the bump:
+
+```markdown
 <details><summary>Claude summary</summary>
 
 ## What
@@ -143,53 +135,26 @@ Updated <package> <old> -> <new>
 _None yet — will be appended as flakes are identified during CI iteration._
 
 </details>
-EOF
-
-gh pr create \
-  --repo NVIDIA-NeMo/RL \
-  --base main \
-  --head <branch-name> \
-  --title "build: bump <package> to <ref>" \
-  --body-file /tmp/pr-body.md \
-  --label "CI:L2"
 ```
 
-The `CI:L2` label is **mandatory** for a bump — it is the only way to
-expand the matrix to L1 (functional) + L2 (convergence). Without a `CI:*`
-label, `pre-flight` resolves `test_level=none` and the quality-check job
-stays red. See @skills/cicd/SKILL.md for the full label table.
-
-`gh pr edit` is unreliable. To update a PR's title or body later, use the
-REST API directly:
-
-```bash
-gh api -X PATCH "repos/NVIDIA-NeMo/RL/pulls/<N>" \
-  -F "body=@/tmp/pr-body.md"
-
-gh api -X PATCH "repos/NVIDIA-NeMo/RL/pulls/<N>" \
-  -f "title=build: bump <package> to <ref>"
-```
+To update the PR title or body later, use `gh api -X PATCH
+"repos/NVIDIA-NeMo/RL/pulls/<N>" -F "body=@/tmp/pr-body.md"` — never
+`gh pr edit`.
 
 ## Step 5 — Trigger CI on the exact SHA
 
-Even with a signed commit, post `/ok to test` on the SHA you actually
-want exercised so any cached / cancelled run is re-fired. The
-`pull-request/<N>` mirror branch is what `CICD NeMo RL` watches:
-
-```bash
-SHA=$(git rev-parse HEAD)
-gh pr comment <N> --repo NVIDIA-NeMo/RL --body "/ok to test $SHA"
-```
-
-Use the **full** SHA (`git rev-parse HEAD`), never the short form.
+Trigger mechanics + `pull-request/<N>` mirror branch live in
+@skills/cicd/SKILL.md "How CI Is Triggered". For this loop the rule is
+simple: **on every new SHA you push, post `/ok to test
+$(git rev-parse HEAD)`**. Use the **full** SHA — the short form
+silently fails to match.
 
 ## Step 6 — Attach the watchdog (always; never a cronjob)
 
 For a bump PR you want a single live process that emits per-job state
-changes for the **CICD NeMo RL** workflow only. Other workflows
+changes for the **`CICD NeMo RL`** workflow only. Other workflows
 (copyright check, semantic-pull-request, secrets scan, automodel
-submodule check, wheel build) are noise here — the gate that decides
-green-or-red for a bump is `CICD NeMo RL`.
+submodule check, wheel build) are noise here.
 
 **Always attach a watchdog with the Monitor tool. Never schedule wakeups
 or cronjobs for this loop.** A watchdog gives you:
@@ -290,26 +255,17 @@ once the run is green.
 
 When a `JOB <name> -> failure` event fires:
 
-1. Skim the logs to confirm it's a flake / pre-existing issue, not the
-   bump itself:
+1. **Triage the failure — is it the bump or a flake?** Pull logs per
+   @skills/cicd/SKILL.md "CI Failure Investigation". Only quarantine if
+   the failure reproduces on `main` or is clearly unrelated
+   infrastructure. If it's caused by the bump itself, **stop
+   quarantining** — fix or revert. Quarantining a real regression hides
+   the very signal the bump PR exists to surface.
 
-   ```bash
-   RUN_ID=<from "RUN ... STARTED" event>
-   gh run view "$RUN_ID" --repo NVIDIA-NeMo/RL --log-failed > /tmp/run.log
-   wc -l /tmp/run.log
-   tail -200 /tmp/run.log
-   ```
-
-   If the failure is caused by the bump (real regression, not a flake),
-   **stop quarantining** — fix the underlying issue or revert the bump.
-   Quarantining a real regression hides the very signal the bump PR
-   exists to surface.
-
-2. Quarantine the failing test by appending its driver-script path to
-   @tests/test_suites/disabled.txt (NeMo-RL does not have an
+2. **Quarantine via `tests/test_suites/disabled.txt`.** NeMo-RL has no
    active/flaky directory split — the disabled list is the canonical
-   quarantine surface; see @skills/testing/SKILL.md for the
-   `tests/test_suites/` layout):
+   quarantine surface, matched by exact path against the entries in
+   `nightly.txt` / `release.txt` / `nightly_gb200.txt`:
 
    ```bash
    cat >> tests/test_suites/disabled.txt <<EOF
@@ -319,42 +275,35 @@ When a `JOB <name> -> failure` event fires:
    EOF
    ```
 
-   Use the same path that appears in `nightly.txt` / `release.txt` /
-   `nightly_gb200.txt` etc. — the disabled list is matched by exact
-   path and applies to every suite that references the script.
+   Copy the path verbatim from the suite list — extra whitespace or a
+   trailing `/` will miss.
 
-3. Append the test to the PR description's **Quarantined tests**
-   section, with a one-line reason and a follow-up tracking link if you
-   have one. This is the durable record of what this bump deferred.
+3. **Append to the PR body's Quarantined tests section** with a one-line
+   reason and a follow-up tracking link if you have one. This is the
+   durable record of what this bump deferred.
 
-4. Commit, push, retrigger:
+4. **Commit, push, retrigger:**
 
    ```bash
    git add tests/test_suites/disabled.txt
    git commit -S -s -m "ci: quarantine flaky <test> for <package> bump"
    git push
-   SHA=$(git rev-parse HEAD)
-   gh pr comment <N> --repo NVIDIA-NeMo/RL --body "/ok to test $SHA"
+   gh pr comment <N> --repo NVIDIA-NeMo/RL --body "/ok to test $(git rev-parse HEAD)"
    ```
 
-5. Update the PR body via `gh api PATCH` so the quarantine list stays
-   current.
+5. **Update the PR body** via `gh api PATCH` so the quarantine list
+   stays current.
 
-The watchdog is persistent — it will pick up the new run automatically
-and emit `RUN <id> STARTED` for the new attempt.
+The watchdog is persistent — it picks up the new run automatically and
+emits `RUN <id> STARTED` for the new attempt. Loop back to step 1.
 
 ## Step 8 — Stop when green
 
 `RUN <id> COMPLETED conclusion=success` is the exit condition. Then:
 
 ```bash
-# Sanity check
 gh pr checks <N> --repo NVIDIA-NeMo/RL | awk '{print $2}' | sort | uniq -c
-
-# Tear down
 TaskStop(<watchdog-task-id>)
-
-# Tick the boxes in the PR body
 gh api -X PATCH "repos/NVIDIA-NeMo/RL/pulls/<N>" -F "body=@/tmp/pr-body.md"
 ```
 
@@ -362,15 +311,12 @@ gh api -X PATCH "repos/NVIDIA-NeMo/RL/pulls/<N>" -F "body=@/tmp/pr-body.md"
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `uv lock` errors with "not a Python project" on a `3rdparty/*` path | Submodule not initialised in the worktree | `git submodule update --init --recursive` |
-| CI never starts on a new push | Commit not GPG-signed and no `/ok to test` for the new SHA, or no `CI:*` label | Post `/ok to test $(git rev-parse HEAD)`; ensure exactly one `CI:*` label is attached |
-| Quality-check job is red but no test failures | `test_level=none` — PR has no `CI:*` label, so the matrix never expanded | Attach `CI:L2` (or whatever tier the bump warrants) |
+| Quality-check job is red but no test failures | `test_level=none` — PR has no `CI:*` label, so the matrix never expanded | Attach `CI:L2` (or the tier the bump warrants) |
 | `semantic-pull-request` rejects the title | Bracket-prefixed `[build]` style — NeMo-RL uses bare Conventional Commits | Rewrite to `build: bump …` (no `[area]`) |
-| Watchdog goes silent for 30+ min | `gh` rate-limited or auth expired | Bump poll interval; `gh auth status`; restart Monitor |
-| Quarantine commit doesn't trigger a new run | Pushed but didn't post `/ok to test` for the new SHA | Always re-post on the new SHA |
-| Wrong TE branch ref (`release/v2.15`) silently resolves nothing | TE uses `release_vX.Y` with an underscore | Verify with `git ls-remote` before locking |
 | TE / vLLM SHA still pinned somewhere after edit | `pyproject.toml` lists the same git ref in multiple places (override-dependencies + helper list) | `grep -n "<package>.*git@" pyproject.toml` and update every occurrence |
-| Quarantined script still runs in CI | Disabled list path doesn't match exactly the path used in `nightly*.txt` | Copy the path verbatim from the suite list — extra whitespace or trailing `/` will miss |
+| Quarantined script still runs in CI | Disabled list path doesn't match the path used in `nightly*.txt` exactly | Copy the path verbatim — extra whitespace or trailing `/` will miss |
+| Wrong TE branch ref (`release/v2.15`) silently resolves nothing | TE uses `release_vX.Y` with an underscore | Verify with `git ls-remote` before locking |
+| `uv lock` errors with "not a Python project" on a `3rdparty/*` path | Submodule not initialised in the worktree | `git submodule update --init --recursive` |
 
 ## Anti-patterns
 
