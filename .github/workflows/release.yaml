@@ -57,7 +57,7 @@ jobs:
     if: |
       !cancelled()
       && (github.event_name == 'workflow_dispatch' || vars.BUILD_TEST_PUBLISH_WHEEL == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@ca6bda93283f6c3b5684d132dec0d5b33e40d2ef
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@6f5c2545f1d0e1c47ab939ab6ac87079c38fb095
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       python-package: nemo_rl
