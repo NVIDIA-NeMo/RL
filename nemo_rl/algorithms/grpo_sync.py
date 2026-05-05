@@ -70,6 +70,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane import build_data_plane_client
 from nemo_rl.data_plane.preshard import (
+    DP_SEED_FIELDS as _DP_SEED_FIELDS,
     driver_balanced_preshards,
     fan_out_per_rank_metas,
 )
@@ -87,20 +88,6 @@ from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-
-# Tensor fields of ``train_data`` we seed into the partition. The set must
-# match FIELD_SCHEMA in nemo_rl/data_plane/schema.py once Stage 2 lands.
-_DP_SEED_FIELDS = (
-    "input_ids",
-    "input_lengths",
-    "generation_logprobs",
-    "prev_logprobs",
-    "reference_policy_logprobs",
-    "advantages",
-    "token_mask",
-    "sample_mask",
-)
-
 
 def grpo_train_sync(
     policy: ColocatablePolicyInterface,

@@ -37,6 +37,21 @@ from tensordict import TensorDict
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
+# Tensor fields the data plane carries between driver and DP workers. The
+# canonical schema for the ``train`` partition. Producers (sync trainer fan-out,
+# async trainer fan-out) write only the subset they have computed; consumers
+# (``train_presharded`` workers) fetch what they need via ``select_fields``.
+DP_SEED_FIELDS = (
+    "input_ids",
+    "input_lengths",
+    "generation_logprobs",
+    "prev_logprobs",
+    "reference_policy_logprobs",
+    "advantages",
+    "token_mask",
+    "sample_mask",
+)
+
 
 def driver_balanced_preshards(
     train_data: BatchedDataDict,
