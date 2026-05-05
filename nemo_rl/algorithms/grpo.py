@@ -1739,12 +1739,13 @@ def grpo_train(
                     train_data["prev_logprobs"] = torch.zeros_like(
                         train_data["generation_logprobs"]
                     )
+
+                memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 if not (skip_prev_logprobs and skip_reference_policy_logprobs):
                     print("▶ Preparing for logprob inference...", flush=True)
                     with timer.time("logprob_inference_prep"):
                         policy.prepare_for_lp_inference()
 
-                memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
                     # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
