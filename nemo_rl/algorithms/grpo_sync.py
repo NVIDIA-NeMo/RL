@@ -30,7 +30,6 @@ data-plane integration plan).
 
 from __future__ import annotations
 
-import asyncio
 import os
 import warnings
 from contextlib import nullcontext
@@ -38,7 +37,6 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-from tensordict import TensorDict
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 # Re-imports from grpo so this file is a thin trainer-only fork.
@@ -70,9 +68,10 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-from nemo_rl.data_plane import (
-    KVBatchMeta,
-    build_data_plane_client,
+from nemo_rl.data_plane import build_data_plane_client
+from nemo_rl.data_plane.preshard import (
+    driver_balanced_preshards,
+    fan_out_per_rank_metas,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -593,115 +592,24 @@ def grpo_train_sync(
                     )
                     del baseline_for_log
 
-                # ── Driver-side balanced packing (mirrors legacy lm_policy.train).
-                # ``shard_by_batch_size(shards=DP_world, sequence_packing_args=...)``
-                # uses ``bin_count_multiple=DP_world``, which is what guarantees
-                # every DP rank ends up with the same number of microbatches —
-                # without it, sequence-packing / dynamic-batching produce
-                # variable per-rank bin counts and Megatron diverges on its
-                # first cross-DP collective. Pre-shard here, then fan out a
-                # ``list[KVBatchMeta]`` with each shard's pre-computed
-                # micro_batch_indices/lengths in ``extra_info``.
-                policy_cfg = master_config["policy"]
-                dp_world = policy.sharding_annotations.get_axis_size(
-                    "data_parallel"
+                # Driver-side balanced packing + per-rank fan-out — see
+                # nemo_rl/data_plane/preshard.py for the bin_count_multiple
+                # rationale and the failure mode it prevents.
+                pre_shards = driver_balanced_preshards(
+                    train_data,
+                    dp_world=policy.sharding_annotations.get_axis_size(
+                        "data_parallel"
+                    ),
+                    policy_cfg=master_config["policy"],
                 )
-                gbs = policy_cfg["train_global_batch_size"]
-                seqpack_cfg = policy_cfg.get("sequence_packing", {}) or {}
-                dynbatch_cfg = policy_cfg.get("dynamic_batching", {}) or {}
-
-                spa: Optional[dict[str, Any]] = None
-                dba: Optional[dict[str, Any]] = None
-                if dynbatch_cfg.get("enabled", False):
-                    dba = {
-                        "input_key": "input_ids",
-                        "input_lengths_key": "input_lengths",
-                        "sequence_length_round": dynbatch_cfg[
-                            "sequence_length_round"
-                        ],
-                        "max_tokens_per_microbatch": dynbatch_cfg[
-                            "train_mb_tokens"
-                        ],
-                    }
-                elif seqpack_cfg.get("enabled", False):
-                    spa = {
-                        "algorithm": seqpack_cfg["algorithm"],
-                        "input_key": "input_ids",
-                        "input_lengths_key": "input_lengths",
-                        "sequence_length_pad_multiple": policy_cfg[
-                            "make_sequence_length_divisible_by"
-                        ],
-                        "max_tokens_per_microbatch": seqpack_cfg[
-                            "train_mb_tokens"
-                        ],
-                    }
-
-                if dba is not None:
-                    pre_shards, _ = train_data.shard_by_batch_size(
-                        dp_world,
-                        batch_size=gbs,
-                        dynamic_batching_args=dba,
-                    )
-                elif spa is not None:
-                    pre_shards, _ = train_data.shard_by_batch_size(
-                        dp_world,
-                        batch_size=gbs,
-                        sequence_packing_args=spa,
-                    )
-                else:
-                    pre_shards = train_data.shard_by_batch_size(
-                        dp_world,
-                        batch_size=gbs,
-                    )
-
-                dp_metas: list[KVBatchMeta] = []
-                for dp_rank, shard in enumerate(pre_shards):
-                    n_shard = int(shard["sample_mask"].shape[0])
-                    shard_keys = [
-                        f"step{total_steps}_dp{dp_rank}_s{i}"
-                        for i in range(n_shard)
-                    ]
-                    shard_field_names = [
-                        f
-                        for f in _DP_SEED_FIELDS
-                        if f in shard and isinstance(shard[f], torch.Tensor)
-                    ]
-                    shard_fields = TensorDict(
-                        {
-                            f: shard[f].detach().contiguous()
-                            for f in shard_field_names
-                        },
-                        batch_size=[n_shard],
-                    )
-                    asyncio.run(
-                        dp_client.kv_batch_put(
-                            keys=shard_keys,
-                            partition_id="train",
-                            fields=shard_fields,
-                        )
-                    )
-                    extra: dict[str, Any] = {}
-                    if (
-                        getattr(shard, "micro_batch_indices", None) is not None
-                        and getattr(shard, "micro_batch_lengths", None) is not None
-                    ):
-                        extra["micro_batch_indices"] = shard.micro_batch_indices
-                        extra["micro_batch_lengths"] = shard.micro_batch_lengths
-                        ecpg = getattr(shard, "elem_counts_per_gb", None)
-                        if ecpg is not None:
-                            extra["elem_counts_per_gb"] = ecpg
-                    dp_metas.append(
-                        KVBatchMeta(
-                            partition_id="train",
-                            task_name="train",
-                            keys=shard_keys,
-                            fields=shard_field_names,
-                            sequence_lengths=[
-                                int(s) for s in shard["input_lengths"].tolist()
-                            ],
-                            extra_info=extra,
-                        )
-                    )
+                dp_metas = fan_out_per_rank_metas(
+                    pre_shards,
+                    dp_client=dp_client,
+                    partition_id="train",
+                    task_name="train",
+                    key_prefix=f"step{total_steps}",
+                    seed_fields=_DP_SEED_FIELDS,
+                )
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
