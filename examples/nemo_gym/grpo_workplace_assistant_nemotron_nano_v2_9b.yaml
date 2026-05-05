@@ -34,7 +34,6 @@ grpo:
     source_max: 1.0
     target_min: 0.0
     target_max: 1.0
-  skip_reference_policy_logprobs_calculation: true
   seq_logprob_error_threshold: null
 
   async_grpo:
