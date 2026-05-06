@@ -19,30 +19,31 @@ PROJECT_ROOT="${PROJECT_ROOT:-${BASE}/RL-v07-tier1-bench}"
 
 # (config_rel, num_nodes, job_suffix)
 declare -a JOBS=(
+    # Node counts target GB200 (4 GPUs/node) — 2x the recipe's H100 nNn8g count.
     # Llama 3.1 8B (PP=2, TP=1) — only G6 fusion applies.
-    "perf_test/v07_tier1/llama_8b/v07_00_baseline   2 llama8b-00-base"
-    "perf_test/v07_tier1/llama_8b/v07_01_g6_fusion  2 llama8b-01-g6"
+    "perf_test/v07_tier1/llama_8b/v07_00_baseline   4 llama8b-00-base"
+    "perf_test/v07_tier1/llama_8b/v07_01_g6_fusion  4 llama8b-01-g6"
 
     # Qwen3 30B-A3B (TP=1, EP=8) — G6, G3 (MoE A2A), and stack apply.
-    "perf_test/v07_tier1/qwen3_30ba3b/v07_00_baseline    4 qwen30ba3b-00-base"
-    "perf_test/v07_tier1/qwen3_30ba3b/v07_01_g6_fusion   4 qwen30ba3b-01-g6"
-    "perf_test/v07_tier1/qwen3_30ba3b/v07_04_g3_moe_a2a  4 qwen30ba3b-04-g3"
-    "perf_test/v07_tier1/qwen3_30ba3b/v07_05_stack       4 qwen30ba3b-05-stack"
+    "perf_test/v07_tier1/qwen3_30ba3b/v07_00_baseline    8 qwen30ba3b-00-base"
+    "perf_test/v07_tier1/qwen3_30ba3b/v07_01_g6_fusion   8 qwen30ba3b-01-g6"
+    "perf_test/v07_tier1/qwen3_30ba3b/v07_04_g3_moe_a2a  8 qwen30ba3b-04-g3"
+    "perf_test/v07_tier1/qwen3_30ba3b/v07_05_stack       8 qwen30ba3b-05-stack"
 
     # Qwen3 32B (TP=4, PP=4, SP=on) — G1, G5, G6, stack apply (no MoE).
-    "perf_test/v07_tier1/qwen3_32b/v07_00_baseline       4 qwen32b-00-base"
-    "perf_test/v07_tier1/qwen3_32b/v07_01_g6_fusion      4 qwen32b-01-g6"
-    "perf_test/v07_tier1/qwen3_32b/v07_02_g1_tpoverlap   4 qwen32b-02-g1"
-    "perf_test/v07_tier1/qwen3_32b/v07_03_g5_delaywgrad  4 qwen32b-03-g5"
-    "perf_test/v07_tier1/qwen3_32b/v07_05_stack          4 qwen32b-05-stack"
+    "perf_test/v07_tier1/qwen3_32b/v07_00_baseline       8 qwen32b-00-base"
+    "perf_test/v07_tier1/qwen3_32b/v07_01_g6_fusion      8 qwen32b-01-g6"
+    "perf_test/v07_tier1/qwen3_32b/v07_02_g1_tpoverlap   8 qwen32b-02-g1"
+    "perf_test/v07_tier1/qwen3_32b/v07_03_g5_delaywgrad  8 qwen32b-03-g5"
+    "perf_test/v07_tier1/qwen3_32b/v07_05_stack          8 qwen32b-05-stack"
 
     # Qwen3 235B (TP=2, PP=8, CP=2, EP=16, SP=on) — full matrix.
-    "perf_test/v07_tier1/qwen3_235b/v07_00_baseline      16 qwen235b-00-base"
-    "perf_test/v07_tier1/qwen3_235b/v07_01_g6_fusion     16 qwen235b-01-g6"
-    "perf_test/v07_tier1/qwen3_235b/v07_02_g1_tpoverlap  16 qwen235b-02-g1"
-    "perf_test/v07_tier1/qwen3_235b/v07_03_g5_delaywgrad 16 qwen235b-03-g5"
-    "perf_test/v07_tier1/qwen3_235b/v07_04_g3_moe_a2a    16 qwen235b-04-g3"
-    "perf_test/v07_tier1/qwen3_235b/v07_05_stack         16 qwen235b-05-stack"
+    "perf_test/v07_tier1/qwen3_235b/v07_00_baseline      32 qwen235b-00-base"
+    "perf_test/v07_tier1/qwen3_235b/v07_01_g6_fusion     32 qwen235b-01-g6"
+    "perf_test/v07_tier1/qwen3_235b/v07_02_g1_tpoverlap  32 qwen235b-02-g1"
+    "perf_test/v07_tier1/qwen3_235b/v07_03_g5_delaywgrad 32 qwen235b-03-g5"
+    "perf_test/v07_tier1/qwen3_235b/v07_04_g3_moe_a2a    32 qwen235b-04-g3"
+    "perf_test/v07_tier1/qwen3_235b/v07_05_stack         32 qwen235b-05-stack"
 )
 
 FILTER="${1:-}"

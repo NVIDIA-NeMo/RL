@@ -20,3 +20,7 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
       CUDA_HOME: /usr/local/cuda
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
