@@ -145,6 +145,7 @@ project-includes = [
   "nemo_rl/utils/nvml.py",
   "nemo_rl/utils/packed_tensor.py",
   "nemo_rl/utils/prefetch_venvs.py",
+  "nemo_rl/utils/sequence_length_generator.py",
   "nemo_rl/utils/timer.py",
   "nemo_rl/utils/venvs.py",
   "tools/model_diagnostics/1.max_model_len_respected.py",
