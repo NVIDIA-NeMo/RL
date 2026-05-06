@@ -721,8 +721,12 @@ def random_input_len_processor(
 
     if callable(input_len_or_input_len_generator):
         input_len = input_len_or_input_len_generator(idx)
-    else:
+    elif isinstance(input_len_or_input_len_generator, int):
         input_len = input_len_or_input_len_generator
+    else:
+        raise ValueError(
+            f"Invalid input_len_or_input_len_generator: {input_len_or_input_len_generator}"
+        )
 
     input_len = int(input_len)
     if max_seq_length is not None:

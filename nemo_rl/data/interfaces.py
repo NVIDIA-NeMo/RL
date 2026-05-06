@@ -60,7 +60,7 @@ class TaskDataSpec:
 
     system_prompt_file: Optional[PathLike] = None
 
-    input_len_or_input_len_generator: Optional[Callable | int] = None
+    input_len_or_input_len_generator: Optional[Callable[[int], int] | int] = None
 
     def __post_init__(self) -> None:
         def load_prompt_file(
