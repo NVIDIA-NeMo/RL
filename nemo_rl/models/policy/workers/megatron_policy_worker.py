@@ -1817,14 +1817,13 @@ def refit_sglang_colocated(
 ) -> bool:
     """Refit colocated SGLang engines from the Megatron policy.
 
-    Wraps the Miles-style lifecycle: optional fault-tolerance recover,
-    connect (when new/recovered engines), pause + flush, send HF tensor
-    buckets via Ray IPC, post-process, continue.
+    Lifecycle: optional fault-tolerance recover, connect (when new /
+    recovered engines), pause + flush, send HF tensor buckets via Ray
+    IPC, post-process, continue.
     """
     from nemo_rl.models.policy.utils import (
         fetch_updatable_engines_with_recover,
         get_sglang_quantization_cfg,
-        post_process_sglang_weights,
     )
 
     sglang_quant = get_sglang_quantization_cfg(policy_generation)
@@ -1848,10 +1847,10 @@ def refit_sglang_colocated(
             "clear_updatable_num_new_engines did not zero num_new_engines"
         )
 
-    # Mirror Miles' mixin._pause_and_prepare_engines: pause with the configured
-    # mode, but only flush_cache when the mode actually drops generation state.
-    # "in_place" leaves the engine paused without dropping its KV cache, so
-    # flushing would clobber the still-valid in-place state.
+    # Pause with the configured mode, but only flush_cache when the mode
+    # actually drops generation state. "in_place" leaves the engine paused
+    # without dropping its KV cache, so flushing would clobber the
+    # still-valid in-place state.
     pause_mode = policy_generation.pause_generation_mode
     policy_generation.pause_generation(mode=pause_mode)
     policy_generation.invalidate_kv_cache()
@@ -1863,7 +1862,7 @@ def refit_sglang_colocated(
             sglang_quantization_cfg=sglang_quant,
         )
         ray.get(futures)
-        post_process_sglang_weights(rollout_engines)
+        policy_generation.post_process_weights()
     finally:
         policy_generation.continue_generation()
     return True
@@ -1884,12 +1883,13 @@ def refit_sglang_distributed(
     from nemo_rl.models.policy.utils import (
         fetch_updatable_engines_with_recover,
         get_sglang_quantization_cfg,
-        post_process_sglang_weights,
     )
 
+    print("[REFIT-DIST 0] entering refit_sglang_distributed", flush=True)
     sglang_quant = get_sglang_quantization_cfg(policy_generation)
     target_precision = sglang_quant.get("scheme", "bf16")
 
+    print("[REFIT-DIST 1] fetch_updatable_engines_with_recover...", flush=True)
     (
         rollout_engines,
         rollout_engine_lock,
@@ -1897,26 +1897,44 @@ def refit_sglang_distributed(
         engine_gpu_counts,
         _engine_gpu_offsets,
     ) = fetch_updatable_engines_with_recover(policy_generation)
+    print(
+        f"[REFIT-DIST 1] fetched: num_new_engines={num_new_engines} "
+        f"engine_gpu_counts={engine_gpu_counts}",
+        flush=True,
+    )
 
     if num_new_engines > 0:
+        print(
+            "[REFIT-DIST 2] connect_sglang_rollout_engines_distributed (NCCL group setup)...",
+            flush=True,
+        )
         policy.connect_sglang_rollout_engines_distributed(
             rollout_engines=rollout_engines,
             engine_gpu_counts=engine_gpu_counts,
         )
+        print("[REFIT-DIST 2] connect_sglang_rollout_engines_distributed done", flush=True)
         policy_generation.clear_updatable_num_new_engines()
         assert policy_generation.num_new_engines == 0, (
             "clear_updatable_num_new_engines did not zero num_new_engines"
         )
 
-    # Mirror Miles' mixin._pause_and_prepare_engines: pause with the configured
-    # mode, but only flush_cache when the mode actually drops generation state.
-    # "in_place" leaves the engine paused without dropping its KV cache, so
-    # flushing would clobber the still-valid in-place state.
+    # Pause with the configured mode, but only flush_cache when the mode
+    # actually drops generation state. "in_place" leaves the engine paused
+    # without dropping its KV cache, so flushing would clobber the
+    # still-valid in-place state.
     pause_mode = policy_generation.pause_generation_mode
+    print(f"[REFIT-DIST 3] pause_generation(mode={pause_mode!r})...", flush=True)
     policy_generation.pause_generation(mode=pause_mode)
+    print("[REFIT-DIST 3] pause_generation done", flush=True)
     if pause_mode != "in_place":
+        print("[REFIT-DIST 4] invalidate_kv_cache...", flush=True)
         policy_generation.invalidate_kv_cache()
+        print("[REFIT-DIST 4] invalidate_kv_cache done", flush=True)
     try:
+        print(
+            "[REFIT-DIST 5] update_weights_to_sglang_distributed (kicks engine RPC + NCCL broadcast)...",
+            flush=True,
+        )
         futures = policy.update_weights_to_sglang_distributed(
             rollout_engines=rollout_engines,
             rollout_engine_lock=rollout_engine_lock,
@@ -1924,8 +1942,18 @@ def refit_sglang_distributed(
             target_precision=target_precision,
             sglang_quantization_cfg=sglang_quant,
         )
+        print(
+            f"[REFIT-DIST 5] update_weights_to_sglang_distributed returned futures (n={len(futures) if futures is not None else 0}); ray.get...",
+            flush=True,
+        )
         ray.get(futures)
-        post_process_sglang_weights(rollout_engines)
+        print("[REFIT-DIST 5] ray.get(futures) done", flush=True)
+        print("[REFIT-DIST 6] post_process_weights...", flush=True)
+        policy_generation.post_process_weights()
+        print("[REFIT-DIST 6] post_process_weights done", flush=True)
     finally:
+        print("[REFIT-DIST 7] continue_generation (finally)...", flush=True)
         policy_generation.continue_generation()
+        print("[REFIT-DIST 7] continue_generation done", flush=True)
+    print("[REFIT-DIST 8] refit_sglang_distributed complete", flush=True)
     return True

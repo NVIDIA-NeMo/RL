@@ -15,6 +15,7 @@
 import gc
 import os
 import traceback
+from datetime import timedelta
 from enum import Enum
 from typing import Any, Dict, Iterable, Optional
 
@@ -670,9 +671,8 @@ def send_hf_buckets_via_ipc_actor_impl(
 ) -> list:
     """Send finalized HF tensor buckets to colocated SGLang engines via Ray IPC.
 
-    Mirrors Miles' ``_send_to_colocated_engine``: per bucket, group by dtype,
-    serialize a ``FlattenedTensorBucket`` per dtype, ``dist.gather_object`` to
-    the gather source rank, then call
+    Per bucket: group by dtype, serialize a ``FlattenedTensorBucket`` per
+    dtype, ``dist.gather_object`` to the gather source rank, then call
     ``ipc_engine.update_weights_from_tensor.remote(...)`` once per dtype.
 
     The trainer-side topology (``_ipc_gather_group`` / ``_ipc_gather_src`` /
@@ -709,10 +709,8 @@ def send_hf_buckets_via_ipc_actor_impl(
             if not bucket:
                 continue
 
-            # Wait on async DTensor redistributes inside the bucket.
-            bucket = [
-                (n, (t.wait() if hasattr(t, "wait") else t)) for n, t in bucket
-            ]
+            # No async-collective ``.wait()`` here — Megatron's AutoBridge
+            # yields plain ``torch.Tensor``, no DTensor wrapping.
 
             if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
                 by_dtype: dict = {"dtype": list(bucket)}
@@ -769,6 +767,89 @@ def find_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def init_process_group(
+    backend: "str | dist.Backend | None" = None,
+    init_method: Optional[str] = None,
+    timeout: Optional[timedelta] = None,
+    world_size: int = -1,
+    rank: int = -1,
+    store: "Optional[dist.Store]" = None,
+    group_name: Optional[str] = None,
+    pg_options: Any = None,
+) -> "torch.distributed.ProcessGroup":
+    """Create a side-by-side ``ProcessGroup`` without touching the default world.
+
+    ``torch.distributed.init_process_group`` initializes the *default* world
+    process group. Once the Megatron trainer has stood up its own world during
+    Policy construction, calling it again to talk to SGLang either errors with
+    "trying to initialize the default process group twice" or — depending on
+    torch version — silently hangs in rendezvous against a peer that has
+    already finished its own custom-group setup.
+
+    Same approach as SGLang's ``sglang.srt.utils.common.init_custom_process_group``:
+    replay the public API's wiring (rendezvous → ``PrefixStore`` →
+    ``_new_process_group_helper``) but skip the "set as default PG" step, so
+    multiple independent groups can coexist in the same process.
+
+    Only one of ``init_method`` and ``store`` may be set; otherwise the
+    rendezvous source is ambiguous.
+    """
+    from torch.distributed.distributed_c10d import (
+        Backend,
+        PrefixStore,
+        _new_process_group_helper,
+        _world,
+        default_pg_timeout,
+        rendezvous,
+    )
+
+    assert (store is None) or (init_method is None), (
+        "Cannot specify both init_method and store."
+    )
+
+    if store is not None:
+        assert world_size > 0, "world_size must be positive if using store"
+        assert rank >= 0, "rank must be non-negative if using store"
+    elif init_method is None:
+        init_method = "env://"
+
+    backend = Backend(backend) if backend else Backend("undefined")
+    if timeout is None:
+        timeout = default_pg_timeout
+
+    if store is None:
+        rendezvous_iterator = rendezvous(
+            init_method, rank, world_size, timeout=timeout
+        )
+        store, rank, world_size = next(rendezvous_iterator)
+        store.set_timeout(timeout)
+        # PrefixStore so multiple co-tenant groups don't trample each other's keys.
+        store = PrefixStore(group_name or "", store)
+
+    # ``pg_options`` was renamed to ``backend_options`` in PyTorch 2.6:
+    #   https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
+    # Use numeric tuple compare — string compare ``"2.10" >= "2.6"`` returns
+    # False because ``"1"`` sorts before ``"6"`` lexicographically.
+    _torch_mm = tuple(
+        int(x) for x in torch.__version__.split("+")[0].split(".")[:2]
+    )
+    pg_options_kw = "backend_options" if _torch_mm >= (2, 6) else "pg_options"
+    pg, _ = _new_process_group_helper(
+        world_size,
+        rank,
+        [],
+        backend,
+        store,
+        group_name=group_name,
+        **{pg_options_kw: pg_options},
+        timeout=timeout,
+    )
+
+    # Map identity ranks so collective ops can resolve member ranks for ``pg``.
+    _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+    return pg
+
+
 def connect_rollout_engines_from_distributed(
     *,
     group_name: str,
@@ -777,10 +858,8 @@ def connect_rollout_engines_from_distributed(
 ) -> "torch.distributed.ProcessGroup":
     """Set up the SGLang NCCL weight-update group with trainer rank 0 as rank 0.
 
-    Mirrors Miles'
-    ``update_weight_from_distributed/broadcast.connect_rollout_engines_from_distributed``
-    but is the single, NeMo-RL-specific source: only trainer rank 0 broadcasts
-    because the AutoBridge path restores full HF weights, not per-PP slices.
+    Only trainer rank 0 broadcasts because the AutoBridge path restores
+    full HF weights, not per-PP slices.
 
     The caller (a trainer) must invoke this only on rank 0; other ranks must
     not call it.
@@ -806,7 +885,7 @@ def connect_rollout_engines_from_distributed(
         )
         rank_cursor += gpu_count
 
-    group = dist.init_process_group(
+    group = init_process_group(
         backend="nccl",
         init_method=f"tcp://{master_address}:{master_port}",
         world_size=world_size,
@@ -871,27 +950,6 @@ def fetch_updatable_engines_with_recover(policy_generation: Any) -> tuple:
     return policy_generation.get_updatable_engines_and_lock()
 
 
-def post_process_sglang_weights(rollout_engines: list) -> None:
-    """Run SGLang's post-process-weights RPC on every node-0 engine.
-
-    Called by the Megatron-side dispatch helpers after a colocate IPC or
-    distributed broadcast refit so SGLang finalizes its weight tables (e.g.
-    materializes quantized scales, swaps in the freshly loaded buffer).
-    """
-    import ray
-
-    refs = [
-        engine.post_process_weights.remote(
-            restore_weights_before_load=False,
-            post_process_quantization=True,
-        )
-        for engine in rollout_engines
-        if engine is not None
-    ]
-    if refs:
-        ray.get(refs)
-
-
 def broadcast_hf_buckets_via_distributed_impl(
     *,
     bucket_iterator: Iterable[list[tuple[str, torch.Tensor]]],
@@ -916,21 +974,35 @@ def broadcast_hf_buckets_via_distributed_impl(
 
     import ray
 
+    bucket_idx = 0
     for bucket in bucket_iterator:
         if not bucket:
             continue
 
-        bucket = [
-            (n, (t.wait() if hasattr(t, "wait") else t)) for n, t in bucket
-        ]
+        bucket_idx += 1
+        # No async-collective ``.wait()`` here — AutoBridge yields plain
+        # ``torch.Tensor`` for the Megatron path (no DTensor wrapping).
 
         names = [name for name, _ in bucket]
         dtypes = [tensor.dtype for _, tensor in bucket]
         shapes = [tensor.shape for _, tensor in bucket]
+        devices = [str(tensor.device) for _, tensor in bucket]
+        total_bytes = sum(t.numel() * t.element_size() for _, t in bucket)
+        print(
+            f"[BCAST bucket={bucket_idx}] n={len(bucket)} bytes={total_bytes} "
+            f"first={names[0]} last={names[-1]} devs={set(devices)} dtypes={set(dtypes)}",
+            flush=True,
+        )
 
+        print(f"[BCAST bucket={bucket_idx}] acquiring rollout_engine_lock...", flush=True)
         while not ray.get(rollout_engine_lock.acquire.remote()):
             _time.sleep(0.1)
+        print(f"[BCAST bucket={bucket_idx}] lock acquired", flush=True)
         try:
+            print(
+                f"[BCAST bucket={bucket_idx}] kicking engine.update_weights_from_distributed.remote() RPCs...",
+                flush=True,
+            )
             refs = [
                 engine.update_weights_from_distributed.remote(
                     names=names,
@@ -941,14 +1013,37 @@ def broadcast_hf_buckets_via_distributed_impl(
                 )
                 for engine in rollout_engines
             ]
-            handles = [
-                dist.broadcast(
-                    tensor.data, 0, group=model_update_group, async_op=True
+            print(
+                f"[BCAST bucket={bucket_idx}] issuing {len(bucket)} dist.broadcast async_op calls...",
+                flush=True,
+            )
+            handles = []
+            for i, (_, tensor) in enumerate(bucket):
+                handles.append(
+                    dist.broadcast(
+                        tensor.data, 0, group=model_update_group, async_op=True
+                    )
                 )
-                for _, tensor in bucket
-            ]
-            for handle in handles:
+            print(
+                f"[BCAST bucket={bucket_idx}] all {len(handles)} broadcasts launched; waiting...",
+                flush=True,
+            )
+            for i, handle in enumerate(handles):
                 handle.wait()
+                if i == 0 or (i + 1) == len(handles):
+                    print(
+                        f"[BCAST bucket={bucket_idx}] handle.wait() done {i + 1}/{len(handles)}",
+                        flush=True,
+                    )
+            print(
+                f"[BCAST bucket={bucket_idx}] all broadcasts complete; ray.get(refs)...",
+                flush=True,
+            )
             ray.get(refs)
+            print(
+                f"[BCAST bucket={bucket_idx}] engine RPCs returned (engine done loading)",
+                flush=True,
+            )
         finally:
             ray.get(rollout_engine_lock.release.remote())
+            print(f"[BCAST bucket={bucket_idx}] lock released", flush=True)

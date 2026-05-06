@@ -14,10 +14,9 @@
 
 """Offline HF -> MXFP8 conversion + startup helper for SGLang.
 
-Ports the checkpoint-writing portion of Miles'
-``tools/convert_hf_to_mxfp8.py`` onto NeMo-RL's quantization core, so SGLang
-can boot from an MXFP8 HF checkpoint and the online weight-update path can
-reuse the exact same per-tensor decisions.
+Wraps NeMo-RL's quantization core so SGLang can boot from an MXFP8 HF
+checkpoint and the online weight-update path can reuse the exact same
+per-tensor decisions.
 """
 
 from __future__ import annotations
@@ -256,8 +255,7 @@ def convert_mxfp8(
 ) -> None:
     """Convert an HF safetensors checkpoint to MXFP8 with UE8M0 scales.
 
-    Mirrors Miles' ``tools/convert_hf_to_mxfp8.convert_mxfp8`` but uses the
-    shared quantization core in ``mxfp8_quantization_core``.
+    Uses the shared quantization core in ``mxfp8_quantization_core``.
     """
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available, cannot run MXFP8 quantization.")

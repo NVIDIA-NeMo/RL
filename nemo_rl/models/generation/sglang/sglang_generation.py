@@ -403,6 +403,32 @@ class SGLangGeneration(GenerationInterface):
             return
         ray.get([e.continue_generation.remote() for e in engines])
 
+    def post_process_weights(
+        self,
+        *,
+        restore_weights_before_load: bool = False,
+        post_process_quantization: bool = True,
+    ) -> None:
+        """Run SGLang's ``/post_process_weights`` RPC on every node-0 engine.
+
+        Called by the Megatron-side refit dispatch helpers after a colocate
+        IPC or distributed broadcast refit so SGLang finalizes its weight
+        tables (e.g. materializes quantized scales, swaps in the freshly
+        loaded buffer).
+        """
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        ray.get(
+            [
+                e.post_process_weights.remote(
+                    restore_weights_before_load=restore_weights_before_load,
+                    post_process_quantization=post_process_quantization,
+                )
+                for e in engines
+            ]
+        )
+
     def health_monitoring_pause(self) -> None:
         if self._health_monitor:
             self._health_monitor.pause()

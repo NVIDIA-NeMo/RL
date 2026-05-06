@@ -36,6 +36,13 @@ os.environ.setdefault("NEMO_RL_PY_EXECUTABLES_SYSTEM", "1")
 # shared host other processes may already hold memory on some of our GPUs.
 os.environ.setdefault("SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", "false")
 
+# Skip the runtime ``sglang-kernel`` distribution version check. The container
+# ships the pre-built ``sgl-kernel`` (the older distribution name) bound
+# against torch 2.10; the renamed ``sglang-kernel`` dist isn't installed so
+# the assert would unconditionally raise. The kernel itself is fine — only
+# the metadata lookup fails.
+os.environ.setdefault("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK", "1")
+
 # Ensure the test directory is on sys.path so helpers.py is importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -50,12 +57,24 @@ _STUB_MODULES = [
     "vllm.lora",
     "vllm.lora.request",
     "wandb",
-    # TE meta package raises RuntimeError on import in this venv; stub to
-    # bypass so the sglang import chain can complete without real TE.
-    "transformer_engine",
-    "transformer_engine.common",
-    "transformer_engine.pytorch",
 ]
+
+# Transformer Engine is conditionally stubbed: the sglang-only test image
+# historically didn't ship a working TE, but the e2e image (where we also
+# exercise the Megatron policy worker) does. Probe with importlib so we only
+# replace it with a MagicMock when real TE genuinely cannot be imported —
+# stubbing real TE turns ``transformer_engine.pytorch`` into a MagicMock which
+# makes downstream ``from transformer_engine.pytorch.tensor import ...`` fail
+# with "X is not a package" inside megatron.core.
+import importlib.util as _importlib_util
+
+if _importlib_util.find_spec("transformer_engine") is None:
+    _STUB_MODULES += [
+        "transformer_engine",
+        "transformer_engine.common",
+        "transformer_engine.pytorch",
+    ]
+
 for _mod in _STUB_MODULES:
     if _mod in sys.modules:
         continue

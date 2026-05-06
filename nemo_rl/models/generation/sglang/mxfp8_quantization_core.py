@@ -14,7 +14,6 @@
 
 """Shared MXFP8 tensor quantization rules for SGLang rollout weight updates.
 
-The policy and kernel are ported from Miles' ``tools/convert_hf_to_mxfp8.py``.
 Offline conversion (``mxfp8_setup.py``) and online refit (the Megatron SGLang
 weight iterator) must call into this module so they make the exact same
 quantization decision for any given HF tensor name.
@@ -22,7 +21,6 @@ quantization decision for any given HF tensor name.
 
 from __future__ import annotations
 
-from functools import partial
 from typing import Any
 
 import torch
@@ -115,19 +113,22 @@ def should_quantize(
 def quantize_mxfp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(qweight, scale)`` in the SGLang MXFP8 layout.
 
-    Mirrors Miles' ``tools/convert_hf_to_mxfp8.quantize_mxfp8``: prefer
-    flashinfer's swizzle-free kernel, fall back to SGLang's Triton kernel.
+    Uses flashinfer's swizzle-free MXFP8 kernel (``flashinfer.mxfp8_quantize``
+    with ``is_sf_swizzled_layout=False``). flashinfer is a hard requirement
+    here — both the SGLang and Megatron actor environments pin it via
+    ``pyproject.toml``'s global ``flashinfer-python==0.6.4`` constraint, so a
+    missing import means the env was built incorrectly.
     """
     try:
         from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
-
-        mxfp8_quantize = partial(
-            flashinfer_mxfp8_quantize, is_sf_swizzled_layout=False
-        )
-    except ImportError:
-        from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
-
-        mxfp8_quantize = mxfp8_group_quantize
+    except ImportError as e:
+        raise ImportError(
+            "flashinfer is required for MXFP8 weight quantization but is not "
+            "installed in the current actor environment. Install "
+            "`flashinfer-python==0.6.4` (and `flashinfer-cubin==0.6.4`); "
+            "in NeMo-RL this is normally provided by the `mcore` or `sglang` "
+            "extras (see pyproject.toml constraint-dependencies)."
+        ) from e
 
     weight = weight.contiguous()
     k = weight.shape[-1]
@@ -135,7 +136,9 @@ def quantize_mxfp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         raise ValueError(f"Last dim {k} must be divisible by 32 for MXFP8.")
 
     weight_flat = weight.view(-1, k).contiguous()
-    qweight, scale = mxfp8_quantize(weight_flat)
+    qweight, scale = flashinfer_mxfp8_quantize(
+        weight_flat, is_sf_swizzled_layout=False
+    )
     qweight = qweight.view_as(weight)
     scale = scale.view(*weight.shape[:-1], k // 32).contiguous()
     return qweight, scale
@@ -202,7 +205,7 @@ def maybe_quantize_hf_weight_mxfp8(
     quantization_config: dict[str, Any],
     num_hidden_layers: int,
 ) -> list[tuple[str, torch.Tensor]]:
-    """Apply Miles' HF-name MXFP8 policy to one finalized HF tensor.
+    """Apply the HF-name MXFP8 policy to one finalized HF tensor.
 
     Returns a list of ``(name, tensor)`` pairs:
 

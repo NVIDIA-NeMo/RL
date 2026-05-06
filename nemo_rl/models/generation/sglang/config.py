@@ -60,8 +60,14 @@ class SglangSpecificArgs(TypedDict):
     disable_overlap_schedule: NotRequired[bool]
     enable_mixed_chunk: NotRequired[bool]
     enable_dp_attention: NotRequired[bool]
-    enable_deepep_moe: NotRequired[bool]
     enable_ep_moe: NotRequired[bool]
+    # MoE all-to-all backend. Newer sglang forks replaced ``enable_ep_moe``
+    # with this single switch: one of {"none", "deepep", "mooncake", "mori",
+    # "ascend_fuseep", "flashinfer"}. Defaults to "none" upstream.
+    moe_a2a_backend: NotRequired[str]
+    # DeepEP routing mode (only meaningful when ``moe_a2a_backend == "deepep"``):
+    # one of {"auto", "normal", "low_latency"}.
+    deepep_mode: NotRequired[str]
     enable_torch_compile: NotRequired[bool]
     torch_compile_max_bs: NotRequired[int]
     cuda_graph_max_bs: NotRequired[int | None]

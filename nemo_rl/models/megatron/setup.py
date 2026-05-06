@@ -202,11 +202,13 @@ def validate_and_set_config(
 ):
     # Handle generation configuration
     is_generation_colocated = None
+    rollout_backend = None
     sampling_params = None
     if "generation" in config and config["generation"] is not None:
         generation_cfg = config["generation"]
         # set generation colocated
         is_generation_colocated = generation_cfg["colocated"]["enabled"]
+        rollout_backend = generation_cfg.get("backend")
         # set sampling params
         sampling_params = TrainingSamplingParams(
             top_k=generation_cfg["top_k"],
@@ -214,10 +216,20 @@ def validate_and_set_config(
             temperature=generation_cfg["temperature"],
         )
 
-    # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
-    # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
+    # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error
+    # for PyNCCLCommunicator (see https://github.com/NVIDIA-NeMo/RL/issues/564).
+    #
+    # SGLang is the exception: its scheduler subprocess defaults to
+    # ``NCCL_CUMEM_ENABLE=0``, and trainer / engine must agree on the
+    # transport selection. Setting the trainer to 1 while sglang stays at
+    # 0 leaves NCCL with mismatched allocator modes on the two sides,
+    # which leads to the same NCCL P2P init error this flag is supposed
+    # to prevent.
     if not is_generation_colocated:
         os.environ["NCCL_CUMEM_ENABLE"] = "1"
+        
+    if rollout_backend == "sglang":
+            os.environ["NCCL_CUMEM_ENABLE"] = "0"
 
     # Setup data types
     dtype_map = {

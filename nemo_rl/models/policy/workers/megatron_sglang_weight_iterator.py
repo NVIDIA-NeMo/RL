@@ -14,11 +14,11 @@
 
 """SGLang-only HF weight iterator for the Megatron policy worker.
 
-Modeled after Miles' ``HfWeightIteratorBridge.get_hf_weight_chunks``: emit
-buckets of HF-named tensors restored from Megatron via AutoBridge, with no
-vLLM-specific KV/Q scale tensors. When ``target_precision == "mxfp8"`` the
-iterator additionally applies Miles' offline ``should_quantize`` /
-``quantize_mxfp8`` core to each finalized HF tensor.
+Emits buckets of HF-named tensors restored from Megatron via AutoBridge,
+with no vLLM-specific KV/Q scale tensors. When
+``target_precision == "mxfp8"`` the iterator additionally applies the
+offline ``should_quantize`` / ``quantize_mxfp8`` core to each finalized
+HF tensor.
 """
 
 from __future__ import annotations
@@ -119,7 +119,10 @@ class MegatronSGLangHfWeightIterator:
             show_progress=False,
             conversion_tasks=self._conversion_tasks,
         ):
-            tensor = tensor if not hasattr(tensor, "wait") else tensor.wait()
+            # AutoBridge yields plain ``torch.Tensor`` for Megatron (no
+            # DTensor / async-collective wrapping), so no ``.wait()`` is
+            # needed here. The previous ``hasattr(tensor, "wait")`` check
+            # was a copy-from-FSDP residue.
 
             if target_precision == "mxfp8" and skip_weight_substrings is not None:
                 if should_quantize(

@@ -219,7 +219,7 @@ def mock_trainer(ray_cluster, sglang_gen):
     Actors are launched into the SGLang cluster's placement group using
     PlacementGroupSchedulingStrategy with fractional GPU (num_gpus=0.2), so
     they co-reside with the SGLang worker (which also takes 0.2) on the same
-    bundles. This matches the nemo_rl colocated-mode and miles patterns; the
+    bundles. This matches the nemo_rl colocated-mode pattern; the
     PG's bundles have ``CPU: max_colocated_worker_groups`` capacity (=2) to
     fit both worker groups.
     """

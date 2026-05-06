@@ -768,6 +768,11 @@ def _compute_server_args(
         else get_base_gpu_id(gpus_per_node, sglang_cfg, rank)
     )
     base = _to_local_gpu_id(base)
+    # ``_gpus_per_engine`` is the engine's total GPU count (TP × PP). When PP=1
+    # (the historical default) this equals ``tp_size``; when ``pp_size > 1``
+    # the engine spans ``tp_size * pp_size`` GPUs, so derive ``tp_size`` by
+    # dividing out PP. Falsy/0 ``pp_size`` is treated as 1.
+    _pp_size = sglang_cfg["sglang_cfg"].get("pp_size", 1) or 1
     kwargs = {
         "model_path": sglang_cfg["sglang_cfg"]["model_path"],
         "trust_remote_code": True,
@@ -785,9 +790,9 @@ def _compute_server_args(
         "gpu_id_step": 1,
         "base_gpu_id": base,
         # parallel
-        "tp_size": _gpus_per_engine,
+        "tp_size": _gpus_per_engine // _pp_size,
         "dp_size": sglang_cfg["sglang_cfg"]["dp_size"],
-        "pp_size": sglang_cfg["sglang_cfg"]["pp_size"],
+        "pp_size": _pp_size,
         "ep_size": sglang_cfg["sglang_cfg"]["ep_size"],
         # always skip warmup to prevent warmup timeout.
         "skip_server_warmup": sglang_cfg["sglang_cfg"]["skip_server_warmup"],
@@ -810,6 +815,18 @@ def _compute_server_args(
         "allow_auto_truncate",
         "disable_piecewise_cuda_graph",
         "disable_cuda_graph",
+        # CUDA graph batch-size cap (Optional[int], default None).
+        "cuda_graph_max_bs",
+        # DP-attention switch (newer sglang forks): replicates attention along
+        # ``dp_size`` while keeping MoE/MLP under TP.
+        "enable_dp_attention",
+        # MoE all-to-all backend: "none" | "deepep" | "mooncake" | "mori" |
+        # "ascend_fuseep" | "flashinfer". Replaces the older
+        # ``enable_ep_moe`` boolean knob.
+        "moe_a2a_backend",
+        # DeepEP routing mode (used when ``moe_a2a_backend == "deepep"``):
+        # "auto" | "normal" | "low_latency".
+        "deepep_mode",
     ]:
         if key in sglang_cfg["sglang_cfg"]:
             kwargs[key] = sglang_cfg["sglang_cfg"][key]
