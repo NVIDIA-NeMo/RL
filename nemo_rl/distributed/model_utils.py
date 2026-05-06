@@ -1833,7 +1833,6 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
 def from_parallel_hidden_states_to_logprobs(
     tensor_parallel_hidden_states: torch.Tensor,
     output_weight_layer: torch.Tensor,
-    output_weight: torch.Tensor,
     runtime_gather_output: bool,
     target: torch.Tensor,
     vocab_start_index: int,
@@ -2161,7 +2160,6 @@ def _gpt_forward_with_linear_ce_fusion(
     )
     logprobs = from_parallel_hidden_states_to_logprobs(
         hidden_states,  # .transpose(0, 1).contiguous(),
-        output_weight_layer,
         output_weight_layer,
         runtime_gather_output,
         labels,
