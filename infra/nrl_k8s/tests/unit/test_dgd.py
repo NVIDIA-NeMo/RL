@@ -264,6 +264,61 @@ class TestBuildDgdManifest:
         assert m["kind"] == "DynamoGraphDeployment"
         assert "Service" not in (m.get("spec", {}).get("services") or {})
 
+    def test_owner_ref_attached_when_provided(self, tmp_path):
+        self._write(tmp_path)
+        owner = dgd.build_owner_reference(
+            api_version="ray.io/v1",
+            kind="RayCluster",
+            name="rc-train",
+            uid="abc-123",
+        )
+        m = dgd.build_dgd_manifest(
+            DynamoGraphSpec(manifest="dgd.yaml"),
+            _infra(),
+            tmp_path,
+            owner_ref=owner,
+        )
+        refs = m["metadata"]["ownerReferences"]
+        assert len(refs) == 1
+        ref = refs[0]
+        assert ref["apiVersion"] == "ray.io/v1"
+        assert ref["kind"] == "RayCluster"
+        assert ref["name"] == "rc-train"
+        assert ref["uid"] == "abc-123"
+        # Operator already controls the DGD; we're a non-controlling owner.
+        assert ref["controller"] is False
+
+    def test_no_owner_ref_when_unset(self, tmp_path):
+        self._write(tmp_path)
+        m = dgd.build_dgd_manifest(
+            DynamoGraphSpec(manifest="dgd.yaml"), _infra(), tmp_path
+        )
+        assert "ownerReferences" not in m["metadata"]
+
+
+# =============================================================================
+# build_owner_reference
+# =============================================================================
+
+
+class TestBuildOwnerReference:
+    def test_default_fields(self):
+        ref = dgd.build_owner_reference(
+            api_version="ray.io/v1", kind="RayCluster", name="x", uid="u"
+        )
+        assert ref["controller"] is False
+        assert ref["blockOwnerDeletion"] is False
+
+    def test_block_owner_deletion_true(self):
+        ref = dgd.build_owner_reference(
+            api_version="ray.io/v1",
+            kind="RayCluster",
+            name="x",
+            uid="u",
+            block_owner_deletion=True,
+        )
+        assert ref["blockOwnerDeletion"] is True
+
 
 # =============================================================================
 # resolve_dgd_name

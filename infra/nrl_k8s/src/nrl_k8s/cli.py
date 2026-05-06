@@ -804,6 +804,7 @@ def _run_rayjob(
     cli_wait: bool | None,
 ) -> None:
     """``nrl-k8s run --rayjob`` path. KubeRay owns the RayCluster lifecycle."""
+    from . import dgd as dgd_mod
     from . import k8s, orchestrate
     from . import submit as submit_mod
     from .rayjob import build_rayjob_manifest
@@ -823,6 +824,15 @@ def _run_rayjob(
 
     if dry_run:
         click.echo(yaml.safe_dump(manifest, sort_keys=False).rstrip())
+        # Render any declared DGDs too so the user sees the full ephemeral
+        # bring-up plan. Owner refs aren't filled in (no UID yet on a dry-run);
+        # the live path stamps them at apply time.
+        for dgd_key, dgd_spec in loaded.infra.dynamo.items():
+            click.echo("---")
+            dgd_manifest = dgd_mod.build_dgd_manifest(
+                dgd_spec, loaded.infra, loaded.infra_source_path.parent
+            )
+            click.echo(yaml.safe_dump(dgd_manifest, sort_keys=False).rstrip())
         return
 
     if not submit_mod.is_in_cluster():
@@ -839,6 +849,43 @@ def _run_rayjob(
         _explain_and_exit(exc, context=f"rayjob {job_name} apply failed")
     except Exception as exc:  # noqa: BLE001
         _explain_and_exit(exc, context=f"rayjob {job_name} apply failed")
+
+    # If the recipe declares any DGDs, wait for KubeRay to spawn the
+    # RayCluster, look up its UID, then apply each DGD with an ownerReference
+    # pointing at the RayCluster. K8s GC cascades the DGD when the RayCluster
+    # is deleted (e.g. when shutdownAfterJobFinishes fires), so the inference
+    # GPUs free at the same moment as the training GPUs. Note: KubeRay starts
+    # submitting the entrypoint as soon as the RayCluster is ready, so the
+    # entrypoint should tolerate a brief window where DGD pods are still
+    # coming up — usually a /health curl-loop in the recipe.
+    if loaded.infra.dynamo:
+        click.echo(
+            f"[run --rayjob] waiting for RayJob {job_name} to spawn its RayCluster ..."
+        )
+        try:
+            rc_name = k8s.wait_for_rayjob_raycluster_name(job_name, namespace)
+        except TimeoutError as exc:
+            _explain_and_exit(exc, context=f"rayjob {job_name} RayCluster lookup")
+        rc_obj = k8s.get_raycluster(rc_name, namespace)
+        rc_uid = (rc_obj or {}).get("metadata", {}).get("uid")
+        if not rc_uid:
+            _cli_error(
+                f"RayCluster {rc_name} has no metadata.uid yet; cannot anchor "
+                f"DGD ownerReferences. Try again in a few seconds."
+            )
+        owner = dgd_mod.build_owner_reference(
+            api_version="ray.io/v1",
+            kind="RayCluster",
+            name=rc_name,
+            uid=rc_uid,
+        )
+        for dgd_key in loaded.infra.dynamo:
+            try:
+                orchestrate.ensure_dgd(
+                    dgd_key, loaded, log=click.echo, owner_ref=owner
+                )
+            except ApiException as exc:
+                _explain_and_exit(exc, context=f"dynamo.{dgd_key} apply failed")
 
     job_id_cmd = f"$(kubectl get rayjob {job_name} -n {namespace} -o jsonpath='{{.status.jobId}}')"
     click.echo(
