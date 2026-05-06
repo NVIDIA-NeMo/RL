@@ -1774,17 +1774,29 @@ def grpo_train(
                     del logprob_data
                     del extra_multimodal_data
 
-                    (
-                        max_seq_mult_prob_error,
-                        num_masked_seqs,
-                        masked_correct_pct,
-                    ) = compute_and_apply_seq_logprob_error_masking(
-                        train_data=train_data,
-                        rewards=rewards,
-                        seq_logprob_error_threshold=master_config["grpo"][
-                            "seq_logprob_error_threshold"
-                        ],
+                    # Seq-level logprob error metrics/masking require real prev_logprobs
+                    seq_logprob_error_threshold = master_config["grpo"].get(
+                        "seq_logprob_error_threshold", None
                     )
+                    if skip_prev_logprobs:
+                        # Cannot compute seq-level metrics with placeholder prev_logprobs
+                        assert seq_logprob_error_threshold is None, (
+                            "seq_logprob_error_threshold requires prev_logprobs computation; "
+                            "cannot use with force_on_policy_ratio=True"
+                        )
+                        max_seq_mult_prob_error = 0.0
+                        num_masked_seqs = 0
+                        masked_correct_pct = 0.0
+                    else:
+                        (
+                            max_seq_mult_prob_error,
+                            num_masked_seqs,
+                            masked_correct_pct,
+                        ) = compute_and_apply_seq_logprob_error_masking(
+                            train_data=train_data,
+                            rewards=rewards,
+                            seq_logprob_error_threshold=seq_logprob_error_threshold,
+                        )
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
@@ -2836,17 +2848,29 @@ def async_grpo_train(
                         )["reference_logprobs"]
                         train_data["reference_policy_logprobs"] = reference_logprobs
 
-                    (
-                        max_seq_mult_prob_error,
-                        num_masked_seqs,
-                        masked_correct_pct,
-                    ) = compute_and_apply_seq_logprob_error_masking(
-                        train_data=train_data,
-                        rewards=rewards,
-                        seq_logprob_error_threshold=master_config["grpo"][
-                            "seq_logprob_error_threshold"
-                        ],
+                    # Seq-level logprob error metrics/masking require real prev_logprobs
+                    seq_logprob_error_threshold = master_config["grpo"].get(
+                        "seq_logprob_error_threshold", None
                     )
+                    if skip_prev_logprobs:
+                        # Cannot compute seq-level metrics with placeholder prev_logprobs
+                        assert seq_logprob_error_threshold is None, (
+                            "seq_logprob_error_threshold requires prev_logprobs computation; "
+                            "cannot use with force_on_policy_ratio=True"
+                        )
+                        max_seq_mult_prob_error = 0.0
+                        num_masked_seqs = 0
+                        masked_correct_pct = 0.0
+                    else:
+                        (
+                            max_seq_mult_prob_error,
+                            num_masked_seqs,
+                            masked_correct_pct,
+                        ) = compute_and_apply_seq_logprob_error_masking(
+                            train_data=train_data,
+                            rewards=rewards,
+                            seq_logprob_error_threshold=seq_logprob_error_threshold,
+                        )
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
