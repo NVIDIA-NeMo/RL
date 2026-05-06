@@ -314,6 +314,22 @@ class DynamicBatchingConfig(TypedDict):
     sequence_length_round: int
 
 
+class RoutingConfig(TypedDict):
+    enabled: bool
+    gate_every_n_layers: int
+    protect_first_n_groups: NotRequired[int]
+    protect_last_n_groups: NotRequired[int]
+    router_hidden_size: NotRequired[int]
+    router_lr: NotRequired[float]
+    init_keep_bias: NotRequired[float]
+    entropy_coef: NotRequired[float]
+    ratio_clip_min: NotRequired[float]
+    ratio_clip_max: NotRequired[float]
+    compute_penalty: NotRequired[float]
+    target_compute_fraction: NotRequired[float | None]
+    generation_top_k: NotRequired[int]
+
+
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
@@ -329,6 +345,7 @@ class PolicyConfig(TypedDict):
         int
     ]  # used in static batched (framework) generation
     precision: str
+    worker_extension_cls_fqn: NotRequired[str | None]
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
@@ -338,6 +355,7 @@ class PolicyConfig(TypedDict):
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
+    routing: NotRequired[RoutingConfig]
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float]

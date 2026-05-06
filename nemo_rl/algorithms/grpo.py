@@ -565,6 +565,7 @@ def setup(
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_optimizer=True,
+            worker_extension_cls_fqn=policy_config.get("worker_extension_cls_fqn"),
         )
         return p, time.perf_counter() - t0
 

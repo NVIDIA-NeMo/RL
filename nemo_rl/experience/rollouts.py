@@ -84,6 +84,19 @@ def generate_responses(
     # Extract truncated info if available (response hit max_tokens without stop token)
     response_truncated = generation_outputs.get("truncated")
 
+    # Optional metadata produced by generation extensions (for example routed
+    # layer-skip policies). Keep this close to generation so custom training
+    # loops can consume it without reimplementing rollout bookkeeping.
+    for key in (
+        "route_masks",
+        "route_logprobs",
+        "route_entropies",
+        "route_compute_fractions",
+        "route_keep_fractions",
+    ):
+        if key in generation_outputs:
+            batch[key] = generation_outputs[key]
+
     # Extract generated parts
     generated_ids = []
     for i in range(len(input_lengths)):

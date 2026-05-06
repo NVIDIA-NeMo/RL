@@ -1,0 +1,68 @@
+# Routed layer-skip GRPO MVP for the 1B math recipe.
+#
+# This uses the Megatron/framework generation path rather than vLLM so the
+# custom worker can actually skip transformer layer groups during rollout.
+#
+# Example:
+#   uv run python examples/run_routed_grpo.py \
+#     --config examples/configs/grpo_math_1B_routed.yaml
+
+defaults: "grpo_math_1B_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_steps: 200
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "results/grpo_math_1B_routed"
+
+policy:
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  generation_batch_size: 1
+  max_total_sequence_length: 512
+  worker_extension_cls_fqn: "nemo_rl.models.policy.workers.routed_megatron_policy_worker.RoutedMegatronPolicyWorker"
+
+  generation:
+    backend: "megatron"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+
+  dynamic_batching:
+    enabled: false
+
+  sequence_packing:
+    enabled: false
+
+  routing:
+    enabled: true
+    init_keep_bias: 2.0
+    router_lr: 1.0e-4
+    compute_penalty: 0.05
+    entropy_coef: 0.02
+
+    gate_every_n_layers: 4
+    protect_first_n_groups: 1
+    protect_last_n_groups: 1
+    router_hidden_size: 128
+
+    ratio_clip_min: 0.2
+    ratio_clip_max: 0.2
+    target_compute_fraction: null
+    generation_top_k: 50
+
+logger:
+  log_dir: "logs/grpo_math_1B_routed"
+  wandb_enabled: false
+  tensorboard_enabled: false
+  monitor_gpus: false

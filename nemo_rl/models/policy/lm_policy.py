@@ -695,6 +695,54 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return aggregated_results
 
+    def train_router(
+        self,
+        data: BatchedDataDict[Any],
+        timer: Optional[Timer] = None,
+    ) -> dict[str, Any]:
+        """Train a worker-extension router on a global batch.
+
+        This is intentionally extension-oriented: base policy workers do not expose
+        ``train_router``. Routed workers can implement it without changing the
+        token-level policy training contract.
+        """
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        with timer.time("router_training/sharding_data") if timer else nullcontext():
+            sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+
+        with (
+            timer.time("router_training/submit_training_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "train_router",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+            )
+        results = self.worker_group.get_all_worker_results(futures)
+
+        aggregated: dict[str, Any] = {}
+        for key in results[0]:
+            values = [result[key] for result in results]
+            if torch.is_tensor(values[0]):
+                aggregated[key] = torch.stack([v.detach().cpu() for v in values]).mean()
+            elif isinstance(values[0], (int, float)):
+                aggregated[key] = float(np.mean(values))
+            else:
+                aggregated[key] = values[0]
+        return aggregated
+
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
