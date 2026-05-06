@@ -146,10 +146,37 @@ def _patch_dgd_service_account(spec: dict[str, Any], service_account: str) -> No
         eps["serviceAccountName"] = service_account
 
 
+def build_owner_reference(
+    *,
+    api_version: str,
+    kind: str,
+    name: str,
+    uid: str,
+    block_owner_deletion: bool = False,
+) -> dict[str, Any]:
+    """Build a ``metadata.ownerReferences`` entry pointing at ``kind/name``.
+
+    The DGD already has a controller (the dynamo operator), so we set
+    ``controller: false`` — we are a non-controlling owner solely to drive
+    K8s garbage collection. ``blockOwnerDeletion=False`` keeps the parent's
+    deletion fast (the kubelet GC sweeps the DGD asynchronously).
+    """
+    return {
+        "apiVersion": api_version,
+        "kind": kind,
+        "name": name,
+        "uid": uid,
+        "controller": False,
+        "blockOwnerDeletion": block_owner_deletion,
+    }
+
+
 def build_dgd_manifest(
     dgd: DynamoGraphSpec,
     infra: InfraConfig,
     base_dir: Path,
+    *,
+    owner_ref: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the full DGD manifest ready for ``apply_dgd``.
 
@@ -159,7 +186,9 @@ def build_dgd_manifest(
       3. Override ``metadata.name`` if ``dgd.name`` is set.
       4. Set ``metadata.namespace = infra.namespace``.
       5. Merge ``dgd.labels`` / ``dgd.annotations`` and the ``managed-by`` label.
-      6. Patch cross-cutting fields (image / imagePullSecrets / serviceAccount)
+      6. Attach ``ownerReferences`` if provided so K8s GC cascades when the
+         owning resource (typically the training RayCluster) is deleted.
+      7. Patch cross-cutting fields (image / imagePullSecrets / serviceAccount)
          across every service's ``extraPodSpec``.
     """
     raw = load_dgd_manifest(dgd.manifest, base_dir)
@@ -194,6 +223,9 @@ def build_dgd_manifest(
     annotations = {**infra.annotations, **(metadata.get("annotations") or {}), **dgd.annotations}
     if annotations:
         metadata["annotations"] = annotations
+
+    if owner_ref is not None:
+        metadata["ownerReferences"] = [owner_ref]
 
     spec = raw["spec"]
     _patch_dgd_images(spec, infra.image)

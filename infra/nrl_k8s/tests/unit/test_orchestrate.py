@@ -653,7 +653,12 @@ class TestRunInvokesDgds:
 
         ensure_dgd = MagicMock(return_value="from-disk")
         monkeypatch.setattr(orchestrate, "ensure_dgd", ensure_dgd)
-        monkeypatch.setattr(orchestrate, "ensure_cluster", MagicMock(return_value="rc"))
+        monkeypatch.setattr(orchestrate, "ensure_cluster", MagicMock(return_value="rc-train"))
+        monkeypatch.setattr(
+            orchestrate.k8s,
+            "get_raycluster",
+            MagicMock(return_value={"metadata": {"uid": "test-uid"}}),
+        )
         monkeypatch.setattr(orchestrate, "submit_daemon", MagicMock())
         monkeypatch.setattr(orchestrate, "submit_training", MagicMock())
 
@@ -661,3 +666,48 @@ class TestRunInvokesDgds:
 
         ensure_dgd.assert_called_once()
         assert ensure_dgd.call_args.args[0] == "serving"
+
+    def test_run_passes_owner_ref_pointing_at_training_cluster(
+        self, tmp_path, monkeypatch, log
+    ) -> None:
+        log_fn, _ = log
+        loaded = _loaded_with_dgd(tmp_path)
+
+        ensure_dgd = MagicMock(return_value="from-disk")
+        monkeypatch.setattr(orchestrate, "ensure_dgd", ensure_dgd)
+        monkeypatch.setattr(orchestrate, "ensure_cluster", MagicMock(return_value="rc-train"))
+        monkeypatch.setattr(
+            orchestrate.k8s,
+            "get_raycluster",
+            MagicMock(return_value={"metadata": {"uid": "rc-train-uid"}}),
+        )
+        monkeypatch.setattr(orchestrate, "submit_daemon", MagicMock())
+        monkeypatch.setattr(orchestrate, "submit_training", MagicMock())
+
+        orchestrate.run(loaded, log=log_fn, repo_root=Path("/tmp"))
+
+        owner_ref = ensure_dgd.call_args.kwargs["owner_ref"]
+        assert owner_ref is not None
+        assert owner_ref["kind"] == "RayCluster"
+        assert owner_ref["name"] == "rc-train"
+        assert owner_ref["uid"] == "rc-train-uid"
+        assert owner_ref["controller"] is False
+
+    def test_run_no_owner_ref_when_no_dgds(
+        self, tmp_path, monkeypatch, log
+    ) -> None:
+        log_fn, _ = log
+        loaded = _loaded()  # no dynamo section
+
+        ensure_cluster = MagicMock(return_value="rc-train")
+        monkeypatch.setattr(orchestrate, "ensure_cluster", ensure_cluster)
+        get_rc = MagicMock()
+        monkeypatch.setattr(orchestrate.k8s, "get_raycluster", get_rc)
+        monkeypatch.setattr(orchestrate, "submit_daemon", MagicMock())
+        monkeypatch.setattr(orchestrate, "submit_training", MagicMock())
+
+        orchestrate.run(loaded, log=log_fn, repo_root=Path("/tmp"))
+
+        # Without DGDs, the early "fetch training UID" call never fires —
+        # the original lazy-bringup behaviour is preserved.
+        get_rc.assert_not_called()

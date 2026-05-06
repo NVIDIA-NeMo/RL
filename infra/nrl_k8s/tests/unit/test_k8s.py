@@ -176,6 +176,31 @@ class TestWaitForReady:
             k8s.wait_for_raycluster_ready("rc-a", "ns-a", timeout_s=10, poll_s=0)
 
 
+class TestWaitForRayJobRayClusterName:
+    def test_returns_name_when_status_populated(self, mock_custom_api, monkeypatch) -> None:
+        # First poll: rayjob exists but status.rayClusterName not yet set;
+        # second poll: KubeRay has populated it.
+        mock_custom_api.get_namespaced_custom_object.side_effect = [
+            {"status": {}},
+            {"status": {"rayClusterName": "rc-train-abc12"}},
+        ]
+        monkeypatch.setattr(k8s.time, "sleep", lambda _s: None)
+        out = k8s.wait_for_rayjob_raycluster_name(
+            "rj-train", "ns-a", timeout_s=10, poll_s=0
+        )
+        assert out == "rc-train-abc12"
+
+    def test_raises_on_timeout(self, mock_custom_api, monkeypatch) -> None:
+        mock_custom_api.get_namespaced_custom_object.return_value = {"status": {}}
+        monkeypatch.setattr(k8s.time, "sleep", lambda _s: None)
+        ticks = iter([0.0, 100.0, 100.0, 100.0])
+        monkeypatch.setattr(k8s.time, "monotonic", lambda: next(ticks, 100.0))
+        with pytest.raises(TimeoutError):
+            k8s.wait_for_rayjob_raycluster_name(
+                "rj-train", "ns-a", timeout_s=10, poll_s=0
+            )
+
+
 # =============================================================================
 # delete_configmap
 # =============================================================================
