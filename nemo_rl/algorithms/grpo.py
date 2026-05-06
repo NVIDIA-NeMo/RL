@@ -1070,13 +1070,17 @@ def scale_rewards(
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
-    Returns True if vLLM backend is used with async_engine enabled.
+    Returns True for vLLM backend with async_engine enabled, or for the
+    Dynamo backend (which is intrinsically HTTP-only and async — there is
+    no in-process generate() path).
     """
     generation_config = master_config.policy["generation"]
     if generation_config is None:
         return False
 
     backend = generation_config.get("backend", "")
+    if backend == "dynamo":
+        return True
     if backend != "vllm":
         return False
 
@@ -1093,15 +1097,24 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
 
     # Validate the setup for training with NeMo-Gym
     assert _should_use_async_rollouts(master_config), (
-        "❌ Error: In order to use NeMo-Gym, you must use vllm generation backend with `async_engine: true`!"
+        "❌ Error: In order to use NeMo-Gym, you must use the vllm generation "
+        "backend with `async_engine: true`, or the dynamo backend!"
     )
 
-    # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
-    generation_config = master_config.policy["generation"]
-    should_expose_http_server = generation_config["vllm_cfg"].get("expose_http_server")
-    assert should_expose_http_server, (
-        "In order to use NeMo-Gym, you must expose the vllm server via `expose_http_server: true`!"
-    )
+    generation_config = master_config["policy"]["generation"]
+    backend = generation_config.get("backend", "")
+
+    # vllm-specific gate: the gym dispatches rollouts to the colocated
+    # vLLM's HTTP server, so it has to be exposed. Dynamo always exposes
+    # an HTTP frontend (it's the only path), so no analogous check there.
+    if backend == "vllm":
+        should_expose_http_server = generation_config["vllm_cfg"].get(
+            "expose_http_server"
+        )
+        assert should_expose_http_server, (
+            "In order to use NeMo-Gym with the vllm backend, you must expose "
+            "the server via `expose_http_server: true`!"
+        )
 
     return should_use_nemo_gym
 
