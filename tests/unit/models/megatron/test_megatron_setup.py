@@ -1190,11 +1190,11 @@ class TestSetupReferenceModelState:
 
         # Verify state dict is returned
         assert isinstance(result, dict)
-        assert "layer1.weight" in result
-        assert "layer1.bias" in result
+        assert "0/layer1.weight" in result
+        assert "0/layer1.bias" in result
 
         # Verify tensors are on CPU
-        assert result["layer1.weight"].device.type == "cpu"
+        assert result["0/layer1.weight"].device.type == "cpu"
 
         captured = capsys.readouterr()
         assert "Reference model loaded" in captured.out
