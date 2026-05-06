@@ -13,8 +13,8 @@
 # limitations under the License.
 
 #!/bin/bash
-# Shard: automodel-marked policy worker tests (test_dtensor_worker*.py, test_automodel_types.py)
+# Shard: mcore-marked policy worker tests (test_megatron_worker.py)
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
-uv run --extra automodel bash -x ./tests/run_unit.sh "unit/models/policy/" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated --automodel-only
+uv run --extra mcore bash -x ./tests/run_unit.sh "unit/models/policy/" "${EXCLUDED_UNIT_TESTS[@]}" --shard-id=2 --num-shards=3 --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated --mcore-only

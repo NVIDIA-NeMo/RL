@@ -186,6 +186,7 @@ test = [
   "pytest-cov",
   "pytest-asyncio",
   "pytest-testmon",
+  "pytest-shard",
 ]
 
 [tool.uv.sources]
