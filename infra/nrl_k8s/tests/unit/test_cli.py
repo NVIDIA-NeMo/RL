@@ -132,11 +132,9 @@ class TestCheck:
         assert result.exit_code == 0, result.output
         parsed = json.loads(out.read_text())
         assert parsed["infra"]["image"] == "img:new"
-        assert parsed["manifests"]["training"]["metadata"]["name"] == "rc-t"
-        # Image is patched through into the rendered manifest.
-        containers = parsed["manifests"]["training"]["spec"]["headGroupSpec"][
-            "template"
-        ]["spec"]["containers"]
+        [rc] = [m for m in parsed["manifests"] if m["kind"] == "RayCluster"]
+        assert rc["metadata"]["name"] == "rc-t"
+        containers = rc["spec"]["headGroupSpec"]["template"]["spec"]["containers"]
         assert containers[0]["image"] == "img:new"
 
     def test_reports_validation_error_cleanly(self, tmp_path) -> None:

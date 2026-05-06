@@ -205,19 +205,36 @@ def main() -> None:
     default=None,
     help="Override the format when using --output. Defaults to the extension.",
 )
+@click.option(
+    "--manifests-only",
+    is_flag=True,
+    default=False,
+    help="Emit only K8s manifests as a multi-document YAML stream. "
+    "Writes to stdout, or to --output if set. Suitable for "
+    "kubectl apply -f -.",
+)
 def check(
     recipe: Path,
     overrides: tuple[str, ...],
     infra_path: Path | None,
     output_path: Path | None,
     output_format: str | None,
+    manifests_only: bool,
 ) -> None:
     """Load + validate a recipe/infra pair and print a one-line summary per role.
 
-    Dumps the fully-resolved config + rendered RayCluster manifests
-    to a file with ``-o``. Replaces the former ``validate`` + ``plan``.
+    Dumps the fully-resolved config + rendered K8s manifests to a file
+    with ``-o``. Use ``--manifests-only`` for a multi-document YAML stream
+    that can be piped to ``kubectl apply -f -``.
     """
-    from .manifest import build_deployment_manifest, build_raycluster_manifest
+    from .manifest import (
+        build_compute_domain_manifest,
+        build_deployment_manifest,
+        build_raycluster_manifest,
+        build_roce_template_manifest,
+        build_service_for_deployment,
+        dra_resources_for_cluster,
+    )
 
     try:
         loaded = load_recipe_with_infra(
@@ -226,30 +243,54 @@ def check(
     except Exception as exc:  # noqa: BLE001 — surface the full message to the user
         _explain_and_exit(exc, context="failed to load recipe")
 
-    manifests: dict[str, dict] = {}
+    all_manifests: list[dict] = []
+    ns = loaded.infra.namespace
+
     for role in ALL_ROLES:
         cluster = getattr(loaded.infra.kuberay, role)
         if cluster is None:
             continue
-        manifests[role] = build_raycluster_manifest(cluster, loaded.infra, role=role)
+        rc_manifest = build_raycluster_manifest(cluster, loaded.infra, role=role)
+        for kind, name in dra_resources_for_cluster(
+            cluster.name, role, rc_manifest["spec"]
+        ):
+            if kind == "compute-domain":
+                all_manifests.append(build_compute_domain_manifest(name, ns))
+            elif kind == "roce":
+                all_manifests.append(build_roce_template_manifest(name, ns))
+        all_manifests.append(rc_manifest)
 
-    dep_manifests: dict[str, dict] = {}
-    for key, dep_spec in loaded.infra.deployments.items():
-        dep_manifests[key] = build_deployment_manifest(dep_spec, loaded.infra)
+    for _key, dep_spec in loaded.infra.deployments.items():
+        all_manifests.append(build_deployment_manifest(dep_spec, loaded.infra))
+        svc = build_service_for_deployment(dep_spec, loaded.infra)
+        if svc is not None:
+            all_manifests.append(svc)
 
-    if output_path is not None:
-        _dump_check_output(loaded, manifests, output_path, output_format, dep_manifests)
-        total = len(manifests) + len(dep_manifests)
-        click.echo(f"wrote full config + {total} manifest(s) to {output_path}")
+    if manifests_only:
+        stream = "\n---\n".join(
+            yaml.safe_dump(m, sort_keys=False) for m in all_manifests
+        )
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(stream)
+            click.echo(f"wrote {len(all_manifests)} manifest(s) to {output_path}")
+        else:
+            click.echo(stream, nl=False)
         return
 
-    _print_check_summary(loaded, manifests, dep_manifests)
+    if output_path is not None:
+        _dump_check_output(loaded, all_manifests, output_path, output_format)
+        click.echo(
+            f"wrote full config + {len(all_manifests)} manifest(s) to {output_path}"
+        )
+        return
+
+    _print_check_summary(loaded, all_manifests)
 
 
 def _print_check_summary(
     loaded: LoadedConfig,
-    manifests: dict[str, dict],
-    dep_manifests: dict[str, dict] | None = None,
+    all_manifests: list[dict],
 ) -> None:
     """One-page overview — namespace, image, launch/attach, per-role highlights."""
     infra = loaded.infra
@@ -268,68 +309,103 @@ def _print_check_summary(
         click.echo("entrypoint:")
         _print_block(infra.launch.entrypoint)
 
+    by_kind: dict[str, list[dict]] = {}
+    for m in all_manifests:
+        by_kind.setdefault(m["kind"], []).append(m)
+
+    rc_by_name = {m["metadata"]["name"]: m for m in by_kind.get("RayCluster", [])}
     click.echo("")
     click.echo("KUBERAY")
     click.echo("-------")
-    if not manifests:
-        click.echo("  (none declared)")
-    else:
-        for role, m in manifests.items():
-            spec = m["spec"]
-            name = m["metadata"]["name"]
-            head = spec.get("headGroupSpec", {}).get("template", {}).get("spec", {})
-            head_res = (
-                head.get("containers", [{}])[0].get("resources", {}).get("limits") or {}
+    has_clusters = False
+    for role in ALL_ROLES:
+        cluster_obj = getattr(infra.kuberay, role)
+        if cluster_obj is None:
+            continue
+        has_clusters = True
+        m = rc_by_name.get(cluster_obj.name)
+        if m is None:
+            continue
+        spec = m["spec"]
+        name = m["metadata"]["name"]
+        head = spec.get("headGroupSpec", {}).get("template", {}).get("spec", {})
+        head_res = (
+            head.get("containers", [{}])[0].get("resources", {}).get("limits") or {}
+        )
+        workers = spec.get("workerGroupSpecs") or []
+        wrep = sum(int(w.get("replicas", 0)) for w in workers)
+        wgpu = 0
+        wcpu = wmem = "—"
+        if workers:
+            w_res = (
+                workers[0]
+                .get("template", {})
+                .get("spec", {})
+                .get("containers", [{}])[0]
+                .get("resources", {})
+                .get("limits")
+                or {}
             )
-            workers = spec.get("workerGroupSpecs") or []
-            wrep = sum(int(w.get("replicas", 0)) for w in workers)
-            wgpu = 0
-            wcpu = wmem = "—"
-            if workers:
-                w_res = (
-                    workers[0]
-                    .get("template", {})
-                    .get("spec", {})
-                    .get("containers", [{}])[0]
-                    .get("resources", {})
-                    .get("limits")
-                    or {}
+            wgpu = int(w_res.get("nvidia.com/gpu", 0)) * wrep
+            wcpu = w_res.get("cpu", "—")
+            wmem = w_res.get("memory", "—")
+        daemon = cluster_obj.daemon
+        daemon_id = daemon.submissionId if daemon else "—"
+
+        click.echo(f"  {role}: {name}")
+        click.echo(
+            f"    head    cpu={head_res.get('cpu', '—')} mem={head_res.get('memory', '—')}"
+        )
+        if workers:
+            seg = cluster_obj.segmentSize
+            if seg and len(workers) > 1:
+                click.echo(
+                    f"    workers {wrep}x ({len(workers)} segments x {seg})"
+                    f" cpu={wcpu} mem={wmem} gpu={wgpu}"
                 )
-                wgpu = int(w_res.get("nvidia.com/gpu", 0)) * wrep
-                wcpu = w_res.get("cpu", "—")
-                wmem = w_res.get("memory", "—")
-            daemon = getattr(loaded.infra.kuberay, role).daemon
-            daemon_id = daemon.submissionId if daemon else "—"
-
-            click.echo(f"  {role}: {name}")
-            click.echo(
-                f"    head    cpu={head_res.get('cpu', '—')} mem={head_res.get('memory', '—')}"
-            )
-            if workers:
-                cluster_obj = getattr(loaded.infra.kuberay, role)
-                seg = cluster_obj.segmentSize if cluster_obj else None
-                if seg and len(workers) > 1:
-                    click.echo(
-                        f"    workers {wrep}x ({len(workers)} segments x {seg})"
-                        f" cpu={wcpu} mem={wmem} gpu={wgpu}"
-                    )
-                else:
-                    click.echo(f"    workers {wrep}x cpu={wcpu} mem={wmem} gpu={wgpu}")
             else:
-                click.echo("    workers (none — head-only)")
-            click.echo(f"    daemon  {daemon_id}")
-            if daemon and daemon.entrypoint:
-                click.echo("    entrypoint:")
-                _print_block(daemon.entrypoint, indent="      ")
+                click.echo(f"    workers {wrep}x cpu={wcpu} mem={wmem} gpu={wgpu}")
+        else:
+            click.echo("    workers (none — head-only)")
+        click.echo(f"    daemon  {daemon_id}")
+        if daemon and daemon.entrypoint:
+            click.echo("    entrypoint:")
+            _print_block(daemon.entrypoint, indent="      ")
+    if not has_clusters:
+        click.echo("  (none declared)")
 
-    if dep_manifests:
+    deployments = by_kind.get("Deployment", [])
+    if deployments:
         click.echo("")
         click.echo("DEPLOYMENTS")
         click.echo("-----------")
-        for key, m in dep_manifests.items():
+        for m in deployments:
             name = m["metadata"]["name"]
             replicas = m["spec"].get("replicas", 1)
-            click.echo(f"  {key}: {name} (replicas={replicas})")
+            click.echo(f"  {name} (replicas={replicas})")
+
+    services = by_kind.get("Service", [])
+    if services:
+        click.echo("")
+        click.echo("SERVICES")
+        click.echo("--------")
+        for m in services:
+            name = m["metadata"]["name"]
+            ports = m["spec"].get("ports", [])
+            port_str = ", ".join(f"{p.get('name', '?')}:{p['port']}" for p in ports)
+            click.echo(f"  {name} ({port_str})")
+
+    dra = [
+        m
+        for m in all_manifests
+        if m["kind"] in ("ComputeDomain", "ResourceClaimTemplate")
+    ]
+    if dra:
+        click.echo("")
+        click.echo("DRA RESOURCES")
+        click.echo("-------------")
+        for m in dra:
+            click.echo(f"  {m['kind']}: {m['metadata']['name']}")
 
 
 def _print_block(text: str, *, indent: str = "  ") -> None:
@@ -346,19 +422,16 @@ def _print_block(text: str, *, indent: str = "  ") -> None:
 
 def _dump_check_output(
     loaded: LoadedConfig,
-    manifests: dict[str, dict],
+    all_manifests: list[dict],
     path: Path,
     fmt_override: str | None,
-    dep_manifests: dict[str, dict] | None = None,
 ) -> None:
     fmt = fmt_override or ("json" if path.suffix == ".json" else "yaml")
     bundle = {
         "infra": loaded.infra.model_dump(mode="json"),
         "recipe": OmegaConf.to_container(loaded.recipe, resolve=True),
-        "manifests": manifests,
+        "manifests": all_manifests,
     }
-    if dep_manifests:
-        bundle["deployment_manifests"] = dep_manifests
     path.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "json":
         path.write_text(json.dumps(bundle, indent=2, sort_keys=True))
