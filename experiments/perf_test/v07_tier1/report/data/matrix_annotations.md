@@ -28,14 +28,29 @@ Replace the INVALID rows with these once they steady-state.
 
 Commit 1f788697 also adds runtime override in `_apply_performance_config`. Prior runs may or may not reflect the yaml depending on whether the cached megatron checkpoint was built with the toggle. Phase B does not re-run grad_accum, but next pass should re-measure 06 to lock the verdict.
 
-## Phase A interim: llama_8b fused_residual_rmsnorm (OCI-HSG)
+## Phase A finals: fused_residual_rmsnorm (OCI-HSG, n=8 post-warmup each)
 
-- Baseline 2586264: E2E TPS/GPU median 3618 (post-warmup, n=8)
-- Variant  2586265: E2E TPS/GPU median 3711 (post-warmup, n=8)
-- **Delta: +2.57%** — borderline (within-batch noise band ±2%). Need 30B/32B/235B pairs to draw conclusion.
+| pair | baseline E2E | variant E2E | delta |
+|------|--------------|-------------|-------|
+| llama_8b 2586264/2586265 | 3618 | 3711 | +2.57% |
+| qwen3_30b 2586266/2586267 | 1845 | 1845 | -0.02% |
+| qwen3_32b 2586268/2586269 | 1224 | 1221 | -0.29% |
+| qwen3_235b 2586270/2586271 | pending | pending | — |
+
+3/3 completed pairs show no measurable speedup at GB200 scale. Llama_8b +2.57% is borderline (above ±2% but within inter-batch noise observed across same-yaml runs at 3.6%). Conclusion subject to 235B confirm.
+
+## Phase C interim: llama_8b ce_te_fusion (OCI-HSG)
+
+- Baseline 2586671: median 3749 (n=8)
+- Variant ce_te_fusion 2586673: median 3810 (n=8)
+- **Delta: +1.62%** — within noise. Note: baseline differs from Phase A's same-yaml baseline by 3.6% (3618 vs 3749) — confirms inter-batch variance is real and pair-isolation matters.
 
 ## Phase C jobs
 
-- OCI-HSG: 2586671–2586679 (9 jobs, llama_8b + 30B + 32B variants for cuda_graph + ce_te_fusion + nccl_ub)
-- Lyris: 1692930–1692938 (mirror set), all PENDING due to 235B-priority queue head
-- Submitted at commit 5b5a3473; running jobs equivalent to bd5d8196 since `use_custom_fsdp=false` matches mcore default and `reuse_grad_buf_for_mxfp8_param_ag` not set.
+- OCI-HSG initial: 2586671-2586679 (9 jobs at 5b5a3473)
+- Lyris initial: 1692930-1692938 (all still PENDING)
+- **CUDA-graph variants FAILED** (2586672, 2586675, 2586677): missing `use_te_rng_tracker=true` + llama recompute conflict. Fixed in d3bd8f24.
+- OCI-HSG retry: 2587286-2587292 (paired base+v07_12 for all 3 models)
+- Lyris retry: 1693100-1693105
+
+Behavioral equivalence note: original Phase C jobs ran at 5b5a3473; subsequent commit bd5d8196 added `use_custom_fsdp` wiring + `reuse_grad_buf_for_mxfp8_param_ag` allowlist. Neither changed runtime behavior since all yamls use mcore defaults for these.
