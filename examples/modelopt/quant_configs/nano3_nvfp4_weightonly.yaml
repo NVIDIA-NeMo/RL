@@ -1,0 +1,74 @@
+# Nano3 (NemotronH) NVFP4 weight-only (W4A16) custom quantization recipe.
+#
+# Reference this from a NeMo-RL YAML config:
+#
+#     policy:
+#       quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml"
+#
+# Defines W4A16: NVFP4 (e2m1, dynamic e4m3 micro-block scales) on
+# weights only; activations stay in the model's native dtype (BF16/FP16).
+# Disables layers Nano3 keeps in BF16:
+#   - attention QKV / output projection (HF q_proj/k_proj/v_proj/o_proj,
+#     fused qkv_proj, Megatron linear_qkv / linear_proj)
+#   - mamba conv1d (incompatible with NVFP4)
+#   - explicit pre-attention layers 4/11/18/25/32/41 (BF16 by design)
+#   - lm_head / output_layer and BatchNorm (sensitive layers)
+#
+# Then disables ``*input_quantizer`` and ``*output_quantizer`` so only
+# the weight quantizers remain enabled.
+#
+# See https://github.com/NVIDIA/Model-Optimizer for the full set of
+# supported quantizer options and built-in PTQ recipes.
+metadata:
+  recipe_type: ptq
+  description: Nano3 NVFP4 W4A16 (weight-only) recipe.
+quantize:
+  algorithm: max
+  quant_cfg:
+    - quantizer_name: '*'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*.[q|k|v|o]_proj.*'
+      enable: false
+    - quantizer_name: '*.qkv_proj.*'
+      enable: false
+    - quantizer_name: '*.linear_proj.*'
+      enable: false
+    - quantizer_name: '*.linear_qkv.*'
+      enable: false
+    - quantizer_name: '*mixer.conv1d*'
+      enable: false
+    - quantizer_name: '*.layers.4.*'
+      enable: false
+    - quantizer_name: '*.layers.11.*'
+      enable: false
+    - quantizer_name: '*.layers.18.*'
+      enable: false
+    - quantizer_name: '*.layers.25.*'
+      enable: false
+    - quantizer_name: '*.layers.32.*'
+      enable: false
+    - quantizer_name: '*.layers.41.*'
+      enable: false
+    - quantizer_name: '*lm_head*'
+      enable: false
+    - quantizer_name: '*output_layer*'
+      enable: false
+    - parent_class: 'nn.BatchNorm1d'
+      quantizer_name: '*'
+      enable: false
+    - parent_class: 'nn.BatchNorm2d'
+      quantizer_name: '*'
+      enable: false
+    - parent_class: 'nn.BatchNorm3d'
+      quantizer_name: '*'
+      enable: false
+    - quantizer_name: '*input_quantizer'
+      enable: false
+    - quantizer_name: '*output_quantizer'
+      enable: false
