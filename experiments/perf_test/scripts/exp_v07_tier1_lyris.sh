@@ -15,8 +15,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export BASE="${BASE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/Nemo-RL_feature_test}"
-export CONTAINER="${CONTAINER:-${BASE}/nemo_rl.sqsh}"
-export HF_HOME="${HF_HOME:-${BASE}/hf_home}"
+export CONTAINER="${CONTAINER:-${BASE}/RL/nemo_rl_nightly.sqsh}"
+# Shared HF cache lives one level above BASE, alongside other Lyris workspaces.
+export HF_HOME="${HF_HOME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/hf_home}"
 export ACCOUNT="${ACCOUNT:-coreai_dlalgo_llm}"
 export PARTITION="${PARTITION:-gb200}"
 # Empty GRES_FLAG: cluster_config.sh respects existing (even empty) value via +x check.
