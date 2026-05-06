@@ -30,6 +30,7 @@ from megatron.bridge.training.checkpointing import (
     init_checkpointing_context,
     load_checkpoint,
 )
+from megatron.bridge.training.comm_overlap import CommOverlapConfig
 from megatron.bridge.training.config import (
     CheckpointConfig,
     ConfigContainer,
@@ -484,6 +485,16 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # Fusion settings
     model_cfg.apply_rope_fusion = config["megatron_cfg"]["apply_rope_fusion"]
     model_cfg.bias_activation_fusion = config["megatron_cfg"]["bias_activation_fusion"]
+
+    # G6 fusion bundle (Tier 1) — only override when explicitly set in config to
+    # preserve the Bridge model-provider defaults otherwise.
+    for _knob in (
+        "bias_dropout_add_fusion",
+        "masked_softmax_fusion",
+        "persist_layer_norm",
+    ):
+        if _knob in config["megatron_cfg"]:
+            setattr(model_cfg, _knob, config["megatron_cfg"][_knob])
     # Optional explicit attention backend override for environments where
     # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")
@@ -617,6 +628,30 @@ def _validate_dtype_config(
         )
 
 
+def _build_comm_overlap_config(config: PolicyConfig) -> Optional[CommOverlapConfig]:
+    """Build the CommOverlapConfig from policy.megatron_cfg knobs.
+
+    Returns None when none of the comm-overlap knobs are set, so we preserve
+    Bridge's default (no comm overlap config attached).
+    """
+    mcfg = config["megatron_cfg"]
+    knobs = {
+        "tp_comm_overlap": mcfg.get("tp_comm_overlap"),
+        "delay_wgrad_compute": mcfg.get("delay_wgrad_compute"),
+        "overlap_moe_expert_parallel_comm": mcfg.get(
+            "overlap_moe_expert_parallel_comm"
+        ),
+    }
+    if all(v is None for v in knobs.values()):
+        return None
+    # tp_comm_overlap is a required positional in CommOverlapConfig — default False.
+    return CommOverlapConfig(
+        tp_comm_overlap=bool(knobs["tp_comm_overlap"]),
+        delay_wgrad_compute=knobs["delay_wgrad_compute"],
+        overlap_moe_expert_parallel_comm=knobs["overlap_moe_expert_parallel_comm"],
+    )
+
+
 def _create_megatron_config(
     model_cfg: Any,
     checkpoint_config: CheckpointConfig,
@@ -628,6 +663,7 @@ def _create_megatron_config(
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
+        comm_overlap=_build_comm_overlap_config(config),
         logger=LoggerConfig(logging_level=0),
         train=TrainingConfig(
             micro_batch_size=1,  # ignored

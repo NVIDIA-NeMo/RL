@@ -220,6 +220,18 @@ class MegatronConfig(TypedDict):
     apply_rope_fusion: bool
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: bool
+    # G6 fusion bundle (Tier 1): pure passthrough kernel fusions on the model provider.
+    # Default to None (preserve Bridge default) — set explicitly via YAML to override.
+    bias_dropout_add_fusion: NotRequired[bool]
+    masked_softmax_fusion: NotRequired[bool]
+    persist_layer_norm: NotRequired[bool]
+    # G1 (Tier 1): tensor-parallel communication overlap via UserBuffers.
+    # Requires sequence_parallel=True. May need NCCL UserBuffers/symmem env in container.
+    tp_comm_overlap: NotRequired[bool]
+    # G5 (Tier 1): asymmetric dgrad/wgrad scheduling. Stacks with tp_comm_overlap.
+    delay_wgrad_compute: NotRequired[bool]
+    # G3 (Tier 1, MoE-only): overlap MoE A2A combine backprop with wgrad GEMM (MLM #3795).
+    overlap_moe_expert_parallel_comm: NotRequired[bool]
     # Force reconvert from HF even if the checkpoint already exists (default: False)
     force_reconvert_from_hf: NotRequired[bool]
     # Attention backend available values:
