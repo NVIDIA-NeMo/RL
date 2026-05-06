@@ -166,6 +166,87 @@ NaN appears only at deeper layers, the source is between MoE layers.
 Re-running the W4A4 job with this probe and reading the `[DBG-W4A4]`
 lines from the driver log.
 
-## Step 6 — Fix and verify
+## Step 6 — Probe results and root-cause confirmation
 
-(to fill in once the probe identifies the upstream module)
+Job 157662 reproduced the crash with the diagnostic probe in place.
+Every `[DBG-W4A4]` line printed identically:
+
+```
+[DBG-W4A4] w13 expert input A shape=(1, 2688) dtype=torch.bfloat16
+  has_nan=True has_inf=False min=0 max=0
+```
+
+Reading the probe output:
+- `shape=(1, 2688)` — one row, hidden_size=2688 (matches Nemotron-3-Nano).
+- `dtype=bfloat16` — the expected MoE expert input dtype.
+- `has_nan=True, has_inf=False` — only NaN, no Inf.
+- After `nan_to_num(0.0)`, `min=max=0` — every element of `A` is NaN.
+
+A *fully* NaN tensor (rather than a partial mix of finite and NaN
+values) is the signature of an uninitialized buffer, not the result
+of a numerical blow-up. Combined with the new vLLM call path going
+through `vllm/model_executor/layers/fused_moe/modular_kernel.py`,
+the conclusion is:
+
+> The new container's vLLM `_dummy_run` includes a
+> `modular_kernel`-driven pre-compile pass that invokes the fused-MoE
+> kernel **once per expert** with an uninitialized `(1, hidden)`
+> bfloat16 buffer, regardless of routing, to JIT-compile the triton
+> kernel for that shape. ModelOpt's `_invoke_fused_moe_quantized_function`
+> hook intercepts those compile-only calls and tries to calibrate
+> amax on uninitialized memory.
+
+The dirty branch's prior W4A4 run (job 156103, 2026-05-04) ran on an
+older container whose vLLM did not have this per-expert pre-compile
+pass, so all expert calls were on real (routed) activations and
+calibrated cleanly with `amax≈0.0003`.
+
+## Step 7 — Fix
+
+Patch `modelopt/torch/quantization/plugins/vllm.py:
+`_invoke_fused_moe_quantized_function`:
+
+```python
+# vLLM's modular_kernel pre-compile pass invokes this hook once per
+# expert during `_dummy_run`, regardless of routing, to JIT-compile
+# the triton kernel for the expected shape. For experts with no
+# routed tokens, A is an uninitialized bfloat16 buffer (entirely NaN
+# bit patterns). The fakequant calibration prolog overwrites every
+# quantizer's amax with -1.0 sentinels right after this loop ends —
+# numerical amax produced during calibration is discarded; the real
+# amax is delivered by the Megatron policy worker via QAT/refit. So
+# treating a fully-NaN no-token buffer as zeros here loses no info.
+# Genuine numerical NaN (mixed finite + NaN) still propagates and
+# legitimately trips MaxCalibrator's NaN guard.
+if A.numel() > 0 and torch.isnan(A).all():
+    A = torch.zeros_like(A)
+```
+
+Why this is safe:
+- During real inference (post-calibration), `MaxCalibrator.collect`
+  is not called at all — `TensorQuantizer.forward` only calls
+  `collect` when the calibrator is enabled. So the workaround can
+  never silence a real-inference NaN.
+- Partial NaN (mixed finite + NaN) is left untouched, so genuine
+  numerical bugs (e.g., a Mamba state explosion) still surface.
+- The amax this calibration step produces is overwritten with `-1.0`
+  immediately after by `_fakequant_run_prolog_worker`, so the
+  numerical value of "amax of zeros = 0" is discarded.
+
+## Step 8 — Verify
+
+Resubmitting the W4A4 SFT real job (`opd_nemotron_nano3_nvfp4_default_sft0.1_t1.4_ep8_cp4.sh`)
+with this fix in place. Expected: vLLM `compile_or_warm_up_model`
+completes; calibration prolog finishes; training begins; per-step
+`Training Results` reach `Loss / KL Loss / SFT Loss / Mean Generation Length`
+prints; `train/total_reward` lands in the BF16 baseline range
+(0.84-0.86). If the run reaches step 1 with finite reward, the
+diagnosis and fix are validated.
+
+## Cleanup
+
+The diagnostic print probe at the entry of
+`_invoke_fused_moe_quantized_function` was replaced in-place by the
+fix. The modelopt repo's `main` is otherwise unchanged from the
+state at investigation start (other pre-existing local KV-cache
+patches are untouched).
