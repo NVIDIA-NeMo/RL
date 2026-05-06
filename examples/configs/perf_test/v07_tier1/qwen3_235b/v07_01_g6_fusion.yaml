@@ -1,0 +1,21 @@
+defaults: ../../../recipes/llm/performance/grpo-qwen3-235b-16n8g.yaml
+
+# v0.7 Tier 1 variant: G6 fusion bundle (Qwen3 235B, 16n8g).
+checkpointing:
+  enabled: false
+grpo:
+  max_num_steps: 10
+logger:
+  log_dir: logs/perf_test/v07_tier1/qwen3_235b/v07_01_g6_fusion
+  wandb_enabled: false
+  tensorboard_enabled: true
+policy:
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    bias_dropout_add_fusion: true
+    masked_softmax_fusion: true
+    persist_layer_norm: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      CUDA_HOME: /usr/local/cuda

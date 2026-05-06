@@ -1,0 +1,19 @@
+defaults: ../../../recipes/llm/performance/grpo-llama3.1-8b-instruct-2n8g.yaml
+
+# v0.7 Tier 1 baseline (Llama 3.1 8B, 2n8g): no Tier 1 knobs set.
+# Reference for the v07_* variants in this directory.
+checkpointing:
+  enabled: false
+grpo:
+  max_num_steps: 10
+logger:
+  log_dir: logs/perf_test/v07_tier1/llama_8b/v07_00_baseline
+  wandb_enabled: false
+  tensorboard_enabled: true
+policy:
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      CUDA_HOME: /usr/local/cuda

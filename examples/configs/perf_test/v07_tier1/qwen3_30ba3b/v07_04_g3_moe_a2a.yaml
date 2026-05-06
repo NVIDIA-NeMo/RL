@@ -1,0 +1,21 @@
+defaults: ../../../recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml
+
+# v0.7 Tier 1 variant: G3 MoE A2A combine + wgrad GEMM overlap (Qwen3 30B-A3B, 4n8g).
+# Hides MoE all-to-all combine under wgrad. Stacks with #2278 GroupedGEMM.
+checkpointing:
+  enabled: false
+grpo:
+  max_num_steps: 10
+logger:
+  log_dir: logs/perf_test/v07_tier1/qwen3_30ba3b/v07_04_g3_moe_a2a
+  wandb_enabled: false
+  tensorboard_enabled: true
+policy:
+  make_sequence_length_divisible_by: 128
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    overlap_moe_expert_parallel_comm: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      CUDA_HOME: /usr/local/cuda

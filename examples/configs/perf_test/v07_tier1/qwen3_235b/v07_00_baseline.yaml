@@ -1,0 +1,18 @@
+defaults: ../../../recipes/llm/performance/grpo-qwen3-235b-16n8g.yaml
+
+# v0.7 Tier 1 baseline (Qwen3 235B-A22B MoE, 16n8g, TP=2 PP=8 CP=2 EP=16 SP=on).
+checkpointing:
+  enabled: false
+grpo:
+  max_num_steps: 10
+logger:
+  log_dir: logs/perf_test/v07_tier1/qwen3_235b/v07_00_baseline
+  wandb_enabled: false
+  tensorboard_enabled: true
+policy:
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      CUDA_HOME: /usr/local/cuda

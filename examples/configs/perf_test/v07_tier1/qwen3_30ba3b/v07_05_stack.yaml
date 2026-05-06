@@ -1,0 +1,24 @@
+defaults: ../../../recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml
+
+# v0.7 Tier 1 stack (Qwen3 30B-A3B MoE, 4n8g): G6 fusion + G3 MoE A2A overlap.
+# G1 (tp_comm_overlap) and G5 (delay_wgrad) skipped for this recipe (TP=1).
+checkpointing:
+  enabled: false
+grpo:
+  max_num_steps: 10
+logger:
+  log_dir: logs/perf_test/v07_tier1/qwen3_30ba3b/v07_05_stack
+  wandb_enabled: false
+  tensorboard_enabled: true
+policy:
+  make_sequence_length_divisible_by: 128
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    bias_dropout_add_fusion: true
+    masked_softmax_fusion: true
+    persist_layer_norm: true
+    overlap_moe_expert_parallel_comm: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      CUDA_HOME: /usr/local/cuda
