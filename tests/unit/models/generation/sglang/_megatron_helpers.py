@@ -340,7 +340,11 @@ def make_sglang_cfg(
         "ep_size": sglang.ep_size,
         "disable_piecewise_cuda_graph": True,
         "disable_cuda_graph": sglang.disable_cuda_graph,
-        "mem_fraction_static": 0.7,
+        # Colocate shares the GPU with Megatron's resident weights+optimizer
+        # so the engine can't claim the larger 0.7 slice without OOMing
+        # during the step-8 ``onload_kv`` resume. Disag has the GPU to
+        # itself and benefits from the larger KV cache budget.
+        "mem_fraction_static": 0.3 if colocated else 0.7,
     }
     if sglang.enable_dp_attention:
         sglang_cfg["enable_dp_attention"] = True
