@@ -1,0 +1,21 @@
+defaults: ../../../recipes/llm/performance/grpo-qwen3-30ba3b-4n4g.yaml
+
+# Phase A — MLM PR #3384 (fused_residual_rmsnorm) on Qwen3-30B-A3B MoE.
+# Toggles fused dLN+add bwd kernel on RMSNorm. Pairs with v07_00_baseline.
+checkpointing:
+  enabled: false
+grpo:
+  max_num_steps: 10
+logger:
+  log_dir: logs/perf_test/v07_tier1/qwen3_30ba3b/v07_11_fused_resid_rmsnorm
+  wandb_enabled: false
+  tensorboard_enabled: true
+policy:
+  make_sequence_length_divisible_by: 128
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    fused_residual_rmsnorm: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      CUDA_HOME: /usr/local/cuda

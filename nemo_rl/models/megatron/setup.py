@@ -492,6 +492,7 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         "bias_dropout_add_fusion",
         "masked_softmax_fusion",
         "persist_layer_norm",
+        "fused_residual_rmsnorm",
     ):
         if _knob in config["megatron_cfg"]:
             setattr(model_cfg, _knob, config["megatron_cfg"][_knob])
