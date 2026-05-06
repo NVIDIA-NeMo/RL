@@ -40,6 +40,19 @@ def test_is_mamba_provider_rejects_gpt():
     assert _is_mamba_provider(_make_gpt_cfg()) is False
 
 
+def test_is_mamba_provider_detects_hybrid_new_name():
+    cfg = MagicMock(spec=["mamba_num_heads", "hybrid_layer_pattern"])
+    cfg.mamba_num_heads = 1
+    cfg.hybrid_layer_pattern = "M-A-"
+    assert _is_mamba_provider(cfg) is True
+
+
+def test_is_mamba_provider_rejects_mamba_num_heads_without_pattern():
+    cfg = MagicMock(spec=["mamba_num_heads"])
+    cfg.mamba_num_heads = 1
+    assert _is_mamba_provider(cfg) is False
+
+
 @patch.dict(os.environ, {"DISABLE_MODELOPT_LAYER_SPEC": "0"}, clear=False)
 @patch("nemo_rl.modelopt.models.policy.workers.utils.modelopt_mamba_stack_spec")
 def test_quantization_layer_spec_mamba_default(mock_modelopt_mamba):
