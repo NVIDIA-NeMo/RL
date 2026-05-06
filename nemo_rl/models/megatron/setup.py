@@ -698,6 +698,7 @@ def _build_ddp_config(config: PolicyConfig) -> DistributedDataParallelConfig:
             "use_distributed_optimizer"
         ],
         "data_parallel_sharding_strategy": ddp_cfg["data_parallel_sharding_strategy"],
+        "use_custom_fsdp": ddp_cfg["use_custom_fsdp"],
     }
     for _knob in (
         "nccl_ub",
@@ -705,6 +706,7 @@ def _build_ddp_config(config: PolicyConfig) -> DistributedDataParallelConfig:
         "align_param_gather",
         "bucket_size",
         "fp8_param_gather",
+        "reuse_grad_buf_for_mxfp8_param_ag",
     ):
         if _knob in ddp_cfg:
             kwargs[_knob] = ddp_cfg[_knob]

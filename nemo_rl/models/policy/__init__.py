@@ -196,9 +196,11 @@ class MegatronDDPConfig(TypedDict):
     # Multi-instance distributed optimizer (>10K-GPU scaling).
     num_distributed_optimizer_instances: NotRequired[int]
     align_param_gather: NotRequired[bool]
-    bucket_size: NotRequired[int]
+    bucket_size: NotRequired[int | None]
     # Only with fp8_recipe="mxfp8". Significant param-gather reduction.
     fp8_param_gather: NotRequired[bool]
+    # Pairs with fp8_param_gather; mcore asserts fp8_param_gather=True.
+    reuse_grad_buf_for_mxfp8_param_ag: NotRequired[bool]
 
 
 # Type exists to be lax if not specified
