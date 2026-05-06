@@ -87,12 +87,52 @@ def _summarize_nemo_gym_output_item(output_item: Any) -> dict[str, Any]:
     return summary
 
 
+def _summarize_nemo_gym_request_params(
+    responses_create_params: Any,
+) -> dict[str, Any]:
+    """Extract call-site identifiers from the request that produced the empty result.
+
+    With many concurrent rollouts in flight, the request-side fields (model,
+    max_output_tokens, metadata/user) are what let an operator pinpoint which
+    call failed.
+    """
+    if not isinstance(responses_create_params, dict):
+        return {
+            "python_type": type(responses_create_params).__name__,
+            "repr": _truncate_error_value(responses_create_params),
+        }
+
+    request_summary: dict[str, Any] = {}
+    for key in (
+        "model",
+        "max_output_tokens",
+        "temperature",
+        "top_p",
+        "user",
+        "metadata",
+        "previous_response_id",
+    ):
+        if key in responses_create_params:
+            request_summary[key] = responses_create_params[key]
+
+    input_value = responses_create_params.get("input")
+    if isinstance(input_value, list):
+        request_summary["input_message_count"] = len(input_value)
+    elif isinstance(input_value, str):
+        request_summary["input_str_len"] = len(input_value)
+
+    return request_summary
+
+
 def _summarize_nemo_gym_empty_generation_result(
     nemo_gym_result: dict[str, Any],
 ) -> dict[str, Any]:
     response = nemo_gym_result.get("response")
     if not isinstance(response, dict):
         return {
+            "request": _summarize_nemo_gym_request_params(
+                nemo_gym_result.get("responses_create_params")
+            ),
             "response_python_type": type(response).__name__,
             "response_repr": _truncate_error_value(response),
         }
@@ -113,6 +153,9 @@ def _summarize_nemo_gym_empty_generation_result(
         output_count = None
 
     summary = {
+        "request": _summarize_nemo_gym_request_params(
+            nemo_gym_result.get("responses_create_params")
+        ),
         "response_keys": sorted(response.keys()),
         "response_status": response.get("status"),
         "response_finish_reason": response.get("finish_reason"),

@@ -53,10 +53,15 @@ def test_nemo_gym_stub_module():
 
 def test_summarize_nemo_gym_empty_generation_result_is_diagnosable():
     """The empty-generation summary should expose the response status, finish reason,
-    incomplete details, and per-output structure so the resulting ValueError points at
-    the actual cause (e.g. truncation due to max_output_tokens) instead of guessing."""
+    incomplete details, per-output structure, and request-side identifiers (model,
+    max_output_tokens, metadata) so the resulting ValueError points at the actual
+    failed call instead of guessing."""
     nemo_gym_result = {
         "responses_create_params": {
+            "model": "dummy-model",
+            "max_output_tokens": 64,
+            "temperature": 0.7,
+            "metadata": {"task_id": "abc123"},
             "input": [{"role": "user", "content": "hello"}],
         },
         "response": {
@@ -86,6 +91,13 @@ def test_summarize_nemo_gym_empty_generation_result_is_diagnosable():
     assert summary["response_model"] == "dummy-model"
     assert summary["usage"] == {"input_tokens": 2, "output_tokens": 0}
 
+    request = summary["request"]
+    assert request["model"] == "dummy-model"
+    assert request["max_output_tokens"] == 64
+    assert request["temperature"] == 0.7
+    assert request["metadata"] == {"task_id": "abc123"}
+    assert request["input_message_count"] == 1
+
     [output_item] = summary["output_summary"]
     assert output_item["status"] == "incomplete"
     assert output_item["finish_reason"] == "length"
@@ -95,9 +107,16 @@ def test_summarize_nemo_gym_empty_generation_result_is_diagnosable():
 
 def test_summarize_nemo_gym_empty_generation_result_handles_non_dict_response():
     """If the response field is missing / malformed, the summarizer should still
-    produce a useful representation rather than raising."""
-    summary = _summarize_nemo_gym_empty_generation_result({"response": None})
+    produce a useful representation (including request-side identifiers) rather
+    than raising."""
+    summary = _summarize_nemo_gym_empty_generation_result(
+        {
+            "responses_create_params": {"model": "dummy-model"},
+            "response": None,
+        }
+    )
     assert summary["response_python_type"] == "NoneType"
+    assert summary["request"]["model"] == "dummy-model"
 
 
 @pytest.fixture(scope="function")
