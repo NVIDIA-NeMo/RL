@@ -301,8 +301,67 @@ signature.
 
 ## Step 11 — Resubmit and verify
 
-Resubmitting `opd_nemotron_nano3_nvfp4_default_sft0.1_t1.4_ep8_cp4.sh`.
-Expected: vLLM `compile_or_warm_up_model` completes, calibration
-prolog finishes, and training reaches step 1 with `train/total_reward`
-in BF16 baseline range (0.84–0.86). If reached, diagnosis and fix
-are both validated.
+Resubmitted `opd_nemotron_nano3_nvfp4_default_sft0.1_t1.4_ep8_cp4.sh`
+as job 157664.
+
+## Step 12 — Cross-rank "MoE calibration incomplete" RuntimeError
+
+Job 157664 cleared the NaN-amax assertion. New crash:
+
+```
+RuntimeError: MoE calibration incomplete: some experts received no
+tokens during calibration. Increase --calib-size to ensure all experts
+see calibration data.
+```
+
+Source (`modelopt/torch/quantization/model_calib.py:113` —
+`_check_moe_calibration_complete`):
+
+```python
+has_amax = getattr(quantizer, "_amax", None) is not None
+amax_states = DistributedProcessGroup.get_dist_syncd_obj(has_amax, group, lambda objs: objs)
+if any(amax_states) and not all(amax_states):
+    raise RuntimeError("MoE calibration incomplete: ...")
+```
+
+The cross-rank check flags partial-coverage states: some ranks have
+`_amax`, others don't.
+
+Why this fires now (vs the dirty-branch run 156103 which passed):
+- The Step-10 fix in `MaxCalibrator.collect` had been *returning early*
+  on full-NaN inputs, so quantizers in the all-NaN code path stayed
+  at `_amax = None`.
+- vLLM's `_dummy_run(1, ...)` only routes the single dummy token to
+  `top_k=2` experts; the other 126 experts of the 128-expert MoE get
+  the uninitialized-buffer (all-NaN) call.
+- After Step 10: 2 routed experts → `_amax` set; 126 unrouted experts
+  → `_amax` None. Across the EP group, this is exactly the partial-
+  coverage state the post-calibration check rejects.
+- The dirty branch's old vLLM didn't have the per-expert pre-compile
+  pass, so all expert quantizers stayed at `_amax = None` (or all got
+  routed, depending on routing) — the all-False or all-True cases that
+  pass the cross-rank check.
+
+## Step 13 — Adjust the central fix to *initialize zero* instead of skip
+
+Replaced the early-return with a zero-amax assignment:
+
+```python
+if x.numel() > 0 and torch.isnan(x).all():
+    local_amax = torch.zeros_like(local_amax)
+else:
+    assert not torch.any(torch.isnan(local_amax)), ...
+```
+
+Now every expert quantizer ends up with `_amax = 0` (not None) after
+calibration, so the cross-rank check sees uniform-True. Subsequent
+`module.amax.fill_(-1.0)` in `_fakequant_run_prolog_worker` overwrites
+the zero with the sentinel as designed; the real amax is then
+delivered by the Megatron actor.
+
+The `>= 0` and `isinf` assertions further down are unaffected — zero
+satisfies both.
+
+## Step 14 — Resubmit again
+
+Submitting again.
