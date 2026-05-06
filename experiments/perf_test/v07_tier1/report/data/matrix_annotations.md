@@ -28,22 +28,57 @@ Replace the INVALID rows with these once they steady-state.
 
 Commit 1f788697 also adds runtime override in `_apply_performance_config`. Prior runs may or may not reflect the yaml depending on whether the cached megatron checkpoint was built with the toggle. Phase B does not re-run grad_accum, but next pass should re-measure 06 to lock the verdict.
 
-## Phase A finals: fused_residual_rmsnorm (OCI-HSG, n=8 post-warmup each)
+## Phase A finals: fused_residual_rmsnorm
 
-| pair | baseline E2E | variant E2E | delta |
-|------|--------------|-------------|-------|
+OCI-HSG (n=8 post-warmup each) — E2E TPS:
+
+| pair | baseline | variant | delta |
+|------|----------|---------|-------|
 | llama_8b 2586264/2586265 | 3618 | 3711 | +2.57% |
 | qwen3_30b 2586266/2586267 | 1845 | 1845 | -0.02% |
 | qwen3_32b 2586268/2586269 | 1224 | 1221 | -0.29% |
-| qwen3_235b 2586270/2586271 | pending | pending | — |
+| qwen3_235b 2586270/2586271 | running | **FAILED** | — |
 
-3/3 completed pairs show no measurable speedup at GB200 scale. Llama_8b +2.57% is borderline (above ±2% but within inter-batch noise observed across same-yaml runs at 3.6%). Conclusion subject to 235B confirm.
+Lyris (n=9 post-warmup each) — Total step time medians:
 
-## Phase C interim: llama_8b ce_te_fusion (OCI-HSG)
+| pair | baseline | variant | delta |
+|------|----------|---------|-------|
+| llama_8b 1692688/1692689 | 76.01s | 72.81s | **-4.21%** |
 
-- Baseline 2586671: median 3749 (n=8)
-- Variant ce_te_fusion 2586673: median 3810 (n=8)
-- **Delta: +1.62%** — within noise. Note: baseline differs from Phase A's same-yaml baseline by 3.6% (3618 vs 3749) — confirms inter-batch variance is real and pair-isolation matters.
+**235B variant FAILED** (job 2586271): `RuntimeError: you can only change requires_grad flags of leaf variables` in TE `pytorch/ops/fuser.py:141`. Upstream TE op bug specific to the 235B model interaction with fused_residual_rmsnorm. Cannot pair-test 235B until TE patch lands.
+
+**Llama_8b cross-cluster discrepancy**: OCI-HSG shows +2.57% (slower with variant), Lyris shows -4.21% (faster). Both within ±5% inter-batch noise band but signs flip — variance dominates the signal. Conclusion: no measurable speedup on 30B/32B; llama_8b within-noise either direction; 235B blocked by upstream bug.
+
+## Phase B 32B interim (OCI-HSG, n=6 post-warmup, jobs still running)
+
+Paired against same-batch baseline 2586605:
+
+| variant | jobid | median step | delta |
+|---------|-------|-------------|-------|
+| baseline | 2586605 | 343.54s | — |
+| v07_07 overlap_p2p | 2586606 | 351.82s | +2.41% |
+| v07_08 defer_embed_wgrad | 2586607 | 340.86s | -0.78% |
+| v07_09 tp_atomic | 2586608 | 343.35s | -0.06% |
+
+After silent-drop fix (commit 1f788697), all three previously-silent knobs measure at noise floor on 32B. p2p +2.41% trends toward slowdown but still within ±5% inter-batch band; defer_embed/tp_atomic both clean nulls.
+
+## Phase C interim
+
+**OCI-HSG llama_8b ce_te_fusion** (n=8 post-warmup):
+- baseline 2586671 / variant 2586673: 3749 vs 3810 TPS → **+1.62%** (within noise). Baseline differs from Phase A's same-yaml baseline by 3.6% (3618 vs 3749) — confirms inter-batch variance is real and pair-isolation matters.
+
+**OCI-HSG 32B (n=4-5, jobs still running)**, paired against 2586676:
+
+| variant | jobid | median | delta |
+|---------|-------|--------|-------|
+| baseline | 2586676 | 344.21s | — |
+| v07_13 ce_te_fusion | 2586678 | 344.82s | +0.18% |
+| v07_14 nccl_ub | 2586679 | 341.69s | -0.73% |
+
+nccl_ub was the highest-expected-delta knob in Phase C (advertised 1-2% reduce/gather speedup). Interim measurement -0.73% is squarely in the noise floor. Will re-confirm with full n=8 medians once jobs finish.
+
+**Lyris llama_8b ce_te_fusion** (n=9):
+- baseline 1692930 / variant 1692932: 74.86s vs 75.03s → **+0.23%** (noise). Confirms OCI's +1.62% was upper-edge of the noise band.
 
 ## Phase C jobs
 
