@@ -49,36 +49,47 @@ Lyris (n=9 post-warmup each) — Total step time medians:
 
 **Llama_8b cross-cluster discrepancy**: OCI-HSG shows +2.57% (slower with variant), Lyris shows -4.21% (faster). Both within ±5% inter-batch noise band but signs flip — variance dominates the signal. Conclusion: no measurable speedup on 30B/32B; llama_8b within-noise either direction; 235B blocked by upstream bug.
 
-## Phase B 32B interim (OCI-HSG, n=6 post-warmup, jobs still running)
+## Phase B 32B FINAL (OCI-HSG, n=9 post-warmup)
 
 Paired against same-batch baseline 2586605:
 
 | variant | jobid | median step | delta |
 |---------|-------|-------------|-------|
-| baseline | 2586605 | 343.54s | — |
-| v07_07 overlap_p2p | 2586606 | 351.82s | +2.41% |
-| v07_08 defer_embed_wgrad | 2586607 | 340.86s | -0.78% |
-| v07_09 tp_atomic | 2586608 | 343.35s | -0.06% |
+| baseline | 2586605 | 344.42s | — |
+| v07_07 overlap_p2p | 2586606 | 353.16s | +2.54% |
+| v07_08 defer_embed_wgrad | 2586607 | 342.27s | -0.62% |
+| v07_09 tp_atomic | 2586608 | 344.79s | +0.11% |
 
-After silent-drop fix (commit 1f788697), all three previously-silent knobs measure at noise floor on 32B. p2p +2.41% trends toward slowdown but still within ±5% inter-batch band; defer_embed/tp_atomic both clean nulls.
+After silent-drop fix (commit 1f788697), all three previously-silent knobs measure at noise floor on 32B. `overlap_p2p_comm` trends 2.5% slower (consistent across n=6 interim and n=9 final) but still inside ±5% inter-batch band; defer_embed/tp_atomic both clean nulls.
 
 ## Phase C interim
 
 **OCI-HSG llama_8b ce_te_fusion** (n=8 post-warmup):
 - baseline 2586671 / variant 2586673: 3749 vs 3810 TPS → **+1.62%** (within noise). Baseline differs from Phase A's same-yaml baseline by 3.6% (3618 vs 3749) — confirms inter-batch variance is real and pair-isolation matters.
 
-**OCI-HSG 32B (n=4-5, jobs still running)**, paired against 2586676:
+**OCI-HSG 32B FINAL (n=9)**, paired against 2586676:
 
 | variant | jobid | median | delta |
 |---------|-------|--------|-------|
-| baseline | 2586676 | 344.21s | — |
-| v07_13 ce_te_fusion | 2586678 | 344.82s | +0.18% |
-| v07_14 nccl_ub | 2586679 | 341.69s | -0.73% |
+| baseline | 2586676 | 344.64s | — |
+| v07_13 ce_te_fusion | 2586678 | 347.08s | +0.71% |
+| v07_14 nccl_ub | 2586679 | 343.43s | -0.35% |
 
-nccl_ub was the highest-expected-delta knob in Phase C (advertised 1-2% reduce/gather speedup). Interim measurement -0.73% is squarely in the noise floor. Will re-confirm with full n=8 medians once jobs finish.
+nccl_ub was the highest-expected-delta knob in Phase C (advertised 1-2% reduce/gather speedup). Final n=9 -0.35% confirms it sits at noise floor on 32B.
 
 **Lyris llama_8b ce_te_fusion** (n=9):
 - baseline 1692930 / variant 1692932: 74.86s vs 75.03s → **+0.23%** (noise). Confirms OCI's +1.62% was upper-edge of the noise band.
+
+## Phase C retry: external_cuda_graph llama_8b FINAL (n=9)
+
+After commit d3bd8f24 fix (use_te_rng_tracker + activation_checkpointing=false), retry batch ran successfully:
+
+| Cluster | baseline | variant | delta |
+|---------|----------|---------|-------|
+| OCI-HSG | 80.67s (2587286) | 85.01s (2587287) | **+5.38%** |
+| Lyris   | 78.18s (1693100) | 79.36s (1693101) | **+1.51%** |
+
+Both clusters show external_cuda_graph SLOWING DOWN llama_8b. Likely cause: graph capture in step 1 amortizes over remaining steps; with max_num_steps=10 and ~10s capture overhead, the variant pays a fixed cost on short runs that real training would amortize. **CUDA-graph requires max_num_steps≥50 to fairly measure.** Current Phase C verdict: cannot conclude — need longer-run re-eval.
 
 ## Phase C jobs
 

@@ -101,16 +101,16 @@ After Tier 2 finals showed null deltas, an audit found that four Tier 2 knobs (`
 
 Commit `1f788697` adds the missing forwarders + extends the `MegatronConfig` TypedDict + adds a runtime override path for grad_accum_fusion. Six DDPConfig fields (`use_custom_fsdp`, `nccl_ub`, `num_distributed_optimizer_instances`, `align_param_gather`, `bucket_size`, `fp8_param_gather`, `reuse_grad_buf_for_mxfp8_param_ag`) wired in `bd5d8196`.
 
-Paired re-runs on Qwen3-32B (same-batch baseline 2586605, n=6 interim):
+Paired re-runs on Qwen3-32B FINAL (same-batch baseline 2586605, n=9 post-warmup):
 
 | Variant | jobid | median step | Δ |
 |---|---|---|---|
-| baseline | 2586605 | 343.5s | — |
-| `overlap_p2p_comm` | 2586606 | 351.8s | +2.41% |
-| `defer_embedding_wgrad_compute` | 2586607 | 340.9s | -0.78% |
-| `tp_comm_atomic_ag/rs` | 2586608 | 343.4s | -0.06% |
+| baseline | 2586605 | 344.4s | — |
+| `overlap_p2p_comm` | 2586606 | 353.2s | +2.54% |
+| `defer_embedding_wgrad_compute` | 2586607 | 342.3s | -0.62% |
+| `tp_comm_atomic_ag/rs` | 2586608 | 344.8s | +0.11% |
 
-After fixing the silent drop, all three knobs measure at noise floor on 32B — **the original null result was correct, just for the wrong reason.** 235B re-runs still in queue.
+After fixing the silent drop, all three knobs measure at noise floor on 32B — **the original null result was correct, just for the wrong reason.** `overlap_p2p_comm` trends 2.5% slower (consistent direction across n=6 interim and n=9 final) but still inside the ±5% inter-batch band. 235B re-runs still in queue.
 
 ---
 
@@ -138,17 +138,18 @@ The 235B variant FAILED with `RuntimeError: you can only change requires_grad fl
 
 After the silent-drop fix added them to the allowlist, three more knobs were measurable for the first time. Phase C also pulled in two yaml-level config conflicts that broke the first batch (`activation_checkpointing` ⊥ `external_cuda_graph`; CUDA-graph requires `use_te_rng_tracker=true`); commit `d3bd8f24` ships the fix and re-submits.
 
-Interim, paired:
+Final, paired (n=9 post-warmup):
 
-| Variant | Recipe | n | Δ |
+| Variant | Recipe | OCI-HSG Δ | Lyris Δ |
 |---|---|---|---|
-| `external_cuda_graph` | Llama-8B / 30B / 32B | — | retry batch running |
-| `cross_entropy_loss_fusion + te_rmsnorm_linear_unfused_backward` | Llama-8B (OCI) | 8 | +1.62% |
-| `cross_entropy_loss_fusion + te_rmsnorm_linear_unfused_backward` | Llama-8B (Lyris) | 9 | +0.23% |
-| `cross_entropy_loss_fusion + te_rmsnorm_linear_unfused_backward` | 32B | 4 | +0.18% |
-| **`nccl_ub`** | **32B** | **4** | **-0.73%** |
+| `external_cuda_graph` | Llama-8B (n=9 each) | **+5.38%** | **+1.51%** |
+| `cross_entropy_loss_fusion` | Llama-8B | +1.62% (n=8) | +0.23% |
+| `cross_entropy_loss_fusion` | 32B | +0.71% | running |
+| `nccl_ub` | 32B | -0.35% | running |
 
-The strongest expected signal here was `nccl_ub` (advertised 1–2% reduce/gather speedup on tightly TP-coupled workloads). Interim measurement -0.73% sits squarely in the noise floor.
+`nccl_ub`, the strongest expected signal in Phase C (advertised 1–2% reduce/gather speedup), measures at -0.35% on 32B — squarely in the noise floor.
+
+`external_cuda_graph` shows a consistent **slowdown** on Llama-8B across both clusters: +5.38% on OCI, +1.51% on Lyris. The likely cause is amortization: graph capture happens during step 1, savings appear in steps 2–10. With max_num_steps=10 and ~10s capture overhead, the variant pays a fixed cost on every short run that real training would amortize away. **CUDA-graph cannot be measured at n=10 GRPO steps.** A correct re-evaluation needs max_num_steps≥50 or explicit capture-vs-execute timing separation.
 
 ---
 
