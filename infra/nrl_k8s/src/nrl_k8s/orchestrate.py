@@ -39,7 +39,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from omegaconf import OmegaConf
 from ray.job_submission import JobStatus, JobSubmissionClient
@@ -318,16 +318,24 @@ def ensure_dgd(
     log: callable,
     recreate: bool = False,
     wait_ready: bool = True,
+    owner_ref: dict[str, Any] | None = None,
 ) -> str:
     """Apply a DynamoGraphDeployment and wait for state=successful.
 
     Idempotent — if a live DGD with the same name exists and matches the
     rendered manifest, reuse it. On drift, warn and reuse unless
     ``recreate=True``. Mirrors :func:`ensure_cluster` semantics for RayClusters.
+
+    When ``owner_ref`` is provided, it's attached to the DGD's
+    ``metadata.ownerReferences`` so K8s GC cascades the DGD when the owner
+    (typically the training RayCluster) is deleted. Pass ``None`` for
+    untethered lifetimes.
     """
     spec = _require_dgd(loaded.infra, dgd_key)
     base_dir = loaded.infra_source_path.parent
-    manifest = dgd_mod.build_dgd_manifest(spec, loaded.infra, base_dir)
+    manifest = dgd_mod.build_dgd_manifest(
+        spec, loaded.infra, base_dir, owner_ref=owner_ref
+    )
     name = manifest["metadata"]["name"]
     namespace = loaded.infra.namespace
 
@@ -633,8 +641,33 @@ def run(
     for dep_key in loaded.infra.deployments:
         ensure_deployment(dep_key, loaded, log=log)
 
+    # Bring up the training RayCluster *first* so we have a UID to anchor any
+    # DGD ownerReferences against — that's how DGDs get garbage-collected when
+    # the training cluster is torn down. The other roles (generation/gym) come
+    # up afterwards in the same loop and are no-ops on the second pass.
+    training_cluster_owner: dict[str, Any] | None = None
+    if _get_cluster(loaded.infra, "training") is not None and loaded.infra.dynamo:
+        training_name = ensure_cluster(
+            "training", loaded, log=log, recreate=recreate
+        )
+        training_obj = k8s.get_raycluster(training_name, loaded.infra.namespace)
+        training_uid = (training_obj or {}).get("metadata", {}).get("uid")
+        if training_uid:
+            training_cluster_owner = dgd_mod.build_owner_reference(
+                api_version="ray.io/v1",
+                kind="RayCluster",
+                name=training_name,
+                uid=training_uid,
+            )
+
     for dgd_key in loaded.infra.dynamo:
-        ensure_dgd(dgd_key, loaded, log=log, recreate=recreate)
+        ensure_dgd(
+            dgd_key,
+            loaded,
+            log=log,
+            recreate=recreate,
+            owner_ref=training_cluster_owner,
+        )
 
     for role in ALL_ROLES:
         if _get_cluster(loaded.infra, role) is None:
