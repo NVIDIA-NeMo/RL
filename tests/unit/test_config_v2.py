@@ -33,8 +33,8 @@ from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
-# # All tests in this module should run first
-# pytestmark = pytest.mark.run_first
+# All tests in this module should run first
+pytestmark = pytest.mark.run_first
 
 register_omegaconf_resolvers()
 

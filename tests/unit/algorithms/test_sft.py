@@ -64,31 +64,29 @@ def mock_components():
 
     # Create mock master config
     master_config = MasterConfig.model_construct(
-        **{
-            "sft": {
-                "max_num_steps": 5,
-                "max_num_epochs": 2,
-                "val_period": 100,
-                "val_batches": 1,
-                "val_global_batch_size": 1,
-                "val_micro_batch_size": 1,
-                "val_at_start": False,
-                "val_at_end": False,
-            },
-            "policy": {
-                "train_global_batch_size": 1,
-                "make_sequence_length_divisible_by": 8,
-            },
-            "checkpointing": {
-                "enabled": False,
-                "checkpoint_must_save_by": None,
-                "save_period": 10,
-            },
-            "cluster": {
-                "num_nodes": 1,
-                "gpus_per_node": 2,
-            },
-        }
+        sft={
+            "max_num_steps": 5,
+            "max_num_epochs": 2,
+            "val_period": 100,
+            "val_batches": 1,
+            "val_global_batch_size": 1,
+            "val_micro_batch_size": 1,
+            "val_at_start": False,
+            "val_at_end": False,
+        },
+        policy={
+            "train_global_batch_size": 1,
+            "make_sequence_length_divisible_by": 8,
+        },
+        checkpointing={
+            "enabled": False,
+            "checkpoint_must_save_by": None,
+            "save_period": 10,
+        },
+        cluster={
+            "num_nodes": 1,
+            "gpus_per_node": 2,
+        },
     )
 
     return {

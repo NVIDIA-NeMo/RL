@@ -21,6 +21,7 @@ import ray
 import torch
 from yaml import safe_load
 
+from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
@@ -49,11 +50,9 @@ def test_nemo_gym_stub_module():
 @pytest.fixture(scope="function")
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
-    master_config = {
-        "policy": {
-            "generation": generation_config,
-        },
-    }
+    master_config = MasterConfig.model_construct(
+        policy={"generation": generation_config}
+    )
     setup_nemo_gym_config(master_config, nemo_gym_tokenizer)
 
     generation_config["vllm_cfg"]["max_model_len"] = 16_384
