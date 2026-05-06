@@ -16,6 +16,7 @@ import argparse
 import os
 import pprint
 import sys
+from typing import Any
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -47,11 +48,31 @@ def parse_args():
     return args, overrides
 
 
-def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
+def setup_data(tokenizer: AutoTokenizer, data_config: dict[str, Any], env_configs):
     print("Setting up data...")
+    if data_config.get("input_len_or_input_len_generator", None) is not None:
+        input_len_or_input_len_generator = data_config[
+            "input_len_or_input_len_generator"
+        ]
+        if isinstance(input_len_or_input_len_generator, dict):
+            from nemo_rl.utils.sequence_length_generator import (
+                get_sequence_length_generator,
+            )
+
+            data_config["input_len_or_input_len_generator"] = (
+                get_sequence_length_generator(input_len_or_input_len_generator)
+            )
+    else:
+        raise ValueError("data.input_len_or_input_len_generator must be provided")
+
+    if "num_samples" not in data_config:
+        raise ValueError("data.num_samples must be provided")
 
     # load dataset
-    base_dataset = RandomDataset(data_config["input_len_or_input_len_generator"])
+    base_dataset = RandomDataset(
+        data_config["input_len_or_input_len_generator"],
+        num_samples=data_config["num_samples"],
+    )
 
     env = DummyEnvironment.options(
         runtime_env={

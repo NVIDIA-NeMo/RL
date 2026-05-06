@@ -156,6 +156,8 @@ class BaseVllmGenerationWorker:
                 )
             elif isinstance(output_len_or_output_len_generator, int):
                 pass
+            elif callable(output_len_or_output_len_generator):
+                pass
             else:
                 raise ValueError(
                     f"Invalid output_len_or_output_len_generator: {output_len_or_output_len_generator}"
@@ -612,6 +614,26 @@ class BaseVllmGenerationWorker:
 
         return list(stop_set) if stop_set else None
 
+    def _resolve_max_tokens(
+        self, max_new_tokens: Optional[int] = None, sample_idx: int | None = None
+    ) -> int:
+        max_tokens = (
+            max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
+        )
+        output_len_or_output_len_generator = self.cfg[
+            "output_len_or_output_len_generator"
+        ]
+        if output_len_or_output_len_generator is None:
+            return max_tokens
+
+        if callable(output_len_or_output_len_generator):
+            output_len = output_len_or_output_len_generator(
+                sample_idx if sample_idx is not None else 0
+            )
+        else:
+            output_len = output_len_or_output_len_generator
+        return min(max_tokens, int(output_len))
+
     def _build_sampling_params(
         self,
         *,
@@ -625,7 +647,7 @@ class BaseVllmGenerationWorker:
         temperature = 0.0 if greedy else self.cfg["temperature"]
 
         max_tokens = (
-            max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
+            max_new_tokens if max_new_tokens is not None else self._resolve_max_tokens()
         )
 
         return self.SamplingParams(
@@ -893,8 +915,10 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             temperature=self.cfg["temperature"] if not greedy else 0,
             top_p=self.cfg["top_p"],
             top_k=top_k if not greedy else 1,
-            max_tokens=self.cfg["max_new_tokens"],
-            stop_token_ids=self.cfg["stop_token_ids"],
+            max_tokens=self._resolve_max_tokens(),
+            stop_token_ids=self.cfg["stop_token_ids"]
+            if not self.cfg["ignore_eos"]
+            else [],
             ignore_eos=self.cfg["ignore_eos"],
             stop=stop_strings,
             include_stop_str_in_output=True,  # returning stop strings like hf

@@ -247,6 +247,7 @@ base_vllm_test_config: VllmConfig = {
     "top_k": None,
     "stop_token_ids": None,
     "stop_strings": None,
+    "ignore_eos": False,
     "vllm_cfg": {
         "async_engine": False,
         "precision": "bfloat16",

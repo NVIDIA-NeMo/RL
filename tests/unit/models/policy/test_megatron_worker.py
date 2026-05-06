@@ -90,6 +90,7 @@ def create_megatron_test_config(
             "max_new_tokens": 32,  # Small number of tokens for testing
             "stop_token_ids": None,
             "stop_strings": None,
+            "ignore_eos": False,
             "mcore_generation_config": {
                 "buffer_size_gb": 2,
                 "num_cuda_graphs": 16,

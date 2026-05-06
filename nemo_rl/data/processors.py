@@ -711,27 +711,37 @@ def random_input_len_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
     tokenizer: TokenizerType,
-    max_seq_length: int,
+    max_seq_length: int | None,
     idx: int,
 ) -> DatumSpec:
     """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for random input length."""
     input_len_or_input_len_generator = task_data_spec.input_len_or_input_len_generator
+    if input_len_or_input_len_generator is None:
+        raise ValueError("input_len_or_input_len_generator must be provided")
+
     if callable(input_len_or_input_len_generator):
         input_len = input_len_or_input_len_generator(idx)
     else:
         input_len = input_len_or_input_len_generator
 
+    input_len = int(input_len)
+    if max_seq_length is not None:
+        assert input_len <= max_seq_length
+
+    vocab_size = getattr(tokenizer, "vocab_size", None)
+    if vocab_size is None:
+        raise ValueError("tokenizer.vocab_size must be available for random data")
+
     message_log: LLMMessageLogType = []
     user_message = {
         "role": "user",
         "content": "Synthetic random input data",
-        "token_ids": torch.randint(0, tokenizer.vocab_size, (input_len,)),  # type: ignore
+        "token_ids": torch.randint(0, vocab_size, (input_len,)),
     }
-    message_log.append(user_message)  # type: ignore
-    assert input_len <= max_seq_length  # type: ignore
+    message_log.append(user_message)
     output: DatumSpec = {
         "message_log": message_log,
-        "length": input_len,  # type: ignore
+        "length": input_len,
         "loss_multiplier": 1.0,
         "idx": idx,
         "extra_env_info": {},

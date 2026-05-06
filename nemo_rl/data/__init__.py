@@ -77,6 +77,8 @@ class DataConfig(TypedDict):
     # - Dict[str, Any]: generator config with 'mean' and 'std' keys for sampling from normal distribution
     # Used by RandomDataset for benchmarking. Recommended default: not set (dataset-specific).
     input_len_or_input_len_generator: NotRequired[Dict[str, Any] | int]
+    # Number of synthetic samples to expose when using RandomDataset. Recommended default: not set.
+    num_samples: NotRequired[int]
 
 
 # ===============================================================================

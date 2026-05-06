@@ -12,15 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Local math dataset."""
+"""Synthetic random-length dataset for benchmarking."""
 
-from typing import Callable
+from typing import Any, Callable
 
 from nemo_rl.data import processors
-from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import (
-    prepare_openinstructmath2_dataset,
-)
 from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.utils.sequence_length_generator import get_sequence_length_generator
+
+
+class _SyntheticRandomRawDataset:
+    """Indexable raw dataset that supplies task names for synthetic processing."""
+
+    def __init__(self, num_samples: int):
+        self.num_samples = num_samples
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        if idx < 0 or idx >= self.num_samples:
+            raise IndexError(idx)
+        return {"task_name": "random"}
 
 
 class RandomDataset:
@@ -29,7 +42,9 @@ class RandomDataset:
     This dataset is used for benchmarking purposes. It is not meant to be used for training or evaluation.
 
     Args:
-        input_len_or_input_len_generator: An integer or a dictionary with keys 'mean' and 'std' for the normal distribution that samples the input length.
+        input_len_or_input_len_generator: Fixed input length, a callable input
+            length generator, or a dict with 'mean' and 'std' for normal sampling.
+        num_samples: Number of synthetic raw samples to expose.
 
     Returns:
         A RandomDataset object.
@@ -37,14 +52,18 @@ class RandomDataset:
 
     def __init__(
         self,
-        input_len_or_input_len_generator: Callable | int,
+        input_len_or_input_len_generator: Callable | dict[str, Any] | int,
+        num_samples: int,
     ):
+        if isinstance(input_len_or_input_len_generator, dict):
+            input_len_or_input_len_generator = get_sequence_length_generator(
+                input_len_or_input_len_generator
+            )
         self.input_len_or_input_len_generator = input_len_or_input_len_generator
 
-        # use openmathinstruct2 dataset as iterator, the real token_ids are synthetic
-        self.formatted_ds = prepare_openinstructmath2_dataset()
+        self.formatted_ds = {"train": _SyntheticRandomRawDataset(num_samples)}
         self.task_spec = TaskDataSpec(
-            task_name="math",
+            task_name="random",
             input_len_or_input_len_generator=self.input_len_or_input_len_generator,
         )
         self.processor = processors.random_input_len_processor

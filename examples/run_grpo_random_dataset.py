@@ -92,7 +92,10 @@ def setup_data(
                 input_len_or_input_len_generator
             )
     else:
-        assert False, "input_len_generator_cfg must be provided"
+        raise ValueError("data.input_len_or_input_len_generator must be provided")
+
+    if "num_samples" not in data_config:
+        raise ValueError("data.num_samples must be provided")
 
     random_task_spec = TaskDataSpec(
         task_name="random",
@@ -102,7 +105,10 @@ def setup_data(
     )
 
     # load dataset
-    data: Any = RandomDataset(data_config["input_len_or_input_len_generator"])
+    data: Any = RandomDataset(
+        data_config["input_len_or_input_len_generator"],
+        num_samples=data_config["num_samples"],
+    )
 
     # data processor
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (

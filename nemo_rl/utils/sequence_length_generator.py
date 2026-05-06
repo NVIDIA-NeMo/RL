@@ -28,7 +28,7 @@ def get_sequence_length_generator(sequence_length_generator_cfg: dict) -> Callab
     mean = sequence_length_generator_cfg["mean"]
     std = sequence_length_generator_cfg["std"]
 
-    def sample_length() -> int:
+    def sample_length(idx: int | None = None) -> int:
         length = int(np.round(np.random.normal(mean, std)))
         return max(1, length)
 

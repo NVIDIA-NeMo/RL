@@ -16,6 +16,7 @@ import os
 import sys
 import tempfile
 from collections import defaultdict
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -26,6 +27,7 @@ sys.path.append("/".join(abspath.split("/")[:-4]))
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.datasets.random_dataset import RandomDataset
 from nemo_rl.data.datasets.eval_datasets import (
     AIMEDataset,
     GPQADataset,
@@ -41,6 +43,7 @@ from nemo_rl.data.processors import (
     helpsteer3_data_processor,
     math_data_processor,
     math_hf_data_processor,
+    random_input_len_processor,
 )
 from nemo_rl.models.policy import TokenizerConfig
 
@@ -67,6 +70,11 @@ class DummyTokenizer:
         if return_tensors == "pt":
             return {"input_ids": torch.tensor([encoded], dtype=torch.long)}
         return {"input_ids": encoded}
+
+
+class RandomTokenizer:
+    vocab_size = 100
+    tokenizer = SimpleNamespace(bos_token_id=None, name_or_path="random-tokenizer")
 
 
 def test_math_data_processor():
@@ -100,6 +108,99 @@ def test_math_data_processor():
 
     assert dataset[0]["extra_env_info"]["ground_truth"] == "answer1"
     assert dataset[1]["extra_env_info"]["ground_truth"] == "answer2"
+
+
+def test_random_input_len_processor_uses_fixed_length():
+    tokenizer = RandomTokenizer()
+    task_spec = TaskDataSpec(
+        task_name="random",
+        input_len_or_input_len_generator=7,
+    )
+
+    datum = random_input_len_processor(
+        datum_dict={"task_name": "random"},
+        task_data_spec=task_spec,
+        tokenizer=tokenizer,
+        max_seq_length=16,
+        idx=3,
+    )
+
+    assert datum["task_name"] == "random"
+    assert datum["length"] == 7
+    assert datum["idx"] == 3
+    assert datum["loss_multiplier"] == 1.0
+    assert datum["extra_env_info"] == {}
+    assert datum["message_log"][0]["role"] == "user"
+    assert datum["message_log"][0]["token_ids"].shape == (7,)
+    assert torch.all(datum["message_log"][0]["token_ids"] < tokenizer.vocab_size)
+
+
+def test_random_input_len_processor_passes_idx_to_generator():
+    tokenizer = RandomTokenizer()
+    seen_indices = []
+
+    def input_len_generator(idx: int) -> int:
+        seen_indices.append(idx)
+        return idx + 2
+
+    task_spec = TaskDataSpec(
+        task_name="random",
+        input_len_or_input_len_generator=input_len_generator,
+    )
+
+    datum = random_input_len_processor(
+        datum_dict={"task_name": "random"},
+        task_data_spec=task_spec,
+        tokenizer=tokenizer,
+        max_seq_length=16,
+        idx=5,
+    )
+
+    assert seen_indices == [5]
+    assert datum["length"] == 7
+    assert datum["message_log"][0]["token_ids"].shape == (7,)
+
+
+def test_random_input_len_processor_rejects_overlength_input():
+    tokenizer = RandomTokenizer()
+    task_spec = TaskDataSpec(
+        task_name="random",
+        input_len_or_input_len_generator=17,
+    )
+
+    with pytest.raises(AssertionError):
+        random_input_len_processor(
+            datum_dict={"task_name": "random"},
+            task_data_spec=task_spec,
+            tokenizer=tokenizer,
+            max_seq_length=16,
+            idx=0,
+        )
+
+
+def test_random_dataset_processes_synthetic_samples():
+    tokenizer = RandomTokenizer()
+    random_dataset = RandomDataset(
+        input_len_or_input_len_generator={"mean": 4, "std": 0},
+        num_samples=3,
+    )
+
+    assert len(random_dataset.formatted_ds["train"]) == 3
+    assert random_dataset.formatted_ds["train"][0] == {"task_name": "random"}
+
+    processed_dataset = AllTaskProcessedDataset(
+        dataset=random_dataset.formatted_ds["train"],
+        tokenizer=tokenizer,
+        default_task_data_spec=random_dataset.task_spec,
+        task_data_processors=random_dataset.processor,
+        max_seq_length=8,
+    )
+
+    item = processed_dataset[1]
+    assert item["task_name"] == "random"
+    assert item["idx"] == 1
+    assert item["length"] == 4
+    assert item["message_log"][0]["token_ids"].shape == (4,)
 
 
 @pytest.mark.hf_gated
