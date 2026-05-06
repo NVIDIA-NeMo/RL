@@ -18,6 +18,8 @@ on:
     branches:
       - main
       - "r**"
+      - "pull-request/**"
+      - "deploy-release/*"
   workflow_dispatch:
     inputs:
       release-ref:
