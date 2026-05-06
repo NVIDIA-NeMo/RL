@@ -2101,18 +2101,24 @@ def grpo_train(
             )  # type: ignore
             # track example with high token mult prob error above 1.05
             if metrics["token_mult_prob_error"] > 1.05:
-                logger.log_plot_token_mult_prob_error(
-                    {
-                        "prompt_lengths": repeated_batch["length"],
-                        "full_lengths": input_lengths,
-                        "generation_logprobs": train_data["generation_logprobs"],
-                        "prev_logprobs": train_data["prev_logprobs"],
-                        "token_mask": train_data["token_mask"],
-                        "sample_mask": train_data["sample_mask"],
-                    },
-                    total_steps + 1,
-                    name="train/token_mult_prob_error_plot_sample",
-                )
+                if skip_prev_logprobs:
+                    print(
+                        "Skipp the plot of token mult prob error because prev_logprobs is not available",
+                        flush=True,
+                    )
+                else:
+                    logger.log_plot_token_mult_prob_error(
+                        {
+                            "prompt_lengths": repeated_batch["length"],
+                            "full_lengths": input_lengths,
+                            "generation_logprobs": train_data["generation_logprobs"],
+                            "prev_logprobs": train_data["prev_logprobs"],
+                            "token_mask": train_data["token_mask"],
+                            "sample_mask": train_data["sample_mask"],
+                        },
+                        total_steps + 1,
+                        name="train/token_mult_prob_error_plot_sample",
+                    )
             del train_data
             if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
                 "enable_vllm_metrics_logger", False
