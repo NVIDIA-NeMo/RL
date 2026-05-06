@@ -18,7 +18,7 @@ CONFIG_DIR = REPO_ROOT / "examples" / "modelopt" / "quant_configs"
         "nano3_nvfp4_weightonly.yaml",
     ],
 )
-def test_nano3_yaml_resolves(filename):
+def test_nano3_yaml_contains_required_disables(filename):
     path = CONFIG_DIR / filename
     cfg = resolve_quant_cfg(str(path))
     assert "quant_cfg" in cfg
