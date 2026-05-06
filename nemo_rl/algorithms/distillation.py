@@ -22,7 +22,11 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.grpo import _should_use_async_rollouts, refit_policy_generation
+from nemo_rl.algorithms.grpo import (
+    _should_use_async_rollouts,
+    _should_use_nemo_gym,
+    refit_policy_generation,
+)
 from nemo_rl.algorithms.loss import (
     DistillationLossConfig,
     DistillationLossDataDict,
@@ -45,6 +49,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
+    run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import (
@@ -527,6 +532,9 @@ def distillation_train(
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert student_generation is not None  # for mypy type check
+    use_nemo_gym = _should_use_nemo_gym(master_config)
+    if use_nemo_gym:
+        print("▶ Using NeMo-Gym rollouts for distillation", flush=True)
 
     # common config/state items
     current_epoch = distillation_save_state["current_epoch"]  # current epoch
@@ -619,8 +627,21 @@ def distillation_train(
                         student_generation.prepare_for_generation()
 
                 with timer.time("generation"):
+                    if use_nemo_gym:
+                        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                            policy_generation=student_generation,
+                            input_batch=repeated_batch,
+                            tokenizer=tokenizer,
+                            task_to_env=task_to_env,
+                            generation_config=master_config["policy"]["generation"],
+                            max_seq_len=None,
+                            max_rollout_turns=None,
+                            greedy=False,
+                        )
+                        repeated_batch = nemo_gym_rollout_result.final_batch
+                        rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                     # Use async rollouts if vLLM async engine is enabled
-                    if _should_use_async_rollouts(master_config):
+                    elif _should_use_async_rollouts(master_config):
                         (
                             repeated_batch,
                             rollout_metrics,
@@ -965,6 +986,8 @@ def validate(
         )
         return {}, {}
 
+    use_nemo_gym = _should_use_nemo_gym(master_config)
+
     timer = Timer()
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
@@ -983,8 +1006,21 @@ def validate(
                 break
 
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
+            if use_nemo_gym:
+                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                    policy_generation=policy_generation,
+                    input_batch=val_batch,
+                    tokenizer=tokenizer,
+                    task_to_env=val_task_to_env,
+                    generation_config=master_config["policy"]["generation"],
+                    max_seq_len=None,
+                    max_rollout_turns=None,
+                    greedy=False,
+                )
+                val_batch = nemo_gym_rollout_result.final_batch
+                gen_metrics = nemo_gym_rollout_result.rollout_metrics
             # Use async rollouts if vLLM async engine is enabled
-            if _should_use_async_rollouts(master_config):
+            elif _should_use_async_rollouts(master_config):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
                     val_batch,
