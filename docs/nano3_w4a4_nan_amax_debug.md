@@ -250,3 +250,59 @@ The diagnostic print probe at the entry of
 fix. The modelopt repo's `main` is otherwise unchanged from the
 state at investigation start (other pre-existing local KV-cache
 patches are untouched).
+
+## Step 9 — Hit the same NaN amax in a *Linear* layer's input_quantizer
+
+Job 157663 made it past the MoE expert pre-compile but immediately
+crashed at:
+
+```
+File "vllm/.../linear.py", line 576, in forward
+File "modelopt/.../plugins/vllm.py", line 317, in apply
+    x = layer.input_quantizer(x)
+AssertionError: detected nan values in amax. nan in original tensor: True
+```
+
+Same uninitialized-buffer signature, just at a different vLLM hook —
+`FakeQuantMethod.apply` for regular Linear layers. vLLM's
+`_dummy_run` pre-compile pass sweeps **every** quantized hook (Linear,
+RowParallelLinear, ColumnParallelLinear, fused MoE, attention bmm)
+with synthetic-shape buffers, not just the MoE expert path.
+
+`grep -n "(input_quantizer|output_quantizer|weight_quantizer|bmm_quantizer)\("`
+in `modelopt/torch/quantization/plugins/vllm.py` lists 15+ call sites
+(Linear apply, MoE w13, MoE w2, MoE per-expert weight quant, attention
+q/k/v bmm, etc.). Patching each one is brittle whack-a-mole.
+
+## Step 10 — Centralized fix in `MaxCalibrator.collect`
+
+Reverted the per-call-site patches in `plugins/vllm.py` to the upstream
+state. Single replacement in
+`modelopt/torch/quantization/calib/max.py:collect`: when `x` is fully
+NaN, skip the update and return early. The assertion below still
+catches partial-NaN (mixed finite + NaN) which represents genuine
+numerical bugs.
+
+```python
+# vLLM's _dummy_run pre-compile pass invokes quantized layers with
+# uninitialized bfloat16 buffers (entirely NaN bit patterns)... [comment
+# documents the dummy-prolog amax-sentinel discard behavior].
+if x.numel() > 0 and torch.isnan(x).all():
+    return
+assert not torch.any(torch.isnan(local_amax)), ...
+```
+
+This covers every call path that goes through `MaxCalibrator` —
+Linear, ColumnParallelLinear, RowParallelLinear, MoE w13/w2 input,
+MoE per-expert weight, attention q/k/v bmm — without per-site edits.
+Real-data calibration is unaffected because finite tensors don't
+trigger the early return; it only fires for the uninitialized-buffer
+signature.
+
+## Step 11 — Resubmit and verify
+
+Resubmitting `opd_nemotron_nano3_nvfp4_default_sft0.1_t1.4_ep8_cp4.sh`.
+Expected: vLLM `compile_or_warm_up_model` completes, calibration
+prolog finishes, and training reaches step 1 with `train/total_reward`
+in BF16 baseline range (0.84–0.86). If reached, diagnosis and fix
+are both validated.
