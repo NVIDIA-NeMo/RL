@@ -732,6 +732,7 @@ def setup_model_and_optimizer(
     load_optimizer: bool = True,
     get_embedding_ranks=None,  # TODO @sahilj: What is this?
     get_position_embedding_ranks=None,
+    pre_load_checkpoint_hook: Optional[Callable] = None,
 ):
     state = GlobalState()
     state.cfg = megatron_cfg
@@ -918,6 +919,8 @@ def setup_model_and_optimizer(
 
     # Load checkpoint if applicable
     if should_load_checkpoint:
+        if pre_load_checkpoint_hook is not None:
+            pre_load_checkpoint_hook(state, model)
         load_checkpoint(
             state,
             model,
@@ -957,8 +960,25 @@ def handle_model_import(
     hf_model_name: str,
     pretrained_path: str,
     pt_checkpoint_exists: bool,
+    model_post_wrap_hook: Optional[Callable] = None,
+    transformer_layer_spec: Optional[Any] = None,
 ) -> None:
-    """Handle HF model import if checkpoint doesn't exist."""
+    """Handle HF model import if checkpoint doesn't exist.
+
+    Args:
+        config: Policy config used for ``hf_config_overrides`` and ``megatron_cfg``.
+        hf_model_name: HF model id (or local path) to import.
+        pretrained_path: Output directory for the Megatron checkpoint.
+        pt_checkpoint_exists: Whether a Megatron checkpoint already exists at
+            ``pretrained_path``. If True and ``force_reconvert_from_hf`` is
+            False, the import is skipped.
+        model_post_wrap_hook: Optional callable forwarded to
+            :func:`import_model_from_hf_name`. Invoked on each Megatron model
+            chunk after it is built (and before DDP wrapping).
+        transformer_layer_spec: Optional Megatron ``ModuleSpec`` (or callable
+            returning one) overriding the default layer spec from the model
+            provider.
+    """
     force_reconvert_from_hf = config["megatron_cfg"].get(
         "force_reconvert_from_hf", False
     )
@@ -971,6 +991,8 @@ def handle_model_import(
             hf_model_name,
             pretrained_path,
             config["megatron_cfg"],
+            model_post_wrap_hook=model_post_wrap_hook,
+            transformer_layer_spec=transformer_layer_spec,
             **hf_config_overrides,
         )
 
@@ -980,7 +1002,10 @@ def handle_model_import(
 
 
 def setup_reference_model_state(
-    config: PolicyConfig, megatron_cfg: ConfigContainer, pretrained_path: str
+    config: PolicyConfig,
+    megatron_cfg: ConfigContainer,
+    pretrained_path: str,
+    pre_load_checkpoint_hook: Optional[Callable] = None,
 ) -> dict:
     """Setup the reference model for inference and return its state dict."""
     # Create reference checkpoint config
@@ -1078,6 +1103,8 @@ def setup_reference_model_state(
     print("Loading the Reference Model")
 
     if should_load_checkpoint:
+        if pre_load_checkpoint_hook is not None:
+            pre_load_checkpoint_hook(ref_state, reference_model)
         load_checkpoint(
             ref_state,
             reference_model,
