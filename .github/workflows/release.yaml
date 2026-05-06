@@ -61,9 +61,7 @@ concurrency:
 
 jobs:
   release:
-    if: |
-      !cancelled()
-      && (github.event_name == 'workflow_dispatch' || vars.BUILD_TEST_PUBLISH_WHEEL == 'true')
+    if: ${{ !cancelled() }}
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@a0921929733d506dee2de6889c39feee5da623ab
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
