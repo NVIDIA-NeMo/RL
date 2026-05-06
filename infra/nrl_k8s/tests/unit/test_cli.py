@@ -484,6 +484,58 @@ class TestClusterDown:
 
 
 # =============================================================================
+# --target resolution — including the dynamo.<key> path
+# =============================================================================
+
+
+def _loaded_with_dynamo(tmp_path: Path):
+    """Build a LoadedConfig that has a single declared DGD."""
+    from nrl_k8s.config import LoadedConfig
+    from nrl_k8s.schema import InfraConfig
+    from omegaconf import OmegaConf
+
+    infra = InfraConfig.model_validate(
+        {
+            "namespace": "ns-a",
+            "image": "img:1",
+            "dynamo": {"serving": {"manifest": "dgd.yaml", "name": "my-dgd"}},
+        }
+    )
+    return LoadedConfig(
+        recipe=OmegaConf.create({}),
+        infra=infra,
+        source_path=tmp_path / "recipe.yaml",
+        infra_source_path=tmp_path / "infra.yaml",
+    )
+
+
+class TestResolveTargets:
+    def test_dynamo_dotted_path(self, tmp_path) -> None:
+        loaded = _loaded_with_dynamo(tmp_path)
+        results = cli._resolve_targets(loaded, ("dynamo.serving",))
+        assert len(results) == 1
+        kind, key, spec = results[0]
+        assert kind == "dynamo"
+        assert key == "serving"
+        assert spec.name == "my-dgd"
+
+    def test_dynamo_unknown_key_errors(self, tmp_path) -> None:
+        loaded = _loaded_with_dynamo(tmp_path)
+        with pytest.raises(SystemExit):
+            cli._resolve_targets(loaded, ("dynamo.nope",))
+
+    def test_empty_targets_includes_dynamo(self, tmp_path) -> None:
+        loaded = _loaded_with_dynamo(tmp_path)
+        kinds = {kind for kind, _, _ in cli._resolve_targets(loaded, ())}
+        assert "dynamo" in kinds
+
+    def test_unknown_kind_errors(self, tmp_path) -> None:
+        loaded = _loaded_with_dynamo(tmp_path)
+        with pytest.raises(SystemExit):
+            cli._resolve_targets(loaded, ("clusters.foo",))
+
+
+# =============================================================================
 # --mode resolution (interactive vs batch)
 # =============================================================================
 
