@@ -13,17 +13,39 @@
 # limitations under the License.
 
 import os
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
+import torch
 from megatron.bridge import AutoBridge
+from megatron.core.transformer import ModuleSpec
 
 from nemo_rl.models.policy import MegatronConfig
+
+
+def to_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        key = dtype.lower()
+        aliases = {
+            "fp32": torch.float32,
+            "float32": torch.float32,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+        }
+        if key in aliases:
+            return aliases[key]
+    raise ValueError(f"Unknown dtype: {dtype}")
 
 
 def import_model_from_hf_name(
     hf_model_name: str,
     output_path: str,
     megatron_config: Optional[MegatronConfig] = None,
+    model_post_wrap_hook: Optional[Callable] = None,
+    transformer_layer_spec: Optional[ModuleSpec | Callable] = None,
     **config_overrides: Any,
 ):
     """Import a Hugging Face model into Megatron checkpoint format and save the Megatron checkpoint to the output path.
@@ -31,7 +53,15 @@ def import_model_from_hf_name(
     Args:
         hf_model_name: Hugging Face model ID or local path (e.g., 'meta-llama/Llama-3.1-8B-Instruct').
         output_path: Directory to write the Megatron checkpoint (e.g., /tmp/megatron_ckpt).
-        megatron_config: Optional megatron config with paralellism settings for distributed megatron model import.
+        megatron_config: Optional megatron config with parallelism settings for distributed megatron model import.
+        model_post_wrap_hook: Optional callable invoked on each Megatron model
+            chunk after it is built (and before DDP wrapping). Forwarded to
+            ``provide_distributed_model(post_wrap_hook=...)``.
+        transformer_layer_spec: Optional Megatron ``ModuleSpec`` (or callable
+            returning one) overriding the default layer spec selected by the
+            model provider.
+        **config_overrides: Extra keyword arguments forwarded to
+            ``AutoBridge.from_hf_pretrained``.
     """
     bridge = AutoBridge.from_hf_pretrained(
         hf_model_name, trust_remote_code=True, **config_overrides
@@ -73,11 +103,15 @@ def import_model_from_hf_name(
         model_provider.num_layers_in_last_pipeline_stage = megatron_config[
             "num_layers_in_last_pipeline_stage"
         ]
-        model_provider.pipeline_dtype = megatron_config["pipeline_dtype"]
+        model_provider.pipeline_dtype = to_torch_dtype(
+            megatron_config["pipeline_dtype"]
+        )
         model_provider.sequence_parallel = megatron_config["sequence_parallel"]
         model_provider.gradient_accumulation_fusion = megatron_config[
             "gradient_accumulation_fusion"
         ]
+    if transformer_layer_spec is not None:
+        model_provider.transformer_layer_spec = transformer_layer_spec
     model_provider.finalize()
 
     from megatron.core import parallel_state
@@ -89,7 +123,10 @@ def import_model_from_hf_name(
 
         model_parallel_cuda_manual_seed(0)
 
-    megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
+    megatron_model = model_provider.provide_distributed_model(
+        wrap_with_ddp=False,
+        post_wrap_hook=model_post_wrap_hook,
+    )
 
     # The above parallelism settings are used to load the model in a distributed manner.
     # However, we do not want to save the parallelism settings to the checkpoint config

@@ -51,10 +51,10 @@ dependencies = [
   "pyzmq",
   "decord2",
   "soundfile>=0.13.1",
-  "nccl4py",                                                                                                          # for non-colocated refit
-  "cuda-bindings",                                                                                                    # for non-colocated refit
+  "nccl4py; sys_platform != 'darwin'",                                                                                # for non-colocated refit
+  "cuda-bindings; sys_platform != 'darwin'",                                                                          # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
-  "nvidia-cudnn-cu12==9.19.0.56",                                                                                     # for transformer-engine no build isolation
+  "nvidia-cudnn-cu12==9.19.0.56; sys_platform != 'darwin'",                                                           # for transformer-engine no build isolation
 ]
 
 [project.optional-dependencies]
@@ -109,6 +109,7 @@ mcore = [
   "emerging-optimizers==0.2.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
 ]
+modelopt = ["nvidia-modelopt"]
 nvrx = [
   "nvidia-resiliency-ext",
 ] # for ft_launcher (fault-tolerant training launcher)
@@ -189,6 +190,7 @@ emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizer
 # Official sglang v0.5.10 with transformers v5 support
 sglang = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "python" }
 sglang-kernel = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "sgl-kernel" }
+nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "905018803414702e414a86716484ed4115b37ba6" }
 
 [tool.uv.workspace]
 members = [
@@ -241,7 +243,7 @@ link-mode = "copy"
 # The nvidia-modelopt override is needed because mcore is still on 0.33
 override-dependencies = [
   "transformer-engine[pytorch,core_cu12] @ git+https://github.com/NVIDIA/TransformerEngine.git@71bbefbf153418f943640df0f7373625dc93fa46",
-  "nvidia-cudnn-cu12==9.19.0.56",
+  "nvidia-cudnn-cu12==9.19.0.56; sys_platform != 'darwin'",
   "opencv-python-headless>=4.11.0",
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.39.0",
@@ -274,6 +276,7 @@ override-dependencies = [
   # Upgrade pytest to 9.0.3
   "pytest>=9.0.3",
 ]
+
 # CVE fixes
 constraint-dependencies = [
   "brotli>=1.2.0",            # Address CVE GHSA-2qfp-q593-8484
@@ -542,8 +545,7 @@ exclude = '''
 '''
 
 [tool.pytest.ini_options]
-addopts = "--testmon --durations=100 -s -rA -x"
-#addopts = "--durations=100 -s -rA -x"
+addopts = "--durations=100 -s -rA -x"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
