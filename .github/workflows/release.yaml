@@ -62,7 +62,7 @@ concurrency:
 jobs:
   release:
     if: ${{ !cancelled() }}
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@a0921929733d506dee2de6889c39feee5da623ab
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@6afcae295503a63fdafed18ba127c7d6dda24c01
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       python-package: nemo_rl
