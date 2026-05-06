@@ -137,10 +137,10 @@ class GenerationConfig(TypedDict):
     max_new_tokens: int
     temperature: float
     top_p: float
-    top_k: int
-    model_name: str
-    stop_token_ids: list[int]
-    stop_strings: NotRequired[list[str]]
+    top_k: int | None
+    model_name: NotRequired[str]
+    stop_token_ids: list[int] | None
+    stop_strings: NotRequired[list[str] | None]
     ignore_eos: bool
     output_len_or_output_len_generator: NotRequired[Dict[str, Any] | int]
     colocated: NotRequired[ColocationConfig]
