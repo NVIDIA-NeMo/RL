@@ -1,8 +1,12 @@
 """Collect v0.7 Tier 1 perf_test metrics across runs into one CSV.
 
+Parses the per-step "Performance Metrics" blocks emitted by NeMo-RL's GRPO driver
+into ray-driver.log, takes the median of each metric over post-warmup steps,
+and emits one row per (model, variant) run.
+
 Usage (from worktree root):
     python experiments/perf_test/scripts/collect_v07_metrics.py \
-        --logs-root logs/perf_test/v07_tier1\
+        --logs-root logs/perf_test/v07_tier1 \
         --output experiments/perf_test/scripts/v07_tier1_matrix.csv
 """
 
@@ -10,76 +14,84 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import re
 import statistics
 from dataclasses import dataclass
 from pathlib import Path
 
-VARIANT_RE = re.compile(r"v07_(\d+)_([a-z0-9]+)")
+WARMUP_STEPS = 2
+
+# Each "🔍 Performance Metrics:" block has lines like
+#   - E2E (Tokens/sec/gpu): 3081.01
+# We pull a fixed set of keys from each block.
+METRIC_PATTERNS = {
+    "e2e_samples_per_sec_per_gpu": re.compile(r"E2E \(Samples/sec/gpu\):\s*([\d.]+)"),
+    "e2e_tokens_per_sec_per_gpu": re.compile(r"E2E \(Tokens/sec/gpu\):\s*([\d.]+)"),
+    "policy_train_tps_per_gpu": re.compile(
+        r"Policy Training \(Tokens/sec/gpu\):\s*([\d.]+)"
+    ),
+    "logprob_tps_per_gpu": re.compile(
+        r"Policy and Reference Logprobs \(Tokens/sec/gpu\):\s*([\d.]+)"
+    ),
+    "training_wg_tps_per_gpu": re.compile(
+        r"Training Worker Group \(Tokens/sec/gpu\):\s*([\d.]+)"
+    ),
+    "generation_wg_tps_per_gpu": re.compile(
+        r"Generation Worker Group \(Tokens/sec/gpu\):\s*([\d.]+)"
+    ),
+    "e2e_tokens_per_sec": re.compile(r"E2E \(Tokens/sec\):\s*([\d.]+)"),
+    "training_tflops": re.compile(r"Training FLOPS:\s*([\d.]+)\s*TFLOPS"),
+    "training_mfu_pct": re.compile(
+        r"Training Model Floating Point Utilization:\s*([\d.]+)%"
+    ),
+    "mean_tokens_per_sample": re.compile(r"Mean Total Tokens per Sample:\s*([\d.]+)"),
+}
+
+BLOCK_HEADER = re.compile(r"Performance Metrics:")
 
 
 @dataclass
 class RunMetrics:
     model: str
     variant: str
-    median_step_time: float | None
-    median_logprob_time: float | None
-    tokens_per_sec: float | None
-    n_steps_seen: int
+    n_blocks: int
+    n_used: int  # blocks after warmup
+    medians: dict[str, float]
 
 
-def _median_or_none(values: list[float]) -> float | None:
-    if not values:
-        return None
-    return statistics.median(values)
+def parse_log(log_path: Path) -> tuple[int, int, dict[str, float]]:
+    """Read a ray-driver.log, return (total_blocks, used_blocks, median_metrics)."""
+    text = log_path.read_text(errors="replace")
+    blocks = BLOCK_HEADER.split(text)[1:]  # drop preamble before first block
+    used = blocks[WARMUP_STEPS:]
+    series: dict[str, list[float]] = {k: [] for k in METRIC_PATTERNS}
+    for block in used:
+        for k, pat in METRIC_PATTERNS.items():
+            m = pat.search(block)
+            if m:
+                try:
+                    series[k].append(float(m.group(1)))
+                except ValueError:
+                    pass
+    medians = {k: statistics.median(v) for k, v in series.items() if v}
+    return len(blocks), len(used), medians
 
 
-def _extract_steps(metrics: dict, key: str) -> list[float]:
-    """Pull values for a tensorboard key dumped as {key: {"<step>": value}}."""
-    series = metrics.get(key)
-    if not isinstance(series, dict):
-        return []
-    items = sorted(series.items(), key=lambda kv: int(kv[0]))
-    # Skip first 2 steps as warmup. Use whatever's left.
-    items = items[2:]
-    return [float(v) for _, v in items if v is not None]
+def find_runs(logs_root: Path):
+    """Yield (model, variant, ray_driver_log_path) for each run directory.
 
-
-def parse_run(metrics_json: Path) -> RunMetrics | None:
-    parts = metrics_json.parts
-    # logs/perf_test/v07_tier1/<model>/<variant>/metrics.json
-    try:
-        idx = parts.index("v07_tier1")
-        model = parts[idx + 1]
-        variant = parts[idx + 2]
-    except (ValueError, IndexError):
-        return None
-    try:
-        with open(metrics_json) as fh:
-            data = json.load(fh)
-    except Exception:
-        return None
-
-    step_times = _extract_steps(data, "train/global_step_time")
-    logprob_times = _extract_steps(data, "train/logprob_step_time")
-
-    tokens_per_sec: float | None = None
-    if step_times:
-        tokens_series = _extract_steps(data, "train/total_num_tokens")
-        if tokens_series and len(tokens_series) == len(step_times):
-            tokens_per_sec = statistics.median(
-                t / s for t, s in zip(tokens_series, step_times) if s > 0
-            )
-
-    return RunMetrics(
-        model=model,
-        variant=variant,
-        median_step_time=_median_or_none(step_times),
-        median_logprob_time=_median_or_none(logprob_times),
-        tokens_per_sec=tokens_per_sec,
-        n_steps_seen=len(step_times) + 2,
-    )
+    Layout: <logs_root>/<model>/<variant>/<jobid>-logs/ray-driver.log
+    Pick the most recent jobid per (model, variant).
+    """
+    seen: dict[tuple[str, str], Path] = {}
+    for log in logs_root.glob("*/*/*-logs/ray-driver.log"):
+        model = log.parents[2].name
+        variant = log.parents[1].name
+        key = (model, variant)
+        if key not in seen or log.stat().st_mtime > seen[key].stat().st_mtime:
+            seen[key] = log
+    for (model, variant), log in seen.items():
+        yield model, variant, log
 
 
 def main() -> int:
@@ -89,36 +101,29 @@ def main() -> int:
     args = parser.parse_args()
 
     rows: list[RunMetrics] = []
-    for metrics_path in args.logs_root.glob("**/metrics.json"):
-        rec = parse_run(metrics_path)
-        if rec is not None:
-            rows.append(rec)
+    for model, variant, log in find_runs(args.logs_root):
+        n_blocks, n_used, medians = parse_log(log)
+        if n_blocks == 0:
+            continue
+        rows.append(RunMetrics(model, variant, n_blocks, n_used, medians))
 
     rows.sort(key=lambda r: (r.model, r.variant))
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["model", "variant", "n_blocks", "n_used"] + list(METRIC_PATTERNS)
     with open(args.output, "w", newline="") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(
-            [
-                "model",
-                "variant",
-                "median_step_s",
-                "median_logprob_s",
-                "tokens_per_sec",
-                "steps_seen",
-            ]
-        )
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
         for r in rows:
-            writer.writerow(
-                [
-                    r.model,
-                    r.variant,
-                    f"{r.median_step_time:.4f}" if r.median_step_time else "",
-                    f"{r.median_logprob_time:.4f}" if r.median_logprob_time else "",
-                    f"{r.tokens_per_sec:.1f}" if r.tokens_per_sec else "",
-                    r.n_steps_seen,
-                ]
-            )
+            row = {
+                "model": r.model,
+                "variant": r.variant,
+                "n_blocks": r.n_blocks,
+                "n_used": r.n_used,
+            }
+            for k in METRIC_PATTERNS:
+                v = r.medians.get(k)
+                row[k] = f"{v:.2f}" if v is not None else ""
+            writer.writerow(row)
 
     print(f"[collect] wrote {len(rows)} rows to {args.output}")
     return 0
