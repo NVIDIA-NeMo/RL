@@ -496,6 +496,23 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     ):
         if _knob in config["megatron_cfg"]:
             setattr(model_cfg, _knob, config["megatron_cfg"][_knob])
+
+    # Tier 2 TransformerConfig passthroughs — TP/MoE/CE knobs that live on
+    # TransformerConfig (not CommOverlapConfig). Same opt-in pattern as G6.
+    for _knob in (
+        "tp_comm_atomic_ag",
+        "tp_comm_atomic_rs",
+        "tp_comm_split_ag",
+        "tp_comm_split_rs",
+        "gradient_accumulation_fusion",
+        "cross_entropy_loss_fusion",
+        "cross_entropy_fusion_impl",
+        "enable_cuda_graph",
+        "external_cuda_graph",
+        "cuda_graph_use_single_mempool",
+    ):
+        if _knob in config["megatron_cfg"]:
+            setattr(model_cfg, _knob, config["megatron_cfg"][_knob])
     # Optional explicit attention backend override for environments where
     # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")
@@ -642,6 +659,9 @@ def _build_comm_overlap_config(config: PolicyConfig) -> Optional[CommOverlapConf
         "overlap_moe_expert_parallel_comm": mcfg.get(
             "overlap_moe_expert_parallel_comm"
         ),
+        "overlap_p2p_comm": mcfg.get("overlap_p2p_comm"),
+        "defer_embedding_wgrad_compute": mcfg.get("defer_embedding_wgrad_compute"),
+        "wgrad_deferral_limit": mcfg.get("wgrad_deferral_limit"),
     }
     if all(v is None for v in knobs.values()):
         return None
@@ -650,6 +670,9 @@ def _build_comm_overlap_config(config: PolicyConfig) -> Optional[CommOverlapConf
         tp_comm_overlap=bool(knobs["tp_comm_overlap"]),
         delay_wgrad_compute=knobs["delay_wgrad_compute"],
         overlap_moe_expert_parallel_comm=knobs["overlap_moe_expert_parallel_comm"],
+        overlap_p2p_comm=knobs["overlap_p2p_comm"],
+        defer_embedding_wgrad_compute=knobs["defer_embedding_wgrad_compute"],
+        wgrad_deferral_limit=knobs["wgrad_deferral_limit"],
     )
 
 

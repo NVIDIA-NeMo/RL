@@ -15,6 +15,10 @@ policy:
     enabled: true
   megatron_cfg:
     tp_comm_overlap: true
+    # Bridge GPT autocast spec uses `split_ag or atomic_ag` — must disable split
+    # to actually pick the atomic kernel (gpt_full_te_layer_autocast_spec.py:211).
+    tp_comm_split_ag: false
+    tp_comm_split_rs: false
     tp_comm_atomic_ag: true
     tp_comm_atomic_rs: true
     env_vars:

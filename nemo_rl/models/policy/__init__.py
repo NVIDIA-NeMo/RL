@@ -225,6 +225,8 @@ class MegatronConfig(TypedDict):
     bias_dropout_add_fusion: NotRequired[bool]
     masked_softmax_fusion: NotRequired[bool]
     persist_layer_norm: NotRequired[bool]
+    # Phase A (MLM #3384): fused dLN+add backward kernel on RMSNorm.
+    fused_residual_rmsnorm: NotRequired[bool]
     # G1 (Tier 1): tensor-parallel communication overlap via UserBuffers.
     # Requires sequence_parallel=True. May need NCCL UserBuffers/symmem env in container.
     tp_comm_overlap: NotRequired[bool]
@@ -232,6 +234,23 @@ class MegatronConfig(TypedDict):
     delay_wgrad_compute: NotRequired[bool]
     # G3 (Tier 1, MoE-only): overlap MoE A2A combine backprop with wgrad GEMM (MLM #3795).
     overlap_moe_expert_parallel_comm: NotRequired[bool]
+    # Tier 2 pipeline-overlap knobs (CommOverlapConfig passthroughs).
+    overlap_p2p_comm: NotRequired[bool]
+    defer_embedding_wgrad_compute: NotRequired[bool]
+    wgrad_deferral_limit: NotRequired[int]
+    # Tier 2 TP atomic-gemm overlap (TransformerConfig).
+    tp_comm_atomic_ag: NotRequired[bool]
+    tp_comm_atomic_rs: NotRequired[bool]
+    tp_comm_split_ag: NotRequired[bool]
+    tp_comm_split_rs: NotRequired[bool]
+    # Tier 2 cross-entropy fusion (Bridge default is True/native; Qwen3 recipes use "te").
+    cross_entropy_loss_fusion: NotRequired[bool]
+    cross_entropy_fusion_impl: NotRequired[str]
+    # Tier 2 CUDA-graph capture (TransformerConfig). Significant fwd-pass speedup
+    # on small models / short sequences when the graph captures cleanly.
+    enable_cuda_graph: NotRequired[bool]
+    external_cuda_graph: NotRequired[bool]
+    cuda_graph_use_single_mempool: NotRequired[bool]
     # Force reconvert from HF even if the checkpoint already exists (default: False)
     force_reconvert_from_hf: NotRequired[bool]
     # Attention backend available values:
