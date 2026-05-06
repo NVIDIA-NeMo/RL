@@ -15,6 +15,7 @@
 import asyncio
 import json
 import os
+import time
 from collections import Counter
 from itertools import combinations
 from typing import NotRequired, TypedDict, cast
@@ -320,8 +321,6 @@ async def _run_env_eval_impl(
     # Run evaluation loop
     score = 0.0
     for batch in dataloader:
-        import time
-
         start_time = time.time()
         # measure multiple samples
         if num_tests_per_prompt > 1:
