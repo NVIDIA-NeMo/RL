@@ -169,7 +169,7 @@ Four open NeMo-RL PRs were re-measured with same-batch pairing on Qwen3-30B-A3B 
 
 `activation_offload` (PR #2279) shows null perf cost (the design intent was memory savings without throughput regression). The 32B core-attn-MoE variant trending -1.76% is borderline but plausibly within batch noise.
 
-`selective_recompute` (PR #2280) on 32B shows the expected directional cost (full recompute +4.16% vs no recompute) — confirming the wiring works. Llama re-runs need a config audit (variant labels appear inverted; following up).
+`selective_recompute` (PR #2280) on 32B shows the expected directional cost (full recompute +4.16% vs no recompute) — confirming the wiring works. On Llama-8B (n=29 each, max_num_steps=30) the medians come out full=62.2s, no_ckpt=68.8s, selective_attn=74s — i.e. `full` faster than `no_ckpt`, which is the wrong direction. Yamls were audited and labels are correct (`activation_checkpointing: true/false` + `recompute_granularity: full/selective`). The likely explanation is **inter-batch noise** swamping the signal: the three jobs were submitted as a 3-variant batch but landed on different nodes at different times, and the within-run variance is ~30-40%. Same-batch pairing (each variant against a co-scheduled baseline in the identical SLURM submission) is needed to get a clean Llama-8B number.
 
 **HybridEP (PR #2133) at d28bd676**: both 30B runs failed with infrastructure errors — `ModuleNotFoundError: No module named 'torch._tensor'` on the baseline (venv corruption) and `Error compiling objects for extension` on the hp_ep variant (DeepEP build failure). Need to rebuild the worktree's venv and re-pin DeepEP before this can be measured.
 
