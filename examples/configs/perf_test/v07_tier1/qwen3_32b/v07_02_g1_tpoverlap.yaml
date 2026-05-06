@@ -1,6 +1,6 @@
-defaults: ../../../recipes/llm/performance/grpo-qwen3-32b-4n8g.yaml
+defaults: ../../../recipes/llm/performance/grpo-qwen3-32b-4n4g.yaml
 
-# v0.7 Tier 1 variant: G1 tp_comm_overlap (Qwen3 32B, 4n8g, TP=4 SP=on).
+# v0.7 Tier 1 variant: G1 tp_comm_overlap (Qwen3 32B, 4n4g, TP=4 SP=on).
 # UserBuffers TP comm overlap. Stacks with G5/G6.
 checkpointing:
   enabled: false
@@ -18,7 +18,3 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
       CUDA_HOME: /usr/local/cuda
-
-cluster:
-  gpus_per_node: 4
-  num_nodes: 8

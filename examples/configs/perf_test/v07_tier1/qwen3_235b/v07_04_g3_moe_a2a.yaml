@@ -1,6 +1,6 @@
-defaults: ../../../recipes/llm/performance/grpo-qwen3-235b-16n8g.yaml
+defaults: ../../../recipes/llm/performance/grpo-qwen3-235b-16n4g.yaml
 
-# v0.7 Tier 1 variant: G3 MoE A2A combine + wgrad GEMM overlap (Qwen3 235B, 16n8g).
+# v0.7 Tier 1 variant: G3 MoE A2A combine + wgrad GEMM overlap (Qwen3 235B, 16n4g).
 checkpointing:
   enabled: false
 grpo:
@@ -17,7 +17,3 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
       CUDA_HOME: /usr/local/cuda
-
-cluster:
-  gpus_per_node: 4
-  num_nodes: 32

@@ -1,6 +1,6 @@
-defaults: ../../../recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml
+defaults: ../../../recipes/llm/performance/grpo-qwen3-30ba3b-4n4g.yaml
 
-# v0.7 Tier 1 stack (Qwen3 30B-A3B MoE, 4n8g): G6 fusion + G3 MoE A2A overlap.
+# v0.7 Tier 1 stack (Qwen3 30B-A3B MoE, 4n4g): G6 fusion + G3 MoE A2A overlap.
 # G1 (tp_comm_overlap) and G5 (delay_wgrad) skipped for this recipe (TP=1).
 checkpointing:
   enabled: false
@@ -22,7 +22,3 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
       CUDA_HOME: /usr/local/cuda
-
-cluster:
-  gpus_per_node: 4
-  num_nodes: 8

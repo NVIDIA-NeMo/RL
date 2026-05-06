@@ -1,6 +1,6 @@
-defaults: ../../../recipes/llm/performance/grpo-qwen3-30ba3b-4n8g.yaml
+defaults: ../../../recipes/llm/performance/grpo-qwen3-30ba3b-4n4g.yaml
 
-# v0.7 Tier 1 baseline (Qwen3 30B-A3B MoE, 4n8g): no Tier 1 knobs.
+# v0.7 Tier 1 baseline (Qwen3 30B-A3B MoE, 4n4g): no Tier 1 knobs.
 checkpointing:
   enabled: false
 grpo:
@@ -17,7 +17,3 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
       CUDA_HOME: /usr/local/cuda
-
-cluster:
-  gpus_per_node: 4
-  num_nodes: 8

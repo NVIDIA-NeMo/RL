@@ -1,6 +1,6 @@
-defaults: ../../../recipes/llm/performance/grpo-qwen3-32b-4n8g.yaml
+defaults: ../../../recipes/llm/performance/grpo-qwen3-32b-4n4g.yaml
 
-# v0.7 Tier 1 variant: G6 fusion bundle (Qwen3 32B, 4n8g).
+# v0.7 Tier 1 variant: G6 fusion bundle (Qwen3 32B, 4n4g).
 checkpointing:
   enabled: false
 grpo:
@@ -19,7 +19,3 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
       CUDA_HOME: /usr/local/cuda
-
-cluster:
-  gpus_per_node: 4
-  num_nodes: 8
