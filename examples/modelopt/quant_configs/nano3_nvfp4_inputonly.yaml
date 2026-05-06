@@ -28,7 +28,13 @@ metadata:
 quantize:
   algorithm: max
   quant_cfg:
+    # Deny-all-then-enable: start by disabling every quantizer (including
+    # KV-cache q/k/v_bmm_quantizers, which would otherwise be enabled by a
+    # wildcard '*' true and produce NaN amax on dummy calibration), then
+    # explicitly enable just '*input_quantizer' for W16A4.
     - quantizer_name: '*'
+      enable: false
+    - quantizer_name: '*input_quantizer'
       enable: true
       cfg:
         block_sizes:
@@ -36,6 +42,7 @@ quantize:
           type: dynamic
           scale_bits: e4m3
         num_bits: e2m1
+    # Override the enable above: Nano3 keeps these layers in BF16.
     - quantizer_name: '*.[q|k|v|o]_proj.*'
       enable: false
     - quantizer_name: '*.qkv_proj.*'
@@ -70,8 +77,4 @@ quantize:
       enable: false
     - parent_class: 'nn.BatchNorm3d'
       quantizer_name: '*'
-      enable: false
-    - quantizer_name: '*weight_quantizer'
-      enable: false
-    - quantizer_name: '*output_quantizer'
       enable: false
