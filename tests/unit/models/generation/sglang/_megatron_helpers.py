@@ -21,8 +21,8 @@ Exposes:
   --enable-dp-attention / tp4 ep2 dp4 --enable-dp-attention / tp2 ep2 pp2"
   SGLang).
 - ``make_policy_config(...)`` — produces a ``PolicyConfig`` dict suitable for
-  ``nemo_rl.models.policy.lm_policy.Policy`` against the sliced Nemotron-3
-  Nano model.
+  ``nemo_rl.models.policy.lm_policy.Policy`` against the
+  Qwen3-30B-A3B-Instruct-2507 model (MoE, supports EP > 1).
 - ``make_sglang_cfg(...)`` — produces an SGLang generation config compatible
   with ``SGLangGeneration``.
 - ``required_world_size(...)`` / ``min_dp_for_megatron(...)`` — helpers used
@@ -38,11 +38,11 @@ from typing import Any
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-# These are the model-specific ids we hard-code here. They are read from the
-# Nemotron-3-Nano tokenizer once and cached; expressing them as constants keeps
-# the test fixtures importable without a tokenizer.
-PAD_TOKEN_ID = 11    # Nemotron tokenizer's pad
-EOS_TOKEN_ID = 0     # Nemotron tokenizer's eos
+# Qwen3 tokenizer ids (shared across the Qwen3 family — verified against
+# ``Qwen/Qwen3-30B-A3B-Instruct-2507``). Hard-coding keeps these fixtures
+# importable without spinning up a tokenizer.
+PAD_TOKEN_ID = 151643  # Qwen3 ``<|endoftext|>``
+EOS_TOKEN_ID = 151645  # Qwen3 ``<|im_end|>``
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +216,7 @@ def make_policy_config(
             "train_iters": 10,
             "empty_unused_memory_level": 1,
             "activation_checkpointing": False,
-            "converter_type": "NemotronHForCausalLM",
+            "converter_type": "Qwen3MoeForCausalLM",
             "tensor_model_parallel_size": megatron.tp,
             "expert_tensor_parallel_size": 1,
             "expert_model_parallel_size": megatron.ep,
@@ -232,9 +232,9 @@ def make_policy_config(
             "moe_router_bias_update_rate": 0.0,
             "moe_permute_fusion": False,
             "apply_rope_fusion": True,
-            # NemotronH uses ``silu``, which is incompatible with
-            # ``bias_activation_fusion=True`` (Megatron-Core only fuses bias
-            # for gelu/swiglu/quick_geglu).
+            # Megatron-Core only fuses bias for gelu/swiglu/quick_geglu.
+            # Leave the bias-activation fusion off so any swap of activation
+            # function (e.g. silu) doesn't trip the fused kernel's check.
             "bias_activation_fusion": False,
             "defer_fp32_logits": False,
             "moe_per_layer_logging": False,
@@ -340,12 +340,7 @@ def make_sglang_cfg(
         "ep_size": sglang.ep_size,
         "disable_piecewise_cuda_graph": True,
         "disable_cuda_graph": sglang.disable_cuda_graph,
-        # In colocate mode the trainer and engine share the same GPU, so
-        # the engine's static memory fraction has to leave room for
-        # Megatron's resident weights. In disaggregate the engine has the
-        # GPU to itself and can claim a much larger slice for the KV
-        # cache + cuda graph.
-        "mem_fraction_static": 0.3 if colocated else 0.7,
+        "mem_fraction_static": 0.7,
     }
     if sglang.enable_dp_attention:
         sglang_cfg["enable_dp_attention"] = True

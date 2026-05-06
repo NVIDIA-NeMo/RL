@@ -30,14 +30,12 @@ Cross-product the user asked for:
         - tp=4 ep=2 dp=4 --enable-dp-attention   (4 engine GPUs)
         - tp=2 ep=2 pp=2                          (4 engine GPUs)
 
-Model: ``nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`` sliced to 14 layers
-(``MEMEM*EMEMEM*E``; sliced once per host into ``HF_HOME``). 14 is the
-smallest layer count that simultaneously (a) gives every sglang PP rank
-at least one attention layer — necessary to avoid a NemotronH-implementation
-corner case where the weight checker's CPU copy of the rank's
-``embed_tokens.weight`` fails with ``CUDA error: invalid argument`` when
-the rank has zero attention layers — and (b) divides evenly by PP=2 so
-megatron is happy with our ``pp=2`` configs. See ``_nemotron_slicer.py``.
+Model: ``Qwen/Qwen3-30B-A3B-Instruct-2507``. The full HF checkpoint is
+resolved against ``HF_HOME``. This is an MoE model (128 experts, 8
+active per token, 48 layers) so the EP > 1 ``MEGATRON_CFGS`` variants
+(``mcore_ep2_pp2`` / ``mcore_tp2_ep2_pp2``) are valid here. Megatron-Bridge
+auto-detects the architecture via the HF ``architectures`` field
+(``Qwen3MoeForCausalLM``), so no custom converter wiring is required.
 
 Tests:
 
@@ -69,7 +67,7 @@ from _megatron_helpers import (
     megatron_world_size,
     required_world_size,
 )
-from _nemotron_slicer import ensure_sliced_model
+from _qwen3_slicer import ensure_sliced_model
 from helpers import post_and_assert_200
 
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -119,23 +117,29 @@ def _build_params() -> list[pytest.param]:
 
 
 # ---------------------------------------------------------------------------
-# Sliced-model fixture
+# Model-path fixture
 # ---------------------------------------------------------------------------
-# Allow tests to run against an arbitrary HuggingFace local snapshot path via
-# ``NEMOTRON_TEST_MODEL_PATH``; this is mainly useful for diagnostics where we
-# want to compare slice vs. full-model behaviour without re-slicing.
-_NEMOTRON_TEST_MODEL_PATH_ENV = "NEMOTRON_TEST_MODEL_PATH"
+# Default to the upstream ``Qwen/Qwen3-4B`` HF id (resolved by transformers /
+# AutoBridge against ``HF_HOME``). Override via ``QWEN3_TEST_MODEL_PATH`` for
+# offline / mirror scenarios where the suite needs to point at a local
+# checkpoint instead.
+_QWEN3_TEST_MODEL_PATH_ENV = "QWEN3_TEST_MODEL_PATH"
 
 
 @pytest.fixture(scope="session")
 def sliced_model_path() -> str:
-    """Materialize the sliced Nemotron-3-Nano checkpoint once per session.
+    """Resolve the sliced Qwen3-30B-A3B model path once per session.
 
-    Honours the ``NEMOTRON_TEST_MODEL_PATH`` env var as an override so we can
-    point the suite at the full upstream checkpoint when debugging
-    slice-specific issues.
+    Slices ``Qwen/Qwen3-30B-A3B-Instruct-2507`` down to the first
+    ``_qwen3_slicer.SLICED_NUM_LAYERS`` transformer blocks (default 4)
+    so that the single-GPU ``mcore_dp1`` / ``sgl_tp1`` parametrizations
+    fit in one H200's memory budget while still exercising the full
+    Qwen3MoE module set (attention, MoE router, experts).
+
+    Honours ``QWEN3_TEST_MODEL_PATH`` as an override for offline or
+    mirrored snapshots; the slicer is then bypassed entirely.
     """
-    override = os.environ.get(_NEMOTRON_TEST_MODEL_PATH_ENV)
+    override = os.environ.get(_QWEN3_TEST_MODEL_PATH_ENV)
     if override:
         return override
     return str(ensure_sliced_model())
@@ -206,8 +210,9 @@ def env(request, ray_cluster, sliced_model_path):
         )
 
     # --- build SGLangGeneration; weights stay live on GPU until the test
-    # explicitly offloads them (avoids a NemotronH × multi-rank ×
-    # released-storage corner case in sglang's weight_checker.snapshot).
+    # explicitly offloads them. The fixture deliberately does not
+    # pre-offload — some sglang weight_checker paths assert that the
+    # backing storage is still resident at snapshot time.
     sglang_cfg = make_sglang_cfg(
         model_path=sliced_model_path,
         sglang=s,

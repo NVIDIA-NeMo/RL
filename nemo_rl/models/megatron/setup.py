@@ -226,10 +226,14 @@ def validate_and_set_config(
     # which leads to the same NCCL P2P init error this flag is supposed
     # to prevent.
     if not is_generation_colocated:
-        os.environ["NCCL_CUMEM_ENABLE"] = "1"
+        # ``setdefault`` rather than direct assignment so an outer env
+        # override survives — on hosts without inter-GPU P2P (e.g.
+        # IOMMU-isolated PCIe), only ``NCCL_CUMEM_ENABLE=1`` works for
+        # the SGLang case, even though the in-process default is 0.
+        os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         
     if rollout_backend == "sglang":
-            os.environ["NCCL_CUMEM_ENABLE"] = "0"
+            os.environ.setdefault("NCCL_CUMEM_ENABLE", "0")
 
     # Setup data types
     dtype_map = {
