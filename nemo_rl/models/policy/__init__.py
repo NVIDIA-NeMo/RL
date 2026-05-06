@@ -263,6 +263,8 @@ class MegatronConfig(TypedDict):
     enable_cuda_graph: NotRequired[bool]
     external_cuda_graph: NotRequired[bool]
     cuda_graph_use_single_mempool: NotRequired[bool]
+    # Required by mcore when any cudagraph mode is active.
+    use_te_rng_tracker: NotRequired[bool]
     # Force reconvert from HF even if the checkpoint already exists (default: False)
     force_reconvert_from_hf: NotRequired[bool]
     # Attention backend available values:

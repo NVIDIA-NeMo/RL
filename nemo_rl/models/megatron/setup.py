@@ -510,6 +510,8 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         "enable_cuda_graph",
         "external_cuda_graph",
         "cuda_graph_use_single_mempool",
+        # Required by mcore when any cudagraph mode is active.
+        "use_te_rng_tracker",
     ):
         if _knob in config["megatron_cfg"]:
             setattr(model_cfg, _knob, config["megatron_cfg"][_knob])

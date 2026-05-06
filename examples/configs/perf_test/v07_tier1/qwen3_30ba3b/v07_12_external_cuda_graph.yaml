@@ -15,6 +15,7 @@ policy:
     enabled: true
   megatron_cfg:
     external_cuda_graph: true
+    use_te_rng_tracker: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
       CUDA_HOME: /usr/local/cuda

@@ -14,7 +14,12 @@ policy:
   sequence_packing:
     enabled: true
   megatron_cfg:
+    # Disable activation_checkpointing — base recipe sets it true, but mcore
+    # asserts full recompute is incompatible with per-iteration external_cuda_graph.
+    # Llama3.1-8B on 2n4g GB200 fits without recompute.
+    activation_checkpointing: false
     external_cuda_graph: true
+    use_te_rng_tracker: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
       CUDA_HOME: /usr/local/cuda
