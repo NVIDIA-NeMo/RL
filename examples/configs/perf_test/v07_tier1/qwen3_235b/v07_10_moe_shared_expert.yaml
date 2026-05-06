@@ -1,0 +1,19 @@
+defaults: ../../../recipes/llm/performance/grpo-qwen3-235b-16n4g.yaml
+
+# v0.7 Tier 2 variant: moe_shared_expert_overlap (Qwen3 235B, 16n4g, MoE).
+checkpointing:
+  enabled: false
+grpo:
+  max_num_steps: 10
+logger:
+  log_dir: logs/perf_test/v07_tier1/qwen3_235b/v07_10_moe_shared_expert
+  wandb_enabled: false
+  tensorboard_enabled: true
+policy:
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    moe_shared_expert_overlap: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      CUDA_HOME: /usr/local/cuda

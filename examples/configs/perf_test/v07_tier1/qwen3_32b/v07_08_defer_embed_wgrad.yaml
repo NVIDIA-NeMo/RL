@@ -1,0 +1,19 @@
+defaults: ../../../recipes/llm/performance/grpo-qwen3-32b-4n4g.yaml
+
+# v0.7 Tier 2 variant: defer_embedding_wgrad_compute (Qwen3 32B, 4n4g, PP=4).
+checkpointing:
+  enabled: false
+grpo:
+  max_num_steps: 10
+logger:
+  log_dir: logs/perf_test/v07_tier1/qwen3_32b/v07_08_defer_embed_wgrad
+  wandb_enabled: false
+  tensorboard_enabled: true
+policy:
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    defer_embedding_wgrad_compute: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      CUDA_HOME: /usr/local/cuda
