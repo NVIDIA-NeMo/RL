@@ -1708,6 +1708,49 @@ def test_clipped_pg_loss_gspo_importance_sampling_correction():
     torch.testing.assert_close(actual_loss, expected_actor_loss, atol=1e-4, rtol=1e-3)
 
 
+def test_distillation_loss_adds_sft_component():
+    """SFT weight should add rollout-token NLL on top of KL loss."""
+    student_topk_logprobs = torch.log_softmax(
+        torch.tensor([[[1.0, 0.0], [0.5, -0.5]]]), dim=-1
+    )
+    teacher_topk_logprobs = student_topk_logprobs.clone()
+    sft_logprobs = torch.log(torch.tensor([[0.5, 0.25]]))
+    token_mask = torch.tensor([[1.0, 1.0, 1.0]])
+    sample_mask = torch.tensor([1.0])
+    data = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "input_lengths": torch.tensor([3]),
+        "token_mask": token_mask,
+        "sample_mask": sample_mask,
+        "teacher_topk_logits": torch.empty(1, 2, 2),
+        "teacher_topk_indices": torch.empty(1, 2, 2, dtype=torch.long),
+    }
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+            "sft_weight": 0.1,
+        }
+    )
+
+    loss, metrics = loss_fn(
+        student_topk_logprobs=student_topk_logprobs,
+        teacher_topk_logprobs=teacher_topk_logprobs,
+        H_all=None,
+        data=data,
+        global_valid_seqs=sample_mask.sum(),
+        global_valid_toks=torch.tensor(2.0),
+        sft_logprobs=sft_logprobs,
+    )
+
+    expected_sft_loss = -sft_logprobs.mean()
+    assert torch.isclose(torch.tensor(metrics["kl_loss"]), torch.tensor(0.0))
+    assert torch.isclose(torch.tensor(metrics["sft_loss"]), expected_sft_loss)
+    assert torch.isclose(loss, 0.1 * expected_sft_loss)
+    assert torch.isclose(torch.tensor(metrics["loss"]), loss)
+
+
 def setup_distillation_test_data(batch_size=2, seq_len=4, vocab_size=8, topk=64):
     """Setup test data for distillation loss function tests."""
     if not torch.cuda.is_available():

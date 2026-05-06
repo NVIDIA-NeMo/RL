@@ -126,6 +126,17 @@ def prepare_loss_input(
             "teacher_topk_logprobs": teacher_topk_logprobs,
             "H_all": H_all,
         }
+
+        if getattr(loss_fn, "sft_weight", 0.0) > 0:
+            sft_logprobs = get_next_token_logprobs_from_logits(
+                input_ids=data["input_ids"],
+                next_token_logits=logits,
+                seq_index=data.get("seq_index", None),
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+            )
+            loss_input["sft_logprobs"] = sft_logprobs
     elif loss_fn.input_type == LossInputType.DRAFT:
         from megatron.core.transformer.multi_token_prediction import roll_tensor
 

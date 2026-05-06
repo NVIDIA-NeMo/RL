@@ -941,6 +941,7 @@ class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
+    sft_weight: NotRequired[float]
 
 
 class DistillationLossDataDict(TypedDict):
@@ -962,12 +963,14 @@ class DistillationLossFn(LossFunction):
         self.kl_type = cfg["kl_type"]
         self.mixed_kl_weight = cfg["mixed_kl_weight"]
         self.zero_outside_topk = cfg["zero_outside_topk"]
+        self.sft_weight = cfg.get("sft_weight", 0.0)
         self.log_infinitesimal = -100
 
         assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
+        assert self.sft_weight >= 0, "Invalid SFT loss weight"
 
     def __call__(
         self,
@@ -977,8 +980,14 @@ class DistillationLossFn(LossFunction):
         data: DistillationLossDataDict,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
+        sft_logprobs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute distillation loss between teacher and student logits."""
+        """Compute distillation loss between teacher and student logits.
+
+        Args:
+            sft_logprobs: Student log probabilities at actual generated tokens,
+                shaped [B, S-1]. Used for SSD-style SFT loss on rollout tokens.
+        """
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
@@ -1013,7 +1022,9 @@ class DistillationLossFn(LossFunction):
         per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
 
         # Masking and reduction
-        if "token_mask" in data and "sample_mask" in data:
+        has_masks = "token_mask" in data and "sample_mask" in data
+        mask = None
+        if has_masks:
             token_mask = data["token_mask"][:, 1:]
             sample_mask = data["sample_mask"]
             # Align mask length to current per_token_kl
@@ -1029,9 +1040,32 @@ class DistillationLossFn(LossFunction):
         else:
             kl_loss = per_token_kl.mean()
 
+        sft_loss = torch.tensor(0.0, device=kl_loss.device)
+        if self.sft_weight > 0 and sft_logprobs is not None:
+            per_token_sft = -sft_logprobs  # [B, S-1]
+            if has_masks:
+                sft_loss = masked_mean(
+                    per_token_sft,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            else:
+                sft_loss = per_token_sft.mean()
+        elif self.sft_weight > 0 and sft_logprobs is None:
+            import warnings
+
+            warnings.warn(
+                "sft_weight > 0 but sft_logprobs is None. SFT loss will be skipped.",
+                stacklevel=2,
+            )
+
+        total_loss = kl_loss + self.sft_weight * sft_loss
+
         metrics = {
-            "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
+            "loss": float(total_loss.item()) if total_loss.ndim == 0 else total_loss,
+            "kl_loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
+            "sft_loss": float(sft_loss.item()) if sft_loss.ndim == 0 else sft_loss,
             "num_valid_samples": data["input_ids"].shape[0],
         }
 
-        return kl_loss, metrics
+        return total_loss, metrics
