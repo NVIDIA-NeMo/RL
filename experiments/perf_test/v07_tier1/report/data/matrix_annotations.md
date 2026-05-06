@@ -27,3 +27,15 @@ Replace the INVALID rows with these once they steady-state.
 ## gradient_accumulation_fusion runtime fix
 
 Commit 1f788697 also adds runtime override in `_apply_performance_config`. Prior runs may or may not reflect the yaml depending on whether the cached megatron checkpoint was built with the toggle. Phase B does not re-run grad_accum, but next pass should re-measure 06 to lock the verdict.
+
+## Phase A interim: llama_8b fused_residual_rmsnorm (OCI-HSG)
+
+- Baseline 2586264: E2E TPS/GPU median 3618 (post-warmup, n=8)
+- Variant  2586265: E2E TPS/GPU median 3711 (post-warmup, n=8)
+- **Delta: +2.57%** — borderline (within-batch noise band ±2%). Need 30B/32B/235B pairs to draw conclusion.
+
+## Phase C jobs
+
+- OCI-HSG: 2586671–2586679 (9 jobs, llama_8b + 30B + 32B variants for cuda_graph + ce_te_fusion + nccl_ub)
+- Lyris: 1692930–1692938 (mirror set), all PENDING due to 235B-priority queue head
+- Submitted at commit 5b5a3473; running jobs equivalent to bd5d8196 since `use_custom_fsdp=false` matches mcore default and `reuse_grad_buf_for_mxfp8_param_ag` not set.
