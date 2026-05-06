@@ -1264,17 +1264,75 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
     def _build_layer_to_pp_stage(self, pp_size: int) -> dict[str, int]:
         """Build mapping from layer group name to PP stage index.
 
-        Uses ``num_layers`` from the Megatron transformer config to evenly
-        distribute transformer layers across ``pp_size`` stages.  Embedding
-        and final-norm layers are assigned to the first and last stages
-        respectively.
+        Mirrors Megatron-LM's ``get_num_layers_to_build``
+        (``transformer_block.py``) for the standard (non-VP, non-custom-layout)
+        path: middle stages share ``num_layers - first - last`` evenly, while
+        the first/last stages get their explicit counts when set.
+
+        Cases not yet supported are asserted out so failures are loud rather
+        than silently producing wrong layer→stage mappings:
+          - ``pipeline_model_parallel_layout`` (e.g. DeepSeek-V3)
+          - ``virtual_pipeline_model_parallel_size`` (interleaved PP)
+          - ``account_for_embedding_in_pipeline_split``
+          - ``account_for_loss_in_pipeline_split``
         """
-        num_layers = self.megatron_bridge.transformer_config.num_layers
-        layers_per_stage = num_layers // pp_size
+        config = self.megatron_bridge.transformer_config
+
+        assert getattr(config, "pipeline_model_parallel_layout", None) is None, (
+            "nccl_reshard_refit does not support custom pipeline_model_parallel_layout yet"
+        )
+        assert getattr(config, "virtual_pipeline_model_parallel_size", None) in (
+            None,
+            1,
+        ), (
+            "nccl_reshard_refit does not support virtual_pipeline_model_parallel_size > 1 yet"
+        )
+        assert not getattr(config, "account_for_embedding_in_pipeline_split", False), (
+            "nccl_reshard_refit does not support account_for_embedding_in_pipeline_split yet"
+        )
+        assert not getattr(config, "account_for_loss_in_pipeline_split", False), (
+            "nccl_reshard_refit does not support account_for_loss_in_pipeline_split yet"
+        )
+
+        num_layers = config.num_layers
+        n_first = getattr(config, "num_layers_in_first_pipeline_stage", None)
+        n_last = getattr(config, "num_layers_in_last_pipeline_stage", None)
+
+        layers_to_distribute = num_layers
+        stages_left = pp_size
+        if n_first is not None:
+            layers_to_distribute -= n_first
+            stages_left -= 1
+        if n_last is not None:
+            layers_to_distribute -= n_last
+            stages_left -= 1
+
+        if stages_left > 0:
+            assert layers_to_distribute % stages_left == 0, (
+                f"With uneven pipelining the leftover layers ({layers_to_distribute}) "
+                f"must be divisible by leftover stages ({stages_left})"
+            )
+            middle_per_stage = layers_to_distribute // stages_left
+        else:
+            middle_per_stage = 0
 
         layer_to_pp_stage: dict[str, int] = {}
-        for i in range(num_layers):
-            layer_to_pp_stage[f"model.layers.{i}"] = i // layers_per_stage
+        layer_idx = 0
+        for stage in range(pp_size):
+            if stage == 0 and n_first is not None:
+                count = n_first
+            elif stage == pp_size - 1 and n_last is not None:
+                count = n_last
+            else:
+                count = middle_per_stage
+            for _ in range(count):
+                layer_to_pp_stage[f"model.layers.{layer_idx}"] = stage
+                layer_idx += 1
+
+        assert layer_idx == num_layers, (
+            f"Layer assignment incomplete: assigned {layer_idx} of {num_layers}"
+        )
+
         layer_to_pp_stage["model.embed_tokens"] = 0
         layer_to_pp_stage["model.norm"] = pp_size - 1
         layer_to_pp_stage["lm_head"] = pp_size - 1
