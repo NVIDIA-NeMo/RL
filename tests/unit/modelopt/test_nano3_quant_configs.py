@@ -98,3 +98,68 @@ def test_nano3_default_disables_bf16_attention_layers():
     for layer_idx in (4, 11, 18, 25, 32, 41):
         pattern = f"*.layers.{layer_idx}.*"
         assert pattern in flat_names, f"{pattern} missing from nano3_nvfp4_default.yaml"
+
+
+# Standard ``modelopt.torch.quantization.config._default_disabled_quantizer_cfg``
+# items that ``mtq.NVFP4_DEFAULT_CFG`` (and therefore ``NANO3_NVFP4_CFG``)
+# inherit. Locking these in here so the YAML recipes stay equivalent.
+_DEFAULT_DISABLED_PATTERNS = [
+    "*lm_head*",
+    "*proj_out.*",
+    "*block_sparse_moe.gate*",
+    "*router*",
+    "*mlp.gate.*",
+    "*mlp.shared_expert_gate.*",
+    "*linear_attn.conv1d*",
+    "*mixer.conv1d*",
+    "*output_layer*",
+    "output.*",
+]
+_DEFAULT_DISABLED_PARENT_CLASSES = [
+    "nn.BatchNorm1d",
+    "nn.BatchNorm2d",
+    "nn.BatchNorm3d",
+    "nn.LeakyReLU",
+]
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "nano3_nvfp4_default.yaml",
+        "nano3_nvfp4_inputonly.yaml",
+        "nano3_nvfp4_weightonly.yaml",
+    ],
+)
+def test_nano3_yaml_inherits_default_disabled_quantizer_cfg(filename):
+    """Every recipe must carry the standard ``_default_disabled_quantizer_cfg``
+    exclusions (router / MoE gate / lm_head / BatchNorm / LeakyReLU / ...)
+    that ``mtq.NVFP4_DEFAULT_CFG`` inherits."""
+    cfg = resolve_quant_cfg(str(CONFIG_DIR / filename))
+    qcfg = cfg["quant_cfg"]
+    flat_names = [e.get("quantizer_name") for e in qcfg if isinstance(e, dict)]
+    parent_classes = [
+        e.get("parent_class")
+        for e in qcfg
+        if isinstance(e, dict) and e.get("parent_class") is not None
+    ]
+    for pattern in _DEFAULT_DISABLED_PATTERNS:
+        assert pattern in flat_names, f"{pattern} missing from {filename}"
+    for parent_class in _DEFAULT_DISABLED_PARENT_CLASSES:
+        assert parent_class in parent_classes, (
+            f"{parent_class} parent_class disable missing from {filename}"
+        )
+
+
+def test_nano3_default_does_not_enable_output_quantizer():
+    """``mtq.NVFP4_DEFAULT_CFG`` only enables weight + input quantizers, not
+    output. Keep ``nano3_nvfp4_default.yaml`` equivalent."""
+    cfg = resolve_quant_cfg(str(CONFIG_DIR / "nano3_nvfp4_default.yaml"))
+    qcfg = cfg["quant_cfg"]
+    assert _enables_quantizer_pattern(qcfg, "*weight_quantizer")
+    assert _enables_quantizer_pattern(qcfg, "*input_quantizer")
+    assert not _enables_quantizer_pattern(qcfg, "*output_quantizer"), (
+        "nano3_nvfp4_default.yaml enables *output_quantizer, but "
+        "NVFP4_DEFAULT_CFG only enables *weight_quantizer and "
+        "*input_quantizer. Drop the output_quantizer entry."
+    )
