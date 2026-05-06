@@ -19,6 +19,9 @@
 #
 # See https://github.com/NVIDIA/Model-Optimizer for the full set of
 # supported quantizer options and built-in PTQ recipes.
+#
+# Only the `quantize:` section is consumed by `mtq.quantize`; `metadata:`
+# is informational.
 metadata:
   recipe_type: ptq
   description: Nano3 NVFP4 W4A16 (weight-only) recipe.
