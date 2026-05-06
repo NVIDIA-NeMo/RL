@@ -29,6 +29,7 @@ from nrl_k8s.schema import (
     CheckpointsSpec,
     ClusterSpec,
     CodeSource,
+    DynamoGraphSpec,
     HFCacheKind,
     HFCacheSpec,
     InfraConfig,
@@ -295,3 +296,43 @@ class TestClusterSpecSegmentSize:
     def test_negative_rejected(self) -> None:
         with pytest.raises(ValidationError):
             ClusterSpec.model_validate({"name": "x", "spec": {}, "segmentSize": -1})
+
+
+class TestDynamoGraphSpec:
+    def test_minimal_payload(self) -> None:
+        spec = DynamoGraphSpec.model_validate({"manifest": "dgd.yaml"})
+        assert spec.manifest == "dgd.yaml"
+        assert spec.name is None
+        assert spec.overrides == {}
+        assert spec.readyTimeoutS == 600
+
+    def test_missing_manifest_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            DynamoGraphSpec.model_validate({})
+
+    def test_unknown_key_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            DynamoGraphSpec.model_validate({"manifest": "x.yaml", "manifesto": "typo"})
+
+    def test_overrides_accepts_arbitrary_dict(self) -> None:
+        spec = DynamoGraphSpec.model_validate(
+            {
+                "manifest": "x.yaml",
+                "overrides": {"services": {"VllmDecodeWorker": {"replicas": 2}}},
+            }
+        )
+        assert spec.overrides["services"]["VllmDecodeWorker"]["replicas"] == 2
+
+
+class TestInfraConfigDynamoField:
+    def test_dynamo_defaults_to_empty(self) -> None:
+        cfg = InfraConfig.model_validate(_min_infra())
+        assert cfg.dynamo == {}
+
+    def test_dynamo_accepted(self) -> None:
+        payload = _min_infra() | {
+            "dynamo": {"serving": {"manifest": "dgd.yaml", "name": "my-dgd"}}
+        }
+        cfg = InfraConfig.model_validate(payload)
+        assert "serving" in cfg.dynamo
+        assert cfg.dynamo["serving"].name == "my-dgd"

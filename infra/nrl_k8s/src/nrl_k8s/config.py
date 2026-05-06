@@ -72,11 +72,15 @@ class LoadedConfig:
     ``recipe`` holds the resolved recipe with ``infra`` removed (so it can be
     passed to the NeMo-RL entry-point as-is). ``infra`` is the validated
     :class:`InfraConfig` instance. ``source_path`` is the recipe path we loaded.
+    ``infra_source_path`` is the standalone infra YAML when split, or the
+    recipe path when the infra block was bundled — used to anchor file-path
+    references like ``DynamoGraphSpec.manifest``.
     """
 
     recipe: DictConfig
     infra: InfraConfig
     source_path: Path
+    infra_source_path: Path
 
 
 # =============================================================================
@@ -109,6 +113,7 @@ def load_recipe_with_infra(
     """
     overrides = overrides or []
     recipe_path = Path(recipe_path).resolve()
+    resolved_infra_path = Path(infra_path).resolve() if infra_path else None
     _register_nrl_resolvers()
 
     recipe_overrides, infra_overrides = _partition_overrides(overrides)
@@ -116,7 +121,7 @@ def load_recipe_with_infra(
 
     infra_raw = _merge_infra(
         recipe,
-        infra_path=Path(infra_path).resolve() if infra_path else None,
+        infra_path=resolved_infra_path,
         overrides=infra_overrides,
     )
     recipe.pop("infra", None)  # peel any recipe-level infra: off
@@ -127,7 +132,12 @@ def load_recipe_with_infra(
         infra_container["namespace"] = _infer_kube_namespace()
     infra = InfraConfig.model_validate(infra_container)
 
-    return LoadedConfig(recipe=recipe, infra=infra, source_path=recipe_path)
+    return LoadedConfig(
+        recipe=recipe,
+        infra=infra,
+        source_path=recipe_path,
+        infra_source_path=resolved_infra_path or recipe_path,
+    )
 
 
 _SA_NS_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")

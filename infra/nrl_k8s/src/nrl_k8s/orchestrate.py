@@ -44,6 +44,7 @@ from typing import Literal
 from omegaconf import OmegaConf
 from ray.job_submission import JobStatus, JobSubmissionClient
 
+from . import dgd as dgd_mod
 from . import k8s, submit, workdir
 from .config import LoadedConfig, get_username
 from .manifest import (
@@ -54,7 +55,7 @@ from .manifest import (
     build_service_for_deployment,
     dra_resources_for_cluster,
 )
-from .schema import ClusterSpec, CodeSource, InfraConfig, SubmitterMode
+from .schema import ClusterSpec, CodeSource, DynamoGraphSpec, InfraConfig, SubmitterMode
 from .submitters import SubmissionHandle, build_submitter, save_handle
 
 Role = Literal["generation", "gym", "training"]
@@ -310,6 +311,88 @@ def delete_deployment(
     k8s.delete_deployment(name, namespace)
 
 
+def ensure_dgd(
+    dgd_key: str,
+    loaded: LoadedConfig,
+    *,
+    log: callable,
+    recreate: bool = False,
+    wait_ready: bool = True,
+) -> str:
+    """Apply a DynamoGraphDeployment and wait for state=successful.
+
+    Idempotent — if a live DGD with the same name exists and matches the
+    rendered manifest, reuse it. On drift, warn and reuse unless
+    ``recreate=True``. Mirrors :func:`ensure_cluster` semantics for RayClusters.
+    """
+    spec = _require_dgd(loaded.infra, dgd_key)
+    base_dir = loaded.infra_source_path.parent
+    manifest = dgd_mod.build_dgd_manifest(spec, loaded.infra, base_dir)
+    name = manifest["metadata"]["name"]
+    namespace = loaded.infra.namespace
+
+    live = dgd_mod.get_dgd(name, namespace)
+    if live is not None:
+        live_owner = (live.get("metadata", {}).get("labels") or {}).get("nrl-k8s/owner")
+        me = get_username()
+        if live_owner and live_owner != me:
+            raise RuntimeError(
+                f"DynamoGraphDeployment {name} in namespace {namespace} is owned by "
+                f"'{live_owner}' (you are '{me}'). Use a different name "
+                f"(via DynamoGraphSpec.name) or ask {live_owner} to tear it down."
+            )
+
+    if live is None:
+        log(f"[dynamo:{dgd_key}] applying DynamoGraphDeployment {name} in namespace {namespace}")
+        dgd_mod.apply_dgd(manifest, namespace)
+    elif _spec_drifted(live.get("spec") or {}, manifest["spec"]):
+        if recreate:
+            log(
+                f"[dynamo:{dgd_key}] --recreate: DGD {name} drifted from rendered "
+                f"manifest; deleting and re-applying"
+            )
+            dgd_mod.delete_dgd(name, namespace)
+            dgd_mod.wait_for_dgd_gone(name, namespace)
+            dgd_mod.apply_dgd(manifest, namespace)
+        else:
+            log(
+                f"[dynamo:{dgd_key}] warning: live DGD {name} drifted from rendered "
+                f"manifest; reusing as-is (pass --recreate to replace)"
+            )
+    else:
+        log(f"[dynamo:{dgd_key}] DGD {name} already exists and matches — reusing")
+
+    if wait_ready:
+        log(
+            f"[dynamo:{dgd_key}] waiting for DGD {name} to reach state=successful ..."
+        )
+        dgd_mod.wait_for_dgd_ready(
+            name, namespace, timeout_s=spec.readyTimeoutS
+        )
+        log(f"[dynamo:{dgd_key}] DGD {name} is ready.")
+
+    return name
+
+
+def delete_dgd(
+    dgd_key: str,
+    loaded: LoadedConfig,
+    *,
+    log: callable,
+) -> None:
+    """Delete a managed DynamoGraphDeployment.
+
+    The dynamo operator garbage-collects the per-service Services and pods
+    via owner references — we don't need to clean those up explicitly.
+    """
+    spec = _require_dgd(loaded.infra, dgd_key)
+    base_dir = loaded.infra_source_path.parent
+    name = spec.name or dgd_mod.resolve_dgd_name(spec, base_dir)
+    namespace = loaded.infra.namespace
+    log(f"[dynamo:{dgd_key}] deleting DynamoGraphDeployment {name}")
+    dgd_mod.delete_dgd(name, namespace)
+
+
 def submit_daemon(
     role: Role,
     loaded: LoadedConfig,
@@ -443,6 +526,7 @@ def submit_training(
     wd: Path | None = None
     if upload:
         log("[training] staging working_dir ...")
+        _inject_dynamo_into_recipe(loaded, log=log)
         recipe_yaml = OmegaConf.to_yaml(loaded.recipe)
         wd = workdir.stage_workdir(
             repo_root,
@@ -549,6 +633,9 @@ def run(
     for dep_key in loaded.infra.deployments:
         ensure_deployment(dep_key, loaded, log=log)
 
+    for dgd_key in loaded.infra.dynamo:
+        ensure_dgd(dgd_key, loaded, log=log, recreate=recreate)
+
     for role in ALL_ROLES:
         if _get_cluster(loaded.infra, role) is None:
             log(f"[{role}] not defined in recipe — skipping")
@@ -623,6 +710,44 @@ def _require_deployment(infra: InfraConfig, key: str):
     return dep
 
 
+def _get_dgd(infra: InfraConfig, key: str) -> DynamoGraphSpec | None:
+    return infra.dynamo.get(key)
+
+
+def _require_dgd(infra: InfraConfig, key: str) -> DynamoGraphSpec:
+    spec = _get_dgd(infra, key)
+    if spec is None:
+        raise ValueError(f"infra.dynamo.{key} is not defined")
+    return spec
+
+
+def _inject_dynamo_into_recipe(loaded: LoadedConfig, *, log: callable) -> None:
+    """Stamp the DGD's name into the recipe before staging the working_dir.
+
+    Only applies when exactly one DGD is declared — the unambiguous case.
+    With multiple DGDs the user is expected to wire ``dgd_name`` themselves
+    (the orchestrator can't know which to point training at).
+    """
+    if len(loaded.infra.dynamo) != 1:
+        return
+    ((dgd_key, spec),) = loaded.infra.dynamo.items()
+    base_dir = loaded.infra_source_path.parent
+    resolved_name = dgd_mod.resolve_dgd_name(spec, base_dir)
+    OmegaConf.update(
+        loaded.recipe, "policy.generation.backend", "dynamo", merge=False
+    )
+    OmegaConf.update(
+        loaded.recipe,
+        "policy.generation.dynamo_cfg.dgd_name",
+        resolved_name,
+        force_add=True,
+    )
+    log(
+        f"[training] injecting policy.generation.backend=dynamo and "
+        f"dynamo_cfg.dgd_name={resolved_name} from infra.dynamo.{dgd_key}"
+    )
+
+
 def _upload_paths(infra: InfraConfig) -> list[str]:
     """Resolve the list of repo-relative paths to stage for Ray uploads."""
     if infra.launch.rayUploadPaths is not None:
@@ -678,8 +803,10 @@ __all__ = [
     "bring_up_cluster",
     "default_run_id",
     "delete_deployment",
+    "delete_dgd",
     "ensure_cluster",
     "ensure_deployment",
+    "ensure_dgd",
     "run",
     "submit_daemon",
     "submit_training",

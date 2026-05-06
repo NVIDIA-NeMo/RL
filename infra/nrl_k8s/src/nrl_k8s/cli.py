@@ -217,6 +217,7 @@ def check(
     Dumps the fully-resolved config + rendered RayCluster manifests
     to a file with ``-o``. Replaces the former ``validate`` + ``plan``.
     """
+    from . import dgd as dgd_mod
     from .manifest import build_deployment_manifest, build_raycluster_manifest
 
     try:
@@ -225,6 +226,25 @@ def check(
         )
     except Exception as exc:  # noqa: BLE001 — surface the full message to the user
         _explain_and_exit(exc, context="failed to load recipe")
+
+    # Fail-fast: applying a DGD without the dynamo-operator installed is a
+    # silent no-op (CRD lookup succeeds, no controller reconciles it). Catch
+    # it here so the user gets the install hint instead of a long timeout.
+    if loaded.infra.dynamo:
+        try:
+            crd_present = dgd_mod.is_dgd_crd_installed(loaded.infra.namespace)
+        except ApiException as exc:
+            _explain_and_exit(exc, context="checking DynamoGraphDeployment CRD")
+        if not crd_present:
+            _cli_error(
+                "infra.dynamo is set but the DynamoGraphDeployment CRD is not "
+                "installed in this cluster.",
+                hint=(
+                    "install the dynamo-operator first:\n"
+                    "    cd infra/helm && helmfile -e <env> sync\n"
+                    "see infra/helm/helmfile.yaml for the dynamo-platform release."
+                ),
+            )
 
     manifests: dict[str, dict] = {}
     for role in ALL_ROLES:
@@ -237,19 +257,28 @@ def check(
     for key, dep_spec in loaded.infra.deployments.items():
         dep_manifests[key] = build_deployment_manifest(dep_spec, loaded.infra)
 
+    dgd_manifests: dict[str, dict] = {}
+    for key, dgd_spec in loaded.infra.dynamo.items():
+        dgd_manifests[key] = dgd_mod.build_dgd_manifest(
+            dgd_spec, loaded.infra, loaded.infra_source_path.parent
+        )
+
     if output_path is not None:
-        _dump_check_output(loaded, manifests, output_path, output_format, dep_manifests)
-        total = len(manifests) + len(dep_manifests)
+        _dump_check_output(
+            loaded, manifests, output_path, output_format, dep_manifests, dgd_manifests
+        )
+        total = len(manifests) + len(dep_manifests) + len(dgd_manifests)
         click.echo(f"wrote full config + {total} manifest(s) to {output_path}")
         return
 
-    _print_check_summary(loaded, manifests, dep_manifests)
+    _print_check_summary(loaded, manifests, dep_manifests, dgd_manifests)
 
 
 def _print_check_summary(
     loaded: LoadedConfig,
     manifests: dict[str, dict],
     dep_manifests: dict[str, dict] | None = None,
+    dgd_manifests: dict[str, dict] | None = None,
 ) -> None:
     """One-page overview — namespace, image, launch/attach, per-role highlights."""
     infra = loaded.infra
@@ -331,6 +360,19 @@ def _print_check_summary(
             replicas = m["spec"].get("replicas", 1)
             click.echo(f"  {key}: {name} (replicas={replicas})")
 
+    if dgd_manifests:
+        click.echo("")
+        click.echo("DYNAMO")
+        click.echo("------")
+        for key, m in dgd_manifests.items():
+            name = m["metadata"]["name"]
+            services = (m.get("spec") or {}).get("services") or {}
+            ready_to = loaded.infra.dynamo[key].readyTimeoutS
+            click.echo(
+                f"  {key}: {name} (services={list(services.keys())}, "
+                f"readyTimeoutS={ready_to})"
+            )
+
 
 def _print_block(text: str, *, indent: str = "  ") -> None:
     """Print a multi-line shell/script body with consistent indent."""
@@ -350,6 +392,7 @@ def _dump_check_output(
     path: Path,
     fmt_override: str | None,
     dep_manifests: dict[str, dict] | None = None,
+    dgd_manifests: dict[str, dict] | None = None,
 ) -> None:
     fmt = fmt_override or ("json" if path.suffix == ".json" else "yaml")
     bundle = {
@@ -359,6 +402,8 @@ def _dump_check_output(
     }
     if dep_manifests:
         bundle["deployment_manifests"] = dep_manifests
+    if dgd_manifests:
+        bundle["dgd_manifests"] = dgd_manifests
     path.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "json":
         path.write_text(json.dumps(bundle, indent=2, sort_keys=True))
@@ -798,6 +843,8 @@ def _resolve_targets(loaded: LoadedConfig, targets: tuple[str, ...]):
                 results.append(("kuberay", role, spec))
         for key, spec in loaded.infra.deployments.items():
             results.append(("deployment", key, spec))
+        for key, spec in loaded.infra.dynamo.items():
+            results.append(("dynamo", key, spec))
         return results
 
     results = []
@@ -817,9 +864,15 @@ def _resolve_targets(loaded: LoadedConfig, targets: tuple[str, ...]):
             if spec is None:
                 _cli_error(f"deployments.{key} is not defined in the recipe")
             results.append(("deployment", key, spec))
+        elif kind == "dynamo":
+            spec = loaded.infra.dynamo.get(key)
+            if spec is None:
+                _cli_error(f"dynamo.{key} is not defined in the recipe")
+            results.append(("dynamo", key, spec))
         else:
             _cli_error(
-                f"unknown resource kind: {kind!r} (expected 'kuberay' or 'deployments')"
+                f"unknown resource kind: {kind!r} "
+                f"(expected 'kuberay', 'deployments', or 'dynamo')"
             )
     return results
 
@@ -860,6 +913,7 @@ def cluster_up(
     brings up just the training RayCluster. With ``--target deployments.nemo_skills``,
     brings up just that Deployment.
     """
+    from . import dgd as dgd_mod
     from . import orchestrate
     from .manifest import build_deployment_manifest, build_raycluster_manifest
 
@@ -873,6 +927,10 @@ def cluster_up(
         for kind, key, spec in targets:
             if kind == "kuberay":
                 manifest = build_raycluster_manifest(spec, loaded.infra, role=key)
+            elif kind == "dynamo":
+                manifest = dgd_mod.build_dgd_manifest(
+                    spec, loaded.infra, loaded.infra_source_path.parent
+                )
             else:
                 manifest = build_deployment_manifest(spec, loaded.infra)
             click.echo(yaml.safe_dump(manifest, sort_keys=False).rstrip())
@@ -900,6 +958,10 @@ def cluster_up(
                         log=click.echo,
                         repo_root=Path.cwd(),
                     )
+            elif kind == "dynamo":
+                orchestrate.ensure_dgd(
+                    key, loaded, log=click.echo, wait_ready=wait
+                )
             else:
                 orchestrate.ensure_deployment(key, loaded, log=click.echo)
         except ApiException as exc:
@@ -952,6 +1014,8 @@ def cluster_down(
                 k8s.wait_for_raycluster_gone(spec.name, namespace)
             click.echo(f"RayCluster {spec.name} deleted.")
             orchestrate.delete_dra_resources(key, loaded, log=click.echo)
+        elif kind == "dynamo":
+            orchestrate.delete_dgd(key, loaded, log=click.echo)
         else:
             click.echo(f"deleting Service {spec.name} in {namespace} ...")
             k8s.delete_service(spec.name, namespace)
