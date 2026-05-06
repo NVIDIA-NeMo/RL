@@ -17,4 +17,4 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
-uv run --extra automodel bash -x ./tests/run_unit.sh "unit/models/policy/" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated --automodel-only --junitxml=${PROJECT_ROOT}/tests/automodel_policy_durations.xml
+uv run --extra automodel bash -x ./tests/run_unit.sh "unit/models/policy/" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated --automodel-only

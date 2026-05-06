@@ -26,7 +26,7 @@ TEST_PATHS=(
 )
 
 # Base run (tests without extra markers)
-uv run --no-sync bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated --junitxml=${PROJECT_ROOT}/tests/vllm_base_durations.xml
+uv run --no-sync bash -x ./tests/run_unit.sh "${TEST_PATHS[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
 
 # vllm-only run (catch-all across all unit tests)
-uv run --extra vllm bash -x ./tests/run_unit.sh "unit/" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --vllm-only --junitxml=${PROJECT_ROOT}/tests/vllm_only_durations.xml
+uv run --extra vllm bash -x ./tests/run_unit.sh "unit/" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --vllm-only
