@@ -142,8 +142,20 @@ def _patch_dgd_image_pull_secrets(spec: dict[str, Any], secrets: list[str]) -> N
 
 
 def _patch_dgd_service_account(spec: dict[str, Any], service_account: str) -> None:
+    """Default each service's pod ``serviceAccountName`` to ``service_account``.
+
+    The dynamo operator creates a per-DGD ``<dgd-name>-k8s-service-discovery``
+    SA with RBAC for ``endpointslices`` and ``dynamoworkermetadatas`` and
+    wires worker pods to it during reconciliation. Setting
+    ``serviceAccountName`` in the DGD manifest overrides that wiring, so
+    the worker pod 403s on its discovery reflectors and the DGD deadlocks
+    at state=pending. Only honour this patch if the user explicitly set a
+    ``serviceAccountName`` somewhere in the DGD spec — otherwise leave the
+    operator alone.
+    """
     for eps in _walk_service_pod_specs(spec):
-        eps["serviceAccountName"] = service_account
+        if "serviceAccountName" in eps:
+            eps["serviceAccountName"] = service_account
 
 
 def build_owner_reference(
