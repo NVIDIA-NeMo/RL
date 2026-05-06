@@ -1,0 +1,20 @@
+defaults: ../../../recipes/llm/performance/grpo-qwen3-32b-4n4g.yaml
+
+# Phase C — cross_entropy_fusion_impl="te" on Qwen3-32B.
+checkpointing:
+  enabled: false
+grpo:
+  max_num_steps: 10
+logger:
+  log_dir: logs/perf_test/v07_tier1/qwen3_32b/v07_13_ce_te_fusion
+  wandb_enabled: false
+  tensorboard_enabled: true
+policy:
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    cross_entropy_loss_fusion: true
+    cross_entropy_fusion_impl: te
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      CUDA_HOME: /usr/local/cuda

@@ -1,0 +1,22 @@
+defaults: ../../../recipes/llm/performance/grpo-qwen3-32b-4n4g.yaml
+
+# Phase C — NCCL UserBuffers in DDP comm. Largest expected delta on multi-node
+# DP since param-gather and grad-reduce can use registered buffers.
+# Requires NCCL with symmem support and matching launcher env.
+checkpointing:
+  enabled: false
+grpo:
+  max_num_steps: 10
+logger:
+  log_dir: logs/perf_test/v07_tier1/qwen3_32b/v07_14_nccl_ub
+  wandb_enabled: false
+  tensorboard_enabled: true
+policy:
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    distributed_data_parallel_config:
+      nccl_ub: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      CUDA_HOME: /usr/local/cuda

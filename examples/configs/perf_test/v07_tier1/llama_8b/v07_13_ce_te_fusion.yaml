@@ -1,0 +1,21 @@
+defaults: ../../../recipes/llm/performance/grpo-llama3.1-8b-instruct-2n4g.yaml
+
+# Phase C — cross_entropy_fusion_impl="te" (Bridge GPTModelProvider default
+# is "native"; Qwen3 recipes override to "te"). Pairs with v07_00_baseline.
+checkpointing:
+  enabled: false
+grpo:
+  max_num_steps: 10
+logger:
+  log_dir: logs/perf_test/v07_tier1/llama_8b/v07_13_ce_te_fusion
+  wandb_enabled: false
+  tensorboard_enabled: true
+policy:
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    cross_entropy_loss_fusion: true
+    cross_entropy_fusion_impl: te
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      CUDA_HOME: /usr/local/cuda

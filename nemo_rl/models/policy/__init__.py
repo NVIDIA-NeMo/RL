@@ -189,6 +189,16 @@ class MegatronDDPConfig(TypedDict):
     overlap_param_gather: bool
     use_custom_fsdp: bool
     data_parallel_sharding_strategy: str
+    # Tier 2 optional DDP knobs — opt-in passthrough; set to override mcore defaults.
+    # NCCL UserBuffers — large multi-node gain when supported. Requires
+    # symmetric memory and matching launcher env.
+    nccl_ub: NotRequired[bool]
+    # Multi-instance distributed optimizer (>10K-GPU scaling).
+    num_distributed_optimizer_instances: NotRequired[int]
+    align_param_gather: NotRequired[bool]
+    bucket_size: NotRequired[int]
+    # Only with fp8_recipe="mxfp8". Significant param-gather reduction.
+    fp8_param_gather: NotRequired[bool]
 
 
 # Type exists to be lax if not specified

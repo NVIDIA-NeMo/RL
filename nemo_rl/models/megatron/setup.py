@@ -676,6 +676,41 @@ def _build_comm_overlap_config(config: PolicyConfig) -> Optional[CommOverlapConf
     )
 
 
+def _build_ddp_config(config: PolicyConfig) -> DistributedDataParallelConfig:
+    """Build DistributedDataParallelConfig with optional Tier 2 perf knobs.
+
+    Required keys come from config["megatron_cfg"]["distributed_data_parallel_config"].
+    Optional Tier 2 knobs (nccl_ub, num_distributed_optimizer_instances,
+    align_param_gather, bucket_size, fp8_param_gather) live in the same
+    sub-dict but are only forwarded when explicitly set, to preserve mcore
+    defaults otherwise.
+    """
+    ddp_cfg = config["megatron_cfg"]["distributed_data_parallel_config"]
+    kwargs: dict[str, Any] = {
+        "check_for_nan_in_grad": True,
+        "grad_reduce_in_fp32": ddp_cfg["grad_reduce_in_fp32"],
+        "overlap_grad_reduce": ddp_cfg["overlap_grad_reduce"],
+        "overlap_param_gather": ddp_cfg["overlap_param_gather"],
+        # average_in_collective=False is required with calculate_per_token_loss=True
+        # otherwise mcore raises an assertion error.
+        "average_in_collective": False,
+        "use_distributed_optimizer": config["megatron_cfg"]["optimizer"][
+            "use_distributed_optimizer"
+        ],
+        "data_parallel_sharding_strategy": ddp_cfg["data_parallel_sharding_strategy"],
+    }
+    for _knob in (
+        "nccl_ub",
+        "num_distributed_optimizer_instances",
+        "align_param_gather",
+        "bucket_size",
+        "fp8_param_gather",
+    ):
+        if _knob in ddp_cfg:
+            kwargs[_knob] = ddp_cfg[_knob]
+    return DistributedDataParallelConfig(**kwargs)
+
+
 def _create_megatron_config(
     model_cfg: Any,
     checkpoint_config: CheckpointConfig,
@@ -695,27 +730,7 @@ def _create_megatron_config(
             train_iters=config["megatron_cfg"]["train_iters"],
         ),
         optimizer=OptimizerConfig(**config["megatron_cfg"]["optimizer"]),
-        ddp=DistributedDataParallelConfig(
-            check_for_nan_in_grad=True,
-            grad_reduce_in_fp32=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["grad_reduce_in_fp32"],
-            overlap_grad_reduce=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["overlap_grad_reduce"],
-            overlap_param_gather=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["overlap_param_gather"],
-            # we need to set average_in_collective=False with calculate_per_token_loss=T
-            # otherwise, mcore throws an assertion error.
-            average_in_collective=False,  # Required with calculate_per_token_loss=True
-            use_distributed_optimizer=config["megatron_cfg"]["optimizer"][
-                "use_distributed_optimizer"
-            ],
-            data_parallel_sharding_strategy=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["data_parallel_sharding_strategy"],
-        ),
+        ddp=_build_ddp_config(config),
         scheduler=SchedulerConfig(**config["megatron_cfg"]["scheduler"]),
         dataset=None,
         tokenizer=TokenizerConfig(
