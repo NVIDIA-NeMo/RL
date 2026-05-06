@@ -23,6 +23,7 @@ from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import (
+    _should_log_nemo_gym_responses,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
     refit_policy_generation,
@@ -627,19 +628,29 @@ def distillation_train(
                         student_generation.prepare_for_generation()
 
                 with timer.time("generation"):
+                    # We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
                     if use_nemo_gym:
+                        generation_config = master_config["policy"]["generation"]
                         nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                             policy_generation=student_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
-                            generation_config=master_config["policy"]["generation"],
                             max_seq_len=None,
+                            generation_config=generation_config,
                             max_rollout_turns=None,
                             greedy=False,
                         )
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
+                        del nemo_gym_rollout_result
+
+                        # NeMo Gym responses can be very large and expensive to log.
+                        # Here we have logic to opt-in to logging.
+                        if not _should_log_nemo_gym_responses(master_config):
+                            for key in list(rollout_metrics):
+                                if "full_result" in key:
+                                    rollout_metrics.pop(key)
                     # Use async rollouts if vLLM async engine is enabled
                     elif _should_use_async_rollouts(master_config):
                         (
@@ -1001,24 +1012,28 @@ def validate(
             + master_config["distillation"]["val_batch_size"]
             - 1
         ) // master_config["distillation"]["val_batch_size"]
+        additional_metrics_to_report: dict[str, Any] = {}
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
 
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
+            # We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
             if use_nemo_gym:
+                generation_config = master_config["policy"]["generation"]
                 nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
                     tokenizer=tokenizer,
                     task_to_env=val_task_to_env,
-                    generation_config=master_config["policy"]["generation"],
                     max_seq_len=None,
+                    generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
+                additional_metrics_to_report = gen_metrics
             # Use async rollouts if vLLM async engine is enabled
             elif _should_use_async_rollouts(master_config):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
@@ -1070,6 +1085,7 @@ def validate(
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
+            **additional_metrics_to_report,
         }
 
         # Print sample conversations only once at the end of validation
