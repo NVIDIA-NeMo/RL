@@ -72,7 +72,7 @@ policy:
 data:
   train:
     dataset_name: mmpr-tiny
-    download_dir: /lustre/fs1/portfolios/coreai/users/aroshanghias/data/mmpr_tiny/processed
+    download_dir: results/mmpr_tiny_processed
     split_validation_size: 0.008
     seed: 42
   default:

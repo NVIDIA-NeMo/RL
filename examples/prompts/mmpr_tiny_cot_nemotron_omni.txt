@@ -1,3 +1,0 @@
-Solve the following problem step by step. Show your reasoning inside <think> </think> tags. When you are done thinking, provide your final answer wrapped in \boxed{{}}.
-
-{}
