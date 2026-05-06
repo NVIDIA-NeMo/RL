@@ -1648,6 +1648,30 @@ def _check_stale_rayjobs(loaded: LoadedConfig, namespace: str) -> None:
     _error_on_stale(_find_stale_resources(checks), namespace)
 
 
+def _rolebinding_exists(name: str, namespace: str) -> bool | None:
+    """Check whether a RoleBinding exists in *namespace* via the K8s API.
+
+    Returns True/False when the check succeeds, or None when the caller
+    lacks permission to read RoleBindings (403).
+    """
+    from kubernetes import client as k8s_client
+
+    from . import k8s
+
+    k8s.load_kubeconfig()
+    try:
+        k8s_client.RbacAuthorizationV1Api().read_namespaced_role_binding(
+            name, namespace
+        )
+        return True
+    except ApiException as exc:
+        if exc.status == 404:
+            return False
+        if exc.status == 403:
+            return None
+        raise
+
+
 def _check_dev_pod_rbac(namespace: str) -> None:
     """Verify the default SA has edit access so kubectl works inside the dev pod."""
     import subprocess
@@ -1660,6 +1684,22 @@ def _check_dev_pod_rbac(namespace: str) -> None:
     )
     if result.stdout.strip() == "yes":
         return
+
+    if "cannot impersonate" in result.stderr or "Forbidden" in result.stderr:
+        # User lacks impersonation privileges (e.g. engineer role).
+        # Fall back to checking whether the expected RoleBinding exists.
+        rb = _rolebinding_exists("default-sa-edit", namespace)
+        if rb is True:
+            return
+        if rb is None:
+            # Can't impersonate *or* read RBAC — skip the check with a warning.
+            click.echo(
+                "warning: cannot verify default SA permissions (impersonate + "
+                "RBAC read both denied) — assuming they are configured correctly",
+                err=True,
+            )
+            return
+
     heredoc = (
         f"kubectl apply -f - <<'EOF'\n"
         f"apiVersion: rbac.authorization.k8s.io/v1\n"
