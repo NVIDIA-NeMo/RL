@@ -67,6 +67,7 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -394,6 +395,13 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
+    # The dynamo backend forwards rollouts to an external DynamoGraphDeployment,
+    # so it never colocates and never participates in cross-cluster collective
+    # communication. We track it as a sibling flag so downstream gates stay
+    # readable.
+    is_dynamo = generation_config.get("backend") == "dynamo"
+    if is_dynamo:
+        colocated_inference = False
 
     env_name_list = extract_necessary_env_names(data_config)
     rm_env_enabled = "reward_model" in env_name_list
@@ -416,7 +424,29 @@ def setup(
             f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
         )
 
-    if colocated_inference:
+    if is_dynamo:
+        # Dynamo: all GPUs go to training. Inference is served by a
+        # DynamoGraphDeployment external to this Ray cluster.
+        if total_nodes == 1:
+            train_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+        else:
+            train_gpus_per_node = cluster_config["gpus_per_node"]
+
+        train_cluster = RayVirtualCluster(
+            name="grpo_train_cluster",
+            bundle_ct_per_node_list=[train_gpus_per_node] * policy_nodes,
+            use_gpus=True,
+            num_gpus_per_node=train_gpus_per_node,
+            max_colocated_worker_groups=1,
+        )
+        inference_cluster = None
+        print(
+            f"  ✓ Dynamo backend — {policy_nodes} node(s) × {train_gpus_per_node} GPU(s) "
+            f"allocated to training (inference served by DGD)",
+            flush=True,
+        )
+
+    elif colocated_inference:
         if total_nodes == 1:
             policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
             assert policy_gpus_per_node > 0, (
@@ -717,14 +747,41 @@ def setup(
             flush=True,
         )
 
+    elif backend == "dynamo":
+        # Dynamo: rollouts forwarded to an external DynamoGraphDeployment over
+        # HTTP. The class itself is a thin URL wrapper; the heavy lifting lives
+        # in the DGD pods.
+        generation_config = cast(DynamoConfig, generation_config)
+
+        def init_dynamo():
+            t0 = time.perf_counter()
+            pg = DynamoGeneration(cluster=inference_cluster, config=generation_config)
+            return pg, time.perf_counter() - t0
+
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_dynamo,
+            generation_name="Dynamo",
+            init_time_key="dynamo_init_time_s",
+            colocated_inference=False,
+            worker_init_timing_metrics=worker_init_timing_metrics,
+        )
+
+        print(
+            f"  ✓ Using Dynamo backend "
+            f"(frontend: {policy_generation.dp_openai_server_base_urls[0]})",
+            flush=True,
+        )
+
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    # if it is not colocated inference, initialize collective communication for update weights.
+    # The dynamo backend skips this — the DGD has its own internal communication
+    # and refit is not supported in this phase.
+    if not colocated_inference and not is_dynamo:
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -743,9 +800,9 @@ def setup(
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
-    # prepare refit info
+    # prepare refit info (skipped for dynamo: refit not supported in this phase)
     state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None:
+    if policy_generation is not None and not is_dynamo:
         policy_generation.prepare_refit_info(state_dict_info)
 
     # Calculate total setup time
@@ -1332,6 +1389,8 @@ def grpo_train(
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
         policy_generation = policy  # type: ignore
+        NEED_REFIT = False
+    elif master_config["policy"]["generation"].get("backend") == "dynamo":
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
@@ -2426,6 +2485,8 @@ def async_grpo_train(
     # Setup generation interface
     if policy_generation is None:
         policy_generation = policy
+        NEED_REFIT = False
+    elif master_config["policy"]["generation"].get("backend") == "dynamo":
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True
     assert policy_generation is not None
