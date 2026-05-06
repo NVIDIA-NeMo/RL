@@ -1,0 +1,107 @@
+# Workplace-assistant smoke for the Dynamo k8s integration.
+#
+# Architecture:
+#   * Megatron training on a single GPU in the Ray training cluster.
+#   * Generation lives in a separate DynamoGraphDeployment (DGD) that hosts
+#     vLLM on its own GB300 GPU and exposes an OpenAI-compatible HTTP
+#     endpoint at <dgd-name>-frontend.<namespace>.svc.cluster.local:8000/v1.
+#   * `DynamoGeneration` in nemo-rl is a thin URL forwarder — the gym
+#     dispatches rollouts to that endpoint over HTTP. Direct .generate() /
+#     refit are not implemented in this phase; that's fine for a 1-step
+#     smoke (initial weights match between Megatron's HF init and the DGD's
+#     vLLM model load).
+#
+# Differences from the upstream Nemotron-Nano-V2 9B workplace recipe:
+#   * Qwen3-4B-Thinking-2507 instead of Nemotron-Nano-V2-9B
+#   * Megatron TP=1 (no model parallelism for 4B), MoE knobs cleared
+#   * 2 prompts × 2 generations = 4 rollouts/step (vs 64×16=1024)
+#   * 1 training step, no validation, no checkpoint, no wandb
+#   * Generation backend = dynamo (rather than colocated vLLM)
+
+defaults: grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  max_rollout_turns: 1
+  max_num_steps: 1
+  val_period: 999999
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  model_name: "Qwen/Qwen3-4B-Thinking-2507"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 16384
+  precision: "bfloat16"
+
+  # Qwen3-4B is a dense transformer; clear the Nemotron-Nano-V2 MoE knobs
+  # the parent sets. Without this, Megatron tries to wire MoE routing on
+  # a non-MoE model and either errors or silently mis-trains.
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    context_parallel_size: 1
+    activation_checkpointing: false
+    sequence_parallel: false
+    freeze_moe_router: false
+    moe_router_dtype: null
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: false
+
+  generation:
+    # dgd_name is stamped via Hydra `+` override at runtime (see infra
+    # YAML's entrypoint) so this recipe stays user-agnostic. tool_call_parser
+    # / reasoning_parser configure the dynamo.vllm worker via --dyn-* flags
+    # at DGD apply time (see infra/nrl_k8s/examples_dgd/qwen3_4b_thinking_gb300.yaml).
+    backend: "dynamo"
+    dynamo_cfg:
+      tool_call_parser: "hermes"
+      reasoning_parser: "deepseek_r1"
+      # frontend_port and namespace fall through to the operator defaults
+      # (8000, infra.namespace).
+    # Generation runs entirely on the DGD; nothing colocated on the
+    # training worker.
+    colocated:
+      enabled: false
+
+# Re-enable reasoning parsing on the agent side (parent recipe turned this
+# off because Nemotron-Nano-V2 with auto-thinking off doesn't emit reason
+# blocks). Qwen3-4B-Thinking always emits <think>…</think>.
+env:
+  nemo_gym:
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: true
+
+checkpointing:
+  enabled: false
+
+logger:
+  log_dir: "logs/grpo-workplace-assistant-dynamo-smoke"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
