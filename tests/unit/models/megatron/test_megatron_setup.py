@@ -1242,9 +1242,9 @@ class TestSetupReferenceModelState:
         mock_load_checkpoint.assert_called_once()
         chunk_0.eval.assert_called_once()
         chunk_1.eval.assert_called_once()
-        assert set(result) == {"chunk0.layer.weight", "chunk1.layer.weight"}
-        assert result["chunk0.layer.weight"].device.type == "cpu"
-        assert result["chunk1.layer.weight"].device.type == "cpu"
+        assert set(result) == {"0/chunk0.layer.weight", "1/chunk1.layer.weight"}
+        assert result["0/chunk0.layer.weight"].device.type == "cpu"
+        assert result["1/chunk1.layer.weight"].device.type == "cpu"
 
 
 @pytest.mark.mcore
