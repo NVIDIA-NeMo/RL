@@ -66,18 +66,28 @@ def format_prompt_for_vllm_generation(
                 continue
             # init prompt dict
             prompt_dict = {"prompt": msg}
-            # add additional data if present
+            # collect multi_modal_data from images and audios
+            multi_modal_data = {}
             images = data.get("vllm_images", None)
-            if images is None or len(images[i]) == 0:
+            if images is not None and len(images[i]) > 0:
+                multi_modal_data["image"] = (
+                    images[i][0] if len(images[i]) == 1 else images[i]
+                )
+            audios = data.get("vllm_audios", None)
+            if audios is not None and len(audios[i]) > 0:
+                multi_modal_data["audio"] = (
+                    audios[i][0] if len(audios[i]) == 1 else audios[i]
+                )
+            if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
                 continue
-            else:
-                prompt_dict["multi_modal_data"] = {
-                    "image": images[i][0] if len(images[i]) == 1 else images[i]
-                }
+            prompt_dict["multi_modal_data"] = multi_modal_data
             prompts.append(prompt_dict)
     else:
-        # Regular LLM generation using token_ids
+        # Regular LLM generation using token_ids (pre-tokenized).
+        # Note: eval.py uses raw prompt strings instead of token IDs because its
+        # collate function produces message_log dicts, not tokenized tensors.
+        # Both are valid vLLM input formats but may tokenize slightly differently.
         for i in range(start_idx, end_idx):
             # Use input_lengths to get only valid tokens (not padding)
             prompts.append(_get_regular_prompt(i))
@@ -183,3 +193,25 @@ def compute_spec_decode_metrics(
                 )
 
     return spec_metrics
+
+
+# TODO: Replace this hard-coded map with a generic plugin-registration
+# hook on ``VllmGeneration`` (e.g. a ``worker_cls_overrides`` registry populated
+# by ``nemo_rl.modelopt`` on import) so core has no knowledge of ModelOpt-specific
+# worker classes.
+GENERATION_WORKER_OVERRIDES = {
+    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantGenerationWorker",
+    "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantAsyncGenerationWorker",
+}
+
+
+def resolve_generation_worker_cls(default_cls: str, config: dict) -> str:
+    """Return the quantized vLLM generation worker FQN if ``quant_cfg`` is set, else ``default_cls``.
+
+    Safe to call even when ModelOpt is not installed — returns ``default_cls``
+    unchanged whenever ``quant_cfg`` is ``None``, so the core generation path
+    stays import-free of ModelOpt.
+    """
+    if config.get("quant_cfg") is None:
+        return default_cls
+    return GENERATION_WORKER_OVERRIDES.get(default_cls, default_cls)
