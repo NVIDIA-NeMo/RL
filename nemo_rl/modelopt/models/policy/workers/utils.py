@@ -20,6 +20,10 @@ import modelopt.torch.quantization as mtq
 import torch
 import torch.nn as nn
 from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
+from megatron.bridge.models.mamba.mamba_provider import (
+    modelopt_mamba_stack_spec,
+    transformer_engine_mamba_stack_spec,
+)
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from modelopt.torch.quantization.config import need_calibration
 from modelopt.torch.utils.dataset_utils import (
@@ -163,8 +167,28 @@ def get_modelopt_checkpoint_dir() -> str:
     return modelopt_checkpoint_dir
 
 
+def _is_mamba_provider(config) -> bool:
+    """Detect whether a Megatron model provider is a Mamba/hybrid model.
+
+    True for either explicit ``mamba_stack_spec`` (NemotronH and similar) or
+    a hybrid SSM model with ``mamba_num_heads`` and a layer-pattern field.
+    """
+    if hasattr(config, "mamba_stack_spec"):
+        return True
+    if not hasattr(config, "mamba_num_heads"):
+        return False
+    return hasattr(config, "hybrid_layer_pattern") or hasattr(
+        config, "hybrid_override_pattern"
+    )
+
+
 def quantization_layer_spec(config):
     """Layer specification for quantization with ModelOpt.
+
+    Routes mamba/hybrid configs to the mamba stack spec; otherwise falls back
+    to the GPT modelopt spec. ``DISABLE_MODELOPT_LAYER_SPEC=1`` returns the
+    plain TE spec without modelopt wrappers (used when modelopt's layer-spec
+    interaction with the importer is undesired).
 
     We need to disable arbitrary attention mask for sequence packing.
     """
@@ -172,7 +196,12 @@ def quantization_layer_spec(config):
         os.environ.get("DISABLE_MODELOPT_LAYER_SPEC", "0")
     )
     if disable_modelopt_layer_spec:
+        if _is_mamba_provider(config):
+            return transformer_engine_mamba_stack_spec()
         return transformer_engine_layer_spec(config)
+    if _is_mamba_provider(config):
+        print("Using Mamba quantization_layer_spec")
+        return modelopt_mamba_stack_spec(config)
     print("Using quantization_layer_spec without arbitrary attention mask")
     return get_gpt_modelopt_spec(
         config=config,
