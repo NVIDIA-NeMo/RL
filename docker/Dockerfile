@@ -12,9 +12,10 @@
 #   Local NeMo RL source override:
 #     docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
 #
-# Optional build args to skip vLLM or SGLang dependencies:
+# Optional build args to skip vLLM, SGLang, or TRT-LLM dependencies:
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
+#   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
@@ -55,6 +56,14 @@ apt install -y --only-upgrade gnupg
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
+
+# === HPCX (OpenMPI + UCX) bundled in cuda-dl-base ===
+# Expose the bundled HPCX stack so TRT-LLM can find libmpi.so.40 / libucp.so for
+# multi-rank / IB transport. CUDA 13 driver compat is already provided by the
+# cu13.2 base image — no manual cuda-compat install needed.
+ENV HPCX_HOME=/opt/hpcx \
+    PATH=/opt/hpcx/ompi/bin:/opt/hpcx/ucx/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/hpcx/ompi/lib:/opt/hpcx/ucx/lib:${LD_LIBRARY_PATH}
 
 # CMake (for sglang build)
 RUN GITHUB_ARTIFACTORY=github.com \
@@ -102,9 +111,10 @@ ARG BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION
 ARG BUILD_CUSTOM_FLASHINFER
 ARG BUILD_CUSTOM_FLASHINFER_URL
 ARG BUILD_CUSTOM_FLASHINFER_REF
-# Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
+# Skip building vLLM, SGLang, or TRT-LLM dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
+ARG SKIP_TRTLLM_BUILD
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
@@ -148,6 +158,9 @@ fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
     uv sync --link-mode symlink --locked --extra sglang --no-install-project
 fi
+if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
+    uv sync --link-mode symlink --locked --extra trtllm --no-install-project
+fi
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --extra modelopt --no-install-project
@@ -177,6 +190,7 @@ FROM hermetic AS release
 # Re-declare build args for this stage
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
+ARG SKIP_TRTLLM_BUILD
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF
@@ -204,6 +218,9 @@ if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
 fi
 if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
     NEGATIVE_FILTERS="$NEGATIVE_FILTERS sglang"
+fi
+if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
+    NEGATIVE_FILTERS="$NEGATIVE_FILTERS trtllm"
 fi
 if [[ -n "$NEGATIVE_FILTERS" ]]; then
     UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
