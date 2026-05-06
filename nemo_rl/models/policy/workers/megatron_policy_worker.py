@@ -973,6 +973,40 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         return refit_param_info_hf
 
+    def _is_fp8_export(self) -> bool:
+        """Return True iff the train side stores weights as TE blockwise FP8.
+
+        Only ``fp8_param=True`` together with ``fp8_recipe="blockwise"`` produces
+        ``Float8BlockwiseQTensor`` weights that Megatron-Bridge can export via
+        ``build_export_fp8_tasks``.  The common ``fp8_param=False`` recipe runs
+        FP8 GEMMs internally but stores BF16 weights, so the standard task list
+        is correct for that case.
+        """
+        if self.fp8_cfg is None:
+            return False
+        return bool(
+            self.fp8_cfg.get("fp8_param", False)
+            and self.fp8_cfg.get("fp8_recipe") == "blockwise"
+        )
+
+    def _build_refit_conversion_tasks(self) -> list:
+        """Build the conversion-task list driving refit (BF16 or FP8 export).
+
+        For BF16 / FP8-but-fp8_param=False training: standard ``get_conversion_tasks``.
+        For FP8-with-fp8_param=True: Bridge's ``build_export_fp8_tasks``, which
+        emits a *pair* of tasks per FP8 weight (the FP8 data and a ``*_scale_inv``
+        scale tensor).
+        """
+        if self._is_fp8_export():
+            return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
+                self.megatron_bridge.hf_pretrained, [self.model]
+            )
+        return [
+            task
+            for task in self.megatron_bridge.get_conversion_tasks([self.model])
+            if task is not None
+        ]
+
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
 
@@ -987,11 +1021,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         Returns:
             List of (parameter_name, size_in_bytes) tuples.
         """
-        self.refit_conversion_tasks = [
-            task
-            for task in self.megatron_bridge.get_conversion_tasks([self.model])
-            if task is not None
-        ]
+        self.refit_conversion_tasks = self._build_refit_conversion_tasks()
         param_info = []
 
         def calculate_size_in_bytes(param, tp_size, ep_size):
@@ -1004,6 +1034,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     torch.bfloat16: 2,
                     torch.float16: 2,
                     torch.float32: 4,
+                    torch.float8_e4m3fn: 1,
+                    torch.float8_e5m2: 1,
+                    torch.uint8: 1,
                 }
                 scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
                 size_in_bytes = (
@@ -1118,6 +1151,48 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 continue  # Non-local PP rank
 
             local_tensor = task.param_weight
+
+            # FP8 blockwise scale_inv tasks ship as siblings of their weight
+            # tasks. Bridge wraps the base mapping in `_HFNameSuffixMapping`
+            # which delegates `.hf_param` to the base — for compound mappings
+            # the scale tensor must be split the same way the weight is, then
+            # each piece gets the `_scale_inv` suffix on the HF name.
+            if task.global_param_name.endswith("_scale_inv"):
+                hf_param = task.mapping.hf_param
+                if isinstance(hf_param, dict):
+                    base = task.mapping._base_mapping
+                    if isinstance(base, QKVMapping):
+                        # QKV scale: split along dim 0 by head structure.
+                        # split_qkv_weights auto-detects FP8 scale tensors via
+                        # the trailing-dim block divisor (see Bridge code).
+                        tp_size = base.tp_size
+                        local_config = SimpleNamespace(
+                            num_attention_heads=config.num_attention_heads // tp_size,
+                            num_query_groups=config.num_query_groups // tp_size,
+                            kv_channels=config.kv_channels,
+                            hidden_size=config.hidden_size,
+                            attention_output_gate=getattr(
+                                config, "attention_output_gate", False
+                            ),
+                        )
+                        q_s, k_s, v_s = split_qkv_weights(local_config, local_tensor)
+                        yield hf_param["q"] + "_scale_inv", q_s
+                        yield hf_param["k"] + "_scale_inv", k_s
+                        yield hf_param["v"] + "_scale_inv", v_s
+                    elif isinstance(base, GatedMLPMapping):
+                        # linear_fc1 scale: rows are [gate_scale; up_scale]
+                        gate_s, up_s = torch.chunk(local_tensor, 2, dim=0)
+                        yield hf_param["gate"] + "_scale_inv", gate_s
+                        yield hf_param["up"] + "_scale_inv", up_s
+                    else:
+                        raise NotImplementedError(
+                            f"FP8 scale_inv not yet supported for compound "
+                            f"mapping: {type(base).__name__}"
+                        )
+                else:
+                    yield str(hf_param) + "_scale_inv", local_tensor
+                continue
+
             hf_param = task.mapping.hf_param
 
             if isinstance(hf_param, dict):

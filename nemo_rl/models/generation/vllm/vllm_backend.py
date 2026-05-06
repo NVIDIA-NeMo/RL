@@ -415,6 +415,22 @@ class VllmInternalWorkerExtension:
             (["q_proj.weight", "k_proj.weight", "v_proj.weight"], "qkv_proj.weight"),
             (["q_proj.bias", "k_proj.bias", "v_proj.bias"], "qkv_proj.bias"),
             (["gate_proj.weight", "up_proj.weight"], "gate_up_proj.weight"),
+            # FP8 blockwise scale siblings (paired with the weights above).
+            # vLLM-FP8 stores `<vllm_name>.weight_scale_inv` next to the FP8
+            # weight, with shape `[output//block, input//block]`. The same
+            # column-parallel TP slicing applies to dim 0.
+            (
+                [
+                    "q_proj.weight_scale_inv",
+                    "k_proj.weight_scale_inv",
+                    "v_proj.weight_scale_inv",
+                ],
+                "qkv_proj.weight_scale_inv",
+            ),
+            (
+                ["gate_proj.weight_scale_inv", "up_proj.weight_scale_inv"],
+                "gate_up_proj.weight_scale_inv",
+            ),
         ]
 
         for hf_name in hf_shapes:
