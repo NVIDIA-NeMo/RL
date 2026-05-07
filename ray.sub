@@ -205,10 +205,40 @@ head_node_ip=${ip_addresses_array[0]}
 
 ip_head=$head_node_ip:$PORT
 
+# Network init for Mooncake-cpu (TQ data-plane backend "mooncake_cpu").
+# Mooncake's transfer_metadata_plugin.cpp:1127 calls getifaddrs() and binds
+# the RPC listener to the FIRST interface with an IP — usually usb0
+# (169.254.3.1 link-local APIPA), which is unreachable cross-node. The fix
+# kills avahi-autoipd (the daemon that re-assigns 169.254.3.1), tells
+# NetworkManager to stop managing usb0, flushes the address, and runs a
+# 2 s relaunch loop as a failsafe. Lifted from data-plane-bench/ray.sub
+# (proven at 32-node and 48-node scales). Belt-and-braces: ifconfig +
+# ip variants both attempted because the container set varies.
+# Without this, mooncake_cpu fails with metadata 404s and a
+# MemcpyWorkerPool segfault during the first kv_batch_put.
+# See research/data_plane_mooncake_status.md.
+NETWORK_INIT_CMDS='# Kill avahi-autoipd for usb0: it is the daemon that re-assigns 169.254.3.1.
+pkill avahi-autoipd 2>/dev/null || true
+if [ -f /run/avahi-autoipd.usb0.pid ]; then kill $(cat /run/avahi-autoipd.usb0.pid) 2>/dev/null || true; fi
+nmcli device set usb0 managed no 2>/dev/null || true
+ifconfig usb0 0.0.0.0 2>/dev/null || true
+ifconfig usb0 down 2>/dev/null || true
+ip link set usb0 down 2>/dev/null || true
+ip addr flush dev usb0 2>/dev/null || true
+{ while :; do
+    pkill avahi-autoipd 2>/dev/null || true
+    ifconfig usb0 0.0.0.0 2>/dev/null || true
+    ifconfig usb0 down 2>/dev/null || true
+    ip link set usb0 down 2>/dev/null || true
+    ip addr flush dev usb0 2>/dev/null || true
+    sleep 2
+  done; } &'
+
 # First we start the head of the ray cluster on one of the physical nodes
 # Give the head node actual resources to make it schedulable
 
 head_cmd=$(cat <<EOF
+$NETWORK_INIT_CMDS
 # Touch a file to indicate that the head node has started
 # Overlapping srun commands will check this file to determine if we can overlap a container command
 touch $LOG_DIR/STARTED_RAY_HEAD
@@ -317,6 +347,7 @@ for ((i = 1; i < SLURM_JOB_NUM_NODES; i++)); do
   node_i=${nodes_array[$i]}
     
   worker_cmd=$(cat <<EOF
+$NETWORK_INIT_CMDS
 env
 
 exit-dramatically() {

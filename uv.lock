@@ -3602,6 +3602,19 @@ wheels = [
 ]
 
 [[package]]
+name = "mooncake-transfer-engine"
+version = "0.3.10.post2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "requests" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/89/15/bbe5a5d85ccd40338672bdd4df1a033fd6bdbe592962224770c02a5c99db/mooncake_transfer_engine-0.3.10.post2-cp313-cp313-manylinux_2_35_x86_64.whl", hash = "sha256:5507dcb9a2d4653626b3c9e6d4ebf11a55b7e3c10d832bc9397992376c0d3e77", size = 44701058, upload-time = "2026-04-22T05:34:03.958Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/6c/7ab9adcf1996a9b0d85dd7a46bfae9002787d9d52fa6096f75327493782b/mooncake_transfer_engine-0.3.10.post2-cp313-cp313-manylinux_2_39_aarch64.whl", hash = "sha256:d6fd7a0d730336e2853b7802c280d6141a7873f319068837c9618c648ccf63e4", size = 16844377, upload-time = "2026-04-22T05:58:24.663Z" },
+]
+
+[[package]]
 name = "mpmath"
 version = "1.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -4063,6 +4076,7 @@ dependencies = [
     { name = "math-verify" },
     { name = "matplotlib" },
     { name = "mlflow" },
+    { name = "mooncake-transfer-engine" },
     { name = "nccl4py" },
     { name = "ninja" },
     { name = "num2words" },
@@ -4212,6 +4226,7 @@ requires-dist = [
     { name = "megatron-bridge", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-Bridge-workspace" },
     { name = "megatron-core", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-LM-workspace" },
     { name = "mlflow", specifier = ">=3.11.1" },
+    { name = "mooncake-transfer-engine" },
     { name = "nccl4py" },
     { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'automodel'", editable = "3rdparty/Automodel-workspace/Automodel" },
     { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "3rdparty/Gym-workspace/Gym" },

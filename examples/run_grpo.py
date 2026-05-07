@@ -99,6 +99,19 @@ def main() -> None:
         val_task_to_env,
     ) = setup_response_data(tokenizer, config["data"], config["env"])
 
+    # Pick the policy factory at the launcher level so the legacy trainer
+    # stays data-plane-agnostic (architectural invariant — see
+    # tests/data_plane/unit/test_architecture_invariants.py).
+    _dp_cfg = config.get("data_plane") or {}
+    if _dp_cfg.get("enabled", False):
+        from nemo_rl.models.policy.tq_policy import TQPolicy
+
+        def _make_policy(**kwargs):
+            return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
+        _policy_factory = _make_policy
+    else:
+        _policy_factory = None  # setup() defaults to plain Policy
+
     (
         policy,
         policy_generation,
@@ -110,7 +123,10 @@ def main() -> None:
         checkpointer,
         grpo_state,
         master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+    ) = setup(
+        config, tokenizer, dataset, val_dataset,
+        policy_factory=_policy_factory,
+    )
 
     # Check if async mode is enabled
     if "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:

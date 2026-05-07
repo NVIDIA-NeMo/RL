@@ -67,6 +67,12 @@ dependencies = [
   # extra and the corresponding plumbing in the per-worker venv builder.
   "tensordict",
   "TransferQueue==0.1.6",
+  # Backs data_plane.backend="mooncake_cpu". Default backend is "simple"
+  # (in-process), but the mooncake_cpu path needs the `mooncake_master`
+  # binary that ships in this wheel at <site-packages>/mooncake/. Bundled
+  # with TQ rather than gated behind an extra so worker venvs (built
+  # without extras) can be flipped to mooncake_cpu via config alone.
+  "mooncake-transfer-engine",
 ]
 
 [project.optional-dependencies]
