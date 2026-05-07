@@ -25,6 +25,7 @@ Reference papers:
 
 import torch
 
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_kl,
@@ -155,11 +156,11 @@ class ReinforcePlusPlusAdvantageEstimator:
         use_kl_in_reward: If True, add KL penalty to reward instead of loss.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: dict):
+    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
         self.minus_baseline = estimator_config["minus_baseline"]
-        self.use_kl_in_reward = loss_config["use_kl_in_reward"]
-        self.kl_coef = loss_config["reference_policy_kl_penalty"]
-        self.kl_type = loss_config["reference_policy_kl_type"]
+        self.use_kl_in_reward = loss_config.use_kl_in_reward
+        self.kl_coef = loss_config.reference_policy_kl_penalty
+        self.kl_type = loss_config.reference_policy_kl_type
 
     def compute_advantage(
         self,

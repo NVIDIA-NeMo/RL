@@ -142,12 +142,12 @@ class GRPOConfig(TypedDict):
     normalize_rewards: bool
     use_leave_one_out_baseline: bool
     val_period: int
-    val_batch_size: int
+    val_batch_size: int | None  # None for NeMo-Gym compatibility
     val_at_start: bool
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
-    max_val_samples: int
+    max_val_samples: int | None  # None for NeMo-Gym compatibility
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
