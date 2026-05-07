@@ -80,7 +80,7 @@ jobs:
       publish-as-latest: true
       run-on-version-tag-only: ${{ github.ref_name != 'main' }}
       restrict-to-admins: true
-    secrets: inherit
+    secrets: inherit  # pragma: allowlist secret
 
   release-summary:
     needs: [release]
