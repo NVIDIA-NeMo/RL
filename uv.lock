@@ -110,7 +110,7 @@ overrides = [
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.10.0", index = "https://pypi.org/simple" },
     { name = "torchaudio", marker = "sys_platform != 'darwin'", specifier = "==2.10.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchaudio", marker = "sys_platform == 'darwin'", specifier = "==2.10.0", index = "https://pypi.org/simple" },
-    { name = "transformer-engine", extras = ["pytorch", "core-cu12"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=71bbefbf153418f943640df0f7373625dc93fa46" },
+    { name = "transformer-engine", extras = ["pytorch", "core-cu12"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.14.1" },
     { name = "transformers", specifier = "==5.3.0" },
     { name = "xgrammar", specifier = "==0.1.33" },
 ]
@@ -171,12 +171,12 @@ requires-dist = ["torch", "scikit-build-core", "wheel"]
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
-version = "2.14.0+71bbefb"
+version = "2.14.1+366798e"
 requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine-torch"
-version = "2.14.0+71bbefb"
+version = "2.14.1+366798e"
 requires-dist = ["torch", "transformer-engine"]
 
 [[package]]
@@ -4398,8 +4398,8 @@ requires-dist = [
     { name = "torchdata" },
     { name = "torchvision", marker = "sys_platform != 'darwin'", specifier = "==0.25.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchvision", marker = "sys_platform == 'darwin'", specifier = "==0.25.0", index = "https://pypi.org/simple" },
-    { name = "transformer-engine", extras = ["core-cu12", "pytorch"], marker = "extra == 'mcore'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=71bbefbf153418f943640df0f7373625dc93fa46" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'automodel'", specifier = ">=2.9.0a0,<2.12.0" },
+    { name = "transformer-engine", extras = ["core-cu12", "pytorch"], marker = "extra == 'automodel'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.14.1" },
+    { name = "transformer-engine", extras = ["core-cu12", "pytorch"], marker = "extra == 'mcore'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.14.1" },
     { name = "transformers", specifier = "==5.3.0" },
     { name = "transformers", marker = "extra == 'automodel'", specifier = ">=5.3.0" },
     { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu129" },
@@ -8136,8 +8136,8 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.14.0+71bbefb"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=71bbefbf153418f943640df0f7373625dc93fa46#71bbefbf153418f943640df0f7373625dc93fa46" }
+version = "2.14.1+366798e"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.14.1#366798ef8a0a00d8f2c1650d11e7e623d7c33e26" }
 dependencies = [
     { name = "importlib-metadata" },
     { name = "packaging" },
