@@ -2,8 +2,6 @@ defaults: ./grpo-deepseek-v3-32n8g.yaml
 checkpointing:
   checkpoint_dir: results/grpo-deepseek-v3-32n4g
 policy:
-  sequence_packing:
-    enabled: false
   megatron_cfg:
     pipeline_model_parallel_size: 8
     num_layers_in_first_pipeline_stage: 7

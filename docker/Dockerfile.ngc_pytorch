@@ -112,6 +112,7 @@ uv sync --link-mode symlink --locked --inexact --no-install-project $UV_NO_INSTA
 uv sync --link-mode symlink --locked --inexact --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra mcore --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra automodel --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --inexact --extra modelopt --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 EOF
 
