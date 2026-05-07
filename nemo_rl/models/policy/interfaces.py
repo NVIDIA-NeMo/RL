@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Policy interfaces for NeMo-RL."""
+
 from abc import ABC, abstractmethod
 from typing import Any, Optional, TypedDict
-
 import ray
 import torch
 
@@ -46,6 +48,112 @@ class TopkLogitsOutputSpec(TypedDict):
 
     topk_logits: torch.Tensor
     topk_indices: torch.Tensor
+
+
+class PolicyTrainerInterface(ABC):
+    """Training-focused policy interface.
+
+    .. warning::
+        This interface is experimental and subject to change.
+        Do not use in production code yet.
+    """
+
+    @abstractmethod
+    def get_logprobs(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        timer: Optional[Timer] = None,
+    ) -> BatchedDataDict[LogprobOutputSpec]:
+        """Get per-token logprobs under the current policy.
+
+        Args:
+            data: BatchedDataDict containing rollouts (tokens)
+
+        Returns:
+            BatchedDataDict containing logprobs tensor.
+        """
+        pass
+
+    @abstractmethod
+    def get_reference_policy_logprobs(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
+        """Get per-token logprobs under the reference (frozen) policy.
+
+        Used for KL-constrained algorithms (PPO with KL penalty, DPO, RLHF).
+
+        Args:
+            data: BatchedDataDict containing rollouts (tokens)
+            micro_batch_size: Optional override for micro batch size.
+
+        Returns:
+            BatchedDataDict containing reference_logprobs tensor.
+        """
+        pass
+
+    @abstractmethod
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Get per-position top-k logits and global indices for a batch.
+
+        Notes:
+            - Aligns to next-token positions → returns S-1 positions.
+        """
+        pass
+
+    @abstractmethod
+    def train(
+        self,
+        data: BatchedDataDict,
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        *,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> dict[str, Any]:
+        """Train the policy on a global batch of data.
+
+        The loss function is passed in, not owned by the trainer. This enables
+        algorithm variation (GRPO, PPO, DPO) without changing the backend.
+
+        Args:
+            data: BatchedDataDict containing rollouts (tokens)
+            loss_fn: Loss function to use for training
+            eval_mode: Whether to run in evaluation mode (no gradient updates)
+            gbs: Global batch size override (if None, uses config default)
+            mbs: Micro batch size override (if None, uses config default)
+            timer: Optional timer for profiling
+        """
+        pass
+
+    @abstractmethod
+    def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
+        """Transition to training mode (reclaim GPU memory, restore optimizer state)."""
+        pass
+
+    @abstractmethod
+    def finish_training(self, *args: Any, **kwargs: Any) -> None:
+        """Transition out of training mode (release GPU memory for generation)."""
+        pass
+
+    @abstractmethod
+    def save_checkpoint(self, *args: Any, **kwargs: Any) -> None:
+        """Persist model + optimizer state."""
+        pass
+
+    @abstractmethod
+    def shutdown(self) -> bool:
+        """Release all resources. Returns True if clean shutdown."""
+        pass
 
 
 class PolicyInterface(ABC):
@@ -164,6 +272,7 @@ class PolicyInterface(ABC):
 
 
 class ColocatablePolicyInterface(PolicyInterface):
+
     @abstractmethod
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
