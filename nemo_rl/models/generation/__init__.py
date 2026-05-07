@@ -16,7 +16,11 @@ from typing import cast
 
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.interfaces import (  # noqa: F401
+    GenerationBackendInterface,
+    GenerationConfig,
+    GenerationInterface,
+)
 from nemo_rl.models.generation.vllm import VllmConfig
 
 TokenizerType = PreTrainedTokenizerBase

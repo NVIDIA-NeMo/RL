@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Generation interfaces for NeMo-RL."""
+
 from abc import ABC, abstractmethod
 from typing import Any, NotRequired, TypedDict, Union
 
@@ -217,6 +220,58 @@ class GenerationOutputSpec(TypedDict):
         torch.Tensor
     ]  # Whether each sequence was truncated and hit max_tokens without stop token
     __extra__: Any
+
+
+class GenerationBackendInterface(ABC):
+    """Generation-focused backend interface.
+
+    .. warning::
+        This interface is experimental and subject to change.
+        Do not use in production code yet.
+    """
+
+    @abstractmethod
+    def generate(
+        self, data: BatchedDataDict["GenerationDatumSpec"], greedy: bool
+    ) -> BatchedDataDict["GenerationOutputSpec"]:
+        """Generate completions for a batch of prompts.
+
+        Args:
+            data: BatchedDataDict conforming to GenerationDatumSpec
+                  (input_ids, input_lengths, optional stop_strings).
+            greedy: If True, use greedy decoding. Otherwise sample.
+
+        Returns:
+            BatchedDataDict conforming to GenerationOutputSpec
+            (output_ids, generation_lengths, unpadded_sequence_lengths, logprobs).
+        """
+        pass
+
+    @property
+    def requires_kv_scale_sync(self) -> bool:
+        """Whether the generation backend requires KV cache scales synchronization."""
+        return False
+
+    def clear_logger_metrics(self) -> None:
+        """Clear telemetry metrics for performance reporting.
+
+        Optional — backends may override. Default does nothing.
+        """
+        pass
+
+    def get_logger_metrics(self) -> dict[str, Any]:
+        """Get telemetry metrics for performance reporting.
+
+        Optional — backends may override. Default returns empty dict.
+        """
+        return {}
+
+    def shutdown(self) -> bool:
+        """Release resources (GPU memory, engine processes).
+
+        Returns True if clean shutdown, False on error.
+        """
+        return True
 
 
 class GenerationInterface(ABC):
