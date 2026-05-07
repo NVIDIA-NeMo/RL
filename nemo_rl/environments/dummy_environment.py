@@ -24,7 +24,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentRet
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class DummyEnvironment(EnvironmentInterface):
-    def _init__(self):
+    def __init__(self):
         pass
 
     def shutdown(self):
