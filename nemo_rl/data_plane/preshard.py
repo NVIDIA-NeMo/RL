@@ -25,7 +25,6 @@ deadlocks at the first cross-DP collective.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Optional, Sequence
 
 import torch
@@ -34,13 +33,14 @@ from tensordict import TensorDict
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-# Required tensor fields for the ``train`` partition schema. These are the
-# fields ``register_partition`` declares; ``fan_out_per_rank_metas`` writes
-# any additional tensor fields present in the shard (e.g. multimodal image
-# tensors) on top, so VLM workloads aren't silently dropped. Producers (sync
-# / async trainer fan-out) write only the subset they have computed;
-# consumers (``train_presharded`` workers) fetch what they need via
-# ``select_fields``.
+# Tensor fields the ``train`` partition schema declares. The rollout
+# actor's first ``kv_batch_put`` writes the input-side subset
+# (input_ids, input_lengths, generation_logprobs, token_mask,
+# sample_mask) plus any multimodal extras present in the rollout
+# output; later stages add ``prev_logprobs`` /
+# ``reference_policy_logprobs`` (worker write-back) and ``advantages``
+# (driver delta-write). Consumers (``train_presharded`` workers) fetch
+# the union via ``select_fields``.
 DP_SEED_FIELDS = (
     "input_ids",
     "input_lengths",
@@ -52,8 +52,8 @@ DP_SEED_FIELDS = (
     "sample_mask",
 )
 
-# Subset used by ``get_logprobs`` / ``get_reference_policy_logprobs`` —
-# logprob workers only need the input + masks, not the full train fields.
+# Subset used by ``get_logprobs_from_meta`` / ``get_reference_policy_logprobs_from_meta``
+# — logprob workers only need the input + masks, not the full train fields.
 LP_SEED_FIELDS = (
     "input_ids",
     "input_lengths",
@@ -62,184 +62,206 @@ LP_SEED_FIELDS = (
 )
 
 
-def driver_balanced_preshards(
-    train_data: BatchedDataDict,
+def select_meta_indices(
+    meta: KVBatchMeta,
+    indices: Sequence[int],
+) -> KVBatchMeta:
+    """Return a new KVBatchMeta with keys/sequence_lengths sub-selected.
+
+    Pure metadata operation — no I/O. Use to filter a meta after a
+    driver-side selection (e.g. dynamic_sampling's non-zero-std mask).
+    The dropped uids' TQ payload is the caller's responsibility to
+    ``kv_clear``; this helper only updates the meta.
+    """
+    keys = [meta.keys[i] for i in indices]
+    seq_lens: Optional[list[int]] = None
+    if meta.sequence_lengths is not None:
+        seq_lens = [meta.sequence_lengths[i] for i in indices]
+    return KVBatchMeta(
+        partition_id=meta.partition_id,
+        task_name=meta.task_name,
+        keys=keys,
+        fields=meta.fields,
+        sequence_lengths=seq_lens,
+        extra_info=dict(meta.extra_info or {}),
+    )
+
+
+def concat_metas(metas: Sequence[KVBatchMeta]) -> KVBatchMeta:
+    """Concatenate multiple metas into one (same partition_id required).
+
+    Use after dynamic_sampling cache merge: each iteration produces its
+    own meta of survivors; concatenating them gives the meta for the
+    fully-accumulated training batch. Pure metadata; no I/O.
+    """
+    if not metas:
+        raise ValueError("concat_metas: empty input")
+    pid = metas[0].partition_id
+    if any(m.partition_id != pid for m in metas):
+        raise ValueError("concat_metas: partition_ids must match")
+    keys: list[str] = []
+    seq_lens: Optional[list[int]] = []
+    for m in metas:
+        keys.extend(m.keys)
+        if m.sequence_lengths is None:
+            seq_lens = None
+            break
+        seq_lens.extend(m.sequence_lengths)
+    if seq_lens is None:
+        seq_lens = None
+    return KVBatchMeta(
+        partition_id=pid,
+        task_name=metas[0].task_name,
+        keys=keys,
+        fields=metas[0].fields,
+        sequence_lengths=seq_lens,
+        extra_info=dict(metas[0].extra_info or {}),
+    )
+
+
+def slice_meta(meta: KVBatchMeta, start: int, stop: int) -> KVBatchMeta:
+    """Slice a meta's keys/sequence_lengths to ``[start:stop)``.
+
+    Use to trim an over-full cache to ``train_prompts_size`` after
+    dynamic_sampling overflow. Caller is responsible for ``kv_clear``ing
+    the discarded keys; this helper only updates the meta.
+    """
+    seq_lens: Optional[list[int]] = None
+    if meta.sequence_lengths is not None:
+        seq_lens = list(meta.sequence_lengths[start:stop])
+    return KVBatchMeta(
+        partition_id=meta.partition_id,
+        task_name=meta.task_name,
+        keys=list(meta.keys[start:stop]),
+        fields=meta.fields,
+        sequence_lengths=seq_lens,
+        extra_info=dict(meta.extra_info or {}),
+    )
+
+
+def shard_meta_for_dp(
+    meta: KVBatchMeta,
     *,
     dp_world: int,
-    policy_cfg: dict[str, Any],
-) -> list[BatchedDataDict]:
-    """Shard ``train_data`` into ``dp_world`` balanced shards.
+    batch_size: Optional[int] = None,
+    sequence_packing_args: Optional[dict[str, Any]] = None,
+    dynamic_batching_args: Optional[dict[str, Any]] = None,
+) -> tuple[list[KVBatchMeta], Optional[list[int]]]:
+    """Pure key-list split: assign ``meta.keys`` to ``dp_world`` ranks.
 
-    Mirrors legacy ``lm_policy.train``: ``shard_by_batch_size(shards=dp_world,
-    sequence_packing_args=...)`` uses ``bin_count_multiple=dp_world`` which is
-    what guarantees every DP rank ends up with the same number of microbatches.
-    Without it, sequence packing / dynamic batching produce variable per-rank
-    bin counts and Megatron diverges on its first cross-DP collective.
+    Mirrors verl's ``BatchData.chunk(KVBatchMeta)`` (verl/protocol.py:1271-1289)
+    with NeMo-RL's seq-len-aware packing on top. **No I/O, no key minting.**
+    Returned per-rank metas reference subsets of the input ``meta.keys``
+    under the same ``partition_id``; workers fetch their slice via the
+    existing ``*_presharded`` flow.
 
-    Pure transform — no I/O, no TQ. Caller computes ``dp_world`` (typically
-    ``policy.sharding_annotations.get_axis_size("data_parallel")``).
+    Use this for every dispatch *after* rollout (logprob, ref-logprob, train).
+    The rollout actor's first write is a flat ``kv_batch_put`` (see
+    :func:`nemo_rl.algorithms.sync_utils.rollout_to_tq`) — no fan-out.
+
+    Per-rank packing metadata (``micro_batch_indices`` /
+    ``micro_batch_lengths`` / ``elem_counts_per_gb``) lands in each shard's
+    ``extra_info`` so the ``*_presharded`` worker can reattach packing exactly
+    as it does today via the legacy fan-out path.
+
+    Args:
+        meta: input KVBatchMeta covering the full step batch. Must have
+            ``sequence_lengths`` populated (per-key seq lens).
+        dp_world: number of data-parallel ranks.
+        batch_size: total samples — passed to ``shard_by_batch_size``.
+            Use ``None`` for the logprob path (matches ``_shard_for_logprob``);
+            use the GBS for the train path (matches ``_shard_for_train``).
+        sequence_packing_args / dynamic_batching_args: packing config —
+            same dicts passed to ``BatchedDataDict.shard_by_batch_size``.
+            Mutually exclusive. Both ``None`` → unpacked interleave-split.
+
+    Returns:
+        ``(per_rank_metas, unsorted_indices)``. ``per_rank_metas`` is the
+        list of ``dp_world`` ``KVBatchMeta`` slices. ``unsorted_indices``
+        is the inverse permutation that maps aggregated DP-rank-order
+        outputs back to original ``meta.keys`` order — pass it to
+        ``BatchedDataDict.reorder_data`` after worker results are
+        aggregated. ``None`` when no reorder occurred (rare; even the
+        unpacked path interleaves via ``shard_by_batch_size``).
     """
-    gbs = policy_cfg["train_global_batch_size"]
-    seqpack_cfg = policy_cfg.get("sequence_packing", {}) or {}
-    dynbatch_cfg = policy_cfg.get("dynamic_batching", {}) or {}
-
-    spa: Optional[dict[str, Any]] = None
-    dba: Optional[dict[str, Any]] = None
-    if dynbatch_cfg.get("enabled", False):
-        dba = {
-            "input_key": "input_ids",
-            "input_lengths_key": "input_lengths",
-            "sequence_length_round": dynbatch_cfg["sequence_length_round"],
-            "max_tokens_per_microbatch": dynbatch_cfg["train_mb_tokens"],
-        }
-    elif seqpack_cfg.get("enabled", False):
-        spa = {
-            "algorithm": seqpack_cfg["algorithm"],
-            "input_key": "input_ids",
-            "input_lengths_key": "input_lengths",
-            "sequence_length_pad_multiple": policy_cfg[
-                "make_sequence_length_divisible_by"
-            ],
-            "max_tokens_per_microbatch": seqpack_cfg["train_mb_tokens"],
-        }
-
-    if dba is not None:
-        pre_shards, _ = train_data.shard_by_batch_size(
-            dp_world,
-            batch_size=gbs,
-            dynamic_batching_args=dba,
+    n = len(meta.keys)
+    if dp_world <= 0:
+        raise ValueError(f"dp_world must be positive, got {dp_world}")
+    if meta.sequence_lengths is None or len(meta.sequence_lengths) != n:
+        raise ValueError(
+            "shard_meta_for_dp requires meta.sequence_lengths populated and "
+            f"of length {n} (got {meta.sequence_lengths!r}). The rollout "
+            "actor's fan-out should populate this from input_lengths."
         )
-    elif spa is not None:
-        pre_shards, _ = train_data.shard_by_batch_size(
+    if sequence_packing_args is not None and dynamic_batching_args is not None:
+        raise ValueError(
+            "Pass at most one of sequence_packing_args / dynamic_batching_args."
+        )
+
+    seq_lens = list(meta.sequence_lengths)
+    # Skeleton BatchedDataDict — `shard_by_batch_size` only needs
+    # input_ids (placeholder), input_lengths (real), sample_mask (ones).
+    # ``_meta_idx`` lets us recover which original meta index each shard row
+    # corresponds to, so we can slice ``meta.keys`` per rank.
+    skeleton = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(n, 1, dtype=torch.int64),
+            "input_lengths": torch.tensor(seq_lens, dtype=torch.int64),
+            "sample_mask": torch.ones(n, dtype=torch.float32),
+            "_meta_idx": torch.arange(n, dtype=torch.int64),
+        }
+    )
+
+    if dynamic_batching_args is not None:
+        sharded, _ = skeleton.shard_by_batch_size(
             dp_world,
-            batch_size=gbs,
-            sequence_packing_args=spa,
+            batch_size=batch_size,
+            dynamic_batching_args=dynamic_batching_args,
+        )
+    elif sequence_packing_args is not None:
+        sharded, _ = skeleton.shard_by_batch_size(
+            dp_world,
+            batch_size=batch_size,
+            sequence_packing_args=sequence_packing_args,
         )
     else:
-        pre_shards = train_data.shard_by_batch_size(
-            dp_world,
-            batch_size=gbs,
+        sharded = skeleton.shard_by_batch_size(dp_world, batch_size=batch_size)
+
+    base_extra: dict[str, Any] = dict(meta.extra_info or {})
+    out: list[KVBatchMeta] = []
+    flat_idx: list[int] = []
+    for shard in sharded:
+        idx_list: list[int] = shard["_meta_idx"].tolist()
+        flat_idx.extend(idx_list)
+        rank_keys = [meta.keys[i] for i in idx_list]
+        rank_seqlens = [seq_lens[i] for i in idx_list]
+        rank_extra = dict(base_extra)
+        # Per-shard packing metadata — set by ``shard_by_batch_size`` when
+        # sequence_packing/dynamic_batching is enabled. Workers' *_presharded
+        # paths look these up off ``meta.extra_info``.
+        for attr in ("micro_batch_indices", "micro_batch_lengths", "elem_counts_per_gb"):
+            val = getattr(shard, attr, None)
+            if val is not None:
+                rank_extra[attr] = val
+        out.append(
+            KVBatchMeta(
+                partition_id=meta.partition_id,
+                task_name=meta.task_name,
+                keys=rank_keys,
+                fields=meta.fields,
+                sequence_lengths=rank_seqlens,
+                extra_info=rank_extra,
+            )
         )
-    return pre_shards
 
-
-def _build_shard_payload(
-    dp_rank: int,
-    shard: BatchedDataDict,
-    *,
-    partition_id: str,
-    task_name: str,
-    key_prefix: str,
-    seed_fields: Sequence[str],
-) -> tuple[list[str], TensorDict, KVBatchMeta]:
-    """Pure-Python prep for one shard: keys, TensorDict payload, KVBatchMeta.
-
-    Field selection: union of ``seed_fields`` (the schema-declared set) with
-    every tensor key present in the shard. The latter ensures VLM /
-    multimodal extras (e.g. ``pixel_values``) ride along instead of being
-    silently dropped — the legacy in-memory path passes the full
-    BatchedDataDict, so the TQ path must too.
-    """
-    n_shard = int(shard["sample_mask"].shape[0])
-    shard_keys = [f"{key_prefix}_dp{dp_rank}_s{i}" for i in range(n_shard)]
-    declared = [
-        f for f in seed_fields
-        if f in shard and isinstance(shard[f], torch.Tensor)
-    ]
-    extras = [
-        f for f in shard.keys()
-        if f not in seed_fields and isinstance(shard[f], torch.Tensor)
-    ]
-    shard_field_names = declared + extras
-    shard_fields = TensorDict(
-        {f: shard[f].detach().contiguous() for f in shard_field_names},
-        batch_size=[n_shard],
-    )
-    extra: dict[str, Any] = {}
-    if (
-        getattr(shard, "micro_batch_indices", None) is not None
-        and getattr(shard, "micro_batch_lengths", None) is not None
-    ):
-        extra["micro_batch_indices"] = shard.micro_batch_indices
-        extra["micro_batch_lengths"] = shard.micro_batch_lengths
-        ecpg = getattr(shard, "elem_counts_per_gb", None)
-        if ecpg is not None:
-            extra["elem_counts_per_gb"] = ecpg
-    meta = KVBatchMeta(
-        partition_id=partition_id,
-        task_name=task_name,
-        keys=shard_keys,
-        fields=shard_field_names,
-        sequence_lengths=[int(s) for s in shard["input_lengths"].tolist()],
-        extra_info=extra,
-    )
-    return shard_keys, shard_fields, meta
-
-
-async def fan_out_per_rank_metas_async(
-    pre_shards: Sequence[BatchedDataDict],
-    *,
-    dp_client: DataPlaneClient,
-    partition_id: str,
-    task_name: str,
-    key_prefix: str,
-    seed_fields: Sequence[str],
-) -> list[KVBatchMeta]:
-    """Async variant — issues all per-rank ``kv_batch_put`` calls concurrently.
-
-    The sync ``fan_out_per_rank_metas`` wraps this with ``asyncio.run``. The
-    O(DP) RPC latency previously serialized through one event loop per shard
-    is now O(1) under ``asyncio.gather``.
-    """
-    payloads = [
-        _build_shard_payload(
-            r, s,
-            partition_id=partition_id,
-            task_name=task_name,
-            key_prefix=key_prefix,
-            seed_fields=seed_fields,
-        )
-        for r, s in enumerate(pre_shards)
-    ]
-    await asyncio.gather(*[
-        dp_client.kv_batch_put(
-            keys=keys,
-            partition_id=partition_id,
-            fields=fields,
-        )
-        for keys, fields, _ in payloads
-    ])
-    return [meta for _, _, meta in payloads]
-
-
-def fan_out_per_rank_metas(
-    pre_shards: Sequence[BatchedDataDict],
-    *,
-    dp_client: DataPlaneClient,
-    partition_id: str,
-    task_name: str,
-    key_prefix: str,
-    seed_fields: Sequence[str],
-) -> list[KVBatchMeta]:
-    """For each pre-shard: ``kv_batch_put`` tensor fields, return per-rank meta.
-
-    Each shard's key list is ``f"{key_prefix}_dp{r}_s{i}"`` for ``i in
-    range(n_shard)``. Pre-computed packing metadata
-    (``micro_batch_indices`` / ``micro_batch_lengths`` /
-    ``elem_counts_per_gb``) rides on ``KVBatchMeta.extra_info`` so
-    ``train_presharded`` can reattach it post-fetch and skip a local repack.
-
-    Sync façade over :func:`fan_out_per_rank_metas_async`. The caller chooses
-    ``key_prefix`` to namespace keys: ``f"step{N}"`` for sync GRPO,
-    ``f"v{wv}_step{N}"`` for the planned async path.
-    """
-    return asyncio.run(
-        fan_out_per_rank_metas_async(
-            pre_shards,
-            dp_client=dp_client,
-            partition_id=partition_id,
-            task_name=task_name,
-            key_prefix=key_prefix,
-            seed_fields=seed_fields,
-        )
-    )
+    # Build inverse permutation: unsorted[orig_idx] = position_in_aggregated.
+    # When workers' results are concatenated in DP-rank order, row `j` of
+    # the aggregate corresponds to original index `flat_idx[j]`. To restore
+    # original meta.keys order, the caller does aggregated.reorder_data(
+    # unsorted_indices) — same contract as `_shard_for_logprob`.
+    unsorted: Optional[list[int]] = None
+    if flat_idx != list(range(n)):
+        unsorted = [0] * n
+        for new_pos, old_idx in enumerate(flat_idx):
+            unsorted[old_idx] = new_pos
+    return out, unsorted

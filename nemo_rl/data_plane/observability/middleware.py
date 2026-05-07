@@ -147,14 +147,14 @@ class MetricsDataPlaneClient(DataPlaneClient):
 
     # ── (B) direct-by-key ──────────────────────────────────────────────
 
-    async def kv_batch_put(
+    def kv_batch_put(
         self, keys, partition_id, fields=None, tags=None,
     ):
         t0 = monotonic()
         status = "ok"
         n_bytes = _td_bytes(fields)
         try:
-            return await self._inner.kv_batch_put(
+            return self._inner.kv_batch_put(
                 keys, partition_id, fields=fields, tags=tags,
             )
         except Exception:

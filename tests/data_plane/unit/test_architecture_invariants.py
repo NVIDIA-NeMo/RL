@@ -101,7 +101,7 @@ def test_grpo_sync_engages_tq_policy():
     ``TQPolicy.__init__``). Without this guard, a misconfiguration could
     silently route through the legacy in-memory dispatch.
 
-    The TQ wire-level constructs (``KVBatchMeta``, ``fan_out_per_rank_metas``,
+    The TQ wire-level constructs (``KVBatchMeta``, ``shard_meta_for_dp``,
     ``build_data_plane_client``) belong inside ``tq_policy.py`` /
     ``preshard.py``, not in the trainer.
     """
