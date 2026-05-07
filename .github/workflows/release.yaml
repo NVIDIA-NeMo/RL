@@ -62,7 +62,7 @@ concurrency:
 jobs:
   release:
     if: ${{ !cancelled() }}
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@43d259e5b5f0a6cb4c14eefa04738a5bdf316fe1
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@d2f3dd32aad11b7034f3f1821174556507d61670
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       python-package: nemo_rl
@@ -80,18 +80,7 @@ jobs:
       publish-as-latest: true
       run-on-version-tag-only: ${{ github.ref_name != 'main' }}
       restrict-to-admins: true
-    secrets:
-      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
-      TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
-      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
-      BOT_KEY: ${{ secrets.BOT_KEY }}
-      AWS_ASSUME_ROLE_ARN: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AKAMAI_HOST: ${{ secrets.AKAMAI_HOST }}
-      AKAMAI_CLIENT_TOKEN: ${{ secrets.AKAMAI_CLIENT_TOKEN }}
-      AKAMAI_CLIENT_SECRET: ${{ secrets.AKAMAI_CLIENT_SECRET }}
-      AKAMAI_ACCESS_TOKEN: ${{ secrets.AKAMAI_ACCESS_TOKEN }}
+    secrets: inherit
       S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
 
   release-summary:
