@@ -1205,6 +1205,9 @@ def refit_policy_generation(
     _refit_buffer_size_gb: Optional[int] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
+    weight_sync_method: Optional[str] = None,
+    mx_config: Optional[Any] = None,
+    refit_version: Optional[int] = None,
 ) -> None:
     """Refit the policy generation interface with the latest policy weights.
 
@@ -1267,18 +1270,42 @@ def refit_policy_generation(
                 results = ray.get(futures_inference)
                 update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl
-            # SGLang haven't implemented non-colocated inference mode.
-            if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
+            # ---- ModelExpress v2 path (rank-to-rank NIXL RDMA, MoE-aware) ----
+            if weight_sync_method == "mx":
+                if mx_config is None or not getattr(mx_config, "enabled", False):
+                    raise RuntimeError(
+                        "weight_sync_method='mx' requires an enabled MxConfig "
+                        "(cfg.cluster.weight_sync.method='mx', .enabled=True)"
+                    )
+                version = int(refit_version) if refit_version is not None else 0
+                futures_train = policy.stream_weights_via_mx(
+                    version=version, mx_config=mx_config
                 )
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+                futures_inference = policy_generation.update_weights_via_mx(
+                    version=version, mx_config=mx_config
+                )
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(
+                    result for result in results if result is not None
+                )
+            else:
+                # update weights through nccl (default non-colocated path)
+                # SGLang haven't implemented non-colocated inference mode.
+                if isinstance(policy_generation, SGLangGeneration):
+                    raise NotImplementedError(
+                        "SGLang haven't implemented non-colocated inference mode. "
+                    )
+                futures_train = policy.broadcast_weights_for_collective(
+                    kv_scales=kv_scales
+                )
+                futures_inference = policy_generation.update_weights_from_collective()
+                # wait for all futures to complete
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(
+                    result for result in results if result is not None
+                )
 
         # check if update is successful
         if not update_success:

@@ -795,6 +795,26 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    def update_weights_via_mx(
+        self, *, version: int, mx_config: Any
+    ) -> list[ray.ObjectRef]:
+        """Update weights via ModelExpress + NIXL RDMA (v2 path)."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "update_weights_via_mx is not yet wired for async_engine=True"
+            )
+
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_weights_via_mx",
+            version=int(version),
+            mx_config=mx_config,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return futures
+
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""
         if not self.worker_group or not self.worker_group.workers:

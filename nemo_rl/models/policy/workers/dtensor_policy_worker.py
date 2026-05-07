@@ -1856,6 +1856,117 @@ class DTensorPolicyWorkerImpl(
         )
 
     @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker/stream_weights_via_mx")
+    def stream_weights_via_mx(
+        self,
+        *,
+        version: int,
+        mx_config: Any,
+    ) -> None:
+        """Publish local DTensor shards to ModelExpress for RDMA refit (v2).
+
+        Unlike ``broadcast_weights_for_collective`` (which calls
+        ``tensor.full_tensor()`` and routes everything through rank 0 over
+        NCCL), this method publishes each rank's *local* DTensor shard to
+        the MX server. The same-rank inference peer pulls directly via NIXL
+        RDMA. See ``pensieve/RL/NemoRL/04_design_v2_moe_rank_to_rank.md``.
+
+        Reuses cached MX publisher across calls — NIXL registration only
+        happens on the first publish, since DTensor local addresses stay
+        constant across optimizer steps. MoE expert metadata is detected
+        heuristically (any tensor name containing ``"experts"`` whose
+        leading axis is divisible by ``ep_world_size``) — override via
+        the ``NRL_MX_EXPERT_TENSOR_PATTERN`` env var.
+        """
+        if kv_scales := getattr(self, "_kv_scales_for_mx", None):
+            raise NotImplementedError(
+                "FP8 kvcache scales are not yet supported on the MX path"
+            )
+
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
+        # ---- Lazy-init the MX publisher (once per worker lifetime) ----
+        if not hasattr(self, "_mx_publisher") or self._mx_publisher is None:
+            from nemo_rl.distributed.mx_helpers import (
+                build_v2_publisher,
+                detect_moe_expert_layout,
+            )
+
+            tp_size = getattr(self, "tp_size", 1) or 1
+            pp_size = getattr(self, "pp_size", 1) or 1
+            ep_size = getattr(self, "ep_size", 1) or 1
+            self._mx_publisher = build_v2_publisher(
+                rank=self.rank,
+                device_id=self.local_device_index
+                if hasattr(self, "local_device_index")
+                else self.rank,
+                fsdp_world_size=self.world_size,
+                tp_world_size=tp_size,
+                pp_world_size=pp_size,
+                ep_world_size=ep_size,
+                mx_config=mx_config,
+            )
+            self._mx_publisher.initialize(
+                model_name=getattr(self, "model_name", "unknown"),
+                dtype=str(self.dtype).removeprefix("torch."),
+            )
+            # Detect MoE layout once (state_dict shape is invariant across steps).
+            self._mx_expert_layout: dict[str, tuple[int, set[int]]] = (
+                detect_moe_expert_layout(
+                    self.model,
+                    ep_world_size=ep_size,
+                    rank=self.rank,
+                )
+                if mx_config.moe_expert_filter
+                else {}
+            )
+
+        # ---- Add tensors with proper DTensor handling ----
+        self._mx_publisher._registry.clear()
+        self._mx_publisher._registered_tensors.clear()
+        for name, tensor in self.model.state_dict().items():
+            if isinstance(tensor, DTensor):
+                # *** key: to_local() not full_tensor() ***
+                local = tensor.to_local()
+            else:
+                local = tensor
+            if local.is_floating_point() and local.dtype != self.dtype:
+                local = local.to(self.dtype, non_blocking=True)
+            local = local.contiguous()
+
+            # Build a faux-DTensor view so describe_tensor() can pull
+            # placement info correctly. We do this by passing the original
+            # DTensor — describe_tensor() only reads .shape / .dtype /
+            # .placements off it. The actual NIXL-registered tensor below
+            # is the local shard. This separation lets the receiver know
+            # the global shape without us having to reconstruct it.
+            view_for_describe = tensor if isinstance(tensor, DTensor) else local
+
+            expert_info = self._mx_expert_layout.get(name)
+            self._mx_publisher.add_tensor(
+                name=name,
+                tensor=local,  # NIXL-registered buffer
+                is_expert=expert_info is not None,
+                expert_axis=(expert_info[0] if expert_info else 0),
+                owned_expert_ids=(expert_info[1] if expert_info else set()),
+            )
+            # Stash the global-shape info from the DTensor view for the
+            # registry. add_tensor uses the registered (local) tensor's
+            # shape; we override to the global shape so receivers know.
+            if isinstance(tensor, DTensor):
+                self._mx_publisher._registry[-1].global_shape = tuple(
+                    int(s) for s in tensor.shape
+                )
+
+        # ---- Publish + mark ready ----
+        self._mx_publisher.publish(version=int(version))
+        self._mx_publisher.mark_ready()
+
+        if self.cpu_offload:
+            self.model = self.move_to_cpu(self.model)
+
+    @torch.no_grad()
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
