@@ -39,7 +39,7 @@ class GRPOAdvantageEstimator:
     Note: GRPO computes advantages over all responses for each prompt.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: dict):
+    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
         self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
         self.normalize_rewards = estimator_config["normalize_rewards"]
 
@@ -81,7 +81,7 @@ class GDPOAdvantageEstimator:
     Note: GDPO computes advantages for each reward separately over all responses for each prompt.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: dict):
+    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
         self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
         self.normalize_rewards = estimator_config["normalize_rewards"]
 
