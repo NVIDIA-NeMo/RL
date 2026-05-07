@@ -18,7 +18,8 @@ mkdir -p $EXP_DIR
 
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
-    $PROJECT_ROOT/examples/run_eval_random_dataset.py \
+    $PROJECT_ROOT/examples/run_eval.py \
+    data.dataset_name=random \
     generation.model_name=Qwen/Qwen3-0.6B \
     tokenizer.name=Qwen/Qwen3-0.6B \
     generation.max_new_tokens=4 \

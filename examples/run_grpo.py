@@ -15,13 +15,26 @@
 import argparse
 import os
 import pprint
+from collections import defaultdict
+from typing import Any, Optional
 
 from omegaconf import OmegaConf
+from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data import DataConfig
+from nemo_rl.data.datasets import AllTaskProcessedDataset, RandomDataset
+from nemo_rl.data.interfaces import (
+    TaskDataProcessFnCallable,
+    TaskDataSpec,
+)
+from nemo_rl.data.processors import random_input_len_processor
 from nemo_rl.data.utils import setup_response_data
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.dummy_environment import DummyEnvironment
+from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
     load_config,
@@ -29,6 +42,8 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+
+TokenizerType = PreTrainedTokenizerBase
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -42,6 +57,79 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     args, overrides = parser.parse_known_args()
 
     return args, overrides
+
+
+def _setup_random_data(
+    tokenizer: TokenizerType,
+    data_config: DataConfig,
+) -> tuple[
+    AllTaskProcessedDataset,
+    Optional[AllTaskProcessedDataset],
+    dict[str, EnvironmentInterface],
+    dict[str, EnvironmentInterface],
+]:
+    """Build a RandomDataset + DummyEnvironment for synthetic benchmarking."""
+    print("\n▶ Setting up data (random dataset)...")
+    if data_config.get("input_len_or_input_len_generator") is None:
+        raise ValueError(
+            "data.input_len_or_input_len_generator must be provided when "
+            "data.dataset_name == 'random'"
+        )
+    if "num_samples" not in data_config:
+        raise ValueError(
+            "data.num_samples must be provided when data.dataset_name == 'random'"
+        )
+
+    if isinstance(data_config["input_len_or_input_len_generator"], dict):
+        from nemo_rl.utils.sequence_length_generator import (
+            get_sequence_length_generator,
+        )
+
+        data_config["input_len_or_input_len_generator"] = get_sequence_length_generator(
+            data_config["input_len_or_input_len_generator"]
+        )
+
+    random_task_spec = TaskDataSpec(
+        task_name="random",
+        input_len_or_input_len_generator=data_config[
+            "input_len_or_input_len_generator"
+        ],
+    )
+
+    base_dataset: Any = RandomDataset(
+        data_config["input_len_or_input_len_generator"],
+        num_samples=data_config["num_samples"],
+    )
+
+    # data processor — defaultdict so any task name in the synthetic data falls
+    # back to the random processor
+    task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
+        defaultdict(lambda: (random_task_spec, random_input_len_processor))
+    )
+    task_data_processors["random"] = (random_task_spec, random_input_len_processor)
+
+    dummy_env = DummyEnvironment.options(  # type: ignore # wrapped with ray.remote
+        runtime_env={
+            "py_executable": get_actor_python_env(
+                "nemo_rl.environments.math_environment.MathEnvironment"
+            ),
+            "env_vars": dict(os.environ),  # pass through user env
+        }
+    ).remote()
+
+    dataset = AllTaskProcessedDataset(
+        base_dataset.formatted_ds["train"],
+        tokenizer,
+        random_task_spec,
+        task_data_processors,
+        max_seq_length=data_config["max_input_seq_length"],
+    )
+
+    val_dataset: Optional[AllTaskProcessedDataset] = None
+
+    task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: dummy_env)
+    task_to_env["random"] = dummy_env
+    return dataset, val_dataset, task_to_env, task_to_env
 
 
 def main() -> None:
@@ -91,13 +179,21 @@ def main() -> None:
         has_refit_draft_weights=has_refit_draft_weights,
     )
 
-    # setup data
-    (
-        dataset,
-        val_dataset,
-        task_to_env,
-        val_task_to_env,
-    ) = setup_response_data(tokenizer, config["data"], config["env"])
+    # setup data — branch on synthetic random-data path for benchmarking
+    if config["data"].get("dataset_name") == "random":
+        (
+            dataset,
+            val_dataset,
+            task_to_env,
+            val_task_to_env,
+        ) = _setup_random_data(tokenizer, config["data"])
+    else:
+        (
+            dataset,
+            val_dataset,
+            task_to_env,
+            val_task_to_env,
+        ) = setup_response_data(tokenizer, config["data"], config["env"])
 
     (
         policy,
