@@ -16,7 +16,7 @@
 After the sync 1-hop refactor, ``fan_out_per_rank_metas`` was retired in
 favor of:
 
-  * ``rollout_to_tq`` — single flat ``kv_batch_put`` of every tensor
+  * ``kv_first_write`` — single flat ``kv_batch_put`` of every tensor
     field in the rollout output (multimodal extras ride along).
   * ``shard_meta_for_dp`` — pure key-list split per DP rank, no I/O.
 
@@ -39,7 +39,7 @@ from nemo_rl.data_plane.preshard import (
     slice_meta,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.algorithms.sync_utils import rollout_to_tq
+from nemo_rl.algorithms.sync_utils import kv_first_write
 
 
 def _final_batch(n_samples: int = 4, *, with_extras: bool = False) -> BatchedDataDict:
@@ -63,15 +63,15 @@ def _setup_partition(client: NoOpDataPlaneClient, *, num_samples: int):
     )
 
 
-# ── rollout_to_tq schema extensibility ────────────────────────────────
+# ── kv_first_write schema extensibility ────────────────────────────────
 
 
-def test_rollout_to_tq_writes_seed_fields():
+def test_kv_first_write_writes_seed_fields():
     client = NoOpDataPlaneClient()
     _setup_partition(client, num_samples=4)
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
-    meta = rollout_to_tq(fb, uids=uids, dp_client=client, partition_id="train")
+    meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
     # Every tensor field in the input lands in TQ under f"{uid}_g0".
     assert meta.keys == [f"u{i}_g0" for i in range(4)]
     fetched = client.kv_batch_get(
@@ -81,13 +81,13 @@ def test_rollout_to_tq_writes_seed_fields():
     assert fetched["input_ids"].shape == (4, 8)
 
 
-def test_rollout_to_tq_carries_multimodal_extras():
+def test_kv_first_write_carries_multimodal_extras():
     """VLM extras (pixel_values) ride along with no schema declaration."""
     client = NoOpDataPlaneClient()
     _setup_partition(client, num_samples=4)
     fb = _final_batch(4, with_extras=True)
     uids = [f"u{i}" for i in range(4)]
-    meta = rollout_to_tq(fb, uids=uids, dp_client=client, partition_id="train")
+    meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
     assert "pixel_values" in (meta.fields or [])
     fetched = client.kv_batch_get(
         keys=meta.keys, partition_id="train", select_fields=["pixel_values"],
@@ -95,13 +95,13 @@ def test_rollout_to_tq_carries_multimodal_extras():
     assert fetched["pixel_values"].shape == (4, 3, 4, 4)
 
 
-def test_rollout_to_tq_keys_match_uids_x_ngen():
+def test_kv_first_write_keys_match_uids_x_ngen():
     """Keys are f"{uid}_g{i}"; n_gen inferred from sample_mask shape vs uids."""
     client = NoOpDataPlaneClient()
     _setup_partition(client, num_samples=6)
     fb = _final_batch(6)  # 3 prompts × 2 generations
     uids = ["a", "b", "c"]
-    meta = rollout_to_tq(fb, uids=uids, dp_client=client, partition_id="train")
+    meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
     assert meta.keys == ["a_g0", "a_g1", "b_g0", "b_g1", "c_g0", "c_g1"]
 
 

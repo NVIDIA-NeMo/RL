@@ -16,16 +16,16 @@
 Houses the sync 1-hop counterparts to ``async_utils.AsyncTrajectoryCollector``
 and ``async_utils.ReplayBuffer``:
 
-* :func:`rollout_to_tq` — the flat first-write primitive (mirrors verl
+* :func:`kv_first_write` — the flat first-write primitive (mirrors verl
   ``main_ppo_sync.py:386-423``); single ``kv_batch_put`` of every tensor
   field under per-sample keys ``f"{uid}_g{i}"``.
 
-* :class:`SyncTrajectoryCollector` — the Ray actor that owns the
+* :class:`SyncRolloutActor` — the Ray actor that owns the
   multi-turn rollout loop AND the post-rollout flatten / mask /
   prompt extraction / reward shaping / baseline-std for a sync GRPO
   step. The driver dispatches a per-step prompt batch + uids; the
   actor runs ``run_multi_turn_rollout`` (or async / nemo_gym variants),
-  then writes the bulk schema to TQ via :func:`rollout_to_tq`. Only a
+  then writes the bulk schema to TQ via :func:`kv_first_write`. Only a
   ``KVBatchMeta`` and a small per-sample slice (rewards, masks,
   lengths, baseline/std, prompt_ids_for_adv) cross back to the driver
   via Ray.
@@ -61,7 +61,7 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation.interfaces import GenerationInterface
 
 
-def rollout_to_tq(
+def kv_first_write(
     final_batch_cpu: BatchedDataDict[Any],
     *,
     uids: Sequence[str],
@@ -69,6 +69,7 @@ def rollout_to_tq(
     partition_id: str,
     extra_info: Optional[dict[str, Any]] = None,
     task_name: str = "train",
+    pad_to_multiple: int = 1,
 ) -> KVBatchMeta:
     """Single flat ``kv_batch_put`` of every tensor field in ``final_batch_cpu``.
 
@@ -76,7 +77,19 @@ def rollout_to_tq(
     no DP awareness, no fan-out. Bulk lives in TQ from here on; the
     caller never re-handles it on the driver. See
     ``research/data_plane_integration_plan.md`` §1.2.
+
+    **Wire format (Phase 1)**: variable-length tensor fields are converted
+    to ``torch.jagged`` nested tensors via :func:`to_nested_by_length`
+    before the put. A field qualifies as variable-length when its shape
+    is ``(N, S, ...)`` with ``S == max(input_lengths)`` and
+    ``N == len(uids) * n_gen`` — catches ``input_ids``, ``token_mask``,
+    ``generation_logprobs``. Rectangular fields (``input_lengths``,
+    ``sample_mask``, image embeddings) pass through as regular tensors.
+    The padding tax is paid only when a consumer calls
+    :func:`materialize(layout='padded', pad_value_dict=...)`.
     """
+    from nemo_rl.data_plane.codec import maybe_pack_jagged
+
     n = int(final_batch_cpu["sample_mask"].shape[0])
     if n == 0 or len(uids) == 0 or n % len(uids) != 0:
         raise ValueError(
@@ -88,26 +101,34 @@ def rollout_to_tq(
     bulk_field_names = [
         k for k, v in final_batch_cpu.items() if isinstance(v, torch.Tensor)
     ]
+    lengths = final_batch_cpu["input_lengths"]
+
     bulk = TensorDict(
-        {k: final_batch_cpu[k].detach().contiguous() for k in bulk_field_names},
+        {k: maybe_pack_jagged(final_batch_cpu[k], lengths) for k in bulk_field_names},
         batch_size=[n],
     )
     dp_client.kv_batch_put(
         keys=keys, partition_id=partition_id, fields=bulk,
     )
 
+    extras = dict(extra_info or {})
+    if pad_to_multiple > 1:
+        # Reader pads jagged fields up to this multiple so downstream
+        # backends (mcore SP, PyTorch CP) get sequence dims that satisfy
+        # their own divisibility asserts.
+        extras["pad_to_multiple"] = int(pad_to_multiple)
     return KVBatchMeta(
         partition_id=partition_id,
         task_name=task_name,
         keys=keys,
         fields=bulk_field_names,
-        sequence_lengths=[int(s) for s in final_batch_cpu["input_lengths"].tolist()],
-        extra_info=dict(extra_info or {}),
+        sequence_lengths=[int(s) for s in lengths.tolist()],
+        extra_info=extras,
     )
 
 
 @ray.remote  # pragma: no cover
-class SyncTrajectoryCollector:
+class SyncRolloutActor:
     """Per-step rollout dispatcher: rollout + flatten + mask + prompt extraction
     + baseline/std + TQ put. Returns ``(meta, slice, metrics)``.
 
@@ -253,12 +274,15 @@ class SyncTrajectoryCollector:
             "prompt_ids_for_adv": prompt_flat["token_ids"],
         }
 
-        meta = rollout_to_tq(
+        meta = kv_first_write(
             bulk_batch, uids=uids,
             dp_client=self._dp_client,
             partition_id=partition_id,
             extra_info={"rollout_metrics": rollout_metrics},
             task_name="train" if partition_id == "train" else partition_id,
+            pad_to_multiple=int(
+                cfg["policy"].get("make_sequence_length_divisible_by") or 1
+            ),
         )
 
         if self.policy_generation is not None:

@@ -99,19 +99,6 @@ def main() -> None:
         val_task_to_env,
     ) = setup_response_data(tokenizer, config["data"], config["env"])
 
-    # If data_plane is enabled, build a TQPolicy factory so setup()
-    # constructs the TQ-mediated policy class without grpo.py needing
-    # to know about it (preserves the "legacy grpo has zero data-plane
-    # refs" architecture invariant from a085559c).
-    _dp_cfg = config.get("data_plane")
-    if _dp_cfg and _dp_cfg.get("enabled", False):
-        from nemo_rl.models.policy.tq_policy import TQPolicy
-
-        def _policy_factory(**kwargs):
-            return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
-    else:
-        _policy_factory = None
-
     (
         policy,
         policy_generation,
@@ -123,10 +110,7 @@ def main() -> None:
         checkpointer,
         grpo_state,
         master_config,
-    ) = setup(
-        config, tokenizer, dataset, val_dataset,
-        policy_factory=_policy_factory,
-    )
+    ) = setup(config, tokenizer, dataset, val_dataset)
 
     # Check if async mode is enabled
     if "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:

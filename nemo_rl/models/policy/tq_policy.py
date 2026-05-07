@@ -18,7 +18,7 @@ Exposes ``train_from_meta`` / ``get_logprobs_from_meta`` /
 ``Policy.{train, get_logprobs, get_reference_policy_logprobs}`` but
 accepting a ``KVBatchMeta`` instead of a ``BatchedDataDict``. The meta
 names per-sample TQ keys minted once at rollout
-(:class:`nemo_rl.algorithms.sync_utils.SyncTrajectoryCollector`); each
+(:class:`nemo_rl.algorithms.sync_utils.SyncRolloutActor`); each
 dispatch slices the key list per DP rank via
 :func:`nemo_rl.data_plane.preshard.shard_meta_for_dp` (no re-fan-out,
 no key minting). Workers fetch their slice from TQ via

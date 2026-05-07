@@ -13,18 +13,25 @@
 # limitations under the License.
 """Wire <-> trainer codec.
 
-Phase 1 ships a minimal materialize() that converts a TensorDict (the
-wire format) back into a BatchedDataDict (what the existing trainer body
-consumes). The wire format today is *padded* — the seed-put in
-grpo_train writes already-padded tensors. So this is a thin translation,
-not a real jagged → padded transform.
+Phase 1 of the jagged-on-the-wire plan (mirrors verl):
 
-Stage 2 will land:
-  * ``FIELD_SCHEMA`` table + per-field encoding.
-  * ``to_csr`` / ``from_csr`` for variable-length list[list[primitive]].
-  * ``StringEnum`` for fixed-vocab strings.
-  * Real jagged ``materialize(layout='padded')`` that pads
-    ``torch.nested.nested_tensor`` fields per ``pad_value_dict``.
+  * Writer side: variable-length fields are encoded as
+    ``torch.nested.nested_tensor`` with ``layout=torch.jagged`` before
+    ``kv_batch_put``. Padding tax is paid only when a consumer needs a
+    rectangular tensor.
+
+  * Reader side: :func:`materialize` accepts the wire TensorDict and,
+    when ``layout='padded'``, calls
+    :func:`torch.nested.to_padded_tensor` on any nested leaves using
+    the per-field padding value supplied in ``pad_value_dict``. Trainer
+    code consumes the padded BatchedDataDict unchanged.
+
+  * Worker write-backs that produce ``response``-shaped outputs use
+    :func:`response_from_nested` (same shape contract as verl's
+    ``verl/workers/utils/padding.py:response_from_nested``).
+
+Stage 2 (future) will migrate trainer code to natively consume
+nested tensors, retiring the bridge.
 """
 
 from __future__ import annotations
@@ -40,33 +47,121 @@ if TYPE_CHECKING:
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
+# ── Padded ↔ nested helpers ───────────────────────────────────────────
+
+
+def to_nested_by_length(
+    padded: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Strip right-padding off a rectangular tensor using per-row lengths.
+
+    ``padded`` has shape ``(N, S, ...)``; ``lengths`` has shape ``(N,)``.
+    Returns a ``torch.jagged`` nested tensor whose i-th row is
+    ``padded[i, :lengths[i], ...]``.
+
+    Used by the producer side: convert
+    :func:`batched_message_log_to_flat_message` output (already padded)
+    into the wire format before ``kv_batch_put``.
+    """
+    if padded.dim() < 2:
+        raise ValueError(
+            f"to_nested_by_length expects (N, S, ...); got shape {tuple(padded.shape)}"
+        )
+    n = padded.shape[0]
+    if lengths.shape != (n,):
+        raise ValueError(
+            f"lengths shape {tuple(lengths.shape)} != ({n},) (rows of padded)"
+        )
+    rows = [padded[i, : int(lengths[i].item())] for i in range(n)]
+    return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+
+def maybe_pack_jagged(
+    val: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Convert ``val`` to jagged iff it looks like a per-token field.
+
+    Heuristic: ``val`` qualifies when ``val.shape == (N, max(lengths), ...)``
+    where ``N == lengths.shape[0]``. Other shapes pass through as
+    rectangular tensors. Used by every write site (initial put,
+    driver delta-write, worker write-back) so all per-token fields
+    land in TQ as jagged with the same row lengths — read-time
+    materialization then pads them all to the same target shape,
+    avoiding shape-mismatch crashes between mixed wire formats.
+    """
+    n = lengths.shape[0]
+    if n == 0:
+        return val.detach().contiguous()
+    max_len = int(lengths.max().item())
+    if val.dim() < 2 or val.shape[0] != n or val.shape[1] != max_len:
+        return val.detach().contiguous()
+    return to_nested_by_length(val.detach(), lengths)
+
+
+def response_from_nested(
+    full: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Extract the response slice from a (prompt+response) nested tensor.
+
+    Mirrors verl ``verl/workers/utils/padding.py:response_from_nested``.
+    Used on the worker side for logprob / ref-logprob write-back where
+    only the response-token slice is interesting downstream.
+
+    ``full``: jagged nested tensor of shape ``(N, prompt_len + response_len)``.
+    ``response_mask``: jagged nested tensor of shape ``(N, response_len)``;
+    its ``offsets().diff()`` gives the per-row response length.
+
+    Output: jagged nested tensor of shape ``(N, response_len)`` with the
+    "left-shift by one token" convention applied (so logprobs at output
+    position i correspond to the prediction of input token i+1).
+    """
+    values = full.values()
+    offsets = full.offsets()
+    response_lens = response_mask.offsets().diff()
+    response_list = []
+    for resp_len, seq_offset in zip(response_lens, offsets[1:], strict=True):
+        # left-shift output by one token for log_probs / values
+        response_list.append(
+            values[seq_offset - resp_len - 1 : seq_offset - 1]
+        )
+    return torch.nested.as_nested_tensor(response_list, layout=torch.jagged)
+
+
+# ── materialize: wire TensorDict → trainer BatchedDataDict ────────────
+
+
 def materialize(
     td: TensorDict,
     layout: Literal["padded", "jagged"] = "padded",
     pad_value_dict: dict[str, int | float] | None = None,
+    pad_to_multiple: int = 1,
 ) -> "BatchedDataDict[Any]":
     """Convert a wire TensorDict to a BatchedDataDict.
 
-    Phase 1 contract: the wire is padded already, so this is a thin
-    translation (no nested → padded transform). ``layout`` and
-    ``pad_value_dict`` are accepted for forward compatibility with
-    Stage 2's real jagged path; ``layout='jagged'`` is not yet supported.
+    ``layout='padded'`` (default): any nested-tensor leaves are padded
+    via :func:`torch.nested.to_padded_tensor` using ``pad_value_dict[k]``
+    (or 0 if not specified). Regular tensor leaves pass through.
+    Trainer/worker code expects rectangular tensors — this is the bridge.
 
-    Note on import: ``BatchedDataDict`` lives in ``nemo_rl.distributed``
-    which transitively pulls the multimodal stack (``decord``,
-    ``torchvision``, ``transformers``) at module load. Lazy-importing
-    here keeps ``import nemo_rl.data_plane`` cheap so unit tests that
-    don't actually call this function can run in a slim env.
+    ``pad_to_multiple`` rounds the seq dim up to the next multiple after
+    ``to_padded_tensor``. Required when downstream backends impose
+    alignment (mcore SP needs ``seq_len % TP == 0``; PyTorch CP needs
+    ``seq_len % (CP * 2) == 0``). Default 1 = no extra alignment.
+
+    ``layout='jagged'``: nested leaves pass through; rectangular leaves
+    pass through. Use only when the caller knows how to consume nested.
+
+    The lazy ``BatchedDataDict`` import keeps ``import
+    nemo_rl.data_plane`` cheap for unit tests that don't actually call
+    this function (``BatchedDataDict`` transitively pulls multimodal
+    deps like decord / torchvision).
     """
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-    if layout != "padded":
-        raise NotImplementedError(
-            f"materialize(layout={layout!r}) is Stage 2 work. "
-            "Phase 1 wire format is padded — use layout='padded'."
-        )
-    del pad_value_dict  # accepted for forward-compat; unused in Phase 1
-
+    pads = pad_value_dict or {}
     out: dict[str, torch.Tensor] = {}
     for key, val in td.items(include_nested=False):
         if not isinstance(val, torch.Tensor):
@@ -74,5 +169,17 @@ def materialize(
                 f"materialize() received non-tensor leaf {key!r}: {type(val)}. "
                 "Wire format must be tensor-only (P3)."
             )
-        out[key] = val
+        if val.is_nested and layout == "padded":
+            pad = pads.get(key, 0)
+            padded = torch.nested.to_padded_tensor(val, padding=pad)
+            if pad_to_multiple > 1 and padded.dim() >= 2:
+                seq_dim = padded.shape[1]
+                rem = seq_dim % pad_to_multiple
+                if rem != 0:
+                    extra = pad_to_multiple - rem
+                    pad_spec = [0, 0] * (padded.dim() - 2) + [0, extra]
+                    padded = torch.nn.functional.pad(padded, pad_spec, value=pad)
+            out[key] = padded
+        else:
+            out[key] = val
     return BatchedDataDict(out)

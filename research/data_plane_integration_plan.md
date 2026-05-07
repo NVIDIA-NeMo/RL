@@ -182,7 +182,7 @@ This goal is what makes sync 1-hop worth building. Any design that lets rollout 
 | Step | Where | What | Notes |
 |---|---|---|---|
 | 1. uid mint | **driver**, after dataloader returns prompts | `uid = uuid.uuid4()` per prompt | Mirrors verl `main_ppo_sync.py:1377`. Globally unique → no train/val/checkpoint-replay collisions. |
-| 2. first TQ write | **rollout actor** (`SyncTrajectoryCollector` / `AsyncTrajectoryCollector`), AFTER generation + env.step + reward | `keys = [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]; kv_batch_put(keys, partition_id, fields=<all rollout tensors>)` | Atomic per-prompt put. Bulk never visits the driver. |
+| 2. first TQ write | **rollout actor** (`SyncRolloutActor` / `AsyncTrajectoryCollector`), AFTER generation + env.step + reward | `keys = [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]; kv_batch_put(keys, partition_id, fields=<all rollout tensors>)` | Atomic per-prompt put. Bulk never visits the driver. |
 | 3. driver delta-write | **driver**, after computing reward shaping / dyn-sample / overlong / advantage | `kv_batch_put(meta.keys, fields={"advantages": ..., "sample_mask": ..., ...})` | Same keys; new columns. |
 | 4. worker delta-write | **worker** `*_presharded` body, after computing logprobs / ref-logprobs / train metrics | `kv_batch_put(my_slice_keys, fields={"prev_logprobs": ..., "reference_policy_logprobs": ...})` before returning to driver | Same keys; new columns. **TQ is the source of truth** — driver pulls only what it consumes for its own compute (small slice). |
 | 5. cleanup | **driver**, end of step | `kv_clear(meta.keys, partition_id)` | The only deletion site. |
@@ -199,7 +199,7 @@ These exist in the current code and **must not survive the sync 1-hop landing**:
 
 | Primitive | Inputs | Outputs | Use site | I/O? |
 |---|---|---|---|---|
-| `dp_client.kv_batch_put(keys, partition_id, fields, tags)` | flat per-sample keys + tensors | none | **rollout actor's only write** (sync `SyncTrajectoryCollector`, async `AsyncTrajectoryCollector`) | yes — single put |
+| `dp_client.kv_batch_put(keys, partition_id, fields, tags)` | flat per-sample keys + tensors | none | **rollout actor's only write** (sync `SyncRolloutActor`, async `AsyncTrajectoryCollector`) | yes — single put |
 | `shard_meta_for_dp(meta, dp_world, packing_args)` | one `KVBatchMeta` (full step batch) | list[`KVBatchMeta`] (per-rank slices, same partition_id, same keys subset) + inverse permutation | every dispatch after rollout (logprob, ref-logprob, train) | **no** — pure key-list split |
 | `fan_out_per_rank_metas(sharded_data, …)` (legacy) | pre-balanced `BatchedDataDict` shards | list[`KVBatchMeta`] | **legacy backward-compat only** — `TQPolicy.{train,get_logprobs,…}` (the non-`*_from_meta` paths) and the async-on-TQ trainer in `grpo.py` (commit `10e3b854`). Retired when async migrates. | yes — re-writes bulk under per-rank keys |
 
@@ -221,7 +221,7 @@ await tq.async_kv_batch_put(
 
 The rollout actor writes **what it produced**, not "what each DP rank needs." DP awareness enters at dispatch via `_balance_batch` + `BatchData.chunk(KVBatchMeta)` — never at first write.
 
-NeMo-RL counterpart (`SyncTrajectoryCollector.rollout_to_tq` / `AsyncTrajectoryCollector` writeback): identical shape, keys `f"{uid}_g{i}"`. No `fan_out_per_rank_metas` call.
+NeMo-RL counterpart (`SyncRolloutActor.rollout_to_tq` / `AsyncTrajectoryCollector` writeback): identical shape, keys `f"{uid}_g{i}"`. No `fan_out_per_rank_metas` call.
 
 ### Dual API: data-driven (legacy) vs meta-driven (`*_from_meta`)
 

@@ -38,7 +38,7 @@ they never `import transfer_queue` directly. That's the swappable boundary.
 
 ### Helpers built on top (`nemo_rl/data_plane/`)
 
-- `rollout_to_tq(batch, uids, ...) → KVBatchMeta` — single flat
+- `kv_first_write(batch, uids, ...) → KVBatchMeta` — single flat
   `kv_batch_put` of all rollout fields
 - `read_columns(client, meta, select)` — `kv_batch_get → materialize`
 - `write_columns(client, meta, fields)` — typed `kv_batch_put` for deltas
@@ -75,7 +75,7 @@ invariant verl maintains (`{uid}_{session_id}_{i}`).
 └─────────────┬──────────────────────────────────────────────────────────────────┘
               │  spawns
               ▼
-┌──────────── SyncTrajectoryCollector (Ray @remote) ───────────────────────────────────┐
+┌──────────── SyncRolloutActor (Ray @remote) ───────────────────────────────────┐
 │   vllm.generate → flatten → mask → prompt extract                              │
 │ ② kv_batch_put( keys=[uid_g0..uid_gN-1],                                       │
 │                 fields=TensorDict({input_ids, gen_logprobs, token_mask, ...})) │
@@ -134,7 +134,7 @@ Steady state on the validation run (32 samples, 8 GPUs, no PP/TP):
 | TQ call                    | Site                | Count / step | Payload                        |
 |----------------------------|---------------------|-------------:|--------------------------------|
 | `register_partition`       | driver              | 1            | metadata only                  |
-| `kv_batch_put` (rollout)   | SyncTrajectoryCollector    | 1            | full bulk (~600 KB; GBs at scale) |
+| `kv_batch_put` (rollout)   | SyncRolloutActor    | 1            | full bulk (~600 KB; GBs at scale) |
 | `shard_meta_for_dp`        | driver              | 3            | no I/O                         |
 | `kv_batch_get` (lp inputs) | workers             | 8 (per DP)   | input slice                    |
 | `kv_batch_put` (lp out)    | workers (leader)    | 1            | prev_logprobs delta            |
@@ -155,7 +155,7 @@ Total: ~31 TQ RPCs / step. 16 of those are the per-DP fetch fan-out
 
 **Rollout produces (only first-write):**
 ```python
-meta = rollout_to_tq(
+meta = kv_first_write(
     final_batch_cpu=batch,
     uids=[f"step{step}_p{i}" for i in range(num_prompts)],
     dp_client=policy._dp_client,
@@ -208,7 +208,7 @@ verl's TQ-aware trainer lives in
 |------------------------|----------------------------------------------------------|---------------------------------------------------|
 | API surface            | `tq.*` module functions                                  | `DataPlaneClient` ABC, swappable adapters         |
 | Init                   | `tq.init()` once globally                                | `register_partition` per step                     |
-| Generation actor       | Per-prompt async `AgentLoopWorkerTQ`s; each writes when its agent loop finishes | One batched `SyncTrajectoryCollector`; single put after all generations done |
+| Generation actor       | Per-prompt async `AgentLoopWorkerTQ`s; each writes when its agent loop finishes | One batched `SyncRolloutActor`; single put after all generations done |
 | Producer→consumer signal | Tags (`{"global_steps": N, "status": "success"}`) polled by `ReplayBuffer` background thread | Controller-side `production_status` bit; consumers wait on field production |
 | Step gate              | `ReplayBuffer.sample()` blocks until all prompts of `global_steps` are tagged success | Rollout actor's `ray.get()` returns only when entire batch done |
 | Driver-side compute    | Driver pulls **bulk** (full input_ids + response_mask) for `_compute_old_log_prob`, `_compute_values`, `_compute_advantage` | Driver only touches **small slices** (advantages-input, log_data) |
@@ -243,7 +243,7 @@ verl's TQ-aware trainer lives in
    for compute_advantages/values; that scales poorly at long-context
    (1–5 GB / step at 8k–32k seq) since the driver becomes a single-node
    serialization bottleneck. We touch only small slices on the driver.
-4. **Helper layer (`rollout_to_tq` / `read_columns` / `write_columns`).**
+4. **Helper layer (`kv_first_write` / `read_columns` / `write_columns`).**
    verl inlines the `kv_batch_get → process → kv_batch_put` pattern at
    each call site. We extracted it because the same pattern repeats 5+
    times and we want one place to validate dtype / shape / key invariants.
