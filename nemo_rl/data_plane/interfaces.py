@@ -181,7 +181,7 @@ class DataPlaneClient(ABC):
     # ── (B) direct-by-key (TQ-aligned signatures) ──────────────────────
 
     @abstractmethod
-    async def kv_batch_put(
+    def kv_batch_put(
         self,
         keys: list[str],
         partition_id: str,
@@ -193,8 +193,7 @@ class DataPlaneClient(ABC):
         Writing a field flips the controller's ``production_status`` bit
         for ``(sample, field)`` — that flip *is* the "stage finished for
         these keys" signal that downstream consumers wait on. Returns the
-        meta downstream consumers can use for direct
-        :meth:`kv_batch_get`.
+        meta downstream consumers can use for direct :meth:`kv_batch_get`.
 
         The adapter MUST reject non-tensor leaves in ``fields`` (P3 —
         no pickle on the bus).

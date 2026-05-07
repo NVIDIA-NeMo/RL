@@ -19,7 +19,6 @@ in the slim Tier-1 venv (no TQ, no Ray).
 
 from __future__ import annotations
 
-import asyncio
 
 import pytest
 import torch
@@ -47,7 +46,7 @@ def test_put_records_bytes_and_count(wrapped_client):
         partition_id="p", fields=["x"], num_samples=4, consumer_tasks=["read"]
     )
     fields = TensorDict({"x": torch.zeros(4, dtype=torch.float32)}, batch_size=[4])
-    asyncio.run(client.kv_batch_put(keys=["a", "b", "c", "d"], partition_id="p", fields=fields))
+    client.kv_batch_put(keys=["a", "b", "c", "d"], partition_id="p", fields=fields)
 
     snap = sink.snapshot()
     assert snap["data_plane/put/count"] == 1
@@ -62,11 +61,9 @@ def test_get_records_after_put(wrapped_client):
     client.register_partition(
         partition_id="p", fields=["x"], num_samples=2, consumer_tasks=["read"]
     )
-    asyncio.run(
-        client.kv_batch_put(
-            keys=["a", "b"], partition_id="p",
-            fields=TensorDict({"x": torch.ones(2)}, batch_size=[2]),
-        )
+    client.kv_batch_put(
+        keys=["a", "b"], partition_id="p",
+        fields=TensorDict({"x": torch.ones(2)}, batch_size=[2]),
     )
     out = client.kv_batch_get(keys=["a", "b"], partition_id="p", select_fields=["x"])
     assert torch.equal(out["x"], torch.ones(2))
@@ -104,11 +101,9 @@ def test_throughput_metric_emitted(wrapped_client):
     client.register_partition(
         partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["r"]
     )
-    asyncio.run(
-        client.kv_batch_put(
-            keys=["a"], partition_id="p",
-            fields=TensorDict({"x": torch.zeros(1)}, batch_size=[1]),
-        )
+    client.kv_batch_put(
+        keys=["a"], partition_id="p",
+        fields=TensorDict({"x": torch.zeros(1)}, batch_size=[1]),
     )
     snap = sink.snapshot()
     assert "data_plane/put/throughput_MB_s" in snap

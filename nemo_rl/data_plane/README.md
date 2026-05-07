@@ -41,14 +41,15 @@ client.register_partition(
     consumer_tasks=["prev_lp", "ref_lp", "train"],
 )
 
-# Producer (rollout, ref policy, …) — async put.
-import asyncio
-asyncio.run(client.kv_batch_put(
+# Producer (rollout, ref policy, …) — sync put. Use ``async_kv_batch_put``
+# only when composing with an existing event loop (e.g. async rollout
+# actor); see ``research/data_plane_integration_plan.md`` §1.2.
+client.kv_batch_put(
     keys=["uid-0", "uid-1"],
     partition_id="train",
     fields=TensorDict({"input_ids": torch.zeros(2, 128, dtype=torch.long)},
                       batch_size=[2]),
-))
+)
 
 # Consumer — task-mediated discovery + tensor fetch.
 meta = client.get_meta(

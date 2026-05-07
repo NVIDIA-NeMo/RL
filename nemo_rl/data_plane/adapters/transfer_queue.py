@@ -22,7 +22,6 @@ business logic. Backend init is lifted from
 
 from __future__ import annotations
 
-import asyncio
 import os
 import socket
 import subprocess
@@ -435,7 +434,7 @@ class TQDataPlaneClient(DataPlaneClient):
 
     # ── (B) direct-by-key ──────────────────────────────────────────────
 
-    async def kv_batch_put(
+    def kv_batch_put(
         self,
         keys: list[str],
         partition_id: str,
@@ -455,11 +454,7 @@ class TQDataPlaneClient(DataPlaneClient):
             wire_fields = _to_wire(fields)
             field_names = list(wire_fields.keys())
 
-        # The pip-published transfer_queue exposes a synchronous
-        # ``kv_batch_put``; wrap in a thread so the ABC's async signature
-        # composes with rollout/policy event loops without blocking.
-        await asyncio.to_thread(
-            self._tq.kv_batch_put,
+        self._tq.kv_batch_put(
             keys=list(keys),
             partition_id=partition_id,
             fields=wire_fields,

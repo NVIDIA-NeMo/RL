@@ -11,43 +11,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TQ-mediated Policy: drop-in replacement for ``Policy`` whose
-``train`` / ``get_logprobs`` / ``get_reference_policy_logprobs`` route
-their per-step bulk tensors through a TransferQueue partition instead
-of Ray's in-memory object store.
+"""TQ-mediated Policy: meta-driven 1-hop counterpart to ``Policy``.
 
-Same method names and return shapes as ``Policy``. Only the transport
-between driver and DP workers changes — workers fetch their slice from
-TQ via ``self._fetch(meta)`` (already wired on
-:class:`AbstractPolicyWorker`) and return data via Ray, just as the
-legacy path does.
-
-Method bodies mirror :class:`Policy` line-for-line on the structural
-pieces (shard, dispatch, aggregate, reorder, FLOPs annotation). The
-deltas are isolated and clearly marked: ``fan_out_per_rank_metas`` to
-seed the partition, ``meta=metas`` instead of ``data=sharded`` on the
-worker call, and the worker method name (``*_presharded`` vs the
-legacy worker entrypoints).
-
-Long-term retirement: when the legacy in-memory path is removed,
-``Policy``'s method bodies get replaced with the bodies here and this
-file goes away.
+Exposes ``train_from_meta`` / ``get_logprobs_from_meta`` /
+``get_reference_policy_logprobs_from_meta`` — same return shapes as
+``Policy.{train, get_logprobs, get_reference_policy_logprobs}`` but
+accepting a ``KVBatchMeta`` instead of a ``BatchedDataDict``. The meta
+names per-sample TQ keys minted once at rollout
+(:class:`nemo_rl.algorithms.sync_utils.SyncTrajectoryCollector`); each
+dispatch slices the key list per DP rank via
+:func:`nemo_rl.data_plane.preshard.shard_meta_for_dp` (no re-fan-out,
+no key minting). Workers fetch their slice from TQ via
+``self._fetch(meta)`` and write deltas back via
+``self._write_back_result_field(...)``. See
+``research/data_plane_integration_plan.md`` §1.2.
 """
 
 from __future__ import annotations
 
 import warnings
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Any, Optional
 
 import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.preshard import (
     DP_SEED_FIELDS,
     LP_SEED_FIELDS,
-    fan_out_per_rank_metas,
+    shard_meta_for_dp,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
@@ -76,7 +70,8 @@ class TQPolicy(Policy):
     The partition lifecycle (``register_partition`` / ``kv_clear``) is
     the trainer's responsibility — this class assumes the partition
     named ``self._tq_partition_id`` (default ``"train"``) is open with a
-    schema that includes the seed fields written by ``fan_out_per_rank_metas``.
+    schema covering ``DP_SEED_FIELDS`` (the bulk schema written by the
+    rollout actor at first put + driver-/worker-written deltas).
     """
 
     def __init__(
@@ -87,26 +82,9 @@ class TQPolicy(Policy):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-
-        # Lazy import — keeps ``Policy``-only call sites from importing
-        # the data-plane stack at module load.
-        from nemo_rl.data_plane import build_data_plane_client
-
-        # Driver-side controller bootstrap. Workers attach with
-        # ``bootstrap=False`` via the ``setup_data_plane`` forwarded below.
-        # ``dp_cfg`` is public so async ReplayBuffer / AsyncTrajectoryCollector
-        # can read it off the policy without referencing master_config.
         self.dp_cfg = dp_cfg
         self._dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
         self._tq_partition_id = tq_partition_id
-
-        # Per-step monotonic counter for key namespacing — every fan-out
-        # call within a step needs a distinct prefix or keys collide
-        # in the partition. The trainer's per-step ``kv_clear`` resets
-        # the partition each step; the counter doesn't reset, but the
-        # combination ``f"{tag}_{idx}"`` stays unique within a partition
-        # life cycle.
-        self._tq_call_idx = 0
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -149,235 +127,188 @@ class TQPolicy(Policy):
             grpo_group_size=group_size,
         )
 
-    # ── helpers ────────────────────────────────────────────────────────
+    # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────
 
-    def _next_key_prefix(self, tag: str) -> str:
-        """Monotonic per-instance prefix for fan-out keys."""
-        self._tq_call_idx += 1
-        return f"{tag}_{self._tq_call_idx}"
+    def _packing_args(
+        self, mb_tokens_key: str,
+    ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+        """Resolve (sequence_packing_args, dynamic_batching_args) for the
+        stage identified by ``mb_tokens_key`` (``"logprob_mb_tokens"`` or
+        ``"train_mb_tokens"``)."""
+        if getattr(self, "use_dynamic_batches", False):
+            args = dict(self.dynamic_batching_args)
+            args["max_tokens_per_microbatch"] = self.cfg["dynamic_batching"][mb_tokens_key]
+            return None, args
+        if getattr(self, "use_sequence_packing", False):
+            args = dict(self.sequence_packing_args)
+            args["max_tokens_per_microbatch"] = self.cfg["sequence_packing"][mb_tokens_key]
+            return args, None
+        return None, None
 
-    def _fan_out_logprob_metas(
+    def _logprob_dispatch(
         self,
-        sharded_data: list,
+        meta: KVBatchMeta,
+        *,
         task_name: str,
-        prefix_tag: str,
-    ) -> list[KVBatchMeta]:
-        """Stage logprob inputs into the TQ partition."""
-        return fan_out_per_rank_metas(
-            sharded_data,
-            dp_client=self._dp_client,
-            partition_id=self._tq_partition_id,
-            task_name=task_name,
-            key_prefix=self._next_key_prefix(prefix_tag),
-            seed_fields=LP_SEED_FIELDS,
-        )
+        worker_method: str,
+        aggregate_fn: Any,
+        timer_prefix: str,
+        timer: Optional[Timer],
+        common_kwargs: dict[str, Any],
+    ) -> BatchedDataDict[Any]:
+        """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
-    def _fan_out_train_metas(
-        self,
-        sharded_data: list,
-        prefix_tag: str = "step",
-    ) -> list[KVBatchMeta]:
-        """Stage training inputs into the TQ partition."""
-        return fan_out_per_rank_metas(
-            sharded_data,
-            dp_client=self._dp_client,
-            partition_id=self._tq_partition_id,
-            task_name="train",
-            key_prefix=self._next_key_prefix(prefix_tag),
-            seed_fields=DP_SEED_FIELDS,
-        )
-
-    # ── overrides — mirror Policy's structure, swap transport ──────────
-
-    def get_logprobs(  # type: ignore[override]
-        self,
-        data: BatchedDataDict[GenerationDatumSpec],
-        timer: Optional[Timer] = None,
-    ) -> BatchedDataDict[LogprobOutputSpec]:
-        """TQ-mediated counterpart to ``Policy.get_logprobs``.
-
-        Body mirrors the legacy ``get_logprobs`` post-Phase-1 line-for-line:
-        ``_shard_for_logprob`` → dispatch → aggregate → reorder. The only
-        deltas are the fan-out step (TQ pre-stage) and the worker call
-        signature (``meta=metas``, worker method ``*_presharded``).
+        Logprob workers need only LP_SEED_FIELDS — narrow the meta's
+        field list so ``_fetch`` doesn't pull rollout-only payload (e.g.
+        multimodal). The same shape is used for both prev_lp and ref_lp.
         """
-        with timer.time("get_logprobs/shard_data") if timer else nullcontext():
-            sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
-            metas = self._fan_out_logprob_metas(
-                sharded_data, task_name="prev_lp", prefix_tag="lp",
+        spa, dba = self._packing_args("logprob_mb_tokens")
+        lp_meta = replace(meta, fields=list(LP_SEED_FIELDS), task_name=task_name)
+        with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
+            metas, unsorted_indices = shard_meta_for_dp(
+                lp_meta,
+                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                batch_size=None,
+                sequence_packing_args=spa,
+                dynamic_batching_args=dba,
             )
-
-        with (
-            timer.time("get_logprobs/submit_logprob_futures")
-            if timer
-            else nullcontext()
-        ):
+        with timer.time(f"{timer_prefix}/submit_futures") if timer else nullcontext():
             futures = self.worker_group.run_all_workers_sharded_data(
-                "get_logprobs_presharded",
+                worker_method,
                 meta=metas,
                 in_sharded_axes=["data_parallel"],
-                replicate_on_axes=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
+                replicate_on_axes=["context_parallel", "tensor_parallel", "pipeline_parallel"],
+                output_is_replicated=["context_parallel", "tensor_parallel", "pipeline_parallel"],
+                common_kwargs=common_kwargs,
             )
-        logprobs: BatchedDataDict[LogprobOutputSpec] = _aggregate_logprob_results(
-            self.worker_group.get_all_worker_results(futures)
+        result = aggregate_fn(self.worker_group.get_all_worker_results(futures))
+        if unsorted_indices is not None:
+            result.reorder_data(unsorted_indices)
+        return result
+
+    def get_logprobs_from_meta(
+        self,
+        meta: KVBatchMeta,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> BatchedDataDict[LogprobOutputSpec]:
+        return self._logprob_dispatch(
+            meta,
+            task_name="prev_lp",
+            worker_method="get_logprobs_presharded",
+            aggregate_fn=_aggregate_logprob_results,
+            timer_prefix="get_logprobs",
+            timer=timer,
+            common_kwargs={"micro_batch_size": micro_batch_size},
         )
 
-        if unsorted_data_indices is not None:
-            logprobs.reorder_data(unsorted_data_indices)
-
-        return logprobs
-
-    def get_reference_policy_logprobs(  # type: ignore[override]
+    def get_reference_policy_logprobs_from_meta(
         self,
-        data: BatchedDataDict[GenerationDatumSpec],
+        meta: KVBatchMeta,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
-        """TQ-mediated counterpart to ``Policy.get_reference_policy_logprobs``.
-
-        Same shape as :meth:`get_logprobs`, just routed to the
-        reference-policy worker method and aggregator.
-        """
-        with (
-            timer.time("get_reference_policy_logprobs/shard_data")
-            if timer
-            else nullcontext()
-        ):
-            sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
-            metas = self._fan_out_logprob_metas(
-                sharded_data, task_name="ref_lp", prefix_tag="reflp",
-            )
-
-        with (
-            timer.time(
-                "get_reference_policy_logprobs/submit_reference_policy_logprob_futures"
-            )
-            if timer
-            else nullcontext()
-        ):
-            futures = self.worker_group.run_all_workers_sharded_data(
-                "get_reference_policy_logprobs_presharded",
-                meta=metas,
-                in_sharded_axes=["data_parallel"],
-                replicate_on_axes=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                common_kwargs={"micro_batch_size": micro_batch_size},
-            )
-        logprobs: BatchedDataDict[ReferenceLogprobOutputSpec] = (
-            _aggregate_reference_logprob_results(
-                self.worker_group.get_all_worker_results(futures)
-            )
+        return self._logprob_dispatch(
+            meta,
+            task_name="ref_lp",
+            worker_method="get_reference_policy_logprobs_presharded",
+            aggregate_fn=_aggregate_reference_logprob_results,
+            timer_prefix="get_reference_policy_logprobs",
+            timer=timer,
+            common_kwargs={"micro_batch_size": micro_batch_size},
         )
 
-        if unsorted_data_indices is not None:
-            logprobs.reorder_data(unsorted_data_indices)
-
-        return logprobs
-
-    def train(  # type: ignore[override]
+    def train_from_meta(
         self,
-        data: BatchedDataDict[Any],
+        meta: KVBatchMeta,
         loss_fn: LossFunction,
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
     ) -> dict[str, Any]:
-        """TQ-mediated counterpart to ``Policy.train``.
+        """1-hop counterpart to :meth:`train`.
 
-        Body mirrors the legacy ``train`` body post-Phase-1: shard,
-        FLOPs accumulation, dispatch, aggregate, FLOPs annotation. The
-        deltas are the fan-out step (TQ pre-stage) and the worker call
-        signature (``meta=dp_metas``, ``train_presharded``). The
-        ``bin_count_multiple=DP_world`` invariant from
-        ``a085559c`` is provided by ``self._shard_for_train`` (inherited
-        from ``Policy``); ``train_presharded`` reattaches the per-shard
-        packing metadata from ``meta.extra_info`` so the worker's local
-        ``shards=1`` re-pack doesn't desync Megatron's collectives.
+        ``meta`` names per-sample keys; columns written by the rollout
+        actor + worker logprob deltas + driver-side advantage delta have
+        all landed under the same keys at this point. Workers fetch the
+        union via ``train_presharded`` → ``self._fetch(meta)``.
+
+        **No partition drain.** Sync 1-hop's trainer calls ``kv_clear`` once
+        at end of step. The drain in :meth:`train` (which clears after
+        every call) is needed only for the legacy fan-out path that mints
+        fresh keys per call.
         """
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
 
-        with timer.time("policy_training/sharding_data") if timer else nullcontext():
-            sharded_data = self._shard_for_train(data, batch_size)
-            dp_metas = self._fan_out_train_metas(sharded_data, prefix_tag="step")
+        spa, dba = self._packing_args("train_mb_tokens")
+        # Train workers fetch the full DP_SEED_FIELDS schema (rollout +
+        # logprob deltas + advantages + sample_mask). Caller is responsible
+        # for ensuring those columns have been written to TQ before this
+        # call (workers + driver delta-writes).
+        train_meta = replace(
+            meta, fields=list(DP_SEED_FIELDS), task_name="train",
+        )
+        with (
+            timer.time("policy_training/shard_meta")
+            if timer
+            else nullcontext()
+        ):
+            dp_metas, _ = shard_meta_for_dp(
+                train_meta,
+                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                batch_size=batch_size,
+                sequence_packing_args=spa,
+                dynamic_batching_args=dba,
+            )
 
-        # Drain in finally so a worker exception doesn't leak staged tensors
-        # into the next step. Per-instance ``tq_call_idx`` keeps keys unique
-        # across calls so we never collide pre-drain, but unbounded growth
-        # is wasteful and would eventually evict good data.
-        try:
-            if self.flops_tracker is not None:
-                self.flops_tracker.reset()
-                for shard in sharded_data:
-                    input_lengths = shard["input_lengths"]
-                    self.flops_tracker.track_batch(input_lengths.tolist())
+        if self.flops_tracker is not None:
+            self.flops_tracker.reset()
+            for m in dp_metas:
+                self.flops_tracker.track_batch(list(m.sequence_lengths or []))
 
-            with (
-                timer.time("policy_training/submit_training_futures")
-                if timer
-                else nullcontext()
-            ):
-                futures = self.worker_group.run_all_workers_sharded_data(
-                    "train_presharded",
-                    meta=dp_metas,
-                    in_sharded_axes=["data_parallel"],
-                    replicate_on_axes=[
-                        "context_parallel",
-                        "tensor_parallel",
-                        "pipeline_parallel",
-                    ],
-                    output_is_replicated=[
-                        "context_parallel",
-                        "tensor_parallel",
-                        "pipeline_parallel",
-                    ],
-                    common_kwargs={
-                        "loss_fn": loss_fn,
-                        "eval_mode": eval_mode,
-                        "gbs": batch_size,
-                        "mbs": micro_batch_size,
-                    },
-                )
-            results = self.worker_group.get_all_worker_results(futures)
-            aggregated_results = _aggregate_train_results(results)
+        with (
+            timer.time("policy_training/submit_training_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "train_presharded",
+                meta=dp_metas,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={
+                    "loss_fn": loss_fn,
+                    "eval_mode": eval_mode,
+                    "gbs": batch_size,
+                    "mbs": micro_batch_size,
+                },
+            )
+        results = self.worker_group.get_all_worker_results(futures)
+        aggregated_results = _aggregate_train_results(results)
 
-            if self.flops_tracker is not None:
-                aggregated_results["total_flops"] = self.flops_tracker.total_flops
-                aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
-                gpus_per_worker = self.worker_group.cluster.world_size() / max(
-                    len(results), 1
-                )
-                try:
-                    aggregated_results["theoretical_tflops"] = gpus_per_worker * sum(
-                        get_theoretical_tflops(r["gpu_name"], r["model_dtype"])
-                        for r in results
-                    )
-                except Exception as e:
-                    warnings.warn(f"Error getting theoretical flops: {e}")
-
-            return aggregated_results
-        finally:
+        if self.flops_tracker is not None:
+            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+            aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
+            gpus_per_worker = self.worker_group.cluster.world_size() / max(
+                len(results), 1
+            )
             try:
-                self._dp_client.kv_clear(
-                    keys=None, partition_id=self._tq_partition_id,
+                aggregated_results["theoretical_tflops"] = gpus_per_worker * sum(
+                    get_theoretical_tflops(r["gpu_name"], r["model_dtype"])
+                    for r in results
                 )
             except Exception as e:
-                warnings.warn(f"Error draining TQ partition after train: {e}")
+                warnings.warn(f"Error getting theoretical flops: {e}")
+
+        return aggregated_results

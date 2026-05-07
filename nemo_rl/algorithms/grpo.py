@@ -2605,15 +2605,8 @@ def async_grpo_train(
         num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
     )
 
-    # When a TQ-mediated policy is in use, ``policy.dp_cfg`` carries the
-    # config the producer + ReplayBuffer need to attach as clients. For
-    # the legacy in-memory path, this attribute is absent and ``_dp_cfg``
-    # stays ``None``.
-    _dp_cfg = getattr(policy, "dp_cfg", None)
-
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
         max_size=optimal_buffer_size,
-        dp_cfg=_dp_cfg,
     )
 
     _tc_py_exec = get_actor_python_env(
@@ -2648,7 +2641,6 @@ def async_grpo_train(
         master_config=master_config,
         replay_buffer=replay_buffer,
         start_step=step,
-        dp_cfg=_dp_cfg,
     )
 
     # Start trajectory collection in background

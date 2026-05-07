@@ -163,6 +163,133 @@ This decouples the wire format (jagged, fixed) from the trainer format (padded t
 
 ---
 
+## 1.2 Per-sample Key Lifecycle (locked design)
+
+This section codifies the agreement reached during sync 1-hop design (`research/conversation:2026-05-06`). It is the canonical reference for any code that mints, slices, or clears TQ keys.
+
+### Goal — rollout 1-hop put
+
+Rollout-produced bulk tensors (`input_ids`, `output_ids`, `attention_mask`, `position_ids`, `multi_modal_inputs`, per-token `logprobs`, …) make **a single hop** from the rollout actor process directly into TQ via **one flat `kv_batch_put`**. The driver process never holds these bytes in its memory between rollout finish and train fan-out — only a `KVBatchMeta` (key list + tags) and a small per-sample slice (`total_reward`, `loss_multiplier`, `truncated`, `length`, `input_lengths`) cross to the driver via Ray.
+
+Concretely, the driver memory budget for the rollout-to-train window drops from `O(B × T × bytes_per_field × n_fields + multimodal_payload)` (today) to `O(B × n_small_slice_fields)` (a few kB to MB at typical batch sizes — independent of sequence length and multimodal payload).
+
+Downstream stages reach the rollout bytes through **meta-dispatch + worker-side fetch** (see "Dispatch primitives" below), not through driver-side materialize-and-resend. The driver only fetches small slices explicitly when its own compute needs them (`generation_logprobs` for sequence-error masking, `input_ids[:prompt_len]` for `prompt_ids_for_adv` in advantage compute) — never the full payload.
+
+This goal is what makes sync 1-hop worth building. Any design that lets rollout bulk visit the driver process — even transiently between rollout return and a driver-side `kv_batch_put` — fails the goal and is rejected.
+
+### Invariant — one key per sample, minted once, lives the whole step
+
+| Step | Where | What | Notes |
+|---|---|---|---|
+| 1. uid mint | **driver**, after dataloader returns prompts | `uid = uuid.uuid4()` per prompt | Mirrors verl `main_ppo_sync.py:1377`. Globally unique → no train/val/checkpoint-replay collisions. |
+| 2. first TQ write | **rollout actor** (`SyncTrajectoryCollector` / `AsyncTrajectoryCollector`), AFTER generation + env.step + reward | `keys = [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]; kv_batch_put(keys, partition_id, fields=<all rollout tensors>)` | Atomic per-prompt put. Bulk never visits the driver. |
+| 3. driver delta-write | **driver**, after computing reward shaping / dyn-sample / overlong / advantage | `kv_batch_put(meta.keys, fields={"advantages": ..., "sample_mask": ..., ...})` | Same keys; new columns. |
+| 4. worker delta-write | **worker** `*_presharded` body, after computing logprobs / ref-logprobs / train metrics | `kv_batch_put(my_slice_keys, fields={"prev_logprobs": ..., "reference_policy_logprobs": ...})` before returning to driver | Same keys; new columns. **TQ is the source of truth** — driver pulls only what it consumes for its own compute (small slice). |
+| 5. cleanup | **driver**, end of step | `kv_clear(meta.keys, partition_id)` | The only deletion site. |
+
+### Forbidden patterns
+
+These exist in the current code and **must not survive the sync 1-hop landing**:
+
+- **`_next_key_prefix` / `_tq_call_idx`** in `TQPolicy`. Each `policy.train` / `policy.get_logprobs` / `policy.get_reference_policy_logprobs` call today re-mints `f"{prefix}_{N}_dp{r}_s{i}"` keys and **re-writes the bulk shard data 3× per step** under three disjoint key sets. This is a code-smell signaling lifecycle violation. See `tq_policy.py:154-157`, `preshard.py:144`.
+- **DP-aware first write**. The rollout-side write must NOT pre-shard data per DP rank. Verl's `_agent_loop_postprocess` (`main_ppo_sync.py:386-423`) does a single flat `kv_batch_put` with `f"{uid}_{sid}_{i}"` keys — the rollout worker is unaware of the DP world. DP balancing is a dispatch-side concern (`_balance_batch` permutes meta keys before `BatchData.chunk`), not a write-side concern. **`fan_out_per_rank_metas` is therefore not used in the sync 1-hop path at all.**
+- **`step{N}_p{idx}_g{i}`-style sequential keys**. The `step{N}` prefix is not enough to disambiguate train vs val vs checkpoint replays. Use `uuid4` per prompt instead. The step boundary is enforced by `kv_clear` at step end + the controller's `partition_id`.
+
+### Dispatch primitives
+
+| Primitive | Inputs | Outputs | Use site | I/O? |
+|---|---|---|---|---|
+| `dp_client.kv_batch_put(keys, partition_id, fields, tags)` | flat per-sample keys + tensors | none | **rollout actor's only write** (sync `SyncTrajectoryCollector`, async `AsyncTrajectoryCollector`) | yes — single put |
+| `shard_meta_for_dp(meta, dp_world, packing_args)` | one `KVBatchMeta` (full step batch) | list[`KVBatchMeta`] (per-rank slices, same partition_id, same keys subset) + inverse permutation | every dispatch after rollout (logprob, ref-logprob, train) | **no** — pure key-list split |
+| `fan_out_per_rank_metas(sharded_data, …)` (legacy) | pre-balanced `BatchedDataDict` shards | list[`KVBatchMeta`] | **legacy backward-compat only** — `TQPolicy.{train,get_logprobs,…}` (the non-`*_from_meta` paths) and the async-on-TQ trainer in `grpo.py` (commit `10e3b854`). Retired when async migrates. | yes — re-writes bulk under per-rank keys |
+
+`shard_meta_for_dp` mirrors verl's `BatchData.chunk(KVBatchMeta)` (`verl/protocol.py:1271-1289`). The seq-len-balanced reorder + `bin_count_multiple=DP_world` invariant from commit `a085559c` lives inside this helper as a permutation of the input meta's key list before slicing.
+
+### Rollout first-write — single flat put
+
+Verl's pattern (`main_ppo_sync.py:386-423`):
+
+```python
+keys = [f"{uid}_{session_id}_{i}" for i in range(n_outputs)]
+await tq.async_kv_batch_put(
+    keys=keys, partition_id="train" if not validate else "val",
+    fields=<all tensor fields per sample>,
+    tags=[{"global_steps": N, "status": "success",
+           "prompt_len": ..., "response_len": ..., "seq_len": ...}, ...],
+)
+```
+
+The rollout actor writes **what it produced**, not "what each DP rank needs." DP awareness enters at dispatch via `_balance_batch` + `BatchData.chunk(KVBatchMeta)` — never at first write.
+
+NeMo-RL counterpart (`SyncTrajectoryCollector.rollout_to_tq` / `AsyncTrajectoryCollector` writeback): identical shape, keys `f"{uid}_g{i}"`. No `fan_out_per_rank_metas` call.
+
+### Dual API: data-driven (legacy) vs meta-driven (`*_from_meta`)
+
+Worker dispatches that move bulk through TQ are **meta-driven** — the worker fetches its slice from TQ given a `KVBatchMeta`. These methods take the `_from_meta` suffix to differentiate them from the legacy data-driven methods that accept a `BatchedDataDict`:
+
+| Path | Worker dispatch | Driver compute |
+|---|---|---|
+| Legacy / in-memory | `policy.train(data: BatchedDataDict)`, `policy.get_logprobs(data)`, `policy.get_reference_policy_logprobs(data)` | data-driven on real tensors |
+| 1-hop / TQ-mediated | `policy.train_from_meta(meta: KVBatchMeta)`, `policy.get_logprobs_from_meta(meta)`, `policy.get_reference_policy_logprobs_from_meta(meta)` | data-driven on real tensors **(unchanged)** |
+
+**Both API surfaces coexist on `TQPolicy`.** The `_from_meta` variants are what the sync 1-hop trainer calls; the legacy variants stay for backward-compat callers (e.g. tests or future async paths that haven't migrated).
+
+**Driver-internal compute stays data-driven**, mirroring verl. `compute_and_apply_seq_logprob_error_masking`, `adv_estimator.compute_advantage`, `_log_mixed_rewards_and_advantages_information` all take real tensors as args. The driver fetches a small slice of columns from TQ via `read_columns(dp_client, meta, select_fields=[...])`, computes on those tensors, and writes deltas back via `write_columns(dp_client, meta, fields={...})` — both helpers in `nemo_rl/data_plane/driver_io.py`.
+
+The invariant is: **API boundary that crosses to a worker (`policy.*`) takes a meta; everything driver-local takes data.** This matches verl's `_compute_old_log_prob` / `_compute_advantage` shape exactly (`main_ppo_sync.py:1042-1198`): take `batch: KVBatchMeta` at the function boundary, internally `tq.kv_batch_get → compute on tensors → tq.kv_batch_put`.
+
+### Worker write-back model (no `@tqbridge` auto-decorator)
+
+Verl auto-wraps every `@register`'d worker method with `@tqbridge` (`verl/utils/transferqueue_utils.py:296-398`), which fetches tensors before the body and writes outputs back to TQ after. We do not adopt the auto-wrapper — workers' `*_presharded` bodies in NeMo-RL already fetch from TQ inline (`self._fetch(meta)`), and the symmetric write-back is hand-rolled in the same body:
+
+```python
+# Worker side (illustrative; concrete impl in lm_policy / tq_policy *_presharded methods)
+def get_logprobs_presharded(self, meta: KVBatchMeta, ...) -> dict:
+    data = self._fetch(meta)               # kv_batch_get(meta.keys, select_fields=lp inputs)
+    logprobs = self._compute_logprobs(data)
+    self._dp_client.kv_batch_put(          # write delta column under SAME keys
+        keys=meta.keys, partition_id=meta.partition_id,
+        fields=TensorDict({"prev_logprobs": logprobs}, batch_size=[len(meta.keys)]),
+    )
+    return {"logprobs": logprobs, "metrics": ...}   # Ray return for driver compute
+```
+
+The Ray return path stays for things the driver needs immediately (advantage compute reads `prev_logprobs` slice). The TQ write-back stays so subsequent stages — especially `train_presharded` — can fetch the assembled union without depending on Ray scheduling order.
+
+### Why we keep both Ray return AND TQ write-back
+
+- **TQ write-back ensures completeness.** `train_presharded` fetches the union of {rollout fields, driver-written deltas (advantages, sample_mask), worker-written deltas (prev_logprobs, reference_policy_logprobs)} from TQ in one shot. There is no implicit ordering dependency on prior Ray-call results.
+- **Ray return covers driver compute.** `compute_and_apply_seq_logprob_error_masking` and `adv_estimator.compute_advantage` need slices of `prev_logprobs` / `reference_policy_logprobs` immediately. Driver fetches them off the Ray return rather than re-issuing a `kv_batch_get`.
+
+This is verl's actual pattern minus the decorator — verl's `_compute_old_log_prob` (main_ppo_sync.py:1042-1059) does both: workers' `tqbridge` writes `log_probs`/`entropy` to TQ, then driver `kv_batch_get`s them back to do `response_from_nested` reshape and `kv_batch_put`s the reshape result.
+
+### Validation / async / multi-run isolation
+
+- **Train vs val**: separate `partition_id` (`"train"`, `"val"`). Same uid namespace is fine.
+- **Async**: weight version lives in `tags`, not the key. `f"{uid}_g{i}"` works for both sync and async; a separate async PR migrates `async_utils.py` from `f"v{wv}_p{pid}_g{i}"` later.
+- **Cross-experiment**: TQ controller is named per-experiment (one Ray cluster per experiment, see `nemo_rl/data_plane/README.md:99`); collisions fail loud at startup.
+
+### Scope discipline
+
+Sync 1-hop changes are confined to `nemo_rl/algorithms/grpo_sync.py` plus new files. `nemo_rl/algorithms/grpo.py` and `nemo_rl/algorithms/async_utils.py` stay untouched. Async is migrated in a separate PR after sync parity is proven.
+
+### `grpo.use_dynamic_sampling` on the 1-hop path
+
+The DAPO-style dynamic-sampling filter (`nemo_rl/algorithms/grpo.py:dynamic_sampling`) drops samples mid-step where `std == 0` (no learning signal) and may carry survivors across multiple inner iterations until the buffer fills `num_prompts_per_step × num_generations_per_prompt`.
+
+**Implemented on the 1-hop path** in `grpo_sync.py` because the filter operates entirely on per-sample slice fields (`std`, `baseline`, `total_reward`) — never touches bulk tensors. The 1-hop variant:
+
+1. Filters survivors on `slice_data["std"] != 0`, accumulates `(meta, slice)` pairs across iterations via `(pending_meta, pending_slice)` state.
+2. `kv_clear`s dropped uids' TQ payload inline so orphan keys don't leak.
+3. On overflow (`current_size > train_prompts_size`), slices the cache and `kv_clear`s the discarded valid samples.
+4. Helpers in `nemo_rl/data_plane/preshard.py`: `select_meta_indices`, `concat_metas`, `slice_meta` — all pure metadata operations, no I/O on bulk.
+
+The bulk in TQ stays untouched throughout — workers fetch their training slice via `train_presharded` after `policy.train_from_meta(meta)`, regardless of whether dynamic_sampling filtered.
+
+Verl does not implement dynamic sampling at all on its sync TQ path (`main_ppo_sync.py` has no filter equivalent), so the design is NeMo-RL-specific; the slice-only formulation makes it tractable.
+
+---
+
 ## 2. Architecture Overview
 
 Three layers, top to bottom:
