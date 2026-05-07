@@ -64,14 +64,53 @@ def _tq():  # pragma: no cover - trivially exercised by smoke tests
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _get_head_node_ip() -> str:
+def _get_local_node_ip() -> str:
+    """Return THIS process's host IP, not the cluster head's.
+
+    Each Ray actor process must use its own node's IP for Mooncake's
+    listener bind (multi-node correctness). If we used the head IP,
+    actors on worker nodes would announce a listener address that
+    only routes back to the head — peers fail with connection refused.
+
+    Skips link-local APIPA addresses (RFC 3927 IPv4 169.254/16,
+    RFC 4291 IPv6 fe80::/10): on this cluster ``avahi-autoipd``
+    assigns 169.254.x to ``usb0``, and ``gethostbyname`` can resolve
+    to that non-routable address. The cluster wrapper's network-init
+    block strips usb0 in most cases, but the check is a defense in
+    depth (and free).
+    """
+    import ipaddress
     try:
-        return socket.gethostbyname(socket.gethostname())
+        ip = socket.gethostbyname(socket.gethostname())
+        if ipaddress.ip_address(ip).is_link_local:
+            return ""
+        return ip
     except Exception:
         return ""
 
 
 def _usb0_down() -> None:
+    """Best-effort attempt to take down usb0 / strip 169.254.x APIPA.
+
+    **DO NOT rely on this from Python.** Ray actors run unprivileged —
+    the ``ip``/``ifconfig`` calls here silently return "Operation not
+    permitted" without `CAP_NET_ADMIN`. Even when run as root, the fix
+    is too late: Mooncake's RPC listener has already scanned
+    ``getifaddrs()`` and bound to the first active interface (usually
+    ``usb0`` 169.254.3.1, the link-local APIPA address) before the
+    Python adapter is loaded. Background daemons (``avahi-autoipd``,
+    NetworkManager) also re-assign the APIPA address within seconds.
+
+    The proven fix lives at the **Slurm container start-up** layer
+    (e.g. a ``NETWORK_INIT_CMDS`` block in the cluster wrapper that
+    kills ``avahi-autoipd``, sets ``nmcli device set usb0 managed no``,
+    flushes the address, and runs a 5 s relaunch loop as a failsafe).
+    See ``research/data_plane_mooncake_status.md`` and
+    ``data-plane-bench/DEBUG_TQ_BACKENDS.md`` (Issue 1).
+
+    This function is kept for reference only; it is a no-op on the
+    workers where it matters.
+    """
     cmds = [
         "ifconfig usb0 0.0.0.0 2>/dev/null",
         "ifconfig usb0 down 2>/dev/null",
@@ -227,19 +266,61 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
             },
         }
     elif backend == "mooncake_cpu":
+        # Enable KV-path 1D→2D promotion (see codec._KV_PROMOTE_1D);
+        # mooncake_cpu goes through TQ's KVStorageManager which has the
+        # 1D schema/data mismatch. Idempotent with the per-process
+        # set_kv_promote_1d in TQDataPlaneClient.__init__; kept here
+        # so this branch is self-contained.
+        from nemo_rl.data_plane.codec import set_kv_promote_1d
+        set_kv_promote_1d(True)
+
+        # The mooncake-transfer-engine wheel ships `mooncake_master` at
+        # <site-packages>/mooncake/, NOT on $PATH. TQ's
+        # subprocess.Popen(["mooncake_master", ...]) fails with
+        # FileNotFoundError unless we put the package dir on PATH first.
+        # The wheel is a base dep (TQ-tier), so the import should always
+        # succeed — fail loud otherwise.
+        import mooncake  # type: ignore[import-not-found]
+
+        _moon_pkg = os.path.dirname(mooncake.__file__)
+        _master = os.path.join(_moon_pkg, "mooncake_master")
+        if os.path.exists(_master) and not os.access(_master, os.X_OK):
+            # Wheels can strip the +x bit on extract; restore it.
+            import stat as _stat
+            try:
+                os.chmod(
+                    _master,
+                    os.stat(_master).st_mode
+                    | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH,
+                )
+            except OSError:
+                pass
+        _existing_path = os.environ.get("PATH", "")
+        if _moon_pkg not in _existing_path.split(os.pathsep):
+            os.environ["PATH"] = _moon_pkg + os.pathsep + _existing_path
         _usb0_down()
-        head_ip = _get_head_node_ip()
-        if head_ip and not head_ip.startswith("169.254."):
-            os.environ.setdefault("MC_TCP_BIND_ADDRESS", head_ip)
+        local_ip = _get_local_node_ip()
+        if local_ip:
+            # Force-assign (NOT setdefault): Ray actors inherit env vars
+            # from the driver, so on multi-node runs every actor would
+            # otherwise carry the driver's IP and announce listeners at
+            # the wrong host. Each process must publish its OWN IP.
+            os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
         overlay = {
             **controller_overlay,
             "backend": {
                 "storage_backend": "MooncakeStore",
                 "MooncakeStore": {
-                    "global_segment_size": 4 * 1024**3,
-                    "local_buffer_size": 1 * 1024**3,
-                    "metadata_server": f"{head_ip}:50050",
-                    "master_server_address": f"{head_ip}:50051",
+                    # Sized to match data-plane-bench's proven config
+                    # (32-node / 48-node tests). 4 GiB / 1 GiB defaults
+                    # are too small for production-scale rollouts.
+                    "global_segment_size": 128 * 1024**3,
+                    "local_buffer_size": 16 * 1024**3,
+                    # _init_tq runs on the driver only — driver IS the
+                    # head, so local_ip here is also the head's IP that
+                    # mooncake_master + the metadata server bind to.
+                    "metadata_server": f"{local_ip}:50050",
+                    "master_server_address": f"{local_ip}:50051",
                     **_mooncake_transport_config(),
                 },
             },
@@ -276,7 +357,33 @@ def _to_wire(td: TensorDict) -> TensorDict:
             "Tensorize via codec helpers, use `tags=` for primitives, "
             "or use the Ray object store for arbitrary Python objects."
         )
-    return td.detach().contiguous()
+    out = td.detach().contiguous()
+    # KV-path round-trip preservation. TQ's extract_field_schema
+    # silently unsqueezes 1D fields to (N, 1) when recording per-row
+    # shape into metadata (transfer_queue/metadata.py:171-173), but
+    # _generate_values row-iterates the original 1D tensor — producing
+    # 0-dim per-row tensors. The KV storage backend (mooncake_cpu)
+    # stores them under the metadata shape (1,) and on get returns
+    # (1,)-shaped tensors which stack back to (N, 1). The simple
+    # backend doesn't go through this kv path so the bug doesn't
+    # surface there. Fix here at the wire layer: unsqueeze 1D → 2D so
+    # per-row tensors are 1D (1,) and writer-stored shape matches
+    # metadata-recorded shape. materialize squeezes the trailing 1
+    # back on read so consumers see (N,).
+    from nemo_rl.data_plane.codec import _KV_PROMOTE_1D as _promote_1d
+    if _promote_1d:
+        new_dict: dict[str, torch.Tensor] = {}
+        changed = False
+        for k in out.keys(include_nested=True, leaves_only=True):
+            v = out.get(k)
+            if isinstance(v, torch.Tensor) and not v.is_nested and v.dim() == 1:
+                new_dict[str(k)] = v.unsqueeze(-1).contiguous()
+                changed = True
+            else:
+                new_dict[str(k)] = v
+        if changed:
+            out = TensorDict(new_dict, batch_size=out.batch_size)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -311,6 +418,36 @@ class TQDataPlaneClient(DataPlaneClient):
                 cluster — ``cfg`` is then only consulted for client-side
                 knobs (poll interval).
         """
+        # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing,
+        # because Mooncake's getifaddrs() listener bind happens inside
+        # tq.init/connect — once it's bound to usb0 (169.254.3.1), no env
+        # var change rescues it. Three per-process knobs needed in EVERY
+        # process that builds a TQ client (driver, SyncRolloutActor, every
+        # MegatronPolicyWorker rank):
+        #   1. MC_TCP_BIND_ADDRESS — picked up by Mooncake engine.so for
+        #      client registration so peers receive a routable address.
+        #   2. MC_STORE_MEMCPY=0 — bypasses Mooncake #1986 LOCAL_MEMCPY
+        #      cross-process pointer-deref segfault (see comment below).
+        #   3. KV-path 1D promotion — works around TQ's
+        #      extract_field_schema schema/data mismatch for 1D fields.
+        if cfg.get("backend") == "mooncake_cpu":
+            local_ip = _get_local_node_ip()
+            if local_ip:
+                # Force-assign per-process: Ray actors inherit env vars
+                # from the driver, so a setdefault on the worker would
+                # be a no-op and the actor would announce the driver's
+                # IP — peers fail with "connection refused".
+                os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
+            # Disable LOCAL_MEMCPY fast-path: with multiple Ray actors on
+            # the same host (driver + 8 policy workers + rollout actor),
+            # mooncake's isLocalTransfer() incorrectly compares IP-only
+            # and reinterpret_casts another process's virtual address,
+            # segfaulting MemcpyWorkerPool. See kvcache-ai/Mooncake#1986
+            # (PR #1995 is the upstream fix; not yet in our wheel).
+            os.environ.setdefault("MC_STORE_MEMCPY", "0")
+            from nemo_rl.data_plane.codec import set_kv_promote_1d
+            set_kv_promote_1d(True)
+
         if bootstrap:
             _init_tq(cfg)
         else:

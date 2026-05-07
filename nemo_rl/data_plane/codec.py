@@ -77,6 +77,48 @@ def to_nested_by_length(
     return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
 
+# Wire-format kill-switch: backends that can't carry torch.nested tensors
+# (e.g. mooncake_cpu, whose C++ MemcpyWorkerPool segfaults on jagged
+# pointer arithmetic) flip this to False at adapter init, forcing the
+# writer back to padded. Default is jagged (the bandwidth win on simple).
+_PACK_JAGGED = True
+
+# 1D field round-trip kill-switch: TQ's KVStorageManager path silently
+# unsqueezes 1D fields in metadata while row-iterating them in data
+# (transfer_queue/metadata.py:171 vs storage/managers/base.py:_generate_values).
+# Backends that go through that path (mooncake_cpu) need the writer to
+# unsqueeze 1D fields to (N, 1) so per-row tensors match the metadata
+# shape; the reader then squeezes the trailing 1 back. Independent of
+# wire-format encoding (jagged vs padded). Default off — only the
+# affected adapter flips it.
+_KV_PROMOTE_1D = False
+
+
+def set_wire_format(jagged: bool) -> None:
+    """Adapter hook: set whether writers should pack to nested tensors.
+
+    Called once by the TQ adapter at init time based on
+    ``data_plane.backend``. Mooncake_cpu sets this to ``False`` so all
+    writes stay rectangular (the bench validated mooncake against
+    padded tensors only). Simple backend stays jagged for the
+    bandwidth/memory win.
+    """
+    global _PACK_JAGGED
+    _PACK_JAGGED = bool(jagged)
+
+
+def set_kv_promote_1d(enabled: bool) -> None:
+    """Adapter hook: when True, writer unsqueezes 1D bulk fields to
+    (N, 1) and reader squeezes the trailing 1 in :func:`materialize`.
+
+    Required by backends that go through TQ's KVStorageManager path
+    (mooncake_cpu) — see ``_KV_PROMOTE_1D`` above for the schema/data
+    mismatch. Independent of jagged-vs-padded wire encoding.
+    """
+    global _KV_PROMOTE_1D
+    _KV_PROMOTE_1D = bool(enabled)
+
+
 def maybe_pack_jagged(
     val: torch.Tensor,
     lengths: torch.Tensor,
@@ -90,12 +132,45 @@ def maybe_pack_jagged(
     land in TQ as jagged with the same row lengths — read-time
     materialization then pads them all to the same target shape,
     avoiding shape-mismatch crashes between mixed wire formats.
+
+    No-op when :func:`set_wire_format` has been called with
+    ``jagged=False`` — used by the mooncake_cpu adapter to stay on the
+    padded path that backend's C++ memcpy worker actually supports.
     """
+    if not _PACK_JAGGED:
+        return val.detach().contiguous()
     n = lengths.shape[0]
     if n == 0:
         return val.detach().contiguous()
     max_len = int(lengths.max().item())
     if val.dim() < 2 or val.shape[0] != n or val.shape[1] != max_len:
+        return val.detach().contiguous()
+    return to_nested_by_length(val.detach(), lengths)
+
+
+def pack_per_token_field(val: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Force-jaggedize a known per-token field, tolerating SP padding.
+
+    Unlike :func:`maybe_pack_jagged` (which is shape-strict to avoid
+    false positives on 3D extras like image features), this function is
+    invoked at write-back sites where the caller already knows the
+    field is per-token (e.g. ``prev_logprobs``,
+    ``reference_policy_logprobs``). mcore SP rounds the forward
+    output's seq dim up to a multiple of TP, so the value can be
+    1+ tokens wider than ``max(lengths)``; :func:`to_nested_by_length`
+    slices each row to its own length and drops the trailing SP
+    padding cleanly.
+
+    Falls back to rectangular when ``val`` cannot be jaggedized
+    (wrong batch dim, < 2D, or seq dim shorter than ``max(lengths)``).
+    """
+    if not _PACK_JAGGED:
+        return val.detach().contiguous()
+    n = lengths.shape[0]
+    if n == 0:
+        return val.detach().contiguous()
+    max_len = int(lengths.max().item())
+    if val.dim() < 2 or val.shape[0] != n or val.shape[1] < max_len:
         return val.detach().contiguous()
     return to_nested_by_length(val.detach(), lengths)
 
@@ -182,4 +257,12 @@ def materialize(
             out[key] = padded
         else:
             out[key] = val
+        # KV-path round-trip: writer side unsqueezed 1D fields to (N, 1)
+        # so per-row tensors match TQ's extract_field_schema implicit
+        # unsqueeze (transfer_queue/metadata.py:171-173). Squeeze the
+        # trailing 1 back so consumers see the original (N,) shape.
+        # Safe to apply unconditionally on the _KV_PROMOTE_1D path: none
+        # of the bulk fields naturally carry shape[-1] == 1.
+        if _KV_PROMOTE_1D and out[key].dim() >= 2 and out[key].shape[-1] == 1:
+            out[key] = out[key].squeeze(-1)
     return BatchedDataDict(out)

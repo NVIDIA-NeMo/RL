@@ -506,12 +506,20 @@ class AbstractPolicyWorker:
             return
         from tensordict import TensorDict
 
-        from nemo_rl.data_plane.codec import maybe_pack_jagged
+        from nemo_rl.data_plane.codec import pack_per_token_field
 
         seq_lens = meta.sequence_lengths
         if seq_lens is not None:
             lengths = torch.tensor(seq_lens, dtype=torch.long)
-            packed = {k: maybe_pack_jagged(v, lengths) for k, v in fields.items()}
+            # All write-back fields here are per-token (logprobs, ref
+            # logprobs, masks). Use pack_per_token_field, not the more
+            # conservative maybe_pack_jagged: mcore SP pads the forward
+            # output's seq dim a few tokens beyond max(lengths), and
+            # the strict heuristic would leave them rectangular at the
+            # SP-padded width while input_ids re-materializes to the
+            # lengths-derived width — a cross-field shape divergence
+            # that blows up the seq-dim validator at training time.
+            packed = {k: pack_per_token_field(v, lengths) for k, v in fields.items()}
         else:
             packed = {k: v.detach().contiguous() for k, v in fields.items()}
 
