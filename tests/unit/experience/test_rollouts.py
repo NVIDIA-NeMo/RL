@@ -828,9 +828,7 @@ def test_run_async_nemo_gym_rollout(
         max_rollout_turns=None,
     )
     for row in rows:
-        assert (
-            row["responses_create_params"]["max_output_tokens"] == max_new_tokens
-        )
+        assert row["responses_create_params"]["max_output_tokens"] == max_new_tokens
     actual_result = asdict(actual_result)
     actual_result["final_batch"] = actual_result["final_batch"].get_dict()
 
