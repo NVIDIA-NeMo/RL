@@ -40,7 +40,7 @@ class ReplayBuffer:
     grpo.num_generations_per_prompt (required to compute per-prompt advantages).
     """
 
-    def __init__(self, max_size: int, dp_cfg: Optional[dict[str, Any]] = None):
+    def __init__(self, max_size: int):
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
@@ -51,25 +51,6 @@ class ReplayBuffer:
 
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
-
-        # Optional data-plane wiring. When set, sampled ``KVBatchMeta`` entries
-        # have their TQ keys cleared on consumption — closes Race 1 from
-        # research/data_plane_async_rl_limitations.md §5.9 (every consumed
-        # trajectory must clear its TQ payload, otherwise TQ leaks at
-        # training-throughput rate). Lazy-built on first need so the in-memory
-        # path (dp_cfg=None) never imports the data-plane module.
-        self._dp_cfg = dp_cfg
-        self._dp_client = None
-
-    def _ensure_dp_client(self):
-        """Lazily build a data-plane client. None when ``dp_cfg`` not set."""
-        if self._dp_client is None and self._dp_cfg is not None:
-            # ``bootstrap=False`` — the controller is already running on the
-            # driver; this client only needs to attach to it for ``kv_clear``.
-            from nemo_rl.data_plane import build_data_plane_client
-
-            self._dp_client = build_data_plane_client(self._dp_cfg, bootstrap=False)
-        return self._dp_client
 
     def push_with_wait_signal(
         self,
@@ -236,45 +217,6 @@ class ReplayBuffer:
                 f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
             )
 
-            # Data-plane consumption: materialize any KVBatchMeta entries into
-            # the dict format ``async_grpo_train`` expects, then clear their TQ
-            # payload (Race 1 fix from research/data_plane_async_rl_limitations
-            # .md §5.9). The materialize+clear sequence is held under the
-            # buffer lock — Race 5: releasing between fetch and clear opens a
-            # window where a stale-version push could race the in-flight
-            # delete; keys are versioned (PR 3 uses f"v{wv}_p{pid}_g{i}") so
-            # collisions are unlikely, but the lock is the cheap correctness
-            # invariant.
-            client = self._ensure_dp_client()
-            if client is not None:
-                from nemo_rl.data_plane.codec import materialize as _dp_materialize
-                from nemo_rl.data_plane.interfaces import KVBatchMeta
-
-                rebuilt: list[Any] = []
-                metas_to_clear: list[KVBatchMeta] = []
-                for item in sampled_items:
-                    if isinstance(item, KVBatchMeta):
-                        td = client.kv_batch_get(
-                            item.keys,
-                            item.partition_id,
-                            select_fields=item.fields,
-                        )
-                        bdd = _dp_materialize(td, layout="padded")
-                        extra = item.extra_info or {}
-                        rebuilt.append(
-                            {
-                                "batch": bdd,
-                                "rollout_metrics": extra.get("rollout_metrics", {}),
-                                "timestamp": extra.get("timestamp"),
-                            }
-                        )
-                        metas_to_clear.append(item)
-                    else:
-                        rebuilt.append(item)
-                for m in metas_to_clear:
-                    client.kv_clear(m.keys, m.partition_id)
-                sampled_items = rebuilt
-
             return {
                 "trajectories": sampled_items,
                 "avg_trajectory_age": avg_trajectory_age,
@@ -305,7 +247,6 @@ class AsyncTrajectoryCollector:
         master_config: MasterConfig,
         replay_buffer: Any,
         start_step: int = 0,
-        dp_cfg: Optional[dict[str, Any]] = None,
     ):
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
@@ -313,14 +254,6 @@ class AsyncTrajectoryCollector:
         self.master_config = master_config
         self.replay_buffer = replay_buffer
         self.running = False
-
-        # Optional data-plane wiring (mirrors ReplayBuffer.dp_cfg). When set,
-        # rollouts are tensorized into the TQ partition ``rollouts`` before a
-        # ``KVBatchMeta`` reference is pushed onto the buffer — see
-        # research/data_plane_async_rl_limitations.md §5.4. Lazy-built so the
-        # in-memory path (dp_cfg=None) never imports the data-plane module.
-        self._dp_cfg = dp_cfg
-        self._dp_client = None
 
         self._pg_lock: _threading.Lock = _threading.Lock()
 
@@ -418,14 +351,6 @@ class AsyncTrajectoryCollector:
             print(f"🔄 Updated weight version to {version}, resuming collection")
         else:
             print(f"🔄 Updated weight version to {version}")
-
-    def _ensure_dp_client(self):
-        """Lazily build a data-plane client. None when ``dp_cfg`` not set."""
-        if self._dp_client is None and self._dp_cfg is not None:
-            from nemo_rl.data_plane import build_data_plane_client
-
-            self._dp_client = build_data_plane_client(self._dp_cfg, bootstrap=False)
-        return self._dp_client
 
     def _should_pause_for_generation_limits(self) -> bool:
         """Check if collection should be paused due to generation limits."""
@@ -761,63 +686,6 @@ class AsyncTrajectoryCollector:
                 "rollout_metrics": rollout_metrics,
                 "timestamp": time.time(),
             }
-
-            # When the data plane is enabled, replace the in-memory dict
-            # trajectory with a KVBatchMeta reference: tensors land in the
-            # ``rollouts`` partition; the buffer holds only the meta. The
-            # trainer (PR 4 — grpo_async_dp) materializes per consumed batch.
-            # See research/data_plane_async_rl_limitations.md §5.4 (1).
-            client = self._ensure_dp_client()
-            if client is not None:
-                import asyncio
-
-                import torch
-                from tensordict import TensorDict
-
-                from nemo_rl.data_plane.interfaces import KVBatchMeta
-
-                n_samples = int(final_batch_cpu["sample_mask"].shape[0])
-                keys = [
-                    f"v{generation_weight_version}_p{prompt_idx}_g{i}"
-                    for i in range(n_samples)
-                ]
-                # Write whatever tensor fields the rollout produced; trainer
-                # decides which subset to fetch via ``select_fields``.
-                tensor_fields = [
-                    f
-                    for f in final_batch_cpu.keys()
-                    if isinstance(final_batch_cpu[f], torch.Tensor)
-                ]
-                fields = TensorDict(
-                    {
-                        f: final_batch_cpu[f].detach().contiguous()
-                        for f in tensor_fields
-                    },
-                    batch_size=[n_samples],
-                )
-                # `_collection_loop` runs in a worker thread (no enclosing
-                # event loop here), so ``asyncio.run`` is safe — Race 3.
-                asyncio.run(
-                    client.kv_batch_put(
-                        keys=keys,
-                        partition_id="rollouts",
-                        fields=fields,
-                        tags=[{"version": generation_weight_version}] * n_samples,
-                    )
-                )
-                trajectory_group = KVBatchMeta(
-                    partition_id="rollouts",
-                    task_name="train",
-                    keys=keys,
-                    fields=tensor_fields,
-                    sequence_lengths=[
-                        int(s) for s in final_batch_cpu["input_lengths"].tolist()
-                    ],
-                    extra_info={
-                        "rollout_metrics": rollout_metrics,
-                        "timestamp": time.time(),
-                    },
-                )
 
             # Use exponential backoff when buffer is full
             try:

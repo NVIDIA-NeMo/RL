@@ -293,7 +293,7 @@ class AbstractPolicyWorker:
 
         Args:
             meta: per-DP-rank shard produced by the driver's
-                :func:`nemo_rl.data_plane.preshard.fan_out_per_rank_metas`.
+                :func:`nemo_rl.data_plane.preshard.shard_meta_for_dp`.
             layout: codec layout. Phase 1 always ``"padded"`` — the
                 wire format is already padded. Stage 2 will introduce
                 ``"jagged"``.
@@ -455,18 +455,98 @@ class AbstractPolicyWorker:
             data, loss_fn=loss_fn, eval_mode=eval_mode, gbs=gbs, mbs=mbs,
         )
 
+    def _is_replica_leader(self) -> bool:
+        """True iff this rank should perform per-DP-rank-unique side-effects
+        (e.g. TQ write-back). Returns ``True`` for non-replicated configs."""
+        replica_group = self._get_replica_group()
+        if replica_group is None:
+            return True
+        leader = torch.distributed.get_global_rank(replica_group, 0)
+        return torch.distributed.get_rank() == leader
+
+    def _write_back(
+        self,
+        meta: "KVBatchMeta",
+        fields: dict[str, torch.Tensor],
+    ) -> None:
+        """Leader-only ``kv_batch_put(meta.keys, fields=...)``.
+
+        Tensors must be CPU and aligned to ``meta.keys`` order — the TQ
+        adapter rejects GPU tensors / shape mismatches.
+        """
+        if not self._is_replica_leader() or not fields:
+            return
+        from tensordict import TensorDict
+
+        td = TensorDict(
+            {k: v.detach().contiguous() for k, v in fields.items()},
+            batch_size=[len(meta.keys)],
+        )
+        self._require_dp_client().kv_batch_put(
+            keys=meta.keys, partition_id=meta.partition_id, fields=td,
+        )
+
+    def _write_back_result_field(
+        self,
+        meta: "KVBatchMeta",
+        result: Any,
+        *,
+        result_key: str,
+        tq_field: str,
+    ) -> None:
+        """Write ``result[result_key]`` to TQ as column ``tq_field`` under
+        ``meta.keys``. No-op if client unset, key missing, value not a
+        tensor, or batch dim mismatched. Leader-only.
+
+        This is the single chokepoint for ``*_presharded`` write-backs —
+        keeps the per-method bodies declarative ("fetch, run, write back
+        this column") instead of repeating the conditional plumbing.
+        """
+        if self._dp_client is None:
+            return
+        # ``BatchedDataDict`` is a ``UserDict``, not ``dict`` — test the
+        # ``Mapping`` ABC so the result of ``self.get_logprobs(data)``
+        # passes the type guard. ``isinstance(_, dict)`` would silently
+        # skip and the worker write-back would never happen.
+        from collections.abc import Mapping
+
+        if not isinstance(result, Mapping) or result_key not in result:
+            raise RuntimeError(
+                f"_write_back_result_field: result type {type(result).__name__} "
+                f"missing key {result_key!r}; cannot write back."
+            )
+        val = result[result_key]
+        if not isinstance(val, torch.Tensor):
+            raise TypeError(
+                f"_write_back_result_field: result[{result_key!r}] is "
+                f"{type(val).__name__}, expected torch.Tensor."
+            )
+        if val.shape[0] != len(meta.keys):
+            raise ValueError(
+                f"_write_back_result_field: shape mismatch — "
+                f"result[{result_key!r}] has batch dim {val.shape[0]} "
+                f"but meta.keys has {len(meta.keys)}."
+            )
+        self._write_back(meta, {tq_field: val.detach().to("cpu")})
+
     @wrap_with_nvtx_name("policy_worker/get_logprobs_presharded")
     def get_logprobs_presharded(
         self,
         meta: KVBatchMeta,
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[Any]:
-        """Per-rank logprob entrypoint. Fetch → packing prep → delegate."""
+        """Per-rank logprob entrypoint. Fetch → packing prep → run → write back."""
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
-        return self.get_logprobs(  # type: ignore[attr-defined]
+        result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
             data=data, micro_batch_size=micro_batch_size,
         )
+        # Canonical TQ column name is "prev_logprobs" (matches DP_SEED_FIELDS
+        # and what `train_presharded` fetches for the loss).
+        self._write_back_result_field(
+            meta, result, result_key="logprobs", tq_field="prev_logprobs",
+        )
+        return result
 
     @wrap_with_nvtx_name("policy_worker/get_reference_policy_logprobs_presharded")
     def get_reference_policy_logprobs_presharded(
@@ -474,9 +554,17 @@ class AbstractPolicyWorker:
         meta: KVBatchMeta,
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
-        """Per-rank reference-policy logprob entrypoint. Fetch → packing prep → delegate."""
+        """Per-rank reference-policy logprob entrypoint. Fetch → packing prep → run → write back."""
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
-        return self.get_reference_policy_logprobs(
-            data=data, micro_batch_size=micro_batch_size,
+        result: BatchedDataDict[ReferenceLogprobOutputSpec] = (
+            self.get_reference_policy_logprobs(
+                data=data, micro_batch_size=micro_batch_size,
+            )
         )
+        self._write_back_result_field(
+            meta, result,
+            result_key="reference_logprobs",
+            tq_field="reference_policy_logprobs",
+        )
+        return result

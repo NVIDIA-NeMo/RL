@@ -5,7 +5,7 @@ what calls TQ, in what order, with what payloads — and how this differs
 from verl's TQ-on-PPO trainer.
 
 Audience: anyone touching `nemo_rl/algorithms/grpo_sync.py`,
-`nemo_rl/data_plane/`, or `nemo_rl/experience/sync_rollout_actor.py`.
+`nemo_rl/data_plane/`, or `nemo_rl/algorithms/sync_utils.py`.
 
 ---
 
@@ -75,7 +75,7 @@ invariant verl maintains (`{uid}_{session_id}_{i}`).
 └─────────────┬──────────────────────────────────────────────────────────────────┘
               │  spawns
               ▼
-┌──────────── SyncRolloutActor (Ray @remote) ───────────────────────────────────┐
+┌──────────── SyncTrajectoryCollector (Ray @remote) ───────────────────────────────────┐
 │   vllm.generate → flatten → mask → prompt extract                              │
 │ ② kv_batch_put( keys=[uid_g0..uid_gN-1],                                       │
 │                 fields=TensorDict({input_ids, gen_logprobs, token_mask, ...})) │
@@ -134,7 +134,7 @@ Steady state on the validation run (32 samples, 8 GPUs, no PP/TP):
 | TQ call                    | Site                | Count / step | Payload                        |
 |----------------------------|---------------------|-------------:|--------------------------------|
 | `register_partition`       | driver              | 1            | metadata only                  |
-| `kv_batch_put` (rollout)   | SyncRolloutActor    | 1            | full bulk (~600 KB; GBs at scale) |
+| `kv_batch_put` (rollout)   | SyncTrajectoryCollector    | 1            | full bulk (~600 KB; GBs at scale) |
 | `shard_meta_for_dp`        | driver              | 3            | no I/O                         |
 | `kv_batch_get` (lp inputs) | workers             | 8 (per DP)   | input slice                    |
 | `kv_batch_put` (lp out)    | workers (leader)    | 1            | prev_logprobs delta            |
@@ -208,7 +208,7 @@ verl's TQ-aware trainer lives in
 |------------------------|----------------------------------------------------------|---------------------------------------------------|
 | API surface            | `tq.*` module functions                                  | `DataPlaneClient` ABC, swappable adapters         |
 | Init                   | `tq.init()` once globally                                | `register_partition` per step                     |
-| Generation actor       | Per-prompt async `AgentLoopWorkerTQ`s; each writes when its agent loop finishes | One batched `SyncRolloutActor`; single put after all generations done |
+| Generation actor       | Per-prompt async `AgentLoopWorkerTQ`s; each writes when its agent loop finishes | One batched `SyncTrajectoryCollector`; single put after all generations done |
 | Producer→consumer signal | Tags (`{"global_steps": N, "status": "success"}`) polled by `ReplayBuffer` background thread | Controller-side `production_status` bit; consumers wait on field production |
 | Step gate              | `ReplayBuffer.sample()` blocks until all prompts of `global_steps` are tagged success | Rollout actor's `ray.get()` returns only when entire batch done |
 | Driver-side compute    | Driver pulls **bulk** (full input_ids + response_mask) for `_compute_old_log_prob`, `_compute_values`, `_compute_advantage` | Driver only touches **small slices** (advantages-input, log_data) |
@@ -331,8 +331,8 @@ next data-plane optimization round.
 | Stable boundary                  | `nemo_rl/data_plane/interfaces.py`                            |
 | Adapter (TransferQueue impl)     | `nemo_rl/data_plane/adapters/transfer_queue.py`               |
 | Driver-side helpers              | `nemo_rl/data_plane/driver_io.py` (`read_columns`, `write_columns`) |
-| First-write helper               | `nemo_rl/experience/rollout_to_tq.py`                         |
-| Rollout actor                    | `nemo_rl/experience/sync_rollout_actor.py`                    |
+| First-write helper               | `nemo_rl/algorithms/sync_utils.py`                         |
+| Rollout actor                    | `nemo_rl/algorithms/sync_utils.py`                    |
 | DP-rank meta sharding            | `nemo_rl/data_plane/preshard.py`                              |
 | Worker fetch + write-back        | `nemo_rl/models/policy/workers/base_policy_worker.py`         |
 | TQ-aware policy facade           | `nemo_rl/models/policy/tq_policy.py`                          |

@@ -37,7 +37,6 @@ Spec:
 
 from __future__ import annotations
 
-import asyncio
 
 import pytest
 import torch
@@ -135,10 +134,8 @@ def _round_trip_shards_through_tq(
             {f: shard[f].detach().contiguous() for f in names},
             batch_size=[n],
         )
-        asyncio.run(
-            tq_client.kv_batch_put(
-                keys=keys, partition_id=partition_id, fields=fields,
-            )
+        tq_client.kv_batch_put(
+            keys=keys, partition_id=partition_id, fields=fields,
         )
         td_back = tq_client.kv_batch_get(
             keys=keys, partition_id=partition_id, select_fields=list(names),

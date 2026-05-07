@@ -22,7 +22,6 @@ the data-plane extra still passes.
 
 from __future__ import annotations
 
-import asyncio
 
 import pytest
 import torch
@@ -61,12 +60,10 @@ def test_smoke_round_trip(tq_client) -> None:
         consumer_tasks=["read"],
     )
     keys = ["a", "b", "c", "d"]
-    asyncio.run(
-        tq_client.kv_batch_put(
-            keys=keys,
-            partition_id="smoke",
-            fields=TensorDict({"x": torch.arange(4)}, batch_size=[4]),
-        )
+    tq_client.kv_batch_put(
+        keys=keys,
+        partition_id="smoke",
+        fields=TensorDict({"x": torch.arange(4)}, batch_size=[4]),
     )
 
     meta = tq_client.get_meta(

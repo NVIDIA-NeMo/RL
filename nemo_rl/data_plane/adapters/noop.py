@@ -159,7 +159,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
                 return False
         return True
 
-    async def kv_batch_put(
+    def kv_batch_put(
         self,
         keys: list[str],
         partition_id: str,

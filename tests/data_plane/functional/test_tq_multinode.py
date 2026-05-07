@@ -24,7 +24,6 @@ Skipped automatically when:
 
 from __future__ import annotations
 
-import asyncio
 
 import pytest
 import torch
@@ -73,14 +72,12 @@ def test_multinode_round_trip() -> None:
                 {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
             )
             try:
-                asyncio.run(
-                    actor_client.kv_batch_put(
-                        keys=keys,
-                        partition_id="mn",
-                        fields=TensorDict(
-                            {"x": torch.arange(len(keys))}, batch_size=[len(keys)]
-                        ),
-                    )
+                actor_client.kv_batch_put(
+                    keys=keys,
+                    partition_id="mn",
+                    fields=TensorDict(
+                        {"x": torch.arange(len(keys))}, batch_size=[len(keys)]
+                    ),
                 )
             finally:
                 actor_client.close()
