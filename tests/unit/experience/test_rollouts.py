@@ -823,7 +823,7 @@ def test_run_async_nemo_gym_rollout(
         input_batch=input_batch,
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
-        max_seq_len=65536,
+        max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         generation_config=nemo_gym_vllm_generation.cfg,
         max_rollout_turns=None,
     )

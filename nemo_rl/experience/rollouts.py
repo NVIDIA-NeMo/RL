@@ -20,6 +20,7 @@ import copy
 import json
 import math
 import statistics
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -1094,6 +1095,8 @@ def run_async_nemo_gym_rollout(
     greedy: bool = False,
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
+    # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
+    # still relies on the underlying model server's configured context/window limits.
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
     nemo_gym_rows = input_batch["extra_env_info"]
 
@@ -1103,6 +1106,14 @@ def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
+    engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+    if max_seq_len is not None and max_seq_len > engine_max_model_len:
+        warnings.warn(
+            f"policy max_total_sequence_length ({max_seq_len}) is greater than the "
+            f"generation engine's max_model_len ({engine_max_model_len}). The engine "
+            "will truncate sequences to its own limit, so the policy cap will not be "
+            "honored. Lower max_total_sequence_length or raise the engine's max_model_len."
+        )
     # We don't use these stop criteria
     assert not generation_config["stop_strings"], (
         "Stop strings is not supported in the generation config in NeMo-Gym path!"
@@ -1120,11 +1131,8 @@ def run_async_nemo_gym_rollout(
     timer.start(f"{timer_prefix}/total")
 
     for rowidx, row in enumerate(nemo_gym_rows):
-        # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
-        # still relies on the underlying model server's configured context/window limits.
         # We do not translate max_seq_len into row-level max_tokens here because that would
         # change semantics from "total sequence length" to "max new tokens".
-
         responses_create_params = row["responses_create_params"]
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
