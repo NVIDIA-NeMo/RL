@@ -201,11 +201,13 @@ policy:
 
   generation:
     backend: "vllm"
-    # Hard upper bound on generation length. Combined with data.max_input_seq_length
-    # below, this guarantees:
-    #   prompt + generation + 1 (chat-template assistant-end token) <= max_total_sequence_length
-    # For max_total_sequence_length=9000 and data.max_input_seq_length=6400:
-    #   2599 = 9000 - 6400 - 1
+    # Hard upper bound on generation length. Must satisfy:
+    #   actual_max_prompt_len + max_new_tokens + 1 <= max_total_sequence_length
+    # where actual_max_prompt_len is the longest prompt your dataset actually
+    # produces after the chat template + tool schemas are applied (measure it).
+    # For this dataset the observed max is ~6201 tokens, so with
+    # max_total_sequence_length=9000:
+    #   2599 = 9000 - 6400 - 1   (6400 leaves a small headroom above 6201)
     # The +1 accounts for the boundary token that nemo-rl appends when packaging
     # the (prompt + response) trajectory for the logprob stage. Without this cap,
     # vLLM lets the model fill the remaining context window, and the boundary
@@ -258,13 +260,17 @@ policy:
         num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
-  # Hard cap on prompt length. Must be strictly less than max_total_sequence_length
-  # so that there is room for the model's response plus the chat-template
-  # assistant-end token in the final trajectory. See policy.generation.max_new_tokens
-  # comment for the full invariant.
-  # 6400 covers the actual dataset max (~6201 tokens after applying chat template
-  # with all tool schemas), so no real prompts are truncated.
-  max_input_seq_length: 6400
+  # Optional hard cap on prompt length; leave as null to skip prompt truncation.
+  # When null, you are responsible for knowing your dataset's actual max prompt
+  # length (after chat template + tool schemas) and setting
+  # policy.generation.max_new_tokens so that:
+  #   actual_max_prompt_len + max_new_tokens + 1 <= max_total_sequence_length
+  # For this dataset the observed max is ~6201 tokens; see the
+  # policy.generation.max_new_tokens comment for the full invariant.
+  # If you set a non-null value, it must be strictly less than
+  # max_total_sequence_length and >= your actual max prompt length, or real
+  # prompts will be truncated.
+  max_input_seq_length: null
   shuffle: False
   num_workers: 1
   use_multiple_dataloader: false
