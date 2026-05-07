@@ -40,8 +40,13 @@ EXEMPLAR_CONFIG="$PROJECT_ROOT/examples/configs/grpo_math_1B_megatron.yaml"
 
 # Resolve the megatron checkpoint base directory using the same logic as
 # get_megatron_checkpoint_dir(), so we can locate the bridge checkpoint.
-MEGATRON_CKPT_BASE=$(cd $PROJECT_ROOT && uv run --no-sync python -c \
-    "from nemo_rl.models.policy.utils import get_megatron_checkpoint_dir; print(get_megatron_checkpoint_dir())")
+if [[ -n "${NRL_MEGATRON_CHECKPOINT_DIR:-}" ]]; then
+    MEGATRON_CKPT_BASE="$NRL_MEGATRON_CHECKPOINT_DIR"
+elif [[ -n "${HF_HOME:-}" ]]; then
+    MEGATRON_CKPT_BASE="$HF_HOME/nemo_rl"
+else
+    MEGATRON_CKPT_BASE="$HOME/.cache/huggingface/nemo_rl"
+fi
 BRIDGE_CKPT="${MEGATRON_CKPT_BASE}/${MODEL_NAME}/iter_0000000"
 
 cd $PROJECT_ROOT
