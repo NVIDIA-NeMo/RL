@@ -66,11 +66,6 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.driver_io import read_columns, write_columns
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
-from nemo_rl.data_plane.preshard import (
-    concat_metas,
-    select_meta_indices,
-    slice_meta,
-)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.algorithms.sync_utils import SyncRolloutActor
@@ -122,7 +117,7 @@ def _apply_dynamic_sampling(
 
     # Subset this iteration's survivors and merge into the running cache.
     if keep_idx:
-        km = select_meta_indices(meta, keep_idx)
+        km = meta.subset(keep_idx)
         ks: _DSlice = {
             k: (v[keep_idx] if isinstance(v, torch.Tensor) else v)
             for k, v in slice_data.items()
@@ -132,7 +127,7 @@ def _apply_dynamic_sampling(
             pending_meta, pending_slice = km, ks
         else:
             assert pending_slice is not None
-            pending_meta = concat_metas([pending_meta, km])
+            pending_meta = pending_meta.concat(km)
             pending_slice = {
                 k: (torch.cat([pending_slice[k], ks[k]])
                     if isinstance(ks[k], torch.Tensor) else ks[k])
@@ -156,7 +151,7 @@ def _apply_dynamic_sampling(
             keys=list(pending_meta.keys[train_prompts_size:]),
             partition_id=pending_meta.partition_id,
         )
-        pending_meta = slice_meta(pending_meta, 0, train_prompts_size)
+        pending_meta = pending_meta.slice(0, train_prompts_size)
         pending_slice = {
             k: (v[:train_prompts_size] if isinstance(v, torch.Tensor) else v)
             for k, v in pending_slice.items()

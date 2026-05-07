@@ -44,7 +44,7 @@ they never `import transfer_queue` directly. That's the swappable boundary.
 - `write_columns(client, meta, fields)` — typed `kv_batch_put` for deltas
 - `shard_meta_for_dp(meta, dp_world)` — pure metadata split, no I/O,
   no key remint
-- `select_meta_indices(meta, idxs)` — pure metadata sub-selection
+- `meta.subset(idxs)` / `meta.slice(start, stop)` / `meta.concat(other)` — pure metadata transforms (methods on `KVBatchMeta`)
   (used by dynamic_sampling)
 
 ---
@@ -102,7 +102,7 @@ invariant verl maintains (`{uid}_{session_id}_{i}`).
               │   compute advantages (vectorized, on driver, tiny)       │
               │ ⑨ write_columns(meta, {advantages: T})                   │
               │                                                          │
-              │   [optional] dynamic_sampling: select_meta_indices(...)  │
+              │   [optional] dynamic_sampling: meta.subset(...)          │
               │   [optional] kv_clear(dropped_keys)                      │
               └────┬─────────────────────────────────────────────────────┘
                    │  shard_meta_for_dp again, Ray-call per rank

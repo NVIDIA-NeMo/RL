@@ -33,10 +33,7 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.preshard import (
     DP_SEED_FIELDS,
-    concat_metas,
-    select_meta_indices,
     shard_meta_for_dp,
-    slice_meta,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.algorithms.sync_utils import kv_first_write
@@ -149,24 +146,38 @@ def test_shard_meta_for_dp_unsorted_round_trip():
 # ── meta utility helpers ──────────────────────────────────────────────
 
 
-def test_select_meta_indices_subsets_keys_and_seqlens():
+def test_kvbatchmeta_subset_filters_keys_and_seqlens():
     m = _meta(6)
-    sub = select_meta_indices(m, [1, 3, 5])
+    sub = m.subset([1, 3, 5])
     assert sub.keys == ["k1", "k3", "k5"]
     assert sub.sequence_lengths == [11, 13, 15]
     assert sub.partition_id == m.partition_id
 
 
-def test_concat_metas_joins_keys_and_seqlens():
+def test_kvbatchmeta_concat_joins_keys_and_seqlens():
     m1 = _meta(3)
-    m2 = select_meta_indices(_meta(6), [3, 4, 5])
-    j = concat_metas([m1, m2])
+    m2 = _meta(6).subset([3, 4, 5])
+    j = m1.concat(m2)
     assert j.keys == ["k0", "k1", "k2", "k3", "k4", "k5"]
     assert j.sequence_lengths == [10, 11, 12, 13, 14, 15]
 
 
-def test_slice_meta_takes_range():
+def test_kvbatchmeta_slice_takes_range():
     m = _meta(5)
-    s = slice_meta(m, 1, 4)
+    s = m.slice(1, 4)
     assert s.keys == ["k1", "k2", "k3"]
     assert s.sequence_lengths == [11, 12, 13]
+
+
+def test_kvbatchmeta_concat_rejects_partition_mismatch():
+    import pytest
+    m1 = _meta(2)
+    m2 = KVBatchMeta(
+        partition_id="other",
+        task_name="train",
+        keys=["x", "y"],
+        fields=None,
+        sequence_lengths=[1, 2],
+    )
+    with pytest.raises(ValueError, match=r"partition_ids must match"):
+        m1.concat(m2)

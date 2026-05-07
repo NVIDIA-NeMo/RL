@@ -282,7 +282,7 @@ The DAPO-style dynamic-sampling filter (`nemo_rl/algorithms/grpo.py:dynamic_samp
 1. Filters survivors on `slice_data["std"] != 0`, accumulates `(meta, slice)` pairs across iterations via `(pending_meta, pending_slice)` state.
 2. `kv_clear`s dropped uids' TQ payload inline so orphan keys don't leak.
 3. On overflow (`current_size > train_prompts_size`), slices the cache and `kv_clear`s the discarded valid samples.
-4. Helpers in `nemo_rl/data_plane/preshard.py`: `select_meta_indices`, `concat_metas`, `slice_meta` — all pure metadata operations, no I/O on bulk.
+4. Methods on `KVBatchMeta` (in `nemo_rl/data_plane/interfaces.py`): `subset(indices)`, `concat(*others)`, `slice(start, stop)` — all pure metadata transforms, no I/O on bulk.
 
 The bulk in TQ stays untouched throughout — workers fetch their training slice via `train_presharded` after `policy.train_from_meta(meta)`, regardless of whether dynamic_sampling filtered.
 
