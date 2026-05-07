@@ -222,8 +222,12 @@ Depending on your data shape, you may want to change these values."""
                 {
                     "role": "user",
                     "content": "",
+                    # Pin dtype=long so a JSON path that promotes ints to floats
+                    # (seen with mini_swe_agent → litellm → Dynamo tokenize-endpoint)
+                    # doesn't surface as a FloatTensor in the embedding lookup.
                     "token_ids": torch.tensor(
-                        output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
+                        output_item_dict["prompt_token_ids"][len(seen_token_ids) :],
+                        dtype=torch.long,
                     ),
                 }
             )
@@ -231,9 +235,13 @@ Depending on your data shape, you may want to change these values."""
                 {
                     "role": "assistant",
                     "content": "",
-                    "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
+                    "token_ids": torch.tensor(
+                        output_item_dict["generation_token_ids"],
+                        dtype=torch.long,
+                    ),
                     "generation_logprobs": torch.tensor(
-                        output_item_dict["generation_log_probs"]
+                        output_item_dict["generation_log_probs"],
+                        dtype=torch.float32,
                     ),
                 }
             )
