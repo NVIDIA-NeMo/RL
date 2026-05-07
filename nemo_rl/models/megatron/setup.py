@@ -261,6 +261,39 @@ def _get_hf_config_overrides_hash(overrides: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
 
 
+def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
+    """Resolve the latest iteration directory under ``path``.
+
+    Checks ``latest_checkpointed_iteration.txt`` first; falls back to scanning
+    for ``iter_*`` subdirectories and taking the last one (lexicographic order).
+    """
+    tracker = os.path.join(path, "latest_checkpointed_iteration.txt")
+    if os.path.exists(tracker):
+        with open(tracker) as f:
+            iteration_str = f.read().strip()
+        if iteration_str == "release":
+            return os.path.join(path, "release")
+        try:
+            return os.path.join(path, f"iter_{int(iteration_str):07d}")
+        except ValueError:
+            raise ValueError(
+                f"pretrained_checkpoint.path={path!r}: "
+                f"latest_checkpointed_iteration.txt contains unexpected value "
+                f"{iteration_str!r}; expected an integer or 'release'."
+            )
+    try:
+        iter_subdirs = sorted(
+            d
+            for d in os.listdir(path)
+            if d.startswith("iter_") and os.path.isdir(os.path.join(path, d))
+        )
+    except (FileNotFoundError, NotADirectoryError):
+        iter_subdirs = []
+    if not iter_subdirs:
+        raise FileNotFoundError(not_found_msg)
+    return os.path.join(path, iter_subdirs[-1])
+
+
 def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     """Validate and setup model paths.
 
@@ -289,52 +322,20 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
 
         if fmt == "megatron_bridge":
             path = pretrained_ckpt["path"]
-            # Check if path is already a valid iter dir (contains run_config.yaml).
-            run_config = os.path.join(path, "run_config.yaml")
-            if os.path.exists(run_config):
+            # If it's already a specific iter dir (contains run_config.yaml), use it directly.
+            if os.path.exists(os.path.join(path, "run_config.yaml")):
                 return hf_model_name, path, True
 
-            # Not a direct iter dir — resolve the latest iteration from the tracker
-            # file or by scanning for iter_* subdirectories.
-            tracker = os.path.join(path, "latest_checkpointed_iteration.txt")
-            if os.path.exists(tracker):
-                with open(tracker) as f:
-                    iteration_str = f.read().strip()
-                if iteration_str == "release":
-                    resolved = os.path.join(path, "release")
-                else:
-                    try:
-                        resolved = os.path.join(path, f"iter_{int(iteration_str):07d}")
-                    except ValueError:
-                        raise ValueError(
-                            f"pretrained_checkpoint.path={path!r}: "
-                            f"latest_checkpointed_iteration.txt contains unexpected value "
-                            f"{iteration_str!r}; expected an integer or 'release'."
-                        )
-            else:
-                try:
-                    iter_subdirs = sorted(
-                        d
-                        for d in os.listdir(path)
-                        if d.startswith("iter_")
-                        and os.path.isdir(os.path.join(path, d))
-                    )
-                except (FileNotFoundError, NotADirectoryError):
-                    iter_subdirs = []
-
-                if not iter_subdirs:
-                    raise FileNotFoundError(
-                        f"pretrained_checkpoint.path={path!r} does not contain "
-                        f"run_config.yaml, latest_checkpointed_iteration.txt, or any "
-                        f"iter_* subdirectories.  For megatron_bridge format, path must "
-                        f"point to either a specific iteration directory "
-                        f"(e.g. /checkpoints/iter_0005000/) or a checkpoint root "
-                        f"directory containing iter_* subdirectories."
-                    )
-                resolved = os.path.join(path, iter_subdirs[-1])
-
-            run_config = os.path.join(resolved, "run_config.yaml")
-            if not os.path.exists(run_config):
+            resolved = _resolve_iter_dir_from_root(
+                path,
+                f"pretrained_checkpoint.path={path!r} does not contain "
+                f"run_config.yaml, latest_checkpointed_iteration.txt, or any "
+                f"iter_* subdirectories.  For megatron_bridge format, path must "
+                f"point to either a specific iteration directory "
+                f"(e.g. /checkpoints/iter_0005000/) or a checkpoint root "
+                f"directory containing iter_* subdirectories.",
+            )
+            if not os.path.exists(os.path.join(resolved, "run_config.yaml")):
                 raise FileNotFoundError(
                     f"pretrained_checkpoint.path={path!r}: resolved to iteration "
                     f"directory {resolved!r} but it does not contain "
@@ -361,37 +362,12 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
             if os.path.exists(os.path.join(path, "metadata.json")):
                 resolved = path
             else:
-                tracker = os.path.join(path, "latest_checkpointed_iteration.txt")
-                if os.path.exists(tracker):
-                    with open(tracker) as f:
-                        iteration_str = f.read().strip()
-                    if iteration_str == "release":
-                        resolved = os.path.join(path, "release")
-                    else:
-                        try:
-                            resolved = os.path.join(
-                                path, f"iter_{int(iteration_str):07d}"
-                            )
-                        except ValueError:
-                            raise ValueError(
-                                f"pretrained_checkpoint.path={path!r}: "
-                                f"latest_checkpointed_iteration.txt contains unexpected "
-                                f"value {iteration_str!r}; expected an integer or 'release'."
-                            )
-                else:
-                    iter_subdirs = sorted(
-                        d
-                        for d in os.listdir(path)
-                        if d.startswith("iter_")
-                        and os.path.isdir(os.path.join(path, d))
-                    )
-                    if not iter_subdirs:
-                        raise FileNotFoundError(
-                            f"pretrained_checkpoint.path={path!r} does not contain "
-                            f"metadata.json, latest_checkpointed_iteration.txt, or any "
-                            f"iter_* subdirectories.  Cannot resolve a megatron_lm checkpoint."
-                        )
-                    resolved = os.path.join(path, iter_subdirs[-1])
+                resolved = _resolve_iter_dir_from_root(
+                    path,
+                    f"pretrained_checkpoint.path={path!r} does not contain "
+                    f"metadata.json, latest_checkpointed_iteration.txt, or any "
+                    f"iter_* subdirectories.  Cannot resolve a megatron_lm checkpoint.",
+                )
             if not os.path.exists(os.path.join(resolved, "metadata.json")):
                 raise FileNotFoundError(
                     f"Resolved megatron_lm checkpoint directory {resolved!r} does not "
@@ -1163,7 +1139,7 @@ def handle_model_import(
     megatron_lm formats.
 
     Args:
-        config: Policy config used for ``pretrained_ckpt``,
+        config: Policy config used for ``pretrained_checkpoint``,
             ``hf_config_overrides``, and ``megatron_cfg``.
         hf_model_name: HF model id (or local path) to import.
         pretrained_path: Output directory for the Megatron checkpoint.

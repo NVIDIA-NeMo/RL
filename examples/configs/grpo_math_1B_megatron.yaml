@@ -35,6 +35,11 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
+  # pretrained_checkpoint: load weights from an existing megatron-bridge or
+  # Megatron-LM checkpoint instead of converting from HuggingFace.
+  # pretrained_checkpoint:
+  #   path: "/path/to/checkpoint"  # iter dir or checkpoint root
+  #   format: "megatron_bridge"    # or "megatron_lm"
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"

@@ -9,6 +9,11 @@ checkpointing:
   enabled: false
   checkpoint_dir: "results/grpo_8b_megatron"
   checkpoint_must_save_by: null
+  # pretrained_checkpoint: load weights from an existing megatron-bridge or
+  # Megatron-LM checkpoint instead of converting from HuggingFace.
+  # pretrained_checkpoint:
+  #   path: "/path/to/checkpoint"  # iter dir or checkpoint root
+  #   format: "megatron_bridge"    # or "megatron_lm"
 
 policy:
   model_name: "meta-llama/Llama-3.1-8B-Instruct"
