@@ -103,9 +103,9 @@ def main():
 
     # Setup tokenizer — get_tokenizer handles both text-only and multimodal
     is_multimodal = _is_multimodal_dataset(config.data["dataset_name"])
-    tokenizer = get_tokenizer(config["tokenizer"], get_processor=is_multimodal)
-    config["generation"] = configure_generation_config(
-        config["generation"], tokenizer, is_eval=True
+    tokenizer = get_tokenizer(config.tokenizer, get_processor=is_multimodal)
+    config.generation = configure_generation_config(
+        config.generation, tokenizer, is_eval=True
     )
 
     # Setup data
