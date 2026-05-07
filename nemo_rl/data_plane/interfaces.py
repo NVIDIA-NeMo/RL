@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, Sequence, TypedDict
 
 from tensordict import TensorDict
 
@@ -89,6 +89,65 @@ class KVBatchMeta:
     @property
     def size(self) -> int:
         return len(self.keys)
+
+    # ── Pure-metadata transforms (no I/O) ──────────────────────────────
+    # Used by dynamic_sampling on the meta path: filter zero-std rows
+    # (subset), accumulate survivors across iterations (concat), trim
+    # an over-full cache to the training batch size (slice). Each
+    # returns a fresh KVBatchMeta — caller is responsible for kv_clear-
+    # ing any uids dropped from the working set.
+
+    def _replace(
+        self,
+        *,
+        keys: list[str],
+        sequence_lengths: list[int] | None,
+    ) -> "KVBatchMeta":
+        """Return a copy with new keys/sequence_lengths, same metadata otherwise."""
+        return KVBatchMeta(
+            partition_id=self.partition_id,
+            task_name=self.task_name,
+            keys=list(keys),
+            fields=self.fields,
+            sequence_lengths=list(sequence_lengths) if sequence_lengths is not None else None,
+            extra_info=dict(self.extra_info or {}),
+        )
+
+    def subset(self, indices: "Sequence[int]") -> "KVBatchMeta":
+        """Return a new meta with only the rows at ``indices`` (any order)."""
+        return self._replace(
+            keys=[self.keys[i] for i in indices],
+            sequence_lengths=(
+                [self.sequence_lengths[i] for i in indices]
+                if self.sequence_lengths is not None
+                else None
+            ),
+        )
+
+    def slice(self, start: int, stop: int) -> "KVBatchMeta":
+        """Return a new meta with rows in the contiguous range ``[start, stop)``."""
+        return self._replace(
+            keys=self.keys[start:stop],
+            sequence_lengths=(
+                self.sequence_lengths[start:stop]
+                if self.sequence_lengths is not None
+                else None
+            ),
+        )
+
+    def concat(self, *others: "KVBatchMeta") -> "KVBatchMeta":
+        """Append ``others`` to ``self``. All metas must share ``partition_id``."""
+        if any(o.partition_id != self.partition_id for o in others):
+            raise ValueError("KVBatchMeta.concat: partition_ids must match")
+        all_m = (self, *others)
+        keys = [k for m in all_m for k in m.keys]
+        all_have_lens = all(m.sequence_lengths is not None for m in all_m)
+        seq_lens = (
+            [s for m in all_m for s in (m.sequence_lengths or [])]
+            if all_have_lens
+            else None
+        )
+        return self._replace(keys=keys, sequence_lengths=seq_lens)
 
 
 class DataPlaneClient(ABC):
