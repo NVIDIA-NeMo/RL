@@ -157,7 +157,7 @@ def shard_meta_for_dp(
 
     Use this for every dispatch *after* rollout (logprob, ref-logprob, train).
     The rollout actor's first write is a flat ``kv_batch_put`` (see
-    :func:`nemo_rl.algorithms.sync_utils.rollout_to_tq`) — no fan-out.
+    :func:`nemo_rl.algorithms.sync_utils.kv_first_write`) — no fan-out.
 
     Per-rank packing metadata (``micro_batch_indices`` /
     ``micro_batch_lengths`` / ``elem_counts_per_gb``) lands in each shard's

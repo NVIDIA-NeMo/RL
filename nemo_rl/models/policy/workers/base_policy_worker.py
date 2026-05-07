@@ -281,6 +281,15 @@ class AbstractPolicyWorker:
         """
         return None
 
+    def _pad_value_dict(self) -> dict[str, Any]:
+        """Per-field pad value used by :func:`materialize` to detile the
+        jagged wire format. Token-id fields use the tokenizer pad id;
+        masks / logprobs default to 0 (set by codec)."""
+        pad_id = getattr(getattr(self, "tokenizer", None), "pad_token_id", None)
+        if pad_id is None:
+            return {}
+        return {"input_ids": pad_id, "prompt_ids_for_adv": pad_id}
+
     def _fetch(
         self,
         meta: "KVBatchMeta",
@@ -294,9 +303,11 @@ class AbstractPolicyWorker:
         Args:
             meta: per-DP-rank shard produced by the driver's
                 :func:`nemo_rl.data_plane.preshard.shard_meta_for_dp`.
-            layout: codec layout. Phase 1 always ``"padded"`` — the
-                wire format is already padded. Stage 2 will introduce
-                ``"jagged"``.
+            layout: codec layout. ``"padded"`` (default) bridges the
+                jagged wire format back to rectangular tensors via
+                :func:`torch.nested.to_padded_tensor`, using
+                :meth:`_pad_value_dict` for the per-field pad value.
+                ``"jagged"`` returns nested tensors as-is.
             fetch_policy: how the rank obtains its slice when TP/CP/PP
                 siblings share the same ``meta``:
                   * ``"auto"`` (default) — leader-fetch + NCCL broadcast
@@ -322,6 +333,7 @@ class AbstractPolicyWorker:
 
         from nemo_rl.data_plane import materialize
 
+        pad_value_dict = self._pad_value_dict()
         replica_group = (
             self._get_replica_group()
             if fetch_policy in {"auto", "leader_broadcast"}
@@ -334,6 +346,8 @@ class AbstractPolicyWorker:
                 "Either configure TP/CP/PP > 1 or use fetch_policy='auto'."
             )
 
+        pad_to_multiple = int((meta.extra_info or {}).get("pad_to_multiple", 1))
+
         if replica_group is not None:
             leader = torch.distributed.get_global_rank(replica_group, 0)
             is_leader = torch.distributed.get_rank() == leader
@@ -343,7 +357,11 @@ class AbstractPolicyWorker:
                     partition_id=meta.partition_id,
                     select_fields=list(meta.fields) if meta.fields else None,
                 )
-                data = materialize(td, layout=layout)
+                data = materialize(
+                    td, layout=layout,
+                    pad_value_dict=pad_value_dict,
+                    pad_to_multiple=pad_to_multiple,
+                )
             else:
                 data = None
             data = _broadcast_batched_data_dict(
@@ -359,7 +377,11 @@ class AbstractPolicyWorker:
             partition_id=meta.partition_id,
             select_fields=list(meta.fields) if meta.fields else None,
         )
-        data = materialize(td, layout=layout)
+        data = materialize(
+            td, layout=layout,
+            pad_value_dict=pad_value_dict,
+            pad_to_multiple=pad_to_multiple,
+        )
         if preprocess is not None:
             data = preprocess(self, data)
         return data
@@ -473,15 +495,27 @@ class AbstractPolicyWorker:
 
         Tensors must be CPU and aligned to ``meta.keys`` order — the TQ
         adapter rejects GPU tensors / shape mismatches.
+
+        Per-token fields are converted to jagged via
+        :func:`maybe_pack_jagged` so they land with the same row lengths
+        as the initial put. Without this, a worker logprob write-back
+        (rectangular ``[N, S]``) would mismatch the jagged ``input_ids``
+        on the next read.
         """
         if not self._is_replica_leader() or not fields:
             return
         from tensordict import TensorDict
 
-        td = TensorDict(
-            {k: v.detach().contiguous() for k, v in fields.items()},
-            batch_size=[len(meta.keys)],
-        )
+        from nemo_rl.data_plane.codec import maybe_pack_jagged
+
+        seq_lens = meta.sequence_lengths
+        if seq_lens is not None:
+            lengths = torch.tensor(seq_lens, dtype=torch.long)
+            packed = {k: maybe_pack_jagged(v, lengths) for k, v in fields.items()}
+        else:
+            packed = {k: v.detach().contiguous() for k, v in fields.items()}
+
+        td = TensorDict(packed, batch_size=[len(meta.keys)])
         self._require_dp_client().kv_batch_put(
             keys=meta.keys, partition_id=meta.partition_id, fields=td,
         )

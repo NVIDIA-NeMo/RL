@@ -202,7 +202,7 @@ def make_actor_runtime_env(actor_class_fqn: str) -> dict:
     the same interpreter as the driver.
 
     Used by ReplayBuffer, AsyncTrajectoryCollector, and
-    SyncTrajectoryCollector — three actors that need the VLLM tier's
+    SyncRolloutActor — three actors that need the VLLM tier's
     venv on every node.
     """
     # Local import — venvs.py is dep-light; the registry imports

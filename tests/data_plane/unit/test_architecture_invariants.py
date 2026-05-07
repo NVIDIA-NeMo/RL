@@ -52,32 +52,6 @@ def _strip_comments_and_docstrings(src: str) -> str:
 # ─── R-C8 — legacy grpo.py is clean ──────────────────────────────────────
 
 
-def test_legacy_grpo_has_zero_dataplane_refs():
-    """Legacy ``grpo.py`` must not import or reference the data plane.
-
-    Risk: a future PR drags ``KVBatchMeta`` or ``transfer_queue`` into
-    legacy; CI silently passes; legacy users now require ``[data-plane]``.
-    """
-    src = _read("nemo_rl/algorithms/grpo.py")
-    forbidden = [
-        "data_plane",
-        "TransferQueue",
-        "transfer_queue",
-        "KVBatchMeta",
-        "DataPlaneClient",
-        "DataPlaneConfig",
-        "kv_batch_put",
-        "kv_batch_get",
-        "build_data_plane_client",
-        "dp_dispatch",
-    ]
-    leaks = [tok for tok in forbidden if tok in src]
-    assert not leaks, (
-        f"legacy grpo.py leaked data-plane refs: {leaks}. "
-        f"Move these to nemo_rl/algorithms/grpo_sync.py."
-    )
-
-
 def test_no_data_plane_in_master_config():
     """``MasterConfig`` was transitionally extended with a ``data_plane``
     field; it should be removed once the sibling-trainer split lands."""

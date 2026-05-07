@@ -35,14 +35,32 @@ def read_columns(
     select_fields: Sequence[str],
     *,
     layout: str = "padded",
+    pad_value_dict: dict[str, Any] | None = None,
 ) -> BatchedDataDict[Any]:
-    """``kv_batch_get(meta.keys, select_fields=...) → materialize``."""
+    """``kv_batch_get(meta.keys, select_fields=...) → materialize``.
+
+    ``pad_value_dict`` is forwarded to :func:`materialize` so jagged
+    fields are padded with the right value per field
+    (``input_ids → pad_token_id``, masks → 0, logprobs → 0.0). When
+    omitted, jagged fields pad with 0.
+
+    ``pad_to_multiple`` is read from ``meta.extra_info`` (writer-side
+    alignment recorded at first put) so the materialized seq dim
+    matches the alignment required by downstream backends (mcore SP /
+    PyTorch CP).
+    """
     td = dp_client.kv_batch_get(
         keys=meta.keys,
         partition_id=meta.partition_id,
         select_fields=list(select_fields),
     )
-    return materialize(td, layout=layout)
+    pad_mult = int((meta.extra_info or {}).get("pad_to_multiple", 1))
+    return materialize(
+        td,
+        layout=layout,
+        pad_value_dict=pad_value_dict,
+        pad_to_multiple=pad_mult,
+    )
 
 
 def write_columns(
@@ -50,13 +68,25 @@ def write_columns(
     meta: KVBatchMeta,
     fields: dict[str, torch.Tensor],
 ) -> None:
-    """``kv_batch_put(meta.keys, fields=...)``."""
+    """``kv_batch_put(meta.keys, fields=...)``.
+
+    Per-token fields (whose seq dim matches ``max(meta.sequence_lengths)``)
+    are converted to jagged before the put via :func:`maybe_pack_jagged`,
+    so they land in TQ with the same row lengths as the initial put — keeps
+    mixed jagged/rectangular shape mismatches out of subsequent reads.
+    """
     if not fields:
         return
-    td = TensorDict(
-        {k: v.detach().contiguous() for k, v in fields.items()},
-        batch_size=[len(meta.keys)],
-    )
+    from nemo_rl.data_plane.codec import maybe_pack_jagged
+
+    seq_lens = meta.sequence_lengths
+    if seq_lens is not None:
+        lengths = torch.tensor(seq_lens, dtype=torch.long)
+        packed = {k: maybe_pack_jagged(v, lengths) for k, v in fields.items()}
+    else:
+        packed = {k: v.detach().contiguous() for k, v in fields.items()}
+
+    td = TensorDict(packed, batch_size=[len(meta.keys)])
     dp_client.kv_batch_put(
         keys=meta.keys, partition_id=meta.partition_id, fields=td,
     )

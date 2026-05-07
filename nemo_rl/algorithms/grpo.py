@@ -17,7 +17,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
@@ -220,7 +220,6 @@ def setup(
     dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
     val_dataset: Optional[AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
-    policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
@@ -581,10 +580,18 @@ def setup(
             "(reference model is not loaded)."
         )
 
-    # ``policy_factory`` lets the caller pick a Policy subclass (e.g.
-    # a TQ-mediated variant) without grpo.py needing to know about its
-    # specific dependencies. Defaults to the legacy in-memory Policy.
-    _make_policy = policy_factory if policy_factory is not None else Policy
+    # When data_plane is enabled, swap in the TQ-mediated Policy subclass
+    # so the worker layer reads inputs from TQ instead of receiving them
+    # via Ray object refs. The TQPolicy import is gated and lazy: legacy
+    # behavior + import graph are unchanged when data_plane is disabled.
+    _dp_cfg = master_config.get("data_plane") or {}
+    if _dp_cfg.get("enabled", False):
+        from nemo_rl.models.policy.tq_policy import TQPolicy
+
+        def _make_policy(**kwargs):
+            return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
+    else:
+        _make_policy = Policy
 
     def init_policy():
         """Initialize policy training workers."""

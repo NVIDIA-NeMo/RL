@@ -73,7 +73,7 @@ from nemo_rl.data_plane.preshard import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.algorithms.sync_utils import SyncTrajectoryCollector
+from nemo_rl.algorithms.sync_utils import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.checkpoint import CheckpointManager
@@ -247,6 +247,14 @@ def grpo_train_sync(
             "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer if you don't "
             "want TransferQueue."
         )
+
+    # Driver-side pad-value dict for materialize() — the wire emits
+    # jagged tensors for variable-length token fields (input_ids,
+    # prompt_ids_for_adv); other fields default to pad=0.
+    _pad_dict = {
+        "input_ids": tokenizer.pad_token_id,
+        "prompt_ids_for_adv": tokenizer.pad_token_id,
+    }
     if not hasattr(policy, "dp_cfg"):
         raise ValueError(
             "grpo_train_sync requires a TQ-mediated policy "
@@ -260,9 +268,9 @@ def grpo_train_sync(
     # TQ first-write. Bulk tensors stay actor-side until kv_batch_put;
     # driver receives only KVBatchMeta + small slice via Ray. See
     # research/data_plane_integration_plan.md §1.2.
-    trajectory_collector = SyncTrajectoryCollector.options(
+    rollout_actor = SyncRolloutActor.options(
         runtime_env=make_actor_runtime_env(
-            "nemo_rl.algorithms.sync_utils.SyncTrajectoryCollector"
+            "nemo_rl.algorithms.sync_utils.SyncRolloutActor"
         ),
     ).remote(
         policy_generation=policy_generation,
@@ -427,7 +435,7 @@ def grpo_train_sync(
                         rollout_metrics,
                         generation_logger_metrics,
                     ) = ray.get(
-                        trajectory_collector.rollout_to_tq.remote(
+                        rollout_actor.rollout_to_tq.remote(
                             repeated_batch,
                             uids=uids,
                             partition_id=policy._tq_partition_id,
@@ -574,6 +582,7 @@ def grpo_train_sync(
                     extras_bdd = read_columns(
                         policy._dp_client, meta,
                         select_fields=["generation_logprobs", "token_mask"],
+                        pad_value_dict=_pad_dict,
                     )
                     generation_logprobs = extras_bdd["generation_logprobs"]
                     token_mask = extras_bdd["token_mask"]
@@ -614,7 +623,7 @@ def grpo_train_sync(
                     # (total_reward, baseline, std) plus the optional
                     # filtered_reward when dynamic_sampling is engaged
                     # (rejected at the actor for now — see
-                    # SyncTrajectoryCollector.rollout_to_tq).
+                    # SyncRolloutActor.rollout_to_tq).
                     rb_for_adv = BatchedDataDict[Any](
                         {
                             "total_reward": rewards,
@@ -694,6 +703,7 @@ def grpo_train_sync(
                         calibration_data = read_columns(
                             policy._dp_client, meta,
                             select_fields=_calib_fields,
+                            pad_value_dict=_pad_dict,
                         )
                         kv_scales_cache = policy.calibrate_qkv_fp8_scales(
                             calibration_data, include_q=True,
@@ -708,6 +718,7 @@ def grpo_train_sync(
                 if not _should_log_nemo_gym_responses(master_config):
                     _log_input_ids = read_columns(
                         policy._dp_client, meta, select_fields=["input_ids"],
+                        pad_value_dict=_pad_dict,
                     )["input_ids"]
 
                 # ── Step-end TQ cleanup ────────────────────────────────
