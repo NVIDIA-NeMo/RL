@@ -138,9 +138,9 @@ class GenerationConfig(TypedDict):
     temperature: float
     top_p: float
     top_k: int | None
-    model_name: NotRequired[str]
+    model_name: NotRequired[str]  # Not Required b/c GRPO writes this
     stop_token_ids: list[int] | None
-    stop_strings: NotRequired[list[str] | None]
+    stop_strings: list[str] | None
     ignore_eos: bool
     output_len_or_output_len_generator: NotRequired[Dict[str, Any] | int]
     colocated: NotRequired[ColocationConfig]
