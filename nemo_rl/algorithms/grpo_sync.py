@@ -76,13 +76,12 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.algorithms.sync_utils import SyncTrajectoryCollector
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 # ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
 # Slice-only formulation of nemo_rl.algorithms.grpo.dynamic_sampling: filter
@@ -111,9 +110,9 @@ def _apply_dynamic_sampling(
     is_complete, ds_metrics, unfiltered_for_log). When complete, the returned
     pending_* IS the training batch."""
     # Cumulative unfiltered total_reward for legacy metrics["reward"]
-    # (grpo.py:878). Reference is fine — slice tensors are produced
-    # fresh per iteration, not aliased to TQ-owned bulk.
-    pending_unfiltered_rewards = [*pending_unfiltered_rewards, slice_data["total_reward"]]
+    # parity. Reference-only append (no copy) — slice tensors are
+    # produced fresh per iteration, not aliased to TQ-owned bulk.
+    pending_unfiltered_rewards.append(slice_data["total_reward"])
 
     keep_mask = slice_data["std"] != 0.0
     keep_idx = keep_mask.nonzero(as_tuple=True)[0].tolist()
@@ -261,25 +260,10 @@ def grpo_train_sync(
     # TQ first-write. Bulk tensors stay actor-side until kv_batch_put;
     # driver receives only KVBatchMeta + small slice via Ray. See
     # research/data_plane_integration_plan.md §1.2.
-    _stc_py_exec = get_actor_python_env(
-        "nemo_rl.algorithms.sync_utils.SyncTrajectoryCollector"
-    )
-    if _stc_py_exec.startswith("uv"):
-        _stc_py_exec = create_local_venv_on_each_node(
-            _stc_py_exec,
-            "nemo_rl.algorithms.sync_utils.SyncTrajectoryCollector",
-        )
-    _stc_py_venv = os.path.dirname(os.path.dirname(_stc_py_exec))
-    _stc_runtime_env = {
-        "py_executable": _stc_py_exec,
-        "env_vars": {
-            **os.environ,
-            "VIRTUAL_ENV": _stc_py_venv,
-            "UV_PROJECT_ENVIRONMENT": _stc_py_venv,
-        },
-    }
     trajectory_collector = SyncTrajectoryCollector.options(
-        runtime_env=_stc_runtime_env,
+        runtime_env=make_actor_runtime_env(
+            "nemo_rl.algorithms.sync_utils.SyncTrajectoryCollector"
+        ),
     ).remote(
         policy_generation=policy_generation,
         tokenizer=tokenizer,
