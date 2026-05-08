@@ -22,12 +22,16 @@ from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
 )
-from megatron.core.utils import StragglerDetector
+from megatron.core.utils import (
+    StragglerDetector,
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_hybrid_cp_rank,
+    get_thd_batch_on_this_cp_rank,
+)
 from megatron.training.utils import get_ltor_masks_and_position_ids
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
 
 
@@ -343,6 +347,95 @@ def process_global_batch(
     }
 
 
+def _pack_token_aligned_tensors_for_megatron(
+    tensors: dict[str, torch.Tensor],
+    seq_lengths: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Pack token-aligned ``[B, S, ...]`` tensors into Megatron THD batch form.
+
+    This helper only pads and packs data. CP token ownership is delegated to
+    Megatron's THD batch slicing helper so NeMo-RL does not encode CP topology.
+    """
+    total_tokens = int(cu_seqlens_padded[-1].item())
+    packed_tensors = {}
+    for key, tensor in tensors.items():
+        if tensor.dim() < 2:
+            raise ValueError(
+                f"Expected token-aligned tensor '{key}' to have shape [B, S, ...], "
+                f"got {tensor.shape}"
+            )
+        if tensor.shape[0] != seq_lengths.shape[0]:
+            raise ValueError(
+                f"Batch size mismatch for '{key}': tensor has {tensor.shape[0]} rows "
+                f"but seq_lengths has {seq_lengths.shape[0]} entries."
+            )
+
+        packed = torch.zeros(
+            (1, total_tokens, *tensor.shape[2:]),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        for b in range(tensor.shape[0]):
+            seq_len = int(seq_lengths[b].item())
+            start = int(cu_seqlens_padded[b].item())
+            packed[0, start : start + seq_len] = tensor[b, :seq_len]
+        packed_tensors[key] = packed
+
+    return packed_tensors
+
+
+def _slice_batch_for_megatron_context_parallel(
+    batch: dict[str, torch.Tensor],
+    cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens_padded: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None,
+    *,
+    local_cp_size: Optional[int] = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+) -> tuple[dict[str, torch.Tensor], Optional[PackedSeqParams]]:
+    """Delegate CP batch slicing to Megatron using Megatron's dispatch shape.
+
+    NeMo-RL should construct the batch, then let Megatron choose how CP token
+    ownership is mapped for dense, packed THD, or hybrid CP inputs.
+    """
+    if cu_seqlens is None and local_cp_size is None:
+        if cp_rank != 0 or cp_size != 1:
+            raise ValueError(
+                "Dense CP slicing uses Megatron parallel_state. Explicit "
+                "cp_rank/cp_size are only supported for packed THD slicing."
+            )
+        return get_batch_on_this_cp_rank(dict(batch)), None
+
+    if local_cp_size is not None:
+        if cp_rank != 0 or cp_size != 1:
+            raise ValueError(
+                "Hybrid CP slicing uses Megatron process groups. Explicit "
+                "cp_rank/cp_size are only supported for packed THD slicing."
+            )
+        return get_batch_on_this_hybrid_cp_rank(dict(batch), local_cp_size)
+
+    if cu_seqlens_padded is None or max_seqlen is None:
+        raise ValueError(
+            "Packed THD CP slicing requires cu_seqlens, cu_seqlens_padded, and max_seqlen."
+        )
+
+    max_seqlen_t = torch.tensor(
+        [max_seqlen],
+        dtype=torch.int32,
+        device=cu_seqlens.device,
+    )
+    return get_thd_batch_on_this_cp_rank(
+        dict(batch),
+        cu_seqlens,
+        cu_seqlens_padded,
+        max_seqlen_t,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+    )
+
+
 def _pack_sequences_for_megatron(
     input_ids: torch.Tensor,
     seq_lengths: torch.Tensor,
@@ -351,7 +444,7 @@ def _pack_sequences_for_megatron(
     pad_packed_seq_to: Optional[int] = None,
     cp_rank: int = 0,
     cp_size: int = 1,
-) -> tuple[torch.Tensor, PackedSeqParams, torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, PackedSeqParams, torch.Tensor, torch.Tensor]:
     """Pack sequences for Megatron model processing with optional context parallelism.
 
     Args:
@@ -373,7 +466,7 @@ def _pack_sequences_for_megatron(
     """
     batch_size = input_ids.shape[0]
 
-    # Build cumulative sequence lengths (cu_seqlens) and extract valid tokens
+    # Build cumulative sequence lengths (cu_seqlens)
     needs_padding = (
         pad_individual_seqs_to_multiple_of > 1
         or pad_packed_seq_to_multiple_of > 1
@@ -382,7 +475,6 @@ def _pack_sequences_for_megatron(
 
     cu_seqlens = [0]
     cu_seqlens_padded = [0] if needs_padding else None
-    valid_tokens = []
 
     if pad_packed_seq_to is not None:
         assert pad_packed_seq_to % pad_packed_seq_to_multiple_of == 0, (
@@ -395,9 +487,6 @@ def _pack_sequences_for_megatron(
         seq_len = (
             seq_lengths[b].item() if torch.is_tensor(seq_lengths[b]) else seq_lengths[b]
         )
-
-        # Extract valid tokens for this sequence
-        valid_tokens.append(input_ids[b, :seq_len])
 
         # Update cumulative sequence lengths
         cu_seqlens.append(cu_seqlens[-1] + seq_len)
@@ -429,95 +518,24 @@ def _pack_sequences_for_megatron(
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
 
-    # Concatenate all valid tokens
-    # If using individual padding, we need to pad individual sequences
-    # CP will always need padding (of at least cp_size * 2)
-    running_seq_len = 0
-    if pad_factor > 1:
-        all_input_ids = []
-        padded_tokens = []
-        for b in range(batch_size):
-            seq_len = (
-                seq_lengths[b].item()
-                if torch.is_tensor(seq_lengths[b])
-                else seq_lengths[b]
-            )
-            # if last element, pad to the max sequence length
-            if b == batch_size - 1 and needs_padding:
-                if pad_packed_seq_to is not None:
-                    padded_seq_len = pad_packed_seq_to - running_seq_len
-                elif pad_packed_seq_to_multiple_of > 1:
-                    padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
-                    padded_seq_len = (
-                        _round_up_to_multiple(
-                            running_seq_len + padded_seq_len,
-                            pad_packed_seq_to_multiple_of,
-                        )
-                        - running_seq_len
-                    )
-                else:
-                    padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
-            else:
-                padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
-
-            running_seq_len += padded_seq_len
-
-            # Pad this sequence to the required length
-            seq_tokens = input_ids[b, :seq_len]
-            if padded_seq_len > seq_len:
-                # Pad with zeros (or use a padding token if available)
-                seq_tokens = torch.nn.functional.pad(
-                    seq_tokens, (0, padded_seq_len - seq_len), value=0
-                )
-            all_input_ids.append(seq_tokens)
-
-            if cp_size > 1:
-                seq_tokens = _get_tokens_on_this_cp_rank(
-                    seq_tokens, cp_rank, cp_size, seq_dim=0
-                )
-
-            padded_tokens.append(seq_tokens)
-
-        # Concatenate all padded tokens
-        # For 'thd' format, the shape should be [1, T] where T is total tokens
-        packed_input_ids = torch.cat(padded_tokens, dim=0).unsqueeze(0)
-        all_input_ids = torch.cat(all_input_ids, dim=0).unsqueeze(0)
-    else:
-        # No individual padding, just concatenate valid tokens
-        # For 'thd' format, the shape should be [1, T] where T is total tokens
-        packed_input_ids = torch.cat(valid_tokens, dim=0).unsqueeze(0)
-        all_input_ids = packed_input_ids
-        if needs_padding:
-            if pad_packed_seq_to is not None:
-                pad_len = pad_packed_seq_to - packed_input_ids.shape[1]
-            elif pad_packed_seq_to_multiple_of > 1:
-                current_seq_len = packed_input_ids.shape[1]
-                pad_this_seq_to = _round_up_to_multiple(
-                    current_seq_len, pad_packed_seq_to_multiple_of
-                )
-                pad_len = pad_this_seq_to - current_seq_len
-            else:
-                pad_len = 0
-            if pad_len > 0:
-                packed_input_ids = torch.nn.functional.pad(
-                    packed_input_ids, (0, pad_len), value=0
-                )
-                all_input_ids = torch.nn.functional.pad(
-                    all_input_ids, (0, pad_len), value=0
-                )
-
     if cu_seqlens_padded is None:
         cu_seqlens_padded = cu_seqlens.clone()
 
-    packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=cu_seqlens_padded,
-        cu_seqlens_kv=cu_seqlens_padded,
-        cu_seqlens_q_padded=cu_seqlens_padded,
-        cu_seqlens_kv_padded=cu_seqlens_padded,
-        max_seqlen_q=int(max_seqlen),
-        max_seqlen_kv=int(max_seqlen),
-        qkv_format="thd",
+    packed_batch = _pack_token_aligned_tensors_for_megatron(
+        {"tokens": input_ids},
+        seq_lengths,
+        cu_seqlens_padded,
     )
+    all_input_ids = packed_batch["tokens"]
+    cp_packed_batch, packed_seq_params = _slice_batch_for_megatron_context_parallel(
+        packed_batch,
+        cu_seqlens,
+        cu_seqlens_padded,
+        int(max_seqlen),
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+    )
+    packed_input_ids = cp_packed_batch["tokens"]
 
     return (
         all_input_ids.contiguous(),

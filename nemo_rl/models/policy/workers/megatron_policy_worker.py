@@ -134,15 +134,16 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             return None
 
         world_size = torch.distributed.get_world_size()
-        my_dp_rank = parallel_state.get_data_parallel_rank()
-        # Collect global ranks that share this DP rank — they form the
-        # replica group. Done collectively so every rank ends up with
-        # the same ranks list and can pass it to new_group().
+        # This is the training-DP coordinate. Ranks with this same value
+        # receive the same TQ meta from the driver across TP/CP/PP axes.
+        my_dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=False)
         my_replica_ranks_t = torch.full(
             (world_size,), -1, dtype=torch.long, device="cuda",
         )
         my_replica_ranks_t[torch.distributed.get_rank()] = my_dp_rank
-        torch.distributed.all_reduce(my_replica_ranks_t, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(
+            my_replica_ranks_t, op=torch.distributed.ReduceOp.MAX
+        )
         all_dp_ranks = my_replica_ranks_t.tolist()
 
         # Every (dp_rank → ranks) bucket must call new_group on its own

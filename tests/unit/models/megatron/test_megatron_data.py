@@ -271,6 +271,112 @@ class TestProcessMicrobatch:
 
 
 @pytest.mark.mcore
+class TestPackedContextParallelTokenMapping:
+    """Tests for packed token preparation before Megatron-owned CP slicing."""
+
+    def test_pack_token_aligned_tensors_for_megatron(self):
+        from nemo_rl.models.megatron.data import (
+            _pack_token_aligned_tensors_for_megatron,
+        )
+
+        token_metadata = torch.arange(2 * 6 * 2, dtype=torch.long).reshape(2, 6, 2)
+        seq_lengths = torch.tensor([5, 4])
+        cu_seqlens_padded = torch.tensor([0, 8, 16], dtype=torch.int32)
+
+        packed = _pack_token_aligned_tensors_for_megatron(
+            {"metadata": token_metadata},
+            seq_lengths,
+            cu_seqlens_padded,
+        )
+
+        expected_padded = torch.zeros(16, 2, dtype=torch.long)
+        expected_padded[0:5] = token_metadata[0, :5]
+        expected_padded[8:12] = token_metadata[1, :4]
+
+        assert torch.equal(packed["metadata"], expected_padded.unsqueeze(0))
+
+    def test_slice_batch_delegates_dense_to_megatron(self, monkeypatch):
+        from nemo_rl.models.megatron import data as megatron_data
+
+        captured = {}
+
+        def fake_get_batch_on_this_cp_rank(batch):
+            captured["batch"] = batch
+            return {"tokens": batch["tokens"][:, [0, 3]]}
+
+        monkeypatch.setattr(
+            megatron_data,
+            "get_batch_on_this_cp_rank",
+            fake_get_batch_on_this_cp_rank,
+        )
+
+        dense_batch = {"tokens": torch.tensor([[10, 11, 12, 13]])}
+
+        sliced_batch, packed_seq_params = (
+            megatron_data._slice_batch_for_megatron_context_parallel(dense_batch)
+        )
+
+        assert captured["batch"] is not dense_batch
+        assert torch.equal(captured["batch"]["tokens"], dense_batch["tokens"])
+        assert torch.equal(sliced_batch["tokens"], torch.tensor([[10, 13]]))
+        assert packed_seq_params is None
+
+    def test_slice_batch_delegates_packed_thd_to_megatron(self, monkeypatch):
+        from nemo_rl.models.megatron import data as megatron_data
+
+        captured = {}
+        expected_params = MagicMock()
+
+        def fake_get_thd_batch_on_this_cp_rank(
+            batch,
+            cu_seqlens,
+            cu_seqlens_padded,
+            max_seqlen,
+            *,
+            cp_size,
+            cp_rank,
+        ):
+            captured["batch"] = batch
+            captured["cu_seqlens"] = cu_seqlens
+            captured["cu_seqlens_padded"] = cu_seqlens_padded
+            captured["max_seqlen"] = max_seqlen
+            captured["cp_size"] = cp_size
+            captured["cp_rank"] = cp_rank
+            return {"tokens": batch["tokens"][:, [0, 3]]}, expected_params
+
+        monkeypatch.setattr(
+            megatron_data,
+            "get_thd_batch_on_this_cp_rank",
+            fake_get_thd_batch_on_this_cp_rank,
+        )
+
+        packed_batch = {"tokens": torch.tensor([[10, 11, 12, 13]])}
+        cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+        cu_seqlens_padded = torch.tensor([0, 4], dtype=torch.int32)
+
+        sliced_batch, packed_seq_params = (
+            megatron_data._slice_batch_for_megatron_context_parallel(
+                packed_batch,
+                cu_seqlens,
+                cu_seqlens_padded,
+                4,
+                cp_rank=1,
+                cp_size=2,
+            )
+        )
+
+        assert captured["batch"] is not packed_batch
+        assert torch.equal(captured["batch"]["tokens"], packed_batch["tokens"])
+        assert captured["cu_seqlens"] is cu_seqlens
+        assert captured["cu_seqlens_padded"] is cu_seqlens_padded
+        assert torch.equal(captured["max_seqlen"], torch.tensor([4], dtype=torch.int32))
+        assert captured["cp_rank"] == 1
+        assert captured["cp_size"] == 2
+        assert torch.equal(sliced_batch["tokens"], torch.tensor([[10, 13]]))
+        assert packed_seq_params is expected_params
+
+
+@pytest.mark.mcore
 class TestProcessGlobalBatch:
     """Tests for process_global_batch function."""
 
