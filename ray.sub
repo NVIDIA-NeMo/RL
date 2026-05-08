@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --nodes=6
+#SBATCH --nodes=3
 #SBATCH --exclusive
 #SBATCH --account=general_sa
 #SBATCH --job-name=general_sa-nanov3.grpo
 #SBATCH --partition=batch
-#SBATCH --time=04:00:00
+#SBATCH --time=03:00:00
 #SBATCH --dependency=singleton
 
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.

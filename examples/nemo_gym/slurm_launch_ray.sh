@@ -7,7 +7,7 @@
 # After Slurm prints the JOBID, attach with:
 #   bash <JOBID>-attach.sh
 # then inside the container run:
-#   bash examples/nemo_gym/train_nano3_grpo.sh
+#   bash examples/nemo_gym/slurm_train_nano3_grpo.sh
 set -euo pipefail
 
 # read vars from env file
@@ -39,7 +39,7 @@ export HF_HOME_DIR=${EOS_ROOT}/hf_home
 export RESULT_DIR=${PROJECT_ROOT}/results/nemotron_3_nano_grpo
 export ENROOT_CACHE_PATH=${EOS_ROOT}/.enroot
 
-CONTAINER=/lustre/fsw/general_sa/xiyu/containers/nemo-rl-v0.6.0.sqsh
+CONTAINER=/lustre/fsw/general_sa/xiyu/containers/nemo-rl-v0.6.0_prime_verifiers.sqsh
 
 mkdir -p "${RESULT_DIR}/checkpoints" "${RESULT_DIR}/logs"
 
@@ -63,5 +63,5 @@ cat <<EOF
 Submitted Ray cluster bring-up. Once the job is RUNNING:
   squeue -u \$USER                             # find <JOBID>
   bash <JOBID>-attach.sh                       # drop into a shell on the head node
-  bash examples/nemo_gym/train_nano3_grpo.sh             # start training inside that shell
+  bash examples/nemo_gym/slurm_train_nano3_grpo.sh             # start training inside that shell
 EOF

@@ -14,7 +14,7 @@ RESULT_DIR=${PROJECT_ROOT}/results/nemotron_3_nano_grpo
 POLICY_MODEL_DIR=${EOS_ROOT}/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
 TOKENIZER_DIR=${POLICY_MODEL_DIR}
 
-NUM_NODES=6
+NUM_NODES=3
 GPUS_PER_NODE=8
 DATASET_NAME=dapo17k
 RUN_TAG=$(date -u +%y%m%d-%H%M)
@@ -23,7 +23,7 @@ export HF_HOME=/opt/hf_home
 export NRL_IGNORE_VERSION_MISMATCH=1
 
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
-  --config examples/nemo_gym/grpo_nanov3_48xH100.yaml \
+  --config examples/nemo_gym/grpo_nanov3_24xH100.yaml \
   cluster.num_nodes=${NUM_NODES} \
   cluster.gpus_per_node=${GPUS_PER_NODE} \
   data.train.data_path=${TRAIN_FILE} \
