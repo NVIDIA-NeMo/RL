@@ -389,6 +389,16 @@ def setup(
         os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
         print("  ✓ force_on_policy_ratio enabled")
 
+    # Validate skip_reference_policy_logprobs_calculation
+    if grpo_config.get("skip_reference_policy_logprobs_calculation"):
+        assert loss_config["reference_policy_kl_penalty"] == 0, (
+            "grpo.skip_reference_policy_logprobs_calculation=True requires "
+            "loss_fn.reference_policy_kl_penalty == 0"
+        )
+        print(
+            "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
+        )
+
     # ==========================
     #          Cluster
     # ==========================
@@ -1335,12 +1345,6 @@ def grpo_train(
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
-
-    if master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
-        assert master_config["loss_fn"]["reference_policy_kl_penalty"] == 0
-        print(
-            "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
-        )
 
     # Check if we need to sync KV cache scales
     # When fallback to policy as the policy_generation, we use getattr to check.
