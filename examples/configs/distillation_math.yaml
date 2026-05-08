@@ -16,7 +16,7 @@ distillation:
         # Modes:
         # - legacy: current dense OPD path.
         # - stream_teacher: stream teacher top-k refs; requires text-only OPD and
-        #   no teacher dynamic batching or sequence packing in v1.
+        #   no teacher dynamic batching in v1.
         # - stream_rollout: additionally trains student from token refs; v1
         #   rejects async rollouts, dynamic batching, sequence packing, and multimodal.
         # - sparse_loss: keeps stream_teacher transport and avoids dense [B,S,K]
@@ -24,7 +24,7 @@ distillation:
         #   packing, CP, and multimodal.
         # This example keeps dynamic_batching.enabled=true below, so it is
         # legacy-ready as written. For stream_teacher, disable teacher dynamic
-        # batching and sequence packing. For stream_rollout and sparse_loss,
+        # batching. For stream_rollout and sparse_loss,
         # disable dynamic batching and sequence packing for both policy and
         # teacher. stream_rollout also requires async rollouts to be disabled.
         mode: "legacy"

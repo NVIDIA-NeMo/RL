@@ -1488,6 +1488,56 @@ def token_chunk_to_batched_data(chunk: TokenChunk) -> Any:
     )
 
 
+def build_sequence_packing_args_from_config(
+    config: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    sequence_packing = config.get("sequence_packing", {})
+    if not (
+        isinstance(sequence_packing, Mapping)
+        and sequence_packing.get("enabled", False)
+    ):
+        return None
+
+    return {
+        "algorithm": sequence_packing["algorithm"],
+        "input_key": "input_ids",
+        "input_lengths_key": "input_lengths",
+        "max_tokens_per_microbatch": sequence_packing["logprob_mb_tokens"],
+        "sequence_length_pad_multiple": config["make_sequence_length_divisible_by"],
+    }
+
+
+def token_chunk_to_topk_batched_data(
+    chunk: TokenChunk,
+    *,
+    sequence_packing_args: Mapping[str, Any] | None = None,
+) -> tuple[Any, list[int] | None]:
+    data = token_chunk_to_batched_data(chunk)
+    if sequence_packing_args is None:
+        return data, None
+
+    sharded_data, packed_order_indices = data.shard_by_batch_size(
+        shards=1,
+        batch_size=None,
+        sequence_packing_args=sequence_packing_args,
+    )
+    return sharded_data[0], packed_order_indices
+
+
+def reorder_topk_batch_to_original_order(
+    topk_batch: Mapping[str, Any],
+    packed_order_indices: list[int] | None,
+) -> Any:
+    if packed_order_indices is None:
+        return topk_batch
+
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    reordered = BatchedDataDict(dict(topk_batch))
+    reordered.reorder_data(packed_order_indices)
+    return reordered
+
+
 def _resolve_chunk_micro_batch_size(
     *,
     chunk_batch_size: int,
@@ -1613,11 +1663,16 @@ def iter_annotated_teacher_topk_chunks(
     micro_batch_size: int | None = None,
     batch_id: str | None = None,
     put_fn: Callable[[object], object] | None = None,
+    sequence_packing_args: Mapping[str, Any] | None = None,
 ) -> Iterator[AnnotatedTokenChunk]:
     put = put_fn or (lambda value: value)
     for token_chunk in token_chunks:
+        topk_data, packed_order_indices = token_chunk_to_topk_batched_data(
+            token_chunk,
+            sequence_packing_args=sequence_packing_args,
+        )
         topk_batch = get_topk_logits(
-            data=token_chunk_to_batched_data(token_chunk),
+            data=topk_data,
             k=k,
             micro_batch_size=_resolve_chunk_micro_batch_size(
                 chunk_batch_size=int(token_chunk.sample_ids.numel()),
@@ -1626,6 +1681,10 @@ def iter_annotated_teacher_topk_chunks(
         )
         if topk_batch is None:
             continue
+        topk_batch = reorder_topk_batch_to_original_order(
+            topk_batch,
+            packed_order_indices,
+        )
         teacher_chunk = build_teacher_topk_chunk_from_dense(
             token_chunk=token_chunk,
             topk_logits=topk_batch["topk_logits"],

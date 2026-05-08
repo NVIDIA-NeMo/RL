@@ -34,6 +34,7 @@ from nemo_rl.algorithms.distillation_streaming import (
     attach_step_metadata,
     build_batch_manifest_from_train_data,
     build_conservation_oracle,
+    build_sequence_packing_args_from_config,
     build_repeated_sample_metadata,
     build_step_manifest,
     build_teacher_topk_chunk_from_dense,
@@ -553,6 +554,66 @@ def test_iter_annotated_teacher_topk_chunks_yields_refs_and_eos():
     assert outputs[0].token_chunk_ref is token_chunk
     assert isinstance(outputs[0].teacher_topk_ref, TeacherTopKChunk)
     assert outputs[1].end_of_stream is True
+
+
+def test_iter_annotated_teacher_topk_chunks_sequence_packs_local_chunk():
+    input_lengths = [2, 4, 3]
+    manifest = _batch_manifest(
+        sample_ids=[30, 31, 32],
+        update_group=[0, 0, 0],
+        global_batch_slot=[0, 1, 2],
+        input_lengths=input_lengths,
+    )
+    token_chunk = _token_chunk(manifest)
+    transport_width = token_chunk.input_ids.shape[1]
+    calls = []
+
+    sequence_packing_args = build_sequence_packing_args_from_config(
+        {
+            "make_sequence_length_divisible_by": 1,
+            "sequence_packing": {
+                "enabled": True,
+                "algorithm": "modified_first_fit_decreasing",
+                "logprob_mb_tokens": 4,
+            },
+        }
+    )
+
+    def fake_get_topk_logits(data, k, micro_batch_size):
+        calls.append((data, k, micro_batch_size))
+        assert data.micro_batch_indices is not None
+        assert data.micro_batch_lengths is not None
+        batch_size, sequence_length = data["input_ids"].shape
+        row_markers = data["input_ids"][:, 0].to(torch.float32)
+        return {
+            "topk_logits": row_markers.view(batch_size, 1, 1).expand(
+                batch_size,
+                sequence_length,
+                1,
+            ),
+            "topk_indices": row_markers.to(torch.int64)
+            .view(batch_size, 1, 1)
+            .expand(batch_size, sequence_length, 1),
+        }
+
+    outputs = list(
+        iter_annotated_teacher_topk_chunks(
+            token_chunks=[token_chunk],
+            get_topk_logits=fake_get_topk_logits,
+            k=1,
+            micro_batch_size=8,
+            put_fn=lambda value: value,
+            sequence_packing_args=sequence_packing_args,
+        )
+    )
+
+    assert calls[0][1:] == (1, 3)
+    teacher_chunk = outputs[0].teacher_topk_ref
+    expected_markers = []
+    for sample_index, input_length in enumerate(input_lengths):
+        expected_markers.extend([sample_index * transport_width] * (input_length - 1))
+    assert teacher_chunk.topk_logits[:, 0].tolist() == expected_markers
+    assert teacher_chunk.topk_indices[:, 0].tolist() == expected_markers
 
 
 def test_iter_annotated_teacher_topk_chunks_uses_batch_id_for_empty_shard_eos():

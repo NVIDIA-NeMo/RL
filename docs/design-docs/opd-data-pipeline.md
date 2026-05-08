@@ -542,7 +542,8 @@ Implemented v1 currently exposes three non-legacy modes:
 
 - `stream_teacher` streams teacher top-k refs into a student dense-batch
   compatibility path. It does not support multimodal OPD, teacher dynamic
-  batching, or teacher sequence packing.
+  batching, or dense driver-side teacher top-k gather. Teacher sequence packing
+  is supported by packing each local stream chunk before worker top-k inference.
 - `stream_rollout` adds a post-rollout token normalizer and a ref-only student
   consumer. It still receives rollout message logs on the driver in v1; it
   avoids passing the dense post-rollout train batch into student training. It

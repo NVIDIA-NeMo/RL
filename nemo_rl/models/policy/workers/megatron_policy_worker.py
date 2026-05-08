@@ -776,6 +776,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         import ray
 
         from nemo_rl.algorithms.distillation_streaming import (
+            build_sequence_packing_args_from_config,
             iter_annotated_teacher_topk_chunks,
         )
 
@@ -787,6 +788,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 micro_batch_size=micro_batch_size,
                 batch_id=batch_id,
                 put_fn=ray.put,
+                sequence_packing_args=build_sequence_packing_args_from_config(self.cfg),
             )
         )
 
