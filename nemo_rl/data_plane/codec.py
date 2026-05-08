@@ -77,34 +77,15 @@ def to_nested_by_length(
     return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
 
-# Wire-format kill-switch: backends that can't carry torch.nested tensors
-# (e.g. mooncake_cpu, whose C++ MemcpyWorkerPool segfaults on jagged
-# pointer arithmetic) flip this to False at adapter init, forcing the
-# writer back to padded. Default is jagged (the bandwidth win on simple).
-_PACK_JAGGED = True
-
-# 1D field round-trip kill-switch: TQ's KVStorageManager path silently
-# unsqueezes 1D fields in metadata while row-iterating them in data
-# (transfer_queue/metadata.py:171 vs storage/managers/base.py:_generate_values).
-# Backends that go through that path (mooncake_cpu) need the writer to
-# unsqueeze 1D fields to (N, 1) so per-row tensors match the metadata
-# shape; the reader then squeezes the trailing 1 back. Independent of
-# wire-format encoding (jagged vs padded). Default off — only the
-# affected adapter flips it.
+# 1D field round-trip kill-switch for the KV-path. TQ's
+# KVStorageManager silently unsqueezes 1D fields in metadata while
+# row-iterating them in data (transfer_queue/metadata.py:171 vs
+# storage/managers/base.py:_generate_values). Backends that go through
+# that path (mooncake_cpu) need the writer to unsqueeze 1D fields to
+# (N, 1) so per-row tensors match the metadata shape; the reader then
+# squeezes the trailing 1 back. Default off — only the affected
+# adapter flips it.
 _KV_PROMOTE_1D = False
-
-
-def set_wire_format(jagged: bool) -> None:
-    """Adapter hook: set whether writers should pack to nested tensors.
-
-    Called once by the TQ adapter at init time based on
-    ``data_plane.backend``. Mooncake_cpu sets this to ``False`` so all
-    writes stay rectangular (the bench validated mooncake against
-    padded tensors only). Simple backend stays jagged for the
-    bandwidth/memory win.
-    """
-    global _PACK_JAGGED
-    _PACK_JAGGED = bool(jagged)
 
 
 def set_kv_promote_1d(enabled: bool) -> None:
@@ -113,7 +94,7 @@ def set_kv_promote_1d(enabled: bool) -> None:
 
     Required by backends that go through TQ's KVStorageManager path
     (mooncake_cpu) — see ``_KV_PROMOTE_1D`` above for the schema/data
-    mismatch. Independent of jagged-vs-padded wire encoding.
+    mismatch.
     """
     global _KV_PROMOTE_1D
     _KV_PROMOTE_1D = bool(enabled)
@@ -132,13 +113,7 @@ def maybe_pack_jagged(
     land in TQ as jagged with the same row lengths — read-time
     materialization then pads them all to the same target shape,
     avoiding shape-mismatch crashes between mixed wire formats.
-
-    No-op when :func:`set_wire_format` has been called with
-    ``jagged=False`` — used by the mooncake_cpu adapter to stay on the
-    padded path that backend's C++ memcpy worker actually supports.
     """
-    if not _PACK_JAGGED:
-        return val.detach().contiguous()
     n = lengths.shape[0]
     if n == 0:
         return val.detach().contiguous()
@@ -164,8 +139,6 @@ def pack_per_token_field(val: torch.Tensor, lengths: torch.Tensor) -> torch.Tens
     Falls back to rectangular when ``val`` cannot be jaggedized
     (wrong batch dim, < 2D, or seq dim shorter than ``max(lengths)``).
     """
-    if not _PACK_JAGGED:
-        return val.detach().contiguous()
     n = lengths.shape[0]
     if n == 0:
         return val.detach().contiguous()
