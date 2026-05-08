@@ -240,6 +240,7 @@ class MegatronConfig(TypedDict):
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
+    gradient_accumulation_fusion: NotRequired[bool]
     # When True, uses chunked linear cross-entropy fusion loss to compute loss
     # directly from hidden states, avoiding materialization of the full
     # [batch, seq_len, vocab_size] logit tensor. This significantly reduces peak
@@ -346,3 +347,10 @@ class PolicyConfig(TypedDict):
         | SchedulerMilestones
         | None
     ]
+
+    # quantization configs
+    quant_cfg: NotRequired[str | None]
+    quant_calib_data: NotRequired[str | None]
+    quant_calib_size: NotRequired[int | None]
+    quant_batch_size: NotRequired[int | None]
+    quant_sequence_length: NotRequired[int | None]

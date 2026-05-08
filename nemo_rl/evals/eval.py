@@ -435,11 +435,16 @@ async def _run_env_eval_impl(
 async def _generate_texts(vllm_generation, inputs, use_async):
     """Generate texts using either sync or async method."""
     if use_async:
-        # Use async generation - collect all results
-        results = []
-        async for idx, result in vllm_generation.generate_text_async(inputs):
-            results.append((idx, result["texts"][0]))
+        # generate_text_async accepts one sample per call; fan out and gather.
+        async def _generate_single_sample(i):
+            single = inputs.slice(i, i + 1)
+            async for _, result in vllm_generation.generate_text_async(single):
+                return (i, result["texts"][0])
+            raise RuntimeError(f"No output produced for sample {i}")
 
+        results = await asyncio.gather(
+            *(_generate_single_sample(i) for i in range(inputs.size))
+        )
         # Sort by index to maintain order
         results.sort(key=lambda x: x[0])
         return [text for _, text in results]
