@@ -1547,9 +1547,9 @@ def mock_grpo_components():
                     "vllm_cfg": {"async_engine": True},  # Support async mode
                 },
             },
-            "loss_fn": {
-                "use_importance_sampling_correction": True,  # Required for async mode
-            },
+            "loss_fn": ClippedPGLossConfig(
+                use_importance_sampling_correction=True  # Required for async mode
+            ),
             "checkpointing": {
                 "enabled": False,
                 "checkpoint_must_save_by": None,
@@ -1837,7 +1837,7 @@ def test_grpo_advantage_estimator_zero_std():
         "use_leave_one_out_baseline": False,
         "normalize_rewards": True,
     }
-    loss_config = {}
+    loss_config = ClippedPGLossConfig()
     estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
 
     # prompt 0: all same rewards -> std=0; prompt 1: different rewards -> std>0
@@ -1876,7 +1876,7 @@ def test_grpo_advantage_estimator_tensor_shapes():
         "use_leave_one_out_baseline": False,
         "normalize_rewards": True,
     }
-    loss_config = {}
+    loss_config = ClippedPGLossConfig()
     estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
 
     # Test with batch size 2
@@ -1923,7 +1923,7 @@ def test_grpo_advantage_estimator_negative_advantages():
         "use_leave_one_out_baseline": False,
         "normalize_rewards": True,
     }
-    loss_config = {}
+    loss_config = ClippedPGLossConfig()
     estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
 
     # Rewards with values below and above mean
@@ -1957,7 +1957,7 @@ def test_grpo_advantage_estimator_zero_std_and_zero_advantage():
         "use_leave_one_out_baseline": False,
         "normalize_rewards": True,
     }
-    loss_config = {}
+    loss_config = ClippedPGLossConfig()
     estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
 
     # All rewards identical -> std=0, all advantages=0
@@ -1986,7 +1986,7 @@ def test_grpo_advantage_estimator_small_nonzero_std():
         "use_leave_one_out_baseline": False,
         "normalize_rewards": True,
     }
-    loss_config = {}
+    loss_config = ClippedPGLossConfig()
     estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
 
     # Small reward differences -> small std but non-zero
@@ -2022,7 +2022,7 @@ def test_gdpo_advantage_estimator_multiple_rewards():
         "use_leave_one_out_baseline": False,
         "normalize_rewards": True,
     }
-    loss_config = {}
+    loss_config = ClippedPGLossConfig()
     estimator = GDPOAdvantageEstimator(estimator_config, loss_config)
 
     prompt_ids = torch.tensor([[0], [0]])
@@ -2045,7 +2045,7 @@ def test_gdpo_advantage_estimator_single_reward():
         "use_leave_one_out_baseline": False,
         "normalize_rewards": True,
     }
-    loss_config = {}
+    loss_config = ClippedPGLossConfig()
     estimator = GDPOAdvantageEstimator(estimator_config, loss_config)
 
     prompt_ids = torch.tensor([[0], [0]])
@@ -2071,11 +2071,11 @@ def test_reinforce_plus_plus_global_normalization():
     estimator_config = {
         "minus_baseline": True,
     }
-    loss_config = {
-        "use_kl_in_reward": False,
-        "reference_policy_kl_penalty": 0.0001,
-        "reference_policy_kl_type": "k2",
-    }
+    loss_config = ClippedPGLossConfig(
+        use_kl_in_reward=False,
+        reference_policy_kl_penalty=0.0001,
+        reference_policy_kl_type="k2",
+    )
     estimator = ReinforcePlusPlusAdvantageEstimator(estimator_config, loss_config)
 
     prompt_ids = torch.tensor(
