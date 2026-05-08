@@ -54,7 +54,7 @@ dependencies = [
   "nccl4py; sys_platform != 'darwin'",                                                                                # for non-colocated refit
   "cuda-bindings; sys_platform != 'darwin'",                                                                          # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
-  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                                                     # for transformer-engine no build isolation
+  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                           # for transformer-engine no build isolation
 ]
 
 [project.optional-dependencies]
