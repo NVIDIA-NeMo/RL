@@ -11,9 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Wire <-> trainer codec.
-
-Phase 1 of the jagged-on-the-wire plan (mirrors verl):
+"""Wire <-> trainer codec — jagged-on-the-wire bridge.
 
   * Writer side: variable-length fields are encoded as
     ``torch.nested.nested_tensor`` with ``layout=torch.jagged`` before
@@ -27,11 +25,8 @@ Phase 1 of the jagged-on-the-wire plan (mirrors verl):
     code consumes the padded BatchedDataDict unchanged.
 
   * Worker write-backs that produce ``response``-shaped outputs use
-    :func:`response_from_nested` (same shape contract as verl's
-    ``verl/workers/utils/padding.py:response_from_nested``).
-
-Stage 2 (future) will migrate trainer code to natively consume
-nested tensors, retiring the bridge.
+    :func:`response_from_nested` to extract the response slice from a
+    (prompt+response) nested tensor.
 """
 
 from __future__ import annotations
@@ -154,7 +149,6 @@ def response_from_nested(
 ) -> torch.Tensor:
     """Extract the response slice from a (prompt+response) nested tensor.
 
-    Mirrors verl ``verl/workers/utils/padding.py:response_from_nested``.
     Used on the worker side for logprob / ref-logprob write-back where
     only the response-token slice is interesting downstream.
 
@@ -215,7 +209,7 @@ def materialize(
         if not isinstance(val, torch.Tensor):
             raise TypeError(
                 f"materialize() received non-tensor leaf {key!r}: {type(val)}. "
-                "Wire format must be tensor-only (P3)."
+                "Wire format must be tensor-only."
             )
         if val.is_nested and layout == "padded":
             pad = pads.get(key, 0)

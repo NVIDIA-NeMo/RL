@@ -13,10 +13,9 @@
 # limitations under the License.
 """Driver-side TQ I/O helpers: fetch a slice + materialize, write deltas back.
 
-Mirrors verl ``main_ppo_sync.py:_compute_old_log_prob`` /
-``_compute_advantage``: fetch the columns the driver consumes, transform,
-write deltas. Worker-side dispatches use the equivalents on
-``AbstractPolicyWorker`` (``self._fetch(meta)`` / ``self._write_back``).
+Fetch the columns the driver consumes, transform, write deltas. Worker-
+side dispatches use the equivalents on ``AbstractPolicyWorker``
+(``self._fetch(meta)`` / ``self._write_back``).
 """
 
 from typing import Any, Sequence

@@ -13,14 +13,12 @@
 # limitations under the License.
 """Driver-side balanced packing + per-rank fan-out helpers.
 
-Extracted from the ``grpo_sync`` inline block (commit a085559c) so the same
-two operations can be reused across both sync and async data-plane trainers.
-
-These helpers operate on full ``BatchedDataDict``s and rely on
-``shard_by_batch_size``'s ``bin_count_multiple=DP_world`` behavior to keep
-per-rank microbatch counts uniform — without that, sequence packing /
-dynamic batching produce variable per-rank bin counts and Megatron
-deadlocks at the first cross-DP collective.
+Shared by sync and async data-plane trainers. Operates on full
+``BatchedDataDict``s and relies on ``shard_by_batch_size``'s
+``bin_count_multiple=DP_world`` behavior to keep per-rank microbatch
+counts uniform — without that, sequence packing / dynamic batching
+produce variable per-rank bin counts and Megatron deadlocks at the
+first cross-DP collective.
 """
 
 from __future__ import annotations
@@ -72,15 +70,14 @@ def shard_meta_for_dp(
 ) -> tuple[list[KVBatchMeta], Optional[list[int]]]:
     """Pure key-list split: assign ``meta.keys`` to ``dp_world`` ranks.
 
-    Mirrors verl's ``BatchData.chunk(KVBatchMeta)`` (verl/protocol.py:1271-1289)
-    with NeMo-RL's seq-len-aware packing on top. **No I/O, no key minting.**
-    Returned per-rank metas reference subsets of the input ``meta.keys``
-    under the same ``partition_id``; workers fetch their slice via the
-    existing ``*_presharded`` flow.
+    Seq-len-aware on top of ``shard_by_batch_size``. **No I/O, no key
+    minting.** Returned per-rank metas reference subsets of the input
+    ``meta.keys`` under the same ``partition_id``; workers fetch their
+    slice via the existing ``*_presharded`` flow.
 
     Use this for every dispatch *after* rollout (logprob, ref-logprob, train).
-    The rollout actor's first write is a flat ``kv_batch_put`` (see
-    :func:`nemo_rl.experience.sync_rollout_actor.kv_first_write`) — no fan-out.
+    The rollout actor's first write is a flat ``kv_batch_put`` via
+    :func:`nemo_rl.experience.sync_rollout_actor.kv_first_write` — no fan-out.
 
     Per-rank packing metadata (``micro_batch_indices`` /
     ``micro_batch_lengths`` / ``elem_counts_per_gb``) lands in each shard's
