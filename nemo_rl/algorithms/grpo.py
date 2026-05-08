@@ -566,6 +566,24 @@ def setup(
     # Define initialization functions that will be used in all paths
     init_reference_model = master_config["loss_fn"]["reference_policy_kl_penalty"] > 0
 
+    # Auto-enable skip_reference_policy_logprobs_calculation when the reference
+    # model is not loaded (per yuki-97 / terrykong review on PR #2178).
+    # Without this, training loops would still call
+    # policy.get_reference_policy_logprobs() and crash inside
+    # use_reference_model() because reference_state_dict was never initialized
+    # (issue #1968 Bug 1).  Affects existing recipes that have
+    # reference_policy_kl_penalty=0 without setting the skip flag, e.g.
+    # examples/configs/recipes/llm/grpo-deepscaler-1.5b-8K.yaml.
+    if not init_reference_model and not master_config["grpo"].get(
+        "skip_reference_policy_logprobs_calculation"
+    ):
+        master_config["grpo"]["skip_reference_policy_logprobs_calculation"] = True
+        print(
+            "Auto-enabling `grpo.skip_reference_policy_logprobs_calculation=True` "
+            "because `loss_fn.reference_policy_kl_penalty == 0` "
+            "(reference model is not loaded)."
+        )
+
     def init_policy():
         """Initialize policy training workers."""
         t0 = time.perf_counter()
