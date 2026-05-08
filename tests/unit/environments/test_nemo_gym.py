@@ -119,6 +119,66 @@ def test_summarize_nemo_gym_empty_generation_result_handles_non_dict_response():
     assert summary["request"]["model"] == "dummy-model"
 
 
+def test_summarize_nemo_gym_empty_generation_result_survives_tokenizer_failure():
+    """If tokenizing the request input itself raises (e.g. jinja UndefinedError
+    on a malformed message dict), the summary helper must capture that error in
+    ``prompt_token_count_error`` and still return the rest of the diagnostic —
+    otherwise we fail during exception handling and lose the real cause."""
+
+    class _RaisingTokenizer:
+        def apply_chat_template(self, *args, **kwargs):
+            raise RuntimeError("template render failed")
+
+    summary = _summarize_nemo_gym_empty_generation_result(
+        {
+            "responses_create_params": {
+                "model": "dummy-model",
+                "input": [{"not_a_role": "user"}],
+            },
+            "response": {
+                "status": "incomplete",
+                "output": [],
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+        },
+        tokenizer=_RaisingTokenizer(),
+    )
+
+    assert "prompt_token_count" not in summary
+    assert summary["prompt_token_count_error"].startswith("RuntimeError: ")
+    assert summary["response_status"] == "incomplete"
+    assert summary["response_incomplete_details"] == {"reason": "max_output_tokens"}
+    assert summary["request"]["model"] == "dummy-model"
+
+
+def test_summarize_nemo_gym_empty_generation_result_includes_prompt_token_count():
+    """When a working tokenizer is provided, the summary should include
+    ``prompt_token_count`` so operators still get the prompt length they had
+    before — just sourced through the safe path."""
+
+    class _CountingTokenizer:
+        def apply_chat_template(self, input_messages, tokenize=True):
+            assert tokenize is True
+            return list(range(len(input_messages) * 3))
+
+    summary = _summarize_nemo_gym_empty_generation_result(
+        {
+            "responses_create_params": {
+                "model": "dummy-model",
+                "input": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ],
+            },
+            "response": {"status": "incomplete", "output": []},
+        },
+        tokenizer=_CountingTokenizer(),
+    )
+
+    assert summary["prompt_token_count"] == 6
+    assert "prompt_token_count_error" not in summary
+
+
 @pytest.fixture(scope="function")
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)

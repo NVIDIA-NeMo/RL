@@ -87,6 +87,32 @@ def _summarize_nemo_gym_output_item(output_item: Any) -> dict[str, Any]:
     return summary
 
 
+def _safe_prompt_token_count(
+    responses_create_params: Any,
+    tokenizer: Any,
+) -> tuple[int | None, str | None]:
+    """Best-effort prompt token count for the empty-generation diagnostic.
+
+    Tokenizing via ``apply_chat_template`` can itself raise — most commonly
+    ``jinja2.exceptions.UndefinedError`` when the request input is malformed
+    (e.g. a dict missing ``role``). That must not mask the underlying empty-
+    generation failure while we're building the diagnostic summary.
+
+    Returns ``(token_count, error)``: exactly one is non-None on a real attempt,
+    and both are None when no attempt was made (no tokenizer / no input).
+    """
+    if tokenizer is None or not isinstance(responses_create_params, dict):
+        return None, None
+    input_messages = responses_create_params.get("input")
+    if input_messages is None:
+        return None, None
+    try:
+        token_ids = tokenizer.apply_chat_template(input_messages, tokenize=True)
+        return len(token_ids), None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {_truncate_error_value(exc)}"
+
+
 def _summarize_nemo_gym_request_params(
     responses_create_params: Any,
 ) -> dict[str, Any]:
@@ -126,16 +152,27 @@ def _summarize_nemo_gym_request_params(
 
 def _summarize_nemo_gym_empty_generation_result(
     nemo_gym_result: dict[str, Any],
+    tokenizer: Any = None,
 ) -> dict[str, Any]:
+    responses_create_params = nemo_gym_result.get("responses_create_params")
     response = nemo_gym_result.get("response")
+
+    summary: dict[str, Any] = {
+        "request": _summarize_nemo_gym_request_params(responses_create_params),
+    }
+
+    prompt_token_count, prompt_token_count_error = _safe_prompt_token_count(
+        responses_create_params, tokenizer
+    )
+    if prompt_token_count is not None:
+        summary["prompt_token_count"] = prompt_token_count
+    if prompt_token_count_error is not None:
+        summary["prompt_token_count_error"] = prompt_token_count_error
+
     if not isinstance(response, dict):
-        return {
-            "request": _summarize_nemo_gym_request_params(
-                nemo_gym_result.get("responses_create_params")
-            ),
-            "response_python_type": type(response).__name__,
-            "response_repr": _truncate_error_value(response),
-        }
+        summary["response_python_type"] = type(response).__name__
+        summary["response_repr"] = _truncate_error_value(response)
+        return summary
 
     output_items = response.get("output")
     if isinstance(output_items, list):
@@ -152,19 +189,18 @@ def _summarize_nemo_gym_empty_generation_result(
         ]
         output_count = None
 
-    summary = {
-        "request": _summarize_nemo_gym_request_params(
-            nemo_gym_result.get("responses_create_params")
-        ),
-        "response_keys": sorted(response.keys()),
-        "response_status": response.get("status"),
-        "response_finish_reason": response.get("finish_reason"),
-        "response_incomplete_details": response.get("incomplete_details"),
-        "response_error": response.get("error"),
-        "usage": response.get("usage"),
-        "output_count": output_count,
-        "output_summary": output_summary,
-    }
+    summary.update(
+        {
+            "response_keys": sorted(response.keys()),
+            "response_status": response.get("status"),
+            "response_finish_reason": response.get("finish_reason"),
+            "response_incomplete_details": response.get("incomplete_details"),
+            "response_error": response.get("error"),
+            "usage": response.get("usage"),
+            "output_count": output_count,
+            "output_summary": output_summary,
+        }
+    )
 
     if "id" in response:
         summary["response_id"] = response["id"]
@@ -382,16 +418,11 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             output_item_dict.pop("generation_log_probs")
 
         if not nemo_rl_message_log:
-            input_messages = nemo_gym_result["responses_create_params"]["input"]
-            prompt_token_ids = tokenizer.apply_chat_template(
-                input_messages, tokenize=True
-            )
             response_summary = _summarize_nemo_gym_empty_generation_result(
-                nemo_gym_result
+                nemo_gym_result, tokenizer=tokenizer
             )
             raise ValueError(
                 "NeMo Gym returned a result with no generation data.\n"
-                f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
                 "  Response summary:\n"
                 f"  {json.dumps(response_summary, indent=2, sort_keys=True, default=str)}"
             )
