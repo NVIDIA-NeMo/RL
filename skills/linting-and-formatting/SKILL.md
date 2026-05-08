@@ -1,6 +1,7 @@
 ---
-name: code-style
-description: Code style guidelines for NeMo-RL (Python and shell). Covers naming, indentation, comments, docstrings, reflection avoidance, and uv usage. Auto-invoked during code review.
+name: linting-and-formatting
+description: Code style guidelines for NeMo-RL (Python and shell). Covers naming, indentation, comments, docstrings, reflection avoidance, and uv usage.
+when_to_use: Reviewing code style; writing or checking Python or shell code; 'is this naming right', 'docstring format', 'style violation', 'how should I format this', during code review.
 ---
 
 # Code Style
