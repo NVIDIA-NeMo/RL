@@ -34,7 +34,7 @@ from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.driver_io import read_columns, write_columns
 from nemo_rl.data_plane.preshard import DP_SEED_FIELDS, shard_meta_for_dp
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.algorithms.sync_utils import kv_first_write
+from nemo_rl.experience.sync_rollout_actor import kv_first_write
 
 
 def _final_batch(n: int = 4) -> BatchedDataDict:

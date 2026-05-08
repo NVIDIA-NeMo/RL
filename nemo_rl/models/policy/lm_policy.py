@@ -58,43 +58,6 @@ from nemo_rl.utils.timer import Timer
 PathLike = Union[str, "os.PathLike[Any]"]
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Per-stage aggregators that assemble per-rank worker results into the
-# shape each Policy method returns. Reused by ``TQPolicy`` overrides.
-# ──────────────────────────────────────────────────────────────────────────
-
-
-def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
-    out: dict[str, Any] = {
-        "loss": results[0]["global_loss"],
-        "grad_norm": results[0]["grad_norm"],
-    }
-    if "moe_metrics" in results[0]:
-        out["moe_metrics"] = results[0]["moe_metrics"]
-    all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
-    for r in results:
-        for k, v in r["all_mb_metrics"].items():
-            all_mb_metrics[k].extend(v)
-    out["all_mb_metrics"] = dict(all_mb_metrics)
-    return out
-
-
-def _aggregate_logprob_results(
-    results: list[BatchedDataDict[Any]],
-) -> BatchedDataDict[Any]:
-    return BatchedDataDict.from_batches(
-        results, pad_value_dict={"logprobs": 0.0}
-    )
-
-
-def _aggregate_reference_logprob_results(
-    results: list[BatchedDataDict[Any]],
-) -> BatchedDataDict[Any]:
-    return BatchedDataDict.from_batches(
-        results, pad_value_dict={"reference_logprobs": 0.0}
-    )
-
-
 class Policy(ColocatablePolicyInterface, GenerationInterface):
     def __init__(
         self,
@@ -593,34 +556,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         timer: Optional[Timer] = None,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data: list[SlicedDataDict]
-        unsorted_data_indices: list[int]
         with timer.time("get_topk_logits/shard_data") if timer else nullcontext():
-            if self.use_dynamic_batches:
-                self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
-                    "dynamic_batching"
-                ]["logprob_mb_tokens"]
-                sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
-                    dp_size,
-                    batch_size=None,
-                    dynamic_batching_args=self.dynamic_batching_args,
-                )
-            elif self.use_sequence_packing:
-                self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
-                    "sequence_packing"
-                ]["logprob_mb_tokens"]
-                # we just shard into DP shards here as Sequence packing allows for CP.
-                sharded_data, unsorted_data_indices = data.shard_by_batch_size(
-                    dp_size,
-                    batch_size=None,
-                    sequence_packing_args=self.sequence_packing_args,
-                )
-            else:
-                sharded_data = data.shard_by_batch_size(  # type: ignore
-                    dp_size,
-                    batch_size=None,
-                )
+            sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
 
         with (
             timer.time("get_topk_logits/submit_topk_logits_futures")
@@ -653,7 +590,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
         stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
 
-        if self.use_dynamic_batches or self.use_sequence_packing:
+        if unsorted_data_indices is not None:
             stacked.reorder_data(unsorted_data_indices)
 
         return stacked

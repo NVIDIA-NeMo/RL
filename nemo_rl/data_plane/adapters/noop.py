@@ -35,6 +35,23 @@ from tensordict import TensorDict
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 
 
+def _stack_or_nest(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Stack equal-shape rows; reconstruct as jagged nested when ragged.
+
+    Mirrors what the TQ adapter returns: per-token fields written via
+    :func:`nemo_rl.data_plane.codec.maybe_pack_jagged` arrive as nested
+    tensors and must come back as nested tensors so consumers (notably
+    :func:`codec.materialize`) take the same branch they would on the
+    real adapter.
+    """
+    if not tensors:
+        return torch.empty(0)
+    first_shape = tensors[0].shape
+    if all(t.shape == first_shape for t in tensors):
+        return torch.stack(tensors, dim=0)
+    return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+
+
 def _reject_non_tensor_leaves(td: TensorDict) -> None:
     """P3 — no pickle on the bus. Mirror of the TQ adapter check.
 
@@ -220,7 +237,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
                     )
                 out[f].append(row[f])
 
-        stacked = {f: torch.stack(out[f], dim=0) for f in select_fields}
+        stacked = {f: _stack_or_nest(out[f]) for f in select_fields}
         return TensorDict(stacked, batch_size=(len(keys),))
 
     def kv_clear(self, keys: list[str] | None, partition_id: str) -> None:

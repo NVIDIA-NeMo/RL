@@ -46,7 +46,7 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     # ReplayBuffer needs vLLM environment to handle trajectory data from VllmGenerationWorker
     "nemo_rl.algorithms.async_utils.ReplayBuffer": PY_EXECUTABLES.VLLM,
     # SyncRolloutActor drives vLLM rollouts and writes flattened tensors (tensordict) to TQ
-    "nemo_rl.algorithms.sync_utils.SyncRolloutActor": PY_EXECUTABLES.VLLM,
+    "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": PY_EXECUTABLES.VLLM,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.nemo_gym.NemoGym": PY_EXECUTABLES.NEMO_GYM,
 }

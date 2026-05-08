@@ -36,7 +36,7 @@ from nemo_rl.data_plane.preshard import (
     shard_meta_for_dp,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.algorithms.sync_utils import kv_first_write
+from nemo_rl.experience.sync_rollout_actor import kv_first_write
 
 
 def _final_batch(n_samples: int = 4, *, with_extras: bool = False) -> BatchedDataDict:

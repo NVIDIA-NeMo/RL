@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Literal, NotRequired, Sequence, TypedDict
+from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
 from tensordict import TensorDict
 
@@ -53,12 +53,15 @@ class ObservabilityConfig(TypedDict):
     """Optional middleware that records per-op metrics on the client.
 
     Off by default. When ``enabled=True`` the factory wraps the chosen
-    adapter with :class:`MetricsDataPlaneClient`. See
-    ``research/data_plane_observability.md`` for the design.
+    adapter with :class:`MetricsDataPlaneClient`. ``callback`` is
+    injected programmatically (callables don't round-trip through
+    YAML) — set ``cfg["observability"]["callback"] = my_fn`` before
+    :func:`build_data_plane_client` to plug into wandb / file / log.
+    Default callback prints one line per op for debug.
     """
 
     enabled: bool
-    sink: NotRequired[Literal["memory", "log"]]
+    callback: NotRequired[Callable[[dict[str, Any]], None]]
 
 
 @dataclass

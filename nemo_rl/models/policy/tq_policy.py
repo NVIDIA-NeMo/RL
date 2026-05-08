@@ -18,7 +18,7 @@ Exposes ``train_from_meta`` / ``get_logprobs_from_meta`` /
 ``Policy.{train, get_logprobs, get_reference_policy_logprobs}`` but
 accepting a ``KVBatchMeta`` instead of a ``BatchedDataDict``. The meta
 names per-sample TQ keys minted once at rollout
-(:class:`nemo_rl.algorithms.sync_utils.SyncRolloutActor`); each
+(:class:`nemo_rl.experience.sync_rollout_actor.SyncRolloutActor`); each
 dispatch slices the key list per DP rank via
 :func:`nemo_rl.data_plane.preshard.shard_meta_for_dp` (no re-fan-out,
 no key minting). Workers fetch their slice from TQ via
@@ -30,6 +30,7 @@ no key minting). Workers fetch their slice from TQ via
 from __future__ import annotations
 
 import warnings
+from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, Optional
@@ -49,14 +50,48 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
-from nemo_rl.models.policy.lm_policy import (
-    Policy,
-    _aggregate_logprob_results,
-    _aggregate_reference_logprob_results,
-    _aggregate_train_results,
-)
+from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Per-stage aggregators that assemble per-rank worker results into the
+# shape each Policy method returns. Used by the TQ-mediated overrides
+# below; kept out of ``lm_policy.Policy`` since the legacy in-memory
+# path doesn't fan out per-rank and never calls these.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "loss": results[0]["global_loss"],
+        "grad_norm": results[0]["grad_norm"],
+    }
+    if "moe_metrics" in results[0]:
+        out["moe_metrics"] = results[0]["moe_metrics"]
+    all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
+    for r in results:
+        for k, v in r["all_mb_metrics"].items():
+            all_mb_metrics[k].extend(v)
+    out["all_mb_metrics"] = dict(all_mb_metrics)
+    return out
+
+
+def _aggregate_logprob_results(
+    results: list[BatchedDataDict[Any]],
+) -> BatchedDataDict[Any]:
+    return BatchedDataDict.from_batches(
+        results, pad_value_dict={"logprobs": 0.0}
+    )
+
+
+def _aggregate_reference_logprob_results(
+    results: list[BatchedDataDict[Any]],
+) -> BatchedDataDict[Any]:
+    return BatchedDataDict.from_batches(
+        results, pad_value_dict={"reference_logprobs": 0.0}
+    )
 
 
 class TQPolicy(Policy):
