@@ -1103,11 +1103,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 [self.model]
             )
 
+        # ``num_hidden_layers`` is only consumed by the MXFP8 quantization
+        # path on the downstream ``zhw/mxfp8_support`` branch (which sets
+        # it from ``transformer_config.num_layers``). On this branch the
+        # MXFP8 path is unreachable, so 0 is fine.
         num_hidden_layers = 0
-        if target_precision == "mxfp8":
-            num_hidden_layers = int(
-                getattr(self.megatron_bridge.transformer_config, "num_layers", 0)
-            )
 
         return MegatronSGLangHfWeightIterator(
             megatron_bridge=self.megatron_bridge,

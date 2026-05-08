@@ -20,12 +20,12 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 class SglangQuantizationConfig(TypedDict, total=False):
     """SGLang weight-precision config.
 
-    ``scheme="bf16"`` (or omitting the block) means BF16 rollout/refit. Set
-    ``scheme="mxfp8"`` to boot SGLang from an MXFP8 HF checkpoint and to send
-    MXFP8 HF tensors during online refit.
+    ``scheme="bf16"`` (or omitting the block) means BF16 rollout/refit. The
+    quantized-rollout schemes that consume the rest of these fields (e.g.
+    ``mxfp8``) are layered on a downstream branch.
     """
 
-    scheme: str  # "bf16" | "mxfp8"
+    scheme: str  # "bf16" | <quantized scheme name from a downstream branch>
     weight_block_size: list[int]
     scale_fmt: str
     modules_to_not_convert: list[str]
@@ -123,7 +123,8 @@ class SglangSpecificArgs(TypedDict):
     rollout_health_check_interval: NotRequired[int]
     rollout_health_check_timeout: NotRequired[int]
     rollout_health_check_first_wait: NotRequired[int]
-    # Weight precision and (when scheme=mxfp8) offline-conversion knobs.
+    # Weight precision and (when a quantized scheme is selected on a
+    # downstream branch) offline-conversion knobs.
     quantization: NotRequired[SglangQuantizationConfig]
 
 

@@ -15,10 +15,9 @@
 """SGLang-only HF weight iterator for the Megatron policy worker.
 
 Emits buckets of HF-named tensors restored from Megatron via AutoBridge,
-with no vLLM-specific KV/Q scale tensors. When
-``target_precision == "mxfp8"`` the iterator additionally applies the
-offline ``should_quantize`` / ``quantize_mxfp8`` core to each finalized
-HF tensor.
+with no vLLM-specific KV/Q scale tensors. The ``target_precision="mxfp8"``
+branch is reserved here as a stable interface; the actual quantization
+implementation is layered on the downstream ``zhw/mxfp8_support`` branch.
 """
 
 from __future__ import annotations
@@ -27,14 +26,6 @@ from typing import Any, Iterator, Literal
 
 import torch
 
-from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
-    build_dynamic_skip_substrings,
-    quantize_mxfp8,
-    should_quantize,
-    SOURCE_FP8_SCALE_KEY_SUFFIX,
-    strip_weight_suffix,
-)
-
 
 class MegatronSGLangHfWeightIterator:
     """Yield buckets of finalized HF named tensors for SGLang weight refit.
@@ -42,8 +33,9 @@ class MegatronSGLangHfWeightIterator:
     The iterator is bound to a Megatron bridge, the local Megatron model(s),
     and the conversion-task list precomputed by the policy worker. For each
     refit it walks ``bridge.export_hf_weights`` and packs tensors into buckets
-    sized by the *post-transformation* tensor footprint, so MXFP8 buckets
-    correctly account for the added ``weight_scale_inv`` tensor.
+    sized by the *post-transformation* tensor footprint. Quantized refits
+    (added on a downstream branch) account for the added ``weight_scale_inv``
+    tensor in their bucket sizing.
     """
 
     def __init__(
@@ -73,14 +65,11 @@ class MegatronSGLangHfWeightIterator:
                 f"buffer_size_bytes must be positive, got {buffer_size_bytes}"
             )
 
-        skip_weight_substrings = (
-            build_dynamic_skip_substrings(
-                quantization_config=self._quantization_config,
-                num_hidden_layers=self._num_hidden_layers,
+        if target_precision == "mxfp8":
+            raise NotImplementedError(
+                "mxfp8 implementation lives on zhw/mxfp8_support"
             )
-            if target_precision == "mxfp8"
-            else None
-        )
+        skip_weight_substrings = None
 
         bucket: list[tuple[str, torch.Tensor]] = []
         bucket_size = 0
@@ -109,11 +98,19 @@ class MegatronSGLangHfWeightIterator:
     ) -> Iterator[list[tuple[str, torch.Tensor]]]:
         """Yield finalized HF (name, tensor) groups from one AutoBridge tensor.
 
-        AutoBridge yields one HF named tensor at a time. For BF16 each AutoBridge
-        item produces exactly one finalized pair; for MXFP8 each item may
-        expand to a ``(weight, weight_scale_inv)`` pair when the weight is
-        quantized.
+        AutoBridge yields one HF named tensor at a time. For BF16 each
+        AutoBridge item produces exactly one finalized pair. The
+        ``target_precision="mxfp8"`` path (which may expand each item into a
+        ``(weight, weight_scale_inv)`` pair) is layered on
+        ``zhw/mxfp8_support``; on this branch it raises
+        ``NotImplementedError`` from :meth:`iter_hf_weight_buckets` before
+        we ever get here.
         """
+        if target_precision == "mxfp8":
+            raise NotImplementedError(
+                "mxfp8 implementation lives on zhw/mxfp8_support"
+            )
+        del skip_weight_substrings  # unused on the BF16-only path
         for hf_param_name, tensor in self._bridge.export_hf_weights(
             self._models,
             show_progress=False,
@@ -123,19 +120,4 @@ class MegatronSGLangHfWeightIterator:
             # DTensor / async-collective wrapping), so no ``.wait()`` is
             # needed here. The previous ``hasattr(tensor, "wait")`` check
             # was a copy-from-FSDP residue.
-
-            if target_precision == "mxfp8" and skip_weight_substrings is not None:
-                if should_quantize(
-                    hf_param_name,
-                    tensor,
-                    skip_weight_substrings=skip_weight_substrings,
-                    allow_source_fp8=False,
-                ):
-                    qweight, scale = quantize_mxfp8(tensor)
-                    scale_name = (
-                        strip_weight_suffix(hf_param_name) + SOURCE_FP8_SCALE_KEY_SUFFIX
-                    )
-                    yield [(hf_param_name, qweight), (scale_name, scale)]
-                    continue
-
             yield [(hf_param_name, tensor)]

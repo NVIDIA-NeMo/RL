@@ -711,22 +711,11 @@ def setup(
         if "model_path" not in generation_config["sglang_cfg"]:
             generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
 
-        # If MXFP8 is requested, ensure SGLang boots from an MXFP8 HF
-        # checkpoint. This must happen before ``init_sglang`` so the engine
-        # loads quantized weights.
-        sglang_quantization_cfg = (
-            generation_config["sglang_cfg"].get("quantization") or {}
-        )
-        if sglang_quantization_cfg.get("scheme", "bf16") == "mxfp8":
-            from nemo_rl.models.generation.sglang.mxfp8_setup import (
-                ensure_mxfp8_checkpoint,
-            )
-
-            mxfp8_path = ensure_mxfp8_checkpoint(
-                model_path=generation_config["sglang_cfg"]["model_path"],
-                quantization_cfg=sglang_quantization_cfg,
-            )
-            generation_config["sglang_cfg"]["model_path"] = mxfp8_path
+        # Hook point for offline weight-quantization preprocessing of the
+        # SGLang model_path. The MXFP8 implementation
+        # (``ensure_mxfp8_checkpoint``) lives on ``zhw/mxfp8_support`` and
+        # reads ``generation_config["sglang_cfg"].get("quantization")``;
+        # nothing on this branch consumes the quantization block.
 
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_sglang,
