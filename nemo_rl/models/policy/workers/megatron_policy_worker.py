@@ -1368,7 +1368,6 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             train_world_size,
             gen_world_size,
             layer_to_pp_stage=layer_to_pp_stage,
-            metadata_ep_gathered=True,  # export_hf_weights does EP all-gather
         )
         return self.nccl_reshard_refit_info
 
@@ -1426,14 +1425,14 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             for param_info in self.nccl_reshard_refit_info["per_layer_params"][
                 layer_name
             ]:
-                if not param_info.get("_moe_meta"):
+                kind = param_info.get("_moe_kind")
+                if not kind:
                     continue
                 fused_name = param_info["name"]
                 if fused_name in self._fused_expert_map:
                     continue
 
-                meta = param_info["_moe_meta"]
-                if "gate_entries" in meta:
+                if kind == "w13":
                     # w13: fuse gate + up per expert, then stack.
                     # vLLM expects per-rank w13[:, :P] = gate[r*P:(r+1)*P] and
                     # w13[:, P:2P] = up[r*P:(r+1)*P] (P = intermediate / gen_tp_size).
@@ -1468,7 +1467,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                             expert_tensors.append(torch.cat([gate, up], dim=0))
                     if expert_tensors:
                         self._fused_expert_map[fused_name] = torch.stack(expert_tensors)
-                elif "down_entries" in meta:
+                elif kind == "w2":
                     # w2: stack down_proj per expert
                     prefix = fused_name.rsplit(".w2_weight", 1)[0]
                     down_group = groups.get((prefix, "down_proj"), [])

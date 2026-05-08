@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -451,19 +451,24 @@ def get_placements(param_name: str, dim_map: dict, ndim: int) -> list:
     1-D params (layernorm, bias) are always fully replicated.
     Expert params shard dim 0 on EP; their TP shard dims are shifted by +1.
     """
-    num_mesh_dims = max(dim_map.values()) + 1 if dim_map else 1
+    num_mesh_dims = len(dim_map) or 1
     placements = [Replicate() for _ in range(num_mesh_dims)]
 
     if ndim < 2:
+        # For 1-D params, it assumes that it is always fully replicated.
         return placements
 
     if is_expert_param(param_name):
         if "ep" in dim_map:
             placements[dim_map["ep"]] = Shard(0)
-        tp_dim = _get_expert_tp_shard_dim(param_name)
-        if tp_dim is not None and "tp" in dim_map:
-            placements[dim_map["tp"]] = Shard(tp_dim + 1)
+        else:
+            # We currently never shards both EP and TP for the expert params
+            # so far. If MCore etp is enabled, the logic should be changed
+            tp_dim = _get_expert_tp_shard_dim(param_name)
+            if tp_dim is not None and "tp" in dim_map:
+                placements[dim_map["tp"]] = Shard(tp_dim + 1)
     else:
+        # for non-expert params
         tp_dim = get_tp_shard_dim(param_name)
         if tp_dim is not None and "tp" in dim_map:
             placements[dim_map["tp"]] = Shard(tp_dim)
@@ -483,7 +488,6 @@ _INDIVIDUAL_EXPERT_RE = re.compile(
 
 def fuse_expert_params_in_metadata(
     state_dict_metadata: dict[str, dict[str, Any]],
-    ep_size: int = 1,
 ) -> dict[str, dict[str, Any]]:
     """Fuse individual MoE expert params into combined w13/w2 entries.
 
@@ -492,8 +496,11 @@ def fuse_expert_params_in_metadata(
     - gate_proj + up_proj → w13_weight: [num_experts_global, 2*intermediate, hidden]
     - down_proj → w2_weight: [num_experts_global, hidden, intermediate]
 
-    When EP>1, each rank only sees a subset of experts. The metadata comes
-    from a single rank, so we multiply by ep_size to get the global count.
+    The input ``state_dict_metadata`` is required to be EP-gathered, i.e. it
+    must already enumerate every expert globally (not just this rank's local
+    subset).  Both backends meet this invariant: Megatron's metadata pipeline
+    routes through ``export_hf_weights`` which does the EP all-gather, and
+    DTensor doesn't use EP at all.
 
     Non-expert params are passed through unchanged.
     """
@@ -529,11 +536,9 @@ def fuse_expert_params_in_metadata(
     # Create w13_weight entries (fused gate+up)
     for prefix, projs in w13_groups.items():
         gate_entries = projs.get("gate_proj", [])
-        up_entries = projs.get("up_proj", [])
         if not gate_entries:
             continue
-        num_experts_local = len(gate_entries)
-        num_experts_global = num_experts_local * ep_size
+        num_experts_global = len(gate_entries)
         gate_shape = gate_entries[0][1]["shape"]  # [intermediate, hidden]
         intermediate_size = gate_shape[0]
         hidden_size = gate_shape[1]
@@ -542,30 +547,12 @@ def fuse_expert_params_in_metadata(
         fused_metadata[fused_name] = {
             "shape": fused_shape,
             "dtype": gate_entries[0][1]["dtype"],
-            "_moe_fused": True,
-            "_moe_num_experts_local": num_experts_local,
-            "_moe_gate_entries": [
-                n
-                for n, _ in sorted(
-                    gate_entries,
-                    key=lambda x: int(_INDIVIDUAL_EXPERT_RE.match(x[0]).group(2)),
-                )
-            ],
-            "_moe_up_entries": [
-                n
-                for n, _ in sorted(
-                    up_entries,
-                    key=lambda x: int(_INDIVIDUAL_EXPERT_RE.match(x[0]).group(2)),
-                )
-            ]
-            if up_entries
-            else [],
+            "_moe_kind": "w13",
         }
 
     # Create w2_weight entries (down)
     for prefix, entries in w2_groups.items():
-        num_experts_local = len(entries)
-        num_experts_global = num_experts_local * ep_size
+        num_experts_global = len(entries)
         down_shape = entries[0][1]["shape"]  # [hidden, intermediate]
         hidden_size = down_shape[0]
         intermediate_size = down_shape[1]
@@ -574,15 +561,7 @@ def fuse_expert_params_in_metadata(
         fused_metadata[fused_name] = {
             "shape": fused_shape,
             "dtype": entries[0][1]["dtype"],
-            "_moe_fused": True,
-            "_moe_num_experts_local": num_experts_local,
-            "_moe_down_entries": [
-                n
-                for n, _ in sorted(
-                    entries,
-                    key=lambda x: int(_INDIVIDUAL_EXPERT_RE.match(x[0]).group(2)),
-                )
-            ],
+            "_moe_kind": "w2",
         }
 
     return fused_metadata
@@ -620,9 +599,13 @@ def build_nccl_reshard_refit_info(
     train_world_size: int,
     gen_world_size: int,
     layer_to_pp_stage: Optional[dict[str, int]] = None,
-    metadata_ep_gathered: bool = False,
 ) -> dict[str, Any]:
     """Build per-layer parameter info for nccl_reshard-based refit.
+
+    The input ``state_dict_metadata`` must be EP-gathered (enumerate every
+    expert globally, not per-rank).  Both backends meet this naturally:
+    Megatron's metadata pipeline routes through ``export_hf_weights`` (which
+    does the EP all-gather) and DTensor doesn't use EP at all.
 
     Args:
         state_dict_metadata: ``{param_name: {"shape": list, "dtype": str}}``
@@ -631,22 +614,13 @@ def build_nccl_reshard_refit_info(
         layer_to_pp_stage: optional mapping from layer name to PP stage index.
             When provided (PP>1), per-stage meshes are built so each PP stage's
             train ranks + all gen ranks form an independent sub-group.
-        metadata_ep_gathered: if True, the metadata already contains all experts
-            (e.g. from ``export_hf_weights`` which does EP all-gather). In this
-            case ``fuse_expert_params_in_metadata`` must not multiply by ep_size.
 
     Returns:
         ``{"layer_names": [...], "per_layer_params": {layer: [param_info, ...]},
            "pp_size": int}``
     """
     # Fuse individual MoE expert params into combined w13/w2 entries.
-    # When metadata already contains all experts (post-EP-gather), use
-    # ep_size=1 so fusion does not multiply the expert count again.
-    ep_size = train_parallelism.get("ep_size", 1)
-    fusion_ep_size = 1 if metadata_ep_gathered else ep_size
-    state_dict_metadata = fuse_expert_params_in_metadata(
-        state_dict_metadata, ep_size=fusion_ep_size
-    )
+    state_dict_metadata = fuse_expert_params_in_metadata(state_dict_metadata)
 
     pp_size = train_parallelism.get("pp_size", 1)
     use_per_stage = layer_to_pp_stage is not None and pp_size > 1
@@ -718,14 +692,9 @@ def build_nccl_reshard_refit_info(
                 "dst_placements": get_placements(name, dst_dim_map, ndim),
             }
 
-        # Propagate MoE fusion metadata for train-side expert stacking
-        if meta.get("_moe_fused"):
-            moe_meta = {}
-            for k in ("_moe_gate_entries", "_moe_up_entries", "_moe_down_entries"):
-                if k in meta:
-                    # Strip the _moe_ prefix for cleaner access
-                    moe_meta[k.replace("_moe_", "")] = meta[k]
-            info["_moe_meta"] = moe_meta
+        # Propagate MoE fusion kind ("w13" or "w2") for train-side expert stacking
+        if "_moe_kind" in meta:
+            info["_moe_kind"] = meta["_moe_kind"]
 
         per_layer_params.setdefault(layer, []).append(info)
 
