@@ -3,13 +3,6 @@
 /.git
 *.out
 *.log
-debug.md
-debug-*.md
-debug_*.md
-*_debug.md
-*debug.log
-debug_logs/
-debug-log/
 *.tar
 *.tar.gz
 .venv
