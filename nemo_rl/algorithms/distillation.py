@@ -23,7 +23,12 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.grpo import _should_use_async_rollouts, refit_policy_generation
+from nemo_rl.algorithms.grpo import (
+    _should_log_nemo_gym_responses,
+    _should_use_async_rollouts,
+    _should_use_nemo_gym,
+    refit_policy_generation,
+)
 from nemo_rl.algorithms.loss import (
     DistillationLossConfig,
     DistillationLossDataDict,
@@ -60,6 +65,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
+    run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import (
@@ -261,8 +267,10 @@ def setup(
         data_pipeline_config,
         processor_present=_tokenizer_has_multimodal_processor(tokenizer),
     )
-    if data_pipeline_config.mode == "stream_rollout" and _should_use_async_rollouts(
-        master_config
+    if (
+        data_pipeline_config.mode == "stream_rollout"
+        and _should_use_async_rollouts(master_config)
+        and not _should_use_nemo_gym(master_config)
     ):
         raise AssertionError("stream_rollout v1 does not support async rollouts")
 
@@ -605,6 +613,9 @@ def distillation_train(
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert student_generation is not None  # for mypy type check
+    use_nemo_gym = _should_use_nemo_gym(master_config)
+    if use_nemo_gym:
+        print("▶ Using NeMo-Gym rollouts for distillation", flush=True)
 
     # common config/state items
     current_epoch = distillation_save_state["current_epoch"]  # current epoch
@@ -635,8 +646,10 @@ def distillation_train(
         data_pipeline_config,
         processor_present=_tokenizer_has_multimodal_processor(tokenizer),
     )
-    if data_pipeline_config.mode == "stream_rollout" and _should_use_async_rollouts(
-        master_config
+    if (
+        data_pipeline_config.mode == "stream_rollout"
+        and _should_use_async_rollouts(master_config)
+        and not use_nemo_gym
     ):
         raise AssertionError("stream_rollout v1 does not support async rollouts")
     tokenizer_name_or_path = _get_tokenizer_name_or_path(tokenizer, master_config)
@@ -734,8 +747,33 @@ def distillation_train(
                         student_generation.prepare_for_generation()
 
                 with timer.time("generation"):
+                    # NeMo-Gym uses the async OpenAI-compatible rollout path.
+                    if use_nemo_gym:
+                        rollout_metadata = {
+                            key: repeated_batch[key] for key in STREAM_METADATA_KEYS
+                        }
+                        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                            policy_generation=student_generation,
+                            input_batch=repeated_batch,
+                            tokenizer=tokenizer,
+                            task_to_env=task_to_env,
+                            generation_config=master_config["policy"]["generation"],
+                            max_seq_len=None,
+                            max_rollout_turns=None,
+                            greedy=False,
+                        )
+                        repeated_batch = nemo_gym_rollout_result.final_batch
+                        for key, value in rollout_metadata.items():
+                            repeated_batch[key] = value
+                        rollout_metrics = nemo_gym_rollout_result.rollout_metrics
+                        del nemo_gym_rollout_result
+
+                        if not _should_log_nemo_gym_responses(master_config):
+                            for key in list(rollout_metrics):
+                                if "full_result" in key:
+                                    rollout_metrics.pop(key)
                     # Use async rollouts if vLLM async engine is enabled
-                    if _should_use_async_rollouts(master_config):
+                    elif _should_use_async_rollouts(master_config):
                         (
                             repeated_batch,
                             rollout_metrics,
@@ -1250,13 +1288,34 @@ def validate(
             + master_config["distillation"]["val_batch_size"]
             - 1
         ) // master_config["distillation"]["val_batch_size"]
+        additional_metrics_to_report: dict[str, Any] = {}
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
 
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
+            # NeMo-Gym uses the async OpenAI-compatible rollout path.
+            if _should_use_nemo_gym(master_config):
+                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                    policy_generation=policy_generation,
+                    input_batch=val_batch,
+                    tokenizer=tokenizer,
+                    task_to_env=val_task_to_env,
+                    generation_config=master_config["policy"]["generation"],
+                    max_seq_len=None,
+                    max_rollout_turns=None,
+                    greedy=False,
+                )
+                val_batch = nemo_gym_rollout_result.final_batch
+                gen_metrics = nemo_gym_rollout_result.rollout_metrics
+                if not _should_log_nemo_gym_responses(master_config):
+                    for key in list(gen_metrics):
+                        if "full_result" in key:
+                            gen_metrics.pop(key)
+                additional_metrics_to_report = gen_metrics
+                del nemo_gym_rollout_result
             # Use async rollouts if vLLM async engine is enabled
-            if _should_use_async_rollouts(master_config):
+            elif _should_use_async_rollouts(master_config):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
                     val_batch,
@@ -1306,6 +1365,7 @@ def validate(
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
+            **additional_metrics_to_report,
         }
 
         # Print sample conversations only once at the end of validation

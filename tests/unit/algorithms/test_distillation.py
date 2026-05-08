@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -439,6 +440,121 @@ def test_distillation_train_stream_rollout_rejects_async_rollout(mock_components
         )
 
 
+def test_distillation_train_stream_rollout_allows_nemo_gym_metadata_restore(
+    mock_components,
+):
+    mock_components["master_config"]["distillation"]["max_num_steps"] = 1
+    mock_components["master_config"]["distillation"]["max_num_epochs"] = 1
+    mock_components["master_config"]["distillation"]["val_period"] = 0
+    mock_components["master_config"]["distillation"]["val_at_end"] = False
+    mock_components["master_config"]["distillation"]["data_pipeline"] = {
+        "mode": "stream_rollout",
+        "max_chunk_tokens": 128,
+    }
+    mock_components["master_config"]["policy"]["generation"]["backend"] = "vllm"
+    mock_components["master_config"]["policy"]["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+    mock_components["master_config"]["env"] = {"should_use_nemo_gym": True}
+
+    layout = MagicMock()
+    layout.dp = 1
+    mock_components["teacher_policy"].stage_layout.return_value = layout
+    mock_components["teacher_policy"].annotate_topk_stream.return_value = "annotated"
+    mock_components["student_policy"].train_distillation_stream_from_refs.return_value = {
+        "loss": torch.tensor(0.25),
+        "grad_norm": torch.tensor(0.75),
+        "all_mb_metrics": {"global_valid_toks": [3]},
+    }
+
+    final_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {"token_ids": torch.tensor([1, 2]), "role": "user"},
+                    {"token_ids": torch.tensor([3, 4]), "role": "assistant"},
+                ]
+            ],
+            "loss_multiplier": torch.tensor([1.0]),
+            "task_name": ["math"],
+            "extra_env_info": [{}],
+            "length": torch.tensor([4]),
+            "idx": torch.tensor([0]),
+        }
+    )
+    fake_manifest = SimpleNamespace(
+        input_lengths=torch.tensor([4]),
+        batch_size=1,
+        loss_spans=object(),
+    )
+    fake_token_stream = SimpleNamespace(shard_streams=[["chunk"]])
+
+    def fake_rollout_normalizer(**kwargs):
+        rollout_batch = kwargs["rollout_batch"]
+        for key in distil_mod.STREAM_METADATA_KEYS:
+            assert key in rollout_batch
+            assert rollout_batch[key].numel() == 1
+        return fake_manifest, fake_token_stream
+
+    with (
+        patch.object(
+            distil_mod,
+            "run_async_nemo_gym_rollout",
+            return_value=SimpleNamespace(
+                final_batch=final_batch,
+                rollout_metrics={
+                    "mean_gen_tokens_per_sample": 2.0,
+                    "agent/full_result": "raw-response-payload",
+                },
+            ),
+        ) as mock_nemo_gym_rollout,
+        patch.object(
+            distil_mod,
+            "build_token_stream_from_rollout_batch",
+            side_effect=fake_rollout_normalizer,
+        ) as mock_rollout_normalizer,
+        patch.object(distil_mod, "estimate_chunk_bytes", return_value=1),
+        patch.object(distil_mod, "estimate_active_loss_positions", return_value=3),
+        patch.object(
+            distil_mod,
+            "drain_annotated_stream",
+            return_value="drained",
+        ),
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            mock_components["master_config"],
+        )
+
+    mock_nemo_gym_rollout.assert_called_once()
+    mock_rollout_normalizer.assert_called_once()
+    mock_components["student_policy"].train.assert_not_called()
+    mock_components[
+        "student_policy"
+    ].train_distillation_stream_from_refs.assert_called_once()
+
+    train_metrics = None
+    for call in mock_components["logger"].log_metrics.call_args_list:
+        if call.kwargs.get("prefix") == "train":
+            train_metrics = call.args[0]
+            break
+
+    assert train_metrics is not None
+    assert "agent/full_result" not in train_metrics
+
+
 def test_distillation_train_sparse_loss_uses_sparse_stream_consumer(mock_components):
     mock_components["master_config"]["distillation"]["max_num_steps"] = 1
     mock_components["master_config"]["distillation"]["max_num_epochs"] = 1
@@ -567,6 +683,59 @@ def test_validate_function(mock_components):
     # For distillation, we don't need environment interaction since max_rollout_turns=0
     # The validation focuses on generation and teacher-student knowledge transfer
     # Note: validate() function itself doesn't call logger.log_metrics - that's done by the caller
+
+
+def test_validate_nemo_gym_filters_full_result_metrics(mock_components):
+    mock_components["master_config"]["distillation"]["max_val_samples"] = 1
+    mock_components["master_config"]["distillation"]["val_batch_size"] = 1
+    mock_components["master_config"]["policy"]["generation"]["backend"] = "vllm"
+    mock_components["master_config"]["policy"]["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+    mock_components["master_config"]["env"] = {"should_use_nemo_gym": True}
+
+    final_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {"role": "user", "content": "What is 1+1?"},
+                    {"role": "assistant", "content": "2"},
+                ]
+            ],
+            "total_reward": torch.tensor([1.0]),
+        }
+    )
+
+    with (
+        patch.object(
+            distil_mod,
+            "run_async_nemo_gym_rollout",
+            return_value=SimpleNamespace(
+                final_batch=final_batch,
+                rollout_metrics={
+                    "mean_gen_tokens_per_sample": 2.0,
+                    "agent/full_result": "raw-response-payload",
+                    "agent/score/mean": 1.0,
+                },
+            ),
+        ) as mock_nemo_gym_rollout,
+        patch.object(distil_mod, "print_message_log_samples"),
+    ):
+        val_metrics, validation_timings = validate(
+            mock_components["student_generation"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=0,
+            master_config=mock_components["master_config"],
+        )
+
+    mock_nemo_gym_rollout.assert_called_once()
+    assert val_metrics["accuracy"] == 1.0
+    assert val_metrics["agent/score/mean"] == 1.0
+    assert "agent/full_result" not in val_metrics
+    assert isinstance(validation_timings, dict)
 
 
 def test_check_vocab_equality_pass(monkeypatch):

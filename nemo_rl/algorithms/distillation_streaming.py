@@ -465,7 +465,7 @@ def _validate_single_policy_streaming_capability(
             raise AssertionError(
                 f"{role} dynamic batching is unsupported for {mode} v1"
             )
-        if sequence_packing_enabled:
+        if mode == "sparse_loss" and sequence_packing_enabled:
             raise AssertionError(
                 f"{role} sequence packing is unsupported for {mode} v1"
             )

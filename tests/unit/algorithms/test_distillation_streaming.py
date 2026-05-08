@@ -1545,12 +1545,11 @@ def test_validate_streaming_capabilities_rejects_unsupported_v1_combinations():
             stream_config,
         )
 
-    with pytest.raises(AssertionError, match="teacher sequence packing"):
-        validate_streaming_capabilities(
-            base_policy,
-            {**base_policy, "sequence_packing": {"enabled": True}},
-            stream_config,
-        )
+    validate_streaming_capabilities(
+        base_policy,
+        {**base_policy, "sequence_packing": {"enabled": True}},
+        stream_config,
+    )
 
     dtensor_cp_sequence_packing_policy = {
         **base_policy,
@@ -1584,6 +1583,22 @@ def test_validate_streaming_capabilities_rejects_unsupported_v1_combinations():
             base_policy,
             stream_config,
         )
+
+    megatron_cp_with_sequence_packing_policy = {
+        **base_policy,
+        "dtensor_cfg": {"enabled": False},
+        "megatron_cfg": {
+            "enabled": True,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 2,
+        },
+        "sequence_packing": {"enabled": True},
+    }
+    validate_streaming_capabilities(
+        megatron_cp_with_sequence_packing_policy,
+        megatron_cp_with_sequence_packing_policy,
+        stream_config,
+    )
 
     legacy_config = parse_data_pipeline_config(None)
     validate_streaming_capabilities(
