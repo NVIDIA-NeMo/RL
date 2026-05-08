@@ -37,6 +37,7 @@ Spec:
 
 from __future__ import annotations
 
+import os
 
 import pytest
 import torch
@@ -60,10 +61,53 @@ _DP_SEED_FIELDS = (
     "sample_mask",
 )
 
+# ── loud-skip helpers ─────────────────────────────────────────────────────────
 
-@pytest.fixture
-def tq_client(ray_session, tq_simple_cfg):  # ray_session/tq_simple_cfg from conftest
-    client = build_data_plane_client(tq_simple_cfg)
+_REQUIRE_MOONCAKE = os.environ.get("NEMO_RL_REQUIRE_MOONCAKE") == "1"
+
+
+def _mooncake_available() -> bool:
+    try:
+        import mooncake  # noqa: F401
+    except ImportError:
+        if _REQUIRE_MOONCAKE:
+            raise
+        return False
+    return True
+
+
+# ── fixtures ──────────────────────────────────────────────────────────────────
+
+
+def _make_tq_cfg(backend: str) -> dict:
+    return {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": backend,
+        "storage_capacity": 1024,
+        "num_storage_units": 1,
+    }
+
+
+@pytest.fixture(
+    params=["simple", "mooncake_cpu"],
+    ids=["simple", "mooncake_cpu"],
+)
+def tq_client(request, ray_session):
+    """Parametrized fixture over simple and mooncake_cpu backends.
+
+    mooncake_cpu is skipped when the mooncake wheel is not installed.
+    Set NEMO_RL_REQUIRE_MOONCAKE=1 to promote the skip to a loud failure.
+
+    ray_session comes from tests/data_plane/functional/conftest.py.
+    """
+    backend = request.param
+    if backend == "mooncake_cpu" and not _mooncake_available():
+        pytest.skip(
+            "mooncake not installed — skipping mooncake_cpu seqpack equivalence "
+            "(set NEMO_RL_REQUIRE_MOONCAKE=1 to fail loud)"
+        )
+    client = build_data_plane_client(_make_tq_cfg(backend))
     yield client
     client.close()
 

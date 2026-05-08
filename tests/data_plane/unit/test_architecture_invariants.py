@@ -242,6 +242,67 @@ def test_tq_adapter_enforces_no_pickle():
     )
 
 
+# ─── pack_per_token_field export guard (commit 45f4ffb8) ─────────────────────
+
+
+def test_pack_per_token_field_is_exported() -> None:
+    """pack_per_token_field must be importable from nemo_rl.data_plane.codec.
+
+    Guards against silent deletion of the helper added in commit 45f4ffb8.
+    The function handles the qwen3 + TP + SP padding case where
+    val.shape[1] > max(lengths); maybe_pack_jagged is shape-strict and
+    cannot handle that.
+    """
+    from nemo_rl.data_plane.codec import pack_per_token_field  # noqa: F401
+    assert callable(pack_per_token_field), (
+        "nemo_rl.data_plane.codec.pack_per_token_field must be callable. "
+        "It was added in commit 45f4ffb8 to handle SP-padded-wider write-backs."
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "pack_per_token_field defined in codec.py:151 but no callers — "
+        "wiring incomplete on this branch (45f4ffb8). "
+        "When wired, this test xpasses and someone removes the marker."
+    ),
+)
+def test_pack_per_token_field_is_wired_into_writeback() -> None:
+    """At least one of the three write-back call sites must import
+    pack_per_token_field.
+
+    Known sites still using maybe_pack_jagged as of commit 45f4ffb8:
+      - nemo_rl/data_plane/worker_mixin.py:336
+      - nemo_rl/data_plane/driver_io.py:85
+      - nemo_rl/experience/sync_rollout_actor.py:107
+
+    If this test FAILS (i.e., the xfail is not triggered), the SP-padded-wider
+    write-back regression (commit 45f4ffb8) is no longer guarded.
+    Wire `pack_per_token_field` into at least one of the three call sites to
+    make this test xpass, then remove the xfail marker.
+    """
+    sites = [
+        "nemo_rl/data_plane/worker_mixin.py",
+        "nemo_rl/data_plane/driver_io.py",
+        "nemo_rl/experience/sync_rollout_actor.py",
+    ]
+    found_in_any = False
+    for rel_path in sites:
+        src = _read(rel_path)
+        if "pack_per_token_field" in src:
+            found_in_any = True
+            break
+
+    assert found_in_any, (
+        "None of the three write-back call sites reference pack_per_token_field:\n"
+        + "\n".join(f"  {s}" for s in sites)
+        + "\nIf this fails, the SP-padded-wider write-back regression "
+        "(commit 45f4ffb8) is no longer guarded — wire `pack_per_token_field` "
+        "into one of the three call sites."
+    )
+
+
 # ─── ABC contract method names — catch silent renames ────────────────────
 
 
