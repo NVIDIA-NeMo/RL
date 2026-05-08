@@ -78,38 +78,6 @@ def _patch_sglang_safe_unpickler() -> None:
     logger.info("Patched SafeUnpickler allowlist in %s.", file_to_patch)
 
 
-def _patch_sglang_weight_checker() -> None:
-    file_to_patch = _get_sglang_file("srt/utils/weight_checker.py")
-
-    with open(file_to_patch, "r") as f:
-        content = f.read()
-
-    sentinel = '"cos_sin_cache" in name'
-    if sentinel in content:
-        return
-
-    old_snippet = (
-        "    def _reset_tensors(self):\n"
-        "        for name, param in self._model_state():\n"
-        "            param.copy_(_random_like(param))\n"
-    )
-    new_snippet = (
-        "    def _reset_tensors(self):\n"
-        "        for name, param in self._model_state():\n"
-        '            if "cos_sin_cache" in name or "freqs_cis" in name or "_weight_fp32" in name:\n'
-        "                continue\n"
-        "            param.copy_(_random_like(param))\n"
-    )
-    if old_snippet not in content:
-        raise RuntimeError(
-            f"WeightChecker._reset_tensors anchor not found in {file_to_patch}. "
-        )
-
-    content = content.replace(old_snippet, new_snippet, 1)
-    _write_and_verify(file_to_patch, content, sentinel)
-    logger.info("Patched WeightChecker._reset_tensors in %s.", file_to_patch)
-
-
 def _override_sglang_imbalance_check_env() -> None:
     """Force-disable sglang's per-GPU memory imbalance check.
 
@@ -202,7 +170,6 @@ def _patch_megatron_training_hook_mode() -> None:
 
 def _apply_sglang_compat_patches() -> None:
     _patch_sglang_safe_unpickler()
-    _patch_sglang_weight_checker()
     _override_sglang_imbalance_check_env()
     _patch_megatron_dynamic_context_hook_mode()
     _patch_megatron_training_hook_mode()
