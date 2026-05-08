@@ -95,9 +95,12 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
-class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
+class MegatronPolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
 

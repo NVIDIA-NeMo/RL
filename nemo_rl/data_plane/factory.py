@@ -53,12 +53,11 @@ def build_data_plane_client(
 
     obs = cfg.get("observability") or {}
     if obs.get("enabled", False):
-        # Lazy import — observability is an optional layer; avoid pulling
-        # tensordict/torch imports for callers that disable it.
         from nemo_rl.data_plane.observability import (
             MetricsDataPlaneClient,
-            build_sink,
+            print_event,
         )
 
-        client = MetricsDataPlaneClient(client, sink=build_sink(obs.get("sink")))
+        on_event = obs.get("callback") or print_event
+        client = MetricsDataPlaneClient(client, on_event=on_event)
     return client

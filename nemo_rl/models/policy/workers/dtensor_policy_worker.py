@@ -162,9 +162,12 @@ def get_cpu_state_dict(
     return new_state_dict
 
 
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
-class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
+class DTensorPolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker, ColocatablePolicyInterface):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 

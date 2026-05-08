@@ -25,7 +25,7 @@ import inspect
 
 def test_sync_utils_module_imports() -> None:
     """Catches FQN drift after the algorithms.sync_utils consolidation."""
-    from nemo_rl.algorithms.sync_utils import (
+    from nemo_rl.experience.sync_rollout_actor import (
         SyncRolloutActor,
         kv_first_write,
     )
@@ -45,7 +45,7 @@ def test_sync_rollout_actor_registered_under_vllm_tier() -> None:
     )
     from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
-    fqn = "nemo_rl.algorithms.sync_utils.SyncRolloutActor"
+    fqn = "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor"
     env = get_actor_python_env(fqn)
     # Same tier as vLLM workers / AsyncTrajectoryCollector / ReplayBuffer.
     # Allow either the resolved exec path or the SYSTEM-override sentinel.
@@ -111,7 +111,7 @@ def test_async_and_sync_actors_share_env_tier() -> None:
     )
 
     sync_env = get_actor_python_env(
-        "nemo_rl.algorithms.sync_utils.SyncRolloutActor"
+        "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor"
     )
     async_env = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"

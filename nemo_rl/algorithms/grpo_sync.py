@@ -68,7 +68,7 @@ from nemo_rl.data_plane.driver_io import read_columns, write_columns
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.algorithms.sync_utils import SyncRolloutActor
+from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.checkpoint import CheckpointManager
@@ -265,7 +265,7 @@ def grpo_train_sync(
     # research/data_plane_integration_plan.md §1.2.
     rollout_actor = SyncRolloutActor.options(
         runtime_env=make_actor_runtime_env(
-            "nemo_rl.algorithms.sync_utils.SyncRolloutActor"
+            "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor"
         ),
     ).remote(
         policy_generation=policy_generation,
