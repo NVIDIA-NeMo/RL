@@ -1747,6 +1747,124 @@ def get_distillation_topk_logprobs_from_logits(
     return student_topk_logprobs, teacher_topk_logprobs, H_all
 
 
+def get_sparse_distillation_topk_logprobs_from_logits(
+    student_logits: torch.Tensor,
+    teacher_topk_logits: torch.Tensor,
+    teacher_topk_indices: torch.Tensor,
+    teacher_topk_positions: torch.Tensor,
+    zero_outside_topk: bool,
+    calculate_entropy: bool,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Compute distillation logprobs at sparse sequence positions.
+
+    The sparse teacher tensors are batch-aligned: [B, L, K] for logits/indices
+    and [B, L] for sequence positions. Padded sparse slots are masked by the
+    loss function, so this helper only gathers the requested coordinates.
+    """
+    if teacher_topk_indices.shape[-1] <= 0:
+        raise ValueError(
+            f"topk must be positive, got {teacher_topk_indices.shape[-1]}. "
+            "topk=0 is not supported as it would result in empty tensor operations."
+        )
+    if teacher_topk_positions.ndim != 2:
+        raise ValueError("teacher_topk_positions must have shape [B, L]")
+
+    student_logits = student_logits.to(torch.float32)
+    teacher_topk_indices = teacher_topk_indices.to(student_logits.device)
+    teacher_topk_positions = teacher_topk_positions.to(
+        student_logits.device, dtype=torch.long
+    )
+
+    if isinstance(student_logits, torch.distributed.tensor.DTensor):
+        device_mesh = student_logits.device_mesh
+        if device_mesh.mesh_dim_names is not None and "cp" in device_mesh.mesh_dim_names:
+            cp_group = device_mesh.get_group("cp")
+            if cp_group.size() > 1:
+                raise AssertionError("sparse distillation loss does not support CP")
+        parallel_group = device_mesh.get_group("tp")
+        student_logits = student_logits.to_local()
+        vocab_parallel_rank = parallel_group.rank()
+    else:
+        parallel_group = vocab_parallel_group
+
+    if parallel_group is not None:
+        assert vocab_parallel_rank is not None, (
+            "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+        )
+        V_local = int(student_logits.shape[-1])
+        vocab_start_index = vocab_parallel_rank * V_local
+        vocab_end_index = (vocab_parallel_rank + 1) * V_local
+    else:
+        vocab_start_index = 0
+        vocab_end_index = int(student_logits.shape[-1])
+
+    position_index = teacher_topk_positions.unsqueeze(-1).expand(
+        *teacher_topk_positions.shape,
+        student_logits.shape[-1],
+    )
+    student_position_logits = student_logits.gather(dim=1, index=position_index)
+
+    H_all = None
+    if zero_outside_topk:
+        if parallel_group is not None:
+            chunk_size = max(1, min(int(student_position_logits.shape[1]), 1024))
+            student_topk_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
+                student_position_logits,
+                teacher_topk_indices,
+                vocab_start_index,
+                vocab_end_index,
+                chunk_size,
+                parallel_group,
+                False,
+            )
+            if calculate_entropy:
+                H_all = ChunkedDistributedEntropy.apply(  # type: ignore
+                    student_position_logits,
+                    chunk_size,
+                    parallel_group,
+                    False,
+                )
+        else:
+            student_logprobs = torch.nn.functional.log_softmax(
+                student_position_logits,
+                dim=-1,
+            )
+            student_topk_logprobs = student_logprobs.gather(
+                dim=-1,
+                index=teacher_topk_indices,
+            )
+            if calculate_entropy:
+                H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
+    else:
+        if parallel_group is not None:
+            student_topk_logits = gather_logits_at_global_indices(
+                student_position_logits,
+                teacher_topk_indices,
+                tp_group=parallel_group,
+                cp_group=None,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index,
+            )
+        else:
+            student_topk_logits = student_position_logits.gather(
+                dim=-1,
+                index=teacher_topk_indices,
+            )
+        student_topk_logprobs = torch.nn.functional.log_softmax(
+            student_topk_logits,
+            dim=-1,
+        )
+
+    teacher_topk_logits = teacher_topk_logits.to(
+        student_topk_logprobs.device,
+        dtype=student_topk_logprobs.dtype,
+    )
+    teacher_topk_logprobs = torch.nn.functional.log_softmax(teacher_topk_logits, dim=-1)
+    return student_topk_logprobs, teacher_topk_logprobs, H_all
+
+
 class ChunkedDistributedEntropy(torch.autograd.Function):
     """Compute H_all = sum_v p_v log p_v across TP with chunking over sequence.
 

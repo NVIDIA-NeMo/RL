@@ -18,6 +18,7 @@ from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 import numpy as np
 import ray
 import torch
+from psutil import Process
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -28,12 +29,26 @@ from nemo_rl.algorithms.loss import (
     DistillationLossDataDict,
     DistillationLossFn,
 )
+from nemo_rl.algorithms.distillation_streaming import (
+    attach_step_metadata,
+    build_batch_manifest_from_train_data,
+    build_step_manifest,
+    build_token_stream_from_rollout_batch,
+    build_token_stream_from_train_data,
+    drain_annotated_stream,
+    estimate_active_loss_positions,
+    estimate_chunk_bytes,
+    parse_data_pipeline_config,
+    STREAM_METADATA_KEYS,
+    validate_streaming_capabilities,
+)
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
+    add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
@@ -67,6 +82,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 # Configuration
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+_DRIVER_PROCESS = Process(os.getpid())
 
 
 class DistillationConfig(TypedDict):
@@ -85,6 +101,7 @@ class DistillationConfig(TypedDict):
     max_val_samples: int
     topk_logits_k: int
     seed: int
+    data_pipeline: NotRequired[dict[str, Any]]
 
 
 class DistillationSaveState(TypedDict):
@@ -107,6 +124,54 @@ def _default_distillation_save_state() -> DistillationSaveState:
         "consumed_samples": 0,
         "total_valid_tokens": 0,
     }
+
+
+def _get_driver_rss_bytes() -> int:
+    return _DRIVER_PROCESS.memory_info().rss
+
+
+def _get_teacher_annotation_bytes(
+    teacher_topk: BatchedDataDict[dict[str, torch.Tensor]],
+) -> int:
+    return sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in teacher_topk.values()
+        if isinstance(tensor, torch.Tensor)
+    )
+
+
+def _get_tokenizer_name_or_path(
+    tokenizer: TokenizerType,
+    master_config: "MasterConfig",
+) -> str:
+    tokenizer_name = getattr(tokenizer, "name_or_path", None)
+    if isinstance(tokenizer_name, str) and tokenizer_name:
+        return tokenizer_name
+
+    tokenizer_config = master_config["policy"].get("tokenizer", {})
+    if isinstance(tokenizer_config, dict):
+        configured_name = tokenizer_config.get("name")
+        if isinstance(configured_name, str) and configured_name:
+            return configured_name
+
+    for config_key in ("policy", "teacher"):
+        model_name = master_config[config_key].get("model_name")
+        if isinstance(model_name, str) and model_name:
+            return model_name
+
+    return type(tokenizer).__name__
+
+
+def _get_tokenizer_config(tokenizer: TokenizerType) -> dict[str, Any]:
+    init_kwargs = getattr(tokenizer, "init_kwargs", {})
+    return dict(init_kwargs) if isinstance(init_kwargs, dict) else {}
+
+
+def _tokenizer_has_multimodal_processor(tokenizer: TokenizerType) -> bool:
+    return any(
+        getattr(tokenizer, attr, None) is not None
+        for attr in ("image_processor", "video_processor", "feature_extractor")
+    )
 
 
 class MasterConfig(TypedDict):
@@ -187,6 +252,19 @@ def setup(
     data_config = master_config["data"]
     logger_config = master_config["logger"]
     cluster_config = master_config["cluster"]
+    data_pipeline_config = parse_data_pipeline_config(
+        distillation_config.get("data_pipeline")
+    )
+    validate_streaming_capabilities(
+        policy_config,
+        teacher_config,
+        data_pipeline_config,
+        processor_present=_tokenizer_has_multimodal_processor(tokenizer),
+    )
+    if data_pipeline_config.mode == "stream_rollout" and _should_use_async_rollouts(
+        master_config
+    ):
+        raise AssertionError("stream_rollout v1 does not support async rollouts")
 
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
@@ -548,6 +626,21 @@ def distillation_train(
     max_steps = master_config["distillation"][
         "max_num_steps"
     ]  # max number of steps to train for
+    data_pipeline_config = parse_data_pipeline_config(
+        master_config["distillation"].get("data_pipeline")
+    )
+    validate_streaming_capabilities(
+        master_config["policy"],
+        master_config["teacher"],
+        data_pipeline_config,
+        processor_present=_tokenizer_has_multimodal_processor(tokenizer),
+    )
+    if data_pipeline_config.mode == "stream_rollout" and _should_use_async_rollouts(
+        master_config
+    ):
+        raise AssertionError("stream_rollout v1 does not support async rollouts")
+    tokenizer_name_or_path = _get_tokenizer_name_or_path(tokenizer, master_config)
+    tokenizer_config = _get_tokenizer_config(tokenizer)
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -594,12 +687,34 @@ def distillation_train(
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
                 with timer.time("data_processing"):
+                    batch_id = f"distillation-step-{total_steps}"
+                    step_manifest = build_step_manifest(
+                        batch_id=batch_id,
+                        step=total_steps,
+                        prompt_count=batch.size,
+                        num_generations_per_prompt=master_config["distillation"][
+                            "num_generations_per_prompt"
+                        ],
+                        train_global_batch_size=master_config["policy"][
+                            "train_global_batch_size"
+                        ],
+                        max_sequence_length=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
+                        tokenizer_name_or_path=tokenizer_name_or_path,
+                        tokenizer_config=tokenizer_config,
+                        sampling_config=master_config["policy"].get("generation"),
+                        configured_prompts_per_step=master_config["distillation"][
+                            "num_prompts_per_step"
+                        ],
+                    )
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
                             master_config["distillation"]["num_generations_per_prompt"]
                         )
                     )
+                    attach_step_metadata(repeated_batch, step_manifest)
 
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 print(
@@ -654,55 +769,183 @@ def distillation_train(
                     student_generation.finish_generation()
 
                 with timer.time("data_processing"):
-                    # Add loss mask and advantages to each message in LLMMessageLogType
-                    for message_log in repeated_batch["message_log"]:
-                        for message in message_log:
-                            if message["role"] == "assistant":
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
+                    stream_rollout_mode = (
+                        data_pipeline_config.mode == "stream_rollout"
+                    )
+                    sparse_loss_mode = data_pipeline_config.mode == "sparse_loss"
+                    if stream_rollout_mode:
+                        input_lengths = None
+                        batch_manifest = None
+                        train_data = None
+                        flat_messages = None
+                    else:
+                        # Add loss mask and advantages to each message in LLMMessageLogType
+                        add_loss_mask_to_message_log(repeated_batch["message_log"])
 
-                    # Convert updated LLMMessageLogType to FlatMessagesType for training
-                    flat_messages, input_lengths = batched_message_log_to_flat_message(
-                        repeated_batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=master_config["policy"][
-                            "make_sequence_length_divisible_by"
-                        ],
-                    )
+                        # Convert updated LLMMessageLogType to FlatMessagesType for training
+                        flat_messages, input_lengths = (
+                            batched_message_log_to_flat_message(
+                                repeated_batch["message_log"],
+                                pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                                make_sequence_length_divisible_by=master_config[
+                                    "policy"
+                                ]["make_sequence_length_divisible_by"],
+                            )
+                        )
 
-                    # Create training data from flattened messages
-                    train_data = BatchedDataDict[DistillationLossDataDict](
-                        {
-                            "input_ids": flat_messages["token_ids"],
-                            "input_lengths": input_lengths,
-                            "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": repeated_batch["loss_multiplier"],
-                        }
-                    )
-                    # this will be mini-batched inside the policy, so maintain the packed multimodal structure
-                    train_data.update(
-                        flat_messages.get_multimodal_dict(as_tensors=False)
-                    )
-                    train_data.to("cpu")
+                        # Create training data from flattened messages
+                        train_data = BatchedDataDict[DistillationLossDataDict](
+                            {
+                                "input_ids": flat_messages["token_ids"],
+                                "input_lengths": input_lengths,
+                                "token_mask": flat_messages["token_loss_mask"],
+                                "sample_mask": repeated_batch["loss_multiplier"],
+                            }
+                        )
+                        # this will be mini-batched inside the policy, so maintain the packed multimodal structure
+                        train_data.update(
+                            flat_messages.get_multimodal_dict(as_tensors=False)
+                        )
+                        for key in STREAM_METADATA_KEYS:
+                            train_data[key] = repeated_batch[key]
+                        train_data.to("cpu")
+                        batch_manifest = build_batch_manifest_from_train_data(
+                            batch_id=step_manifest.batch_id,
+                            step=step_manifest.step,
+                            train_data=train_data,
+                            metadata=repeated_batch,
+                            max_sequence_length=master_config["policy"][
+                                "max_total_sequence_length"
+                            ],
+                            tokenizer_name_or_path=tokenizer_name_or_path,
+                            tokenizer_config=tokenizer_config,
+                        )
 
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
                     teacher_policy.prepare_for_lp_inference()
 
                 print("▶ Computing teacher logprobs...", flush=True)
-                with timer.time("teacher_logprob_inference"):
-                    teacher_topk = teacher_policy.get_topk_logits(
-                        train_data,
-                        k=master_config["distillation"]["topk_logits_k"],
-                        timer=timer,
+                driver_rss_before_teacher_annotation = (
+                    _get_driver_rss_bytes()
+                    if data_pipeline_config.log_memory_metrics
+                    else 0
+                )
+                stream_teacher_mode = data_pipeline_config.mode != "legacy"
+                if stream_teacher_mode:
+                    teacher_layout = teacher_policy.stage_layout()
+                    if stream_rollout_mode:
+                        batch_manifest, token_stream = (
+                            build_token_stream_from_rollout_batch(
+                                batch_id=step_manifest.batch_id,
+                                step=step_manifest.step,
+                                rollout_batch=repeated_batch,
+                                tokenizer_pad_token_id=tokenizer.pad_token_id,
+                                make_sequence_length_divisible_by=master_config[
+                                    "policy"
+                                ]["make_sequence_length_divisible_by"],
+                                max_sequence_length=master_config["policy"][
+                                    "max_total_sequence_length"
+                                ],
+                                tokenizer_name_or_path=tokenizer_name_or_path,
+                                tokenizer_config=tokenizer_config,
+                                data_pipeline_config=data_pipeline_config,
+                                src_dp_size=teacher_layout.dp,
+                                dst_dp_size=teacher_layout.dp,
+                                planner_mode="preserve_source_shards",
+                            )
+                        )
+                        input_lengths = batch_manifest.input_lengths
+                    else:
+                        token_stream = build_token_stream_from_train_data(
+                            manifest=batch_manifest,
+                            train_data=train_data,
+                            data_pipeline_config=data_pipeline_config,
+                            src_dp_size=teacher_layout.dp,
+                            dst_dp_size=teacher_layout.dp,
+                            planner_mode="preserve_source_shards",
+                        )
+                    token_chunks = [
+                        chunk
+                        for shard_chunks in token_stream.shard_streams
+                        for chunk in shard_chunks
+                    ]
+                    token_chunk_bytes = sum(
+                        estimate_chunk_bytes(chunk) for chunk in token_chunks
                     )
-                    train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
-                    train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                    manifest_loss_positions = estimate_active_loss_positions(
+                        batch_manifest.loss_spans
+                    )
+                    sparse_position_ratio = manifest_loss_positions / max(
+                        int(batch_manifest.input_lengths.sum().item()),
+                        1,
+                    )
+                    with timer.time("teacher_logprob_inference"):
+                        annotated_stream = teacher_policy.annotate_topk_stream(
+                            token_stream,
+                            k=master_config["distillation"]["topk_logits_k"],
+                            timer=timer,
+                        )
+                        drained_annotated_stream = drain_annotated_stream(
+                            annotated_stream
+                        )
+                    driver_rss_after_teacher_annotation = (
+                        _get_driver_rss_bytes()
+                        if data_pipeline_config.log_memory_metrics
+                        else 0
+                    )
+                    opd_metrics = {
+                        "opd/data/token_chunk_bytes": token_chunk_bytes,
+                        "opd/data/inflight_chunks": len(token_chunks),
+                        "opd/data/inflight_bytes": token_chunk_bytes,
+                        "opd/data/manifest_batch_size": batch_manifest.batch_size,
+                        "opd/data/manifest_loss_positions": manifest_loss_positions,
+                        "opd/data/sparse_position_ratio": sparse_position_ratio,
+                    }
+                    if data_pipeline_config.log_memory_metrics:
+                        opd_metrics["opd/data/driver_rss_bytes"] = max(
+                            driver_rss_before_teacher_annotation,
+                            driver_rss_after_teacher_annotation,
+                        )
+                    if stream_rollout_mode:
+                        del train_data
+                        del token_stream
+                        del token_chunks
+                        del annotated_stream
+                else:
+                    with timer.time("teacher_logprob_inference"):
+                        teacher_topk = teacher_policy.get_topk_logits(
+                            train_data,
+                            k=master_config["distillation"]["topk_logits_k"],
+                            timer=timer,
+                        )
+                        train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+                        train_data["teacher_topk_indices"] = teacher_topk[
+                            "topk_indices"
+                        ]
+                    driver_rss_after_teacher_annotation = (
+                        _get_driver_rss_bytes()
+                        if data_pipeline_config.log_memory_metrics
+                        else 0
+                    )
+                    opd_metrics = {
+                        "opd/data/teacher_annotation_bytes": _get_teacher_annotation_bytes(
+                            teacher_topk
+                        ),
+                        "opd/data/manifest_batch_size": batch_manifest.batch_size,
+                        "opd/data/manifest_loss_positions": estimate_active_loss_positions(
+                            batch_manifest.loss_spans
+                        ),
+                        "opd/data/sparse_position_ratio": estimate_active_loss_positions(
+                            batch_manifest.loss_spans
+                        )
+                        / max(int(batch_manifest.input_lengths.sum().item()), 1),
+                    }
+                    if data_pipeline_config.log_memory_metrics:
+                        opd_metrics["opd/data/driver_rss_bytes"] = max(
+                            driver_rss_before_teacher_annotation,
+                            driver_rss_after_teacher_annotation,
+                        )
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -712,11 +955,32 @@ def distillation_train(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
-                    train_results = student_policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    if stream_rollout_mode:
+                        train_results = student_policy.train_distillation_stream_from_refs(
+                            drained_annotated_stream,
+                            loss_fn,
+                            timer=timer,
+                        )
+                    elif sparse_loss_mode:
+                        train_results = student_policy.train_distillation_sparse_stream(
+                            train_data,
+                            drained_annotated_stream,
+                            loss_fn,
+                            timer=timer,
+                        )
+                    elif stream_teacher_mode:
+                        train_results = student_policy.train_distillation_stream(
+                            train_data,
+                            drained_annotated_stream,
+                            loss_fn,
+                            timer=timer,
+                        )
+                    else:
+                        train_results = student_policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
@@ -769,6 +1033,7 @@ def distillation_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
+                metrics.update(opd_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
@@ -860,7 +1125,14 @@ def distillation_train(
 
             # Logging
             # Log training data
-            log_data = {"content": flat_messages["content"]}
+            if flat_messages is None:
+                log_content = [
+                    [message.get("content") for message in message_log]
+                    for message_log in repeated_batch["message_log"]
+                ]
+            else:
+                log_content = flat_messages["content"]
+            log_data = {"content": log_content}
             log_data["input_lengths"] = input_lengths.tolist()
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{total_steps + 1}.jsonl"

@@ -13,6 +13,9 @@
 # limitations under the License.
 import pprint
 import time
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import ray
@@ -27,7 +30,51 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.workers.dtensor_policy_worker import (
+    DTensorPolicyWorker,
+    DTensorPolicyWorkerImpl,
+)
 from tests.unit.test_utils import SimpleLossFn
+
+
+def test_train_distillation_stream_from_refs_assembles_worker_batch():
+    worker = object.__new__(DTensorPolicyWorkerImpl)
+    worker.cfg = {"train_global_batch_size": 4}
+    worker.dp_size = 2
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation_streaming.assemble_dense_distillation_batch_from_annotated_chunks",
+            return_value="dense-batch",
+        ) as mock_assemble,
+        patch.object(
+            DTensorPolicyWorkerImpl,
+            "train",
+            return_value={"global_loss": torch.tensor(1.0)},
+        ) as mock_train,
+    ):
+        result = worker.train_distillation_stream_from_refs(
+            annotated_chunks=["chunk"],
+            student_dp_rank=1,
+            loss_fn="loss-fn",
+            mbs=2,
+            student_dp_size=2,
+        )
+
+    assert torch.equal(result["global_loss"], torch.tensor(1.0))
+    mock_assemble.assert_called_once_with(
+        ["chunk"],
+        train_global_batch_size=4,
+        student_dp_size=2,
+        student_dp_rank=1,
+    )
+    mock_train.assert_called_once_with(
+        data="dense-batch",
+        loss_fn="loss-fn",
+        eval_mode=False,
+        gbs=4,
+        mbs=2,
+    )
 
 
 def create_test_config(
@@ -229,6 +276,99 @@ def calculate_token_logprobs(model_name: str, data: BatchedDataDict):
 
     data = data.to("cpu")
     return token_logprobs
+
+
+class _FakeTopkData:
+    def __init__(self, microbatches, seq_len: int):
+        self._microbatches = microbatches
+        self.size = len(microbatches)
+        self._input_ids = torch.zeros((len(microbatches), seq_len), dtype=torch.long)
+
+    def to(self, _device):
+        return self
+
+    def make_microbatch_iterator(self, _microbatch_size):
+        return iter(self._microbatches)
+
+    def get(self, key: str):
+        assert key == "input_ids"
+        return self._input_ids
+
+
+@patch("nemo_rl.models.policy.workers.dtensor_policy_worker.allgather_cp_sharded_tensor")
+@patch("nemo_rl.models.policy.workers.dtensor_policy_worker.distributed_vocab_topk")
+@patch("nemo_rl.models.policy.workers.dtensor_policy_worker.torch.autocast")
+def test_get_topk_logits_returns_none_on_non_driver_tp_cp_rank_v1(
+    mock_autocast,
+    mock_distributed_vocab_topk,
+    mock_allgather_cp_sharded_tensor,
+):
+    worker = object.__new__(DTensorPolicyWorkerImpl)
+    worker.cfg = {
+        "logprob_batch_size": 1,
+        "dynamic_batching": {"enabled": False},
+    }
+    worker.enable_seq_packing = False
+    worker.cp_size = 2
+    worker.dtype = torch.float32
+    worker.sampling_params = None
+    worker.tokenizer = SimpleNamespace(eos_token_id=0)
+    worker.model = MagicMock()
+    worker.model.eval = MagicMock()
+    worker.model.return_value = SimpleNamespace(
+        logits=torch.arange(24, dtype=torch.float32).reshape(1, 4, 6)
+    )
+    worker.cp_mesh = MagicMock()
+    worker.tp_mesh = MagicMock()
+    worker.device_mesh = MagicMock()
+    worker.device_mesh.__getitem__.return_value = "cp_tp_mesh"
+    worker.create_context_parallel_ctx = MagicMock(return_value=nullcontext())
+
+    cp_group = object()
+    tp_group = object()
+    worker.cp_mesh.get_group.return_value = cp_group
+    worker.tp_mesh.get_group.return_value = tp_group
+
+    microbatch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+            "input_lengths": torch.tensor([4], dtype=torch.int32),
+        }
+    )
+    data = _FakeTopkData([microbatch], seq_len=4)
+
+    mock_autocast.return_value = nullcontext()
+    mock_distributed_vocab_topk.return_value = (
+        torch.arange(12, dtype=torch.float32).reshape(1, 4, 3),
+        torch.arange(12, dtype=torch.int64).reshape(1, 4, 3),
+    )
+    mock_allgather_cp_sharded_tensor.side_effect = lambda tensor, *_args, **_kwargs: (
+        tensor
+    )
+
+    def fake_rank(group):
+        if group is cp_group:
+            return 0
+        if group is tp_group:
+            return 1
+        raise AssertionError(f"unexpected process group: {group}")
+
+    with (
+        patch.object(torch.Tensor, "cuda", lambda self: self),
+        patch(
+            "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensor.from_local",
+            side_effect=lambda tensor, **_kwargs: SimpleNamespace(
+                to_local=lambda: tensor
+            ),
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.dtensor_policy_worker.torch.distributed.get_rank",
+            side_effect=fake_rank,
+        ),
+    ):
+        outputs = worker.get_topk_logits(data, k=3)
+
+    assert outputs is None
 
 
 def _base_setup_impl(request, cluster):

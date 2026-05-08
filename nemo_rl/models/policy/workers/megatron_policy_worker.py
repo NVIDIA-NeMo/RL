@@ -719,6 +719,12 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
+        should_return_payload = (
+            parallel_state.is_pipeline_first_stage(ignore_virtual=True)
+            and parallel_state.get_tensor_model_parallel_rank() == 0
+            and parallel_state.get_context_parallel_rank() == 0
+        )
+
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             logits_chunks = []
             indices_chunks = []
@@ -750,9 +756,129 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         topk_logits = broadcasted["topk_logits"]
         topk_indices = broadcasted["topk_indices"]
 
+        if not should_return_payload:
+            no_grad.__exit__(None, None, None)
+            return None
+
         no_grad.__exit__(None, None, None)
         return BatchedDataDict.from_batches(
             [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
+        )
+
+    @wrap_with_nvtx_name("megatron_policy_worker/annotate_topk_stream")
+    def annotate_topk_stream(
+        self,
+        token_chunks: list[Any] | None,
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        batch_id: Optional[str] = None,
+    ):
+        import ray
+
+        from nemo_rl.algorithms.distillation_streaming import (
+            iter_annotated_teacher_topk_chunks,
+        )
+
+        return list(
+            iter_annotated_teacher_topk_chunks(
+                token_chunks=token_chunks or [],
+                get_topk_logits=self.get_topk_logits,
+                k=k,
+                micro_batch_size=micro_batch_size,
+                batch_id=batch_id,
+                put_fn=ray.put,
+            )
+        )
+
+    @wrap_with_nvtx_name("megatron_policy_worker/train_distillation_stream")
+    def train_distillation_stream(
+        self,
+        data: BatchedDataDict,
+        annotated_chunks: list[Any],
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        student_dp_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        from nemo_rl.algorithms.distillation_streaming import (
+            attach_teacher_topk_to_local_batch_from_annotated_chunks,
+        )
+
+        if gbs is None:
+            gbs = self.cfg["train_global_batch_size"]
+        data = attach_teacher_topk_to_local_batch_from_annotated_chunks(
+            data,
+            annotated_chunks,
+        )
+        return self.train(
+            data=data,
+            loss_fn=loss_fn,
+            eval_mode=eval_mode,
+            gbs=gbs,
+            mbs=mbs,
+        )
+
+    @wrap_with_nvtx_name("megatron_policy_worker/train_distillation_sparse_stream")
+    def train_distillation_sparse_stream(
+        self,
+        data: BatchedDataDict,
+        annotated_chunks: list[Any],
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        student_dp_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        from nemo_rl.algorithms.distillation_streaming import (
+            attach_sparse_teacher_topk_to_local_batch_from_annotated_chunks,
+        )
+
+        if gbs is None:
+            gbs = self.cfg["train_global_batch_size"]
+        data = attach_sparse_teacher_topk_to_local_batch_from_annotated_chunks(
+            data,
+            annotated_chunks,
+        )
+        return self.train(
+            data=data,
+            loss_fn=loss_fn,
+            eval_mode=eval_mode,
+            gbs=gbs,
+            mbs=mbs,
+        )
+
+    @wrap_with_nvtx_name("megatron_policy_worker/train_distillation_stream_from_refs")
+    def train_distillation_stream_from_refs(
+        self,
+        annotated_chunks: list[Any],
+        student_dp_rank: int,
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        student_dp_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        from nemo_rl.algorithms.distillation_streaming import (
+            assemble_dense_distillation_batch_from_annotated_chunks,
+        )
+
+        if gbs is None:
+            gbs = self.cfg["train_global_batch_size"]
+        if student_dp_size is None:
+            student_dp_size = self.dp_size
+        data = assemble_dense_distillation_batch_from_annotated_chunks(
+            annotated_chunks,
+            train_global_batch_size=gbs,
+            student_dp_size=student_dp_size,
+            student_dp_rank=student_dp_rank,
+        )
+        return self.train(
+            data=data,
+            loss_fn=loss_fn,
+            eval_mode=eval_mode,
+            gbs=gbs,
+            mbs=mbs,
         )
 
     @wrap_with_nvtx_name("megatron_policy_worker/generate")

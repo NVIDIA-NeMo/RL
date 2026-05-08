@@ -15,6 +15,8 @@
 import contextlib
 import os
 import tempfile
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -32,6 +34,8 @@ from tests.unit.test_utils import SimpleLossFn
 
 try:
     from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
+        DTensorPolicyWorkerV2,
+        DTensorPolicyWorkerV2Impl,
         _maybe_adapt_tensor_to_hf,
         dtensor_params_generator,
         get_train_context,
@@ -40,6 +44,47 @@ try:
     NEMO_AUTOMODEL_AVAILABLE = True
 except ImportError:
     NEMO_AUTOMODEL_AVAILABLE = False
+
+
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo automodel not available")
+def test_train_distillation_stream_from_refs_assembles_worker_batch():
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.cfg = {"train_global_batch_size": 4}
+    worker.dp_size = 2
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation_streaming.assemble_dense_distillation_batch_from_annotated_chunks",
+            return_value="dense-batch",
+        ) as mock_assemble,
+        patch.object(
+            DTensorPolicyWorkerV2Impl,
+            "train",
+            return_value={"global_loss": torch.tensor(1.0)},
+        ) as mock_train,
+    ):
+        result = worker.train_distillation_stream_from_refs(
+            annotated_chunks=["chunk"],
+            student_dp_rank=1,
+            loss_fn="loss-fn",
+            mbs=2,
+            student_dp_size=2,
+        )
+
+    assert torch.equal(result["global_loss"], torch.tensor(1.0))
+    mock_assemble.assert_called_once_with(
+        ["chunk"],
+        train_global_batch_size=4,
+        student_dp_size=2,
+        student_dp_rank=1,
+    )
+    mock_train.assert_called_once_with(
+        data="dense-batch",
+        loss_fn="loss-fn",
+        eval_mode=False,
+        gbs=4,
+        mbs=2,
+    )
 
 
 def create_test_config(
@@ -158,6 +203,132 @@ def create_test_batch(
     )
     data = data.to("cpu")
     return data
+
+
+class _FakeTopkData:
+    def __init__(self):
+        self.devices = []
+
+    def to(self, device):
+        self.devices.append(device)
+        return self
+
+
+@patch(
+    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.forward_with_post_processing_fn"
+)
+@patch("nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context")
+@patch("nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_microbatch_iterator")
+@patch("nemo_rl.models.policy.workers.dtensor_policy_worker_v2.check_sequence_dim")
+@pytest.mark.skipif(
+    not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available"
+)
+def test_get_topk_logits_returns_shape_on_driver_tp_cp_rank_v2(
+    mock_check_sequence_dim,
+    mock_get_microbatch_iterator,
+    mock_get_train_context,
+    mock_forward_with_post_processing_fn,
+):
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.cfg = {"logprob_batch_size": 1}
+    worker.model = MagicMock()
+    worker.model.eval = MagicMock()
+    worker.cp_size = 2
+    worker.cp_mesh = MagicMock()
+    worker.tp_mesh = MagicMock()
+    worker.dp_mesh = MagicMock()
+    worker.device_mesh = MagicMock()
+    worker.dtype = torch.float32
+    worker.autocast_enabled = False
+    worker.allow_flash_attn_args = False
+    worker.enable_seq_packing = False
+    worker.sampling_params = None
+    worker.tokenizer = MagicMock()
+
+    cp_group = object()
+    tp_group = object()
+    worker.cp_mesh.get_group.return_value = cp_group
+    worker.tp_mesh.get_group.return_value = tp_group
+
+    vals = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+    idx = torch.arange(24, dtype=torch.int64).reshape(2, 4, 3)
+
+    mock_check_sequence_dim.return_value = (1, 4)
+    mock_get_microbatch_iterator.return_value = (
+        [SimpleNamespace(processed_inputs=SimpleNamespace(cp_buffers=[]))],
+        1,
+    )
+    mock_get_train_context.return_value = nullcontext()
+    mock_forward_with_post_processing_fn.return_value = ((vals, idx), None, None)
+
+    with patch(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.torch.distributed.get_rank",
+        side_effect=lambda group: 0 if group in (cp_group, tp_group) else None,
+    ):
+        outputs = worker.get_topk_logits(_FakeTopkData(), k=3)
+
+    assert outputs["topk_logits"].shape == (2, 4, 3)
+    assert outputs["topk_indices"].shape == (2, 4, 3)
+    torch.testing.assert_close(outputs["topk_logits"], vals)
+    torch.testing.assert_close(outputs["topk_indices"], idx)
+
+
+@patch(
+    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.forward_with_post_processing_fn"
+)
+@patch("nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context")
+@patch("nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_microbatch_iterator")
+@patch("nemo_rl.models.policy.workers.dtensor_policy_worker_v2.check_sequence_dim")
+@pytest.mark.skipif(
+    not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available"
+)
+def test_get_topk_logits_returns_none_on_non_driver_tp_or_cp_rank_v2(
+    mock_check_sequence_dim,
+    mock_get_microbatch_iterator,
+    mock_get_train_context,
+    mock_forward_with_post_processing_fn,
+):
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.cfg = {"logprob_batch_size": 1}
+    worker.model = MagicMock()
+    worker.model.eval = MagicMock()
+    worker.cp_size = 2
+    worker.cp_mesh = MagicMock()
+    worker.tp_mesh = MagicMock()
+    worker.dp_mesh = MagicMock()
+    worker.device_mesh = MagicMock()
+    worker.dtype = torch.float32
+    worker.autocast_enabled = False
+    worker.allow_flash_attn_args = False
+    worker.enable_seq_packing = False
+    worker.sampling_params = None
+    worker.tokenizer = MagicMock()
+
+    cp_group = object()
+    tp_group = object()
+    worker.cp_mesh.get_group.return_value = cp_group
+    worker.tp_mesh.get_group.return_value = tp_group
+
+    vals = MagicMock()
+    idx = MagicMock()
+
+    mock_check_sequence_dim.return_value = (1, 4)
+    mock_get_microbatch_iterator.return_value = (
+        [SimpleNamespace(processed_inputs=SimpleNamespace(cp_buffers=[]))],
+        1,
+    )
+    mock_get_train_context.return_value = nullcontext()
+    mock_forward_with_post_processing_fn.return_value = ((vals, idx), None, None)
+
+    with patch(
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.torch.distributed.get_rank",
+        side_effect=lambda group: 1 if group == cp_group else 0,
+    ):
+        outputs = worker.get_topk_logits(_FakeTopkData(), k=3)
+
+    assert outputs is None
+    vals.cpu.assert_not_called()
+    idx.cpu.assert_not_called()
 
 
 @pytest.fixture(scope="module")

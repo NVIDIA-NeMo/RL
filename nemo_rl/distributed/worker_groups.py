@@ -63,31 +63,36 @@ class MultiWorkerFuture:
         """
         from ray import ObjectRef, ObjectRefGenerator
 
-        if return_generators_as_proxies:
-            # Directly return the futures, which are expected to be ObjectRefGenerators (or other proxies).
-            # No ray.get() is called on them. The consumer is responsible for handling the proxies.
+        def select_requested_futures(
+            futures: list[ObjectRef],
+            ignore_out_of_range: bool = False,
+        ) -> list[ObjectRef]:
             if self.return_from_workers is None:
-                return self.futures
+                return futures
 
             if self.called_workers is not None:
                 map_called_worker_to_future_idx = {
                     global_idx: i for i, global_idx in enumerate(self.called_workers)
                 }
-                final_proxies = []
+                selected_futures = []
                 for global_worker_to_return in self.return_from_workers:
                     if global_worker_to_return in map_called_worker_to_future_idx:
                         future_idx = map_called_worker_to_future_idx[
                             global_worker_to_return
                         ]
-                        if future_idx < len(self.futures):
-                            final_proxies.append(self.futures[future_idx])
-                return final_proxies
-            else:
-                return [
-                    self.futures[i]
-                    for i in self.return_from_workers
-                    if i < len(self.futures)
-                ]
+                        if future_idx < len(futures):
+                            selected_futures.append(futures[future_idx])
+                return selected_futures
+
+            if ignore_out_of_range:
+                return [futures[i] for i in self.return_from_workers if i < len(futures)]
+
+            return [futures[i] for i in self.return_from_workers]
+
+        if return_generators_as_proxies:
+            # Directly return the futures, which are expected to be ObjectRefGenerators (or other proxies).
+            # No ray.get() is called on them. The consumer is responsible for handling the proxies.
+            return select_requested_futures(self.futures, ignore_out_of_range=True)
 
         object_refs: list[ObjectRef] = []
         has_generator = False
@@ -833,6 +838,7 @@ class RayWorkerGroup:
         output_is_replicated: list[str] | None = None,
         make_dummy_calls_to_free_axes: bool = False,
         common_kwargs: Optional[dict[str, Any]] = None,
+        remote_call_options: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> MultiWorkerFuture:
         """Run a method on all workers in parallel with sharded data.
@@ -852,6 +858,9 @@ class RayWorkerGroup:
             make_dummy_calls_to_free_axes: Whether to make dummy calls (with None) to workers that
                                            aren't rank 0 on 'free axes' (axes not in in_sharded_axes or replicate_on_axes).
             common_kwargs: Keyword arguments to pass to all workers
+            remote_call_options: Ray actor-method options to apply before
+                                 calling `.remote()`, such as
+                                 `{"num_returns": "streaming"}`.
             **kwargs: Keyword arguments to pass to workers/groups
                       e.g. {"key1": [value_for_worker_1, value_for_worker_2], "key2": [value_for_worker_1, value_for_worker_2]}
 
@@ -960,9 +969,10 @@ class RayWorkerGroup:
                         }
 
                 # Call the method on the worker with its data slice
-                future = getattr(worker, method_name).remote(
-                    *worker_args, **worker_kwargs, **common_kwargs
-                )
+                method = getattr(worker, method_name)
+                if remote_call_options is not None:
+                    method = method.options(**remote_call_options)
+                future = method.remote(*worker_args, **worker_kwargs, **common_kwargs)
                 futures.append(future)
                 called_workers.append(worker_idx)
             else:
@@ -971,9 +981,10 @@ class RayWorkerGroup:
                     # If make_dummy_calls_to_free_axes is True, just call the method with None
                     worker_args = [None] * len(args)
                     worker_kwargs = {key: None for key in kwargs.keys()}
-                    future = getattr(worker, method_name).remote(
-                        *worker_args, **worker_kwargs, **common_kwargs
-                    )
+                    method = getattr(worker, method_name)
+                    if remote_call_options is not None:
+                        method = method.options(**remote_call_options)
+                    future = method.remote(*worker_args, **worker_kwargs, **common_kwargs)
                     futures.append(future)
                     called_workers.append(worker_idx)
                 else:

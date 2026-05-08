@@ -12,6 +12,26 @@ distillation:
     max_val_samples: 512
     topk_logits_k: 64
     seed: 42
+    data_pipeline:
+        # Modes:
+        # - legacy: current dense OPD path.
+        # - stream_teacher: stream teacher top-k refs; requires text-only OPD and
+        #   no teacher dynamic batching or sequence packing in v1.
+        # - stream_rollout: additionally trains student from token refs; v1
+        #   rejects async rollouts, dynamic batching, sequence packing, and multimodal.
+        # - sparse_loss: keeps stream_teacher transport and avoids dense [B,S,K]
+        #   teacher tensors in workers; v1 rejects dynamic batching, sequence
+        #   packing, CP, and multimodal.
+        # This example keeps dynamic_batching.enabled=true below, so it is
+        # legacy-ready as written. For stream_teacher, disable teacher dynamic
+        # batching and sequence packing. For stream_rollout and sparse_loss,
+        # disable dynamic batching and sequence packing for both policy and
+        # teacher. stream_rollout also requires async rollouts to be disabled.
+        mode: "legacy"
+        max_chunk_tokens: 262144
+        max_chunk_bytes: null
+        max_chunk_loss_positions: null
+        log_memory_metrics: true
 
 loss_fn:
     kl_type: "mixed" # forward, reverse, mixed

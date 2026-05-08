@@ -28,6 +28,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
+    get_sparse_distillation_topk_logprobs_from_logits,
 )
 
 
@@ -108,18 +109,32 @@ def prepare_loss_input(
 
     elif loss_fn.input_type == LossInputType.DISTILLATION:
         calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
-        student_topk_logprobs, teacher_topk_logprobs, H_all = (
-            get_distillation_topk_logprobs_from_logits(
-                student_logits=logits,
-                teacher_topk_logits=data["teacher_topk_logits"],
-                teacher_topk_indices=data["teacher_topk_indices"],
-                zero_outside_topk=loss_fn.zero_outside_topk,
-                calculate_entropy=calculate_entropy,
-                vocab_parallel_rank=vocab_parallel_rank,
-                vocab_parallel_group=vocab_parallel_group,
-                context_parallel_group=context_parallel_group,
+        if "teacher_topk_sparse_logits" in data:
+            student_topk_logprobs, teacher_topk_logprobs, H_all = (
+                get_sparse_distillation_topk_logprobs_from_logits(
+                    student_logits=logits,
+                    teacher_topk_logits=data["teacher_topk_sparse_logits"],
+                    teacher_topk_indices=data["teacher_topk_sparse_indices"],
+                    teacher_topk_positions=data["teacher_topk_sparse_positions"],
+                    zero_outside_topk=loss_fn.zero_outside_topk,
+                    calculate_entropy=calculate_entropy,
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                )
             )
-        )
+        else:
+            student_topk_logprobs, teacher_topk_logprobs, H_all = (
+                get_distillation_topk_logprobs_from_logits(
+                    student_logits=logits,
+                    teacher_topk_logits=data["teacher_topk_logits"],
+                    teacher_topk_indices=data["teacher_topk_indices"],
+                    zero_outside_topk=loss_fn.zero_outside_topk,
+                    calculate_entropy=calculate_entropy,
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                )
+            )
 
         loss_input = {
             "student_topk_logprobs": student_topk_logprobs,

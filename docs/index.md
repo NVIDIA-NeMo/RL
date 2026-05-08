@@ -292,6 +292,8 @@ design-docs/loss-functions.md
 design-docs/fsdp2-parallel-plan.md
 design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
+design-docs/opd-data-pipeline.md
+design-docs/opd-data-pipeline-implementation-plan.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
 ```

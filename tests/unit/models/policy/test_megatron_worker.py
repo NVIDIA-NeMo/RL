@@ -14,7 +14,9 @@
 import os
 import tempfile
 import time
+from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -34,6 +36,10 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.workers.megatron_policy_worker import (
+    MegatronPolicyWorker,
+    MegatronPolicyWorkerImpl,
+)
 from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
 
@@ -55,6 +61,170 @@ basic_pg_loss_test_config: ClippedPGLossConfig = {
     "token_level_loss": True,
     "force_on_policy_ratio": False,
 }
+
+
+class _FakeMegatronTopkData:
+    def to(self, _device):
+        return self
+
+
+def test_train_distillation_stream_from_refs_assembles_worker_batch():
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {"train_global_batch_size": 4}
+    worker.dp_size = 2
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation_streaming.assemble_dense_distillation_batch_from_annotated_chunks",
+            return_value="dense-batch",
+        ) as mock_assemble,
+        patch.object(
+            MegatronPolicyWorkerImpl,
+            "train",
+            return_value={"global_loss": torch.tensor(1.0)},
+        ) as mock_train,
+    ):
+        result = worker.train_distillation_stream_from_refs(
+            annotated_chunks=["chunk"],
+            student_dp_rank=1,
+            loss_fn="loss-fn",
+            mbs=2,
+            student_dp_size=2,
+        )
+
+    assert torch.equal(result["global_loss"], torch.tensor(1.0))
+    mock_assemble.assert_called_once_with(
+        ["chunk"],
+        train_global_batch_size=4,
+        student_dp_size=2,
+        student_dp_rank=1,
+    )
+    mock_train.assert_called_once_with(
+        data="dense-batch",
+        loss_fn="loss-fn",
+        eval_mode=False,
+        gbs=4,
+        mbs=2,
+    )
+
+
+@patch(
+    "nemo_rl.models.policy.workers.megatron_policy_worker.broadcast_tensors_from_last_stage"
+)
+@patch(
+    "nemo_rl.models.policy.workers.megatron_policy_worker.megatron_forward_backward"
+)
+@patch("nemo_rl.models.policy.workers.megatron_policy_worker.get_microbatch_iterator")
+def test_get_topk_logits_returns_none_on_non_driver_pipeline_rank(
+    mock_get_microbatch_iterator,
+    mock_megatron_forward_backward,
+    mock_broadcast_tensors_from_last_stage,
+):
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {"logprob_batch_size": 1}
+    worker.model = MagicMock()
+    worker.model.eval = MagicMock()
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
+    worker.defer_fp32_logits = False
+    worker.sampling_params = None
+
+    vals = torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
+    idx = torch.arange(12, dtype=torch.int64).reshape(1, 4, 3)
+
+    mock_get_microbatch_iterator.return_value = (
+        iter([object()]),
+        1,
+        1,
+        4,
+        4,
+    )
+    mock_megatron_forward_backward.return_value = [
+        {"topk_logits": vals, "topk_indices": idx}
+    ]
+    mock_broadcast_tensors_from_last_stage.side_effect = lambda tensors: tensors
+
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.parallel_state.is_pipeline_first_stage",
+            return_value=False,
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.parallel_state.is_pipeline_last_stage",
+            return_value=True,
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.parallel_state.get_tensor_model_parallel_rank",
+            return_value=0,
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.parallel_state.get_context_parallel_rank",
+            return_value=0,
+        ),
+    ):
+        outputs = worker.get_topk_logits(data=_FakeMegatronTopkData(), k=3)
+
+    assert outputs is None
+
+
+@patch(
+    "nemo_rl.models.policy.workers.megatron_policy_worker.broadcast_tensors_from_last_stage"
+)
+@patch(
+    "nemo_rl.models.policy.workers.megatron_policy_worker.megatron_forward_backward"
+)
+@patch("nemo_rl.models.policy.workers.megatron_policy_worker.get_microbatch_iterator")
+def test_get_topk_logits_returns_shape_on_driver_pipeline_rank(
+    mock_get_microbatch_iterator,
+    mock_megatron_forward_backward,
+    mock_broadcast_tensors_from_last_stage,
+):
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {"logprob_batch_size": 1}
+    worker.model = MagicMock()
+    worker.model.eval = MagicMock()
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
+    worker.defer_fp32_logits = False
+    worker.sampling_params = None
+
+    vals = torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
+    idx = torch.arange(12, dtype=torch.int64).reshape(1, 4, 3)
+
+    mock_get_microbatch_iterator.return_value = (
+        iter([object()]),
+        1,
+        1,
+        4,
+        4,
+    )
+    mock_megatron_forward_backward.return_value = [
+        {"topk_logits": vals, "topk_indices": idx}
+    ]
+    mock_broadcast_tensors_from_last_stage.side_effect = lambda tensors: tensors
+
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.parallel_state.is_pipeline_first_stage",
+            return_value=True,
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.parallel_state.is_pipeline_last_stage",
+            return_value=True,
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.parallel_state.get_tensor_model_parallel_rank",
+            return_value=0,
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker.parallel_state.get_context_parallel_rank",
+            return_value=0,
+        ),
+    ):
+        outputs = worker.get_topk_logits(data=_FakeMegatronTopkData(), k=3)
+
+    assert outputs["topk_logits"].shape == (1, 4, 3)
+    assert outputs["topk_indices"].shape == (1, 4, 3)
+    torch.testing.assert_close(outputs["topk_logits"], vals)
+    torch.testing.assert_close(outputs["topk_indices"], idx)
 
 
 def create_megatron_test_config(

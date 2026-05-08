@@ -25,7 +25,11 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     PY_EXECUTABLES,
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.distributed.worker_groups import (
+    MultiWorkerFuture,
+    RayWorkerBuilder,
+    RayWorkerGroup,
+)
 
 
 @ray.remote
@@ -142,6 +146,12 @@ class PrecedenceActor:
 
 
 MY_TEST_ACTOR_FQN = f"{MyTestActor.__module__}.MyTestActor"
+
+
+@ray.remote
+def streaming_values(*values):
+    for value in values:
+        yield value
 
 
 @ray.remote(
@@ -670,6 +680,146 @@ def test_run_all_workers_multiple_data_fewer_data_than_workers(
             "record_call", data=multi_data
         )
         ray.get(futures)
+
+
+def test_multi_worker_future_get_results_fetches_all_refs_before_filtering(monkeypatch):
+    refs = [ray.put("worker-10"), ray.put("worker-11"), ray.put("worker-12")]
+    future_bundle = MultiWorkerFuture(
+        futures=refs,
+        return_from_workers=[12, 10],
+        called_workers=[10, 11, 12],
+    )
+    captured_object_refs = []
+    original_ray_get = ray.get
+
+    def spying_ray_get(object_refs):
+        captured_object_refs.append(list(object_refs))
+        return original_ray_get(object_refs)
+
+    monkeypatch.setattr(ray, "get", spying_ray_get)
+
+    results = future_bundle.get_results(worker_group=None)
+
+    assert results == ["worker-12", "worker-10"]
+    assert captured_object_refs == [refs]
+
+
+def test_multi_worker_future_get_results_returns_selected_proxies(monkeypatch):
+    refs = [ray.put("worker-10"), ray.put("worker-11"), ray.put("worker-12")]
+    future_bundle = MultiWorkerFuture(
+        futures=refs,
+        return_from_workers=[12, 10],
+        called_workers=[10, 11, 12],
+    )
+
+    monkeypatch.setattr(
+        ray,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("ray.get should not be called"),
+    )
+
+    proxies = future_bundle.get_results(
+        worker_group=None, return_generators_as_proxies=True
+    )
+
+    assert proxies == [refs[2], refs[0]]
+
+
+def test_multi_worker_future_get_results_returns_selected_generator_proxies(
+    monkeypatch,
+):
+    generators = [
+        streaming_values.remote("worker-10-chunk-0"),
+        streaming_values.remote("worker-11-chunk-0"),
+        streaming_values.remote("worker-12-chunk-0"),
+    ]
+    future_bundle = MultiWorkerFuture(
+        futures=generators,
+        return_from_workers=[12, 10],
+        called_workers=[10, 11, 12],
+    )
+
+    monkeypatch.setattr(
+        ray,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("ray.get should not be called"),
+    )
+
+    proxies = future_bundle.get_results(
+        worker_group=None, return_generators_as_proxies=True
+    )
+
+    assert proxies == [generators[2], generators[0]]
+
+
+def test_multi_worker_future_get_results_preserves_generator_behavior():
+    future_bundle = MultiWorkerFuture(
+        futures=[streaming_values.remote("chunk-0", "chunk-1"), ray.put("worker-11")],
+        return_from_workers=[11],
+        called_workers=[10, 11],
+    )
+
+    results = future_bundle.get_results(worker_group=None)
+
+    assert results == ["chunk-0", "chunk-1", "worker-11"]
+
+
+class _FakeShardingAnnotations:
+    names = ["data_parallel"]
+
+    def get_axis_size(self, axis_name):
+        assert axis_name == "data_parallel"
+        return 2
+
+    def get_worker_coords(self, worker_idx):
+        return {"data_parallel": worker_idx}
+
+
+class _FakeActorMethod:
+    def __init__(self, worker_idx):
+        self.worker_idx = worker_idx
+        self.option_calls = []
+        self.remote_calls = []
+
+    def options(self, **options):
+        self.option_calls.append(options)
+        return self
+
+    def remote(self, *args, **kwargs):
+        self.remote_calls.append((args, kwargs))
+        return f"worker-{self.worker_idx}-future"
+
+
+class _FakeWorker:
+    def __init__(self, worker_idx):
+        self.annotate_topk_stream = _FakeActorMethod(worker_idx)
+
+
+def test_run_all_workers_sharded_data_applies_remote_call_options():
+    worker_group = object.__new__(RayWorkerGroup)
+    worker_group.sharding_annotations = _FakeShardingAnnotations()
+    worker_group._workers = [_FakeWorker(0), _FakeWorker(1)]
+
+    futures = worker_group.run_all_workers_sharded_data(
+        "annotate_topk_stream",
+        token_chunks=[["chunk-0"], ["chunk-1"]],
+        in_sharded_axes=["data_parallel"],
+        remote_call_options={"num_returns": "streaming"},
+    )
+
+    assert futures.futures == ["worker-0-future", "worker-1-future"]
+    assert futures.called_workers == [0, 1]
+    assert futures.return_from_workers == [0, 1]
+    for worker in worker_group._workers:
+        assert worker.annotate_topk_stream.option_calls == [
+            {"num_returns": "streaming"}
+        ]
+    assert worker_group._workers[0].annotate_topk_stream.remote_calls[0][1][
+        "token_chunks"
+    ] == ["chunk-0"]
+    assert worker_group._workers[1].annotate_topk_stream.remote_calls[0][1][
+        "token_chunks"
+    ] == ["chunk-1"]
 
 
 def test_run_all_workers_sharded_data_1d(worker_group_1d_sharding):

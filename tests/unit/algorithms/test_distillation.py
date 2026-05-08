@@ -104,6 +104,9 @@ def mock_components():
 
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
+    tokenizer.image_processor = None
+    tokenizer.video_processor = None
+    tokenizer.feature_extractor = None
 
     loss_fn = DistillationLossFn(
         {
@@ -215,6 +218,278 @@ def test_distillation_train_max_steps(mock_components):
     )
 
     assert mock_components["student_policy"].train.call_count == 5
+
+
+def test_distillation_train_logs_legacy_opd_metrics_without_changing_teacher_payload(
+    mock_components,
+):
+    """Test that legacy OPD metrics are logged and teacher top-k payload stays unchanged."""
+    mock_components["master_config"]["distillation"]["max_num_steps"] = 1
+    mock_components["master_config"]["distillation"]["max_num_epochs"] = 1
+    mock_components["master_config"]["distillation"]["val_period"] = 0
+    mock_components["master_config"]["distillation"]["val_at_end"] = False
+
+    fake_teacher_topk = {
+        "topk_logits": torch.tensor(
+            [[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]
+        ),
+        "topk_indices": torch.tensor([[[9, 10], [11, 12], [13, 14], [15, 16]]]),
+    }
+    mock_components["teacher_policy"].get_topk_logits.return_value = fake_teacher_topk
+
+    distillation_save_state = _default_distillation_save_state()
+
+    with (
+        patch.object(
+            distil_mod,
+            "_get_teacher_annotation_bytes",
+            return_value=4321,
+        ) as mock_teacher_annotation_bytes,
+        patch.object(
+            distil_mod,
+            "_get_driver_rss_bytes",
+            side_effect=[100, 150],
+        ) as mock_driver_rss_bytes,
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            distillation_save_state,
+            mock_components["master_config"],
+        )
+
+    assert mock_driver_rss_bytes.call_count == 2
+    mock_teacher_annotation_bytes.assert_called_once_with(fake_teacher_topk)
+
+    train_call = mock_components["student_policy"].train.call_args
+    train_payload = train_call.args[0]
+    assert torch.equal(
+        train_payload["teacher_topk_logits"], fake_teacher_topk["topk_logits"]
+    )
+    assert torch.equal(
+        train_payload["teacher_topk_indices"], fake_teacher_topk["topk_indices"]
+    )
+
+    train_metrics = None
+    for call in mock_components["logger"].log_metrics.call_args_list:
+        if call.kwargs.get("prefix") == "train":
+            train_metrics = call.args[0]
+            break
+
+    assert train_metrics is not None
+    assert train_metrics["opd/data/teacher_annotation_bytes"] == 4321
+    assert train_metrics["opd/data/manifest_batch_size"] == 1
+    assert train_metrics["opd/data/manifest_loss_positions"] == 3
+    assert train_metrics["opd/data/driver_rss_bytes"] == 150
+
+
+def test_distillation_train_stream_teacher_uses_stream_consumer(mock_components):
+    mock_components["master_config"]["distillation"]["max_num_steps"] = 1
+    mock_components["master_config"]["distillation"]["max_num_epochs"] = 1
+    mock_components["master_config"]["distillation"]["val_period"] = 0
+    mock_components["master_config"]["distillation"]["val_at_end"] = False
+    mock_components["master_config"]["distillation"]["data_pipeline"] = {
+        "mode": "stream_teacher",
+        "max_chunk_tokens": 1024,
+    }
+
+    layout = MagicMock()
+    layout.dp = 1
+    mock_components["teacher_policy"].stage_layout.return_value = layout
+    mock_components["teacher_policy"].annotate_topk_stream.return_value = "annotated"
+    mock_components["student_policy"].train_distillation_stream.return_value = {
+        "loss": torch.tensor(0.25),
+        "grad_norm": torch.tensor(0.75),
+        "all_mb_metrics": {"global_valid_toks": [3]},
+    }
+
+    distillation_save_state = _default_distillation_save_state()
+
+    with patch.object(
+        distil_mod,
+        "drain_annotated_stream",
+        return_value="drained",
+    ) as mock_drain:
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            distillation_save_state,
+            mock_components["master_config"],
+        )
+
+    mock_components["teacher_policy"].get_topk_logits.assert_not_called()
+    mock_components["student_policy"].train.assert_not_called()
+    mock_components["teacher_policy"].annotate_topk_stream.assert_called_once()
+    mock_drain.assert_called_once_with("annotated")
+    stream_train_call = mock_components["student_policy"].train_distillation_stream.call_args
+    assert stream_train_call.args[1:] == ("drained", mock_components["loss_fn"])
+    assert stream_train_call.args[0]["sample_ids"].tolist() == [0]
+    assert "timer" in stream_train_call.kwargs
+
+
+def test_distillation_train_stream_rollout_uses_ref_stream_consumer(mock_components):
+    mock_components["master_config"]["distillation"]["max_num_steps"] = 1
+    mock_components["master_config"]["distillation"]["data_pipeline"] = {
+        "mode": "stream_rollout",
+        "max_chunk_tokens": 128,
+    }
+
+    layout = MagicMock()
+    layout.dp = 1
+    mock_components["teacher_policy"].stage_layout.return_value = layout
+    mock_components["teacher_policy"].annotate_topk_stream.return_value = "annotated"
+    mock_components["student_policy"].train_distillation_stream_from_refs.return_value = {
+        "loss": torch.tensor(0.25),
+        "grad_norm": torch.tensor(0.75),
+        "all_mb_metrics": {"global_valid_toks": [3]},
+    }
+
+    distillation_save_state = _default_distillation_save_state()
+
+    with (
+        patch.object(
+            distil_mod,
+            "drain_annotated_stream",
+            return_value="drained",
+        ) as mock_drain,
+        patch.object(
+            distil_mod,
+            "build_token_stream_from_rollout_batch",
+            wraps=distil_mod.build_token_stream_from_rollout_batch,
+        ) as mock_rollout_normalizer,
+        patch.object(
+            distil_mod,
+            "batched_message_log_to_flat_message",
+            side_effect=AssertionError("stream_rollout should not use dense flatten"),
+        ),
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            distillation_save_state,
+            mock_components["master_config"],
+        )
+
+    mock_rollout_normalizer.assert_called_once()
+    mock_components["teacher_policy"].get_topk_logits.assert_not_called()
+    mock_components["student_policy"].train.assert_not_called()
+    mock_components["student_policy"].train_distillation_stream.assert_not_called()
+    mock_components[
+        "student_policy"
+    ].train_distillation_stream_from_refs.assert_called_once()
+    ref_stream_call = mock_components[
+        "student_policy"
+    ].train_distillation_stream_from_refs.call_args
+    assert ref_stream_call.args == ("drained", mock_components["loss_fn"])
+    assert "timer" in ref_stream_call.kwargs
+    mock_drain.assert_called_once_with("annotated")
+
+
+def test_distillation_train_stream_rollout_rejects_async_rollout(mock_components):
+    mock_components["master_config"]["distillation"]["data_pipeline"] = {
+        "mode": "stream_rollout"
+    }
+    mock_components["master_config"]["policy"]["generation"]["backend"] = "vllm"
+    mock_components["master_config"]["policy"]["generation"]["vllm_cfg"] = {
+        "async_engine": True
+    }
+
+    with pytest.raises(AssertionError, match="async rollouts"):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            mock_components["master_config"],
+        )
+
+
+def test_distillation_train_sparse_loss_uses_sparse_stream_consumer(mock_components):
+    mock_components["master_config"]["distillation"]["max_num_steps"] = 1
+    mock_components["master_config"]["distillation"]["max_num_epochs"] = 1
+    mock_components["master_config"]["distillation"]["val_period"] = 0
+    mock_components["master_config"]["distillation"]["val_at_end"] = False
+    mock_components["master_config"]["distillation"]["data_pipeline"] = {
+        "mode": "sparse_loss",
+        "max_chunk_tokens": 128,
+    }
+
+    layout = MagicMock()
+    layout.dp = 1
+    mock_components["teacher_policy"].stage_layout.return_value = layout
+    mock_components["teacher_policy"].annotate_topk_stream.return_value = "annotated"
+    mock_components["student_policy"].train_distillation_sparse_stream.return_value = {
+        "loss": torch.tensor(0.25),
+        "grad_norm": torch.tensor(0.75),
+        "all_mb_metrics": {"global_valid_toks": [3]},
+    }
+
+    with patch.object(
+        distil_mod,
+        "drain_annotated_stream",
+        return_value="drained",
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            mock_components["master_config"],
+        )
+
+    mock_components["teacher_policy"].get_topk_logits.assert_not_called()
+    mock_components["student_policy"].train_distillation_stream.assert_not_called()
+    mock_components[
+        "student_policy"
+    ].train_distillation_sparse_stream.assert_called_once()
+    sparse_call = mock_components[
+        "student_policy"
+    ].train_distillation_sparse_stream.call_args
+    assert sparse_call.args[1:] == ("drained", mock_components["loss_fn"])
+    assert "sample_ids" in sparse_call.args[0]
 
 
 def test_exit_on_timeout(mock_components, capsys):

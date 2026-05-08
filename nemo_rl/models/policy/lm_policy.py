@@ -235,6 +235,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         else:
             worker_kwargs["tokenizer"] = tokenizer
             worker_kwargs["processor"] = processor
+        self.supports_multimodal = processor is not None
 
         worker_builder = RayWorkerBuilder(
             worker_builder_cls_fqn,
@@ -314,6 +315,25 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.use_sequence_packing = False
 
         self.cfg = config
+
+    def stage_layout(self):
+        """Return the model/data-parallel layout for stream planning."""
+        from nemo_rl.algorithms.distillation_streaming import StageLayout
+
+        return StageLayout(
+            dp=self.sharding_annotations.get_axis_size("data_parallel"),
+            cp=self.sharding_annotations.get_axis_size("context_parallel"),
+            tp=self.sharding_annotations.get_axis_size("tensor_parallel"),
+            pp=self.sharding_annotations.get_axis_size("pipeline_parallel"),
+            pad_multiple=self.cfg["make_sequence_length_divisible_by"],
+            supports_sequence_packing=bool(
+                self.cfg.get("sequence_packing", {}).get("enabled", False)
+            ),
+            supports_dynamic_batching=bool(
+                self.cfg.get("dynamic_batching", {}).get("enabled", False)
+            ),
+            supports_multimodal=self.supports_multimodal,
+        )
 
     def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:
         """Run a method on all workers in parallel with the same data.
@@ -553,6 +573,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 sharded_data = data.shard_by_batch_size(  # type: ignore
                     dp_size,
                     batch_size=None,
+                    allow_uneven_shards=True,
                 )
 
         with (
@@ -590,6 +611,332 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             stacked.reorder_data(unsorted_data_indices)
 
         return stacked
+
+    def annotate_topk_stream(
+        self,
+        token_stream,
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ):
+        """Dispatch teacher top-k annotation to worker shards."""
+        from nemo_rl.algorithms.distillation_streaming import ShardedBatchStream
+
+        with (
+            timer.time("annotate_topk_stream/submit_teacher_stream_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "annotate_topk_stream",
+                token_chunks=token_stream.shard_streams,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={
+                    "k": k,
+                    "micro_batch_size": micro_batch_size,
+                    "batch_id": token_stream.batch_id,
+                },
+            )
+            shard_streams = self.worker_group.get_all_worker_results(
+                futures,
+            )
+
+        return ShardedBatchStream(
+            batch_id=token_stream.batch_id,
+            layout=token_stream.layout,
+            dp_size=len(shard_streams),
+            manifest=token_stream.manifest,
+            shard_streams=shard_streams,
+        )
+
+    def train_distillation_stream(
+        self,
+        data: BatchedDataDict[Any],
+        annotated_stream,
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        *,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> dict[str, Any]:
+        """Train from a drained teacher-annotated stream."""
+        from nemo_rl.algorithms.distillation_streaming import (
+            route_drained_stream_to_student_shards_by_sample_ids,
+        )
+
+        batch_size = gbs or self.cfg["train_global_batch_size"]
+        micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+
+        with timer.time("policy_training/sharding_stream_data") if timer else nullcontext():
+            if self.use_dynamic_batches:
+                self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                    "dynamic_batching"
+                ]["train_mb_tokens"]
+                sharded_data, _ = data.shard_by_batch_size(
+                    dp_size,
+                    batch_size=batch_size,
+                    dynamic_batching_args=self.dynamic_batching_args,
+                )
+            elif self.use_sequence_packing:
+                self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                    "sequence_packing"
+                ]["train_mb_tokens"]
+                sharded_data, _ = data.shard_by_batch_size(
+                    dp_size,
+                    batch_size=batch_size,
+                    sequence_packing_args=self.sequence_packing_args,
+                )
+            else:
+                sharded_data = data.shard_by_batch_size(
+                    dp_size,
+                    batch_size=batch_size,
+                )
+
+        if self.flops_tracker is not None:
+            self.flops_tracker.reset()
+            for shard in sharded_data:
+                input_lengths = shard["input_lengths"]
+                self.flops_tracker.track_batch(input_lengths.tolist())
+
+        routed_stream = route_drained_stream_to_student_shards_by_sample_ids(
+            annotated_stream,
+            sharded_sample_ids=[shard["sample_ids"] for shard in sharded_data],
+        )
+
+        with (
+            timer.time("policy_training/submit_stream_training_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "train_distillation_stream",
+                data=sharded_data,
+                annotated_chunks=routed_stream.shard_streams,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={
+                    "loss_fn": loss_fn,
+                    "eval_mode": eval_mode,
+                    "gbs": batch_size,
+                    "mbs": micro_batch_size,
+                    "student_dp_size": dp_size,
+                },
+            )
+        results = self.worker_group.get_all_worker_results(futures)
+
+        aggregated_results = {
+            "loss": results[0]["global_loss"],
+            "grad_norm": results[0]["grad_norm"],
+        }
+        if "moe_metrics" in results[0]:
+            aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
+
+        if self.flops_tracker is not None:
+            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+
+        all_mb_metrics = defaultdict(list)
+        for r in results:
+            for k_metric, value in r["all_mb_metrics"].items():
+                all_mb_metrics[k_metric].extend(value)
+        aggregated_results["all_mb_metrics"] = dict(all_mb_metrics)
+
+        return aggregated_results
+
+    def train_distillation_stream_from_refs(
+        self,
+        annotated_stream,
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        *,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> dict[str, Any]:
+        """Train from streamed token/top-k refs using fixed student DP sharding."""
+        from nemo_rl.algorithms.distillation_streaming import (
+            route_drained_stream_to_student_shards,
+        )
+
+        if self.use_dynamic_batches:
+            raise AssertionError(
+                "stream_rollout ref-only training does not support dynamic batching"
+            )
+        if self.use_sequence_packing:
+            raise AssertionError(
+                "stream_rollout ref-only training does not support sequence packing"
+            )
+
+        batch_size = gbs or self.cfg["train_global_batch_size"]
+        micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+
+        routed_stream = route_drained_stream_to_student_shards(
+            annotated_stream,
+            train_global_batch_size=batch_size,
+            student_dp_size=dp_size,
+        )
+
+        with (
+            timer.time("policy_training/submit_ref_stream_training_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "train_distillation_stream_from_refs",
+                annotated_chunks=routed_stream.shard_streams,
+                student_dp_rank=list(range(dp_size)),
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={
+                    "loss_fn": loss_fn,
+                    "eval_mode": eval_mode,
+                    "gbs": batch_size,
+                    "mbs": micro_batch_size,
+                    "student_dp_size": dp_size,
+                },
+            )
+        results = self.worker_group.get_all_worker_results(futures)
+
+        aggregated_results = {
+            "loss": results[0]["global_loss"],
+            "grad_norm": results[0]["grad_norm"],
+        }
+        if "moe_metrics" in results[0]:
+            aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
+
+        all_mb_metrics = defaultdict(list)
+        for r in results:
+            for k_metric, value in r["all_mb_metrics"].items():
+                all_mb_metrics[k_metric].extend(value)
+        aggregated_results["all_mb_metrics"] = dict(all_mb_metrics)
+
+        return aggregated_results
+
+    def train_distillation_sparse_stream(
+        self,
+        data: BatchedDataDict[Any],
+        annotated_stream,
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        *,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> dict[str, Any]:
+        """Train from a drained teacher stream using sparse teacher top-k tensors."""
+        from nemo_rl.algorithms.distillation_streaming import (
+            route_drained_stream_to_student_shards_by_sample_ids,
+        )
+
+        if self.use_dynamic_batches:
+            raise AssertionError(
+                "sparse_loss stream training does not support dynamic batching"
+            )
+        if self.use_sequence_packing:
+            raise AssertionError(
+                "sparse_loss stream training does not support sequence packing"
+            )
+        if self.sharding_annotations.get_axis_size("context_parallel") > 1:
+            raise AssertionError("sparse_loss stream training does not support CP")
+
+        batch_size = gbs or self.cfg["train_global_batch_size"]
+        micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+
+        with timer.time("policy_training/sharding_sparse_stream_data") if timer else nullcontext():
+            sharded_data = data.shard_by_batch_size(
+                dp_size,
+                batch_size=batch_size,
+            )
+
+        if self.flops_tracker is not None:
+            self.flops_tracker.reset()
+            for shard in sharded_data:
+                input_lengths = shard["input_lengths"]
+                self.flops_tracker.track_batch(input_lengths.tolist())
+
+        routed_stream = route_drained_stream_to_student_shards_by_sample_ids(
+            annotated_stream,
+            sharded_sample_ids=[shard["sample_ids"] for shard in sharded_data],
+        )
+
+        with (
+            timer.time("policy_training/submit_sparse_stream_training_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "train_distillation_sparse_stream",
+                data=sharded_data,
+                annotated_chunks=routed_stream.shard_streams,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={
+                    "loss_fn": loss_fn,
+                    "eval_mode": eval_mode,
+                    "gbs": batch_size,
+                    "mbs": micro_batch_size,
+                    "student_dp_size": dp_size,
+                },
+            )
+        results = self.worker_group.get_all_worker_results(futures)
+
+        aggregated_results = {
+            "loss": results[0]["global_loss"],
+            "grad_norm": results[0]["grad_norm"],
+        }
+        if "moe_metrics" in results[0]:
+            aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
+
+        if self.flops_tracker is not None:
+            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+
+        all_mb_metrics = defaultdict(list)
+        for r in results:
+            for k_metric, value in r["all_mb_metrics"].items():
+                all_mb_metrics[k_metric].extend(value)
+        aggregated_results["all_mb_metrics"] = dict(all_mb_metrics)
+
+        return aggregated_results
 
     def train(
         self,

@@ -1791,6 +1791,94 @@ def test_distillation_loss_different_settings(kl_type, zero_outside_topk):
     assert "loss" in metrics
 
 
+@pytest.mark.parametrize(
+    ("kl_type", "zero_outside_topk"),
+    [
+        ("reverse", False),
+        ("reverse", True),
+        ("mixed", True),
+    ],
+)
+def test_sparse_distillation_loss_matches_dense_active_positions_cpu(
+    kl_type,
+    zero_outside_topk,
+):
+    torch.manual_seed(7)
+    batch_size = 2
+    seq_len = 4
+    vocab_size = 8
+    topk = 3
+    active_positions = torch.tensor([[0, 2], [1, 1]], dtype=torch.int64)
+    sparse_mask = torch.tensor([[True, True], [True, False]])
+
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    token_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool)
+    for row in range(batch_size):
+        token_mask[row, active_positions[row, sparse_mask[row]] + 1] = True
+    sample_mask = torch.ones(batch_size, dtype=torch.bool)
+    student_logits = torch.randn((batch_size, seq_len, vocab_size))
+    teacher_dense_logits = torch.randn((batch_size, seq_len, topk))
+    teacher_dense_indices = torch.randint(0, vocab_size, (batch_size, seq_len, topk))
+
+    dense_data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([seq_len, seq_len]),
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "teacher_topk_logits": teacher_dense_logits,
+            "teacher_topk_indices": teacher_dense_indices,
+        }
+    )
+    sparse_data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([seq_len, seq_len]),
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "teacher_topk_sparse_logits": teacher_dense_logits.gather(
+                dim=1,
+                index=active_positions.unsqueeze(-1).expand(batch_size, 2, topk),
+            ),
+            "teacher_topk_sparse_indices": teacher_dense_indices.gather(
+                dim=1,
+                index=active_positions.unsqueeze(-1).expand(batch_size, 2, topk),
+            ),
+            "teacher_topk_sparse_positions": active_positions,
+            "teacher_topk_sparse_mask": sparse_mask,
+        }
+    )
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": kl_type,
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": zero_outside_topk,
+        }
+    )
+
+    dense_loss_input, dense_data = prepare_loss_input(student_logits, dense_data, loss_fn)
+    sparse_loss_input, sparse_data = prepare_loss_input(
+        student_logits,
+        sparse_data,
+        loss_fn,
+    )
+    global_valid_toks = token_mask[:, 1:].sum()
+    dense_loss, _ = loss_fn(
+        data=dense_data,
+        global_valid_seqs=sample_mask.sum(),
+        global_valid_toks=global_valid_toks,
+        **dense_loss_input,
+    )
+    sparse_loss, _ = loss_fn(
+        data=sparse_data,
+        global_valid_seqs=sample_mask.sum(),
+        global_valid_toks=global_valid_toks,
+        **sparse_loss_input,
+    )
+
+    torch.testing.assert_close(sparse_loss, dense_loss)
+
+
 @pytest.mark.parametrize("k", [1, 32, 64, 1000000])
 @pytest.mark.parametrize("zero_outside_topk", [True, False])
 def test_distillation_loss_topk_filtering(k, zero_outside_topk):

@@ -693,6 +693,10 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         out_topk_vals = []
         out_topk_idx = []
         self.model.eval()
+        should_return_payload = (
+            torch.distributed.get_rank(self.cp_mesh.get_group()) == 0
+            and torch.distributed.get_rank(self.tp_mesh.get_group()) == 0
+        )
 
         # Create top-k post-processor
         topk_post_processor = TopkLogitsPostProcessor(
@@ -745,8 +749,12 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
                 # Keep only real sequence tokens (no trimming here; padded positions can be masked downstream)
                 # Shapes remain [B, S, k].
-                out_topk_vals.append(vals.cpu())
-                out_topk_idx.append(idx.cpu())
+                if should_return_payload:
+                    out_topk_vals.append(vals.cpu())
+                    out_topk_idx.append(idx.cpu())
+
+        if not should_return_payload:
+            return None
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
@@ -777,6 +785,122 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             else all_topk_idx_padded[0]
         ).cpu()
         return ret
+
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/annotate_topk_stream")
+    def annotate_topk_stream(
+        self,
+        token_chunks: list[Any] | None,
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        batch_id: Optional[str] = None,
+    ):
+        import ray
+
+        from nemo_rl.algorithms.distillation_streaming import (
+            iter_annotated_teacher_topk_chunks,
+        )
+
+        return list(
+            iter_annotated_teacher_topk_chunks(
+                token_chunks=token_chunks or [],
+                get_topk_logits=self.get_topk_logits,
+                k=k,
+                micro_batch_size=micro_batch_size,
+                batch_id=batch_id,
+                put_fn=ray.put,
+            )
+        )
+
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/train_distillation_stream")
+    def train_distillation_stream(
+        self,
+        data: BatchedDataDict[Any],
+        annotated_chunks: list[Any],
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        student_dp_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        from nemo_rl.algorithms.distillation_streaming import (
+            attach_teacher_topk_to_local_batch_from_annotated_chunks,
+        )
+
+        if gbs is None:
+            gbs = self.cfg["train_global_batch_size"]
+        data = attach_teacher_topk_to_local_batch_from_annotated_chunks(
+            data,
+            annotated_chunks,
+        )
+        return self.train(
+            data=data,
+            loss_fn=loss_fn,
+            eval_mode=eval_mode,
+            gbs=gbs,
+            mbs=mbs,
+        )
+
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/train_distillation_sparse_stream")
+    def train_distillation_sparse_stream(
+        self,
+        data: BatchedDataDict[Any],
+        annotated_chunks: list[Any],
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        student_dp_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        from nemo_rl.algorithms.distillation_streaming import (
+            attach_sparse_teacher_topk_to_local_batch_from_annotated_chunks,
+        )
+
+        if gbs is None:
+            gbs = self.cfg["train_global_batch_size"]
+        data = attach_sparse_teacher_topk_to_local_batch_from_annotated_chunks(
+            data,
+            annotated_chunks,
+        )
+        return self.train(
+            data=data,
+            loss_fn=loss_fn,
+            eval_mode=eval_mode,
+            gbs=gbs,
+            mbs=mbs,
+        )
+
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/train_distillation_stream_from_refs")
+    def train_distillation_stream_from_refs(
+        self,
+        annotated_chunks: list[Any],
+        student_dp_rank: int,
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        student_dp_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        from nemo_rl.algorithms.distillation_streaming import (
+            assemble_dense_distillation_batch_from_annotated_chunks,
+        )
+
+        if gbs is None:
+            gbs = self.cfg["train_global_batch_size"]
+        if student_dp_size is None:
+            student_dp_size = self.dp_size
+        data = assemble_dense_distillation_batch_from_annotated_chunks(
+            annotated_chunks,
+            train_global_batch_size=gbs,
+            student_dp_size=student_dp_size,
+            student_dp_rank=student_dp_rank,
+        )
+        return self.train(
+            data=data,
+            loss_fn=loss_fn,
+            eval_mode=eval_mode,
+            gbs=gbs,
+            mbs=mbs,
+        )
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:

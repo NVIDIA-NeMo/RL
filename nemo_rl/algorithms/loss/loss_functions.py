@@ -948,8 +948,12 @@ class DistillationLossDataDict(TypedDict):
     input_lengths: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
-    teacher_topk_logits: torch.Tensor
-    teacher_topk_indices: torch.Tensor
+    teacher_topk_logits: NotRequired[torch.Tensor]
+    teacher_topk_indices: NotRequired[torch.Tensor]
+    teacher_topk_sparse_logits: NotRequired[torch.Tensor]
+    teacher_topk_sparse_indices: NotRequired[torch.Tensor]
+    teacher_topk_sparse_positions: NotRequired[torch.Tensor]
+    teacher_topk_sparse_mask: NotRequired[torch.Tensor]
 
 
 class DistillationLossFn(LossFunction):
@@ -1013,7 +1017,16 @@ class DistillationLossFn(LossFunction):
         per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
 
         # Masking and reduction
-        if "token_mask" in data and "sample_mask" in data:
+        if "teacher_topk_sparse_mask" in data:
+            mask = data["teacher_topk_sparse_mask"].to(per_token_kl.device)
+            if "sample_mask" in data:
+                mask = mask * data["sample_mask"].to(mask.device).unsqueeze(-1)
+            kl_loss = masked_mean(
+                per_token_kl,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
+        elif "token_mask" in data and "sample_mask" in data:
             token_mask = data["token_mask"][:, 1:]
             sample_mask = data["sample_mask"]
             # Align mask length to current per_token_kl

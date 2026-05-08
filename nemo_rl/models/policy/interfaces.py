@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
 import ray
 import torch
@@ -21,6 +21,9 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.utils.timer import Timer
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.distillation_streaming import ShardedBatchStream, StageLayout
 
 
 class LogprobOutputSpec(TypedDict):
@@ -122,6 +125,71 @@ class PolicyInterface(ABC):
             mbs: Micro batch size override (if None, uses config default)
         """
         pass
+
+    def stage_layout(self) -> "StageLayout":
+        """Return the policy stage layout used by OPD streaming planners."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose a stream stage layout"
+        )
+
+    def annotate_topk_stream(
+        self,
+        token_stream: "ShardedBatchStream",
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> "ShardedBatchStream":
+        """Annotate a token stream with teacher top-k chunks."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support teacher top-k streaming"
+        )
+
+    def train_distillation_stream(
+        self,
+        data: BatchedDataDict,
+        annotated_stream: "ShardedBatchStream",
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        *,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> dict[str, Any]:
+        """Train from a drained OPD annotated stream."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support distillation stream training"
+        )
+
+    def train_distillation_stream_from_refs(
+        self,
+        annotated_stream: "ShardedBatchStream",
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        *,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> dict[str, Any]:
+        """Train from OPD token and teacher refs without driver-provided train data."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support ref-only distillation stream training"
+        )
+
+    def train_distillation_sparse_stream(
+        self,
+        data: BatchedDataDict,
+        annotated_stream: "ShardedBatchStream",
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        *,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> dict[str, Any]:
+        """Train from a drained OPD annotated stream using sparse teacher top-k."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support sparse distillation stream training"
+        )
 
     @abstractmethod
     def calibrate_qkv_fp8_scales(
