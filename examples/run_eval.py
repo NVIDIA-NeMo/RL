@@ -34,7 +34,11 @@ from nemo_rl.environments.dummy_environment import DummyEnvironment
 from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.utils.config import load_config
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 
 
 def parse_args():
@@ -45,10 +49,7 @@ def parse_args():
     )
 
     # Parse known args for the script
-    args, remaining = parser.parse_known_args()
-
-    # Convert remaining args to OmegaConf format
-    overrides = OmegaConf.from_dotlist(remaining)
+    args, overrides = parser.parse_known_args()
 
     return args, overrides
 
@@ -121,6 +122,7 @@ def setup_data(tokenizer, data_config, env_configs):
 def main():
     """Main entry point."""
     # Parse arguments
+    register_omegaconf_resolvers()
     args, overrides = parse_args()
 
     if not args.config:
@@ -132,9 +134,8 @@ def main():
     print(f"Loaded configuration from: {args.config}")
 
     if overrides:
-        override_conf = OmegaConf.from_cli()
-        print(f"Overrides: {override_conf}")
-        config = OmegaConf.merge(config, override_conf)
+        print(f"Overrides: {overrides}")
+        config = parse_hydra_overrides(config, overrides)
 
     config: MasterConfig = OmegaConf.to_container(config, resolve=True)
     print("Applied CLI overrides")

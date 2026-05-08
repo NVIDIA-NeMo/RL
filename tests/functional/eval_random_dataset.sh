@@ -9,12 +9,13 @@ set -eou pipefail
 
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
+LOG_DIR=$EXP_DIR/logs
 JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
-rm -rf $EXP_DIR
-mkdir -p $EXP_DIR
+rm -rf $EXP_DIR $LOG_DIR
+mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
