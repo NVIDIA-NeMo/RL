@@ -257,7 +257,9 @@ class ClippedPGLossFn(LossFunction):
         sample_mask = data["sample_mask"]
         advantages = data["advantages"][:, 1:]
         # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
-        prev_logprobs = None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+        prev_logprobs = (
+            None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+        )
         generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
             reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]

@@ -1729,9 +1729,14 @@ def grpo_train(
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
-                skip_prev_logprobs = master_config["loss_fn"].get("force_on_policy_ratio", False)
+                skip_prev_logprobs = master_config["loss_fn"].get(
+                    "force_on_policy_ratio", False
+                )
                 if skip_prev_logprobs:
-                    print("▶ Skipping prev_logprobs (force_on_policy_ratio=True)...", flush=True)
+                    print(
+                        "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
+                        flush=True,
+                    )
                 else:
                     print("▶ Preparing for logprob inference...", flush=True)
                     with timer.time("logprob_inference_prep"):
@@ -1754,7 +1759,9 @@ def grpo_train(
                             logprob_data, timer=timer
                         )["logprobs"]
                     else:
-                        train_data["prev_logprobs"] = torch.zeros_like(train_data["generation_logprobs"])
+                        train_data["prev_logprobs"] = torch.zeros_like(
+                            train_data["generation_logprobs"]
+                        )
 
                     if not master_config["grpo"].get(
                         "skip_reference_policy_logprobs_calculation"
@@ -2810,9 +2817,14 @@ def async_grpo_train(
 
                 # Training phase (same as sync version)
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
-                skip_prev_logprobs = master_config["loss_fn"].get("force_on_policy_ratio", False)
+                skip_prev_logprobs = master_config["loss_fn"].get(
+                    "force_on_policy_ratio", False
+                )
                 if skip_prev_logprobs:
-                    print("▶ Skipping prev_logprobs (force_on_policy_ratio=True)...", flush=True)
+                    print(
+                        "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
+                        flush=True,
+                    )
                     fprop_logprobs = torch.zeros_like(train_data["generation_logprobs"])
                 else:
                     print("▶ Preparing for logprob inference...")

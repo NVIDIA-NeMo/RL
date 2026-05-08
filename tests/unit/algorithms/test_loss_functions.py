@@ -667,7 +667,9 @@ def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
     loss_1, metrics_1 = loss_fn(
         data=data_1,
         global_valid_seqs=torch.sum(data_1["sample_mask"]),
-        global_valid_toks=torch.sum(data_1["sample_mask"].unsqueeze(-1) * data_1["token_mask"]),
+        global_valid_toks=torch.sum(
+            data_1["sample_mask"].unsqueeze(-1) * data_1["token_mask"]
+        ),
         **loss_input_1,
     )
 
@@ -678,7 +680,9 @@ def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
     loss_2, metrics_2 = loss_fn(
         data=data_2,
         global_valid_seqs=torch.sum(data_2["sample_mask"]),
-        global_valid_toks=torch.sum(data_2["sample_mask"].unsqueeze(-1) * data_2["token_mask"]),
+        global_valid_toks=torch.sum(
+            data_2["sample_mask"].unsqueeze(-1) * data_2["token_mask"]
+        ),
         **loss_input_2,
     )
 
