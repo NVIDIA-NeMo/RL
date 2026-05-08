@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Functional test for pretrained_checkpoint.format=megatron_bridge.
+# Functional test for pretrained_checkpoint with both megatron_bridge and
+# megatron_lm formats.
 #
 # Phase 1: run a standard GRPO step to force the HF→megatron-bridge conversion.
-# Phase 2: re-run pointing checkpointing.pretrained_checkpoint at the bridge
-#          checkpoint produced in phase 1, verifying the restore path end-to-end.
+# Phase 2: re-run with checkpointing.pretrained_checkpoint pointing at the bridge
+#          checkpoint produced in phase 1 (format=megatron_bridge).
+# Phase 3: convert the bridge iter dir to MLM format (drop run_config.yaml,
+#          inject args into common.pt) and re-run with format=megatron_lm.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)
@@ -28,7 +31,6 @@ set -eou pipefail
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
-JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
@@ -85,37 +87,77 @@ if [[ ! -f "${BRIDGE_CKPT}/run_config.yaml" ]]; then
 fi
 echo "[INFO] Bridge checkpoint verified at ${BRIDGE_CKPT}"
 
-# ---------------------------------------------------------------------------
-# Phase 2: restore from the megatron-bridge checkpoint produced in phase 1.
-# Uses a temp config that injects checkpointing.pretrained_checkpoint so that
-# the struct-mode config loader accepts it without a + override.
-# ---------------------------------------------------------------------------
-echo "[INFO] Phase 2: restore from megatron-bridge checkpoint"
+# Capture the script's extra CLI args for use inside run_restore_phase.
+EXTRA_OVERRIDES=("$@")
 
-TEMP_CONFIG=$(mktemp --suffix=.yaml)
-trap "rm -f $TEMP_CONFIG" EXIT
-cat > "$TEMP_CONFIG" << YAML
+# run_restore_phase <log-subdir> <metrics-json> <pretrained-path> <format>
+run_restore_phase() {
+    local log_subdir=$1
+    local metrics_json=$2
+    local pretrained_path=$3
+    local fmt=$4
+
+    # Place the temp config under EXP_DIR so it's cleaned up by the next run's rm -rf.
+    local temp_config="$EXP_DIR/$(basename $log_subdir).yaml"
+    cat > "$temp_config" << YAML
 defaults: ${EXEMPLAR_CONFIG}
 checkpointing:
   pretrained_checkpoint:
-    path: "${BRIDGE_CKPT}"
-    format: megatron_bridge
+    path: "${pretrained_path}"
+    format: ${fmt}
 YAML
 
-uv run --no-sync coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
-    $PROJECT_ROOT/examples/run_grpo.py \
-    --config "$TEMP_CONFIG" \
-    "${COMMON_OVERRIDES[@]}" \
-    logger.tensorboard_enabled=true \
-    logger.log_dir=$LOG_DIR \
-    $@ \
-    2>&1 | tee -a $RUN_LOG
+    uv run --no-sync coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
+        $PROJECT_ROOT/examples/run_grpo.py \
+        --config "$temp_config" \
+        "${COMMON_OVERRIDES[@]}" \
+        logger.tensorboard_enabled=true \
+        logger.log_dir=$log_subdir \
+        "${EXTRA_OVERRIDES[@]}" \
+        2>&1 | tee -a $RUN_LOG
 
-uv run --no-sync tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+    uv run --no-sync tests/json_dump_tb_logs.py $log_subdir --output_path $metrics_json
 
-uv run --no-sync tests/check_metrics.py $JSON_METRICS \
-    'max(data["train/token_mult_prob_error"]) < 1.05' \
-    'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
-    'max(data["train/probs_ratio_clamped_min"]) < 1.21' \
-    'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
-    'max(data["train/probs_ratio_clamped_max"]) < 1.21'
+    uv run --no-sync tests/check_metrics.py $metrics_json \
+        'max(data["train/token_mult_prob_error"]) < 1.05' \
+        'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
+        'max(data["train/probs_ratio_clamped_min"]) < 1.21' \
+        'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
+        'max(data["train/probs_ratio_clamped_max"]) < 1.21'
+}
+
+# ---------------------------------------------------------------------------
+# Phase 2: restore from the megatron-bridge checkpoint produced in phase 1.
+# ---------------------------------------------------------------------------
+echo "[INFO] Phase 2: restore from megatron-bridge checkpoint"
+run_restore_phase \
+    "$LOG_DIR/phase2_mbridge" \
+    "$EXP_DIR/metrics_phase2_mbridge.json" \
+    "$BRIDGE_CKPT" \
+    "megatron_bridge"
+
+# ---------------------------------------------------------------------------
+# Phase 3: convert the bridge iter dir to MLM format and load via format=megatron_lm.
+# The conversion strips run_config.yaml and injects an args Namespace into
+# common.pt — see tests/functional/_bridge_to_mlm_helper.py for details.
+# ---------------------------------------------------------------------------
+echo "[INFO] Phase 3: convert bridge → MLM and restore"
+MLM_CKPT="$EXP_DIR/mlm_ckpt/iter_0000000"
+uv run --no-sync python "$SCRIPT_DIR/_bridge_to_mlm_helper.py" \
+    --bridge-iter-dir "$BRIDGE_CKPT" \
+    --mlm-iter-dir "$MLM_CKPT"
+
+if [[ -f "$MLM_CKPT/run_config.yaml" ]]; then
+    echo "[ERROR] $MLM_CKPT/run_config.yaml should not exist after conversion."
+    exit 1
+fi
+if [[ ! -f "$MLM_CKPT/common.pt" || ! -f "$MLM_CKPT/metadata.json" ]]; then
+    echo "[ERROR] Converted MLM checkpoint at $MLM_CKPT is missing common.pt or metadata.json."
+    exit 1
+fi
+
+run_restore_phase \
+    "$LOG_DIR/phase3_mlm" \
+    "$EXP_DIR/metrics_phase3_mlm.json" \
+    "$MLM_CKPT" \
+    "megatron_lm"
