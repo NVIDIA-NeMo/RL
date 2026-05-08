@@ -81,7 +81,9 @@ def import_model_from_hf_name(
     orig_num_layers_in_last_pipeline_stage = (
         model_provider.num_layers_in_last_pipeline_stage
     )
-    orig_virtual_pipeline_parallel_size = model_provider.virtual_pipeline_parallel_size
+    orig_virtual_pipeline_model_parallel_size = (
+        model_provider.virtual_pipeline_model_parallel_size
+    )
     orig_pipeline_model_parallel_layout = model_provider.pipeline_model_parallel_layout
     orig_pipeline_dtype = model_provider.pipeline_dtype
 
@@ -105,8 +107,8 @@ def import_model_from_hf_name(
         model_provider.num_layers_in_last_pipeline_stage = megatron_config[
             "num_layers_in_last_pipeline_stage"
         ]
-        model_provider.virtual_pipeline_parallel_size = megatron_config[
-            "virtual_pipeline_parallel_size"
+        model_provider.virtual_pipeline_model_parallel_size = megatron_config[
+            "virtual_pipeline_model_parallel_size"
         ]
         model_provider.pipeline_model_parallel_layout = megatron_config[
             "pipeline_model_parallel_layout"
@@ -147,7 +149,9 @@ def import_model_from_hf_name(
     config.expert_tensor_parallel_size = orig_expert_tensor_parallel_size
     config.num_layers_in_first_pipeline_stage = orig_num_layers_in_first_pipeline_stage
     config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
-    config.virtual_pipeline_parallel_size = orig_virtual_pipeline_parallel_size
+    config.virtual_pipeline_model_parallel_size = (
+        orig_virtual_pipeline_model_parallel_size
+    )
     config.pipeline_model_parallel_layout = orig_pipeline_model_parallel_layout
     config.pipeline_dtype = orig_pipeline_dtype
 
