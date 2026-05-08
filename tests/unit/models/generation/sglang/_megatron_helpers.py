@@ -113,6 +113,23 @@ SGLANG_CFGS: tuple[SGLangShape, ...] = (
         dp_size=4,
         enable_dp_attention=True,
     ),
+    # ``dp_size=2`` partitions the 4-GPU TP world into two attention DP
+    # sub-groups of 2 GPUs each (instead of dp=4 = one rank per group).
+    # Both ``ep=2`` and ``ep=4`` fanouts are exercised.
+    SGLangShape(
+        id="sgl_tp4_ep2_dp2_dpattn",
+        tp_size=4,
+        ep_size=2,
+        dp_size=2,
+        enable_dp_attention=True,
+    ),
+    SGLangShape(
+        id="sgl_tp4_ep4_dp2_dpattn",
+        tp_size=4,
+        ep_size=4,
+        dp_size=2,
+        enable_dp_attention=True,
+    ),
     SGLangShape(
         id="sgl_tp2_ep2_pp2",
         tp_size=2,
@@ -120,6 +137,19 @@ SGLANG_CFGS: tuple[SGLangShape, ...] = (
         dp_size=1,
         pp_size=2,
         enable_dp_attention=False,
+    ),
+    # ``tp=2 pp=2 ep=2 dp=2 + --enable-dp-attention``: same physical 4 GPU
+    # layout as ``sgl_tp2_ep2_pp2`` but with DP attention turned on, which
+    # routes through a different MoE token dispatcher and avoids the
+    # standard-dispatcher illegal-mem-access path that crashes the
+    # no-dpattn variant on Qwen3-MoE.
+    SGLangShape(
+        id="sgl_tp2_ep2_dp2_pp2_dpattn",
+        tp_size=2,
+        ep_size=2,
+        dp_size=2,
+        pp_size=2,
+        enable_dp_attention=True,
     ),
 )
 

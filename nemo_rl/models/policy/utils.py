@@ -662,27 +662,56 @@ def stream_weights_via_http_impl(
         torch.cuda.empty_cache()
 
 
+def _check_weight_sync_results(results: list) -> None:
+    from collections.abc import Mapping
+
+    for result in results:
+        if isinstance(result, Mapping):
+            success = result.get("success")
+            error_msg = (
+                result.get("error_message") or result.get("error") or "unknown error"
+            )
+        elif hasattr(result, "success"):
+            success = result.success
+            error_msg = getattr(result, "error_message", "unknown error")
+        else:
+            continue
+
+        if success is False:
+            raise RuntimeError(
+                f"SGLang weight sync failed on rollout engine: {error_msg}. "
+                "Check SGLang version compatibility."
+            )
+
+
 def send_hf_buckets_via_ipc_actor_impl(
     *,
     bucket_iterator: Iterable[list[tuple[str, torch.Tensor]]],
     rollout_engines: list,
     worker_state: dict,
     weight_version: Optional[int] = None,
-) -> list:
+) -> None:
     """Send finalized HF tensor buckets to colocated SGLang engines via Ray IPC.
 
     Per bucket: group by dtype, serialize a ``FlattenedTensorBucket`` per
-    dtype, ``dist.gather_object`` to the gather source rank, then call
-    ``ipc_engine.update_weights_from_tensor.remote(...)`` once per dtype.
+    dtype, ``dist.gather_object`` to the gather source rank, then on the
+    source rank call ``ipc_engine.update_weights_from_tensor.remote(...)``
+    once per dtype, **block on ``ray.get(refs)`` per chunk**, validate
+    engine return values, then drop the trainer-side
+    ``flattened_tensor`` references before moving on.
 
     The trainer-side topology (``_ipc_gather_group`` / ``_ipc_gather_src`` /
     ``_ipc_engine_index``) must already have been set up by
     :func:`connect_colocate_topology`. Placeholder ranks (no covering engine)
-    return ``[]`` immediately — they must not call ``gather_object``.
+    return immediately — they must not call ``gather_object``. Non-source
+    trainer ranks participate only in the gather collective; they don't
+    issue Ray RPCs and don't ``ray.get``.
 
-    Returns the list of Ray ObjectRefs returned by the engine RPCs (only the
-    gather-source rank gets non-empty refs; other ranks return ``[]``).
+    Returns ``None``. Raises ``RuntimeError`` if any chunk fails on the
+    engine side.
     """
+    import ray
+
     from nemo_rl.models.policy.torch_reductions_utils import (
         FlattenedTensorBucket,
         MultiprocessingSerializer,
@@ -694,7 +723,7 @@ def send_hf_buckets_via_ipc_actor_impl(
 
     if gather_group is None or gather_src is None or engine_idx is None:
         # Placeholder rank: must not participate in the per-engine gather.
-        return []
+        return None
 
     if weight_version is None:
         worker_state["weight_version"] = worker_state.get("weight_version", 0) + 1
@@ -702,7 +731,6 @@ def send_hf_buckets_via_ipc_actor_impl(
 
     ipc_engine = rollout_engines[engine_idx]
     my_rank = dist.get_rank()
-    refs: list = []
 
     try:
         for bucket in bucket_iterator:
@@ -720,12 +748,14 @@ def send_hf_buckets_via_ipc_actor_impl(
                     by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
 
             serialized: list[str] = []
+            long_lived_tensors: list[dict] = []
             for _dtype, named_tensors in by_dtype.items():
                 bkt = FlattenedTensorBucket(named_tensors=named_tensors)
                 payload = {
                     "flattened_tensor": bkt.get_flattened_tensor(),
                     "metadata": bkt.get_metadata(),
                 }
+                long_lived_tensors.append(payload)
                 serialized.append(
                     MultiprocessingSerializer.serialize(payload, output_str=True)
                 )
@@ -739,23 +769,34 @@ def send_hf_buckets_via_ipc_actor_impl(
                 group=gather_group,
             )
 
-            if my_rank != gather_src:
-                continue
-
-            num_dtypes = len(gathered[0])
-            for i in range(num_dtypes):
-                refs.append(
-                    ipc_engine.update_weights_from_tensor.remote(
-                        serialized_named_tensors=[g[i] for g in gathered],
-                        load_format="flattened_bucket",
-                        weight_version=str(weight_version),
+            # Only the gather-source rank queues the engine RPC; non-source
+            # ranks have nothing to await but must still hold their
+            # long_lived_tensors past the engine's copy. Mirroring miles, we
+            # use a single uniform "ray.get → check → del" tail across all
+            # ranks: refs is empty on non-source so ray.get is a no-op there.
+            refs: list = []
+            if my_rank == gather_src:
+                num_dtypes = len(gathered[0])
+                for i in range(num_dtypes):
+                    refs.append(
+                        ipc_engine.update_weights_from_tensor.remote(
+                            serialized_named_tensors=[g[i] for g in gathered],
+                            load_format="flattened_bucket",
+                            weight_version=str(weight_version),
+                        )
                     )
-                )
+
+            # Block until the engine has copied this chunk through the IPC
+            # handles, surface any per-chunk failure, then release the
+            # trainer-side GPU tensors before the next chunk allocates.
+            results = ray.get(refs)
+            _check_weight_sync_results(results)
+            del long_lived_tensors, refs, results
     finally:
         gc.collect()
         torch.cuda.empty_cache()
 
-    return refs
+    return None
 
 
 def find_free_port() -> int:

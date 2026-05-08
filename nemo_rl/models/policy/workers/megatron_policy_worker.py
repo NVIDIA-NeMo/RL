@@ -1153,13 +1153,14 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         buffer_size_bytes: int,
         target_precision: str = "bf16",
         sglang_quantization_cfg: Optional[dict] = None,
-    ) -> list:
+    ) -> None:
         """Send finalized HF tensor buckets to colocated SGLang engines.
 
-        Returns the list of Ray ObjectRefs from
-        ``engine.update_weights_from_tensor.remote(...)`` (only the gather
-        source rank gets non-empty refs). The caller awaits them via
-        ``ray.get`` to surface load errors.
+        Synchronous: each chunk is awaited via ``ray.get`` inside
+        :func:`send_hf_buckets_via_ipc_actor_impl` before the next chunk
+        is sent, so trainer-side IPC tensors stay alive until the engine
+        has copied them and per-chunk engine failures surface immediately.
+        Raises ``RuntimeError`` on any chunk failure.
         """
         self._sglang_weight_version += 1
         iterator = self._build_sglang_hf_iterator(
@@ -1170,7 +1171,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             target_precision=cast(Any, target_precision),
             buffer_size_bytes=buffer_size_bytes,
         )
-        return send_hf_buckets_via_ipc_actor_impl(
+        send_hf_buckets_via_ipc_actor_impl(
             bucket_iterator=bucket_iter,
             rollout_engines=list(rollout_engines),
             worker_state=self._sglang_ipc_state,
@@ -1855,6 +1856,10 @@ def refit_sglang_colocated(
     policy_generation.pause_generation(mode=pause_mode)
     policy_generation.invalidate_kv_cache()
     try:
+        # Per-worker actor method is now synchronous (per-chunk ray.get +
+        # lifetime-safe IPC handled inside send_hf_buckets_via_ipc_actor_impl),
+        # but the policy-group dispatch still returns one Ray future per
+        # worker; we await those here to wait for all trainer ranks.
         futures = policy.update_weights_to_sglang_colocated(
             rollout_engines=rollout_engines,
             buffer_size_bytes=buffer_size_bytes,
