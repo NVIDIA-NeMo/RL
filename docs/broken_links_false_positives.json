@@ -5,3 +5,5 @@
 {"uri": "https://huggingface.co/docs/transformers/en/chat_templating_writing"}
 {"uri": "https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForCausalLM"}
 {"uri": "https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForImageTextToText"}
+{"uri": "https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf"}
+{"uri": "https://docs.pytorch.org/docs/stable/notes/cuda.html#reduced-precision-reduction-in-bf16-gemms"}

@@ -56,6 +56,10 @@ class NemoGym(EnvironmentInterface):
             "dummy_key"  # No key necessary for training.
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
+        # In multinode runs, Gym-managed service configs must advertise a real node IP
+        # rather than falling back to localhost, or remote workers will connect to
+        # their own loopback interface instead of the actor-hosted service.
+        initial_global_config_dict.setdefault("default_host", self.node_ip)
 
         initial_global_config_dict.setdefault(
             "global_aiohttp_connector_limit_per_host", 16_384

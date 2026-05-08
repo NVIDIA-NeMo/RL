@@ -136,9 +136,18 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
             config
         )
-        # Handle model import if needed
+        # Handle model import if needed. Subclasses (e.g. ModelOpt quant
+        # worker) may set ``_model_import_post_wrap_hook`` and
+        # ``_transformer_layer_spec`` on ``self`` before calling
+        # super().__init__() to inject quantization hooks into HF->Megatron
+        # import.
         handle_model_import(
-            config, hf_model_name, pretrained_path, pt_checkpoint_exists
+            config,
+            hf_model_name,
+            pretrained_path,
+            pt_checkpoint_exists,
+            model_post_wrap_hook=getattr(self, "_model_import_post_wrap_hook", None),
+            transformer_layer_spec=getattr(self, "_transformer_layer_spec", None),
         )
 
         # Store tokenizer
@@ -178,7 +187,10 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         # Step 4: Setup Megatron model and components
         model_and_optimizer_state = setup_model_and_optimizer(
-            config, self.megatron_cfg, init_optimizer
+            config,
+            self.megatron_cfg,
+            init_optimizer,
+            pre_load_checkpoint_hook=getattr(self, "_pre_load_checkpoint_hook", None),
         )
 
         self.mcore_state = model_and_optimizer_state.state
@@ -197,7 +209,12 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         if init_reference_model:
             self.model = self.move_model(self.model, "cpu")
             self.reference_state_dict = setup_reference_model_state(
-                config, self.megatron_cfg, pretrained_path
+                config,
+                self.megatron_cfg,
+                pretrained_path,
+                pre_load_checkpoint_hook=getattr(
+                    self, "_pre_load_checkpoint_hook", None
+                ),
             )
             self.model = self.move_model(self.model, "cuda")
 
