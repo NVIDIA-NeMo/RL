@@ -50,6 +50,7 @@ else
     MEGATRON_CKPT_BASE="$HOME/.cache/huggingface/nemo_rl"
 fi
 BRIDGE_CKPT="${MEGATRON_CKPT_BASE}/${MODEL_NAME}/iter_0000000"
+trap "rm -rf ${BRIDGE_CKPT}" EXIT
 
 cd $PROJECT_ROOT
 
