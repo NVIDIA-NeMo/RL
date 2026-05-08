@@ -46,6 +46,7 @@ from __future__ import annotations
 
 from typing import Any, Optional, Sequence
 
+import numpy as np
 import ray
 import torch
 from tensordict import TensorDict
@@ -85,8 +86,19 @@ def kv_first_write(
     ``sample_mask``, image embeddings) pass through as regular tensors.
     The padding tax is paid only when a consumer calls
     :func:`materialize(layout='padded', pad_value_dict=...)`.
+
+    Non-tensor object fields (``np.ndarray(dtype=object)`` — verl-style)
+    are pickled per-row and packed into a jagged uint8 nested tensor via
+    :func:`pack_object_array`. Their names are recorded in
+    ``meta.extra_info['object_fields']`` so consumers (read_columns /
+    materialize) decode them back to object arrays. Backends only ever
+    see tensors — both simple and mooncake_cpu carry the same wire.
     """
-    from nemo_rl.data_plane.codec import maybe_pack_jagged
+    from nemo_rl.data_plane.codec import (
+        META_OBJECT_FIELDS,
+        maybe_pack_jagged,
+        pack_object_array,
+    )
 
     n = int(final_batch_cpu["sample_mask"].shape[0])
     if n == 0 or len(uids) == 0 or n % len(uids) != 0:
@@ -95,16 +107,18 @@ def kv_first_write(
         )
     n_gen = n // len(uids)
     keys = [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]
-
-    bulk_field_names = [
-        k for k, v in final_batch_cpu.items() if isinstance(v, torch.Tensor)
-    ]
     lengths = final_batch_cpu["input_lengths"]
 
-    bulk = TensorDict(
-        {k: maybe_pack_jagged(final_batch_cpu[k], lengths) for k in bulk_field_names},
-        batch_size=[n],
-    )
+    wire: dict[str, torch.Tensor] = {}
+    object_field_names: list[str] = []
+    for k, v in final_batch_cpu.items():
+        if isinstance(v, torch.Tensor):
+            wire[k] = maybe_pack_jagged(v, lengths)
+        elif isinstance(v, np.ndarray) and v.dtype == object:
+            wire[k] = pack_object_array(v)
+            object_field_names.append(k)
+
+    bulk = TensorDict(wire, batch_size=[n])
     dp_client.kv_batch_put(
         keys=keys, partition_id=partition_id, fields=bulk,
     )
@@ -115,11 +129,13 @@ def kv_first_write(
         # backends (mcore SP, PyTorch CP) get sequence dims that satisfy
         # their own divisibility asserts.
         extras["pad_to_multiple"] = int(pad_to_multiple)
+    if object_field_names:
+        extras[META_OBJECT_FIELDS] = object_field_names
     return KVBatchMeta(
         partition_id=partition_id,
         task_name=task_name,
         keys=keys,
-        fields=bulk_field_names,
+        fields=list(wire.keys()),
         sequence_lengths=[int(s) for s in lengths.tolist()],
         extra_info=extras,
     )
@@ -252,6 +268,21 @@ class SyncRolloutActor:
         for k, v in flat.get_multimodal_dict(as_tensors=False).items():
             if isinstance(v, torch.Tensor):
                 bulk_batch[k] = v
+
+        # Type-driven dispatch (verl pattern): producer-emitted type IS
+        # the schema. torch.Tensor and np.ndarray(object) pass through;
+        # everything else (typically Python lists from rollouts.py) is
+        # treated as object data and pickled per-row in kv_first_write.
+        # Skip keys already in bulk_batch (e.g. sample_mask ←
+        # loss_multiplier remap). To make a list ride the wire as a
+        # compact tensor, emit it as torch.tensor(...) at rollouts.py.
+        for k, v in fb.items():
+            if isinstance(v, torch.Tensor) or k in bulk_batch:
+                continue
+            bulk_batch[k] = (
+                v if isinstance(v, np.ndarray) and v.dtype == object
+                else np.asarray(v, dtype=object)
+            )
 
         # Slice — only what the driver can't derive from a TQ slice fetch
         # (anything containing `message_log` or per-token data would

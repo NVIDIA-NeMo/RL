@@ -20,10 +20,15 @@ side dispatches use the equivalents on ``AbstractPolicyWorker``
 
 from typing import Any, Sequence
 
+import numpy as np
 import torch
 from tensordict import TensorDict
 
-from nemo_rl.data_plane.codec import materialize
+from nemo_rl.data_plane.codec import (
+    META_OBJECT_FIELDS,
+    materialize,
+    select_object_fields,
+)
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -47,6 +52,11 @@ def read_columns(
     alignment recorded at first put) so the materialized seq dim
     matches the alignment required by downstream backends (mcore SP /
     PyTorch CP).
+
+    Object-encoded fields (registered at write time in
+    ``meta.extra_info['object_fields']``) bypass tensor padding and
+    are unpickled back to ``np.ndarray(dtype=object)`` — see
+    :func:`nemo_rl.data_plane.codec.pack_object_array`.
     """
     td = dp_client.kv_batch_get(
         keys=meta.keys,
@@ -59,13 +69,14 @@ def read_columns(
         layout=layout,
         pad_value_dict=pad_value_dict,
         pad_to_multiple=pad_mult,
+        object_fields=select_object_fields(meta, select_fields),
     )
 
 
 def write_columns(
     dp_client: DataPlaneClient,
     meta: KVBatchMeta,
-    fields: dict[str, torch.Tensor],
+    fields: "dict[str, torch.Tensor | np.ndarray]",
 ) -> None:
     """``kv_batch_put(meta.keys, fields=...)``.
 
@@ -73,17 +84,46 @@ def write_columns(
     are converted to jagged before the put via :func:`maybe_pack_jagged`,
     so they land in TQ with the same row lengths as the initial put — keeps
     mixed jagged/rectangular shape mismatches out of subsequent reads.
+
+    Object-array fields (``np.ndarray(dtype=object)``) must already be
+    registered in ``meta.extra_info[META_OBJECT_FIELDS]`` (typically by
+    :func:`kv_first_write`); writing an unregistered object field raises
+    so subsequent reads can't silently corrupt by treating uint8 wire
+    bytes as a regular tensor.
     """
     if not fields:
         return
-    from nemo_rl.data_plane.codec import maybe_pack_jagged
+    from nemo_rl.data_plane.codec import maybe_pack_jagged, pack_object_array
 
     seq_lens = meta.sequence_lengths
-    if seq_lens is not None:
-        lengths = torch.tensor(seq_lens, dtype=torch.long)
-        packed = {k: maybe_pack_jagged(v, lengths) for k, v in fields.items()}
-    else:
-        packed = {k: v.detach().contiguous() for k, v in fields.items()}
+    lengths = (
+        torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
+    )
+    registered_objects = set(
+        (meta.extra_info or {}).get(META_OBJECT_FIELDS, ())
+    )
+
+    packed: dict[str, torch.Tensor] = {}
+    for k, v in fields.items():
+        if isinstance(v, np.ndarray) and v.dtype == object:
+            if k not in registered_objects:
+                raise ValueError(
+                    f"write_columns: object field {k!r} not registered in "
+                    f"meta.extra_info[{META_OBJECT_FIELDS!r}]; register it "
+                    f"at first put (kv_first_write) so readers decode it."
+                )
+            packed[k] = pack_object_array(v)
+        elif isinstance(v, torch.Tensor):
+            packed[k] = (
+                maybe_pack_jagged(v, lengths)
+                if lengths is not None
+                else v.detach().contiguous()
+            )
+        else:
+            raise TypeError(
+                f"write_columns: unsupported value type for {k!r}: {type(v)}. "
+                "Use torch.Tensor or np.ndarray(dtype=object)."
+            )
 
     td = TensorDict(packed, batch_size=[len(meta.keys)])
     dp_client.kv_batch_put(
