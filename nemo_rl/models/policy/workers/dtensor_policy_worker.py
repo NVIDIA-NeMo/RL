@@ -1717,7 +1717,10 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
         On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         # If reference model was never initialized, yield without swapping
-        if not hasattr(self, "reference_model_state_dict") or self.reference_model_state_dict is None:
+        if (
+            not hasattr(self, "reference_model_state_dict")
+            or self.reference_model_state_dict is None
+        ):
             yield
             return
 

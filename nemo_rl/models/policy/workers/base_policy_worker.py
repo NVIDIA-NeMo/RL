@@ -145,7 +145,9 @@ class AbstractPolicyWorker:
         if not self._has_reference_model():
             logprobs = self.get_logprobs(data=data, micro_batch_size=micro_batch_size)
             return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
-            return_data["reference_logprobs"] = torch.zeros_like(logprobs["logprobs"]).cpu()
+            return_data["reference_logprobs"] = torch.zeros_like(
+                logprobs["logprobs"]
+            ).cpu()
             return return_data
 
         with self.use_reference_model():
