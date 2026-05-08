@@ -54,6 +54,64 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 
 
+def _tokenize_env_observation(
+    tokenizer: TokenizerType,
+    obs_role: str,
+    obs_content: str,
+) -> torch.Tensor:
+    """Tokenize an environment observation using the chat template.
+
+    Uses apply_chat_template to produce properly structured tokens including
+    role markers (e.g. <|im_start|>tool) and a generation prompt
+    (<|im_start|>assistant), so the model knows to respond as an assistant
+    after seeing the observation.  Raw tokenization lacks these markers and
+    causes the model to echo the observation rather than respond to it.
+
+    Falls back to raw tokenization if apply_chat_template is unavailable.
+    """
+    if not hasattr(tokenizer, "apply_chat_template"):
+        return tokenizer(
+            obs_content, return_tensors="pt", add_special_tokens=False
+        ).input_ids[0]
+
+    # Use a minimal two-message sequence to extract the incremental tokens for
+    # this observation.  The dummy prior message makes the template generate
+    # the correct role-marker prefix without needing to re-render the full
+    # (potentially non-standard) conversation history.
+    #
+    # Assumption: the dummy message renders identically in both calls, so
+    # _with_obs[len(_without_obs):] correctly isolates the observation tokens.
+    # This holds as long as:
+    #   1. The template renders each message independently of what follows it
+    #      (i.e. no loop.last logic that changes the trailing separator of a
+    #      non-final message vs a final message).  If violated, _without_obs
+    #      ends without a trailing "\n" while the same message inside _with_obs
+    #      does, making the string-length cutpoint off by one character.
+    #   2. Re-tokenizing the extracted string chunk gives the same token IDs as
+    #      those tokens would have in the full sequence context (i.e. the
+    #      tokenizer is not context-dependent at the observation boundary).
+    #      This holds for all models using special tokens for role markers
+    #      (e.g. <|im_start|>, <|eot_id|>), which cannot be merged with
+    #      adjacent text by BPE.
+    _dummy = [{"role": "user", "content": "x"}]
+    _with_obs = tokenizer.apply_chat_template(
+        _dummy + [{"role": obs_role, "content": obs_content}],
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    _without_obs = tokenizer.apply_chat_template(
+        _dummy,
+        tokenize=False,
+        add_generation_prompt=False,
+        add_special_tokens=False,
+    )
+    obs_chunk = _with_obs[len(_without_obs):]
+    return tokenizer(
+        obs_chunk, return_tensors="pt", add_special_tokens=False
+    ).input_ids[0]
+
+
 def generate_responses(
     policy_generation: GenerationInterface,
     generation_input_data: BatchedDataDict[GenerationDatumSpec],
@@ -496,11 +554,8 @@ def run_multi_turn_rollout(
         truncation_mask = torch.zeros_like(env_output.terminateds, dtype=torch.bool)
         for i, global_idx in enumerate(active_indices.tolist()):
             env_obs_content = env_output.observations[i]["content"]
-            # Tokenize the raw content from the environment
-            # TODO @sahilj: handle if we want these subsequent messages to have a chat template
-            tokenized_obs = tokenizer(
-                env_obs_content, return_tensors="pt", add_special_tokens=False
-            ).input_ids[0]
+            obs_role = env_output.observations[i]["role"]
+            tokenized_obs = _tokenize_env_observation(tokenizer, obs_role, env_obs_content)
             # tokenizer returns torch.float32 when env_obs_content is empty
             tokenized_obs = tokenized_obs.to(dtype=torch.int64)
 
@@ -791,10 +846,8 @@ async def run_sample_multi_turn_rollout(
         # Check termination
         terminated = env_output.terminateds[0].item()
         env_obs_content = env_output.observations[0]["content"]
-        # Tokenize environment response
-        tokenized_obs = tokenizer(
-            env_obs_content, return_tensors="pt", add_special_tokens=False
-        ).input_ids[0]
+        obs_role = env_output.observations[0]["role"]
+        tokenized_obs = _tokenize_env_observation(tokenizer, obs_role, env_obs_content)
 
         # Check for sequence length overflow
         if input_lengths + gen_token_count + len(tokenized_obs) >= max_seq_len:

@@ -108,11 +108,18 @@ def _build_records(tau_bench_env_name: str, split: str) -> list[dict[str, Any]]:
 
     system_prompt = _build_system_prompt(env, tau_bench_env_name)
 
+    # The actual customer opening message comes from env.reset() (via the LLM
+    # user simulator) at training time.  TauBenchWorker.execute() returns it as
+    # the first observation (a "pre-step") before any agent action is processed.
+    # The placeholder below just gives the model a neutral starting point for
+    # the wasted generation on that pre-step turn; the real conversation begins
+    # once the agent sees the customer's actual first message.
+    placeholder_user_msg = "Hi! How can I help you today?"
     return [
         {
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task.instruction},
+                {"role": "user", "content": placeholder_user_msg},
             ],
             "extra_env_info": {
                 "task_index": task_index,
