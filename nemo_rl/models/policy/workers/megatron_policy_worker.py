@@ -1917,7 +1917,9 @@ def refit_sglang_distributed(
             rollout_engines=rollout_engines,
             engine_gpu_counts=engine_gpu_counts,
         )
-        print("[REFIT-DIST 2] connect_sglang_rollout_engines_distributed done", flush=True)
+        print(
+            "[REFIT-DIST 2] connect_sglang_rollout_engines_distributed done", flush=True
+        )
         policy_generation.clear_updatable_num_new_engines()
         assert policy_generation.num_new_engines == 0, (
             "clear_updatable_num_new_engines did not zero num_new_engines"

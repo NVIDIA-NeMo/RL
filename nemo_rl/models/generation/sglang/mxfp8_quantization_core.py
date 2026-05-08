@@ -136,9 +136,7 @@ def quantize_mxfp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         raise ValueError(f"Last dim {k} must be divisible by 32 for MXFP8.")
 
     weight_flat = weight.view(-1, k).contiguous()
-    qweight, scale = flashinfer_mxfp8_quantize(
-        weight_flat, is_sf_swizzled_layout=False
-    )
+    qweight, scale = flashinfer_mxfp8_quantize(weight_flat, is_sf_swizzled_layout=False)
     qweight = qweight.view_as(weight)
     scale = scale.view(*weight.shape[:-1], k // 32).contiguous()
     return qweight, scale
@@ -150,9 +148,7 @@ def source_fp8_to_mxfp8_scale_u8(
     n, k = weight.shape[-2], weight.shape[-1]
     mxfp8_scale_u8 = source_scale_u8.repeat_interleave(
         SOURCE_FP8_BLOCK_SIZE[0], dim=-2
-    ).repeat_interleave(
-        SOURCE_FP8_BLOCK_SIZE[1] // TARGET_MXFP8_BLOCK_SIZE[1], dim=-1
-    )
+    ).repeat_interleave(SOURCE_FP8_BLOCK_SIZE[1] // TARGET_MXFP8_BLOCK_SIZE[1], dim=-1)
     return mxfp8_scale_u8[..., :n, : (k // TARGET_MXFP8_BLOCK_SIZE[1])].contiguous()
 
 

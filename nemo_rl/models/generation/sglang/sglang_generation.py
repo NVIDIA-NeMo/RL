@@ -392,9 +392,7 @@ class SGLangGeneration(GenerationInterface):
             return
         if mode is None:
             mode = self.pause_generation_mode
-        ray.get(
-            [e.pause_generation.remote(mode=mode) for e in engines]
-        )
+        ray.get([e.pause_generation.remote(mode=mode) for e in engines])
 
     def continue_generation(self) -> None:
         """Resume generation on every node-0 engine."""

@@ -594,9 +594,7 @@ def stream_weights_via_http_impl(
     gather_src = worker_state["_ipc_gather_src"]
     gather_group = worker_state["_ipc_gather_group"]
     engine_idx = worker_state["_ipc_engine_index"]
-    engine_url = (
-        rollout_engine_urls[engine_idx] if engine_idx is not None else None
-    )
+    engine_url = rollout_engine_urls[engine_idx] if engine_idx is not None else None
 
     if gather_group is None:
         # Placeholder rank not covered by any engine: drain quietly.
@@ -769,11 +767,6 @@ def send_hf_buckets_via_ipc_actor_impl(
                 group=gather_group,
             )
 
-            # Only the gather-source rank queues the engine RPC; non-source
-            # ranks have nothing to await but must still hold their
-            # long_lived_tensors past the engine's copy. Mirroring miles, we
-            # use a single uniform "ray.get → check → del" tail across all
-            # ranks: refs is empty on non-source so ray.get is a no-op there.
             refs: list = []
             if my_rank == gather_src:
                 num_dtypes = len(gathered[0])
@@ -859,9 +852,7 @@ def init_process_group(
         timeout = default_pg_timeout
 
     if store is None:
-        rendezvous_iterator = rendezvous(
-            init_method, rank, world_size, timeout=timeout
-        )
+        rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
         store, rank, world_size = next(rendezvous_iterator)
         store.set_timeout(timeout)
         # PrefixStore so multiple co-tenant groups don't trample each other's keys.
@@ -871,9 +862,7 @@ def init_process_group(
     #   https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
     # Use numeric tuple compare — string compare ``"2.10" >= "2.6"`` returns
     # False because ``"1"`` sorts before ``"6"`` lexicographically.
-    _torch_mm = tuple(
-        int(x) for x in torch.__version__.split("+")[0].split(".")[:2]
-    )
+    _torch_mm = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
     pg_options_kw = "backend_options" if _torch_mm >= (2, 6) else "pg_options"
     pg, _ = _new_process_group_helper(
         world_size,
@@ -966,9 +955,7 @@ def get_sglang_quantization_cfg(policy_generation: Any) -> dict:
     Returns an empty dict when no quantization config is set, so callers can
     treat the result as a stable mapping without ``None`` checks.
     """
-    return dict(
-        policy_generation.sglang_cfg["sglang_cfg"].get("quantization") or {}
-    )
+    return dict(policy_generation.sglang_cfg["sglang_cfg"].get("quantization") or {})
 
 
 def fetch_updatable_engines_with_recover(policy_generation: Any) -> tuple:
@@ -1035,7 +1022,9 @@ def broadcast_hf_buckets_via_distributed_impl(
             flush=True,
         )
 
-        print(f"[BCAST bucket={bucket_idx}] acquiring rollout_engine_lock...", flush=True)
+        print(
+            f"[BCAST bucket={bucket_idx}] acquiring rollout_engine_lock...", flush=True
+        )
         while not ray.get(rollout_engine_lock.acquire.remote()):
             _time.sleep(0.1)
         print(f"[BCAST bucket={bucket_idx}] lock acquired", flush=True)

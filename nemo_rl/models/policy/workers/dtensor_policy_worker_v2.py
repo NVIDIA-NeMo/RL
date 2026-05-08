@@ -1192,9 +1192,7 @@ def refit_sglang_colocated(
             "clear_updatable_num_new_engines did not zero num_new_engines"
         )
 
-    rollout_engine_urls = ray.get(
-        [e.get_base_url.remote() for e in rollout_engines]
-    )
+    rollout_engine_urls = ray.get([e.get_base_url.remote() for e in rollout_engines])
     futures_train = policy.stream_weights_via_http(
         rollout_engine_urls=rollout_engine_urls,
         num_gpus_per_engine=policy_generation.num_gpus_per_engine,

@@ -1258,7 +1258,9 @@ def refit_policy_generation(
                     mode="broadcast",
                 )
             else:
-                futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
+                futures_train = policy.broadcast_weights_for_collective(
+                    kv_scales=kv_scales
+                )
                 futures_inference = policy_generation.update_weights_from_collective()
                 # wait for all futures to complete
                 ray.get(futures_train)

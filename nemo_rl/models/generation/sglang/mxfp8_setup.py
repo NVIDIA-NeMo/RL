@@ -375,9 +375,7 @@ def _hash_qualified_save_dir(
         json.dumps(src_cfg, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()[:12]
     quant_fingerprint = _quantization_fingerprint(quantization_cfg)
-    payload = (
-        f"{abs_model}|{src_fingerprint}|{quant_fingerprint}|v{CONVERTER_VERSION}"
-    )
+    payload = f"{abs_model}|{src_fingerprint}|{quant_fingerprint}|v{CONVERTER_VERSION}"
     digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
     base = os.path.basename(os.path.normpath(abs_model)) or "hf"
     return os.path.join(os.path.abspath(cache_root), f"{base}-mxfp8-{digest}")
@@ -417,9 +415,7 @@ def ensure_mxfp8_checkpoint(
     cache_root = (
         quantization_cfg.get("cache_root")
         or os.environ.get("NRL_MXFP8_CACHE")
-        or os.path.join(
-            os.path.expanduser("~"), ".cache", "nemo_rl", "mxfp8"
-        )
+        or os.path.join(os.path.expanduser("~"), ".cache", "nemo_rl", "mxfp8")
     )
     save_dir = converted or _hash_qualified_save_dir(
         model_dir=model_path,

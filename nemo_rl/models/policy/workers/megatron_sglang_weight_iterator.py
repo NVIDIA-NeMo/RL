@@ -133,8 +133,7 @@ class MegatronSGLangHfWeightIterator:
                 ):
                     qweight, scale = quantize_mxfp8(tensor)
                     scale_name = (
-                        strip_weight_suffix(hf_param_name)
-                        + SOURCE_FP8_SCALE_KEY_SUFFIX
+                        strip_weight_suffix(hf_param_name) + SOURCE_FP8_SCALE_KEY_SUFFIX
                     )
                     yield [(hf_param_name, qweight), (scale_name, scale)]
                     continue

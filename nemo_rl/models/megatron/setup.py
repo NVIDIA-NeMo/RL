@@ -231,9 +231,9 @@ def validate_and_set_config(
         # IOMMU-isolated PCIe), only ``NCCL_CUMEM_ENABLE=1`` works for
         # the SGLang case, even though the in-process default is 0.
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
-        
+
     if rollout_backend == "sglang":
-            os.environ.setdefault("NCCL_CUMEM_ENABLE", "0")
+        os.environ.setdefault("NCCL_CUMEM_ENABLE", "0")
 
     # Setup data types
     dtype_map = {
