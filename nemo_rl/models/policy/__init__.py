@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict, Union
+from typing import Any, Literal, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
@@ -191,6 +191,21 @@ class MegatronDDPConfig(TypedDict):
     data_parallel_sharding_strategy: str
 
 
+class FlexRouterConfig(TypedDict):
+    """Configuration for one deterministic Flextron submodel route."""
+
+    # MLP/MoE intermediate dimension for this submodel route.
+    # Set an int to apply the same dimension to all eligible layers, or a
+    # list[int] with one value per main hybrid layer before setup projects it
+    # to the layer types handled by the Flextron MLP hooks.
+    mlp_int_list: int | list[int]
+    # Hidden-state dimension for this submodel route.
+    # Set an int to apply the same dimension to all eligible layers, or a
+    # list[int] with one value per main hybrid layer before setup projects it
+    # to the layer types handled by the Flextron hidden-state hooks.
+    emb_int_list: int | list[int]
+
+
 # Type exists to be lax if not specified
 class MegatronConfigDisabled(TypedDict):
     enabled: Literal[False]
@@ -222,6 +237,9 @@ class MegatronConfig(TypedDict):
     bias_activation_fusion: bool
     # Force reconvert from HF even if the checkpoint already exists (default: False)
     force_reconvert_from_hf: NotRequired[bool]
+    # Optional preconverted Megatron checkpoint to use as the base policy weights.
+    # Can point at a checkpoint parent directory or a specific iter_* directory.
+    pretrained_checkpoint_path: NotRequired[str | None]
     # Attention backend available values:
     # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/enums.py#L60
     attention_backend: NotRequired[str]
@@ -236,6 +254,14 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Optional deterministic Flextron submodel routes. Each item specifies the
+    # MLP/MoE intermediate and hidden-state dimensions to force for a nested
+    # route. Omit or set to [] to disable nested Flextron routing.
+    flex_routers: NotRequired[list[FlexRouterConfig]]
+    # Sampling rates for Flextron routes. Must have length 1 + len(flex_routers):
+    # index 0 is the unmasked base model, and later entries map to flex_routers.
+    # Recommended default when disabled is [1.0].
+    flextron_sampling_rates: NotRequired[list[float]]
     peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig

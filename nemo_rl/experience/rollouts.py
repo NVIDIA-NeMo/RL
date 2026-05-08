@@ -70,6 +70,8 @@ def generate_responses(
     else:
         # Ensure the key exists even if it's None, matching GenerationDatumSpec
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
+    if "flex_router_ids" in batch:
+        generation_input_data["flex_router_ids"] = batch["flex_router_ids"]
 
     # Always use synchronous generation
     generation_outputs = policy_generation.generate(
@@ -83,6 +85,10 @@ def generate_responses(
 
     # Extract truncated info if available (response hit max_tokens without stop token)
     response_truncated = generation_outputs.get("truncated")
+    flex_router_ids = generation_outputs.get("flex_router_ids")
+    if flex_router_ids is not None:
+        flex_router_ids = flex_router_ids.cpu()
+        batch["flex_router_ids"] = flex_router_ids
 
     # Extract generated parts
     generated_ids = []
@@ -109,6 +115,8 @@ def generate_responses(
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
                 i, input_length:total_length
             ]
+        if flex_router_ids is not None:
+            assistant_message["flex_router_id"] = int(flex_router_ids[i].item())
 
         batch["message_log"][i].append(assistant_message)
 
@@ -452,6 +460,14 @@ def run_multi_turn_rollout(
             input_lengths=active_input_lengths,
             greedy=greedy,
         )
+        if "flex_router_ids" in active_batch:
+            if "flex_router_ids" not in current_batch:
+                current_batch["flex_router_ids"] = torch.zeros(
+                    batch_size, dtype=torch.long
+                )
+            current_batch["flex_router_ids"][active_indices] = active_batch[
+                "flex_router_ids"
+            ].to(dtype=torch.long)
 
         # Record response truncation (response hit max_tokens without stop token)
         response_truncated = gen_metrics.pop("_response_truncated", None)

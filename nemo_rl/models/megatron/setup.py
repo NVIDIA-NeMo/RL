@@ -82,6 +82,7 @@ from nemo_rl.models.megatron.draft.utils import (
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
+from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -265,6 +266,22 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     """Validate and setup model paths."""
     # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
     hf_model_name = config["model_name"]
+    pretrained_checkpoint_path = config["megatron_cfg"].get(
+        "pretrained_checkpoint_path", None
+    )
+    if pretrained_checkpoint_path is not None:
+        if not isinstance(pretrained_checkpoint_path, str):
+            raise TypeError(
+                "policy.megatron_cfg.pretrained_checkpoint_path must be a string "
+                "or null."
+            )
+        if not pretrained_checkpoint_path.strip():
+            raise ValueError(
+                "policy.megatron_cfg.pretrained_checkpoint_path must be a non-empty "
+                "path when set."
+            )
+        return hf_model_name, pretrained_checkpoint_path, True
+
     hf_config_overrides = config.get("hf_config_overrides", {}) or {}
 
     # Check if the checkpoint already exists
@@ -293,15 +310,14 @@ def setup_model_config(
 ) -> tuple[ConfigContainer, Any]:
     """Handle all the model configuration logic."""
     # Load pretrained run config
-    pretrained_run_config = os.path.join(
-        pretrained_path, "iter_0000000/run_config.yaml"
-    )
+    pretrained_run_config = _get_pretrained_run_config_path(pretrained_path)
 
-    if not os.path.exists(pretrained_run_config):
+    if pretrained_run_config is None:
         raise FileNotFoundError(
-            f"Pretrained run config not found at {pretrained_run_config} on rank={rank}. "
+            f"Pretrained run config not found for checkpoint {pretrained_path} on rank={rank}. "
             "This usually means that the one-time HF->mcore conversion on rank=0 saved to a directory "
-            "not being mounted on this node. Please check"
+            "not being mounted on this node, or that policy.megatron_cfg.pretrained_checkpoint_path "
+            "points to a directory without run_config.yaml."
         )
 
     try:
@@ -350,6 +366,9 @@ def setup_model_config(
     # Validate chunking configuration
     _validate_chunking_config(config)
 
+    # Validate Flextron routing after model dimensions and hybrid pattern are known.
+    _validate_flextron_config(config, model_cfg)
+
     # Create checkpoint configs
     checkpoint_config = _create_checkpoint_config(
         pretrained_path, weights_path, optimizer_path
@@ -366,6 +385,35 @@ def setup_model_config(
     _validate_dtype_config(dtype, megatron_cfg.model, megatron_cfg.optimizer)
 
     return megatron_cfg, model_cfg
+
+
+def _get_pretrained_run_config_path(pretrained_path: str) -> str | None:
+    """Find the run_config.yaml for a Megatron checkpoint path."""
+    candidates = [
+        os.path.join(pretrained_path, "run_config.yaml"),
+        os.path.join(pretrained_path, "iter_0000000", "run_config.yaml"),
+    ]
+
+    tracker_path = os.path.join(pretrained_path, "latest_checkpointed_iteration.txt")
+    if os.path.isfile(tracker_path):
+        try:
+            with open(tracker_path) as tracker_file:
+                iteration = int(tracker_file.read().strip())
+        except (OSError, ValueError):
+            iteration = None
+        if iteration is not None:
+            candidates.append(
+                os.path.join(
+                    pretrained_path,
+                    f"iter_{iteration:07d}",
+                    "run_config.yaml",
+                )
+            )
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -1094,10 +1142,15 @@ def setup_reference_model_state(
 
     # If use_peft, the pretrained checkpoint weights are already loaded inside of the pre_wrap_hook
     # so they only need to be loaded here if use_peft is False
-    should_load_checkpoint = (
-        not use_peft
-        and ref_checkpoint_config.pretrained_checkpoint is not None
-        and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
+    _pretrained_set = ref_checkpoint_config.pretrained_checkpoint is not None
+    _ckpt_exists = _pretrained_set and checkpoint_exists(
+        ref_checkpoint_config.pretrained_checkpoint
+    )
+    should_load_checkpoint = (not use_peft) and _pretrained_set and _ckpt_exists
+    print(
+        f"[ref-setup] use_peft={use_peft} pretrained_set={_pretrained_set} "
+        f"ckpt_exists={_ckpt_exists} path={ref_checkpoint_config.pretrained_checkpoint} "
+        f"-> should_load_checkpoint={should_load_checkpoint}"
     )
 
     print("Loading the Reference Model")

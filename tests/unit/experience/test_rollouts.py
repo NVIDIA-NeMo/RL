@@ -38,6 +38,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
 )
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
+    generate_responses,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -62,6 +63,62 @@ from tests.unit.test_envs import (
 )
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+
+
+class _FakeFlextronGeneration:
+    def generate(self, data, greedy=False):
+        assert "stop_strings" in data
+        return BatchedDataDict(
+            {
+                "output_ids": torch.tensor([[10, 1, 2], [11, 12, 3]]),
+                "generation_lengths": torch.tensor([2, 1]),
+                "unpadded_sequence_lengths": torch.tensor([3, 3]),
+                "logprobs": torch.zeros(2, 3),
+                "flex_router_ids": torch.tensor([1, 0]),
+            }
+        )
+
+
+class _FakeDecodeTokenizer:
+    pad_token_id = 0
+
+    def batch_decode(self, generated_ids, skip_special_tokens=True):
+        return [" ".join(str(int(token)) for token in ids) for ids in generated_ids]
+
+
+def test_generate_responses_attaches_flex_router_metadata():
+    generation_input_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[10, 0], [11, 12]]),
+            "input_lengths": torch.tensor([1, 2]),
+        }
+    )
+    batch = BatchedDataDict(
+        {
+            "message_log": [
+                [{"role": "user", "content": "a", "token_ids": torch.tensor([10])}],
+                [
+                    {
+                        "role": "user",
+                        "content": "b",
+                        "token_ids": torch.tensor([11, 12]),
+                    }
+                ],
+            ],
+        }
+    )
+
+    updated_batch, _, _ = generate_responses(
+        _FakeFlextronGeneration(),
+        generation_input_data,
+        batch,
+        _FakeDecodeTokenizer(),
+        input_lengths=torch.tensor([1, 2]),
+    )
+
+    assert updated_batch["flex_router_ids"].tolist() == [1, 0]
+    assert updated_batch["message_log"][0][-1]["flex_router_id"] == 1
+    assert updated_batch["message_log"][1][-1]["flex_router_id"] == 0
 
 
 class TestCalculateSingleMetric:

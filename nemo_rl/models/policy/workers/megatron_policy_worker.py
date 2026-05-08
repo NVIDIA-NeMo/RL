@@ -57,9 +57,11 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import get_moe_metrics
 from nemo_rl.models.megatron.config import MegatronGenerationConfig
 from nemo_rl.models.megatron.data import (
+    ProcessedMicrobatch,
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.megatron.flextron import FrozenFlextronRouter
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -200,6 +202,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
+        self.frozen_flextron_router = FrozenFlextronRouter(
+            model=self.model, model_cfg=runtime_config.model_cfg
+        )
 
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
@@ -253,6 +258,91 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
     def disable_forward_pre_hook(self, param_sync=True):
         assert isinstance(self.model, DistributedDataParallel)
         self.model.disable_forward_pre_hook(param_sync=param_sync)
+
+    def _has_flextron_router_ids(self, data: BatchedDataDict[Any]) -> bool:
+        return (
+            self.frozen_flextron_router.enabled
+            and "flex_router_ids" in data
+            and data["flex_router_ids"].numel() > 0
+        )
+
+    def _validate_flextron_unpacked_batching(self) -> None:
+        if self.cfg["dynamic_batching"]["enabled"]:
+            raise ValueError(
+                "Routed Flextron Megatron forwards do not support dynamic batching. "
+                "Set policy.dynamic_batching.enabled=false."
+            )
+        if self.cfg["sequence_packing"]["enabled"]:
+            raise ValueError(
+                "Routed Flextron Megatron forwards do not support sequence packing. "
+                "Set policy.sequence_packing.enabled=false."
+            )
+
+    def _get_microbatch_iterator_with_flextron_routes(
+        self,
+        data: BatchedDataDict[Any],
+        micro_batch_size: int,
+    ) -> tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
+        if self._has_flextron_router_ids(data):
+            self._validate_flextron_unpacked_batching()
+            micro_batch_size = 1
+
+        (
+            data_iterator,
+            num_microbatches,
+            micro_batch_size,
+            seq_length,
+            padded_seq_length,
+        ) = get_microbatch_iterator(
+            data,
+            self.cfg,
+            micro_batch_size,
+            straggler_timer=self.mcore_state.straggler_timer,
+        )
+
+        if not self._has_flextron_router_ids(data):
+            return (
+                data_iterator,
+                num_microbatches,
+                micro_batch_size,
+                seq_length,
+                padded_seq_length,
+            )
+
+        return (
+            self._route_flextron_microbatches(data_iterator),
+            num_microbatches,
+            micro_batch_size,
+            seq_length,
+            padded_seq_length,
+        )
+
+    def _route_flextron_microbatches(
+        self, data_iterator: Iterator[ProcessedMicrobatch]
+    ) -> Iterator[ProcessedMicrobatch]:
+        try:
+            for microbatch in data_iterator:
+                router_id = self._microbatch_flextron_router_id(microbatch)
+                with self.frozen_flextron_router.use_router(router_id):
+                    yield microbatch
+        finally:
+            self.frozen_flextron_router.clear_router()
+
+    def _microbatch_flextron_router_id(
+        self, microbatch: ProcessedMicrobatch
+    ) -> int | None:
+        router_ids = microbatch.data_dict.get("flex_router_ids")
+        if router_ids is None or router_ids.numel() == 0:
+            return None
+
+        router_ids = router_ids.detach().reshape(-1).cpu()
+        first_router_id = int(router_ids[0].item())
+        if not torch.all(router_ids == first_router_id):
+            raise ValueError(
+                "Each routed Flextron Megatron microbatch must contain exactly one "
+                f"router id; got {router_ids.tolist()}."
+            )
+        return first_router_id
 
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
@@ -319,11 +409,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     micro_batch_size,
                     seq_length,
                     padded_seq_length,
-                ) = get_microbatch_iterator(
+                ) = self._get_microbatch_iterator_with_flextron_routes(
                     batch,
-                    self.cfg,
                     mbs,
-                    straggler_timer=self.mcore_state.straggler_timer,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -495,11 +583,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             micro_batch_size,
             seq_length,
             padded_seq_length,
-        ) = get_microbatch_iterator(
+        ) = self._get_microbatch_iterator_with_flextron_routes(
             data,
-            self.cfg,
             logprob_batch_size,
-            straggler_timer=self.mcore_state.straggler_timer,
         )
 
         use_linear_ce_fusion = self.cfg["megatron_cfg"].get(
@@ -569,9 +655,17 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             ):
                 continue
             if state_dict_key not in source_state_dict:
-                if raise_if_key_missing:
+                # _extra_state holds TE runtime metadata (FP8 amax/scale, RNG); it may
+                # only appear in state_dict() after a forward pass, so a freshly-loaded
+                # reference model can lack keys the active (already-forward'd) model has.
+                if raise_if_key_missing and not state_dict_key.endswith("_extra_state"):
+                    src_keys = list(source_state_dict.keys())
+                    leaf = state_dict_key.rsplit(".", 1)[-1]
+                    similar = [k for k in src_keys if k.endswith(leaf)][:5]
                     raise ValueError(
-                        f"Key '{state_dict_key}' not in source state_dict."
+                        f"Key '{state_dict_key}' not in source state_dict. "
+                        f"Source has {len(src_keys)} keys, first 5: {src_keys[:5]}. "
+                        f"Keys ending with '{leaf}' in source: {similar}."
                     )
                 continue
             source_value = source_state_dict[state_dict_key]
@@ -757,6 +851,60 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
     @wrap_with_nvtx_name("megatron_policy_worker/generate")
     def generate(
+        self, *, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+        """Generate a batch, applying one frozen Flextron route per sample."""
+        if not self.frozen_flextron_router.enabled:
+            return self._generate_unrouted(data=data, greedy=greedy)
+
+        router_ids = self.frozen_flextron_router.get_router_ids(
+            data, device=data["input_ids"].device
+        )
+        router_groups = self.frozen_flextron_router.grouped_indices(router_ids)
+
+        if len(router_groups) == 1:
+            router_id = next(iter(router_groups))
+            with self.frozen_flextron_router.use_router(router_id):
+                output = self._generate_unrouted(data=data, greedy=greedy)
+            output["flex_router_ids"] = router_ids.cpu()
+            return output
+
+        output_rows: list[dict[str, Any] | None] = [None] * data.size
+        for router_id, indices in router_groups.items():
+            routed_data = data.select_indices(indices)
+            with self.frozen_flextron_router.use_router(router_id):
+                routed_output = self._generate_unrouted(data=routed_data, greedy=greedy)
+            for local_idx, original_idx in enumerate(indices):
+                output_rows[original_idx] = self._select_output_row(
+                    routed_output, local_idx
+                )
+
+        if any(row is None for row in output_rows):
+            raise RuntimeError("Failed to restore all routed Flextron generation rows.")
+
+        output = BatchedDataDict.from_batches(
+            cast(list[dict[str, Any]], output_rows),
+            pad_value_dict={
+                "output_ids": self.tokenizer.pad_token_id,
+                "logprobs": 0.0,
+            },
+        )
+        output["flex_router_ids"] = router_ids.cpu()
+        return output
+
+    @staticmethod
+    def _select_output_row(
+        output: BatchedDataDict[Any], row_idx: int
+    ) -> dict[str, Any]:
+        row = {}
+        for key, value in output.items():
+            if torch.is_tensor(value):
+                row[key] = value[row_idx : row_idx + 1]
+            else:
+                row[key] = [value[row_idx]]
+        return row
+
+    def _generate_unrouted(
         self, *, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using huggingface framework generation.

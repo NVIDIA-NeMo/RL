@@ -124,6 +124,7 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    flex_router_ids: NotRequired[torch.Tensor]
     __extra__: Any
 
 

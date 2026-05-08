@@ -1717,6 +1717,10 @@ def grpo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    if "flex_router_ids" in repeated_batch:
+                        train_data["flex_router_ids"] = repeated_batch[
+                            "flex_router_ids"
+                        ]
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
@@ -1744,6 +1748,8 @@ def grpo_train(
                             **extra_multimodal_data,
                         }
                     )
+                    if "flex_router_ids" in train_data:
+                        logprob_data["flex_router_ids"] = train_data["flex_router_ids"]
                     train_data["prev_logprobs"] = policy.get_logprobs(
                         logprob_data, timer=timer
                     )["logprobs"]
@@ -2064,6 +2070,8 @@ def grpo_train(
                     "generation_logprobs"
                 ].tolist()
                 log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+                if "flex_router_ids" in train_data:
+                    log_data["flex_router_ids"] = train_data["flex_router_ids"].tolist()
 
                 logger.log_batched_dict_as_jsonl(
                     log_data, f"train_data_step{total_steps + 1}.jsonl"
@@ -2786,6 +2794,10 @@ def async_grpo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    if "flex_router_ids" in repeated_batch:
+                        train_data["flex_router_ids"] = repeated_batch[
+                            "flex_router_ids"
+                        ]
                     train_data.to("cpu")
 
                 # Training phase (same as sync version)
@@ -3097,6 +3109,8 @@ def async_grpo_train(
             log_data["advantages"] = train_data["advantages"].tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+            if "flex_router_ids" in train_data:
+                log_data["flex_router_ids"] = train_data["flex_router_ids"].tolist()
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{step + 1}.jsonl"
             )

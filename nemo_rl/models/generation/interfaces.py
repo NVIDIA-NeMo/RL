@@ -137,6 +137,7 @@ class GenerationDatumSpec(TypedDict):
     - input_ids: Tensor of token IDs representing the input sequences (right padded)
     - input_lengths: Tensor containing the actual length of each sequence (without padding)
     - stop_strings: Optional list of strings to stop generation (per sample)
+    - flex_router_ids: Optional tensor of deterministic Flextron route ids
     - __extra__: Additional model-specific data fields
 
     Example of a batch with 4 entries with different sequence lengths:
@@ -162,6 +163,7 @@ class GenerationDatumSpec(TypedDict):
     input_ids: torch.Tensor
     input_lengths: torch.Tensor
     stop_strings: NotRequired[list[str]]
+    flex_router_ids: NotRequired[torch.Tensor]
     __extra__: Any
 
 
@@ -173,6 +175,7 @@ class GenerationOutputSpec(TypedDict):
     - unpadded_sequence_lengths: Tensor containing the actual length of each input + generated sequence (without padding)
     - logprobs: Tensor of log probabilities for each generated token (right padded with zeros)
     - truncated: Boolean tensor indicating if each sequence was truncated (hit max_tokens limit)
+    - flex_router_ids: Optional tensor of deterministic Flextron route ids
     - __extra__: Additional model-specific data fields
 
     Example of a batch with 2 sequences:
@@ -216,6 +219,7 @@ class GenerationOutputSpec(TypedDict):
     truncated: NotRequired[
         torch.Tensor
     ]  # Whether each sequence was truncated and hit max_tokens without stop token
+    flex_router_ids: NotRequired[torch.Tensor]
     __extra__: Any
 
 

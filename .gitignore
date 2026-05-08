@@ -51,3 +51,8 @@ code_snapshots*/
 
 # Claude Code review memory (local only)
 .claude/review-memory/
+
+# local claude context should not be tracked
+CLAUDE.local.md
+experiments/
+logbook/

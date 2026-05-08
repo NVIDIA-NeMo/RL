@@ -133,6 +133,54 @@ class TestValidateModelPaths:
         assert base_checkpoint_exists is False
         assert yarn_checkpoint_exists is False
 
+    def test_pretrained_checkpoint_path_overrides_conversion_path(self):
+        """Test explicit Megatron checkpoint paths are used directly."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        checkpoint_path = "/path/to/megatron/iter_0000001"
+        config = {
+            "model_name": "test-model",
+            "megatron_cfg": {
+                "pretrained_checkpoint_path": checkpoint_path,
+            },
+        }
+
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+
+        assert hf_model_name == "test-model"
+        assert pretrained_path == checkpoint_path
+        assert pt_checkpoint_exists is True
+
+    def test_pretrained_run_config_resolves_direct_iteration_dir(self, tmp_path):
+        """Test direct iter_* checkpoints can provide run_config.yaml."""
+        from nemo_rl.models.megatron.setup import _get_pretrained_run_config_path
+
+        checkpoint_path = tmp_path / "iter_0000001"
+        checkpoint_path.mkdir()
+        run_config_path = checkpoint_path / "run_config.yaml"
+        run_config_path.write_text("model: {}\n")
+
+        assert _get_pretrained_run_config_path(str(checkpoint_path)) == str(
+            run_config_path
+        )
+
+    def test_pretrained_run_config_resolves_tracker_iteration(self, tmp_path):
+        """Test parent checkpoints can resolve run_config.yaml from the tracker."""
+        from nemo_rl.models.megatron.setup import _get_pretrained_run_config_path
+
+        checkpoint_path = tmp_path / "checkpoint"
+        iter_path = checkpoint_path / "iter_0000001"
+        iter_path.mkdir(parents=True)
+        run_config_path = iter_path / "run_config.yaml"
+        run_config_path.write_text("model: {}\n")
+        (checkpoint_path / "latest_checkpointed_iteration.txt").write_text("1\n")
+
+        assert _get_pretrained_run_config_path(str(checkpoint_path)) == str(
+            run_config_path
+        )
+
 
 @pytest.mark.mcore
 class TestApplyParallelismConfig:
@@ -532,6 +580,195 @@ class TestValidateChunkingConfig:
 
         # Should not raise
         _validate_chunking_config(config)
+
+
+@pytest.mark.mcore
+class TestValidateFlextronConfig:
+    """Tests for deterministic Flextron route config validation."""
+
+    @staticmethod
+    def _model_cfg():
+        return SimpleNamespace(
+            hybrid_layer_pattern="ME*E|M/MM/MM",
+            ffn_hidden_size=32,
+            hidden_size=16,
+        )
+
+    def test_scalar_router_config_expands_to_eligible_layers(self):
+        """Test scalar route dimensions expand to all Flextron hook layers."""
+        from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
+
+        model_cfg = self._model_cfg()
+        config = {
+            "megatron_cfg": {
+                "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
+                "flextron_sampling_rates": [0.25, 0.75],
+            }
+        }
+
+        _validate_flextron_config(config, model_cfg)
+
+        assert model_cfg.flextron_sampling_rates == [0.25, 0.75]
+        assert model_cfg.flex_routers == [
+            {
+                "mlp_int_list": [24, 24],
+                "emb_int_list": [12, 12, 12, 12, 12],
+            }
+        ]
+
+    def test_per_layer_router_config_projects_to_hook_layer_types(self):
+        """Test per-layer route dimensions project from main hybrid layers."""
+        from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
+
+        model_cfg = SimpleNamespace(
+            hybrid_layer_pattern="ME*-E",
+            ffn_hidden_size=32,
+            hidden_size=16,
+        )
+        config = {
+            "megatron_cfg": {
+                "flex_routers": [
+                    {
+                        "mlp_int_list": [4, 20, 28, 30, 24],
+                        "emb_int_list": [8, 10, 12, 14, 16],
+                    }
+                ],
+                "flextron_sampling_rates": [1, 2],
+            }
+        }
+
+        _validate_flextron_config(config, model_cfg)
+
+        assert model_cfg.flextron_sampling_rates == [1.0, 2.0]
+        assert model_cfg.flex_routers == [
+            {
+                "mlp_int_list": [20, 24],
+                "emb_int_list": [8, 10, 12, 16],
+            }
+        ]
+
+    def test_empty_router_config_sets_base_only_rates(self):
+        """Test empty routes validate without requiring Flextron model fields."""
+        from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
+
+        model_cfg = SimpleNamespace()
+        config = {
+            "megatron_cfg": {
+                "flex_routers": [],
+                "flextron_sampling_rates": [1.0],
+            }
+        }
+
+        _validate_flextron_config(config, model_cfg)
+
+        assert model_cfg.flextron_sampling_rates == [1.0]
+        assert model_cfg.flex_routers == []
+
+    def test_sampling_rates_length_must_match_routers(self):
+        """Test sampling rate count must include the base model route."""
+        from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
+
+        config = {
+            "megatron_cfg": {
+                "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
+                "flextron_sampling_rates": [1.0],
+            }
+        }
+
+        with pytest.raises(ValueError, match="must have length 2"):
+            _validate_flextron_config(config, self._model_cfg())
+
+    def test_sampling_rates_must_be_non_negative(self):
+        """Test negative sampling rates are rejected."""
+        from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
+
+        config = {
+            "megatron_cfg": {
+                "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
+                "flextron_sampling_rates": [1.0, -0.5],
+            }
+        }
+
+        with pytest.raises(ValueError, match="non-negative"):
+            _validate_flextron_config(config, self._model_cfg())
+
+    def test_sampling_rates_must_sum_positive(self):
+        """Test all-zero sampling rates are rejected."""
+        from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
+
+        config = {
+            "megatron_cfg": {
+                "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
+                "flextron_sampling_rates": [0.0, 0.0],
+            }
+        }
+
+        with pytest.raises(ValueError, match="sum to a value > 0"):
+            _validate_flextron_config(config, self._model_cfg())
+
+    def test_per_layer_router_list_must_match_main_layer_count(self):
+        """Test per-layer route lists must cover every main hybrid layer."""
+        from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
+
+        config = {
+            "megatron_cfg": {
+                "flex_routers": [
+                    {
+                        "mlp_int_list": [4, 20],
+                        "emb_int_list": 12,
+                    }
+                ],
+                "flextron_sampling_rates": [0.5, 0.5],
+            }
+        }
+
+        with pytest.raises(ValueError, match="one value per main hybrid layer"):
+            _validate_flextron_config(config, self._model_cfg())
+
+    def test_flex_routers_require_sampling_rates(self):
+        """Test flex_routers cannot be set without sampling rates."""
+        from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
+
+        config = {
+            "megatron_cfg": {
+                "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
+            }
+        }
+
+        with pytest.raises(ValueError, match="requires"):
+            _validate_flextron_config(config, self._model_cfg())
+
+    def test_vllm_backend_rejects_nonzero_nested_sampling_rates(self):
+        """Test vLLM cannot be used when nested routes can be sampled."""
+        from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
+
+        config = {
+            "generation": {"backend": "vllm"},
+            "megatron_cfg": {
+                "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
+                "flextron_sampling_rates": [0.5, 0.5],
+            },
+        }
+
+        with pytest.raises(ValueError, match="backend='vllm'"):
+            _validate_flextron_config(config, self._model_cfg())
+
+    def test_vllm_backend_allows_base_only_sampling_rates(self):
+        """Test vLLM remains valid when nested routes have zero sampling rate."""
+        from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
+
+        model_cfg = self._model_cfg()
+        config = {
+            "generation": {"backend": "vllm"},
+            "megatron_cfg": {
+                "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
+                "flextron_sampling_rates": [1.0, 0.0],
+            },
+        }
+
+        _validate_flextron_config(config, model_cfg)
+
+        assert model_cfg.flextron_sampling_rates == [1.0, 0.0]
 
 
 @pytest.mark.mcore
