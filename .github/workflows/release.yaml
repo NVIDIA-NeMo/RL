@@ -84,7 +84,7 @@ jobs:
 
   release-summary:
     needs: [release]
-    if: always() && !cancelled()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Result
