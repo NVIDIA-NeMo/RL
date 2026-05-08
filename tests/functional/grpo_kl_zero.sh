@@ -1,0 +1,72 @@
+#!/bin/bash
+# Functional test for `loss_fn.reference_policy_kl_penalty == 0`.
+#
+# Covers the path enabled by PR #2178 (skip loading the reference model when
+# KL penalty is zero) plus the auto-skip safety net added in response to
+# yuki-97 / terrykong's review on that PR.
+#
+# Specifically verifies:
+#   * Training runs end-to-end with `reference_policy_kl_penalty=0` and the
+#     reference model never being loaded.
+#   * The user does NOT have to explicitly set
+#     `grpo.skip_reference_policy_logprobs_calculation=true` -- the setup()
+#     auto-enables it (issue #1968 Bug 1 would crash without this).
+#   * The placeholder zeros that PR #2174 puts in
+#     `train_data["reference_policy_logprobs"]` keep the loss math valid
+#     (KL term contribution is exactly zero when penalty is zero).
+
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
+PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)
+git config --global --add safe.directory $PROJECT_ROOT
+
+set -eou pipefail
+
+EXP_NAME=$(basename $0 .sh)
+EXP_DIR=$SCRIPT_DIR/$EXP_NAME
+LOG_DIR=$EXP_DIR/logs
+JSON_METRICS=$EXP_DIR/metrics.json
+RUN_LOG=$EXP_DIR/run.log
+export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
+
+rm -rf $EXP_DIR $LOG_DIR
+mkdir -p $EXP_DIR $LOG_DIR
+
+cd $PROJECT_ROOT
+uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
+    $PROJECT_ROOT/examples/run_grpo.py \
+    policy.model_name=Qwen/Qwen3-0.6B \
+    grpo.num_prompts_per_step=2 \
+    grpo.num_generations_per_prompt=4 \
+    policy.train_global_batch_size=4 \
+    policy.train_micro_batch_size=1 \
+    cluster.gpus_per_node=2 \
+    grpo.max_num_steps=2 \
+    logger.tensorboard_enabled=true \
+    logger.log_dir=$LOG_DIR \
+    logger.wandb_enabled=false \
+    logger.monitor_gpus=true \
+    checkpointing.enabled=false \
+    ++loss_fn.reference_policy_kl_penalty=0 \
+    $@ \
+    2>&1 | tee $RUN_LOG
+
+# Sanity: the auto-skip path must have fired (PR #2178 + yuki/terrykong review).
+if ! grep -q "Auto-enabling .grpo.skip_reference_policy_logprobs_calculation=True" $RUN_LOG; then
+    echo "[FAIL] expected auto-skip log line not found in $RUN_LOG"
+    exit 1
+fi
+if ! grep -q "Reference policy logprob calculation will be skipped" $RUN_LOG; then
+    echo "[FAIL] expected skip-confirmation log line not found in $RUN_LOG"
+    exit 1
+fi
+
+uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+
+# Same numeric guards as grpo.sh -- training math should be unchanged once
+# the KL term contributes zero.
+uv run tests/check_metrics.py $JSON_METRICS \
+    'max(data["train/gen_kl_error"]) < 0.002' \
+    'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
+    'max(data["train/probs_ratio_clamped_min"]) < 1.21' \
+    'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
+    'max(data["train/probs_ratio_clamped_max"]) < 1.21'
