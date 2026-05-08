@@ -16,9 +16,9 @@
 All call sites in ``nemo_rl/algorithms``, ``nemo_rl/experience`` and
 ``nemo_rl/models`` go through :class:`DataPlaneClient` — never
 ``import transfer_queue`` directly. This is what makes the implementation
-swappable (G2 in the integration plan).
+swappable.
 
-See ``research/data_plane_integration_plan.md`` for the full design.
+See ``nemo_rl/data_plane/README.md`` for the full design.
 """
 
 from __future__ import annotations
@@ -76,9 +76,9 @@ class KVBatchMeta:
       * Result type returned by :meth:`DataPlaneClient.get_meta` — callers
         extract ``.keys`` / ``.partition_id`` and pass them to
         :meth:`kv_batch_get` / :meth:`get_data`.
-      * Argument type for the per-DP-rank fetch entrypoints introduced in
-        Stage 4. ``sequence_lengths`` lets the driver compute a balanced
-        per-rank shard from metadata only (control plane), without ever
+      * Argument type for the per-DP-rank fetch entrypoints.
+        ``sequence_lengths`` lets the driver compute a balanced per-rank
+        shard from metadata only (control plane), without ever
         materializing tensor data.
     """
 
@@ -173,8 +173,7 @@ class DataPlaneClient(ABC):
     The authoritative signal in TransferQueue is *field production* —
     when a stage calls :meth:`kv_batch_put` for a new field, the controller
     flips ``production_status[sample, field] = 1``. Downstream consumers
-    waiting on that field only see those samples once produced. See R13 of
-    the design document.
+    waiting on that field only see those samples once produced.
     """
 
     # ── (A) task-mediated ───────────────────────────────────────────────
@@ -191,10 +190,10 @@ class DataPlaneClient(ABC):
     ) -> None:
         """Declare the partition schema and consumer tasks.
 
-        ``fields`` is the *superset* of fields any producer may write to
-        this partition (R4 — multimodal-tolerant). ``enums`` ships fixed-
-        vocab string codecs to the controller once at register time
-        rather than per-sample (P3, Tier 2).
+        ``fields`` is the superset of fields any producer may write to
+        this partition (multimodal-tolerant). ``enums`` ships fixed-vocab
+        string codecs to the controller once at register time rather
+        than per-sample.
         """
 
     @abstractmethod
@@ -212,8 +211,9 @@ class DataPlaneClient(ABC):
 
         Advances TQ's per-task consumption counter as a side effect of the
         underlying ``mode='fetch'`` call. ``dp_rank`` is preserved on the
-        ABC for forward compatibility but Phase 1 uses driver-side
-        balancing (see Stage 4) instead of ``RankAwareSampler``.
+        ABC for forward compatibility but the current path uses
+        driver-side balancing via :func:`shard_meta_for_dp` instead of
+        TQ's ``RankAwareSampler``.
         """
 
     @abstractmethod
@@ -227,7 +227,7 @@ class DataPlaneClient(ABC):
         Resolution order for the field set:
           1. Explicit ``select_fields`` argument.
           2. ``meta.fields`` if non-None.
-          3. *Fail loudly* — never silently fetch all fields (P2).
+          3. *Fail loudly* — never silently fetch all fields.
         """
 
     @abstractmethod
@@ -257,8 +257,8 @@ class DataPlaneClient(ABC):
         these keys" signal that downstream consumers wait on. Returns the
         meta downstream consumers can use for direct :meth:`kv_batch_get`.
 
-        The adapter MUST reject non-tensor leaves in ``fields`` (P3 —
-        no pickle on the bus).
+        The adapter MUST reject non-tensor leaves in ``fields`` — no
+        pickle on the bus.
         """
 
     @abstractmethod
@@ -270,9 +270,8 @@ class DataPlaneClient(ABC):
     ) -> TensorDict:
         """Direct fetch by uids.
 
-        Used by per-DP-rank slice fetches in Stage 4. Does NOT advance any
-        per-task consumption counter — that only happens via
-        :meth:`get_meta`.
+        Used by per-DP-rank slice fetches. Does NOT advance any per-task
+        consumption counter — that only happens via :meth:`get_meta`.
         """
 
     @abstractmethod

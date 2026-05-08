@@ -16,9 +16,9 @@
 Houses the sync 1-hop counterparts to ``async_utils.AsyncTrajectoryCollector``
 and ``async_utils.ReplayBuffer``:
 
-* :func:`kv_first_write` — the flat first-write primitive (mirrors verl
-  ``main_ppo_sync.py:386-423``); single ``kv_batch_put`` of every tensor
-  field under per-sample keys ``f"{uid}_g{i}"``.
+* :func:`kv_first_write` — the flat first-write primitive: a single
+  ``kv_batch_put`` of every tensor field under per-sample keys
+  ``f"{uid}_g{i}"``.
 
 * :class:`SyncRolloutActor` — the Ray actor that owns the
   multi-turn rollout loop AND the post-rollout flatten / mask /
@@ -34,7 +34,7 @@ and ``async_utils.ReplayBuffer``:
 attention_mask, position_ids, multi_modal_inputs, generation_logprobs,
 token_mask) stay actor-side until ``kv_batch_put``, then live only in
 TQ. Driver never holds these bytes between rollout finish and train
-fan-out. See ``research/data_plane_integration_plan.md`` §1.2.
+fan-out.
 
 The collector is the sync counterpart to
 :class:`nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector`. It
@@ -73,13 +73,11 @@ def kv_first_write(
 ) -> KVBatchMeta:
     """Single flat ``kv_batch_put`` of every tensor field in ``final_batch_cpu``.
 
-    Mirrors verl ``main_ppo_sync.py:386-423``: keys ``f"{uid}_g{i}"``,
-    no DP awareness, no fan-out. Bulk lives in TQ from here on; the
-    caller never re-handles it on the driver. See
-    ``research/data_plane_integration_plan.md`` §1.2.
+    Keys ``f"{uid}_g{i}"``, no DP awareness, no fan-out. Bulk lives in
+    TQ from here on; the caller never re-handles it on the driver.
 
-    **Wire format (Phase 1)**: variable-length tensor fields are converted
-    to ``torch.jagged`` nested tensors via :func:`to_nested_by_length`
+    Wire format: variable-length tensor fields are converted to
+    ``torch.jagged`` nested tensors via :func:`to_nested_by_length`
     before the put. A field qualifies as variable-length when its shape
     is ``(N, S, ...)`` with ``S == max(input_lengths)`` and
     ``N == len(uids) * n_gen`` — catches ``input_ids``, ``token_mask``,

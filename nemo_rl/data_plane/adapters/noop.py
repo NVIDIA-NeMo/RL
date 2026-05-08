@@ -11,17 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""In-memory ``DataPlaneClient`` for tests and the disabled-flag default.
+"""In-memory ``DataPlaneClient`` test fixture.
 
 Behaves like a real adapter end-to-end (put → get → clear, consumption
 counters, field-presence as the stage-done signal) but stores everything
-in process memory. Two uses:
+in process memory. The ABC contract tests run against this implementation
+so they don't require TQ installed.
 
-* The factory returns this when ``cfg["enabled"] = False``, so call sites
-  can be wired unconditionally — no ``if data_plane.enabled`` branching
-  on the producer side.
-* Stage 1 unit tests target the ABC contract through this implementation
-  so the contract test runs without TQ installed.
+Production callers must NOT use this — :func:`build_data_plane_client`
+intentionally raises when ``enabled=False`` rather than returning a NoOp
+fallback (see ``factory.py``).
 """
 
 from __future__ import annotations
@@ -53,7 +52,7 @@ def _stack_or_nest(tensors: list[torch.Tensor]) -> torch.Tensor:
 
 
 def _reject_non_tensor_leaves(td: TensorDict) -> None:
-    """P3 — no pickle on the bus. Mirror of the TQ adapter check.
+    """No pickle on the bus. Mirror of the TQ adapter check.
 
     Walk the leaves via ``keys()`` + indexed lookup rather than
     ``items()``, because some tensordict versions skip ``NonTensorData``
@@ -161,7 +160,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
         if fields is None:
             raise ValueError(
                 "get_data requires either select_fields or meta.fields; "
-                "fetching all fields silently is forbidden (P2)."
+                "fetching all fields silently is forbidden."
             )
         return self.kv_batch_get(meta.keys, meta.partition_id, list(fields))
 

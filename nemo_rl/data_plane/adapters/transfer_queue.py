@@ -42,9 +42,8 @@ from nemo_rl.data_plane.interfaces import (
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Lazy import of transfer_queue. Mirrors verl's pattern at
-# ``verl/utils/transferqueue_utils.py:35-57`` — NeMo-RL still imports
-# cleanly without TQ installed; failure is deferred to construction time.
+# Lazy import of transfer_queue — keeps NeMo-RL importable without TQ
+# installed; failure is deferred to construction time.
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -277,7 +276,7 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# P3 — adapter-level enforcement that nothing but tensors crosses the bus.
+# Adapter-level enforcement that nothing but tensors crosses the bus.
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -463,8 +462,8 @@ class TQDataPlaneClient(DataPlaneClient):
         )
 
         # Lift sequence lengths from the rollout-side `input_lengths` tag
-        # if present. Driver-side balancing (Stage 4) needs this; the
-        # task-mediated path does not.
+        # if present. Driver-side balancing (shard_meta_for_dp) needs
+        # this; the task-mediated path does not.
         tags = tq_meta.custom_meta or [{} for _ in keys]
         seqlens: list[int] | None = None
         if tags and any("input_lengths" in t for t in tags):
@@ -487,7 +486,7 @@ class TQDataPlaneClient(DataPlaneClient):
         if fields is None:
             raise ValueError(
                 "get_data requires either select_fields or meta.fields; "
-                "silently fetching all fields is forbidden (P2)."
+                "silently fetching all fields is forbidden."
             )
         return self.kv_batch_get(meta.keys, meta.partition_id, list(fields))
 

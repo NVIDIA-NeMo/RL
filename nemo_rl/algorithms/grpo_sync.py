@@ -13,10 +13,9 @@
 # limitations under the License.
 """GRPO trainer — TransferQueue-mediated path (sync).
 
-Sibling fork of ``nemo_rl.algorithms.grpo``. Mirrors verl's split between
-``main_ppo.py`` (legacy) and ``main_ppo_sync.py`` (TQ-only): each file
-has zero internal branching on whether TQ is engaged, and the example
-script chooses one or the other.
+Sibling fork of ``nemo_rl.algorithms.grpo``. Each file has zero
+internal branching on whether TQ is engaged; the example script
+chooses one or the other based on ``data_plane.enabled``.
 
 Setup, helpers, and ``validate`` are re-imported from ``grpo``; only the
 training loop body is duplicated here so the per-step lifecycle hooks
@@ -24,8 +23,7 @@ training loop body is duplicated here so the per-step lifecycle hooks
 sequential code.
 
 Parity with the legacy path is verified by running the same config
-against both entrypoints and diffing the wandb runs (Stage 5 of the
-data-plane integration plan).
+against both entrypoints and diffing the wandb runs.
 """
 
 from __future__ import annotations
@@ -261,8 +259,7 @@ def grpo_train_sync(
     # The actor owns the multi-turn rollout loop AND post-rollout
     # flatten / mask construction / prompt extraction / baseline-std /
     # TQ first-write. Bulk tensors stay actor-side until kv_batch_put;
-    # driver receives only KVBatchMeta + small slice via Ray. See
-    # research/data_plane_integration_plan.md §1.2.
+    # driver receives only KVBatchMeta + small slice via Ray.
     rollout_actor = SyncRolloutActor.options(
         runtime_env=make_actor_runtime_env(
             "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor"
@@ -414,7 +411,6 @@ def grpo_train_sync(
                 # mask construction + prompt extraction + baseline/std,
                 # writes bulk to TQ in one flat kv_batch_put, returns
                 # only meta + small slice. Bulk never visits the driver.
-                # See research/data_plane_integration_plan.md §1.2.
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
                     n_prompts = int(repeated_batch.size)
@@ -551,12 +547,12 @@ def grpo_train_sync(
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
-                    # Meta-driven worker dispatch (verl pattern). Workers
-                    # fetch their slice from TQ; logprob result is also
-                    # written back to TQ as ``prev_logprobs`` /
+                    # Meta-driven worker dispatch. Workers fetch their
+                    # slice from TQ; logprob result is also written back
+                    # to TQ as ``prev_logprobs`` /
                     # ``reference_policy_logprobs`` columns under
-                    # ``meta.keys`` (worker write-back from PR-A.5) AND
-                    # returned to the driver via Ray for the next compute.
+                    # ``meta.keys`` AND returned to the driver via Ray
+                    # for the next compute.
                     _prev_lp = policy.get_logprobs_from_meta(meta, timer=timer)
                     prev_logprobs = _prev_lp["logprobs"]
 
@@ -582,9 +578,8 @@ def grpo_train_sync(
                     generation_logprobs = extras_bdd["generation_logprobs"]
                     token_mask = extras_bdd["token_mask"]
 
-                    # Thin BDD for the data-driven masking call. Mirrors
-                    # verl's ``_compute_old_log_prob`` pattern: take the
-                    # slice you need, transform, write delta back.
+                    # Thin BDD for the data-driven masking call: take
+                    # the slice you need, transform, write delta back.
                     masking_data = BatchedDataDict[ClippedPGLossDataDict](
                         {
                             "token_mask": token_mask,
@@ -682,11 +677,10 @@ def grpo_train_sync(
                         # Calibration needs input_ids + input_lengths +
                         # multimodal fields. The actor wrote all of those
                         # to TQ at rollout time; fetch them back as a
-                        # slice (driver-driven, data-driven — same shape
-                        # as verl's _compute_old_log_prob reshape: pull
-                        # what you compute against, transform, no need
-                        # to refetch the bulk schema). Logprob/mask/adv
-                        # columns added later are irrelevant here.
+                        # slice — pull what you compute against, transform,
+                        # no need to refetch the bulk schema. Logprob /
+                        # mask / adv columns added later are irrelevant
+                        # here.
                         _calib_fields = [
                             f for f in (meta.fields or [])
                             if f not in (
@@ -957,9 +951,9 @@ def grpo_train_sync(
                 if _log_input_ids is not None:
                     log_data["token_ids"] = _log_input_ids.tolist()
                 # NOTE: ``content`` (raw assistant text) is not stored in
-                # TQ — the codec is tensor-only (Tier 1 of P3 in the
-                # integration plan). When non-tensor logging matters,
-                # plumb it through Ray return on rollout_to_tq's slice.
+                # TQ — the codec is tensor-only. When non-tensor logging
+                # matters, plumb it through Ray return on rollout_to_tq's
+                # slice.
                 logger.log_batched_dict_as_jsonl(
                     log_data, f"train_data_step{total_steps + 1}.jsonl"
                 )

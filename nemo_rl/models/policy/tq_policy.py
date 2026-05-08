@@ -24,7 +24,7 @@ dispatch slices the key list per DP rank via
 no key minting). Workers fetch their slice from TQ via
 ``self._fetch(meta)`` and write deltas back via
 ``self._write_back_result_field(...)``. See
-``research/data_plane_integration_plan.md`` §1.2.
+``nemo_rl/data_plane/README.md`` for the full design.
 """
 
 from __future__ import annotations
@@ -149,10 +149,10 @@ class TQPolicy(Policy):
     ) -> None:
         """Register the per-step TQ partition.
 
-        Sync trainers call this at the start of each step (verl-style:
-        static partition id ``"train"`` cleared and reused). The schema
-        is the union of all consumer fields — producers write only the
-        subset they have, consumers fetch via ``select_fields``.
+        Sync trainers call this at the start of each step. The static
+        partition id ``"train"`` is cleared and reused across steps. The
+        schema is the union of all consumer fields — producers write
+        only the subset they have, consumers fetch via ``select_fields``.
         """
         self._dp_client.register_partition(
             partition_id=self._tq_partition_id,
