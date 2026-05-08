@@ -13,7 +13,9 @@
 # limitations under the License.
 import json
 import os
+import random
 import re
+import time
 import uuid
 from typing import Any, Dict, List, NotRequired, Optional, Tuple, TypedDict
 
@@ -49,15 +51,23 @@ class TauBenchEnvConfig(TypedDict):
         num_workers: Number of Ray worker actors for parallel execution.
         env_name: tau-bench domain to run ("retail" or "airline").
         task_split: Dataset split ("train", "test", or "dev").
-        user_strategy: How the simulated user behaves ("llm", "react", "verify", "reflection").
+        user_strategy: How the simulated user behaves ("llm", "react", "verify",
+            "reflection", or "mock"). Use "mock" to run without any real LLM calls:
+            the user simulator and judge return random outputs after an optional sleep,
+            and user_base_url / judge_base_url are ignored.
         user_model: LiteLLM model string for the user simulator (e.g. "openai/gpt-4o-mini").
+            Ignored when user_strategy is "mock".
         user_base_url: Optional base URL override for the user model's OpenAI-compatible API.
-        user_api_key: API key for the user model server.
+            Ignored when user_strategy is "mock".
+        user_api_key: API key for the user model server. Ignored when user_strategy is "mock".
         max_steps: Maximum tool-call steps per episode before forced termination.
         judge_model: LiteLLM model string for LLM-as-judge scoring (None disables judging).
+            Ignored when user_strategy is "mock".
         judge_base_url: Optional base URL override for the judge model's API.
-        judge_api_key: API key for the judge model server.
+            Ignored when user_strategy is "mock".
+        judge_api_key: API key for the judge model server. Ignored when user_strategy is "mock".
         judge_weight: Blend weight: 0.0 = pure tau-bench reward, 1.0 = pure judge score.
+        mock_latency_s: Seconds to sleep per simulated LLM call in mock mode (default 0.0).
     """
 
     num_workers: int
@@ -72,6 +82,7 @@ class TauBenchEnvConfig(TypedDict):
     judge_base_url: NotRequired[str | None]
     judge_api_key: NotRequired[str]
     judge_weight: NotRequired[float]
+    mock_latency_s: NotRequired[float]
 
 
 class TauBenchEnvMetadata(TypedDict):
@@ -112,6 +123,7 @@ class TauBenchWorker:
         judge_model: Optional[str],
         judge_base_url: Optional[str],
         judge_api_key: str,
+        mock_latency_s: float = 0.0,
     ) -> None:
         self._env_name = env_name
         self._task_split = task_split
@@ -121,12 +133,53 @@ class TauBenchWorker:
         self._judge_model = judge_model
         self._judge_base_url = judge_base_url
         self._judge_api_key = judge_api_key
+        self._mock_mode = user_strategy == "mock"
+        self._mock_latency_s = mock_latency_s
         self._active_envs: Dict[str, Any] = {}
 
-        # Configure LiteLLM (used by tau-bench's user simulator) once at startup.
-        if user_base_url:
-            os.environ["OPENAI_BASE_URL"] = user_base_url
-        os.environ["OPENAI_API_KEY"] = user_api_key
+        if self._mock_mode:
+            # Patch litellm.completion with a fake that returns random customer-like
+            # text after sleeping mock_latency_s seconds.  This intercepts all LLM
+            # calls made by tau-bench's user simulator so no real API endpoint or
+            # credentials are needed.  user_base_url and judge_base_url are ignored.
+            import litellm as _litellm
+
+            _latency = mock_latency_s
+            _responses = [
+                "I need help with a recent order.",
+                "Can you look into this for me?",
+                "I'd like to return an item.",
+                "What is the status of my request?",
+                "That works for me, thank you.",
+            ]
+
+            class _Msg:
+                def __init__(self, content: str) -> None:
+                    self.content = content
+                    self.role = "assistant"
+
+                def model_dump(self) -> dict:
+                    return {"role": self.role, "content": self.content}
+
+            class _Choice:
+                def __init__(self, content: str) -> None:
+                    self.message = _Msg(content)
+
+            class _Resp:
+                def __init__(self, content: str) -> None:
+                    self.choices = [_Choice(content)]
+                    self._hidden_params = {"response_cost": 0.0}
+
+            def _mock_completion(*args: Any, **kwargs: Any) -> "_Resp":
+                time.sleep(_latency)
+                return _Resp(random.choice(_responses))
+
+            _litellm.completion = _mock_completion  # type: ignore[method-assign]
+        else:
+            # Configure LiteLLM (used by tau-bench's user simulator) once at startup.
+            if user_base_url:
+                os.environ["OPENAI_BASE_URL"] = user_base_url
+            os.environ["OPENAI_API_KEY"] = user_api_key
 
     def _make_env(self, task_index: int) -> tuple:
         """Create and reset a tau-bench Env for a specific task index.
@@ -139,14 +192,22 @@ class TauBenchWorker:
 
         # tau_bench expects provider and model separately; split the LiteLLM
         # "provider/model" format used in the config (e.g. "openai/gpt-4o-mini").
-        user_model = self._user_model
+        user_model = self._user_model or "mock"
         user_provider = None
         if "/" in user_model:
             user_provider, user_model = user_model.split("/", 1)
 
+        # tau-bench does not know about the "mock" strategy; translate it to "llm"
+        # so it instantiates an LLMUserSimulationEnv whose litellm.completion calls
+        # are intercepted by the mock installed in __init__.
+        tau_user_strategy = "llm" if self._mock_mode else self._user_strategy
+        # llm strategy requires a provider; default to "openai" in mock mode.
+        if self._mock_mode:
+            user_provider = user_provider or "openai"
+
         env = get_env(
             env_name=self._env_name,
-            user_strategy=self._user_strategy,
+            user_strategy=tau_user_strategy,
             user_model=user_model,
             task_split=self._task_split,
             user_provider=user_provider,
@@ -196,6 +257,10 @@ class TauBenchWorker:
         Returns a float in [0, 1].  Returns 0.0 on any error so that a judge
         misconfiguration degrades gracefully rather than crashing training.
         """
+        if self._mock_mode:
+            time.sleep(self._mock_latency_s)
+            return random.random()
+
         import litellm
 
         convo_text = "\n".join(
@@ -420,6 +485,7 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
                 judge_model=cfg.get("judge_model"),
                 judge_base_url=cfg.get("judge_base_url"),
                 judge_api_key=cfg.get("judge_api_key", "dummy"),
+                mock_latency_s=cfg.get("mock_latency_s", 0.0),
             )
             for _ in range(self._num_workers)
         ]

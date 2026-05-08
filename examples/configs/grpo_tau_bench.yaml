@@ -16,10 +16,10 @@
 defaults: "grpo_math_1B_megatron.yaml"
 
 grpo:
-  num_prompts_per_step: 32
+  num_prompts_per_step: 16
   num_generations_per_prompt: 8
-  # tau-bench episodes can be up to ~30 tool calls; set headroom above max_steps.
-  max_rollout_turns: 35
+  # tau-bench episodes can be up to ~50 tool calls; set headroom above max_steps.
+  max_rollout_turns: 56
   max_num_steps: 10000
   max_num_epochs: 1
 
@@ -30,9 +30,10 @@ checkpointing:
 
 policy:
   model_name: "Qwen/Qwen2.5-7B-Instruct"
-  max_total_sequence_length: 4096
+  max_total_sequence_length: 8192
   train_micro_batch_size: 1
   logprob_batch_size: 1
+  train_global_batch_size: 128
 
   megatron_cfg:
     enabled: true
@@ -78,29 +79,29 @@ env:
     num_workers: 2
     env_name: "retail"       # "retail" or "airline"
     task_split: "train"
-    user_strategy: "llm"
+    user_strategy: "mock"
     # User simulator model: any OpenAI-compatible endpoint.
-    # A small, fast model is sufficient since the user just follows the task script.
-    user_model: "openai/meta/llama-3.1-8b-instruct"
-    user_base_url: "https://integrate.api.nvidia.com/v1"
-    user_api_key: ${oc.env:NVIDIA_API_KEY}
-    max_steps: 30
+    user_model: null # unused when user_strategy="mock". Required if user_strategy="llm"
+    user_base_url: null # unused when user_strategy="mock". Required if user_strategy="llm"
+    user_api_key: null # unused when user_strategy="mock"
+    max_steps: 50
     # LLM-as-judge: scores policy compliance and communication quality.
     # Set judge_model to null to disable and use pure tau-bench rewards.
-    judge_model: "openai/meta/llama-3.1-8b-instruct"
-    judge_base_url: "https://integrate.api.nvidia.com/v1"
-    judge_api_key: ${oc.env:NVIDIA_API_KEY}
+    judge_model: "mock"
+    judge_base_url: null # unused when judge_model="mock"
+    judge_api_key: null # unused when judge_model="mock"
     judge_weight: 0.3   # 70% task-completion + 30% judge score
+    mock_latency_s: 0.5 # how much time to wait before returning mock user/judge generations
 
 logger:
   log_dir: "logs"
-  wandb_enabled: false
+  wandb_enabled: true #false
   tensorboard_enabled: false
   mlflow_enabled: false
   swanlab_enabled: false
   monitor_gpus: true
   wandb:
-    project: "grpo-dev"
+    project: "ashors-grpo-dev"
     name: "grpo-tau-bench"
   swanlab:
     project: "grpo-dev"
