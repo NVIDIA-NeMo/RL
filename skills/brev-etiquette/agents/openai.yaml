@@ -1,0 +1,4 @@
+interface:
+  display_name: "Brev Etiquette"
+  short_description: "Operate cleanly on Brev instances with limited workspace disk."
+  default_prompt: "Use this skill to keep experiment artifacts, caches, and generated assets on /ephemeral while preserving the repo workspace."
