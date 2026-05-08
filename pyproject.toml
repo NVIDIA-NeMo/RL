@@ -337,20 +337,6 @@ conflicts = [
   ],
 ]
 
-
-# Augment build dependencies for packages that need torch at build time
-[tool.uv.extra-build-dependencies]
-flash-attn = [{ requirement = "torch", match-runtime = true }]
-# Git-sourced packages CAN use match-runtime = true if we provide dependency-metadata
-deep_ep = [{ requirement = "torch", match-runtime = true }]
-deep_gemm = [{ requirement = "torch", match-runtime = true }]
-transformer-engine = [{ requirement = "torch", match-runtime = true }]
-transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
-mamba-ssm = [{ requirement = "torch", match-runtime = true }]
-causal-conv1d = [{ requirement = "torch", match-runtime = true }]
-nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
-sglang-kernel = [{ requirement = "torch", match-runtime = true }]
-
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
