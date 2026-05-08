@@ -286,7 +286,7 @@ class TauBenchWorker:
             content = resp.choices[0].message.content
             return float(json.loads(content).get("score", 0.0))
         except Exception as e:
-            print(f"[TauBench] judge call failed: {e}", flush=True)
+            print(f"[TauBench] judge call failed: {e}")
             return 0.0
 
     def execute(
@@ -337,7 +337,6 @@ class TauBenchWorker:
                 # discarded here; the agent will generate its real first response
                 # on the next turn after seeing the customer's actual message.
                 initial_obs = env_state.pop("initial_obs")
-                print(f"[TauBench] episode={episode_id[:8]} task={task_index} PRE-STEP: customer: {initial_obs[:120]}", flush=True)
                 observations.append({"role": "user", "content": initial_obs})
                 terminateds.append(False)
                 rewards.append(0.0)
@@ -351,7 +350,6 @@ class TauBenchWorker:
                 continue
 
             action = self._parse_action(agent_text)
-            print(f"[TauBench] episode={episode_id[:8]} task={task_index} step={step_count+1} action={action.name}", flush=True)
             # Snapshot before step(): when done=True, step() calls calculate_reward()
             # internally which replays gold actions via self.step(), appending them to
             # tau_env.actions and corrupting any snapshot taken afterwards.
@@ -391,31 +389,6 @@ class TauBenchWorker:
                     reward = (1.0 - judge_weight) * tau_reward + judge_weight * judge_score
                 else:
                     reward = tau_reward
-
-                # --- debug: print completed episode ---
-                tasks = getattr(tau_env, "tasks", [])
-                task_instruction = tasks[tau_env.task_index].instruction if tasks else ""
-                user_sim = getattr(tau_env, "user", None)
-                user_msgs = getattr(user_sim, "messages", []) if user_sim else []
-                print("\n" + "=" * 70, flush=True)
-                print(f"[TauBench] episode_id={episode_id}  task_index={task_index}  steps={step_count}", flush=True)
-                print(f"  tau_reward={tau_reward:.3f}  judge_score={judge_score}  blended={reward:.3f}", flush=True)
-                print(f"  task: {task_instruction[:200]}", flush=True)
-                print("-" * 70, flush=True)
-                print("  CONVERSATION:", flush=True)
-                for i, m in enumerate(user_msgs):
-                    if m.get("role") == "system":
-                        continue
-                    # user sim's role="user" = agent text; role="assistant" = customer
-                    display_role = "AGENT" if m.get("role") == "user" else "CUSTOMER"
-                    content = (m.get("content") or "")
-                    print(f"  [{i}] {display_role}: {content[:300]}{'...' if len(content) > 300 else ''}", flush=True)
-                print("-" * 70, flush=True)
-                print("  AGENT ACTIONS (tool calls):", flush=True)
-                for i, act in enumerate(actions_snapshot):
-                    print(f"  [{i}] {act.name}: {str(act.kwargs)[:300]}", flush=True)
-                print("=" * 70 + "\n", flush=True)
-                # --- end debug ---
 
                 del self._active_envs[episode_id]
 
