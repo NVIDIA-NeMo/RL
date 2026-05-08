@@ -34,4 +34,4 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
   checkpointing.checkpoint_dir=${RESULT_DIR}/checkpoints \
   logger.wandb_enabled=True \
   logger.wandb.project=nemo-rl-prime-verifiers \
-  logger.wandb.name=nanov3-grpo-${DATASET_NAME}-${NUM_NODES}n-${RUN_TAG}
+  logger.wandb.name=nanov3-grpo-${DATASET_NAME}-${NUM_NODES}n-max_input_seq_length_null_${RUN_TAG}

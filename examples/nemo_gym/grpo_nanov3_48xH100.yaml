@@ -5,7 +5,7 @@ grpo:
   num_val_generations_per_prompt: 4
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
   max_num_epochs: 1
-  max_num_steps: 10
+  max_num_steps: 3
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10000
