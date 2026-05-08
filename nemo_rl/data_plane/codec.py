@@ -27,19 +27,36 @@
   * Worker write-backs that produce ``response``-shaped outputs use
     :func:`response_from_nested` to extract the response slice from a
     (prompt+response) nested tensor.
+
+  * Non-tensor object fields (verl-style ``np.ndarray(dtype=object)``)
+    ride the same wire as variable-length tensors: each row is pickled
+    to ``bytes`` and packed into a jagged uint8 nested tensor via
+    :func:`pack_object_array`. Reader unpacks via
+    :func:`unpack_object_array` and emits the field as an object array
+    in the materialized BatchedDataDict. Backends see only tensors —
+    no per-backend non-tensor support required.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal
+import pickle
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Sequence
 
+import numpy as np
 import torch
 from tensordict import TensorDict
 
 if TYPE_CHECKING:
     # Type-only import. At runtime, BatchedDataDict is loaded lazily
     # inside materialize() — see comment there for rationale.
+    from nemo_rl.data_plane.interfaces import KVBatchMeta
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+# Stringly-typed extra_info key for the object-encoded field set;
+# referenced by the writer (kv_first_write), driver-side reader
+# (driver_io.read_columns) and worker-side reader (worker_mixin._fetch).
+META_OBJECT_FIELDS = "object_fields"
 
 
 # ── Padded ↔ nested helpers ───────────────────────────────────────────
@@ -118,6 +135,86 @@ def maybe_pack_jagged(
     return to_nested_by_length(val.detach(), lengths)
 
 
+# ── Object-array codec (verl-style non-tensor passthrough) ────────────
+
+
+def pack_object_array(arr: "np.ndarray | list[Any]") -> torch.Tensor:
+    """Pickle each element and pack into a jagged uint8 nested tensor.
+
+    Mirrors verl's ``non_tensor_batch: dict[str, np.ndarray(dtype=object)]``
+    on a tensor-only wire: each row's pickled bytes ride a ``torch.jagged``
+    nested tensor of dtype ``uint8``. Backends that already handle nested
+    tensors (simple, mooncake_cpu) carry object payloads transparently;
+    no per-backend non-tensor codepath is required.
+
+    ``arr`` may be a Python list or a numpy object array; the result is
+    a 2D jagged ``(N, *)`` uint8 tensor. Recover via
+    :func:`unpack_object_array`.
+
+    Pickle is used unconditionally — the wire stays inside one Ray cluster
+    where producer / consumer share the venv, so format compatibility is
+    implicit.
+    """
+    if isinstance(arr, np.ndarray):
+        if arr.dtype != object:
+            raise TypeError(
+                f"pack_object_array expects dtype=object; got {arr.dtype}"
+            )
+        items: list[Any] = list(arr)
+    elif isinstance(arr, list):
+        items = arr
+    else:
+        raise TypeError(
+            f"pack_object_array expects list or np.ndarray(object); got {type(arr)}"
+        )
+
+    rows: list[torch.Tensor] = []
+    for item in items:
+        b = pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL)
+        # np.frombuffer + .copy() avoids the "non-writable buffer" warning
+        # and severs the lifetime tie to the bytes object.
+        rows.append(
+            torch.from_numpy(np.frombuffer(b, dtype=np.uint8).copy())
+        )
+    return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+
+def unpack_object_array(t: torch.Tensor) -> "np.ndarray":
+    """Inverse of :func:`pack_object_array`.
+
+    Accepts a jagged uint8 nested tensor; returns
+    ``np.ndarray(dtype=object)``. Each row is unpickled in isolation.
+    """
+    if not t.is_nested:
+        raise ValueError(
+            "unpack_object_array expects a nested (jagged) tensor; "
+            "got rectangular — did the wire codec change?"
+        )
+    rows = t.unbind()
+    out = np.empty(len(rows), dtype=object)
+    for i, row in enumerate(rows):
+        out[i] = pickle.loads(row.numpy().tobytes())
+    return out
+
+
+def select_object_fields(
+    meta: "KVBatchMeta",
+    requested: Sequence[str] | None = None,
+) -> list[str]:
+    """Filter ``meta.extra_info[META_OBJECT_FIELDS]`` to a request set.
+
+    Single chokepoint for the read-side filter so :func:`materialize`
+    decodes the right keys regardless of caller (driver_io,
+    worker_mixin). ``requested=None`` returns the full registered set.
+    """
+    extras = meta.extra_info or {}
+    fields = extras.get(META_OBJECT_FIELDS, ())
+    if requested is None:
+        return list(fields)
+    req = set(requested)
+    return [k for k in fields if k in req]
+
+
 def pack_per_token_field(val: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     """Force-jaggedize a known per-token field, tolerating SP padding.
 
@@ -180,6 +277,7 @@ def materialize(
     layout: Literal["padded", "jagged"] = "padded",
     pad_value_dict: dict[str, int | float] | None = None,
     pad_to_multiple: int = 1,
+    object_fields: Iterable[str] | None = None,
 ) -> "BatchedDataDict[Any]":
     """Convert a wire TensorDict to a BatchedDataDict.
 
@@ -196,6 +294,13 @@ def materialize(
     ``layout='jagged'``: nested leaves pass through; rectangular leaves
     pass through. Use only when the caller knows how to consume nested.
 
+    ``object_fields``: names of fields written via
+    :func:`pack_object_array`. Each is decoded via
+    :func:`unpack_object_array` and emitted as ``np.ndarray(dtype=object)``
+    in the result; tensor padding/alignment do not apply. The set is
+    typically read from ``meta.extra_info["object_fields"]`` by the
+    driver / worker fetch helpers.
+
     The lazy ``BatchedDataDict`` import keeps ``import
     nemo_rl.data_plane`` cheap for unit tests that don't actually call
     this function (``BatchedDataDict`` transitively pulls multimodal
@@ -204,8 +309,17 @@ def materialize(
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
     pads = pad_value_dict or {}
-    out: dict[str, torch.Tensor] = {}
+    obj_set = set(object_fields or ())
+    out: dict[str, Any] = {}
     for key, val in td.items(include_nested=False):
+        if key in obj_set:
+            if not isinstance(val, torch.Tensor):
+                raise TypeError(
+                    f"materialize() object field {key!r} is not a tensor: "
+                    f"{type(val)}; wire encoding broken."
+                )
+            out[key] = unpack_object_array(val)
+            continue
         if not isinstance(val, torch.Tensor):
             raise TypeError(
                 f"materialize() received non-tensor leaf {key!r}: {type(val)}. "
@@ -230,6 +344,11 @@ def materialize(
         # trailing 1 back so consumers see the original (N,) shape.
         # Safe to apply unconditionally on the _KV_PROMOTE_1D path: none
         # of the bulk fields naturally carry shape[-1] == 1.
-        if _KV_PROMOTE_1D and out[key].dim() >= 2 and out[key].shape[-1] == 1:
+        if (
+            _KV_PROMOTE_1D
+            and isinstance(out[key], torch.Tensor)
+            and out[key].dim() >= 2
+            and out[key].shape[-1] == 1
+        ):
             out[key] = out[key].squeeze(-1)
     return BatchedDataDict(out)

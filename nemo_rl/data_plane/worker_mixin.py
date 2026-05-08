@@ -200,7 +200,10 @@ class TQWorkerMixin:
                 "replica group, but _get_replica_group() returned None."
             )
 
+        from nemo_rl.data_plane.codec import select_object_fields
+
         pad_to_multiple = int((meta.extra_info or {}).get("pad_to_multiple", 1))
+        obj_fields = select_object_fields(meta, meta.fields)
 
         if replica_group is not None:
             leader = torch.distributed.get_global_rank(replica_group, 0)
@@ -215,6 +218,7 @@ class TQWorkerMixin:
                     td, layout=layout,
                     pad_value_dict=pad_value_dict,
                     pad_to_multiple=pad_to_multiple,
+                    object_fields=obj_fields,
                 )
             else:
                 data = None
@@ -234,6 +238,7 @@ class TQWorkerMixin:
             td, layout=layout,
             pad_value_dict=pad_value_dict,
             pad_to_multiple=pad_to_multiple,
+            object_fields=obj_fields,
         )
         if preprocess is not None:
             data = preprocess(self, data)
