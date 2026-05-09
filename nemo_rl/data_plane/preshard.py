@@ -135,12 +135,14 @@ def shard_meta_for_dp(
         sharded, _ = skeleton.shard_by_batch_size(
             dp_world,
             batch_size=batch_size,
+            # pyrefly: ignore  # bad-argument-type
             dynamic_batching_args=dynamic_batching_args,
         )
     elif sequence_packing_args is not None:
         sharded, _ = skeleton.shard_by_batch_size(
             dp_world,
             batch_size=batch_size,
+            # pyrefly: ignore  # bad-argument-type
             sequence_packing_args=sequence_packing_args,
         )
     else:
@@ -150,6 +152,7 @@ def shard_meta_for_dp(
     out: list[KVBatchMeta] = []
     flat_idx: list[int] = []
     for shard in sharded:
+        # pyrefly: ignore  # no-matching-overload
         idx_list: list[int] = shard["_meta_idx"].tolist()
         flat_idx.extend(idx_list)
         rank_keys = [meta.keys[i] for i in idx_list]

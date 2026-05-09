@@ -18,7 +18,7 @@ side dispatches use the equivalents on ``AbstractPolicyWorker``
 (``self._fetch(meta)`` / ``self._write_back``).
 """
 
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 import numpy as np
 import torch
@@ -38,7 +38,7 @@ def read_columns(
     meta: KVBatchMeta,
     select_fields: Sequence[str],
     *,
-    layout: str = "padded",
+    layout: Literal["jagged", "padded"] = "padded",
     pad_value_dict: dict[str, Any] | None = None,
 ) -> BatchedDataDict[Any]:
     """``kv_batch_get(meta.keys, select_fields=...) → materialize``.

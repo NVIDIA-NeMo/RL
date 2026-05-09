@@ -257,9 +257,11 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
             "backend": {
                 "storage_backend": "MooncakeStore",
                 "MooncakeStore": {
+                    # pyrefly: ignore  # no-matching-overload
                     "global_segment_size": int(
                         cfg.get("global_segment_size", 512 * 1024**3)
                     ),
+                    # pyrefly: ignore  # no-matching-overload
                     "local_buffer_size": int(
                         cfg.get("local_buffer_size", 64 * 1024**3)
                     ),
@@ -282,6 +284,7 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
     # — see _patch_tq_actor_runtime_env() docstring for the why.
     _patch_tq_actor_runtime_env()
 
+    # pyrefly: ignore  # bad-argument-type
     tq.init(conf=conf)
 
 
@@ -304,6 +307,7 @@ def _to_wire(td: TensorDict) -> TensorDict:
             "Tensorize via codec helpers, use `tags=` for primitives, "
             "or use the Ray object store for arbitrary Python objects."
         )
+    # pyrefly: ignore  # missing-argument
     out = td.detach().contiguous()
     # KV-path round-trip preservation. TQ's extract_field_schema
     # silently unsqueezes 1D fields to (N, 1) when recording per-row
@@ -328,9 +332,11 @@ def _to_wire(td: TensorDict) -> TensorDict:
                 new_dict[str(k)] = v.unsqueeze(-1).contiguous()
                 changed = True
             else:
+                # pyrefly: ignore  # bad-argument-type
                 new_dict[str(k)] = v
         if changed:
             out = TensorDict(new_dict, batch_size=out.batch_size)
+    # pyrefly: ignore  # bad-return
     return out
 
 
