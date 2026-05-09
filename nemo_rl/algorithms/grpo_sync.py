@@ -57,6 +57,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    get_gdpo_reward_component_keys,
     log_generation_metrics_to_wandb,
     print_performance_metrics,
 )
@@ -81,7 +82,7 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 # on std != 0, accumulate survivors across iterations, slice on overflow.
 # Bulk in TQ untouched except for kv_clear of dropped/discarded uids.
 
-_DSlice = dict[str, torch.Tensor]
+_DSlice = BatchedDataDict[Any]
 
 
 def _apply_dynamic_sampling(
@@ -116,21 +117,14 @@ def _apply_dynamic_sampling(
     # Subset this iteration's survivors and merge into the running cache.
     if keep_idx:
         km = meta.subset(keep_idx)
-        ks: _DSlice = {
-            k: (v[keep_idx] if isinstance(v, torch.Tensor) else v)
-            for k, v in slice_data.items()
-        }
+        ks = slice_data.select_indices(keep_idx)
         ks["filtered_reward"] = ks["total_reward"]
         if pending_meta is None:
             pending_meta, pending_slice = km, ks
         else:
             assert pending_slice is not None
             pending_meta = pending_meta.concat(km)
-            pending_slice = {
-                k: (torch.cat([pending_slice[k], ks[k]])
-                    if isinstance(ks[k], torch.Tensor) else ks[k])
-                for k in ks
-            }
+            pending_slice = BatchedDataDict.from_batches([pending_slice, ks])
 
     n = len(pending_meta.keys) if pending_meta is not None else 0
     if n < train_prompts_size:
@@ -150,10 +144,7 @@ def _apply_dynamic_sampling(
             partition_id=pending_meta.partition_id,
         )
         pending_meta = pending_meta.slice(0, train_prompts_size)
-        pending_slice = {
-            k: (v[:train_prompts_size] if isinstance(v, torch.Tensor) else v)
-            for k, v in pending_slice.items()
-        }
+        pending_slice = pending_slice.slice(0, train_prompts_size)
         ds_metrics["dynamic_sampling_num_discarded_valid_samples"] = n - train_prompts_size
 
     unfiltered_for_log = torch.cat(pending_unfiltered_rewards)[:train_prompts_size]
@@ -255,6 +246,17 @@ def grpo_train_sync(
             "constructs it via the policy_factory when data_plane.enabled=True."
         )
 
+    # TQ-resident tensors live on CPU; baseline/std are computed on the
+    # slice without a CUDA hop. The flag is a no-op here — warn so users
+    # don't expect it to do anything.
+    if master_config["grpo"].get("calculate_advantages_on_gpu"):
+        warnings.warn(
+            "grpo.calculate_advantages_on_gpu has no effect when "
+            "data_plane.enabled=true; baseline/std are computed on CPU "
+            "because TQ-resident tensors are CPU-side.",
+            stacklevel=2,
+        )
+
     # ── Sync rollout actor (rollout 1-hop put) ──────────────────────
     # The actor owns the multi-turn rollout loop AND post-rollout
     # flatten / mask construction / prompt extraction / baseline-std /
@@ -312,7 +314,7 @@ def grpo_train_sync(
         # legacy ``metrics["reward"]`` semantics (cumulative unfiltered
         # total_reward across all contributing iterations).
         pending_meta = None
-        pending_slice: Optional[dict[str, torch.Tensor]] = None
+        pending_slice: Optional[_DSlice] = None
         pending_unfiltered_rewards: list[torch.Tensor] = []
         dynamic_sampling_num_gen_batches = 0
 
@@ -420,9 +422,14 @@ def grpo_train_sync(
                     # extraction + baseline/std + kv_batch_put + finish
                     # generation + logger metrics — all bundled into one
                     # round-trip.
+                    # ``first_iter`` is the actor's signal to call
+                    # ``policy_generation.snapshot_step_metrics()``.
+                    # ``dynamic_sampling_num_gen_batches`` is incremented
+                    # to 1 just above before this branch — keep these in
+                    # sync if either is renamed.
                     (
                         meta,
-                        slice_data,
+                        slice_extras,
                         rollout_metrics,
                         generation_logger_metrics,
                     ) = ray.get(
@@ -430,8 +437,11 @@ def grpo_train_sync(
                             repeated_batch,
                             uids=uids,
                             partition_id=policy._tq_partition_id,
+                            first_iter=(dynamic_sampling_num_gen_batches == 1),
                         )
                     )
+                    slice_data: _DSlice = BatchedDataDict[Any](slice_extras)
+                    del slice_extras
 
                     if not _should_log_nemo_gym_responses(master_config):
                         for key in list(rollout_metrics):
@@ -450,27 +460,28 @@ def grpo_train_sync(
                 # used to be on the driver, were briefly on the actor,
                 # now back on the driver where they belong (no bulk
                 # touched by any of these ops).
-                slice_data = scale_rewards(
-                    slice_data, master_config["grpo"]["reward_scaling"],
-                )
-                if master_config["grpo"]["reward_shaping"]["enabled"]:
-                    slice_data = apply_reward_shaping(
-                        slice_data, master_config["grpo"]["reward_shaping"],
+                with timer.time("reward_calculation"):
+                    slice_data = scale_rewards(
+                        slice_data, master_config["grpo"]["reward_scaling"],
                     )
-                if master_config["grpo"]["overlong_filtering"]:
-                    lm = slice_data["loss_multiplier"].clone()
-                    lm[slice_data["truncated"]] = 0
-                    slice_data["loss_multiplier"] = lm
-                slice_data["baseline"], slice_data["std"] = (
-                    calculate_baseline_and_std_per_prompt(
-                        slice_data["prompt_ids_for_adv"],
-                        slice_data["total_reward"],
-                        torch.ones_like(slice_data["total_reward"]),
-                        leave_one_out_baseline=master_config["grpo"][
-                            "use_leave_one_out_baseline"
-                        ],
+                    if master_config["grpo"]["reward_shaping"]["enabled"]:
+                        slice_data = apply_reward_shaping(
+                            slice_data, master_config["grpo"]["reward_shaping"],
+                        )
+                    if master_config["grpo"]["overlong_filtering"]:
+                        lm = slice_data["loss_multiplier"].clone()
+                        lm[slice_data["truncated"]] = 0
+                        slice_data["loss_multiplier"] = lm
+                    slice_data["baseline"], slice_data["std"] = (
+                        calculate_baseline_and_std_per_prompt(
+                            slice_data["prompt_ids_for_adv"],
+                            slice_data["total_reward"],
+                            torch.ones_like(slice_data["total_reward"]),
+                            leave_one_out_baseline=master_config["grpo"][
+                                "use_leave_one_out_baseline"
+                            ],
+                        )
                     )
-                )
 
                 # ── Dynamic sampling (DAPO non-zero-std filter) ────────
                 # Slice-only; bulk in TQ untouched except for kv_clear
@@ -609,11 +620,12 @@ def grpo_train_sync(
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
                     # Thin slice-shaped repeated_batch for compute_advantage.
-                    # The estimator only reads scalar/per-sample fields
-                    # (total_reward, baseline, std) plus the optional
-                    # filtered_reward when dynamic_sampling is engaged
-                    # (rejected at the actor for now — see
-                    # SyncRolloutActor.rollout_to_tq).
+                    # GRPO and Reinforce++ estimators ignore repeated_batch
+                    # (swallowed via **kwargs); GDPO reads the per-component
+                    # reward keys discovered by get_gdpo_reward_component_keys.
+                    # The actor plumbs those keys into ``slice_data`` so the
+                    # thin BDD here is byte-equivalent to legacy passing the
+                    # full repeated_batch.
                     rb_for_adv = BatchedDataDict[Any](
                         {
                             "total_reward": rewards,
@@ -621,6 +633,8 @@ def grpo_train_sync(
                             "std": std,
                         }
                     )
+                    for k in get_gdpo_reward_component_keys(slice_data):
+                        rb_for_adv[k] = slice_data[k]
                     advantages = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
@@ -699,16 +713,24 @@ def grpo_train_sync(
                         )["layers"]
                         POLICY_GENERATION_STALE = True
 
-                # Stash input_ids before kv_clear so the late log_data
-                # jsonl block (which logs token_ids) can use it. The clear
-                # below removes meta.keys from TQ, so any post-clear
-                # read_columns on this meta would fail.
+                # Stash input_ids and content before kv_clear so the
+                # late log_data jsonl block can use them. The clear below
+                # removes meta.keys from TQ, so any post-clear
+                # read_columns on this meta would fail. ``content`` is a
+                # decoded object array (list[str]); read_columns handles
+                # decoding via meta.extra_info[META_OBJECT_FIELDS].
                 _log_input_ids: Optional[torch.Tensor] = None
+                _log_content: Optional[np.ndarray] = None
                 if not _should_log_nemo_gym_responses(master_config):
-                    _log_input_ids = read_columns(
-                        policy._dp_client, meta, select_fields=["input_ids"],
+                    _log_select = ["input_ids"]
+                    if "content" in (meta.fields or []):
+                        _log_select.append("content")
+                    _log_extras = read_columns(
+                        policy._dp_client, meta, select_fields=_log_select,
                         pad_value_dict=_pad_dict,
-                    )["input_ids"]
+                    )
+                    _log_input_ids = _log_extras["input_ids"]
+                    _log_content = _log_extras.get("content")
 
                 # ── Step-end TQ cleanup ────────────────────────────────
                 policy._dp_client.kv_clear(
@@ -784,19 +806,19 @@ def grpo_train_sync(
                     metrics.update(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
                     )
+                # Cumulative unfiltered total_reward across all DS iterations
+                # (sliced to train_prompts_size). Falls back to filtered
+                # rewards if apply_dynamic_sampling didn't provide it
+                # (mid-step path). Hoisted once for reuse in metrics, jsonl,
+                # and the per-step print below.
+                unfiltered_rewards = (
+                    unfiltered_rewards_for_logging
+                    if unfiltered_rewards_for_logging is not None
+                    else rewards
+                )
                 if master_config["grpo"]["use_dynamic_sampling"]:
                     metrics["filtered_reward"] = rewards.numpy()
-                    # Cumulative unfiltered total_reward across all
-                    # contributing iterations — matches legacy
-                    # ``metrics["reward"]`` semantics (sliced to
-                    # train_prompts_size). Falls back to filtered if
-                    # apply_dynamic_sampling didn't provide it (e.g.
-                    # mid-step path).
-                    metrics["reward"] = (
-                        unfiltered_rewards_for_logging.numpy()
-                        if unfiltered_rewards_for_logging is not None
-                        else rewards.numpy()
-                    )
+                    metrics["reward"] = unfiltered_rewards.numpy()
 
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(gen_step_metrics)
@@ -937,7 +959,13 @@ def grpo_train_sync(
                 log_data: dict = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
-                log_data["rewards"] = rewards.tolist()
+                if master_config["grpo"]["use_dynamic_sampling"]:
+                    # Legacy semantics: ``rewards`` is unfiltered total_reward,
+                    # ``filtered_rewards`` is the kept slice that's trained on.
+                    log_data["rewards"] = unfiltered_rewards.tolist()
+                    log_data["filtered_rewards"] = rewards.tolist()
+                else:
+                    log_data["rewards"] = rewards.tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
                 log_data["token_loss_mask"] = token_mask.tolist()
                 log_data["sample_loss_mask"] = sample_mask.tolist()
@@ -950,10 +978,10 @@ def grpo_train_sync(
                 # outer ``if not _should_log_nemo_gym_responses`` branch.
                 if _log_input_ids is not None:
                     log_data["token_ids"] = _log_input_ids.tolist()
-                # NOTE: ``content`` (raw assistant text) is not stored in
-                # TQ — the codec is tensor-only. When non-tensor logging
-                # matters, plumb it through Ray return on rollout_to_tq's
-                # slice.
+                # ``content`` (raw assistant text) is fetched from TQ as
+                # an object-array column above (stashed before kv_clear).
+                if _log_content is not None:
+                    log_data["content"] = _log_content.tolist()
                 logger.log_batched_dict_as_jsonl(
                     log_data, f"train_data_step{total_steps + 1}.jsonl"
                 )
@@ -1005,9 +1033,7 @@ def grpo_train_sync(
             print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
             if master_config["grpo"]["use_dynamic_sampling"]:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
-                print(
-                    f"  • Avg Total Reward: {np.mean(repeated_batch['total_reward'].numpy()):.4f}"
-                )
+                print(f"  • Avg Total Reward: {np.mean(unfiltered_rewards.numpy()):.4f}")
             else:
                 print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(

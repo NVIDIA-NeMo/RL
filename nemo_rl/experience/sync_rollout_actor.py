@@ -176,6 +176,7 @@ class SyncRolloutActor:
         *,
         uids: list[str],
         partition_id: str,
+        first_iter: bool = True,
     ) -> tuple[
         KVBatchMeta,
         dict[str, Any],
@@ -192,6 +193,16 @@ class SyncRolloutActor:
         bulk-touching ops — flatten / mask / prompt extraction — that
         require ``message_log`` and would otherwise force bulk onto the
         driver.
+
+        Args:
+            input_batch: Per-step prompt batch (already repeat-interleaved).
+            uids: One uid per prompt; bulk keys are ``f"{uid}_g{i}"``.
+            partition_id: TQ partition target.
+            first_iter: True on the first DS iteration of a step. Drives
+                ``policy_generation.snapshot_step_metrics()`` so per-step
+                generation metrics align with the legacy
+                ``grpo.grpo_train`` path. Driver passes
+                ``dynamic_sampling_num_gen_batches == 1``.
         """
         # Lazy imports — avoid pulling grpo into this module at load.
         from nemo_rl.algorithms.grpo import (
@@ -199,10 +210,22 @@ class SyncRolloutActor:
             _should_use_async_rollouts,
             _should_use_nemo_gym,
         )
+        from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import (
             add_loss_mask_to_message_log,
             batched_message_log_to_flat_message,
         )
+
+        # Per-step generation-side metric hooks: snapshot once on the
+        # first DS iter so backends with per-step deltas have a stable
+        # anchor; clear accumulators before every rollout. Mirrors
+        # legacy ``grpo_train``.
+        if self.policy_generation is not None:
+            if first_iter and hasattr(
+                self.policy_generation, "snapshot_step_metrics"
+            ):
+                self.policy_generation.snapshot_step_metrics()
+            self.policy_generation.clear_logger_metrics()
 
         cfg = self.master_config
         common = dict(
@@ -268,6 +291,11 @@ class SyncRolloutActor:
         for k, v in flat.get_multimodal_dict(as_tensors=False).items():
             if isinstance(v, torch.Tensor):
                 bulk_batch[k] = v
+        # ``content`` (raw assistant text per sample) — rides TQ as an
+        # object array so the driver can fetch it back at jsonl time
+        # (kv_first_write packs it via pack_object_array).
+        if "content" in flat:
+            bulk_batch["content"] = np.asarray(flat["content"], dtype=object)
 
         # Type-driven dispatch (verl pattern): producer-emitted type IS
         # the schema. torch.Tensor and np.ndarray(object) pass through;
@@ -302,6 +330,12 @@ class SyncRolloutActor:
             "input_lengths": input_lengths,
             "prompt_ids_for_adv": prompt_flat["token_ids"],
         }
+        # GDPO multi-reward components: scale_rewards iterates these
+        # keys driver-side and the GDPO advantage estimator reads them
+        # from rb_for_adv. Plumb them through the slice rather than
+        # forcing a separate TQ fetch.
+        for k in get_gdpo_reward_component_keys(fb):
+            slice_extras[k] = fb[k]
 
         meta = kv_first_write(
             bulk_batch, uids=uids,

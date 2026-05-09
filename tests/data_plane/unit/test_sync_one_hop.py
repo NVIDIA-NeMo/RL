@@ -176,9 +176,9 @@ def test_kv_clear_uses_meta_keys_minted_at_rollout():
 # grpo_sync.py without requiring a full trainer to spin up.
 
 
-def _slice_data(rewards: list[float], stds: list[float]) -> dict:
+def _slice_data(rewards: list[float], stds: list[float]) -> BatchedDataDict:
     n = len(rewards)
-    return {
+    return BatchedDataDict({
         "total_reward": torch.tensor(rewards, dtype=torch.float32),
         "std": torch.tensor(stds, dtype=torch.float32),
         "baseline": torch.zeros(n),
@@ -187,7 +187,7 @@ def _slice_data(rewards: list[float], stds: list[float]) -> dict:
         "truncated": torch.zeros(n, dtype=torch.bool),
         "length": torch.tensor([8] * n, dtype=torch.long),
         "prompt_ids_for_adv": torch.zeros(n, 4, dtype=torch.long),
-    }
+    })
 
 
 def _seed_meta(client: NoOpDataPlaneClient, prefix: str, n: int) -> KVBatchMeta:

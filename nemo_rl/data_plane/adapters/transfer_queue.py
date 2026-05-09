@@ -243,16 +243,25 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
         # including this driver). _init_tq only needs local_ip below
         # for the metadata/master server URLs (driver-bound).
         local_ip = _get_local_node_ip()
+        # Mooncake virtual segment / local buffer sizing. Defaults sized
+        # for production-scale rollouts (multi-iter DAPO, large
+        # message_log object payloads); under-sized values cause
+        # ``batch_get_tensor returned None`` once mooncake exhausts its
+        # internal allocator headroom. Lazy-mmap'd, so RSS is bounded
+        # by actual traffic. Override per-recipe via
+        # ``data_plane.global_segment_size`` /
+        # ``data_plane.local_buffer_size`` (bytes).
         overlay = {
             **controller_overlay,
             "backend": {
                 "storage_backend": "MooncakeStore",
                 "MooncakeStore": {
-                    # Sized to match data-plane-bench's proven config
-                    # (32-node / 48-node tests). 4 GiB / 1 GiB defaults
-                    # are too small for production-scale rollouts.
-                    "global_segment_size": 128 * 1024**3,
-                    "local_buffer_size": 16 * 1024**3,
+                    "global_segment_size": int(
+                        cfg.get("global_segment_size", 512 * 1024**3)
+                    ),
+                    "local_buffer_size": int(
+                        cfg.get("local_buffer_size", 64 * 1024**3)
+                    ),
                     # _init_tq runs on the driver only — driver IS the
                     # head, so local_ip here is also the head's IP that
                     # mooncake_master + the metadata server bind to.
