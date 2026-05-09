@@ -64,7 +64,7 @@ policy:
   generation:
     max_new_tokens: 8192
     vllm_cfg:
-      tensor_parallel_size: 4
+      tensor_parallel_size: 8
       gpu_memory_utilization: 0.5
 data:
   max_input_seq_length: 2048
