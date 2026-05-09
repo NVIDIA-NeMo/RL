@@ -24,7 +24,6 @@ Skipped automatically when:
 
 from __future__ import annotations
 
-
 import pytest
 import torch
 from tensordict import TensorDict

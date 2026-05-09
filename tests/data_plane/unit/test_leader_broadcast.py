@@ -25,8 +25,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.data_plane.worker_mixin import _broadcast_batched_data_dict
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 def _worker(rank: int, world_size: int, tmp_init_file: str, q):

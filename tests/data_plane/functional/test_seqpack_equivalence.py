@@ -48,7 +48,6 @@ transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 from nemo_rl.data_plane import build_data_plane_client, materialize
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-
 # Mirror of the seed-field set in nemo_rl/algorithms/grpo_sync.py.
 _DP_SEED_FIELDS = (
     "input_ids",

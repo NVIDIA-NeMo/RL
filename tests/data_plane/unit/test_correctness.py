@@ -25,13 +25,12 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from nemo_rl.experience.sync_rollout_actor import kv_first_write
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.driver_io import read_columns, write_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.preshard import DP_SEED_FIELDS, shard_meta_for_dp
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-
+from nemo_rl.experience.sync_rollout_actor import kv_first_write
 
 # ── helpers ────────────────────────────────────────────────────────────
 
