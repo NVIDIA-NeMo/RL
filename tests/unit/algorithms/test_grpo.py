@@ -995,6 +995,7 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
         "loss_fn": {
             "force_on_policy_ratio": False,
             "use_importance_sampling_correction": False,
+            "reference_policy_kl_penalty": 0.0,
         },
         "env": {},
         "grpo": {
