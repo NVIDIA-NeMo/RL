@@ -52,7 +52,6 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
     target_packed_tensor_size = get_target_packed_tensor_size()
 
     num_buffers = get_num_buffers()
-    streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
 
     packing_tensor_list = [[] for _ in range(num_buffers)]
@@ -64,35 +63,31 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
     while True:
         # Move to the next buffer
         buffer_idx = (buffer_idx + 1) % num_buffers
-        # Synchronize the current stream
-        streams[buffer_idx].synchronize()
-        # Start tasks for the new buffer in a new stream
-        with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
-            try:
-                # Initialize the packing tensor list and sizes
-                packing_tensor_list[buffer_idx] = []
-                packing_tensor_sizes[buffer_idx] = 0
-                # Pack the tensors
-                while True:
-                    # Apply backend specific post processing and then convert to linearized uint8 tensor
-                    tensor = post_iter_func(next(iterator)).view(torch.uint8).view(-1)
-                    packing_tensor_list[buffer_idx].append(tensor)
-                    packing_tensor_sizes[buffer_idx] += tensor.view(torch.uint8).numel()
-                    if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
-                        break
-                # Pack the tensors and call broadcast collective
+        try:
+            # Initialize the packing tensor list and sizes
+            packing_tensor_list[buffer_idx] = []
+            packing_tensor_sizes[buffer_idx] = 0
+            # Pack the tensors
+            while True:
+                # Apply backend specific post processing and then convert to linearized uint8 tensor
+                tensor = post_iter_func(next(iterator)).view(torch.uint8).view(-1)
+                packing_tensor_list[buffer_idx].append(tensor)
+                packing_tensor_sizes[buffer_idx] += tensor.view(torch.uint8).numel()
+                if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
+                    break
+            # Pack the tensors and call broadcast collective
+            packed_tensors[buffer_idx] = torch.cat(
+                packing_tensor_list[buffer_idx], dim=0
+            )
+            group.broadcast(packed_tensors[buffer_idx], src=src)
+        except StopIteration:
+            # do the last broadcast if there are remaining tensors
+            if len(packing_tensor_list[buffer_idx]) > 0:
                 packed_tensors[buffer_idx] = torch.cat(
                     packing_tensor_list[buffer_idx], dim=0
                 )
                 group.broadcast(packed_tensors[buffer_idx], src=src)
-            except StopIteration:
-                # do the last broadcast if there are remaining tensors
-                if len(packing_tensor_list[buffer_idx]) > 0:
-                    packed_tensors[buffer_idx] = torch.cat(
-                        packing_tensor_list[buffer_idx], dim=0
-                    )
-                    group.broadcast(packed_tensors[buffer_idx], src=src)
-                break
+            break
 
 
 def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
@@ -201,3 +196,6 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
                         )
                     )
                 break
+
+    for s in streams:
+        s.synchronize()

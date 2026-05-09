@@ -1,0 +1,123 @@
+# Standalone generation server config for the RL-412 fault-tolerant
+# Megatron-backend demo (Qwen3-30B-A3B). Self-contained (no `defaults:`
+# inheritance) so it can be loaded directly by
+# examples/run_standalone_generation_server.py from the daemon's working_dir.
+
+policy:
+  model_name: Qwen/Qwen3-30B-A3B
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  precision: bfloat16
+  max_total_sequence_length: 4096
+  generation:
+    backend: vllm
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    stop_token_ids: null
+    stop_strings: null
+    # 8 DP shards × TP=1 = 8 GPUs total. Matches the canonical disagg+async
+    # recipe (grpo-qwen3-30ba3b-4n4g-async-1off.yaml) which the wandb run
+    # nvidia/nemorl-single-k8s/8b17617t uses end-to-end. TP=2/PP=2 doesn't
+    # work here — the disagg+async path is only validated at TP=1.
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        # SHRUNK from 8 → 2 to match infra YAML's gpu-shard replicas: 2
+        num_nodes: 2
+    vllm_cfg:
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: auto
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+    vllm_kwargs: {}
+    # GenerationRouter health-poll + cordon thresholds. These propagate to
+    # GenerationRouter.__init__ in run_standalone_generation_server.py;
+    # omit any field to take the in-code default.
+    #
+    # Defaults below are tuned for 30B-class shards under heavy gen burst
+    # load (FastAPI event-loop jitter when vLLM is batching hundreds of
+    # in-flight `/v1/completions`). For lighter workloads (smaller models,
+    # lower concurrency) the in-code defaults are fine.
+    router:
+      # Probe `/openapi.json` every N seconds.
+      health_poll_interval_s: 2.0
+      # Per-probe timeout. vLLM's FastAPI loop can stall 2-3s under
+      # heavy inflight load; 5s gives enough headroom that load jitter
+      # isn't classified as failure.
+      health_timeout_s: 5.0
+      # Consecutive failed probes before cordon. With the values above,
+      # cordon now requires ~50s of sustained unresponsiveness — genuine
+      # failures (pod death, OOM, NCCL hang) still trip cordon within a
+      # bounded window; transient probe lag during burst load doesn't.
+      failure_threshold: 10
+      # Consecutive successful probes before joining/recovered shards
+      # transition to ready.
+      join_success_threshold: 2
+      # Per-request proxy timeout for /v1/{completions,chat/completions}.
+      # Matches the in-code default.
+      proxy_timeout_s: 600.0
+      # Consecutive /v1 proxy errors (5xx or transport) before the shard
+      # is cordoned. Replaces the prior single-shot cordon-on-first-5xx
+      # behavior that turned a transient burst into a permanent eviction.
+      # Distinct from `failure_threshold` (which counts /openapi.json
+      # health-probe failures).
+      proxy_failure_threshold: 5
+      # Downstream connection pool sizing. aiohttp's default is limit=100
+      # which becomes the router's bottleneck under 30B-class burst (2048
+      # concurrent /v1/completions). Sized so 8 shards × 256 in-flight
+      # fits with headroom; bump if num_prompts × num_generations grows.
+      proxy_pool_limit_total: 4096
+      proxy_pool_limit_per_host: 1024
+      # uvicorn TCP listen backlog. Kernel drops SYNs above backlog,
+      # which surfaces as ServerDisconnectedError on the client. 4096
+      # comfortably absorbs an RL burst.
+      uvicorn_backlog: 4096
+      uvicorn_keep_alive_s: 120
+
+# RL-412 fault injection — picked up by maybe_launch_fault_injector after the
+# router boots. Two staggered faults so we can see step changes in throughput
+# at 8 → 7 → 6 gen shards (each kill = 12.5% drop).
+#
+# Re-enabled: round-7 confirmed canonical-parity reward (step-1 = 0.5757 vs
+# canonical 0.5659) on the disagg+async+router path with TP=1/PP=1/EP=8. The
+# FT machinery (router pool sizing, NCCL gate, threshold-based cordon, auto-
+# recovery, broadcast retry) is the only remaining variable to validate.
+fault_inject:
+  enabled: true
+  mode: pod-kill                # http-error | actor-kill | pod-kill
+  # Continuous stress test on Megatron+vLLM-async path: cycle
+  # kill+recover indefinitely. Cycle period for 30B = trigger_after_s
+  # (first only) + recover_after_s + repeat_every_s = 1200+900+300 ≈
+  # 40min for cycle 1, then 900+300 = 20min/cycle thereafter. Slower
+  # cadence than 4B because vLLM-30B init takes ~7min on a fresh pod
+  # and the cross-cluster broadcast handles 30B weights. The schedule
+  # below only fires ONE injector (single FaultInjector with
+  # repeat_every_s set), not the legacy 2-entry schedule — rotation
+  # picks the next dp-N each cycle, so we don't need pre-set targets.
+  recover: true
+  # SHRUNK schedule for capacity-constrained 30B FT test: faster cycles
+  # to fit ~3 cycles in a 25-step run. Restore to 1200/900/300 for full
+  # scale.
+  trigger_after_s: 300            # 5 min — first kill after warmup
+  recover_after_s: 180            # 3 min after kill → /admin/add_shard
+  repeat_every_s: 120             # 2 min between cycles
+  rotate_target: true             # each cycle picks the lowest-numbered ready shard
+  target_shard: dp-0              # first cycle's target; rotation kicks in for cycle 2+

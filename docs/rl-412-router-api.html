@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>NeMo-RL · Router API (RL-412)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700;800&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  /* ============================================================
+     DESIGN TOKENS
+     ============================================================ */
+  :root {
+    --bg:           #0a0e0a;
+    --bg-1:         #11161a;
+    --bg-2:         #161c22;
+    --bg-3:         #1d242c;
+    --bg-4:         #252e38;
+    --border:       #232a32;
+    --border-2:     #2f3944;
+    --border-3:     #3d4856;
+    --text:         #ecf2f8;
+    --text-1:       #c8d3df;
+    --text-2:       #8d99a6;
+    --text-3:       #6b7785;
+
+    --green:        #76b900;        /* NVIDIA green */
+    --green-dim:    #5a8c00;
+    --green-soft:   rgba(118, 185, 0, 0.10);
+    --green-soft-2: rgba(118, 185, 0, 0.18);
+
+    --train:        #6ea8ff;
+    --gen:          #c5a3ff;
+    --ctrl:         #a78bfa;
+    --data:         #5fd8ad;
+    --status:       #6ea8ff;
+    --admin:        #f5a657;
+    --warn:         #f5cb5c;
+    --bad:          #f47272;
+    --good:         #5fd8ad;
+
+    --mono: "Geist Mono", ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: "Geist", -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+
+    --shadow-1: 0 1px 2px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.02);
+    --shadow-2: 0 4px 12px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.03);
+    --shadow-3: 0 8px 24px rgba(0,0,0,0.5);
+    --shadow-glow: 0 0 0 1px var(--green), 0 0 24px rgba(118,185,0,0.18);
+
+    --t: 160ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 16px; line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: "ss01", "ss02", "cv11";
+    text-rendering: optimizeLegibility;
+  }
+  svg text { font-family: var(--sans); }
+  ::selection { background: var(--green-soft-2); color: var(--text); }
+  a { color: var(--green); text-decoration: none; transition: color var(--t); }
+  a:hover { color: #92d800; }
+  code, kbd {
+    color: var(--text);
+    background: rgba(255,255,255,0.06);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 0.88em;
+  }
+  pre {
+    margin: 0;
+    padding: 14px 16px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--text-1);
+  }
+  pre code { background: transparent; padding: 0; font-size: inherit; }
+
+  /* Token colors (homemade highlighter) */
+  .tok-c     { color: #6b7785; font-style: italic; }
+  .tok-k     { color: #ff8aa1; }
+  .tok-s     { color: var(--green); }
+  .tok-n     { color: #f5cb5c; }
+  .tok-f     { color: #6ea8ff; }
+  .tok-p     { color: var(--text-2); }
+  .tok-t     { color: var(--gen); }
+  .tok-meth  { color: #5fd8ad; }
+  .tok-prop  { color: #c5a3ff; }
+  .tok-method-get { color: #5fd8ad; font-weight: 700; }
+  .tok-method-post { color: #f5a657; font-weight: 700; }
+
+  /* ============================================================
+     TOP NAV
+     ============================================================ */
+  .topnav {
+    position: sticky;
+    top: 0;
+    z-index: 80;
+    background: rgba(10, 14, 10, 0.85);
+    backdrop-filter: blur(18px) saturate(180%);
+    -webkit-backdrop-filter: blur(18px) saturate(180%);
+    border-bottom: 1px solid var(--border);
+  }
+  .topnav-inner {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 14px 28px;
+    display: flex;
+    align-items: center;
+    gap: 32px;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text-2);
+    letter-spacing: 0.04em;
+  }
+  .brand .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 12px var(--green);
+  }
+  .brand strong { color: var(--text); font-weight: 600; }
+  .topnav .links {
+    display: flex; gap: 24px;
+    margin-left: auto;
+    font-size: 14px;
+  }
+  .topnav .links a {
+    color: var(--text-2);
+    transition: color var(--t);
+  }
+  .topnav .links a:hover { color: var(--text); }
+  .topnav .links a.active { color: var(--green); }
+
+  /* ============================================================
+     HERO
+     ============================================================ */
+  .hero {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 80px 28px 56px;
+    position: relative;
+  }
+  .hero::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 50%;
+    transform: translateX(-50%);
+    width: 600px; height: 320px;
+    background: radial-gradient(ellipse at top, rgba(118, 185, 0, 0.10), transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+  .hero-inner { position: relative; z-index: 1; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.18em;
+    color: var(--green);
+    text-transform: uppercase;
+    margin-bottom: 18px;
+    display: inline-block;
+    padding: 5px 12px;
+    border: 1px solid var(--green-soft-2);
+    border-radius: 999px;
+    background: var(--green-soft);
+  }
+  h1 {
+    font-size: 52px;
+    font-weight: 800;
+    letter-spacing: -0.025em;
+    line-height: 1.05;
+    margin: 0 0 20px;
+    max-width: 920px;
+  }
+  h1 .accent { color: var(--green); }
+  .hero p.lead {
+    font-size: 19px;
+    line-height: 1.55;
+    color: var(--text-1);
+    margin: 0 0 38px;
+    max-width: 760px;
+  }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+  @media (max-width: 880px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    h1 { font-size: 36px; }
+  }
+  .stat {
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px 20px;
+    transition: border-color var(--t), transform var(--t);
+  }
+  .stat:hover { border-color: var(--green-soft-2); transform: translateY(-2px); }
+  .stat .v {
+    font-family: var(--mono);
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--green);
+    letter-spacing: -0.02em;
+    line-height: 1;
+    margin-bottom: 6px;
+  }
+  .stat .l {
+    font-size: 12.5px;
+    color: var(--text-2);
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    font-family: var(--mono);
+  }
+
+  /* ============================================================
+     CONTENT
+     ============================================================ */
+  main {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 0 28px 120px;
+  }
+  section { margin-bottom: 80px; scroll-margin-top: 80px; }
+  h2 {
+    font-size: 32px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1.2;
+    margin: 0 0 8px;
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+  }
+  h2 .num {
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--green);
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    padding: 2px 8px;
+    border: 1px solid var(--green-soft-2);
+    background: var(--green-soft);
+    border-radius: 6px;
+  }
+  h3 {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin: 28px 0 12px;
+  }
+  .section-sub {
+    color: var(--text-2);
+    font-size: 16px;
+    margin: 0 0 32px;
+    max-width: 740px;
+  }
+
+  /* ============================================================
+     ROUTER API NAVIGATOR (Swagger-style)
+     ============================================================ */
+  .api-shell {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    gap: 24px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  @media (max-width: 880px) {
+    .api-shell { grid-template-columns: 1fr; }
+    .api-side { border-right: none !important; border-bottom: 1px solid var(--border); }
+  }
+  .api-side {
+    background: var(--bg);
+    border-right: 1px solid var(--border);
+    padding: 18px 0;
+    overflow: hidden;
+  }
+  .api-group {
+    padding: 0 18px 6px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-3);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    margin-top: 14px;
+  }
+  .api-group:first-child { margin-top: 0; }
+  .api-side a {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 16px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-2);
+    border-left: 2px solid transparent;
+    transition: background var(--t), color var(--t), border-left-color var(--t);
+    min-width: 0;
+  }
+  .api-side a > span:last-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1;
+  }
+  .api-side a:hover { background: var(--bg-2); color: var(--text); }
+  .api-side a.active {
+    background: var(--bg-2);
+    color: var(--text);
+    border-left-color: var(--green);
+  }
+  .api-side .meth {
+    font-size: 9.5px;
+    font-weight: 800;
+    padding: 2px 5px;
+    border-radius: 3px;
+    width: 38px;
+    text-align: center;
+    flex-shrink: 0;
+    flex-grow: 0;
+  }
+  .meth.get  { background: rgba(95,216,173,0.15); color: var(--data); }
+  .meth.post { background: rgba(245,166,87,0.15); color: var(--admin); }
+  .api-main {
+    padding: 22px 26px;
+  }
+  .api-card {
+    border: 1px solid var(--border-2);
+    border-radius: 10px;
+    margin-bottom: 14px;
+    overflow: hidden;
+    transition: box-shadow var(--t);
+  }
+  .api-card:hover { box-shadow: var(--shadow-2); }
+  .api-card.data    { border-left: 3px solid var(--data); }
+  .api-card.status  { border-left: 3px solid var(--status); }
+  .api-card.admin   { border-left: 3px solid var(--admin); }
+  .api-card.control { border-left: 3px solid var(--ctrl); }
+
+  .api-head {
+    cursor: pointer;
+    padding: 12px 16px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    user-select: none;
+    background: var(--bg-2);
+    transition: background var(--t);
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+  .api-head:hover { background: var(--bg-3); }
+  .api-card.open .api-head { background: var(--bg-3); border-bottom: 1px solid var(--border-2); }
+  .api-head .meth {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 800;
+    padding: 4px 8px;
+    border-radius: 4px;
+    flex-shrink: 0;
+    width: 56px;
+    text-align: center;
+  }
+  .api-head .path {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+    word-break: break-all;
+    min-width: 0;
+    flex: 0 1 auto;
+    max-width: 100%;
+  }
+  .api-head .summary {
+    font-size: 12.5px;
+    color: var(--text-2);
+    font-family: var(--sans);
+    flex: 1 1 220px;
+    min-width: 0;
+    overflow-wrap: break-word;
+  }
+  .api-head .chev {
+    width: 8px; height: 8px;
+    border: solid var(--text-2);
+    border-width: 0 2px 2px 0;
+    transform: rotate(-45deg);
+    transition: transform var(--t);
+  }
+  .api-card.open .api-head .chev { transform: rotate(45deg); }
+  .api-body {
+    display: none;
+    padding: 18px 18px 20px;
+    background: var(--bg-1);
+    font-size: 14px;
+    line-height: 1.65;
+    color: var(--text-1);
+  }
+  .api-card.open .api-body { display: block; }
+  .api-body h5 {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-3);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin: 14px 0 6px;
+    font-weight: 600;
+  }
+  .api-body h5:first-child { margin-top: 0; }
+  .api-body p { margin: 0 0 10px; }
+  .api-body ul { margin: 6px 0 10px; padding-left: 18px; }
+  .api-body li { margin: 3px 0; }
+
+  @media (max-width: 1080px) {
+    .api-head .summary { width: 100%; flex-basis: 100%; padding-left: 0; margin-top: 4px; }
+  }
+  @media (max-width: 880px) {
+    .api-head { flex-wrap: wrap; gap: 8px; }
+    .api-head .meth { width: 50px; }
+    .api-head .path { font-size: 12px; }
+  }
+
+  /* ============================================================
+     FOOTER
+     ============================================================ */
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 36px 28px 60px;
+    margin-top: 60px;
+    color: var(--text-3);
+    font-size: 13px;
+    font-family: var(--mono);
+    text-align: center;
+  }
+  footer a { color: var(--text-2); margin: 0 8px; }
+</style>
+</head>
+<body>
+
+<!-- =====================================================================
+     TOP NAV
+     ===================================================================== -->
+<nav class="topnav">
+  <div class="topnav-inner">
+    <div class="brand">
+      <div class="dot"></div>
+      <span>NeMo-RL</span> <span style="color:var(--text-3)">/</span> <strong>RL-412</strong>
+    </div>
+    <div class="links">
+      <a href="rl-412-disagg-gen.html">Architecture</a>
+      <a href="rl-412-fault-tolerance.html">Fault Tolerance</a>
+      <a href="rl-412-router-api.html" class="active">Router API</a>
+    </div>
+  </div>
+</nav>
+
+<!-- =====================================================================
+     HERO
+     ===================================================================== -->
+<section class="hero">
+  <div class="hero-inner">
+    <span class="eyebrow">RL-412 · Router API</span>
+    <h1>
+      28 endpoints. <span class="accent">Four groups.</span><br/>
+      One FastAPI on port 8089.
+    </h1>
+    <p class="lead">
+      The unified <code>GenerationRouter</code> replaces the old split (data plane on 8090, control on 8089).
+      Every external interaction with a gen daemon &mdash; rollout traffic, NCCL coordination, lifecycle, metrics &mdash;
+      flows through these 28 routes. Input / output schemas are sourced directly from the FastAPI handlers.
+    </p>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="v">28</div>
+        <div class="l">Endpoints</div>
+      </div>
+      <div class="stat">
+        <div class="v">4</div>
+        <div class="l">Logical Groups</div>
+      </div>
+      <div class="stat">
+        <div class="v">8089</div>
+        <div class="l">Single Port</div>
+      </div>
+      <div class="stat">
+        <div class="v">1</div>
+        <div class="l">FastAPI App</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<main>
+
+<!-- =====================================================================
+     ROUTER API REFERENCE
+     ===================================================================== -->
+<section id="api">
+  <h2><span class="num">API</span>Router API reference</h2>
+  <p class="section-sub">
+    The unified router replaces the old split (data plane on 8090, control on 8089).
+    Single FastAPI on port 8089. 28 endpoints across four groups, each with input / output
+    schema sourced directly from the FastAPI handlers. Click any to inspect.
+  </p>
+
+  <div class="api-shell">
+    <aside class="api-side" id="api-nav"></aside>
+    <div class="api-main" id="api-main"></div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  RL-412 router API &middot;
+  <a href="rl-412-disagg-gen.html">&larr; Architecture</a> &middot;
+  <a href="rl-412-fault-tolerance.html">Fault tolerance &rarr;</a> &middot;
+  <a href="https://github.com/NVIDIA-NeMo/RL">NeMo-RL on GitHub</a>
+</footer>
+
+
+<!-- =====================================================================
+     SCRIPTS
+     ===================================================================== -->
+<script>
+/* ===========================================================
+   API NAVIGATOR DATA
+   =========================================================== */
+const API_ENDPOINTS = [
+  // ---- Data plane ----
+  {group:"data", method:"POST", path:"/v1/completions",
+   summary:"OpenAI-compatible completions, proxied to a ready shard",
+   description:"Round-robin (or sticky via X-NRL-Session-Id) over ready DP shards. On 5xx or transport error, replays on a different shard. Threshold-based cordon on consecutive proxy failures.",
+   input:`<p>Request body is forwarded verbatim to the chosen shard's vLLM <code>/v1/completions</code>. Standard OpenAI <code>CompletionRequest</code> shape (<code>model</code>, <code>prompt</code>, <code>max_tokens</code>, <code>temperature</code>, <code>top_p</code>, <code>stream</code>, etc.). Headers <code>Content-Type</code> and <code>Accept</code> are forwarded; optional <code>X-NRL-Session-Id</code> pins the request to a sticky shard.</p>`,
+   output:`<p>Forwarded verbatim from vLLM. The router buffers the full body (<code>await resp.read()</code>) before responding, so even if the client sets <code>stream: true</code> the response is returned as one chunk; <code>media_type</code> is preserved from the upstream <code>Content-Type</code>. On exhaustion of all ready shards: <code>502</code> with <code>{error: string}</code>.</p>`},
+  {group:"data", method:"POST", path:"/v1/chat/completions",
+   summary:"OpenAI-compatible chat completions, proxied",
+   description:"Same proxy + replay logic as /v1/completions. NemoGym's vllm_model gym sub-server hits this for tool-call rollouts.",
+   input:`<p>Request body forwarded to vLLM's <code>/v1/chat/completions</code> — standard OpenAI <code>ChatCompletionRequest</code> (<code>model</code>, <code>messages</code>, <code>tools</code>, <code>tool_choice</code>, <code>max_tokens</code>, <code>temperature</code>, <code>stream</code>, etc.). Same header handling as <code>/v1/completions</code>.</p>`,
+   output:`<p>Forwarded verbatim. Buffered (non-streaming at the router boundary) regardless of <code>stream</code>. <code>502 {error}</code> on no-ready-shard.</p>`},
+  {group:"data", method:"POST", path:"/tokenize",
+   summary:"Tokenize raw text (vLLM root, no /v1)",
+   description:"Proxied with strip_v1 so the request lands at the shard's vLLM root /tokenize. NemoGym uses this after every chat completion to recover prompt token ids.",
+   input:`<p>Forwarded verbatim to vLLM's root <code>/tokenize</code>. vLLM accepts either <code>{prompt: string, ...}</code> or chat-style <code>{messages: [...]}</code>; see vLLM docs for full schema.</p>`,
+   output:`<p>Forwarded verbatim — typically <code>{tokens: int[], count: int, max_model_len: int}</code>. <code>502 {error}</code> on no-ready-shard.</p>`},
+  {group:"data", method:"POST", path:"/detokenize",
+   summary:"Detokenize a list of token ids",
+   description:"Same shape as /tokenize, opposite direction. Proxied at the shard root.",
+   input:`<p>Forwarded verbatim to vLLM's root <code>/detokenize</code>. Body is typically <code>{model: string, tokens: int[]}</code>.</p>`,
+   output:`<p>Forwarded verbatim — typically <code>{prompt: string}</code>. <code>502 {error}</code> on no-ready-shard.</p>`},
+
+  // ---- Status ----
+  {group:"status", method:"GET", path:"/health",
+   summary:"Liveness probe for the router itself",
+   description:"Returns 200 with {status: 'ok'} unconditionally. Cheap. Used by load-balancer / kubelet.",
+   input:`<p>&mdash; (no body, no params)</p>`,
+   output:`<ul><li><code>status</code>: string &mdash; always <code>"ok"</code></li></ul>`},
+  {group:"status", method:"GET", path:"/shards",
+   summary:"Live shard table (router's authoritative view)",
+   description:"Returns array of {shard_id, url, status, inflight, last_health_ok_at, consecutive_failures}. Status is one of ready / joining / cordoned / draining.",
+   input:`<p>&mdash; (no body, no params)</p>`,
+   output:`<p>Array of objects, one per shard:</p><ul><li><code>shard_id</code>: string &mdash; e.g. <code>"dp-0"</code></li><li><code>url</code>: string &mdash; OpenAI base URL (may be empty for sync engines)</li><li><code>status</code>: <code>"ready" | "joining" | "cordoned" | "draining"</code></li><li><code>inflight</code>: int &mdash; in-flight proxy requests</li><li><code>last_health_ok_at</code>: float &mdash; <code>time.monotonic()</code> of last successful probe</li><li><code>consecutive_failures</code>: int &mdash; current health-poll failure streak</li></ul>`},
+  {group:"status", method:"GET", path:"/metrics",
+   summary:"Router-side fault-tolerance + traffic snapshot",
+   description:"Counts of ready/joining/cordoned/draining shards, cumulative add/remove counters, last fault event, per-shard health age. Same payload as the router_metrics field of /step_metrics_snapshot.",
+   input:`<p>&mdash; (no body, no params)</p>`,
+   output:`<p>Object (same shape as <code>metrics_snapshot()</code>):</p><ul><li><code>num_ready_shards</code> / <code>num_joining_shards</code> / <code>num_cordoned_shards</code> / <code>num_draining_shards</code>: int</li><li><code>num_total_shards</code>: int</li><li><code>total_shards_at_bootstrap</code>: int</li><li><code>cumulative_shards_removed</code> / <code>cumulative_shards_added</code>: int</li><li><code>per_shard_world_size</code>: int (TP&times;PP for one DP shard)</li><li><code>current_gen_world_size</code>: int</li><li><code>nccl_reinit_in_progress</code>: bool</li><li><code>last_fault_event</code>: <code>{kind: "remove"|"add"|"cordon", shard_id, reason, monotonic_ts}</code> or <code>null</code></li><li><code>per_shard</code>: array of <code>{shard_id, status, inflight, consecutive_failures, last_health_ok_age_s}</code></li></ul>`},
+  {group:"status", method:"GET", path:"/refit_ready",
+   summary:"Is it safe for the train side to refit right now?",
+   description:"Returns {ready: bool, reason: string}. False while NCCL re-init is in flight (add_shard / remove_shard mid-flight). The train driver polls this at the top of every refit.",
+   input:`<p>&mdash; (no body, no params)</p>`,
+   output:`<ul><li><code>ready</code>: bool</li><li><code>reason</code>: string &mdash; <code>"ok"</code> when ready, <code>"nccl_reinit_in_progress"</code> while a lifecycle op is in flight</li></ul>`},
+  {group:"status", method:"GET", path:"/current_gen_world_size",
+   summary:"Sum of per-shard world sizes for shards in the NCCL group",
+   description:"ready + joining shards × per_shard_world_size. Excludes cordoned / draining. The train driver reads this just before init_collective so it picks up shrink/grow without redeploying.",
+   input:`<p>&mdash; (no body, no params)</p>`,
+   output:`<ul><li><code>world_size</code>: int &mdash; <code>(num_ready + num_joining) * per_shard_world_size</code></li></ul>`},
+  {group:"status", method:"GET", path:"/dp_openai_server_base_urls",
+   summary:"Per-shard OpenAI base URLs (legacy direct-routing)",
+   description:"Returns array of every known shard's URL, including non-ready. Preserved for back-compat with clients that bypass the proxy.",
+   input:`<p>&mdash; (no body, no params)</p>`,
+   output:`<p>Array of strings &mdash; OpenAI base URLs (e.g. <code>"http://&lt;pod-ip&gt;:8000/v1"</code>) for every shard with a non-empty <code>url</code> field. Includes joining/cordoned shards; clients that read this must filter by status themselves if needed.</p>`},
+  {group:"status", method:"GET", path:"/config",
+   summary:"Gen-side policy.cfg, fetched by the train side at bring-up",
+   description:"RemoteGeneration._fetch_remote_config polls this so the train side discovers sampling defaults, model name, etc. 503 when no generation is wired.",
+   input:`<p>&mdash; (no body, no params)</p>`,
+   output:`<p>Object &mdash; the underlying <code>VllmGeneration.cfg</code> serialized to a dict (sampling defaults, model name, vLLM args, etc.). <strong>Errors:</strong> <code>503 {detail: "no generation wired"}</code> when the router has no backing <code>VllmGeneration</code> (fake / cordon-only mode).</p>`},
+  {group:"status", method:"GET", path:"/openapi.json",
+   summary:"Auto-generated OpenAPI 3.0 schema (FastAPI default)",
+   description:"FastAPI's built-in OpenAPI document for the router. Used by the health poller as the liveness probe against each shard's vLLM (vLLM exposes the same path) — and any OpenAPI tooling can introspect the router itself here.",
+   input:`<p>&mdash; (no body, no params)</p>`,
+   output:`<p>OpenAPI 3.0 JSON document describing every route on this router. Stable, always-200 GET — used elsewhere as the per-shard liveness probe (<code>_HEALTH_PATH</code>) because vLLM doesn't expose <code>/health</code>.</p>`},
+
+  // ---- Admin ----
+  {group:"admin", method:"POST", path:"/admin/cordon",
+   summary:"Mark a shard cordoned (no new traffic, no removal)",
+   description:"Body: {shard_id, reason}. Drops the shard from the data-plane rotation. Fault-mode http-error uses this to simulate transient failures without losing the actor.",
+   input:`<p>JSON object (<code>dict[str, str]</code>):</p><ul><li><code>shard_id</code>: string &mdash; <em>required</em></li><li><code>reason</code>: string &mdash; optional, default <code>"manual"</code></li></ul>`,
+   output:`<ul><li><code>shard_id</code>: string &mdash; echoed</li><li><code>status</code>: string &mdash; always <code>"cordoned"</code></li></ul><p><strong>Errors:</strong> <code>400 {detail: "shard_id required"}</code> when <code>shard_id</code> is missing/empty. No-op (200) if the shard is already cordoned or unknown.</p>`},
+  {group:"admin", method:"POST", path:"/admin/uncordon",
+   summary:"Flip cordoned -> joining (NOT directly to ready)",
+   description:"Body: {shard_id}. Conservative: a cordoned shard may have missed broadcasts mid-flight, so we route it through joining and require the next refit's promote_all_joining to flip it ready.",
+   input:`<p>JSON object (<code>dict[str, str]</code>):</p><ul><li><code>shard_id</code>: string &mdash; <em>required</em></li></ul>`,
+   output:`<ul><li><code>shard_id</code>: string &mdash; echoed</li><li><code>status</code>: string &mdash; always <code>"joining"</code> (never directly <code>"ready"</code>)</li></ul><p><strong>Errors:</strong> <code>400 {detail: "shard_id required"}</code> when missing. No-op (200) if the shard is already ready or unknown.</p>`},
+  {group:"admin", method:"POST", path:"/admin/remove_shard",
+   summary:"Kill the shard's actors, free its placement group",
+   description:"Body: {shard_id, reason}. Drains inflight (≤30s), ray.kills the actor, removes the placement group, marks worker indices dead in the underlying VllmGeneration so subsequent dispatches skip them. Does NOT dispatch reset_collective on survivors — per-refit teardown (vllm_backend.update_weights_from_collective finally:) already destroyed their model_update_group at the end of the previous refit; calling reset_collective again under burst kills caused cascade-eviction.",
+   input:`<p>JSON object (<code>dict[str, Any]</code>):</p><ul><li><code>shard_id</code>: string &mdash; <em>required</em></li><li><code>reason</code>: string &mdash; optional, default <code>"admin /admin/remove_shard"</code></li><li><code>drain_timeout_s</code>: float &mdash; optional, default <code>30.0</code> (fault-injection callers pass smaller values to fail-fast inflight rollouts)</li></ul>`,
+   output:`<p>Object from <code>remove_shard()</code>:</p><ul><li><code>shard_id</code>: string</li><li><code>removed</code>: bool &mdash; <code>false</code> with <code>reason: "not found"</code> if the shard was already absent</li><li><code>reason</code>: string &mdash; echoed</li><li><code>world_size</code>: int &mdash; new <code>current_gen_world_size</code> (only when <code>removed: true</code>)</li></ul><p><strong>Errors:</strong> <code>400 {detail: "shard_id required"}</code> when missing.</p>`},
+  {group:"admin", method:"POST", path:"/admin/add_shard",
+   summary:"Allocate + spawn a fresh DP shard (joining state)",
+   description:"Body (optional): {reason}. Drives placement_group → autoscaler v2 schedules a new pod → vLLM async worker init → registered as joining. Stale-weight protection: data plane skips joining shards until the next refit's promote_all_joining flips them to ready.",
+   input:`<p>JSON object, optional (<code>dict[str, str] | null</code>):</p><ul><li><code>reason</code>: string &mdash; optional, default <code>"admin /admin/add_shard"</code> (logged into <code>last_fault_event</code> for wandb attribution)</li></ul>`,
+   output:`<p>Object from <code>add_shard()</code>:</p><ul><li><code>shard_id</code>: string &mdash; allocated id (e.g. <code>"dp-3"</code>), or <code>null</code> when no generation is wired</li><li><code>added</code>: bool &mdash; <code>false</code> if no <code>VllmGeneration</code> is wired or <code>add_dp_worker</code> raised</li><li><code>reason</code>: string &mdash; echoed (or failure detail when <code>added: false</code>)</li><li><code>world_size</code>: int &mdash; new <code>current_gen_world_size</code> (only when <code>added: true</code>)</li><li><code>status</code>: string &mdash; <code>"joining"</code> (only when <code>added: true</code>)</li></ul>`},
+  // ---- Control plane ----
+  {group:"control", method:"POST", path:"/init_collective",
+   summary:"Drive NCCL rendezvous on every gen worker",
+   description:"Body: {ip, port, world_size, train_world_size}. Pauses cordon transitions for the duration (the gen workers' event loop can stall during rendezvous). Returns {success: true} on success or {success: false, error: ...} on failure.",
+   input:`<p>JSON object (handler reads keys directly via <code>body[...]</code> &mdash; all required):</p><ul><li><code>ip</code>: string &mdash; train-side TCPStore host</li><li><code>port</code>: int &mdash; train-side TCPStore port</li><li><code>world_size</code>: int &mdash; total NCCL world (train + gen)</li><li><code>train_world_size</code>: int &mdash; rank offset for the gen side</li></ul>`,
+   output:`<p>Success path (<code>200</code>):</p><ul><li><code>success</code>: bool &mdash; <code>true</code></li></ul><p>Per-worker failure (<code>503</code>) &mdash; some workers raised (cudaErrorLaunchFailure, DistStoreError, etc.); router auto-evicts them and asks train to retry at the new world:</p><ul><li><code>success</code>: <code>false</code></li><li><code>error</code>: string &mdash; human summary</li><li><code>current_gen_world_size</code>: int</li><li><code>failed_indices</code>: int[] &mdash; worker indices that failed rendezvous</li><li><code>evicted_shard_ids</code>: string[]</li></ul><p>Generic failure (<code>500</code>): <code>{success: false, error: string}</code>. <code>503 {detail: "no generation wired"}</code> when no <code>VllmGeneration</code> is attached.</p>`},
+  {group:"control", method:"POST", path:"/reset_collective",
+   summary:"Tear down the cross-cluster NCCL group",
+   description:"Idempotent. Symmetric to the train-side abort_collective. Called automatically inside add_shard / remove_shard on surviving workers; also exposed for explicit teardown after a successful broadcast.",
+   input:`<p>&mdash; (no body)</p>`,
+   output:`<ul><li><code>success</code>: bool &mdash; <code>true</code> on clean teardown</li></ul><p><strong>Errors:</strong> <code>500 {success: false, error: string}</code> on exception. <code>503 {detail: "no generation wired"}</code> when no <code>VllmGeneration</code> is attached.</p>`},
+  {group:"control", method:"POST", path:"/update_weights_from_collective",
+   summary:"Receive broadcast on every gen worker; promote joining shards on success",
+   description:"Returns {success, promoted_shards}. After a successful refit, calls promote_all_joining() so any joining shard added since the last refit flips to ready (its weights are now current).",
+   input:`<p>&mdash; (no body)</p>`,
+   output:`<p>Success path (<code>200</code>):</p><ul><li><code>success</code>: bool</li><li><code>promoted_shards</code>: string[] &mdash; shard ids flipped from <code>joining</code> &rarr; <code>ready</code> by this refit</li></ul><p>Per-worker failure (<code>503</code>):</p><ul><li><code>success</code>: <code>false</code></li><li><code>error</code>: string</li><li><code>current_gen_world_size</code>: int</li><li><code>failed_indices</code>: int[]</li><li><code>evicted_shard_ids</code>: string[]</li><li><code>promoted_shards</code>: <code>[]</code></li></ul><p>Generic failure: <code>500 {success: false, error}</code>. <code>503 {detail: "no generation wired"}</code> when no <code>VllmGeneration</code> is attached.</p>`},
+  {group:"control", method:"POST", path:"/prepare_for_generation",
+   summary:"Pre-rollout kv_cache + worker setup",
+   description:"Wraps generation.prepare_for_generation. Called by the train side after refit and before the next rollout.",
+   input:`<p>&mdash; (no body)</p>`,
+   output:`<ul><li><code>success</code>: bool &mdash; coerced from <code>generation.prepare_for_generation()</code></li></ul><p><strong>Errors:</strong> <code>500 {success: false, error}</code>. <code>503 {detail: "no generation wired"}</code>.</p>`},
+  {group:"control", method:"POST", path:"/finish_generation",
+   summary:"Post-rollout cleanup",
+   description:"Wraps generation.finish_generation. Called after the last sample of a rollout returns.",
+   input:`<p>&mdash; (no body)</p>`,
+   output:`<ul><li><code>success</code>: bool &mdash; coerced from <code>generation.finish_generation()</code></li></ul><p><strong>Errors:</strong> <code>500 {success: false, error}</code>. <code>503 {detail: "no generation wired"}</code>.</p>`},
+  {group:"control", method:"POST", path:"/prepare_refit_info",
+   summary:"Stage state-dict metadata for the upcoming refit",
+   description:"Body: torch-pickled state_dict_info. Called once per refit before broadcast so the gen side knows the parameter shapes / dtypes / partition info.",
+   input:`<p>Raw bytes &mdash; the <em>request body</em> is a <code>torch.save</code>'d (pickled) object loaded via <code>torch.load(io.BytesIO(body), weights_only=True)</code>. Content-type irrelevant; do <strong>not</strong> JSON-encode. Schema: whatever the train side passes to <code>prepare_refit_info</code> (typically <code>{name: (shape, dtype), ...}</code>).</p>`,
+   output:`<ul><li><code>success</code>: bool &mdash; <code>true</code></li></ul><p><strong>Errors:</strong> <code>500 {success: false, error}</code>. <code>503 {detail: "no generation wired"}</code>.</p>`},
+  {group:"control", method:"POST", path:"/invalidate_kv_cache",
+   summary:"Force kv_cache invalidation on every gen worker",
+   description:"Called between refits when streaming weights via HTTP (SGLang path). Not used in the steady NCCL path.",
+   input:`<p>&mdash; (no body)</p>`,
+   output:`<ul><li><code>success</code>: bool &mdash; coerced from <code>generation.invalidate_kv_cache()</code></li></ul><p><strong>Errors:</strong> <code>500 {success: false, error}</code>. <code>503 {detail: "no generation wired"}</code>.</p>`},
+  {group:"control", method:"POST", path:"/clear_logger_metrics",
+   summary:"Reset vLLM logger metrics on every gen worker",
+   description:"Called by the train side at the start of each step so per-step metrics aren't polluted with the previous step's logger samples.",
+   input:`<p>&mdash; (no body)</p>`,
+   output:`<ul><li><code>success</code>: bool &mdash; always <code>true</code></li></ul><p><strong>Errors:</strong> <code>503 {detail: "no generation wired"}</code>.</p>`},
+  {group:"control", method:"GET", path:"/get_logger_metrics",
+   summary:"Return cumulative vLLM logger samples",
+   description:"Inflight batch size, num_pending, kv_cache_usage_perc, generation_tokens. Read by the train side at end-of-step for wandb.",
+   input:`<p>&mdash; (no body, no params)</p>`,
+   output:`<p>Object &mdash; whatever <code>generation.get_logger_metrics()</code> returns; in practice a dict of vLLM PrometheusStatLogger timeline samples (e.g. <code>inflight_batch_size: float[]</code>, <code>num_pending: int[]</code>, <code>kv_cache_usage_perc: float[]</code>, <code>generation_tokens: int[]</code>) keyed per worker.</p><p><strong>Errors:</strong> <code>503 {detail: "no generation wired"}</code>.</p>`},
+  {group:"control", method:"POST", path:"/snapshot_step_metrics",
+   summary:"Take a per-step delta snapshot on every gen worker",
+   description:"Snapshots the destructive metrics (spec-decode counters) so /get_step_metrics returns just this step's delta.",
+   input:`<p>&mdash; (no body)</p>`,
+   output:`<ul><li><code>success</code>: bool &mdash; always <code>true</code> (no-op when generation lacks <code>snapshot_step_metrics</code>)</li></ul><p><strong>Errors:</strong> <code>503 {detail: "no generation wired"}</code>.</p>`},
+  {group:"control", method:"GET", path:"/get_step_metrics",
+   summary:"Return per-step metric delta",
+   description:"Spec-decode counters since the last snapshot_step_metrics call. Cleared by the next snapshot.",
+   input:`<p>&mdash; (no body, no params)</p>`,
+   output:`<p>Object &mdash; <code>generation.get_step_metrics()</code> output (spec-decode counter dict); empty <code>{}</code> if generation doesn't implement the method. <strong>Errors:</strong> <code>503 {detail: "no generation wired"}</code>.</p>`},
+  {group:"control", method:"GET", path:"/step_metrics_snapshot",
+   summary:"Consolidated, non-destructive metrics for wandb",
+   description:"Bundles vllm_logger_metrics + spec_decode_metrics + router_metrics into one round-trip. Called by the train side once per step. Spec-decode counters are intentionally empty here (use /get_step_metrics for the destructive delta).",
+   input:`<p>&mdash; (no body, no params)</p>`,
+   output:`<ul><li><code>vllm_logger_metrics</code>: object &mdash; same shape as <code>GET /get_logger_metrics</code></li><li><code>spec_decode_metrics</code>: object &mdash; intentionally <code>{}</code> here (use the destructive <code>GET /get_step_metrics</code> for spec-decode deltas)</li><li><code>router_metrics</code>: object &mdash; same shape as <code>GET /metrics</code></li></ul><p><strong>Errors:</strong> <code>503 {detail: "no generation wired"}</code>.</p>`},
+];
+
+/* ===========================================================
+   API NAVIGATOR RENDER
+   =========================================================== */
+(function buildApiNav() {
+  const groups = {
+    data:    {label: "Data plane",    color: "var(--data)"},
+    status:  {label: "Status",        color: "var(--status)"},
+    admin:   {label: "Admin",         color: "var(--admin)"},
+    control: {label: "Control plane", color: "var(--ctrl)"},
+  };
+
+  const nav = document.getElementById("api-nav");
+  const main = document.getElementById("api-main");
+
+  Object.keys(groups).forEach(g => {
+    const h = document.createElement("div");
+    h.className = "api-group";
+    h.style.color = groups[g].color;
+    h.textContent = groups[g].label;
+    nav.appendChild(h);
+
+    API_ENDPOINTS.filter(e => e.group === g).forEach((e, idx) => {
+      const id = `api-${g}-${idx}`;
+
+      const navA = document.createElement("a");
+      navA.href = `#${id}`;
+      navA.dataset.target = id;
+      // Use the last path segment for the sidebar so long paths fit. Fall
+      // back to the full path if there's no segment (root /). Always show the
+      // full path on hover via the title attribute.
+      const navLabel = e.path.split("/").filter(Boolean).pop() || e.path;
+      navA.innerHTML = `<span class="meth ${e.method.toLowerCase()}">${e.method}</span><span>${navLabel}</span>`;
+      navA.title = `${e.method} ${e.path}`;
+      nav.appendChild(navA);
+
+      const card = document.createElement("div");
+      card.className = `api-card ${g}`;
+      card.id = id;
+      const inputBlock = e.input ? `<h5>Input</h5>${e.input}` : "";
+      const outputBlock = e.output ? `<h5>Output</h5>${e.output}` : "";
+      card.innerHTML = `
+        <div class="api-head">
+          <span class="meth ${e.method.toLowerCase()}">${e.method}</span>
+          <span class="path">${e.path}</span>
+          <span class="summary">${e.summary}</span>
+          <span class="chev"></span>
+        </div>
+        <div class="api-body">
+          <p>${e.description}</p>
+          ${inputBlock}
+          ${outputBlock}
+          <h5>Example</h5>
+<pre><code>$ curl -s -X ${e.method} <span class="tok-s">"$ROUTER/${e.path.replace(/^\//,"")}"</span>${e.method==="POST" && (e.path.indexOf("/admin/")>=0 || e.path.indexOf("/init_collective")>=0 || e.path.indexOf("/prepare_refit_info")>=0)?"\\\n     -H <span class=\"tok-s\">'Content-Type: application/json'</span> \\\n     -d <span class=\"tok-s\">'{...}'</span>":""}</code></pre>
+        </div>`;
+      main.appendChild(card);
+
+      card.querySelector(".api-head").addEventListener("click", () => {
+        card.classList.toggle("open");
+      });
+    });
+  });
+
+  // Sidebar nav active state via IntersectionObserver
+  const cards = document.querySelectorAll(".api-card");
+  const navLinks = nav.querySelectorAll("a");
+  navLinks.forEach(a => {
+    a.addEventListener("click", () => {
+      const card = document.getElementById(a.dataset.target);
+      card.classList.add("open");
+    });
+  });
+})();
+</script>
+
+</body>
+</html>
+</content>
+</invoke>

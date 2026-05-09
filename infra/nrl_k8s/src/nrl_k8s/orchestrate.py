@@ -48,8 +48,10 @@ from . import k8s, submit, workdir
 from .config import LoadedConfig, get_username
 from .manifest import (
     build_compute_domain_manifest,
+    build_deployment_manifest,
     build_raycluster_manifest,
     build_roce_template_manifest,
+    build_service_for_deployment,
     dra_resources_for_cluster,
 )
 from .schema import ClusterSpec, CodeSource, InfraConfig, SubmitterMode
@@ -115,6 +117,7 @@ def ensure_cluster(
     *,
     log: callable,
     recreate: bool = False,
+    replace: bool = False,
     wait_ready: bool = True,
     ready_timeout_s: int = 900,
 ) -> str:
@@ -122,8 +125,19 @@ def ensure_cluster(
 
     Unlike :func:`bring_up_cluster`, we never silently patch a live cluster.
     If the RayCluster already exists and its spec matches the rendered one
-    we just wait for readiness. If it exists but drifted we log a warning
-    and reuse anyway — pass ``recreate=True`` to delete + re-apply instead.
+    we just wait for readiness. If it exists but drifted, behavior depends
+    on the flags:
+
+    * ``recreate=True``: delete and re-apply (heavy hammer; tears down all
+      pods, loses Ray state).
+    * ``replace=True`` (default for ``nrl-k8s run --replace``): apply the
+      rendered manifest in-place. KubeRay reconciles spec.replicas back
+      to the YAML target without dropping the live pods that still match.
+      Used to undo the autoscaler-v2 dynamic spec.replicas modification
+      that leaves the cluster at fewer pods than the YAML configures
+      (RL-412 demo: prior run reaped a pod, autoscaler patched
+      spec.replicas to 3, the next ``--replace`` should restore it to 4).
+    * Neither: log a drift warning and reuse as-is.
     """
     cluster = _require_cluster(loaded.infra, role)
     manifest = build_raycluster_manifest(cluster, loaded.infra, role=role)
@@ -132,9 +146,7 @@ def ensure_cluster(
 
     live = k8s.get_raycluster(name, namespace)
     if live is not None:
-        live_owner = (live.get("metadata", {}).get("labels") or {}).get(
-            "nrl-k8s/owner"
-        )
+        live_owner = (live.get("metadata", {}).get("labels") or {}).get("nrl-k8s/owner")
         me = get_username()
         if live_owner and live_owner != me:
             raise RuntimeError(
@@ -155,10 +167,18 @@ def ensure_cluster(
             k8s.delete_raycluster(name, namespace)
             k8s.wait_for_raycluster_gone(name, namespace)
             k8s.apply_raycluster(manifest, namespace)
+        elif replace:
+            log(
+                f"[{role}] --replace: RayCluster {name} has drifted "
+                f"(usually spec.replicas mutated by autoscaler); applying "
+                f"rendered manifest in place to restore the YAML target"
+            )
+            k8s.apply_raycluster(manifest, namespace)
         else:
             log(
                 f"[{role}] warning: live RayCluster {name} has drifted from the "
-                f"rendered manifest; reusing as-is (pass --recreate to replace)"
+                f"rendered manifest; reusing as-is (pass --replace to apply or "
+                f"--recreate to delete + re-create)"
             )
     else:
         log(f"[{role}] RayCluster {name} already exists and matches — reusing")
@@ -248,6 +268,68 @@ def delete_dra_resources(
             k8s.delete_compute_domain(name, namespace)
 
 
+def ensure_deployment(
+    dep_key: str,
+    loaded: LoadedConfig,
+    *,
+    log: callable,
+) -> str:
+    """Apply a Kubernetes Deployment + auto-created ClusterIP Service."""
+    dep = _require_deployment(loaded.infra, dep_key)
+    manifest = build_deployment_manifest(dep, loaded.infra)
+    name = dep.name
+    namespace = loaded.infra.namespace
+
+    live = k8s.get_deployment(name, namespace)
+    if live is not None:
+        live_owner = ""
+        if hasattr(live, "metadata") and live.metadata and live.metadata.labels:
+            live_owner = live.metadata.labels.get("nrl-k8s/owner", "")
+        me = get_username()
+        if live_owner and live_owner != me:
+            raise RuntimeError(
+                f"Deployment {name} in namespace {namespace} is owned by "
+                f"'{live_owner}' (you are '{me}'). Use a different deployment "
+                f"name or ask {live_owner} to tear it down."
+            )
+
+    log(f"[deployment:{dep_key}] applying Deployment {name} in namespace {namespace}")
+    k8s.apply_deployment(manifest, namespace)
+
+    svc_manifest = build_service_for_deployment(dep, loaded.infra)
+    if svc_manifest is not None:
+        log(f"[deployment:{dep_key}] applying ClusterIP Service {name}")
+        k8s.apply_service(svc_manifest, namespace)
+        log(f"[deployment:{dep_key}] DNS: {name}.{namespace}.svc.cluster.local")
+
+    if dep.healthCheckUrl:
+        log(f"[deployment:{dep_key}] waiting for Deployment {name} to be ready ...")
+        t0 = time.monotonic()
+        k8s.wait_for_deployment_ready(
+            name, namespace, timeout_s=dep.healthCheckTimeoutS
+        )
+        remaining = max(10, dep.healthCheckTimeoutS - int(time.monotonic() - t0))
+        _wait_for_http(dep.healthCheckUrl, remaining, log, f"deployment:{dep_key}")
+
+    return name
+
+
+def delete_deployment(
+    dep_key: str,
+    loaded: LoadedConfig,
+    *,
+    log: callable,
+) -> None:
+    """Delete a managed Deployment and its auto-created Service."""
+    dep = _require_deployment(loaded.infra, dep_key)
+    name = dep.name
+    namespace = loaded.infra.namespace
+    log(f"[deployment:{dep_key}] deleting Service {name}")
+    k8s.delete_service(name, namespace)
+    log(f"[deployment:{dep_key}] deleting Deployment {name}")
+    k8s.delete_deployment(name, namespace)
+
+
 def submit_daemon(
     role: Role,
     loaded: LoadedConfig,
@@ -287,20 +369,39 @@ def submit_daemon(
         if existing in (JobStatus.FAILED, JobStatus.STOPPED) and not replace:
             raise RuntimeError(
                 f"daemon {daemon.submissionId} is {existing.value} — "
-                f"re-run with --replace (or bump infra.clusters.{role}.daemon.submissionId)"
+                f"re-run with --replace (or bump infra.kuberay.{role}.daemon.submissionId)"
             )
 
         # Ray refuses to re-use a submissionId even after terminal state, so
-        # --replace picks a fresh suffix and stops the live one if any.
+        # --replace picks a fresh suffix and stops every live submission
+        # matching the daemon's base id. We can't just check the
+        # canonical id — each prior --replace cycle creates a fresh
+        # `<base>-<ts>` variant and they're all independent submissions
+        # in Ray's view. Looking up only the canonical id sees STOPPED
+        # (from the first cycle) and leaks every subsequent run as a
+        # zombie holding the cluster's GPUs.
         submission_id = daemon.submissionId
-        if replace and existing is not None:
-            if existing is JobStatus.RUNNING:
-                log(f"[{role}] --replace: stopping {daemon.submissionId}")
-                try:
-                    client.stop_job(daemon.submissionId)
-                    _wait_job_stopped(client, daemon.submissionId, log=log, role=role)
-                except Exception as exc:  # noqa: BLE001
-                    log(f"[{role}] warning: stop failed: {exc}")
+        if replace and daemon.submissionId:
+            base_id = daemon.submissionId
+            try:
+                all_jobs = client.list_jobs()
+            except Exception as exc:  # noqa: BLE001
+                log(f"[{role}] --replace: list_jobs failed: {exc}")
+                all_jobs = []
+            for j in all_jobs:
+                sid = getattr(j, "submission_id", None)
+                if not sid:
+                    continue
+                if sid != base_id and not sid.startswith(f"{base_id}-"):
+                    continue
+                jstatus = getattr(j, "status", None)
+                if jstatus is JobStatus.RUNNING:
+                    log(f"[{role}] --replace: stopping {sid}")
+                    try:
+                        client.stop_job(sid)
+                        _wait_job_stopped(client, sid, log=log, role=role)
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"[{role}] warning: stop {sid} failed: {exc}")
             if daemon.submissionId:
                 submission_id = _fresh_submission_id(daemon.submissionId)
                 log(f"[{role}] --replace: using fresh submissionId {submission_id}")
@@ -355,7 +456,9 @@ def submit_training(
     infra = loaded.infra
     launch = infra.launch
     if not launch.entrypoint:
-        raise ValueError("infra.launch.entrypoint must be set for `nrl-k8s run` / `rayjob`")
+        raise ValueError(
+            "infra.launch.entrypoint must be set for `nrl-k8s run` / `rayjob`"
+        )
 
     if replace:
         _reset_endpoint_registry(loaded, log=log)
@@ -397,13 +500,16 @@ def submit_training(
     if replace:
         if is_exec:
             from .submitters.exec_ import ExecSubmitter
+
             ExecSubmitter(exec_tmp_dir=infra.submit.execTmpDir).stop_all_running(
-                name, infra.namespace, log=log,
+                name,
+                infra.namespace,
+                log=log,
             )
         with submit.dashboard_url(name, infra.namespace) as dash:
             client = JobSubmissionClient(dash)
             for job in client.list_jobs():
-                if job.status is JobStatus.RUNNING:
+                if job.status is JobStatus.RUNNING and job.submission_id:
                     log(
                         f"[training] --replace: stopping running job {job.submission_id}"
                     )
@@ -479,11 +585,16 @@ def run(
     if replace:
         _reset_endpoint_registry(loaded, log=log)
 
+    for dep_key in loaded.infra.deployments:
+        ensure_deployment(dep_key, loaded, log=log)
+
     for role in ALL_ROLES:
         if _get_cluster(loaded.infra, role) is None:
             log(f"[{role}] not defined in recipe — skipping")
             continue
-        name = ensure_cluster(role, loaded, log=log, recreate=recreate)
+        name = ensure_cluster(
+            role, loaded, log=log, recreate=recreate, replace=replace
+        )
         if skip_daemons and role != "training":
             log(f"[{role}] --skip-daemons: not submitting daemon")
             continue
@@ -505,7 +616,7 @@ def _infer_disagg_job_id(infra: InfraConfig) -> str | None:
     ``vllm_base_urls``. We parse the id from the gym daemon entrypoint so
     ``--replace`` can delete the ConfigMap without a dedicated config key.
     """
-    gym = infra.clusters.gym
+    gym = infra.kuberay.gym
     if gym is None or gym.daemon is None:
         return None
     m = _JOB_ID_RE.search(gym.daemon.entrypoint)
@@ -513,8 +624,10 @@ def _infer_disagg_job_id(infra: InfraConfig) -> str | None:
 
 
 def _reset_endpoint_registry(loaded: LoadedConfig, *, log: callable) -> None:
-    """Delete the endpoint-registry ConfigMap so gym + training rendezvous
-    on fresh URLs instead of caching stragglers from a prior failed run.
+    """Delete the endpoint-registry ConfigMap for a fresh rendezvous.
+
+    Ensures gym + training discover fresh URLs instead of caching
+    stragglers from a prior failed run.
     """
     job_id = _infer_disagg_job_id(loaded.infra)
     if not job_id:
@@ -530,14 +643,25 @@ def _reset_endpoint_registry(loaded: LoadedConfig, *, log: callable) -> None:
 
 
 def _get_cluster(infra: InfraConfig, role: Role) -> ClusterSpec | None:
-    return getattr(infra.clusters, role)
+    return getattr(infra.kuberay, role)
 
 
 def _require_cluster(infra: InfraConfig, role: Role) -> ClusterSpec:
     cluster = _get_cluster(infra, role)
     if cluster is None:
-        raise ValueError(f"infra.clusters.{role} is not defined")
+        raise ValueError(f"infra.kuberay.{role} is not defined")
     return cluster
+
+
+def _get_deployment(infra: InfraConfig, key: str):
+    return infra.deployments.get(key)
+
+
+def _require_deployment(infra: InfraConfig, key: str):
+    dep = _get_deployment(infra, key)
+    if dep is None:
+        raise ValueError(f"infra.deployments.{key} is not defined")
+    return dep
 
 
 def _upload_paths(infra: InfraConfig) -> list[str]:
@@ -574,7 +698,7 @@ def _wait_job_stopped(
     )
 
 
-def _wait_for_http(url: str, timeout_s: int, log: callable, role: Role) -> None:
+def _wait_for_http(url: str, timeout_s: int, log: callable, role: str) -> None:
     log(f"[{role}] waiting for health-check {url} (timeout {timeout_s}s)")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -594,7 +718,9 @@ __all__ = [
     "RunResult",
     "bring_up_cluster",
     "default_run_id",
+    "delete_deployment",
     "ensure_cluster",
+    "ensure_deployment",
     "run",
     "submit_daemon",
     "submit_training",

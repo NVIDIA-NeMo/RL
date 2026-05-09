@@ -352,11 +352,50 @@ class ExecSubmitter:
                  "bash", "-c", wait_script],
                 capture=True,
             )
+            timed_out = False
+            for line in out.strip().splitlines():
+                if line:
+                    log(f"[training] --replace: {line}")
+                    if "timeout" in line:
+                        timed_out = True
+        except (subprocess.CalledProcessError, _ExecFailed):
+            timed_out = True
+
+        if not timed_out:
+            return
+
+        # SIGTERM didn't take. Escalate to SIGKILL on the entire process
+        # group so detached Ray actors + placement groups owned by the
+        # zombie driver get reaped, and the new run doesn't race against
+        # leftover PGs (RL-412 saw the autoscaler keep both the old and
+        # new shards alive when --replace timed out without escalation).
+        log("[training] --replace: sending SIGKILL to stuck processes")
+        kill9_script = (
+            f'for pidfile in {self._tmp_root}/nrl-*/pid; do '
+            f'  [ -f "$pidfile" ] || continue; '
+            f'  pid=$(cat "$pidfile"); '
+            f'  kill -0 "$pid" 2>/dev/null || continue; '
+            f'  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d " "); '
+            f'  if [ -n "$pgid" ]; then '
+            f'    echo "SIGKILL pgid $pgid"; '
+            f'    kill -s KILL -"$pgid" 2>/dev/null || true; '
+            f'  else '
+            f'    echo "SIGKILL pid $pid"; '
+            f'    kill -s KILL "$pid" 2>/dev/null || true; '
+            f'  fi; '
+            f'done'
+        )
+        try:
+            out = _run(
+                ["kubectl", "exec", "-n", namespace, pod_name, "--",
+                 "bash", "-c", kill9_script],
+                capture=True,
+            )
             for line in out.strip().splitlines():
                 if line:
                     log(f"[training] --replace: {line}")
         except (subprocess.CalledProcessError, _ExecFailed):
-            pass
+            log("[training] --replace: warning: SIGKILL escalation failed")
 
 
 # =============================================================================

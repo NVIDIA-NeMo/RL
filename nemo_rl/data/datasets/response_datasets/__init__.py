@@ -14,7 +14,13 @@
 
 from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
-from nemo_rl.data.datasets.response_datasets.avqa import AVQADataset
+
+# AVQA pulls in `soundfile`, which isn't shipped in nemo-rl:nightly. Make
+# the import optional so a recipe that doesn't use AVQA still loads.
+try:
+    from nemo_rl.data.datasets.response_datasets.avqa import AVQADataset
+except ImportError:
+    AVQADataset = None  # type: ignore[assignment]
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.daily_omni import DailyOmniDataset
 from nemo_rl.data.datasets.response_datasets.dapo_math import (

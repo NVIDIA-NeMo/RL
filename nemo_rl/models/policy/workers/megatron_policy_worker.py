@@ -1098,9 +1098,218 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_worker_zmq_address: Optional[str] = None,
     ) -> None:
-        """Broadcast the weights for collective communication."""
+        """Broadcast the weights for collective communication.
+
+        Two paths:
+
+        1. **RefitWorker path** (default for the Megatron backend):
+           ``refit_worker_zmq_address`` points at a ZMQ REP socket bound
+           by the sibling RefitWorker actor. Only rank 0 streams (other
+           ranks no-op). We reuse ``packed_broadcast_producer`` with a
+           ZMQ-IPC forwarder substituted for the NCCL group: each packed
+           buffer gets its CUDA IPC handle exported and sent to the
+           RefitWorker, which NCCL-broadcasts the same buffer to gen
+           ranks. The chunk boundaries match the gen-side
+           ``packed_broadcast_consumer`` exactly because the same
+           producer code runs on the same param iterator.
+
+        2. **Legacy NCCL-direct path** (DTensor, or
+           ``NRL_USE_REFIT_WORKER=0``): every train rank participates
+           in ``self.model_update_group`` and broadcasts via
+           ``packed_broadcast_producer``. ``self.model_update_group``
+           must have been bound by ``init_collective``.
+        """
+        # Path 1: RefitWorker / ZMQ-IPC forwarder.
+        if refit_worker_zmq_address is not None:
+            # ALL train ranks must call ``_iter_params_with_optional_kv_scales``
+            # because ``megatron_bridge.export_hf_weights`` runs internal
+            # NCCL all-gathers across the EP/TP/PP groups to materialize
+            # full weights. If only rank 0 participates, the all-gathers
+            # block forever waiting for peers. Non-rank-0 ranks drain the
+            # iterator (so their NCCL peers are happy) but discard the
+            # yielded tensors — only rank 0 streams to the RefitWorker.
+            if self.rank != 0:
+                # Drain the iterator to participate in Megatron's
+                # internal gathers. Tensors yielded here are the
+                # rank's local-shard view post-gather; we don't need
+                # the data, just the side-effect of peer participation.
+                for _ in self._iter_params_with_optional_kv_scales(
+                    kv_scales=kv_scales
+                ):
+                    pass
+                return
+            import zmq as _zmq
+
+            from nemo_rl.models.policy.utils import (
+                IPCProtocol,
+                get_handle_from_tensor,
+            )
+
+            ctx = _zmq.Context()
+            sock = None
+            try:
+                sock = ctx.socket(_zmq.REQ)
+                sock.setsockopt(_zmq.SNDTIMEO, 600000)
+                sock.setsockopt(_zmq.RCVTIMEO, 600000)
+                sock.setsockopt(_zmq.LINGER, 0)
+                sock.connect(refit_worker_zmq_address)
+
+                _producer_pack_debug = (
+                    os.getenv("NRL_REFIT_PACKED_DEBUG", "0") == "1"
+                )
+
+                class _ZmqIpcForwardGroup:
+                    """Duck-typed substitute for ``StatelessProcessGroup``.
+
+                    ``packed_broadcast_producer`` calls ``group.broadcast(buf, src)``
+                    once per packed chunk. Instead of NCCL-broadcasting,
+                    we sync the producing stream so the buffer's bytes
+                    are settled, export a CUDA IPC handle, send
+                    ``(handle, [], used_bytes)`` to the RefitWorker via
+                    ZMQ REQ, and wait for ACK. The RefitWorker then
+                    NCCL-broadcasts the same buffer to gen ranks.
+
+                    No ``_broadcast_stream`` attribute → producer runs
+                    on the default stream (``contextlib.nullcontext``),
+                    which is fine since we're no longer worried about
+                    cross-cluster NCCL poisoning the train context.
+                    """
+
+                    def __init__(self, zmq_socket: Any) -> None:
+                        self._sock = zmq_socket
+                        self._n_chunks = 0
+
+                    def broadcast(
+                        self, tensor: torch.Tensor, src: int
+                    ) -> None:
+                        # IPC handles capture *device* bytes that have
+                        # already been written. Sync the WHOLE device
+                        # (not just current_stream) — Megatron-Bridge's
+                        # ``export_hf_weights`` runs internal TP/EP/PP
+                        # all_gathers on side streams that aren't
+                        # tracked by PyTorch's cross-stream event
+                        # machinery once the bytes leave the process
+                        # via CUDA IPC. Whole-device sync is the only
+                        # safe way to guarantee the receiver sees
+                        # consistent bytes; current-stream-only sync
+                        # produces silent corruption (KL=1, garbage
+                        # rollouts) on Qwen3-30B-MoE.
+                        torch.cuda.synchronize()
+                        if _producer_pack_debug:
+                            import hashlib as _hashlib
+
+                            _head = (
+                                tensor[: min(64, tensor.numel())]
+                                .cpu()
+                                .numpy()
+                                .tobytes()
+                            )
+                            _tail = (
+                                tensor[max(0, tensor.numel() - 64) :]
+                                .cpu()
+                                .numpy()
+                                .tobytes()
+                            )
+                            _sha = _hashlib.sha1(_head + _tail).hexdigest()[:12]
+                            print(
+                                f"[refit_diag.producer.chunk] idx={self._n_chunks} "
+                                f"bytes={int(tensor.numel())} head_tail_sha={_sha}",
+                                flush=True,
+                            )
+                        handle = get_handle_from_tensor(tensor)
+                        used_bytes = int(tensor.numel())
+                        # Payload shape mirrors the colocated ZMQ-IPC
+                        # protocol so we can reuse the receiver loop
+                        # in RefitWorker without a special case.
+                        # The middle field (param-name list) is unused
+                        # by the forwarder — pass [] as a placeholder.
+                        self._sock.send_pyobj((handle, [], used_bytes))
+                        ack = self._sock.recv()
+                        if ack != IPCProtocol.ACK.value.encode():
+                            raise RuntimeError(
+                                f"RefitWorker ACK mismatch: got {ack!r}"
+                            )
+                        self._n_chunks += 1
+
+                forward_group = _ZmqIpcForwardGroup(sock)
+                # DIAGNOSTIC: capture iteration order + per-param byte counts
+                # so we can compare the producer's view against the consumer's
+                # ``state_dict_info`` ordering. If the two diverge (different
+                # element-for-element name order, or any param's numel differs)
+                # the packed-broadcast byte boundaries skew silently and the
+                # gen side reconstructs garbage tensors → KL=1.0 / rewards=0.
+                producer_meta: list[tuple[str, tuple[int, ...], str, int]] = []
+
+                def _logging_iter():
+                    for name, tensor in self._iter_params_with_optional_kv_scales(
+                        kv_scales=kv_scales
+                    ):
+                        producer_meta.append(
+                            (
+                                name,
+                                tuple(tensor.shape),
+                                str(tensor.dtype),
+                                int(tensor.numel()) * tensor.element_size(),
+                            )
+                        )
+                        yield name, tensor
+
+                packed_broadcast_producer(
+                    iterator=_logging_iter(),
+                    group=forward_group,
+                    src=0,
+                    post_iter_func=lambda x: x[1],
+                )
+                import hashlib as _hashlib
+
+                _names_blob = "\n".join(m[0] for m in producer_meta).encode()
+                _full_blob = "\n".join(
+                    f"{m[0]}|{m[1]}|{m[2]}|{m[3]}" for m in producer_meta
+                ).encode()
+                _names_hash = _hashlib.sha256(_names_blob).hexdigest()[:16]
+                _full_hash = _hashlib.sha256(_full_blob).hexdigest()[:16]
+                _total_bytes = sum(m[3] for m in producer_meta)
+                print(
+                    f"[refit_diag.producer] n_params={len(producer_meta)} "
+                    f"total_bytes={_total_bytes} "
+                    f"names_sha={_names_hash} full_sha={_full_hash} "
+                    f"first3={[m[0] for m in producer_meta[:3]]} "
+                    f"last3={[m[0] for m in producer_meta[-3:]]}",
+                    flush=True,
+                )
+                # Tell RefitWorker we're done with this refit.
+                sock.send_pyobj(IPCProtocol.COMPLETE)
+                final_ack = sock.recv()
+                if final_ack != IPCProtocol.ACK.value.encode():
+                    raise RuntimeError(
+                        f"RefitWorker COMPLETE ACK mismatch: got {final_ack!r}"
+                    )
+                print(
+                    f"[megatron_policy_worker.broadcast_weights_for_collective] "
+                    f"forwarded {forward_group._n_chunks} chunks via RefitWorker",
+                    flush=True,
+                )
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    ctx.term()
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        # Path 2: legacy direct NCCL. Fast-path no-op if no group exists
+        # (e.g. RefitWorker mode where ``init_collective`` is a no-op on
+        # the train side).
+        if getattr(self, "model_update_group", None) is None:
+            return
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),

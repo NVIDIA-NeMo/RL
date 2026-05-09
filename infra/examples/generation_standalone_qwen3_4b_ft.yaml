@@ -1,0 +1,102 @@
+# Standalone generation server config for the RL-412 fault-tolerant demo.
+# Self-contained (no `defaults:` inheritance) so it can be loaded directly
+# by examples/run_standalone_generation_server.py from the daemon's
+# uploaded working_dir, without needing the rest of the recipe tree.
+
+policy:
+  model_name: Qwen/Qwen3-4B-Instruct-2507
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  precision: bfloat16
+  max_total_sequence_length: 8192
+  generation:
+    backend: vllm
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    stop_token_ids: null
+    stop_strings: null
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 4
+    vllm_cfg:
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: auto
+      # Reduced from 0.8 because GB300 GPUs in this cluster carry leaked
+       # CUDA memory from prior runs (cluster-side known issue: vLLM
+       # workers SIGKILL'd by a --recreate cycle don't release GPU memory
+       # cleanly; ~220 GiB stays pinned on the host). 0.15 × 276 GiB =
+       # 41 GiB, well within typical free headroom (40-55 GiB observed).
+       # 4B model + KV cache + activations fits comfortably.
+      gpu_memory_utilization: 0.15
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+    vllm_kwargs: {}
+    # GenerationRouter health-poll + cordon thresholds (optional overrides;
+    # omit any field to take GenerationRouter.__init__ defaults). 4B at TP=1
+    # is rarely burst-bound, so we keep the in-code defaults.
+    router: {}
+
+# RL-412 fault injection — picked up by maybe_launch_fault_injector after the
+# router boots. Override on the daemon entrypoint via:
+#   --config <file> ++fault_inject.mode=actor-kill ++fault_inject.trigger_after_s=120
+#
+# This recipe exercises the full RL-412 round-trip:
+#   1. ~10min in: kill dp-0 (pod-kill). Router cordons + frees PG; autoscaler
+#      reaps the pod within idleTimeoutSeconds (60s on this profile).
+#   2. ~10min later (recover_after_s): POST /admin/add_shard. The autoscaler
+#      provisions a new pod, the router registers the new shard as `joining`,
+#      reset_collective fires; train side picks up the new world_size on the
+#      next refit and promote_all_joining flips the new shard to `ready`.
+fault_inject:
+  # Real-world failure mode: actor-kill simulates a vLLM worker
+  # process crashing in-place (CUDA error, OOM, segfault, broken
+  # pipe). Unlike pod-kill which deletes the K8s pod, actor-kill
+  # leaves the pod alive and forces the router to detect the dead
+  # actor via Ray death notification + per-worker eviction in
+  # /init_collective + /update_weights_from_collective. Closer to
+  # production failure modes than the cleaner pod-kill path.
+  enabled: true
+  mode: actor-kill              # http-error | actor-kill | pod-kill
+  # Continuous stress test: cycle kill+recover indefinitely so the FT
+  # path is exercised repeatedly across a long run. Each cycle:
+  #   trigger_after_s sleep -> kill -> recover_after_s sleep -> add_shard
+  #   -> repeat_every_s sleep -> next cycle (target rotates to lowest
+  #   ready dp-N)
+  # 4B step time is ~14-22s; one cycle = 360+240+120 = 720s = 12 min,
+  # so we hit ~5 cycles per hour. trigger_after_s only applies to the
+  # first cycle; subsequent cycles fire as soon as the inter-cycle
+  # repeat_every_s sleep finishes.
+  recover: true
+  # Fast iteration cadence: cycle every ~6 min so a 30-step 4B run sees
+  # 4-5 kill+recover cycles in ~10-15 min wall time. recover_after_s
+  # bounded by autoscaler provision time (~2-3 min for fresh GB300 pod
+  # + ~30s vLLM-4B load).
+  trigger_after_s: 180          # 3 min — fires shortly after first refit
+  recover_after_s: 120          # 2 min after kill — autoscaler reap + provision window
+  # Aggressive 60s cadence to exercise the extreme case: cycle 2 fires
+  # while the previous cycle's reset_collective is still settling on
+  # survivors. The router's bounded reset_collective
+  # (_per_worker_results + 30s timeout) MUST prevent the lifecycle lock
+  # deadlock under this load — that's the validation goal here.
+  repeat_every_s: 60            # 1 min between cycles → ~6 min cycle period
+  rotate_target: true           # each cycle picks the lowest-numbered ready shard
+  target_shard: dp-0            # first cycle's target; rotation kicks in for cycle 2+
+

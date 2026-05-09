@@ -1,0 +1,1582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>NeMo-RL · Disaggregated Generation (RL-412)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700;800&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  /* ============================================================
+     DESIGN TOKENS
+     ============================================================ */
+  :root {
+    --bg:           #0a0e0a;
+    --bg-1:         #11161a;
+    --bg-2:         #161c22;
+    --bg-3:         #1d242c;
+    --bg-4:         #252e38;
+    --border:       #232a32;
+    --border-2:     #2f3944;
+    --border-3:     #3d4856;
+    --text:         #ecf2f8;
+    --text-1:       #c8d3df;
+    --text-2:       #8d99a6;
+    --text-3:       #6b7785;
+
+    --green:        #76b900;        /* NVIDIA green */
+    --green-dim:    #5a8c00;
+    --green-soft:   rgba(118, 185, 0, 0.10);
+    --green-soft-2: rgba(118, 185, 0, 0.18);
+
+    --train:        #6ea8ff;
+    --gen:          #c5a3ff;
+    --ctrl:         #a78bfa;
+    --data:         #5fd8ad;
+    --status:       #6ea8ff;
+    --admin:        #f5a657;
+    --warn:         #f5cb5c;
+    --bad:          #f47272;
+    --good:         #5fd8ad;
+
+    --mono: "Geist Mono", ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: "Geist", -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+
+    --shadow-1: 0 1px 2px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.02);
+    --shadow-2: 0 4px 12px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.03);
+    --shadow-3: 0 8px 24px rgba(0,0,0,0.5);
+    --shadow-glow: 0 0 0 1px var(--green), 0 0 24px rgba(118,185,0,0.18);
+
+    --t: 160ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 16px; line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: "ss01", "ss02", "cv11";
+    text-rendering: optimizeLegibility;
+  }
+  svg text { font-family: var(--sans); }
+  ::selection { background: var(--green-soft-2); color: var(--text); }
+  a { color: var(--green); text-decoration: none; transition: color var(--t); }
+  a:hover { color: #92d800; }
+  code, kbd {
+    color: var(--text);
+    background: rgba(255,255,255,0.06);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 0.88em;
+  }
+  pre {
+    margin: 0;
+    padding: 14px 16px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--text-1);
+  }
+  pre code { background: transparent; padding: 0; font-size: inherit; }
+
+  /* Token colors (homemade highlighter) */
+  .tok-c     { color: #6b7785; font-style: italic; }
+  .tok-k     { color: #ff8aa1; }
+  .tok-s     { color: var(--green); }
+  .tok-n     { color: #f5cb5c; }
+  .tok-f     { color: #6ea8ff; }
+  .tok-p     { color: var(--text-2); }
+  .tok-t     { color: var(--gen); }
+  .tok-meth  { color: #5fd8ad; }
+  .tok-prop  { color: #c5a3ff; }
+  .tok-method-get { color: #5fd8ad; font-weight: 700; }
+  .tok-method-post { color: #f5a657; font-weight: 700; }
+
+  /* ============================================================
+     TOP NAV
+     ============================================================ */
+  .topnav {
+    position: sticky;
+    top: 0;
+    z-index: 80;
+    background: rgba(10, 14, 10, 0.85);
+    backdrop-filter: blur(18px) saturate(180%);
+    -webkit-backdrop-filter: blur(18px) saturate(180%);
+    border-bottom: 1px solid var(--border);
+  }
+  .topnav-inner {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 14px 28px;
+    display: flex;
+    align-items: center;
+    gap: 32px;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text-2);
+    letter-spacing: 0.04em;
+  }
+  .brand .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 12px var(--green);
+  }
+  .brand strong { color: var(--text); font-weight: 600; }
+  .topnav .links {
+    display: flex; gap: 24px;
+    margin-left: auto;
+    font-size: 14px;
+  }
+  .topnav .links a {
+    color: var(--text-2);
+    transition: color var(--t);
+  }
+  .topnav .links a:hover { color: var(--text); }
+  .topnav .links a.active { color: var(--green); }
+
+  /* ============================================================
+     HERO
+     ============================================================ */
+  .hero {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 80px 28px 56px;
+    position: relative;
+  }
+  .hero::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 50%;
+    transform: translateX(-50%);
+    width: 600px; height: 320px;
+    background: radial-gradient(ellipse at top, rgba(118, 185, 0, 0.10), transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+  .hero-inner { position: relative; z-index: 1; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.18em;
+    color: var(--green);
+    text-transform: uppercase;
+    margin-bottom: 18px;
+    display: inline-block;
+    padding: 5px 12px;
+    border: 1px solid var(--green-soft-2);
+    border-radius: 999px;
+    background: var(--green-soft);
+  }
+  h1 {
+    font-size: 52px;
+    font-weight: 800;
+    letter-spacing: -0.025em;
+    line-height: 1.05;
+    margin: 0 0 20px;
+    max-width: 920px;
+  }
+  h1 .accent { color: var(--green); }
+  .hero p.lead {
+    font-size: 19px;
+    line-height: 1.55;
+    color: var(--text-1);
+    margin: 0 0 38px;
+    max-width: 760px;
+  }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+  @media (max-width: 880px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    h1 { font-size: 36px; }
+  }
+  .stat {
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px 20px;
+    transition: border-color var(--t), transform var(--t);
+  }
+  .stat:hover { border-color: var(--green-soft-2); transform: translateY(-2px); }
+  .stat .v {
+    font-family: var(--mono);
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--green);
+    letter-spacing: -0.02em;
+    line-height: 1;
+    margin-bottom: 6px;
+  }
+  .stat .l {
+    font-size: 12.5px;
+    color: var(--text-2);
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    font-family: var(--mono);
+  }
+
+  /* ============================================================
+     CONTENT
+     ============================================================ */
+  main {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 0 28px 120px;
+  }
+  section { margin-bottom: 80px; scroll-margin-top: 80px; }
+  h2 {
+    font-size: 32px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1.2;
+    margin: 0 0 8px;
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+  }
+  h2 .num {
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--green);
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    padding: 2px 8px;
+    border: 1px solid var(--green-soft-2);
+    background: var(--green-soft);
+    border-radius: 6px;
+  }
+  h3 {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin: 28px 0 12px;
+  }
+  .section-sub {
+    color: var(--text-2);
+    font-size: 16px;
+    margin: 0 0 32px;
+    max-width: 740px;
+  }
+
+  /* ============================================================
+     TL;DR
+     ============================================================ */
+  .tldr {
+    background: linear-gradient(180deg, var(--bg-1), var(--bg-2));
+    border: 1px solid var(--border-2);
+    border-left: 3px solid var(--green);
+    border-radius: 10px;
+    padding: 22px 26px;
+    margin: 0 0 28px;
+  }
+  .tldr-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    color: var(--green);
+    text-transform: uppercase;
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+  .tldr p { margin: 0; font-size: 15.5px; line-height: 1.7; color: var(--text-1); }
+  .tldr p + p { margin-top: 8px; }
+
+  /* ============================================================
+     CARDS
+     ============================================================ */
+  .card {
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px 26px;
+    box-shadow: var(--shadow-1);
+    transition: border-color var(--t), box-shadow var(--t);
+  }
+  .card:hover { border-color: var(--border-2); box-shadow: var(--shadow-2); }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  @media (max-width: 880px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+
+  /* ============================================================
+     ARCHITECTURE DIAGRAM (top-level static svg)
+     ============================================================ */
+  .archbox {
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 26px;
+  }
+  .archbox svg { width: 100%; display: block; }
+  svg text { font-family: var(--sans); fill: var(--text); }
+  svg .lbl { font-size: 12px; fill: var(--text-1); }
+  svg .lbl-strong { font-size: 14px; font-weight: 700; }
+  svg .tag { font-size: 10.5px; fill: var(--text-3); font-family: var(--mono); letter-spacing: 0.06em; }
+  svg .num { font-size: 11px; fill: var(--text-2); font-family: var(--mono); }
+
+  svg .train-box { fill: rgba(110,168,255,0.08); stroke: var(--train); stroke-width: 1.5; }
+  svg .gen-box   { fill: rgba(197,163,255,0.08); stroke: var(--gen); stroke-width: 1.5; }
+  svg .router-box{ fill: var(--green-soft); stroke: var(--green); stroke-width: 2; }
+  svg .gpu       { fill: rgba(110,168,255,0.18); stroke: var(--train); stroke-width: 1; }
+  svg .gpu.gen   { fill: rgba(197,163,255,0.18); stroke: var(--gen); }
+
+  svg .arrow-data { stroke: var(--data); fill: none; stroke-width: 2; }
+  svg .arrow-ctrl { stroke: var(--green); fill: none; stroke-width: 2; stroke-dasharray: 5 4; }
+  svg .arrow-nccl { stroke: #f47272; fill: none; stroke-width: 2.4; }
+  svg .arrow-lbl  {
+    font-size: 11px; fill: var(--text-1); font-family: var(--mono);
+    paint-order: stroke fill;
+    stroke: #06080a;
+    stroke-width: 4px;
+    stroke-linejoin: round;
+  }
+
+  /* ============================================================
+     COLLAPSIBLE
+     ============================================================ */
+  details {
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 12px;
+    transition: border-color var(--t);
+  }
+  details[open] { border-color: var(--border-2); }
+  details > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 14px 18px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    user-select: none;
+    font-weight: 600;
+    color: var(--text);
+    transition: background var(--t);
+  }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary::before {
+    content: "";
+    width: 8px; height: 8px;
+    border: solid var(--text-2);
+    border-width: 0 2px 2px 0;
+    transform: rotate(-45deg);
+    transition: transform var(--t);
+    flex-shrink: 0;
+  }
+  details[open] > summary::before { transform: rotate(45deg); }
+  details > summary:hover { background: var(--bg-2); }
+  details .body {
+    padding: 4px 18px 18px 38px;
+    color: var(--text-1);
+    font-size: 14.5px;
+    line-height: 1.65;
+  }
+  details .body p:first-child { margin-top: 0; }
+  details .body p:last-child { margin-bottom: 0; }
+
+  /* ============================================================
+     INTERACTIVE DIAGRAM (refit-flow)
+     ============================================================ */
+  .replay {
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+  }
+  .replay-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 18px;
+    background: var(--bg);
+    padding: 4px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    width: fit-content;
+    max-width: 100%;
+  }
+  .replay-tabs button {
+    background: transparent;
+    color: var(--text-2);
+    border: none;
+    padding: 8px 16px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    cursor: pointer;
+    border-radius: 5px;
+    transition: all var(--t);
+  }
+  .replay-tabs button:hover { color: var(--text); }
+  .replay-tabs button.active {
+    background: var(--green);
+    color: #0a0e0a;
+    font-weight: 700;
+  }
+
+  .replay-stage {
+    background: #06080a;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  .replay-stage svg { width: 100%; display: block; height: 440px; }
+
+  .replay-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+  .btn {
+    background: var(--bg-2);
+    color: var(--text);
+    border: 1px solid var(--border-2);
+    border-radius: 6px;
+    padding: 9px 16px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    cursor: pointer;
+    transition: background var(--t), border-color var(--t), transform 80ms;
+  }
+  .btn:hover { background: var(--bg-3); border-color: var(--border-3); }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .btn.primary {
+    background: var(--green);
+    color: #0a0e0a;
+    border-color: var(--green);
+    font-weight: 700;
+  }
+  .btn.primary:hover { background: #92d800; }
+
+  .step-readout {
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--text-2);
+    text-align: right;
+    white-space: nowrap;
+  }
+  .step-readout .of { color: var(--text-3); }
+  .step-readout .total { color: var(--text); font-weight: 600; }
+
+  .step-panel {
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    min-height: 80px;
+    border-left: 3px solid var(--green);
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+  .step-panel .step-title {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--green);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    margin-bottom: 6px;
+    font-weight: 600;
+    line-height: 1.4;
+  }
+  .step-panel .step-desc {
+    font-size: 14.5px;
+    line-height: 1.6;
+    color: var(--text-1);
+  }
+  .step-panel .step-desc code { font-size: 13px; word-break: break-all; }
+
+  .step-progress {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 14px;
+  }
+  .step-progress .pdot {
+    flex: 1;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    transition: background var(--t);
+  }
+  .step-progress .pdot.done { background: var(--green-dim); }
+  .step-progress .pdot.active {
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+  }
+
+  /* SVG element states for the replay */
+  .replay-stage .stage-node {
+    transition: all 250ms ease;
+  }
+  .replay-stage .stage-node.dim {
+    opacity: 0.35;
+  }
+  .replay-stage .stage-node.active {
+    filter: drop-shadow(0 0 8px var(--green));
+  }
+  .replay-stage .stage-arrow {
+    opacity: 0;
+    transition: opacity 250ms ease;
+    pointer-events: none;
+  }
+  .replay-stage .stage-arrow.show {
+    opacity: 1;
+  }
+  .replay-stage .stage-arrow.show path {
+    stroke-dasharray: 4 4;
+    animation: dash 1.2s linear infinite;
+  }
+  .replay-stage .stage-arrow text {
+    paint-order: stroke fill;
+    stroke: #06080a;
+    stroke-width: 4px;
+    stroke-linejoin: round;
+  }
+  @keyframes dash {
+    to { stroke-dashoffset: -16; }
+  }
+
+  /* ============================================================
+     LEGEND
+     ============================================================ */
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+    margin-top: 16px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .legend .item { display: flex; align-items: center; gap: 6px; color: var(--text-2); }
+  .legend .swatch {
+    width: 10px; height: 10px;
+    border-radius: 2px;
+  }
+
+  /* ============================================================
+     CALLOUT
+     ============================================================ */
+  .callout {
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin: 16px 0;
+    border-left: 3px solid;
+    background: var(--bg-1);
+    border-top: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    font-size: 14.5px;
+    line-height: 1.65;
+  }
+  .callout.green { border-left-color: var(--green); }
+  .callout.warn  { border-left-color: var(--warn); }
+  .callout.bad   { border-left-color: var(--bad); }
+  .callout strong { color: var(--text); }
+
+  /* ============================================================
+     TABLE
+     ============================================================ */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 8px 0;
+    font-size: 13.5px;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    color: var(--text-2);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    background: var(--bg-2);
+    font-weight: 600;
+  }
+  td { color: var(--text-1); }
+  td code { font-size: 12.5px; }
+
+  /* ============================================================
+     PILL
+     ============================================================ */
+  .pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border-2);
+    color: var(--text-2);
+    background: var(--bg-2);
+  }
+  .pill.green { color: var(--green); border-color: var(--green-soft-2); background: var(--green-soft); }
+  .pill.train { color: var(--train); border-color: rgba(110,168,255,0.30); background: rgba(110,168,255,0.10); }
+  .pill.gen   { color: var(--gen);   border-color: rgba(197,163,255,0.30); background: rgba(197,163,255,0.10); }
+
+  /* ============================================================
+     CODE-WITH-FOLD (collapse if >10 lines)
+     ============================================================ */
+  .codefold { position: relative; }
+  .codefold pre { max-height: 280px; overflow: hidden; }
+  .codefold.open pre { max-height: none; }
+  .codefold .fade {
+    position: absolute;
+    bottom: 36px; left: 0; right: 0;
+    height: 50px;
+    background: linear-gradient(180deg, transparent, var(--bg-1));
+    pointer-events: none;
+  }
+  .codefold.open .fade { display: none; }
+  .codefold .toggle {
+    margin-top: 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--green);
+    cursor: pointer;
+    background: none;
+    border: none;
+    padding: 0;
+  }
+  .codefold .toggle:hover { color: #92d800; }
+
+  /* ============================================================
+     FOOTER
+     ============================================================ */
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 36px 28px 60px;
+    margin-top: 60px;
+    color: var(--text-3);
+    font-size: 13px;
+    font-family: var(--mono);
+    text-align: center;
+  }
+  footer a { color: var(--text-2); margin: 0 8px; }
+</style>
+</head>
+<body>
+
+<!-- =====================================================================
+     TOP NAV
+     ===================================================================== -->
+<nav class="topnav">
+  <div class="topnav-inner">
+    <div class="brand">
+      <div class="dot"></div>
+      <span>NeMo-RL</span> <span style="color:var(--text-3)">/</span> <strong>RL-412</strong>
+    </div>
+    <div class="links">
+      <a href="rl-412-disagg-gen.html" class="active">Architecture</a>
+      <a href="rl-412-fault-tolerance.html">Fault Tolerance</a>
+      <a href="rl-412-router-api.html">Router API</a>
+    </div>
+  </div>
+</nav>
+
+<!-- =====================================================================
+     HERO
+     ===================================================================== -->
+<section class="hero">
+  <div class="hero-inner">
+    <span class="eyebrow">RL-412 · Disaggregated Generation</span>
+    <h1>
+      Two clusters. <span class="accent">One router.</span><br/>
+      Live shard surgery during RL training.
+    </h1>
+    <p class="lead">
+      Train the policy on one Kubernetes RayCluster. Roll out on another.
+      Synchronize weights over a cross-cluster NCCL group. Resize the gen
+      fleet at any step boundary &mdash; without restarting the run, without
+      regressing step time, without serving stale weights.
+    </p>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="v">8&#x2009;+&#x2009;8</div>
+        <div class="l">30B Train + Gen Pods</div>
+      </div>
+      <div class="stat">
+        <div class="v">48</div>
+        <div class="l">GPUs (30B Recipe)</div>
+      </div>
+      <div class="stat">
+        <div class="v">28</div>
+        <div class="l">Router Endpoints</div>
+      </div>
+      <div class="stat">
+        <div class="v">0%</div>
+        <div class="l">Step-Time Regression</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<main>
+
+<!-- =====================================================================
+     1. WHAT IT IS
+     ===================================================================== -->
+<section id="what">
+  <h2><span class="num">01</span>What it is</h2>
+  <div class="tldr">
+    <div class="tldr-label">Three sentences</div>
+    <p>RL-412 splits NeMo-RL's GRPO into two long-running RayClusters: one trains, the other generates. A single FastAPI router per gen daemon owns every external interaction &mdash; data plane, control plane, lifecycle, weight sync, metrics &mdash; on port 8089.</p>
+    <p>Cross-cluster NCCL (the <code>model_update_group</code>) flows weights from train to gen on every refit; the router orchestrates it.</p>
+    <p>Crucially, the router can <em>resize</em> the gen fleet mid-run via <code>add_shard</code>/<code>remove_shard</code>, and the train side will rendezvous at the new world size on the next refit. That is the foundation for the fault-tolerance work in <a href="rl-412-fault-tolerance.html">RL-412 FT</a>.</p>
+  </div>
+
+  <div class="archbox">
+    <svg viewBox="0 0 1080 380" role="img" aria-label="Disaggregated topology diagram">
+      <!-- Train cluster -->
+      <rect class="train-box" x="40" y="60" width="320" height="300" rx="10"/>
+      <text class="lbl-strong" x="60" y="88" fill="#6ea8ff">Train RayCluster</text>
+      <text class="tag" x="60" y="106">megatron · ep=8 · dp=4</text>
+      <text class="num" x="60" y="346">8 worker pods · 32 GPUs (30B recipe)</text>
+
+      <!-- Train GPUs grid (compressed to top of cluster) -->
+      <g>
+        <rect class="gpu" x="60" y="126" width="40" height="32" rx="4" stroke="var(--bad)" stroke-width="2"/>
+        <rect class="gpu" x="108" y="126" width="40" height="32" rx="4"/>
+        <rect class="gpu" x="156" y="126" width="40" height="32" rx="4"/>
+        <rect class="gpu" x="204" y="126" width="40" height="32" rx="4"/>
+        <rect class="gpu" x="252" y="126" width="40" height="32" rx="4"/>
+        <rect class="gpu" x="60" y="166" width="40" height="32" rx="4"/>
+        <rect class="gpu" x="108" y="166" width="40" height="32" rx="4"/>
+        <rect class="gpu" x="156" y="166" width="40" height="32" rx="4"/>
+        <text class="tag" x="60" y="218">policy worker · refit_policy_generation()</text>
+        <text x="80" y="148" font-size="11" fill="var(--bad)" text-anchor="middle" font-weight="700">★</text>
+      </g>
+
+      <!-- RefitWorker sub-rect (sibling actor, shares GPU 0) -->
+      <g>
+        <rect x="55" y="232" width="290" height="92" rx="8" fill="rgba(244,114,114,0.10)" stroke="var(--bad)" stroke-width="1.5"/>
+        <text class="lbl-strong" x="68" y="252" fill="var(--bad)" font-size="13">RefitWorker</text>
+        <text class="tag" x="68" y="268" font-size="9.5" style="letter-spacing:0.02em">sibling Ray actor · shares ★ GPU 0</text>
+        <text class="tag" x="68" y="284" font-size="9.5" style="letter-spacing:0.02em">CUDA IPC + ZMQ from policy worker</text>
+        <text class="tag" x="68" y="300" font-size="9.5" style="letter-spacing:0.02em">owns cross-cluster model_update_group</text>
+        <text class="tag" x="68" y="316" font-size="9.5" style="letter-spacing:0.02em">destroys group at end of every refit</text>
+
+        <!-- CUDA IPC arrow: GPU 0 → RefitWorker -->
+        <path d="M 80 158 L 80 232" stroke="var(--bad)" stroke-width="1.5" fill="none" stroke-dasharray="3 3" marker-end="url(#arrowR)"/>
+        <text class="arrow-lbl" x="115" y="200" fill="var(--bad)" font-size="9" text-anchor="start" style="letter-spacing:0.02em">CUDA IPC + ZMQ</text>
+      </g>
+
+      <!-- Router -->
+      <rect class="router-box" x="420" y="140" width="240" height="160" rx="10"/>
+      <text class="lbl-strong" x="435" y="168" fill="var(--green)">GenerationRouter</text>
+      <text class="tag" x="435" y="186" fill="var(--text-1)">unified · port 8089</text>
+      <text class="tag" x="435" y="212">data plane (proxy + replay)</text>
+      <text class="tag" x="435" y="230">control plane (NCCL coord)</text>
+      <text class="tag" x="435" y="248">admin (cordon + lifecycle)</text>
+      <text class="tag" x="435" y="266">status (shards, refit, metrics)</text>
+      <text class="tag" x="435" y="288">17 endpoint groups · 28 endpoints</text>
+
+      <!-- Gen cluster -->
+      <rect class="gen-box" x="720" y="60" width="320" height="300" rx="10"/>
+      <text class="lbl-strong" x="740" y="88" fill="#c5a3ff">Gen RayCluster</text>
+      <text class="tag" x="740" y="106">vllm · per-shard openai server</text>
+      <text class="num" x="740" y="346">N dynamic worker pods (autoscaler v2)</text>
+
+      <!-- Gen DP shards -->
+      <g>
+        <rect class="gpu gen" x="740" y="126" width="50" height="40" rx="4"/>
+        <text class="tag" x="751" y="180" fill="var(--gen)">dp-0</text>
+        <rect class="gpu gen" x="800" y="126" width="50" height="40" rx="4"/>
+        <text class="tag" x="811" y="180" fill="var(--gen)">dp-1</text>
+        <rect class="gpu gen" x="860" y="126" width="50" height="40" rx="4"/>
+        <text class="tag" x="871" y="180" fill="var(--gen)">dp-2</text>
+        <rect class="gpu gen" x="920" y="126" width="50" height="40" rx="4"/>
+        <text class="tag" x="935" y="180" fill="var(--gen)">...</text>
+        <rect class="gpu gen" x="980" y="126" width="50" height="40" rx="4"/>
+        <text class="tag" x="989" y="180" fill="var(--gen)">dp-N</text>
+        <text class="tag" x="740" y="214">each pod = one vLLM async server</text>
+        <text class="tag" x="740" y="232">model_update_group rank K..K+N</text>
+        <text class="tag" x="740" y="260">/v1/completions</text>
+        <text class="tag" x="740" y="278">/init_collective</text>
+        <text class="tag" x="740" y="296">/update_weights_from_collective</text>
+      </g>
+
+      <!-- Arrows -->
+      <!-- data plane: caller -> router -> shards -->
+      <path class="arrow-data" d="M 360 200 L 415 200" marker-end="url(#arrowG)"/>
+      <text class="arrow-lbl" x="388" y="192" fill="var(--data)" font-size="10" text-anchor="middle">data</text>
+      <path class="arrow-data" d="M 660 200 L 720 146 M 660 200 L 720 200 M 660 200 L 720 250" stroke-dasharray="4 4" marker-end="url(#arrowG)"/>
+
+      <!-- Control plane: router -> shards -->
+      <path class="arrow-ctrl" d="M 660 240 L 720 270 M 660 240 L 720 290" marker-end="url(#arrowG)"/>
+      <text class="arrow-lbl" x="690" y="232" fill="var(--green)" font-size="10" text-anchor="middle">control</text>
+
+      <!-- NCCL: RefitWorker -> gen shards (originates from RefitWorker, curves above boxes) -->
+      <path class="arrow-nccl" d="M 345 278 C 460 278, 540 18, 720 70" marker-end="url(#arrowR)" marker-start="url(#arrowR2)"/>
+      <text class="arrow-lbl" x="560" y="34" fill="var(--bad)" text-anchor="middle" font-size="11">cross-cluster NCCL · model_update_group (12 chunks)</text>
+
+      <defs>
+        <marker id="arrowG" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path d="M0,0 L8,4 L0,8 z" fill="var(--data)"/>
+        </marker>
+        <marker id="arrowR" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path d="M0,0 L8,4 L0,8 z" fill="var(--bad)"/>
+        </marker>
+        <marker id="arrowR2" markerWidth="8" markerHeight="8" refX="1" refY="4" orient="auto">
+          <path d="M8,0 L0,4 L8,8 z" fill="var(--bad)"/>
+        </marker>
+      </defs>
+    </svg>
+    <div class="legend">
+      <div class="item"><div class="swatch" style="background:var(--data)"></div>Data plane (HTTP, proxied)</div>
+      <div class="item"><div class="swatch" style="background:var(--green)"></div>Control plane (HTTP)</div>
+      <div class="item"><div class="swatch" style="background:var(--bad)"></div>NCCL collective (binary)</div>
+    </div>
+  </div>
+</section>
+
+
+<!-- =====================================================================
+     2. HOW IT WORKS — INTERACTIVE REFIT FLOW
+     ===================================================================== -->
+<section id="howitworks">
+  <h2><span class="num">02</span>How a refit actually works</h2>
+  <p class="section-sub">
+    Every training step ends with weight sync from train to gen. Walk through it
+    one message at a time. Switch tabs to see the steady-state path versus a
+    kill-and-recover cycle &mdash; same machinery, different sequence.
+  </p>
+
+  <div class="replay">
+    <div class="replay-tabs" role="tablist">
+      <button class="active" data-flow="steady">Steady-state refit</button>
+      <button data-flow="kill">Kill &rarr; recover cycle</button>
+    </div>
+
+    <div class="step-progress" id="progress"></div>
+
+    <div class="replay-stage">
+      <svg viewBox="0 0 1180 420" id="stage" preserveAspectRatio="xMidYMid meet">
+        <!-- Train -->
+        <g id="n-train" class="stage-node">
+          <rect x="20" y="120" width="220" height="200" rx="10" class="train-box"/>
+          <text class="lbl-strong" x="40" y="150" fill="#6ea8ff">Train cluster</text>
+          <text class="tag" x="40" y="166">policy worker · rank 0..K-1</text>
+          <rect class="gpu" x="40"  y="174" width="28" height="22" rx="3" stroke="var(--bad)" stroke-width="1.8"/>
+          <text x="54" y="190" font-size="9" fill="var(--bad)" text-anchor="middle">★</text>
+          <rect class="gpu" x="74"  y="174" width="28" height="22" rx="3"/>
+          <rect class="gpu" x="108" y="174" width="28" height="22" rx="3"/>
+          <rect class="gpu" x="142" y="174" width="28" height="22" rx="3"/>
+          <rect class="gpu" x="176" y="174" width="28" height="22" rx="3"/>
+          <rect class="gpu" x="40"  y="200" width="28" height="22" rx="3"/>
+          <rect class="gpu" x="74"  y="200" width="28" height="22" rx="3"/>
+          <rect class="gpu" x="108" y="200" width="28" height="22" rx="3"/>
+          <text class="tag" x="40" y="240" font-size="10">refit_policy_generation()</text>
+
+          <!-- RefitWorker sub-rect (sibling actor, shares ★ GPU 0) -->
+          <rect x="32" y="250" width="200" height="62" rx="6" fill="rgba(244,114,114,0.10)" stroke="var(--bad)" stroke-width="1.3"/>
+          <text class="lbl-strong" x="42" y="266" fill="var(--bad)" font-size="11">RefitWorker</text>
+          <text class="tag" x="42" y="280" font-size="9" style="letter-spacing:0.02em">shares ★ GPU 0 (sibling actor)</text>
+          <text class="tag" x="42" y="294" font-size="9" style="letter-spacing:0.02em">CUDA IPC + ZMQ from policy</text>
+          <text class="tag" x="42" y="307" font-size="9" style="letter-spacing:0.02em">owns model_update_group</text>
+        </g>
+
+        <!-- Router -->
+        <g id="n-router" class="stage-node">
+          <rect x="420" y="140" width="260" height="160" rx="10" class="router-box"/>
+          <text class="lbl-strong" x="435" y="170" fill="var(--green)">Router</text>
+          <text class="tag" x="435" y="190" fill="var(--text-1)">port 8089</text>
+          <text class="tag" x="435" y="216">/refit_ready</text>
+          <text class="tag" x="435" y="234">/current_gen_world_size</text>
+          <text class="tag" x="435" y="252">/init_collective</text>
+          <text class="tag" x="435" y="270">/update_weights_from_collective</text>
+          <text class="tag" x="435" y="288">promote_all_joining()</text>
+        </g>
+
+        <!-- Gen -->
+        <g id="n-gen" class="stage-node">
+          <rect x="850" y="120" width="230" height="200" rx="10" class="gen-box"/>
+          <text class="lbl-strong" x="870" y="150" fill="#c5a3ff">Gen cluster</text>
+          <text class="tag" x="870" y="170">vllm shards (dp-0..dp-N)</text>
+          <g id="g-shards">
+            <g class="shard" data-id="dp-0">
+              <rect class="gpu gen" x="870" y="186" width="44" height="32" rx="4"/>
+              <text class="tag" x="881" y="206" fill="var(--gen)">dp-0</text>
+            </g>
+            <g class="shard" data-id="dp-1">
+              <rect class="gpu gen" x="920" y="186" width="44" height="32" rx="4"/>
+              <text class="tag" x="931" y="206" fill="var(--gen)">dp-1</text>
+            </g>
+            <g class="shard" data-id="dp-2">
+              <rect class="gpu gen" x="970" y="186" width="44" height="32" rx="4"/>
+              <text class="tag" x="981" y="206" fill="var(--gen)">dp-2</text>
+            </g>
+            <g class="shard" data-id="dp-3">
+              <rect class="gpu gen" x="1020" y="186" width="44" height="32" rx="4"/>
+              <text class="tag" x="1031" y="206" fill="var(--gen)">dp-3</text>
+            </g>
+          </g>
+          <text class="tag" x="870" y="248">rank K..K+N</text>
+          <text class="tag" x="870" y="266">vLLM async openai server</text>
+          <text class="tag" x="870" y="284">/v1/completions</text>
+        </g>
+
+        <!-- Arrows (placeholders, switched by JS) -->
+        <g id="arrows">
+          <g class="stage-arrow" data-id="t-r-1">
+            <path d="M 240 200 Q 330 180 420 200" stroke="var(--green)" stroke-width="2" fill="none" marker-end="url(#stage-arrow-g)"/>
+            <text class="arrow-lbl" x="328" y="178" fill="var(--green)" text-anchor="middle" font-size="10.5">GET /refit_ready</text>
+          </g>
+          <g class="stage-arrow" data-id="t-r-2">
+            <path d="M 240 230 Q 330 230 420 230" stroke="var(--green)" stroke-width="2" fill="none" marker-end="url(#stage-arrow-g)"/>
+            <text class="arrow-lbl" x="328" y="222" fill="var(--green)" text-anchor="middle" font-size="10.5">GET /current_gen_world_size</text>
+          </g>
+          <g class="stage-arrow" data-id="t-r-init">
+            <path d="M 240 260 Q 330 280 420 260" stroke="var(--green)" stroke-width="2" fill="none" marker-end="url(#stage-arrow-g)"/>
+            <text class="arrow-lbl" x="328" y="302" fill="var(--green)" text-anchor="middle" font-size="10.5">POST /init_collective</text>
+          </g>
+          <g class="stage-arrow" data-id="r-g-init">
+            <path d="M 680 230 Q 760 230 850 230" stroke="var(--green)" stroke-width="2" fill="none" marker-end="url(#stage-arrow-g)"/>
+            <text class="arrow-lbl" x="758" y="222" fill="var(--green)" text-anchor="middle" font-size="10.5">init on workers</text>
+          </g>
+          <g class="stage-arrow" data-id="t-g-nccl">
+            <path d="M 228 280 C 320 280, 350 60, 850 138" stroke="var(--bad)" stroke-width="2.4" fill="none" marker-end="url(#stage-arrow-r)" marker-start="url(#stage-arrow-r2)"/>
+            <text class="arrow-lbl" x="560" y="62" fill="var(--bad)" text-anchor="middle" font-size="11">NCCL rendezvous · RefitWorker ↔ gen ranks</text>
+          </g>
+          <g class="stage-arrow" data-id="t-r-update">
+            <path d="M 240 290 Q 330 310 420 290" stroke="var(--green)" stroke-width="2" fill="none" marker-end="url(#stage-arrow-g)"/>
+            <text class="arrow-lbl" x="330" y="346" fill="var(--green)" text-anchor="middle" font-size="10.5">POST /update_weights_from_collective</text>
+          </g>
+          <g class="stage-arrow" data-id="t-g-bcast">
+            <path d="M 228 270 C 330 270, 350 24, 850 102" stroke="var(--bad)" stroke-width="2.4" fill="none" marker-end="url(#stage-arrow-r)"/>
+            <text class="arrow-lbl" x="560" y="22" fill="var(--bad)" text-anchor="middle" font-size="11">NCCL broadcast · weights (12 chunks via RefitWorker)</text>
+          </g>
+          <g class="stage-arrow" data-id="r-promote">
+            <path d="M 550 300 Q 550 340 550 374" stroke="var(--green)" stroke-width="2" fill="none" marker-end="url(#stage-arrow-g)"/>
+            <text class="arrow-lbl" x="550" y="395" fill="var(--green)" text-anchor="middle" font-size="11">promote_all_joining()</text>
+          </g>
+          <g class="stage-arrow" data-id="r-remove">
+            <path d="M 680 200 Q 760 180 850 200" stroke="var(--bad)" stroke-width="2" fill="none" marker-end="url(#stage-arrow-r)"/>
+            <text class="arrow-lbl" x="760" y="172" fill="var(--bad)" text-anchor="middle" font-size="10.5">remove_shard()</text>
+          </g>
+          <g class="stage-arrow" data-id="r-reset">
+            <path d="M 680 270 Q 760 270 850 250" stroke="var(--green)" stroke-width="2" fill="none" marker-end="url(#stage-arrow-g)"/>
+            <text class="arrow-lbl" x="766" y="296" fill="var(--green)" text-anchor="middle" font-size="10.5">group.destroy() · per-refit</text>
+          </g>
+          <g class="stage-arrow" data-id="r-add">
+            <path d="M 680 200 Q 760 180 850 200" stroke="var(--green)" stroke-width="2" fill="none" marker-end="url(#stage-arrow-g)"/>
+            <text class="arrow-lbl" x="760" y="172" fill="var(--green)" text-anchor="middle" font-size="10.5">add_shard (new dp-N)</text>
+          </g>
+        </g>
+        <defs>
+          <marker id="stage-arrow-g" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="var(--green)"/>
+          </marker>
+          <marker id="stage-arrow-r" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="var(--bad)"/>
+          </marker>
+          <marker id="stage-arrow-r2" markerWidth="8" markerHeight="8" refX="1" refY="4" orient="auto">
+            <path d="M8,0 L0,4 L8,8 z" fill="var(--bad)"/>
+          </marker>
+        </defs>
+      </svg>
+    </div>
+
+    <div class="replay-controls">
+      <button class="btn" id="btn-prev">&larr; Prev</button>
+      <button class="btn primary" id="btn-next">Next &rarr;</button>
+      <button class="btn" id="btn-reset">Reset</button>
+      <button class="btn" id="btn-auto">Auto-play</button>
+      <div class="step-readout">
+        <span class="phase" id="step-num">01</span>
+        <span class="of">/</span>
+        <span class="total" id="step-total">10</span>
+      </div>
+    </div>
+
+    <div class="step-panel">
+      <div class="step-title" id="step-title">Step</div>
+      <div class="step-desc" id="step-desc">.</div>
+    </div>
+  </div>
+</section>
+
+
+<!-- =====================================================================
+     3. ROUTER API REFERENCE (moved)
+     ===================================================================== -->
+<section id="api">
+  <h2><span class="num">03</span>Router API reference</h2>
+  <p class="section-sub">
+    The unified router exposes 28 endpoints across four groups (data plane, status, admin, control plane)
+    on a single FastAPI on port 8089.
+  </p>
+  <div class="callout green">
+    The full 28-endpoint reference moved to its own page so this design doc stays focused on architecture.
+    See <a href="rl-412-router-api.html"><strong>RL-412 Router API &rarr;</strong></a> for the per-endpoint
+    input / output schemas, error paths, and curl examples.
+  </div>
+</section>
+
+
+<!-- =====================================================================
+     4. CROSS-CLUSTER NCCL — MODEL_UPDATE_GROUP
+     ===================================================================== -->
+<section id="nccl">
+  <h2><span class="num">04</span>Cross-cluster NCCL</h2>
+  <p class="section-sub">
+    Weight sync travels over a single NCCL group spanning every train rank
+    plus every gen rank: <code>model_update_group</code>. The router owns
+    rendezvous; the train side owns the broadcast.
+  </p>
+
+  <div class="grid-2">
+    <div class="card">
+      <h3 style="margin-top:0">Rendezvous</h3>
+      <p style="color:var(--text-1)">Train side picks a master <code>(ip, port)</code> on the train cluster and dispatches <code>init_collective</code> symmetrically: every train rank and every gen rank enters the same NCCL <code>init_process_group</code> with a contiguous <code>WORLD_SIZE = train_ws + gen_ws</code>. Train ranks fill <code>0..train_ws-1</code>; gen ranks <code>train_ws..train_ws+gen_ws-1</code>.</p>
+      <p style="color:var(--text-1)">Each pair takes ~3-8 seconds at this scale. <strong>Bounded</strong> at 120s per attempt.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Broadcast</h3>
+      <p style="color:var(--text-1)">Train rank 0 packs params into ping-pong buffers and CUDA-IPC-hands them to <strong>RefitWorker</strong>, a sibling Ray actor on the same node + same GPU (separate process). RefitWorker NCCL-broadcasts each chunk to every gen rank, then ACKs back so the sender can swap buffers. ~12 chunks of ~5GB each for Qwen3-30B-A3B. <strong>The cross-cluster NCCL group lives only inside RefitWorker</strong> &mdash; the Megatron worker process never touches it, so a queued NCCL error from a dead gen peer can't poison Megatron's training streams.</p>
+      <p style="color:var(--text-1)">At the end of every refit &mdash; success OR failure &mdash; <strong>both sides destroy the group</strong>: RefitWorker's <code>broadcast_weights_until_complete</code> runs <code>group.destroy()</code> in <code>finally:</code>; <code>vllm_backend.update_weights_from_collective</code> does the same on each gen worker. The placement groups stay up across refits; only the NCCL group is rebuilt by the next <code>init_collective</code>.</p>
+    </div>
+  </div>
+
+  <div class="callout green" style="margin-top:18px">
+    <strong>Per-refit teardown is the safety property.</strong> Between refits there is <em>no</em> NCCL state spanning train&harr;gen. A gen peer that dies outside the broadcast window has no peer process to poison &mdash; the next refit's <code>init_collective</code> rebuilds from scratch on every shard. This is what makes burst kills (multiple shards dying simultaneously, every cycle) recoverable rather than cascading to <code>world=0</code>.
+  </div>
+
+  <details open>
+    <summary><span style="color:var(--gen);margin-right:8px">REFIT</span> RefitWorker split-actor architecture</summary>
+    <div class="body">
+      <p style="color:var(--text-1);font-size:14.5px"><strong>The problem.</strong> Hosting <code>model_update_group</code> inside the Megatron worker process meant a gen peer dying mid-broadcast would queue <code>cudaErrorLaunchFailure</code> into rank 0's primary CUDA context. Megatron's EP/TP/PP/DP groups all share that context &mdash; a single queued device error could surface on any subsequent CUDA op, anywhere in the training step.</p>
+      <p style="color:var(--text-1);font-size:14.5px"><strong>The fix.</strong> The cross-cluster group now lives in a sibling Ray actor, <code>RefitWorker</code>, scheduled with hard <code>NodeAffinitySchedulingStrategy</code> onto train rank 0's node and pinned to rank 0's physical GPU via <code>CUDA_VISIBLE_DEVICES</code> + <code>RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1</code>. <code>num_gpus=0</code> tells Ray not to allocate a fresh device. Two processes on one GPU, independent primary CUDA contexts, joined by CUDA IPC.</p>
+      <pre><code><span class="tok-c"># Cross-cluster world layout (per-refit):</span>
+<span class="tok-c">#   rank 0:    RefitWorker      (sibling Ray actor, train rank 0's GPU)</span>
+<span class="tok-c">#   ranks 1..N: vLLM gen workers (one per gen pod)</span>
+<span class="tok-c"># Megatron policy workers DO NOT participate.</span></code></pre>
+      <p style="color:var(--text-1);font-size:14.5px"><strong>Data path per refit.</strong></p>
+      <ol style="margin:8px 0 0 0; color:var(--text-1); font-size:14.5px">
+        <li>All train ranks call <code>megatron_bridge.export_hf_weights</code> to materialize full-precision weights via intra-cluster TP/EP/PP all-gathers. Only rank 0 streams onward.</li>
+        <li>Rank 0 packs params into one of two GPU "ping-pong" buffers, runs <code>torch.cuda.synchronize()</code>, exports a CUDA IPC handle via <code>reduce_tensor</code>, and sends <code>(handle, [], used_bytes)</code> over ZMQ REQ.</li>
+        <li>RefitWorker (REP) <code>recv_pyobj</code>s the handle, <code>rebuild_cuda_tensor</code>s it (zero-copy view of rank 0's GPU memory &mdash; same physical GPU), <code>clone()</code>s into RefitWorker's own allocation, syncs, and frees the IPC view back to the sender.</li>
+        <li>RefitWorker NCCL-broadcasts the local copy to gen ranks, syncs, ACKs back so the sender can swap to the other ping-pong buffer.</li>
+        <li>When the sender is done it sends <code>IPCProtocol.COMPLETE</code>; RefitWorker breaks out, returns, and (in <code>finally:</code>) destroys the group.</li>
+      </ol>
+      <p style="color:var(--text-1);font-size:14.5px">For Qwen3-30B-A3B that's roughly 12 chunks of ~5GB each, logged as <code>forwarded 12 chunks via RefitWorker</code> on the producer side.</p>
+      <p style="color:var(--text-1);font-size:14.5px"><strong>Why this is safe.</strong> A peer death only poisons RefitWorker's CUDA context. The Policy <code>ray.kill</code>s and respawns RefitWorker at the next refit (<code>lm_policy._ensure_refit_worker</code> liveness ping); Megatron's process is unaffected because it sits behind a process boundary. Combined with the per-refit <code>group.destroy()</code> in RefitWorker's <code>finally:</code> block (mirrored on the gen side in <code>vllm_backend.update_weights_from_collective</code>), there is no NCCL state spanning refits anywhere &mdash; not in Megatron, not in RefitWorker, not in vLLM workers.</p>
+      <p style="font-family:var(--mono);font-size:13px;color:var(--text-3);margin-top:12px">Source: <code>nemo_rl/models/policy/workers/refit_worker.py</code>, <code>lm_policy._ensure_refit_worker</code>, <code>megatron_policy_worker.broadcast_weights_for_collective</code> (path 1), <code>nemo_rl/utils/packed_tensor.py</code> (<code>packed_broadcast_producer</code> / <code>packed_broadcast_consumer</code>).</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>How the train side handles a peer that dies <em>during</em> rendezvous</summary>
+    <div class="body">
+      <p>The interesting failure mode is mid-rendezvous: rank K joins NCCL and then disappears. Without a timeout, every other rank blocks on <code>ncclCommInitRank</code> forever.</p>
+      <p>RL-412 wraps <code>init_collective</code> in a 4-attempt loop with a 120s rendezvous budget per attempt. On timeout: <code>abort_collective</code> on the train side, <code>ray.cancel(force=True)</code> on the futures, sleep 3s for the gen side to settle, re-read <code>/current_gen_world_size</code> (which now reflects the new fault), and retry at the smaller world. After 4 attempts it raises &mdash; the run fails loudly rather than silently wedge.</p>
+      <p>The gen side recovers naturally because per-refit teardown already destroyed every survivor's <code>model_update_group</code> at the end of the prior refit (in <code>vllm_backend.update_weights_from_collective</code>'s <code>finally:</code>). There is no leftover NCCL state to abort &mdash; the next <code>init_collective</code> rebuilds from scratch at the new (smaller) world. Earlier designs <em>did</em> dispatch <code>reset_collective</code> on survivors from <code>remove_shard</code>/<code>add_shard</code>, but that call turned out to cascade-evict survivors under burst kills (queued behind active NCCL ops, exceeded the 30s timeout, router falsely flagged the slow survivor as poisoned, kicked it, queued reset on the next survivor, etc.) and was removed. See the comment block in <code>generation_router.py</code> at <code>remove_shard</code> for the full failure mode.</p>
+      <p>Source: <code>nemo_rl/models/generation/remote_generation.py:194</code> (<code>ensure_collective_synced</code>); <code>nemo_rl/models/generation/generation_router.py</code> (<code>remove_shard</code> NB comment).</p>
+    </div>
+  </details>
+
+  <details>
+    <summary><span style="color:var(--good);margin-right:8px">PERF</span> NCCL library warmup at vLLM startup</summary>
+    <div class="body">
+      <p>The disagg recipe runs vLLM at TP=1/PP=1/EP=1, so there is <em>no</em> intra-shard NCCL group inside a gen worker's process. The cross-cluster <code>model_update_group</code> is the FIRST NCCL collective the engine_core process ever sees. NCCL's per-process lazy init (<code>dlopen</code> shared libs, IB device probe, NCCL workspace <code>cuMemMap</code>) runs on that first call and adds 15-20s to the first <code>init_collective</code> after a fresh shard joins &mdash; which surfaces as a fat step-time spike on the FIRST refit involving a new pod.</p>
+      <p><code>VllmGenerationWorker.warmup_nccl_library</code> pre-pays that cost during bring-up by creating a degenerate 1-rank <code>Communicator.init</code>, running a no-op broadcast on a 1-element tensor, and tearing it down. NCCL allows <code>nranks=1</code> &mdash; ops are no-ops, but the per-process state machine runs the same init paths as a real comm. Cost: ~1-2s once per pod, fully hidden by the existing vLLM init.</p>
+      <p>Wired into both <code>add_dp_worker</code> Phase A (after actor spawn, on the bare actor handle before <code>append_spawned_worker</code>) and <code>prepare_refit_info</code> for the initial cohort. Validated via the <code>nccl_init_timing</code> log line in <code>StatelessProcessGroup</code>: cold-pod first init showed <code>comm_init=17.99s</code>; warmed pod showed <code>~4-5s</code>. Net effect: first-refit-with-new-pod time dropped from ~18s to ~4-5s.</p>
+      <p style="font-family:var(--mono);font-size:13px;color:var(--text-3);margin-top:12px">Source: <code>nemo_rl/models/generation/vllm/vllm_backend.py</code> (<code>warmup_nccl_library</code>), <code>vllm_worker_async.py</code> (<code>warmup_nccl_library_async</code>), <code>vllm_generation.add_dp_worker</code> + <code>prepare_refit_info</code>.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary><span style="color:var(--good);margin-right:8px">PERF</span> <code>load_format: dummy</code> &mdash; skip safetensor load on bringup</summary>
+    <div class="body">
+      <p>vLLM's default bring-up reads model weights from disk (~6-7 minutes for Qwen3-30B-A3B safetensors). On the FT path, <em>every</em> kill triggers an <code>add_shard</code> that provisions a replacement pod, and the joining&rarr;ready window directly affects how much steady-state time each FT cycle gets. Six minutes of safetensor load every cycle is the dominant cost in that window.</p>
+      <p>Setting <code>load_format: dummy</code> in the vLLM config skips the disk read entirely &mdash; vLLM allocates randomly-initialized tensors of the right shape/dtype. Bring-up drops from ~6-7min to ~1-2min.</p>
+      <p>Safe because <code>prepare_refit_info</code> runs immediately after init priming <code>state_dict_info</code>, and the FIRST refit broadcast lands on correctly-shaped (junk-valued) buffers and overwrites them in-place. The data plane gates on <code>status == "ready"</code>, and a joining shard never serves traffic until <code>promote_all_joining()</code> flips it post-broadcast &mdash; so the junk values are never observable to a rollout client.</p>
+      <p style="font-family:var(--mono);font-size:13px;color:var(--text-3);margin-top:12px">Source: <code>infra/examples/generation_standalone_qwen3_30b_ft_full.yaml</code> (<code>vllm_cfg.load_format: dummy</code>).</p>
+    </div>
+  </details>
+
+
+  <details>
+    <summary>Why only rank 0 (RefitWorker) participates in the cross-cluster comm</summary>
+    <div class="body">
+      <p>An earlier design put every train rank into <code>model_update_group</code> so EP shards could broadcast directly to the corresponding gen rank. That worked but tied every train rank's primary CUDA context to the lifetime of cross-cluster NCCL &mdash; one dead gen peer poisoned every Megatron rank.</p>
+      <p>The current design splits the producer in half. All train ranks run <code>megatron_bridge.export_hf_weights</code>, which performs intra-cluster TP/EP/PP all-gathers to materialize full-precision weights on rank 0. Only rank 0 then forwards the materialized chunks to RefitWorker via CUDA IPC + ZMQ. RefitWorker (a sibling Ray actor sharing rank 0's physical GPU but in its own process) is the sole train-side participant in the cross-cluster <code>model_update_group</code>. Cross-cluster world layout is now <code>{rank 0: RefitWorker, ranks 1..N: gen workers}</code> &mdash; Megatron does not touch it.</p>
+      <p>The trade-off: one extra IPC hop per chunk (~free, same physical GPU, zero-copy). The win: a peer death only poisons RefitWorker's CUDA context. The Policy <code>ray.kill</code>s and respawns it at the next refit; Megatron's process is unaffected.</p>
+      <p>Source: <code>nemo_rl/models/policy/workers/refit_worker.py</code>, <code>lm_policy._ensure_refit_worker</code>, <code>megatron_policy_worker.broadcast_weights_for_collective</code> (path 1).</p>
+    </div>
+  </details>
+</section>
+
+
+<!-- =====================================================================
+     5. CONFIGURATION & TOPOLOGY
+     ===================================================================== -->
+<section id="topology">
+  <h2><span class="num">05</span>Topology &amp; configuration</h2>
+  <p class="section-sub">
+    Two recipes, both on a GB300 NVL72 cluster with the
+    <a href="https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/dynamic-resource-allocation.html">Dynamic Resource Allocation</a>
+    pattern shared from gen to train so a single ComputeDomain spans
+    both clusters (cross-cluster NCCL needs it).
+  </p>
+
+  <div class="grid-2">
+    <div class="card">
+      <h3 style="margin-top:0; color: var(--green)">Qwen3-4B FT</h3>
+      <table>
+        <tr><th>Train</th><td>1 pod &times; 4 GB300</td></tr>
+        <tr><th>Gen</th><td>4 pods &times; 1 GPU (TP=1)</td></tr>
+        <tr><th>Total</th><td>8 GPUs</td></tr>
+        <tr><th>Backend</th><td>Automodel (FSDP2)</td></tr>
+        <tr><th>Recipe</th><td><code>qwen3_4b_if_fault_tolerant</code></td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0; color: var(--green)">Qwen3-30B-A3B FT</h3>
+      <table>
+        <tr><th>Train</th><td>8 pods &times; 4 GB300 <span class="pill green">2&times; from 4n</span></td></tr>
+        <tr><th>Gen</th><td>8 pods &times; 1 GPU (TP=1)</td></tr>
+        <tr><th>Total</th><td>40 GPUs</td></tr>
+        <tr><th>Backend</th><td>Megatron · EP=8 · DP=4</td></tr>
+        <tr><th>Recipe</th><td><code>qwen3_30b_if_fault_tolerant</code></td></tr>
+      </table>
+    </div>
+  </div>
+
+  <details style="margin-top:20px">
+    <summary>Why we doubled the 30B train side</summary>
+    <div class="body">
+      <p>The canonical <code>qwen3_30b_math_4n_4gpu</code> shape uses 4 train pods (16 GPUs) with EP=8, DP=2. Step time ran ~50-70s, which made stress-testing the FT path slow.</p>
+      <p>RL-412 doubles to 8 train pods (32 GPUs); EP=8 stays, DP factor goes 2 &rarr; 4. Per-step wall time roughly halves. Same recipe yaml, same Megatron config, just a wider train cluster. See <code>infra/nrl_k8s/examples/qwen3_30b_if_fault_tolerant.gb300.infra.yaml</code>.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>The DRA dance &mdash; why train and gen share ResourceClaimTemplates</summary>
+    <div class="body">
+      <p>Cross-cluster NCCL on GB300 hits <code>cudaErrorOperationNotPermitted</code> (CUDA error 800) on the IMEX channel device unless both clusters live in the same NVIDIA <code>ComputeDomain</code>. The gen cluster declares the standard <code>compute-domain-channel</code> and <code>roce-channel</code> claims; nrl-k8s auto-creates ResourceClaimTemplates from those.</p>
+      <p>The train cluster references those templates by name via <em>custom</em>-named claims (<code>shared-compute-domain</code>, <code>shared-roce</code>). The nrl-k8s CLI rewrites template names only for the standard claim names, so by deviating we inherit the gen cluster's templates verbatim. Result: one ComputeDomain, two RayClusters, one fabric.</p>
+    </div>
+  </details>
+</section>
+
+
+<!-- =====================================================================
+     6. WHAT'S NEXT
+     ===================================================================== -->
+<section id="next">
+  <h2><span class="num">06</span>What&rsquo;s next</h2>
+  <p class="section-sub">
+    RL-412 lands the substrate. Several tracks build on it.
+  </p>
+
+  <div class="grid-3">
+    <div class="card">
+      <h3 style="margin-top:0">Asymmetric scaling</h3>
+      <p style="font-size:14.5px;color:var(--text-1)">Right now train and gen scale together. Future work: scale gen independently of train when rollouts are the bottleneck (or vice versa). The router already supports <code>add_shard</code> at runtime; the missing piece is a policy that decides <em>when</em>.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Heterogeneous gen</h3>
+      <p style="font-size:14.5px;color:var(--text-1)">Mix shard types: some H100, some GB300, some on-prem. The router already abstracts the per-shard URL; <code>add_dp_worker</code> needs to accept placement hints.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Multi-tenant gen</h3>
+      <p style="font-size:14.5px;color:var(--text-1)">One gen cluster fronting many simultaneous training runs. Each refit pushes a different model checkpoint to a partition of shards. The hardest piece is the NCCL group lifecycle &mdash; today there's one comm per (train, gen) pair.</p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  RL-412 disaggregated generation &middot;
+  <a href="rl-412-fault-tolerance.html">Fault tolerance &rarr;</a> &middot;
+  <a href="rl-412-router-api.html">Router API &rarr;</a> &middot;
+  <a href="https://github.com/NVIDIA-NeMo/RL">NeMo-RL on GitHub</a>
+</footer>
+
+
+<!-- =====================================================================
+     SCRIPTS
+     ===================================================================== -->
+<script>
+/* ===========================================================
+   REFIT FLOW REPLAY
+   =========================================================== */
+const FLOWS = {
+  steady: [
+    {
+      title: "Step boundary",
+      desc: `Training step <code>N</code> just finished. The optimizer has stepped. Time to push fresh weights to gen before sampling the next rollout. <code>refit_policy_generation()</code> kicks off in the train driver.`,
+      active: ["n-train"],
+      arrows: [],
+    },
+    {
+      title: "Poll /refit_ready",
+      desc: `Train driver hits the router with <code>GET /refit_ready</code>. The router returns <code>{ready: false, reason: "nccl_reinit_in_progress"}</code> while a lifecycle op is in flight, otherwise <code>{ready: true, reason: "ok"}</code>.`,
+      active: ["n-train", "n-router"],
+      arrows: ["t-r-1"],
+    },
+    {
+      title: "Read current_gen_world_size",
+      desc: `<code>GET /current_gen_world_size</code> returns the sum of per-shard world sizes for shards in the NCCL group (ready + joining; excludes cordoned/draining). The train driver compares this to its cached <code>_last_synced_world_size</code>.`,
+      active: ["n-train", "n-router"],
+      arrows: ["t-r-2"],
+    },
+    {
+      title: "Steady state: world unchanged",
+      desc: `If the world size hasn't changed, <code>ensure_collective_synced()</code> is a no-op &mdash; the comm from the last refit is reused. Skip straight to broadcast.`,
+      active: ["n-router"],
+      arrows: [],
+    },
+    {
+      title: "POST /update_weights_from_collective",
+      desc: `Train driver dispatches the broadcast: <code>policy.broadcast_weights_for_collective()</code> on the train side, <code>POST /update_weights_from_collective</code> on the gen side via the router. Both sides must enter the NCCL collective simultaneously.`,
+      active: ["n-train", "n-router"],
+      arrows: ["t-r-update", "r-g-init"],
+    },
+    {
+      title: "NCCL broadcast",
+      desc: `Train rank 0 walks the state dict parameter-by-parameter, calls <code>nccl.broadcast(src=0)</code>. Every gen worker receives. ~3 seconds at 30B scale.`,
+      active: ["n-train", "n-gen"],
+      arrows: ["t-g-bcast"],
+    },
+    {
+      title: "Promote joining shards",
+      desc: `If <code>update_weights_from_collective</code> succeeded, the router runs <code>promote_all_joining()</code>. Any shard added since the last refit (status <code>joining</code>) flips to <code>ready</code> &mdash; its weights are now current. Fresh shards are admitted to the data plane only here, not on health probe.`,
+      active: ["n-router"],
+      arrows: ["r-promote"],
+    },
+    {
+      title: "Tear down comm (per-refit, both sides)",
+      desc: `Post-broadcast, RefitWorker (train side) and every gen worker call <code>group.destroy()</code> in their <code>finally:</code> block &mdash; <strong>success OR failure</strong>. The cross-cluster NCCL state is dropped at the end of every refit. Between refits there is no NCCL state spanning train&harr;gen, so a peer death outside the broadcast window can't poison anyone. This is the property that makes burst kills (multiple shards dying at once) recoverable.`,
+      active: ["n-train", "n-gen"],
+      arrows: ["r-reset"],
+    },
+    {
+      title: "Resume training",
+      desc: `<code>refit_policy_generation()</code> returns. The train driver runs the next rollout against the (now fresh-weighted) gen cluster via <code>/v1/completions</code>. Step <code>N+1</code> begins.`,
+      active: ["n-train"],
+      arrows: [],
+    },
+  ],
+
+  kill: [
+    {
+      title: "Steady state",
+      desc: `Run is mid-step. Ready shards <code>dp-0, dp-1, dp-2, dp-3</code>. <code>current_gen_world_size = 4</code>. Train and gen are synchronized.`,
+      active: ["n-train", "n-router", "n-gen"],
+      arrows: [],
+    },
+    {
+      title: "Fault: dp-1 dies",
+      desc: `A shard fails &mdash; pod kill, OOM, NCCL hang, whatever. The router's health poller / proxy 5xx threshold trips. <code>_fire_cordon_hook</code> escalates to <code>remove_shard</code>: drain inflight (≤30s), <code>ray.kill(actor)</code>, free placement group, mark worker indices dead. <strong>No <code>reset_collective</code> dispatch on survivors</strong> &mdash; per-refit teardown already destroyed their <code>model_update_group</code> at the end of the previous refit, so there's nothing to abort.`,
+      active: ["n-router", "n-gen"],
+      arrows: ["r-remove"],
+      faulted: ["dp-1"],
+    },
+    {
+      title: "World shrinks",
+      desc: `<code>dp-1</code> popped from the router's table. <code>current_gen_world_size = 3</code>. Survivors are already free of any NCCL state (per-refit teardown). Refit gate stays open.`,
+      active: ["n-router"],
+      arrows: [],
+      removed: ["dp-1"],
+    },
+    {
+      title: "Train side: ensure_collective_synced",
+      desc: `Next refit: train driver polls <code>/refit_ready</code>, then <code>GET /current_gen_world_size</code>. The new value <code>3</code> differs from the cached <code>4</code>. Time to re-rendezvous.`,
+      active: ["n-train", "n-router"],
+      arrows: ["t-r-2"],
+      removed: ["dp-1"],
+    },
+    {
+      title: "Re-rendezvous at smaller world",
+      desc: `Train picks a fresh <code>(ip, port)</code>, dispatches <code>init_collective</code> symmetrically on both sides. NCCL rendezvous at <code>WORLD_SIZE = train_ws + 3</code>. Bounded at 120s; on timeout, abort + retry up to 4 times.`,
+      active: ["n-train", "n-router", "n-gen"],
+      arrows: ["t-r-init", "r-g-init", "t-g-nccl"],
+      removed: ["dp-1"],
+    },
+    {
+      title: "Recover: add_shard fires",
+      desc: `Recovery policy (FaultInjector or operator) hits <code>POST /admin/add_shard</code>. Router calls <code>generation.add_dp_worker()</code> &mdash; that drives a placement-group request, KubeRay autoscaler v2 schedules a new pod, vLLM init runs (~1-2 min for 4B). Registered as <code>joining</code>.`,
+      active: ["n-router", "n-gen"],
+      arrows: ["r-add"],
+      joining: ["dp-4"],
+      removed: ["dp-1"],
+    },
+    {
+      title: "Stale-weight protection",
+      desc: `The new shard <code>dp-4</code> sits in <code>joining</code>. Its weights are the model file on disk &mdash; stale relative to the live training run. The data plane filter is <code>status == "ready"</code>, so no rollout traffic lands on it. Without this gate, KL would spike for ~5 steps after recover.`,
+      active: ["n-router"],
+      arrows: [],
+      joining: ["dp-4"],
+    },
+    {
+      title: "Re-rendezvous at world+1",
+      desc: `Survivors carry no leftover NCCL state (per-refit teardown destroyed their <code>model_update_group</code> at the end of the prior refit). The next refit reads <code>/current_gen_world_size = 4</code> (3 ready + 1 joining), differs from cached <code>3</code>. <code>ensure_collective_synced</code> rebuilds NCCL at the new world from scratch &mdash; the new <code>dp-4</code> joins as a fresh participant.`,
+      active: ["n-train", "n-router", "n-gen"],
+      arrows: ["t-r-init", "r-g-init", "t-g-nccl"],
+      joining: ["dp-4"],
+    },
+    {
+      title: "Broadcast pushes fresh weights to dp-4",
+      desc: `<code>POST /update_weights_from_collective</code>. NCCL broadcast hits every rank, including the new shard. On success, <code>promote_all_joining()</code> flips <code>dp-4</code> from <code>joining</code> to <code>ready</code>.`,
+      active: ["n-train", "n-gen", "n-router"],
+      arrows: ["t-r-update", "t-g-bcast", "r-promote"],
+      joining: ["dp-4"],
+    },
+    {
+      title: "Recovered",
+      desc: `Fleet back at 4 ready shards. Data plane resumes. KL transient typically ≤ 0.003 across the recover window &mdash; well under the canonical KL ceiling of ~0.005.`,
+      active: ["n-router", "n-gen"],
+      arrows: [],
+    },
+  ],
+};
+
+(function buildReplay() {
+  let flowKey = "steady";
+  let idx = 0;
+  let autoTimer = null;
+
+  const tabs = document.querySelectorAll(".replay-tabs button");
+  const stepTitle = document.getElementById("step-title");
+  const stepDesc = document.getElementById("step-desc");
+  const stepNum = document.getElementById("step-num");
+  const stepTotal = document.getElementById("step-total");
+  const progress = document.getElementById("progress");
+  const btnPrev = document.getElementById("btn-prev");
+  const btnNext = document.getElementById("btn-next");
+  const btnReset = document.getElementById("btn-reset");
+  const btnAuto = document.getElementById("btn-auto");
+
+  const stage = document.getElementById("stage");
+  const allNodes = ["n-train", "n-router", "n-gen"];
+
+  function renderProgress() {
+    const flow = FLOWS[flowKey];
+    progress.innerHTML = "";
+    flow.forEach((_, i) => {
+      const d = document.createElement("div");
+      d.className = "pdot";
+      if (i < idx) d.classList.add("done");
+      if (i === idx) d.classList.add("active");
+      progress.appendChild(d);
+    });
+  }
+
+  function render() {
+    const flow = FLOWS[flowKey];
+    const step = flow[idx];
+
+    stepTitle.textContent = `Step ${String(idx + 1).padStart(2, "0")} · ${step.title}`;
+    stepDesc.innerHTML = step.desc;
+    stepNum.textContent = String(idx + 1).padStart(2, "0");
+    stepTotal.textContent = String(flow.length).padStart(2, "0");
+    renderProgress();
+
+    // Reset highlights
+    allNodes.forEach(n => {
+      const el = document.getElementById(n);
+      if (!el) return;
+      el.classList.remove("active");
+      el.classList.add("dim");
+    });
+    (step.active || []).forEach(n => {
+      const el = document.getElementById(n);
+      if (!el) return;
+      el.classList.add("active");
+      el.classList.remove("dim");
+    });
+    if (!step.active || step.active.length === 0) {
+      allNodes.forEach(n => {
+        const el = document.getElementById(n);
+        if (el) el.classList.remove("dim");
+      });
+    }
+
+    // Arrows
+    document.querySelectorAll("#arrows .stage-arrow").forEach(a => a.classList.remove("show"));
+    (step.arrows || []).forEach(aid => {
+      const a = document.querySelector(`[data-id="${aid}"]`);
+      if (a) a.classList.add("show");
+    });
+
+    // Shard states (only meaningful in kill flow)
+    // Make sure dp-4 (and any other dynamically-named shards) exist before
+    // we apply state — otherwise they silently no-op.
+    (step.joining || []).concat(step.faulted || [], step.removed || [])
+      .forEach(sid => ensureGenShard(sid));
+    relayoutGenContainer();
+
+    document.querySelectorAll("#g-shards .shard").forEach(g => {
+      const r = g.querySelector("rect");
+      if (!r) return;
+      r.setAttribute("fill", "rgba(197,163,255,0.18)");
+      r.setAttribute("stroke", "var(--gen)");
+      r.setAttribute("stroke-dasharray", "");
+      g.style.opacity = "1";
+    });
+    (step.faulted || []).forEach(sid => {
+      const g = document.querySelector(`#g-shards .shard[data-id="${sid}"]`);
+      if (!g) return;
+      const r = g.querySelector("rect");
+      r.setAttribute("fill", "rgba(244,114,114,0.30)");
+      r.setAttribute("stroke", "var(--bad)");
+    });
+    (step.removed || []).forEach(sid => {
+      const g = document.querySelector(`#g-shards .shard[data-id="${sid}"]`);
+      if (!g) return;
+      g.style.opacity = "0.18";
+      const r = g.querySelector("rect");
+      r.setAttribute("fill", "transparent");
+      r.setAttribute("stroke-dasharray", "3 3");
+    });
+    (step.joining || []).forEach(sid => {
+      const g = document.querySelector(`#g-shards .shard[data-id="${sid}"]`);
+      if (!g) return;
+      const r = g.querySelector("rect");
+      r.setAttribute("fill", "rgba(245,203,92,0.28)");
+      r.setAttribute("stroke", "var(--warn)");
+      r.setAttribute("stroke-dasharray", "3 3");
+    });
+
+    btnPrev.disabled = idx === 0;
+    btnNext.disabled = idx === flow.length - 1;
+  }
+
+  // Layout constants for the gen-cluster container so add_shard can
+  // re-flow the row + grow the parent rect on demand without spilling.
+  const SHARD_X0 = 870;     // first shard's x
+  const SHARD_W = 44;       // each shard width
+  const SHARD_GAP = 6;      // gap between shards
+  const SHARD_Y = 186;      // row y
+  const SHARD_TY = 206;     // text y
+  const GEN_PADDING_R = 20; // padding inside the gen rect on right
+
+  function ensureGenShard(id) {
+    let g = document.querySelector(`#g-shards .shard[data-id="${id}"]`);
+    if (g) return g;
+    const list = document.getElementById("g-shards");
+    const ns = "http://www.w3.org/2000/svg";
+    g = document.createElementNS(ns, "g");
+    g.setAttribute("class", "shard");
+    g.setAttribute("data-id", id);
+    const r = document.createElementNS(ns, "rect");
+    r.setAttribute("class", "gpu gen");
+    r.setAttribute("y", SHARD_Y);
+    r.setAttribute("width", SHARD_W);
+    r.setAttribute("height", 32);
+    r.setAttribute("rx", 4);
+    g.appendChild(r);
+    const t = document.createElementNS(ns, "text");
+    t.setAttribute("class", "tag");
+    t.setAttribute("y", SHARD_TY);
+    t.setAttribute("fill", "var(--gen)");
+    t.textContent = id;
+    g.appendChild(t);
+    list.appendChild(g);
+    return g;
+  }
+
+  function relayoutGenContainer() {
+    // Re-flow shard rectangles left-to-right, in document order, and
+    // resize the parent gen rect so they always sit fully inside.
+    const shards = Array.from(document.querySelectorAll("#g-shards .shard"));
+    shards.forEach((g, i) => {
+      const x = SHARD_X0 + i * (SHARD_W + SHARD_GAP);
+      const r = g.querySelector("rect");
+      const t = g.querySelector("text");
+      if (r) r.setAttribute("x", x);
+      if (t) t.setAttribute("x", x + 11);
+    });
+    // Auto-grow the gen rect width to enclose the shard row.
+    const lastEnd = SHARD_X0 + shards.length * (SHARD_W + SHARD_GAP) - SHARD_GAP;
+    const minWidth = 230;
+    const newWidth = Math.max(minWidth, lastEnd - 850 + GEN_PADDING_R);
+    const genRect = document.querySelector("#n-gen rect");
+    if (genRect) genRect.setAttribute("width", newWidth);
+  }
+
+  function setFlow(k) {
+    flowKey = k;
+    idx = 0;
+    tabs.forEach(t => t.classList.toggle("active", t.dataset.flow === k));
+
+    // Tear down any shards added by a prior flow so we start fresh
+    // with dp-0..dp-3 inside the original gen rect.
+    document.querySelectorAll("#g-shards .shard").forEach(g => {
+      const id = g.dataset.id;
+      if (!["dp-0", "dp-1", "dp-2", "dp-3"].includes(id)) g.remove();
+      else g.style.opacity = "1";
+    });
+    relayoutGenContainer();
+
+    render();
+  }
+
+  tabs.forEach(t => t.addEventListener("click", () => {
+    stopAuto();
+    setFlow(t.dataset.flow);
+  }));
+  btnPrev.addEventListener("click", () => { stopAuto(); if (idx > 0) { idx--; render(); } });
+  btnNext.addEventListener("click", () => { stopAuto(); if (idx < FLOWS[flowKey].length - 1) { idx++; render(); } });
+  btnReset.addEventListener("click", () => { stopAuto(); idx = 0; render(); });
+  btnAuto.addEventListener("click", () => {
+    if (autoTimer) { stopAuto(); return; }
+    btnAuto.textContent = "Pause";
+    btnAuto.dataset.playing = "1";
+    autoTimer = setInterval(() => {
+      if (idx < FLOWS[flowKey].length - 1) { idx++; render(); }
+      else { stopAuto(); }
+    }, 1800);
+  });
+  function stopAuto() {
+    if (autoTimer) clearInterval(autoTimer);
+    autoTimer = null;
+    btnAuto.textContent = "Auto-play";
+    delete btnAuto.dataset.playing;
+  }
+
+  setFlow("steady");
+})();
+
+/* ===========================================================
+   ACTIVE-LINK in topnav based on scroll position
+   =========================================================== */
+(function () {
+  // Highlight current page only (cross-doc nav)
+  // Already set via class="active" on the relevant link.
+})();
+</script>
+
+</body>
+</html>

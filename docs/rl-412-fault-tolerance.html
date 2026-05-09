@@ -1,0 +1,1743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>NeMo-RL · Fault Tolerance (RL-412)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700;800&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  /* ============================================================
+     DESIGN TOKENS  (mirror disagg-gen.html for visual consistency)
+     ============================================================ */
+  :root {
+    --bg:           #0a0e0a;
+    --bg-1:         #11161a;
+    --bg-2:         #161c22;
+    --bg-3:         #1d242c;
+    --bg-4:         #252e38;
+    --border:       #232a32;
+    --border-2:     #2f3944;
+    --border-3:     #3d4856;
+    --text:         #ecf2f8;
+    --text-1:       #c8d3df;
+    --text-2:       #8d99a6;
+    --text-3:       #6b7785;
+
+    --green:        #76b900;
+    --green-dim:    #5a8c00;
+    --green-soft:   rgba(118, 185, 0, 0.10);
+    --green-soft-2: rgba(118, 185, 0, 0.18);
+
+    --train:        #6ea8ff;
+    --gen:          #c5a3ff;
+    --ctrl:         #a78bfa;
+    --data:         #5fd8ad;
+    --status:       #6ea8ff;
+    --admin:        #f5a657;
+    --warn:         #f5cb5c;
+    --bad:          #f47272;
+    --good:         #5fd8ad;
+
+    /* shard-state colors */
+    --st-ready:    #5fd8ad;
+    --st-joining:  #f5cb5c;
+    --st-cordoned: #ff8aa1;
+    --st-draining: #c5a3ff;
+
+    --mono: "Geist Mono", ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: "Geist", -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+
+    --shadow-1: 0 1px 2px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.02);
+    --shadow-2: 0 4px 12px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.03);
+    --shadow-3: 0 8px 24px rgba(0,0,0,0.5);
+
+    --t: 160ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 16px; line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: "ss01", "ss02", "cv11";
+    text-rendering: optimizeLegibility;
+  }
+  svg text { font-family: var(--sans); }
+  ::selection { background: var(--green-soft-2); color: var(--text); }
+  a { color: var(--green); text-decoration: none; transition: color var(--t); }
+  a:hover { color: #92d800; }
+  code, kbd {
+    color: var(--text);
+    background: rgba(255,255,255,0.06);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 0.88em;
+  }
+  pre {
+    margin: 0;
+    padding: 14px 16px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--text-1);
+  }
+  pre code { background: transparent; padding: 0; font-size: inherit; }
+  .tok-c { color: #6b7785; font-style: italic; }
+  .tok-k { color: #ff8aa1; }
+  .tok-s { color: var(--green); }
+  .tok-n { color: #f5cb5c; }
+
+  /* ============================================================
+     TOP NAV
+     ============================================================ */
+  .topnav {
+    position: sticky; top: 0; z-index: 80;
+    background: rgba(10, 14, 10, 0.85);
+    backdrop-filter: blur(18px) saturate(180%);
+    -webkit-backdrop-filter: blur(18px) saturate(180%);
+    border-bottom: 1px solid var(--border);
+  }
+  .topnav-inner {
+    max-width: 1280px; margin: 0 auto;
+    padding: 14px 28px;
+    display: flex; align-items: center; gap: 32px;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px;
+    font-family: var(--mono); font-size: 13px;
+    color: var(--text-2); letter-spacing: 0.04em;
+  }
+  .brand .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green); box-shadow: 0 0 12px var(--green);
+  }
+  .brand strong { color: var(--text); font-weight: 600; }
+  .topnav .links {
+    display: flex; gap: 24px;
+    margin-left: auto; font-size: 14px;
+  }
+  .topnav .links a { color: var(--text-2); transition: color var(--t); }
+  .topnav .links a:hover { color: var(--text); }
+  .topnav .links a.active { color: var(--green); }
+
+  /* ============================================================
+     HERO
+     ============================================================ */
+  .hero {
+    max-width: 1280px; margin: 0 auto;
+    padding: 80px 28px 56px;
+    position: relative;
+  }
+  .hero::before {
+    content: ""; position: absolute;
+    top: 0; left: 50%; transform: translateX(-50%);
+    width: 600px; height: 320px;
+    background: radial-gradient(ellipse at top, rgba(118, 185, 0, 0.10), transparent 70%);
+    pointer-events: none; z-index: 0;
+  }
+  .hero-inner { position: relative; z-index: 1; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px;
+    letter-spacing: 0.18em; color: var(--green);
+    text-transform: uppercase; margin-bottom: 18px;
+    display: inline-block; padding: 5px 12px;
+    border: 1px solid var(--green-soft-2);
+    border-radius: 999px; background: var(--green-soft);
+  }
+  h1 {
+    font-size: 52px; font-weight: 800;
+    letter-spacing: -0.025em; line-height: 1.05;
+    margin: 0 0 20px; max-width: 920px;
+  }
+  h1 .accent { color: var(--green); }
+  .hero p.lead {
+    font-size: 19px; line-height: 1.55;
+    color: var(--text-1); margin: 0 0 38px;
+    max-width: 760px;
+  }
+  .stats {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
+    margin-bottom: 32px;
+  }
+  @media (max-width: 880px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    h1 { font-size: 36px; }
+  }
+  .stat {
+    background: var(--bg-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 22px 20px;
+    transition: border-color var(--t), transform var(--t);
+  }
+  .stat:hover { border-color: var(--green-soft-2); transform: translateY(-2px); }
+  .stat .v {
+    font-family: var(--mono); font-size: 28px; font-weight: 700;
+    color: var(--green); letter-spacing: -0.02em; line-height: 1;
+    margin-bottom: 6px;
+  }
+  .stat .l {
+    font-size: 12.5px; color: var(--text-2);
+    letter-spacing: 0.02em; text-transform: uppercase;
+    font-family: var(--mono);
+  }
+
+  /* ============================================================
+     CONTENT
+     ============================================================ */
+  main {
+    max-width: 1280px; margin: 0 auto;
+    padding: 0 28px 120px;
+  }
+  section { margin-bottom: 80px; scroll-margin-top: 80px; }
+  h2 {
+    font-size: 32px; font-weight: 700;
+    letter-spacing: -0.02em; line-height: 1.2;
+    margin: 0 0 8px;
+    display: flex; align-items: baseline; gap: 14px;
+  }
+  h2 .num {
+    font-family: var(--mono); font-size: 14px;
+    color: var(--green); font-weight: 600;
+    letter-spacing: 0.05em;
+    padding: 2px 8px;
+    border: 1px solid var(--green-soft-2);
+    background: var(--green-soft);
+    border-radius: 6px;
+  }
+  h3 {
+    font-size: 20px; font-weight: 700;
+    letter-spacing: -0.01em; margin: 28px 0 12px;
+  }
+  .section-sub {
+    color: var(--text-2); font-size: 16px;
+    margin: 0 0 32px; max-width: 740px;
+  }
+
+  .tldr {
+    background: linear-gradient(180deg, var(--bg-1), var(--bg-2));
+    border: 1px solid var(--border-2);
+    border-left: 3px solid var(--green);
+    border-radius: 10px;
+    padding: 22px 26px;
+    margin: 0 0 28px;
+  }
+  .tldr-label {
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.16em; color: var(--green);
+    text-transform: uppercase; margin-bottom: 8px;
+    font-weight: 600;
+  }
+  .tldr p { margin: 0; font-size: 15.5px; line-height: 1.7; color: var(--text-1); }
+  .tldr p + p { margin-top: 8px; }
+
+  .card {
+    background: var(--bg-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 24px 26px;
+    box-shadow: var(--shadow-1);
+    transition: border-color var(--t), box-shadow var(--t);
+  }
+  .card:hover { border-color: var(--border-2); box-shadow: var(--shadow-2); }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  @media (max-width: 880px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+
+  /* ============================================================
+     COLLAPSIBLE
+     ============================================================ */
+  details {
+    background: var(--bg-1); border: 1px solid var(--border);
+    border-radius: 10px; margin-bottom: 12px;
+    transition: border-color var(--t);
+  }
+  details[open] { border-color: var(--border-2); }
+  details > summary {
+    list-style: none; cursor: pointer;
+    padding: 14px 18px;
+    display: flex; align-items: center; gap: 12px;
+    user-select: none; font-weight: 600;
+    color: var(--text); transition: background var(--t);
+  }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary::before {
+    content: ""; width: 8px; height: 8px;
+    border: solid var(--text-2); border-width: 0 2px 2px 0;
+    transform: rotate(-45deg);
+    transition: transform var(--t);
+    flex-shrink: 0;
+  }
+  details[open] > summary::before { transform: rotate(45deg); }
+  details > summary:hover { background: var(--bg-2); }
+  details .body {
+    padding: 4px 18px 18px 38px;
+    color: var(--text-1); font-size: 14.5px; line-height: 1.65;
+  }
+  details .body p:first-child { margin-top: 0; }
+  details .body p:last-child { margin-bottom: 0; }
+
+  /* ============================================================
+     STATE MACHINE
+     ============================================================ */
+  .smwrap {
+    background: var(--bg-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 22px;
+    overflow: hidden;
+  }
+  .smwrap svg { width: 100%; display: block; height: 380px; }
+  .sm-node {
+    cursor: pointer;
+  }
+  /* The inner shape (rect) is the click/hover target. Text is unhittable so
+     mouseenter/mouseleave on the <g> never flickers across child boundaries. */
+  .sm-node text { pointer-events: none; }
+  .sm-node rect {
+    stroke-width: 2; rx: 10; ry: 10;
+    transition: stroke-width var(--t), filter var(--t), opacity var(--t);
+  }
+
+  .sm-state-ready    rect { fill: rgba(95,216,173,0.12);  stroke: var(--st-ready); }
+  .sm-state-joining  rect { fill: rgba(245,203,92,0.14);  stroke: var(--st-joining); }
+  .sm-state-cordoned rect { fill: rgba(255,138,161,0.14); stroke: var(--st-cordoned); }
+  .sm-state-draining rect { fill: rgba(197,163,255,0.14); stroke: var(--st-draining); }
+  .sm-state-removed  rect { fill: var(--bg-3); stroke: var(--text-3); stroke-dasharray: 4 4; }
+  .sm-node .lbl-strong { font-size: 15px; font-weight: 700; }
+
+  /* Edges and edge labels never intercept pointer events — keeps hover on
+     nodes clean even when a label sits near a node's bounding box. */
+  .sm-edge {
+    stroke: var(--text-3); stroke-width: 1.5; fill: none;
+    pointer-events: none;
+    transition: stroke-width var(--t), opacity var(--t);
+  }
+  .sm-edge-lbl {
+    font-family: var(--mono); font-size: 11px;
+    fill: var(--text-2);
+    paint-order: stroke fill;
+    stroke: var(--bg-1);
+    stroke-width: 4px;
+    stroke-linejoin: round;
+    pointer-events: none;
+    transition: opacity var(--t), font-weight var(--t);
+  }
+
+  /* Highlight + pin states. JS toggles `is-active` on the focused node and
+     `is-active` on every edge/label whose data-edge matches a relevant id.
+     `is-dim` goes on everything else so the focused subgraph pops. */
+  .sm-node.is-active rect {
+    stroke-width: 3.5;
+    filter: drop-shadow(0 0 6px rgba(255,255,255,0.18));
+  }
+  .sm-node.is-pinned rect {
+    stroke-width: 3.5;
+    filter: drop-shadow(0 0 8px rgba(118,185,0,0.45));
+  }
+  .sm-node.is-dim rect { opacity: 0.35; }
+  .sm-edge.is-active { stroke-width: 2.6; }
+  .sm-edge.is-dim { opacity: 0.18; }
+  .sm-edge-lbl.is-active { font-weight: 600; }
+  .sm-edge-lbl.is-dim { opacity: 0.25; }
+
+  .smwrap .legend {
+    display: flex; flex-wrap: wrap; gap: 14px;
+    margin-top: 14px; font-family: var(--mono); font-size: 12px;
+  }
+  .smwrap .legend .item { display: flex; align-items: center; gap: 6px; color: var(--text-2); }
+  .smwrap .legend .swatch {
+    width: 11px; height: 11px; border-radius: 2px;
+    border: 1px solid;
+  }
+
+  .sm-popout {
+    background: var(--bg-2);
+    border: 1px solid var(--border-2);
+    border-left: 3px solid var(--green);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin-top: 14px;
+    min-height: 70px;
+    transition: border-left-color var(--t);
+  }
+  .sm-popout.is-pinned { border-left-color: #92d800; }
+  .sm-popout .pop-title {
+    font-family: var(--mono);
+    font-size: 11px; letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--green); font-weight: 600;
+    margin-bottom: 6px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .sm-popout .pop-pin-hint {
+    font-size: 10px; letter-spacing: 0.08em;
+    color: var(--text-3); font-weight: 500;
+    text-transform: none;
+  }
+  .sm-popout .pop-desc {
+    font-size: 14.5px; line-height: 1.6;
+    color: var(--text-1);
+  }
+  .sm-popout .pop-trans {
+    margin-top: 10px;
+    font-family: var(--mono); font-size: 12px;
+    color: var(--text-2);
+  }
+  .sm-popout .pop-trans .arrow { color: var(--text-3); margin: 0 4px; }
+  .sm-popout .pop-trans .row { margin-top: 3px; }
+
+  /* ============================================================
+     LIFECYCLE TIMELINE (interactive)
+     ============================================================ */
+  .lc-wrap {
+    background: var(--bg-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 22px;
+  }
+  .lc-tabs {
+    display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 18px;
+    background: var(--bg); padding: 4px;
+    border-radius: 8px; border: 1px solid var(--border);
+    width: fit-content; max-width: 100%;
+  }
+  .lc-tabs button {
+    background: transparent; color: var(--text-2);
+    border: none; padding: 8px 16px;
+    font-family: var(--mono); font-size: 12.5px;
+    cursor: pointer; border-radius: 5px;
+    transition: all var(--t);
+  }
+  .lc-tabs button:hover { color: var(--text); }
+  .lc-tabs button.active {
+    background: var(--green); color: #0a0e0a; font-weight: 700;
+  }
+  .lc-stage {
+    background: #06080a; border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden;
+    margin-bottom: 14px;
+  }
+  .lc-stage svg { width: 100%; display: block; height: 380px; }
+
+  .lc-controls {
+    display: flex; align-items: center; gap: 10px;
+    flex-wrap: wrap; margin-bottom: 14px;
+  }
+  .btn {
+    background: var(--bg-2); color: var(--text);
+    border: 1px solid var(--border-2); border-radius: 6px;
+    padding: 9px 16px;
+    font-family: var(--mono); font-size: 12.5px;
+    cursor: pointer;
+    transition: background var(--t), border-color var(--t), transform 80ms;
+  }
+  .btn:hover { background: var(--bg-3); border-color: var(--border-3); }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .btn.primary {
+    background: var(--green); color: #0a0e0a;
+    border-color: var(--green); font-weight: 700;
+  }
+  .btn.primary:hover { background: #92d800; }
+  .step-readout {
+    margin-left: auto;
+    font-family: var(--mono); font-size: 12.5px;
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+  .step-readout .total { color: var(--text); font-weight: 600; }
+  .step-progress { display: flex; gap: 4px; margin-bottom: 14px; }
+  .step-progress .pdot {
+    flex: 1; height: 4px; background: var(--border);
+    border-radius: 2px; transition: background var(--t);
+  }
+  .step-progress .pdot.done { background: var(--green-dim); }
+  .step-progress .pdot.active {
+    background: var(--green); box-shadow: 0 0 8px var(--green);
+  }
+  .step-panel {
+    background: var(--bg-2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px 20px;
+    border-left: 3px solid var(--green);
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+  .step-panel .step-title {
+    font-family: var(--mono); font-size: 11px;
+    color: var(--green); text-transform: uppercase;
+    letter-spacing: 0.12em; margin-bottom: 6px;
+    font-weight: 600;
+    line-height: 1.4;
+  }
+  .step-panel .step-desc {
+    font-size: 14.5px; line-height: 1.6; color: var(--text-1);
+  }
+  .step-panel .step-desc code { word-break: break-all; }
+
+  /* ============================================================
+     FAULT MODE TABLE
+     ============================================================ */
+  .fmtable {
+    background: var(--bg-1); border: 1px solid var(--border);
+    border-radius: 12px; overflow: hidden;
+  }
+  .fmrow {
+    display: grid;
+    grid-template-columns: minmax(140px, 160px) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
+    gap: 0; align-items: stretch;
+    border-top: 1px solid var(--border);
+  }
+  .fmcell { min-width: 0; word-wrap: break-word; }
+  @media (max-width: 1024px) {
+    .fmrow { grid-template-columns: minmax(120px, 140px) minmax(0, 1fr); }
+    .fmcell:nth-child(3), .fmcell:nth-child(4) {
+      grid-column: 1 / -1;
+      border-top: 1px dashed var(--border);
+    }
+    .fmrow.h .fmcell:nth-child(3), .fmrow.h .fmcell:nth-child(4) { display: none; }
+  }
+  .fmrow.h {
+    background: var(--bg-2);
+    font-family: var(--mono); font-size: 11px;
+    color: var(--text-3); text-transform: uppercase;
+    letter-spacing: 0.08em; font-weight: 600;
+    border-top: none;
+  }
+  .fmcell {
+    padding: 16px 18px;
+    font-size: 14px; line-height: 1.55;
+    color: var(--text-1);
+    border-right: 1px solid var(--border);
+  }
+  .fmcell:last-child { border-right: none; }
+  .fmcell .mode {
+    font-family: var(--mono); font-size: 13px;
+    color: var(--green); font-weight: 700;
+  }
+  .fmcell ul { margin: 4px 0 0; padding-left: 18px; }
+  .fmcell li { margin: 2px 0; font-size: 13.5px; }
+  @media (max-width: 880px) {
+    .fmrow { grid-template-columns: 1fr; }
+    .fmcell { border-right: none; border-bottom: 1px solid var(--border); }
+    .fmcell:last-child { border-bottom: none; }
+    .fmrow.h { display: none; }
+  }
+
+  /* ============================================================
+     CALLOUT
+     ============================================================ */
+  .callout {
+    border-radius: 10px; padding: 16px 20px; margin: 16px 0;
+    border-left: 3px solid;
+    background: var(--bg-1);
+    border-top: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    font-size: 14.5px; line-height: 1.65;
+  }
+  .callout.green { border-left-color: var(--green); }
+  .callout.warn  { border-left-color: var(--warn); }
+  .callout.bad   { border-left-color: var(--bad); }
+  .callout strong { color: var(--text); }
+
+  /* ============================================================
+     METRIC CARDS
+     ============================================================ */
+  .vresults {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 18px;
+  }
+  @media (max-width: 880px) { .vresults { grid-template-columns: 1fr; } }
+  .vcard {
+    background: var(--bg-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 22px;
+  }
+  .vcard h4 {
+    margin: 0 0 14px; font-size: 18px;
+    color: var(--text); display: flex; align-items: baseline; gap: 10px;
+  }
+  .vcard h4 .small {
+    font-size: 12.5px; color: var(--text-2);
+    font-family: var(--mono); font-weight: 400;
+  }
+  .vmetric {
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+    align-items: baseline;
+    gap: 12px;
+    padding: 8px 0;
+    border-top: 1px dashed var(--border-2);
+    font-size: 14px;
+  }
+  .vmetric:first-of-type { border-top: none; }
+  .vmetric .label {
+    color: var(--text-2);
+    overflow-wrap: break-word;
+    min-width: 0;
+  }
+  .vmetric .value {
+    font-family: var(--mono);
+    color: var(--text); font-size: 13px;
+    text-align: right;
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+  .vmetric .value .accent { color: var(--green); }
+  .vmetric .value .bad { color: var(--bad); }
+  @media (max-width: 600px) {
+    .vmetric { grid-template-columns: 1fr; gap: 2px; }
+    .vmetric .value { text-align: left; }
+  }
+
+  /* ============================================================
+     STATUS PILLS
+     ============================================================ */
+  .status {
+    display: inline-block;
+    font-family: var(--mono); font-size: 11px;
+    padding: 2px 8px; border-radius: 999px;
+    border: 1px solid;
+  }
+  .status.ready    { color: var(--st-ready);    border-color: var(--st-ready);    background: rgba(95,216,173,0.10); }
+  .status.joining  { color: var(--st-joining);  border-color: var(--st-joining);  background: rgba(245,203,92,0.10); }
+  .status.cordoned { color: var(--st-cordoned); border-color: var(--st-cordoned); background: rgba(255,138,161,0.10); }
+  .status.draining { color: var(--st-draining); border-color: var(--st-draining); background: rgba(197,163,255,0.10); }
+  .status.removed  { color: var(--text-3);      border-color: var(--text-3);      background: var(--bg-3); }
+
+  /* ============================================================
+     SVG arrow markers (for stage diagrams)
+     ============================================================ */
+  svg .arrow-active path {
+    stroke-dasharray: 4 4;
+    animation: lc-dash 1.2s linear infinite;
+  }
+  @keyframes lc-dash {
+    to { stroke-dashoffset: -16; }
+  }
+  svg .stage-arrow { opacity: 0; transition: opacity 250ms ease; pointer-events: none; }
+  svg .stage-arrow.show { opacity: 1; }
+  svg .stage-arrow.show path {
+    stroke-dasharray: 4 4;
+    animation: lc-dash 1.2s linear infinite;
+  }
+  svg .stage-arrow text {
+    paint-order: stroke fill;
+    stroke: #06080a;
+    stroke-width: 4px;
+    stroke-linejoin: round;
+  }
+  svg .stage-node { transition: opacity 250ms ease, filter 250ms ease; }
+  svg .stage-node.dim { opacity: 0.35; }
+  svg .stage-node.active { filter: drop-shadow(0 0 8px var(--green)); }
+
+  /* ============================================================
+     FOOTER
+     ============================================================ */
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 36px 28px 60px; margin-top: 60px;
+    color: var(--text-3); font-size: 13px;
+    font-family: var(--mono); text-align: center;
+  }
+  footer a { color: var(--text-2); margin: 0 8px; }
+
+  /* table */
+  table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 13.5px; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  th {
+    color: var(--text-2);
+    font-family: var(--mono); font-size: 11.5px;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    background: var(--bg-2); font-weight: 600;
+  }
+  td { color: var(--text-1); }
+  td code { font-size: 12.5px; }
+
+</style>
+</head>
+<body>
+
+<!-- =====================================================================
+     TOP NAV
+     ===================================================================== -->
+<nav class="topnav">
+  <div class="topnav-inner">
+    <div class="brand">
+      <div class="dot"></div>
+      <span>NeMo-RL</span> <span style="color:var(--text-3)">/</span> <strong>RL-412</strong>
+    </div>
+    <div class="links">
+      <a href="rl-412-disagg-gen.html">Architecture</a>
+      <a href="rl-412-fault-tolerance.html" class="active">Fault Tolerance</a>
+      <a href="rl-412-router-api.html">Router API</a>
+    </div>
+  </div>
+</nav>
+
+
+<!-- =====================================================================
+     HERO
+     ===================================================================== -->
+<section class="hero">
+  <div class="hero-inner">
+    <span class="eyebrow">RL-412 · Fault Tolerance</span>
+    <h1>
+      Lose a shard mid-run.<br/>
+      <span class="accent">Keep training.</span>
+    </h1>
+    <p class="lead">
+      Pod-kill, actor-kill, or HTTP fault: the router cordons the bad shard,
+      the train side rendezvous shrinks at the next refit, the autoscaler
+      reaps the pod, a fresh shard joins and catches up on the next
+      broadcast. No restarts. KL transient under <code>0.003</code>.
+    </p>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="v">3</div>
+        <div class="l">Fault Modes Validated</div>
+      </div>
+      <div class="stat">
+        <div class="v">&le;&#x2009;0.003</div>
+        <div class="l">KL Transient on Recover</div>
+      </div>
+      <div class="stat">
+        <div class="v">120s</div>
+        <div class="l">Bounded Rendezvous</div>
+      </div>
+      <div class="stat">
+        <div class="v">4&times;</div>
+        <div class="l">Retry Attempts on Fault</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<main>
+
+<!-- =====================================================================
+     1. WHAT IT DOES
+     ===================================================================== -->
+<section id="overview">
+  <h2><span class="num">01</span>What it does</h2>
+  <div class="tldr">
+    <div class="tldr-label">Three sentences</div>
+    <p>The router treats the gen fleet like a Kubernetes <em>Deployment</em>: shards are fungible, lifecycle is observable, the world size is dynamic. When a shard dies, the router escalates cordon &rarr; remove_shard automatically; the train side picks up the smaller world via <code>ensure_collective_synced</code> on the next refit.</p>
+    <p>Recovery is symmetric: <code>add_shard</code> drives a fresh placement-group, vLLM bring-up, and a <code>joining</code> registration. The data plane gates on <code>status == "ready"</code>, so traffic never lands on a stale-weight shard.</p>
+    <p>Promotion <code>joining &rarr; ready</code> happens only after the next successful weight broadcast, gated through <code>promote_all_joining()</code>. That is the load-bearing safety property: you cannot serve rollouts off model-file-on-disk weights, even by accident.</p>
+  </div>
+
+  <div class="grid-3">
+    <div class="card">
+      <h3 style="margin-top:0">Detection</h3>
+      <p style="color:var(--text-1);font-size:14.5px">Health poller probes <code>/openapi.json</code> every 2s with a 5s timeout. Threshold: 10 consecutive failures (~50s of unresponsiveness). Data-plane proxy 5xx threshold: 5 consecutive failures, gated to ignore transient stalls during NCCL re-init.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Containment</h3>
+      <p style="color:var(--text-1);font-size:14.5px">Cordon flips status to <code>cordoned</code>. Data plane skips. Auto-escalates to <code>remove_shard</code>: drains inflight (&le;30s), <code>ray.kill</code>s actors, frees the placement group, marks worker indices dead. <strong>No <code>reset_collective</code> dispatch on survivors</strong> &mdash; per-refit teardown already destroyed their <code>model_update_group</code> at the end of the previous refit. Inline NCCL collective failures are handled <em>per worker</em>: <code>_per_worker_results</code> + <code>_evict_failed_workers_inline</code> drop only the worker whose future raised, not the whole shard.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Recovery</h3>
+      <p style="color:var(--text-1);font-size:14.5px">Operator (or FaultInjector) hits <code>POST /admin/add_shard</code>. Autoscaler v2 schedules a fresh pod, vLLM boots, registered as <code>joining</code>. Next refit broadcasts current weights; <code>promote_all_joining()</code> flips it to <code>ready</code>.</p>
+    </div>
+  </div>
+</section>
+
+
+<!-- =====================================================================
+     2. SHARD STATE MACHINE
+     ===================================================================== -->
+<section id="state">
+  <h2><span class="num">02</span>Shard state machine</h2>
+  <p class="section-sub">
+    Four observable states per shard. Hover any state to preview its description and
+    valid transitions; click to pin (click again or pick another state to release).
+  </p>
+
+  <div class="smwrap">
+    <svg viewBox="0 0 1100 380" id="smsvg" preserveAspectRatio="xMidYMid meet">
+      <!-- joining -->
+      <g class="sm-node sm-state-joining" data-state="joining" transform="translate(60,110)">
+        <rect width="200" height="80"/>
+        <text class="lbl-strong" x="100" y="38" text-anchor="middle" fill="var(--st-joining)">joining</text>
+        <text x="100" y="58" text-anchor="middle" font-size="11" fill="var(--text-2)" font-family="var(--mono)">stale weights · NCCL ok</text>
+      </g>
+
+      <!-- ready -->
+      <g class="sm-node sm-state-ready" data-state="ready" transform="translate(450,110)">
+        <rect width="200" height="80"/>
+        <text class="lbl-strong" x="100" y="38" text-anchor="middle" fill="var(--st-ready)">ready</text>
+        <text x="100" y="58" text-anchor="middle" font-size="11" fill="var(--text-2)" font-family="var(--mono)">serves rollouts</text>
+      </g>
+
+      <!-- cordoned -->
+      <g class="sm-node sm-state-cordoned" data-state="cordoned" transform="translate(840,110)">
+        <rect width="200" height="80"/>
+        <text class="lbl-strong" x="100" y="38" text-anchor="middle" fill="var(--st-cordoned)">cordoned</text>
+        <text x="100" y="58" text-anchor="middle" font-size="11" fill="var(--text-2)" font-family="var(--mono)">unhealthy · no traffic</text>
+      </g>
+
+      <!-- draining -->
+      <g class="sm-node sm-state-draining" data-state="draining" transform="translate(450,278)">
+        <rect width="200" height="60"/>
+        <text class="lbl-strong" x="100" y="28" text-anchor="middle" fill="var(--st-draining)">draining</text>
+        <text x="100" y="46" text-anchor="middle" font-size="11" fill="var(--text-2)" font-family="var(--mono)">drains inflight · &le; 30s</text>
+      </g>
+
+      <!-- removed -->
+      <g class="sm-node sm-state-removed" data-state="removed" transform="translate(840,278)">
+        <rect width="200" height="60"/>
+        <text class="lbl-strong" x="100" y="28" text-anchor="middle" fill="var(--text-2)">(removed)</text>
+        <text x="100" y="46" text-anchor="middle" font-size="11" fill="var(--text-3)" font-family="var(--mono)">popped from table</text>
+      </g>
+
+      <defs>
+        <marker id="sm-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+          <path d="M0,0 L8,4 L0,8 z" fill="var(--text-2)"/>
+        </marker>
+      </defs>
+
+      <!-- Edges -->
+      <!-- entry: register_shards (top, into ready) -->
+      <path class="sm-edge" data-edge="register-ready" d="M 550 70 L 550 110" marker-end="url(#sm-arrow)" stroke="var(--st-ready)"/>
+      <text class="sm-edge-lbl" data-edge="register-ready" x="550" y="60" text-anchor="middle" fill="var(--st-ready)">register_shards()</text>
+
+      <!-- entry: add_shard (top, into joining) -->
+      <path class="sm-edge" data-edge="add-joining" d="M 160 70 L 160 110" marker-end="url(#sm-arrow)" stroke="var(--st-joining)"/>
+      <text class="sm-edge-lbl" data-edge="add-joining" x="160" y="60" text-anchor="middle" fill="var(--st-joining)">add_shard()</text>
+
+      <!-- joining -> ready (above edge, label centered) -->
+      <path class="sm-edge" data-edge="joining-ready" d="M 260 150 L 450 150" marker-end="url(#sm-arrow)" stroke="var(--st-ready)"/>
+      <text class="sm-edge-lbl" data-edge="joining-ready" x="360" y="138" text-anchor="middle" fill="var(--st-ready)">promote_all_joining()</text>
+      <text class="sm-edge-lbl" data-edge="joining-ready" x="360" y="166" text-anchor="middle" fill="var(--text-3)">after refit broadcast</text>
+
+      <!-- ready -> cordoned -->
+      <path class="sm-edge" data-edge="ready-cordoned" d="M 650 150 L 840 150" marker-end="url(#sm-arrow)" stroke="var(--st-cordoned)"/>
+      <text class="sm-edge-lbl" data-edge="ready-cordoned" x="745" y="138" text-anchor="middle" fill="var(--st-cordoned)">10x /openapi.json fail</text>
+      <text class="sm-edge-lbl" data-edge="ready-cordoned" x="745" y="166" text-anchor="middle" fill="var(--text-3)">or 5x proxy 5xx</text>
+
+      <!-- ready -> draining (vertical) -->
+      <path class="sm-edge" data-edge="ready-draining" d="M 550 190 L 550 278" marker-end="url(#sm-arrow)" stroke="var(--st-draining)"/>
+      <text class="sm-edge-lbl" data-edge="ready-draining" x="558" y="236" text-anchor="start" fill="var(--st-draining)">remove_shard()</text>
+
+      <!-- cordoned -> joining (curve back, dashed) -->
+      <path class="sm-edge" data-edge="cordoned-joining" d="M 840 178 Q 550 240 260 178" marker-end="url(#sm-arrow)" stroke="var(--st-joining)" stroke-dasharray="4 4"/>
+      <text class="sm-edge-lbl" data-edge="cordoned-joining" x="550" y="246" text-anchor="middle" fill="var(--st-joining)">uncordon · NOT directly to ready</text>
+
+      <!-- cordoned -> draining (auto-escalate) -->
+      <path class="sm-edge" data-edge="cordoned-draining" d="M 840 188 L 660 290" marker-end="url(#sm-arrow)" stroke="var(--st-draining)"/>
+      <text class="sm-edge-lbl" data-edge="cordoned-draining" x="752" y="232" text-anchor="middle" fill="var(--st-draining)">auto-remove</text>
+
+      <!-- draining -> removed -->
+      <path class="sm-edge" data-edge="draining-removed" d="M 650 308 L 840 308" marker-end="url(#sm-arrow)" stroke="var(--text-2)"/>
+      <text class="sm-edge-lbl" data-edge="draining-removed" x="745" y="300" text-anchor="middle">drain done · ray.kill · pg release</text>
+    </svg>
+    <div class="legend">
+      <div class="item"><div class="swatch" style="border-color:var(--st-ready);background:rgba(95,216,173,0.12)"></div>ready</div>
+      <div class="item"><div class="swatch" style="border-color:var(--st-joining);background:rgba(245,203,92,0.14)"></div>joining</div>
+      <div class="item"><div class="swatch" style="border-color:var(--st-cordoned);background:rgba(255,138,161,0.14)"></div>cordoned</div>
+      <div class="item"><div class="swatch" style="border-color:var(--st-draining);background:rgba(197,163,255,0.14)"></div>draining</div>
+    </div>
+
+    <div class="sm-popout" id="sm-popout">
+      <div class="pop-title"><span class="pop-title-text">Hover or click a state</span><span class="pop-pin-hint" id="sm-pin-hint"></span></div>
+      <div class="pop-desc">Each state has a tightly defined set of allowed transitions. The interesting design choices are the <em>forbidden</em> ones &mdash; e.g. health-poll cannot promote joining to ready, only a successful refit can.</div>
+      <div class="pop-trans" id="sm-pop-trans"></div>
+    </div>
+  </div>
+</section>
+
+
+<!-- (removed: section 03 "load-bearing fixes" — design doc, not fix log) -->
+
+
+
+<!-- =====================================================================
+     3.5  NVRES KNOBS — environment-variable hardening
+     ===================================================================== -->
+<section id="nvres">
+  <h2><span class="num">03b</span>NVRES knobs</h2>
+  <p class="section-sub">
+    Three NCCL/torch environment variables and one constant landed alongside
+    the per-worker-eviction work. They borrow their defaults from
+    <a href="https://github.com/NVIDIA/nvidia-resiliency-ext">nvidia-resiliency-ext</a>:
+    surface CUDA errors as exceptions instead of <code>SIGABRT</code>, fail fast on
+    hung collectives, and avoid a known NVL-switch hang on GB300.
+  </p>
+
+  <table>
+    <tr><th>Knob</th><th>Where</th><th>Why</th></tr>
+    <tr>
+      <td><code>NCCL_NVLS_ENABLE=0</code></td>
+      <td><code>nemo_rl/models/generation/vllm/vllm_generation.py</code></td>
+      <td>Avoid the NVL-switch hang on GB300 with cross-node model parallelism. Set as a vLLM <code>ADDITIONAL_ENV_VAR</code> so it propagates to every worker.</td>
+    </tr>
+    <tr>
+      <td><code>TORCH_NCCL_RETHROW_CUDA_ERRORS=0</code></td>
+      <td>worker env</td>
+      <td>Surface NCCL CUDA errors as Python <code>RuntimeError</code> instead of <code>SIGABRT</code>'ing the worker. <code>_per_worker_results</code> can then catch and evict; otherwise the worker process dies and Ray surfaces only <code>RayActorError</code>.</td>
+    </tr>
+    <tr>
+      <td><code>TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=60</code></td>
+      <td>worker env</td>
+      <td>Hung collectives fail in 60s instead of the 600s default. Combined with the 120s train-side rendezvous timeout, the train-side retry loop sees a fault inside one full attempt &mdash; not after 10 minutes.</td>
+    </tr>
+    <tr>
+      <td>TCPStore rendezvous: <code>30s</code> (was 300s)</td>
+      <td><code>nemo_rl/distributed/stateless_process_group.py</code></td>
+      <td>Bounded TCPStore rendezvous + key-wait at 30s. Each retry creates a fresh TCPStore, so a failed cluster doesn't pin training waiting for a key that will never appear.</td>
+    </tr>
+  </table>
+</section>
+
+
+<!-- =====================================================================
+     4. LIFECYCLE: ADD_SHARD / REMOVE_SHARD INTERACTIVE
+     ===================================================================== -->
+<section id="lifecycle">
+  <h2><span class="num">04</span>Lifecycle walkthroughs</h2>
+  <p class="section-sub">
+    Two flows that drive the state machine: <code>remove_shard</code> (fault path) and <code>add_shard</code> (recovery path). Step through to see what each method actually does.
+  </p>
+
+  <div class="lc-wrap">
+    <div class="lc-tabs">
+      <button class="active" data-flow="remove">remove_shard</button>
+      <button data-flow="add">add_shard</button>
+      <button data-flow="cycle">Full kill+recover cycle</button>
+    </div>
+
+    <div class="step-progress" id="lc-progress"></div>
+
+    <div class="lc-stage">
+      <svg viewBox="0 0 1180 380" id="lc-stage-svg" preserveAspectRatio="xMidYMid meet">
+        <!-- Caller -->
+        <g id="lc-caller" class="stage-node">
+          <rect x="20" y="120" width="180" height="80" rx="10" fill="rgba(110,168,255,0.08)" stroke="var(--train)" stroke-width="1.5"/>
+          <text x="40" y="148" font-size="14" font-weight="700" fill="var(--train)">caller</text>
+          <text x="40" y="168" font-size="11" font-family="var(--mono)" fill="var(--text-2)">FaultInjector</text>
+          <text x="40" y="186" font-size="11" font-family="var(--mono)" fill="var(--text-2)">or operator</text>
+        </g>
+
+        <!-- Router -->
+        <g id="lc-router" class="stage-node">
+          <rect x="380" y="100" width="280" height="200" rx="10" fill="var(--green-soft)" stroke="var(--green)" stroke-width="2"/>
+          <text x="395" y="128" font-size="14" font-weight="700" fill="var(--green)">Router (port 8089)</text>
+          <text x="395" y="148" font-size="11" font-family="var(--mono)" fill="var(--text-2)">state:</text>
+          <text x="405" y="166" font-size="11" font-family="var(--mono)" fill="var(--text-2)">_lifecycle_lock · _table_lock</text>
+          <text x="405" y="184" font-size="11" font-family="var(--mono)" fill="var(--text-2)">_nccl_reinit_in_progress</text>
+          <text x="405" y="202" font-size="11" font-family="var(--mono)" fill="var(--text-2)">_shards (dict)</text>
+          <text x="395" y="226" font-size="11" font-family="var(--mono)" fill="var(--text-2)">drives:</text>
+          <text x="405" y="244" font-size="11" font-family="var(--mono)" fill="var(--text-2)">add_dp_worker / mark_workers_dead</text>
+          <text x="405" y="262" font-size="11" font-family="var(--mono)" fill="var(--text-2)">ray.kill / mark_workers_dead</text>
+          <text x="405" y="280" font-size="11" font-family="var(--mono)" fill="var(--text-2)">promote_all_joining</text>
+        </g>
+
+        <!-- Ray / k8s -->
+        <g id="lc-ray" class="stage-node">
+          <rect x="800" y="60" width="220" height="110" rx="10" fill="rgba(245,166,87,0.08)" stroke="var(--admin)" stroke-width="1.5"/>
+          <text x="818" y="88" font-size="14" font-weight="700" fill="var(--admin)">Ray + KubeRay</text>
+          <text x="818" y="110" font-size="11" font-family="var(--mono)" fill="var(--text-2)">placement_group()</text>
+          <text x="818" y="128" font-size="11" font-family="var(--mono)" fill="var(--text-2)">autoscaler v2</text>
+          <text x="818" y="146" font-size="11" font-family="var(--mono)" fill="var(--text-2)">idleTimeoutSeconds = 300</text>
+          <text x="818" y="164" font-size="11" font-family="var(--mono)" fill="var(--text-2)">minReplicas = 0</text>
+        </g>
+
+        <!-- Shards -->
+        <g id="lc-shards" class="stage-node">
+          <rect id="lc-shards-rect" x="800" y="200" width="220" height="158" rx="10" fill="rgba(197,163,255,0.08)" stroke="var(--gen)" stroke-width="1.5"/>
+          <text x="818" y="228" font-size="14" font-weight="700" fill="var(--gen)">Gen shards</text>
+          <text x="818" y="246" font-size="11" font-family="var(--mono)" fill="var(--text-2)">vLLM async openai server</text>
+          <g id="lc-shard-list" data-rowy="260">
+            <g class="lc-shard" data-id="dp-0">
+              <rect x="818" y="260" width="40" height="32" rx="4" fill="rgba(95,216,173,0.18)" stroke="var(--st-ready)"/>
+              <text x="824" y="280" font-size="10" font-family="var(--mono)" fill="var(--st-ready)">dp-0</text>
+            </g>
+            <g class="lc-shard" data-id="dp-1">
+              <rect x="864" y="260" width="40" height="32" rx="4" fill="rgba(95,216,173,0.18)" stroke="var(--st-ready)"/>
+              <text x="870" y="280" font-size="10" font-family="var(--mono)" fill="var(--st-ready)">dp-1</text>
+            </g>
+            <g class="lc-shard" data-id="dp-2">
+              <rect x="910" y="260" width="40" height="32" rx="4" fill="rgba(95,216,173,0.18)" stroke="var(--st-ready)"/>
+              <text x="916" y="280" font-size="10" font-family="var(--mono)" fill="var(--st-ready)">dp-2</text>
+            </g>
+            <g class="lc-shard" data-id="dp-3">
+              <rect x="956" y="260" width="40" height="32" rx="4" fill="rgba(95,216,173,0.18)" stroke="var(--st-ready)"/>
+              <text x="962" y="280" font-size="10" font-family="var(--mono)" fill="var(--st-ready)">dp-3</text>
+            </g>
+            <g class="lc-shard" data-id="dp-4">
+              <rect x="818" y="298" width="40" height="32" rx="4" fill="rgba(95,216,173,0.18)" stroke="var(--st-ready)"/>
+              <text x="824" y="318" font-size="10" font-family="var(--mono)" fill="var(--st-ready)">dp-4</text>
+            </g>
+            <g class="lc-shard" data-id="dp-5">
+              <rect x="864" y="298" width="40" height="32" rx="4" fill="rgba(95,216,173,0.18)" stroke="var(--st-ready)"/>
+              <text x="870" y="318" font-size="10" font-family="var(--mono)" fill="var(--st-ready)">dp-5</text>
+            </g>
+            <g class="lc-shard" data-id="dp-6">
+              <rect x="910" y="298" width="40" height="32" rx="4" fill="rgba(95,216,173,0.18)" stroke="var(--st-ready)"/>
+              <text x="916" y="318" font-size="10" font-family="var(--mono)" fill="var(--st-ready)">dp-6</text>
+            </g>
+            <g class="lc-shard" data-id="dp-7">
+              <rect x="956" y="298" width="40" height="32" rx="4" fill="rgba(95,216,173,0.18)" stroke="var(--st-ready)"/>
+              <text x="962" y="318" font-size="10" font-family="var(--mono)" fill="var(--st-ready)">dp-7</text>
+            </g>
+          </g>
+        </g>
+
+        <defs>
+          <marker id="lc-arr-g" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="var(--green)"/>
+          </marker>
+          <marker id="lc-arr-r" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="var(--bad)"/>
+          </marker>
+          <marker id="lc-arr-y" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="var(--admin)"/>
+          </marker>
+        </defs>
+
+        <g id="lc-arrows">
+          <g class="stage-arrow" data-id="caller-router">
+            <path d="M 200 160 L 380 160" stroke="var(--green)" stroke-width="2" fill="none" marker-end="url(#lc-arr-g)"/>
+            <text x="290" y="152" text-anchor="middle" font-size="10.5" font-family="var(--mono)" fill="var(--green)">POST /admin/...</text>
+          </g>
+          <g class="stage-arrow" data-id="router-shard-kill">
+            <path d="M 660 240 L 800 270" stroke="var(--bad)" stroke-width="2" fill="none" marker-end="url(#lc-arr-r)"/>
+            <text x="726" y="234" text-anchor="middle" font-size="10.5" font-family="var(--mono)" fill="var(--bad)">ray.kill(actor)</text>
+          </g>
+          <g class="stage-arrow" data-id="router-shard-reset">
+            <path d="M 660 270 L 800 296" stroke="var(--green)" stroke-width="2" fill="none" marker-end="url(#lc-arr-g)"/>
+            <text x="730" y="316" text-anchor="middle" font-size="10.5" font-family="var(--mono)" fill="var(--green)">group.destroy() · per-refit</text>
+          </g>
+          <g class="stage-arrow" data-id="router-ray-pg">
+            <path d="M 660 130 L 800 100" stroke="var(--admin)" stroke-width="2" fill="none" marker-end="url(#lc-arr-y)"/>
+            <text x="730" y="98" text-anchor="middle" font-size="10.5" font-family="var(--mono)" fill="var(--admin)">placement_group()</text>
+          </g>
+          <g class="stage-arrow" data-id="router-ray-pgrelease">
+            <path d="M 660 150 L 800 130" stroke="var(--admin)" stroke-width="2" fill="none" marker-end="url(#lc-arr-y)"/>
+            <text x="732" y="170" text-anchor="middle" font-size="10.5" font-family="var(--mono)" fill="var(--admin)">remove_placement_group()</text>
+          </g>
+          <g class="stage-arrow" data-id="ray-shard-spawn">
+            <path d="M 920 170 L 920 200" stroke="var(--gen)" stroke-width="2" fill="none" marker-end="url(#lc-arr-g)"/>
+            <text x="950" y="188" text-anchor="start" font-size="10.5" font-family="var(--mono)" fill="var(--gen)">vLLM init</text>
+          </g>
+          <g class="stage-arrow" data-id="router-shard-add">
+            <path d="M 660 240 L 800 270" stroke="var(--green)" stroke-width="2" fill="none" marker-end="url(#lc-arr-g)"/>
+            <text x="730" y="234" text-anchor="middle" font-size="10.5" font-family="var(--mono)" fill="var(--green)">add_dp_worker()</text>
+          </g>
+        </g>
+      </svg>
+    </div>
+
+    <div class="lc-controls">
+      <button class="btn" id="lc-prev">&larr; Prev</button>
+      <button class="btn primary" id="lc-next">Next &rarr;</button>
+      <button class="btn" id="lc-reset">Reset</button>
+      <button class="btn" id="lc-auto">Auto-play</button>
+      <div class="step-readout">
+        <span id="lc-num">01</span> / <span class="total" id="lc-total">5</span>
+      </div>
+    </div>
+
+    <div class="step-panel">
+      <div class="step-title" id="lc-title">Step</div>
+      <div class="step-desc" id="lc-desc">.</div>
+    </div>
+  </div>
+</section>
+
+
+<!-- =====================================================================
+     5. FAILURE MODES
+     ===================================================================== -->
+<section id="modes">
+  <h2><span class="num">05</span>Failure modes &amp; injectors</h2>
+  <p class="section-sub">
+    The <code>FaultInjector</code> Ray actor exercises three modes against a
+    live cluster. Each one demonstrates a different layer of the FT path.
+  </p>
+
+  <div class="fmtable">
+    <div class="fmrow h">
+      <div class="fmcell">Mode</div>
+      <div class="fmcell">What it does</div>
+      <div class="fmcell">What it tests</div>
+      <div class="fmcell">Recovery</div>
+    </div>
+    <div class="fmrow">
+      <div class="fmcell"><span class="mode">http-error</span><br/><span style="color:var(--text-2);font-size:12.5px">no NCCL impact</span></div>
+      <div class="fmcell">POST <code>/admin/cordon</code> on the router. The shard's actor is left alone. The router temporarily marks it cordoned.</div>
+      <div class="fmcell">
+        <ul>
+          <li>Cordon + replay logic in <code>_proxy()</code></li>
+          <li>Sticky session re-routing</li>
+          <li>uncordon &rarr; joining transition</li>
+        </ul>
+      </div>
+      <div class="fmcell">After <code>recover_after_s</code>, POST <code>/admin/uncordon</code>. Shard becomes <code>joining</code>; next refit promotes to <code>ready</code>.</div>
+    </div>
+    <div class="fmrow">
+      <div class="fmcell"><span class="mode">actor-kill</span><br/><span style="color:var(--text-2);font-size:12.5px">NCCL re-rendezvous</span></div>
+      <div class="fmcell">POST <code>/admin/remove_shard</code> on the router. Router <code>ray.kill</code>s actors, frees the placement group, marks worker indices dead. Survivors keep no NCCL state across refits (per-refit teardown), so no cleanup dispatch is needed.</div>
+      <div class="fmcell">
+        <ul>
+          <li><code>ensure_collective_synced</code> at smaller world</li>
+          <li>Worker indices skipped via <code>mark_workers_dead</code></li>
+          <li>autoscaler v2 idle reap of the freed pod</li>
+        </ul>
+      </div>
+      <div class="fmcell">If <code>recover=True</code>: after <code>recover_after_s</code>, POST <code>/admin/add_shard</code>. New pod scheduled, vLLM boots, registered as <code>joining</code>; next refit promotes.</div>
+    </div>
+    <div class="fmrow">
+      <div class="fmcell"><span class="mode">pod-kill</span><br/><span style="color:var(--text-2);font-size:12.5px">infra reclaim</span></div>
+      <div class="fmcell">remove_shard <em>plus</em> a <code>kubernetes.client.delete_namespaced_pod</code> call. Resolves pod identity by IP via <code>/shards</code> if not pre-set.</div>
+      <div class="fmcell">
+        <ul>
+          <li>End-to-end k8s reclaim</li>
+          <li>RBAC: <code>pods.delete</code> on gen namespace</li>
+          <li>autoscaler v2 minReplicas:0 reaping</li>
+        </ul>
+      </div>
+      <div class="fmcell">Same as actor-kill. The pod disappears immediately (<code>grace_period_seconds=0</code>); the autoscaler picks up the freed PG slot.</div>
+    </div>
+  </div>
+
+  <div class="callout green" style="margin-top:18px">
+    <strong>Repeat mode (continuous stress).</strong> Set <code>repeat_every_s</code>+<code>rotate_target</code>+<code>max_cycles</code> on the FaultInjector and it loops: kill &rarr; recover &rarr; wait_for_steady_state &rarr; pick lowest-numbered ready dp-N &rarr; kill the next one. Validates the FT path under sustained churn, not just a one-shot. Each cycle gates on no-joining + <code>/refit_ready=true</code> with a 600s timeout, so cycle N+1's kill cannot land on top of cycle N's in-flight refit.
+  </div>
+
+  <div class="callout green" style="margin-top:14px">
+    <strong>Burst mode.</strong> Set <code>burst_size</code> + <code>burst_every_n_cycles</code> to fire <em>multiple</em> kills per cycle in quick succession. <code>burst_size: 2, burst_every_n_cycles: 1</code> means every cycle kills 2 shards back-to-back (no <code>_wait_for_steady_state</code> between burst kills &mdash; that's the point). The recovery path is also deferred until <em>after</em> all burst kills fire: previously <code>_maybe_recover</code> serialized recovery between kills via <code>recover_after_s</code> sleeps, which defeated the burst. Now the actor accumulates kills first, sleeps <code>recover_after_s</code> once, then issues N <code>add_shard</code> calls back-to-back. Used to stress the cascade-eviction path.
+  </div>
+
+  <div class="callout green" style="margin-top:14px">
+    <strong><code>new_shard_grace_period_s</code>.</strong> A freshly-promoted replacement shard is excluded from the kill rotation for this many seconds after it's first observed as <code>ready</code>. Without the grace period, rotation immediately re-targets the just-joined replacement on the next cycle, so each new pod barely serves a single training step before being killed again. Recommended: <code>600</code> (10 min) at 30B scale &mdash; gives every replacement a few full step-times of productive contribution before re-entering the rotation pool.
+  </div>
+
+  <details style="margin-top:14px">
+    <summary>YAML config: schedule a fault (burst pattern)</summary>
+    <div class="body">
+<pre><code><span class="tok-c"># in the recipe yaml — Qwen3-30B-A3B production-validated config:</span>
+fault_inject:
+  enabled: <span class="tok-n">true</span>
+  mode: pod-kill                <span class="tok-c"># http-error | actor-kill | pod-kill</span>
+  recover: <span class="tok-n">true</span>
+  trigger_after_s: <span class="tok-n">60</span>             <span class="tok-c"># first kill fires shortly after first refit</span>
+  recover_after_s: <span class="tok-n">420</span>            <span class="tok-c"># 7 min — vLLM-30B pod init bound</span>
+  repeat_every_s: <span class="tok-n">300</span>             <span class="tok-c"># 5 min between cycles</span>
+  rotate_target: <span class="tok-n">true</span>             <span class="tok-c"># pick lowest-numbered ready shard each cycle</span>
+  target_shard: dp-0              <span class="tok-c"># first cycle target only</span>
+
+  <span class="tok-c"># Burst mode — kill 2 shards simultaneously every cycle. Tests</span>
+  <span class="tok-c"># multi-simultaneous-death recovery.</span>
+  burst_size: <span class="tok-n">2</span>
+  burst_every_n_cycles: <span class="tok-n">1</span>
+
+  <span class="tok-c"># Don't kill replacements for 10 min after first observed as ready.</span>
+  new_shard_grace_period_s: <span class="tok-n">600</span></code></pre>
+    </div>
+  </details>
+
+  <details>
+    <summary>Auto-remove on cordon: how a probe failure becomes a pod reclaim</summary>
+    <div class="body">
+      <p>When <code>_fire_cordon_hook</code> fires (probe-failure threshold or 5xx data-plane threshold), default behavior is to call <code>remove_shard</code> automatically &mdash; provided generation is wired and no <code>on_cordon</code> override is set. This is the cascade-prevention mechanism for organic failures: a broken shard doesn't sit cordoned forever; it gets reaped, and the next <code>add_shard</code> brings up a replacement on a healthy node.</p>
+      <p>Custom <code>on_cordon</code> override (e.g. for <code>--fault-mode http-error</code> which uses synthetic cordons) takes precedence &mdash; the http-error mode wants the cordon to be reversible without removal.</p>
+    </div>
+  </details>
+</section>
+
+
+<!-- =====================================================================
+     6. VALIDATION RESULTS
+     ===================================================================== -->
+<section id="validation">
+  <h2><span class="num">06</span>Validation</h2>
+  <p class="section-sub">
+    Two recipes, three fault modes, repeated kill+recover cycles. Wandb
+    trajectory holds inside canonical bounds, with the recover transient
+    well under our KL ceiling.
+  </p>
+
+  <div class="vresults">
+    <div class="vcard">
+      <h4>Qwen3-4B FT <span class="small">automodel · 4 shards · 4 GPU train</span></h4>
+      <div class="vmetric"><span class="label">Reward (canonical range)</span><span class="value"><span class="accent">0.34 - 0.50</span></span></div>
+      <div class="vmetric"><span class="label">KL (canonical range)</span><span class="value"><span class="accent">0.0007 - 0.0014</span></span></div>
+      <div class="vmetric"><span class="label">KL transient on recover</span><span class="value"><span class="accent">&le; 0.003</span> (was 0.004 - 0.010)</span></div>
+      <div class="vmetric"><span class="label">Step-time regression</span><span class="value"><span class="accent">0%</span></span></div>
+      <div class="vmetric"><span class="label">Fault modes validated</span><span class="value">http-error, actor-kill, pod-kill</span></div>
+      <div class="vmetric"><span class="label">Repeat-mode cycles</span><span class="value">10+ kill+recover, no run failure</span></div>
+    </div>
+    <div class="vcard">
+      <h4>Qwen3-30B-A3B FT <span class="small">megatron · 8 shards · 32 GPU train</span></h4>
+      <div class="vmetric"><span class="label">Reward (canonical baseline)</span><span class="value"><span class="accent">parity</span></span></div>
+      <div class="vmetric"><span class="label">KL (steady)</span><span class="value"><span class="accent">0.0018 - 0.0021</span></span></div>
+      <div class="vmetric"><span class="label">Step time</span><span class="value"><span class="accent">154 - 186s</span></span></div>
+      <div class="vmetric"><span class="label">Sustained run</span><span class="value">126+ min, 7+ burst cycles</span></div>
+      <div class="vmetric"><span class="label">Burst pattern</span><span class="value">2 simultaneous kills / cycle, 5 min cadence</span></div>
+      <div class="vmetric"><span class="label">Cascade failures</span><span class="value"><span class="accent">0</span></span></div>
+      <div class="vmetric"><span class="label">Fault modes validated</span><span class="value">pod-kill (burst)</span></div>
+    </div>
+  </div>
+
+  <div class="callout green" style="margin-top:18px">
+    <strong>30B-A3B production validation.</strong> Disaggregated GRPO on Qwen3-30B-A3B (8 train pods &times; 4 GPU + 8 gen pods &times; 1 GPU) ran for <strong>126+ minutes through 7+ burst cycles</strong>, where each cycle kills 2 shards simultaneously on a 5-minute cadence. KL stayed in the <code>0.0018 - 0.0021</code> band, step times in <code>154 - 186s</code>, reward at canonical baseline. <strong>Zero cascade failures.</strong> This validates the per-refit teardown design at 30B scale &mdash; without it, the burst pattern would have collapsed the world inside the first few cycles.
+  </div>
+
+  <div class="callout green" style="margin-top:14px">
+    <strong>The KL improvement is the headline.</strong> Pre-fix KL transient on recover was <code>0.004 - 0.010</code> (5-10x canonical) for 5-6 steps. Post-fix it's <code>&le; 0.003</code> &mdash; well inside the canonical envelope. That's the stale-weight gate doing its job: shards never serve traffic until their weights are current.
+  </div>
+
+  <details>
+    <summary>Cumulative shard-churn counters (router metrics)</summary>
+    <div class="body">
+      <p>The router exposes lifetime fleet-churn counters via <code>/metrics</code> and the per-step bundle <code>/step_metrics_snapshot</code>:</p>
+      <table>
+        <tr><th>Metric</th><th>Meaning</th></tr>
+        <tr><td><code>num_ready_shards</code></td><td>Currently serving traffic</td></tr>
+        <tr><td><code>num_joining_shards</code></td><td>Registered, awaiting next refit's broadcast</td></tr>
+        <tr><td><code>num_cordoned_shards</code></td><td>Marked unhealthy, no traffic; usually 0 (auto-escalates to remove)</td></tr>
+        <tr><td><code>num_draining_shards</code></td><td>Inflight drain in progress; transient</td></tr>
+        <tr><td><code>cumulative_shards_removed</code></td><td>Lifetime removes since gen daemon started</td></tr>
+        <tr><td><code>cumulative_shards_added</code></td><td>Lifetime adds since gen daemon started</td></tr>
+        <tr><td><code>last_fault_event</code></td><td><code>{kind, shard_id, reason, monotonic_ts}</code> for the most recent event</td></tr>
+        <tr><td><code>nccl_reinit_in_progress</code></td><td>True while a lifecycle op is mid-flight</td></tr>
+      </table>
+      <p>The train side scrapes this via <code>/step_metrics_snapshot</code> once per step, so the wandb trajectory pin-points the step boundary where the fleet shrank or grew.</p>
+    </div>
+  </details>
+</section>
+
+
+<!-- =====================================================================
+     7. WHAT'S NEXT
+     ===================================================================== -->
+<section id="next">
+  <h2><span class="num">07</span>What&rsquo;s next</h2>
+  <p class="section-sub">RL-413+ tracks. Brief; details in the issue tracker.</p>
+
+  <div class="grid-3">
+    <div class="card">
+      <h3 style="margin-top:0">Train-side faults</h3>
+      <p style="font-size:14.5px;color:var(--text-1)">RL-412 covers gen-side faults. Train-side resilience (a Megatron worker dying mid-step) is the obvious next layer. Different mechanism: train doesn't have a router; checkpoint+restart is more natural than resize.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Faster recover</h3>
+      <p style="font-size:14.5px;color:var(--text-1)">Recover currently takes 60-180s end-to-end (autoscaler reap + new pod boot + vLLM init + first refit broadcast). Most of that is vLLM init. Pre-warmed standby pods would cut it to ~30s.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Cross-AZ resilience</h3>
+      <p style="font-size:14.5px;color:var(--text-1)">Today both clusters live in one ComputeDomain (one AZ, one rack-scale fabric). A multi-region story needs different NCCL plumbing and a different cordon-on-network-partition heuristic.</p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+
+<footer>
+  RL-412 fault tolerance &middot;
+  <a href="rl-412-disagg-gen.html">&larr; Architecture</a> &middot;
+  <a href="rl-412-router-api.html">Router API &rarr;</a> &middot;
+  <a href="https://github.com/NVIDIA-NeMo/RL">NeMo-RL on GitHub</a>
+</footer>
+
+
+<!-- =====================================================================
+     SCRIPTS
+     ===================================================================== -->
+<script>
+/* ============================================================
+   STATE MACHINE — popout descriptions
+   ============================================================ */
+const SM_DESC = {
+  joining: {
+    title: "joining",
+    desc: `Set on (a) initial bring-up registration (rare; usually we register as <code>ready</code>) and (b) every <code>add_shard</code>. Workers are alive and participate in NCCL; their model weights are stale relative to the live training run. <strong>Data plane skips them entirely.</strong> Only <code>promote_all_joining()</code> &mdash; called from the <code>/update_weights_from_collective</code> handler after a successful broadcast &mdash; can flip them to <code>ready</code>. Health-poll cannot.`,
+    transIn:  [{from: "(new)",     edge: "add-joining",      via: "add_shard()"},
+               {from: "cordoned",  edge: "cordoned-joining", via: "uncordon"}],
+    transOut: [{to: "ready", edge: "joining-ready", via: "promote_all_joining() · after refit"}]
+  },
+  ready: {
+    title: "ready",
+    desc: `Serving rollouts. Counts toward <code>current_gen_world_size</code>. Health poller probes <code>/openapi.json</code> every 2s; threshold of 10 consecutive failures (~50s) flips to <code>cordoned</code>. Proxy 5xx threshold (5 consecutive) also flips to cordoned, gated to ignore transient stalls during NCCL re-init.`,
+    transIn:  [{from: "(new)",   edge: "register-ready", via: "register_shards()"},
+               {from: "joining", edge: "joining-ready",  via: "promote_all_joining()"}],
+    transOut: [{to: "cordoned", edge: "ready-cordoned", via: "10x probe fail · or 5x proxy 5xx"},
+               {to: "draining", edge: "ready-draining", via: "remove_shard()"}]
+  },
+  cordoned: {
+    title: "cordoned",
+    desc: `Status flipped because the shard breached either the health-probe failure threshold or the proxy 5xx threshold. Data plane skips. <strong>Auto-recovery is removed</strong> &mdash; cordoned shards stay cordoned until either an explicit <code>/admin/uncordon</code> (which sends them back through <code>joining</code>) or the auto-escalate path (<code>_fire_cordon_hook</code> calls <code>remove_shard</code>). The latter is the default.`,
+    transIn:  [{from: "ready", edge: "ready-cordoned", via: "10x probe fail · or 5x proxy 5xx"}],
+    transOut: [{to: "joining",  edge: "cordoned-joining",  via: "uncordon · NOT directly to ready"},
+               {to: "draining", edge: "cordoned-draining", via: "auto-remove · _fire_cordon_hook"}]
+  },
+  draining: {
+    title: "draining",
+    desc: `Transient state inside <code>remove_shard</code>. Status flipped to <code>draining</code> while the lock is held; <code>remove_shard</code> then waits up to 30s for <code>inflight == 0</code> outside the lock so the proxy can keep decrementing inflight for in-progress requests. Once drained (or timed out), status flips to <code>cordoned</code> just before <code>ray.kill</code>; immediately after, the entry is popped from the table.`,
+    transIn:  [{from: "ready",    edge: "ready-draining",    via: "remove_shard()"},
+               {from: "cordoned", edge: "cordoned-draining", via: "auto-remove"}],
+    transOut: [{to: "removed", edge: "draining-removed", via: "drain done · ray.kill · pg release"}]
+  },
+  removed: {
+    title: "(removed)",
+    desc: `Not actually a state &mdash; the shard's <code>ShardEntry</code> is popped from the router's <code>_shards</code> dict. <code>ray.kill(actor, no_restart=True)</code> has been called and the placement group released. KubeRay's autoscaler v2, with <code>idleTimeoutSeconds=300</code> and <code>minReplicas=0</code>, reaps the GPU pod a few seconds later. From here, only <code>add_shard</code> can bring a replacement <code>dp-N</code> back.`,
+    transIn:  [{from: "draining", edge: "draining-removed", via: "drain done · ray.kill · pg release"}],
+    transOut: []
+  }
+};
+
+(function bindStateMachine() {
+  const popout    = document.getElementById("sm-popout");
+  const popTitle  = popout.querySelector(".pop-title-text");
+  const popDesc   = popout.querySelector(".pop-desc");
+  const popTrans  = document.getElementById("sm-pop-trans");
+  const popHint   = document.getElementById("sm-pin-hint");
+  const nodes     = Array.from(document.querySelectorAll(".sm-node"));
+  const edges     = Array.from(document.querySelectorAll(".sm-edge, .sm-edge-lbl"));
+
+  const DEFAULT_TITLE = "Hover or click a state";
+  const DEFAULT_DESC  = `Each state has a tightly defined set of allowed transitions. The interesting design choices are the <em>forbidden</em> ones &mdash; e.g. health-poll cannot promote joining to ready, only a successful refit can.`;
+
+  // Single source of truth for which state is currently focused. `pinned` wins
+  // over `hovered` so click-to-pin survives mouse movement; on un-pin we fall
+  // back to whatever is hovered (or default).
+  let pinned  = null;
+  let hovered = null;
+
+  function relevantEdges(state) {
+    const d = SM_DESC[state];
+    if (!d) return new Set();
+    const ids = new Set();
+    (d.transIn  || []).forEach(t => ids.add(t.edge));
+    (d.transOut || []).forEach(t => ids.add(t.edge));
+    return ids;
+  }
+
+  function applyClasses(state, isPinned) {
+    const relevant = relevantEdges(state);
+
+    nodes.forEach(n => {
+      const isThis = (n.dataset.state === state);
+      n.classList.toggle("is-active", isThis && !isPinned);
+      n.classList.toggle("is-pinned", isThis &&  isPinned);
+      n.classList.toggle("is-dim",    !isThis);
+    });
+
+    edges.forEach(e => {
+      const id = e.dataset.edge;
+      const on = relevant.has(id);
+      e.classList.toggle("is-active", on);
+      e.classList.toggle("is-dim",   !on);
+    });
+  }
+
+  function clearClasses() {
+    nodes.forEach(n => n.classList.remove("is-active", "is-pinned", "is-dim"));
+    edges.forEach(e => e.classList.remove("is-active", "is-dim"));
+  }
+
+  function renderPopout(state, isPinned) {
+    const d = SM_DESC[state];
+    if (!d) {
+      popTitle.textContent = DEFAULT_TITLE;
+      popDesc.innerHTML    = DEFAULT_DESC;
+      popTrans.innerHTML   = "";
+      popHint.textContent  = "";
+      popout.classList.remove("is-pinned");
+      return;
+    }
+    popTitle.textContent = d.title;
+    popDesc.innerHTML    = d.desc;
+    popHint.textContent  = isPinned ? "(pinned · click to release)" : "(click to pin)";
+    popout.classList.toggle("is-pinned", isPinned);
+
+    const rows = [];
+    if ((d.transIn || []).length) {
+      rows.push(`<div class="row"><strong>in:</strong> ${d.transIn.map(t =>
+        `${t.from}<span class="arrow">&rarr;</span>${d.title} <em style="color:var(--text-3)">[${t.via}]</em>`
+      ).join(" &middot; ")}</div>`);
+    }
+    if ((d.transOut || []).length) {
+      rows.push(`<div class="row"><strong>out:</strong> ${d.transOut.map(t =>
+        `${d.title}<span class="arrow">&rarr;</span>${t.to} <em style="color:var(--text-3)">[${t.via}]</em>`
+      ).join(" &middot; ")}</div>`);
+    } else {
+      rows.push(`<div class="row" style="color:var(--text-3)"><em>terminal — only add_shard can bring a replacement</em></div>`);
+    }
+    popTrans.innerHTML = rows.join("");
+  }
+
+  function refresh() {
+    const focus = pinned || hovered;
+    if (focus) {
+      applyClasses(focus, focus === pinned);
+      renderPopout(focus, focus === pinned);
+    } else {
+      clearClasses();
+      renderPopout(null, false);
+    }
+  }
+
+  nodes.forEach(n => {
+    const k = n.dataset.state;
+    if (!SM_DESC[k]) return;
+
+    // Hover preview. Inner <text> has pointer-events:none, so mouseenter/leave
+    // on the <g> never cross into a child and won't flicker.
+    n.addEventListener("mouseenter", () => { hovered = k; refresh(); });
+    n.addEventListener("mouseleave", () => {
+      if (hovered === k) hovered = null;
+      refresh();
+    });
+
+    // Click toggles pin. Clicking the pinned node releases; clicking another
+    // replaces the pin. Hover and pin coexist — pin wins, hover is preview.
+    n.addEventListener("click", e => {
+      e.stopPropagation();
+      pinned = (pinned === k) ? null : k;
+      refresh();
+    });
+  });
+
+  // Click anywhere outside a node (inside the diagram) releases the pin —
+  // matches the "click another state OR click empty space" idiom.
+  document.querySelector(".smwrap").addEventListener("click", e => {
+    if (!e.target.closest(".sm-node")) { pinned = null; refresh(); }
+  });
+
+  refresh();
+})();
+
+/* ============================================================
+   LIFECYCLE WALKTHROUGH
+   ============================================================ */
+const LC_FLOWS = {
+  remove: [
+    {
+      title: "Caller hits POST /admin/remove_shard",
+      desc: `Body: <code>{shard_id: "dp-2", reason: "fault-inject actor-kill"}</code>. The router's admin endpoint takes the request and calls <code>self.remove_shard()</code>.`,
+      arrows: ["caller-router"], active: ["lc-caller", "lc-router"], shards: {}
+    },
+    {
+      title: "Acquire _lifecycle_lock and _table_lock",
+      desc: `Lifecycle ops are serialized: NCCL re-init is global, only one add/remove may be in flight. Inside the table lock, status flips to <code>draining</code> and <code>_nccl_reinit_in_progress = True</code>.`,
+      arrows: [], active: ["lc-router"], shards: {"dp-2": "draining"}
+    },
+    {
+      title: "Drain inflight (≤ 30s)",
+      desc: `Outside the lock so the proxy can keep decrementing inflight as in-progress requests complete. Sleep 50ms between checks. Times out gracefully if some requests are stuck.`,
+      arrows: [], active: ["lc-router", "lc-shards"], shards: {"dp-2": "draining"}
+    },
+    {
+      title: "ray.kill + remove_placement_group",
+      desc: `Status flips to <code>cordoned</code>. Then in an executor: <code>ray.kill(actor, no_restart=True)</code> on every actor handle, then <code>remove_placement_group(pg)</code>. Both calls are blocking Ray ops; running them off the event loop keeps the FastAPI healthy.`,
+      arrows: ["router-shard-kill", "router-ray-pgrelease"], active: ["lc-router", "lc-shards", "lc-ray"], shards: {"dp-2": "cordoned"}
+    },
+    {
+      title: "Pop from table; mark workers dead in VllmGeneration",
+      desc: `<code>self._shards.pop(shard_id)</code>. Update the underlying <code>worker_group.mark_workers_dead(worker_indices)</code> so subsequent dispatches (init_collective, generate) skip the dead actor &mdash; otherwise they'd raise <code>RayActorError</code>. Update <code>self._generation.dp_size</code>.`,
+      arrows: [], active: ["lc-router"], shards: {"dp-2": "removed"}
+    },
+    {
+      title: "No reset_collective dispatch on survivors",
+      desc: `Per-refit teardown already destroyed every survivor's <code>model_update_group</code> at the end of the previous refit (in <code>vllm_backend.update_weights_from_collective</code>'s <code>finally:</code>). There is no leftover NCCL state to abort &mdash; the next <code>init_collective</code> from the train side rebuilds from scratch at the smaller world. Earlier designs <em>did</em> dispatch <code>reset_collective</code> here, but that triggered cascade-eviction under burst kills.`,
+      arrows: [], active: ["lc-router", "lc-shards"], shards: {"dp-2": "removed"}
+    },
+    {
+      title: "Clear gate, return",
+      desc: `<code>_nccl_reinit_in_progress = False</code>. <code>/refit_ready</code> opens. The train driver's next <code>ensure_collective_synced</code> notices the world-size change and re-rendezvouses. Response: <code>{shard_id, removed: true, reason, world_size}</code>.`,
+      arrows: [], active: ["lc-router"], shards: {"dp-2": "removed"}
+    },
+  ],
+
+  add: [
+    {
+      title: "Caller hits POST /admin/add_shard",
+      desc: `Body (optional): <code>{reason: "..."}</code>. Drives <code>self.add_shard()</code>.`,
+      arrows: ["caller-router"], active: ["lc-caller", "lc-router"], shards: {"dp-2": "removed"}
+    },
+    {
+      title: "Acquire _lifecycle_lock; allocate new shard_id",
+      desc: `Set <code>_nccl_reinit_in_progress = True</code>. <code>_next_shard_id()</code> picks <code>dp-N</code> with N = max(existing) + 1 &mdash; <em>not</em> count, so removed ids never recycle (cumulative metrics stay sensible).`,
+      arrows: [], active: ["lc-router"], shards: {"dp-2": "removed"}
+    },
+    {
+      title: "Phase A: spawn_worker_only (ungated)",
+      desc: `<code>self._generation.add_dp_worker()</code> in a thread. The heavy provisioning (PG request to autoscaler v2 — ~3-5min for new pod; vLLM init ~1-2min for 4B) happens with <code>_nccl_reinit_in_progress = False</code>. Train can keep refitting at the smaller post-remove world freely. The actor is constructed and <code>prepare_refit_info</code> + bare-handle init run unconditionally.`,
+      arrows: ["router-ray-pg", "ray-shard-spawn"], active: ["lc-router", "lc-ray", "lc-shards"], shards: {"dp-2": "removed", "dp-8": "joining"}
+    },
+    {
+      title: "Phase B: pre_append_hook → append_spawned_worker (gated)",
+      desc: `Just before the new worker is appended to the worker group, <code>pre_append_hook</code> raises the gate (<code>_nccl_reinit_in_progress = True</code>). This is the "register-only gating" optimization &mdash; the gate window is the small (~30-60s) tail of bring-up, not the full ~3-5min PG provisioning. After append, <code>spawn_worker_only</code>'s dead-index compaction shifts surviving workers' indices, so the router re-pairs <code>_shards</code> entries to their new positional indices. New shard registers as <code>joining</code>. Bump cumulative_shards_added; record fault event.`,
+      arrows: [], active: ["lc-router"], shards: {"dp-2": "removed", "dp-8": "joining"}
+    },
+    {
+      title: "No reset_collective dispatch on existing workers",
+      desc: `Same as remove path: per-refit teardown already destroyed each existing worker's <code>model_update_group</code> at the end of the previous refit. The next <code>init_collective</code> from the train side rebuilds it at the new (now larger) world size including the newly added shard. The router-side <code>reset_collective</code> dispatch was removed for the same reason as the remove path.`,
+      arrows: [], active: ["lc-router", "lc-shards"], shards: {"dp-2": "removed", "dp-8": "joining"}
+    },
+    {
+      title: "Clear gate, return",
+      desc: `<code>_nccl_reinit_in_progress = False</code>. <code>/refit_ready</code> opens. The new shard sits in <code>joining</code> &mdash; data plane skips. The next refit's <code>/update_weights_from_collective</code> succeeds, calls <code>promote_all_joining()</code>, flips <code>dp-8</code> to <code>ready</code>.`,
+      arrows: [], active: ["lc-router"], shards: {"dp-2": "removed", "dp-8": "joining"}
+    },
+  ],
+
+  cycle: [
+    {
+      title: "T+0s: steady state",
+      desc: `Fleet healthy. 8 ready shards (30B FT recipe: <code>num_nodes=8 × gpus_per_node=1</code>, vLLM <code>tensor_parallel_size=1</code>). <code>current_gen_world_size = 8</code>. Reward and KL within canonical bounds.`,
+      arrows: [], active: ["lc-router", "lc-shards"], shards: {}
+    },
+    {
+      title: "T+300s: FaultInjector fires",
+      desc: `Repeat-mode injector. Picks lowest-numbered ready shard via <code>/shards</code> (rotate_target). For pod-kill: resolves the pod identity by IP first (the URL is gone after remove). Calls <code>/admin/remove_shard</code>.`,
+      arrows: ["caller-router"], active: ["lc-caller", "lc-router"], shards: {}
+    },
+    {
+      title: "T+302s: shard removed",
+      desc: `Drained inflight, <code>ray.kill</code>ed, PG released. Survivors carry no leftover NCCL state (per-refit teardown destroyed their <code>model_update_group</code> at end of prior refit). World size dropped from 8 -&gt; 7.`,
+      arrows: ["router-shard-kill"], active: ["lc-router", "lc-shards"], shards: {"dp-1": "removed"}
+    },
+    {
+      title: "T+303s: pod-kill mode also deletes the pod",
+      desc: `<code>kubernetes.client.delete_namespaced_pod(grace_period_seconds=0)</code>. Pod gone. Autoscaler v2 idle-reaps the freed PG slot within ~60s.`,
+      arrows: ["router-ray-pgrelease"], active: ["lc-router", "lc-ray"], shards: {"dp-1": "removed"}
+    },
+    {
+      title: "T+305s: train side picks up the smaller world",
+      desc: `Next refit. <code>ensure_collective_synced</code> reads <code>/current_gen_world_size = 7</code>, differs from cached <code>8</code>. Aborts old comm, rendezvouses at smaller world (120s budget per attempt, 4 attempts max).`,
+      arrows: [], active: ["lc-router"], shards: {"dp-1": "removed"}
+    },
+    {
+      title: "T+310s: training continues at world=7",
+      desc: `Next rollout runs against 7 shards. KL and reward stay within bounds &mdash; the surviving shards have current weights.`,
+      arrows: [], active: ["lc-shards"], shards: {"dp-1": "removed"}
+    },
+    {
+      title: "T+420s: FaultInjector recover fires",
+      desc: `<code>recover=True</code>, <code>recover_after_s=120</code> elapsed. POSTs <code>/admin/add_shard</code>. Router calls <code>add_dp_worker()</code>: PG request -&gt; autoscaler v2 schedules pod -&gt; vLLM bring-up.`,
+      arrows: ["caller-router", "router-shard-add"], active: ["lc-caller", "lc-router", "lc-ray"], shards: {"dp-1": "removed"}
+    },
+    {
+      title: "T+540s: new shard joins",
+      desc: `<code>dp-8</code> registered as <code>joining</code>. No <code>reset_collective</code> dispatch on existing workers (per-refit teardown handled it). World size 7 -&gt; 8 (counting joining). Data plane still skips the joining shard &mdash; weights are stale.`,
+      arrows: [], active: ["lc-router", "lc-shards"], shards: {"dp-1": "removed", "dp-8": "joining"}
+    },
+    {
+      title: "T+545s: next refit broadcasts current weights",
+      desc: `Train side rendezvouses at world 8. Broadcasts. <code>/update_weights_from_collective</code> succeeds. <code>promote_all_joining()</code> flips <code>dp-8</code> to <code>ready</code>.`,
+      arrows: [], active: ["lc-router", "lc-shards"], shards: {"dp-1": "removed", "dp-8": "ready"}
+    },
+    {
+      title: "T+550s: recovered. Wait, pick next target, repeat.",
+      desc: `<code>_wait_for_steady_state</code> confirms no <code>joining</code>, <code>refit_ready=true</code>. After <code>repeat_every_s</code>, the injector rotates to the new lowest-numbered ready shard. Cycle continues until <code>max_cycles</code> or daemon exit.`,
+      arrows: [], active: ["lc-router", "lc-shards"], shards: {"dp-1": "removed", "dp-8": "ready"}
+    },
+  ],
+};
+
+(function buildLifecycle() {
+  let flowKey = "remove";
+  let idx = 0;
+
+  const tabs = document.querySelectorAll(".lc-tabs button");
+  const progress = document.getElementById("lc-progress");
+  const numEl = document.getElementById("lc-num");
+  const totalEl = document.getElementById("lc-total");
+  const titleEl = document.getElementById("lc-title");
+  const descEl  = document.getElementById("lc-desc");
+  const btnPrev = document.getElementById("lc-prev");
+  const btnNext = document.getElementById("lc-next");
+  const btnReset= document.getElementById("lc-reset");
+  const btnAuto = document.getElementById("lc-auto");
+  let autoTimer = null;
+
+  const allNodes = ["lc-caller", "lc-router", "lc-ray", "lc-shards"];
+
+  function renderProgress() {
+    const flow = LC_FLOWS[flowKey];
+    progress.innerHTML = "";
+    flow.forEach((_, i) => {
+      const d = document.createElement("div");
+      d.className = "pdot";
+      if (i < idx) d.classList.add("done");
+      if (i === idx) d.classList.add("active");
+      progress.appendChild(d);
+    });
+  }
+
+  // Shard layout constants (kept in sync with the SVG markup so the
+  // dynamic shards land exactly inside the gen-cluster rect and the rect
+  // grows as new shards arrive instead of letting them spill out.)
+  const LC_X0 = 818;       // first shard's x (inside lc-shards-rect at x=800)
+  const LC_W = 40;         // shard width
+  const LC_GAP = 6;        // horizontal gap between shards
+  const LC_H = 32;         // shard height
+  const LC_PAD_R = 18;     // right padding inside the parent rect
+  const LC_CONTAINER_X = 800;
+  const LC_CONTAINER_Y = 200;
+  const LC_BASE_Y = 260;
+  const LC_BASE_W = 220;   // initial parent width
+  const LC_LABEL_DY = 20;  // text y offset within shard
+
+  function setShardClass(g, statusClass) {
+    const r = g.querySelector("rect");
+    const t = g.querySelector("text");
+    g.style.opacity = "1";
+    r.setAttribute("stroke-dasharray", "");
+    if (statusClass === "ready")    { r.setAttribute("fill", "rgba(95,216,173,0.18)");  r.setAttribute("stroke", "var(--st-ready)");    t.setAttribute("fill", "var(--st-ready)"); }
+    if (statusClass === "joining")  { r.setAttribute("fill", "rgba(245,203,92,0.28)");  r.setAttribute("stroke", "var(--st-joining)");  t.setAttribute("fill", "var(--st-joining)"); r.setAttribute("stroke-dasharray", "3 3"); }
+    if (statusClass === "cordoned") { r.setAttribute("fill", "rgba(255,138,161,0.30)"); r.setAttribute("stroke", "var(--st-cordoned)"); t.setAttribute("fill", "var(--st-cordoned)"); }
+    if (statusClass === "draining") { r.setAttribute("fill", "rgba(197,163,255,0.28)"); r.setAttribute("stroke", "var(--st-draining)"); t.setAttribute("fill", "var(--st-draining)"); }
+    if (statusClass === "removed")  { r.setAttribute("fill", "transparent");            r.setAttribute("stroke", "var(--text-3)");      t.setAttribute("fill", "var(--text-3)"); g.style.opacity = "0.25"; r.setAttribute("stroke-dasharray", "3 3"); }
+  }
+
+  function ensureShard(id) {
+    let g = document.querySelector(`#lc-shard-list .lc-shard[data-id="${id}"]`);
+    if (g) return g;
+    const list = document.getElementById("lc-shard-list");
+    const ns = "http://www.w3.org/2000/svg";
+    g = document.createElementNS(ns, "g");
+    g.setAttribute("class", "lc-shard");
+    g.setAttribute("data-id", id);
+    const r = document.createElementNS(ns, "rect");
+    r.setAttribute("y", LC_BASE_Y);
+    r.setAttribute("width", LC_W);
+    r.setAttribute("height", LC_H);
+    r.setAttribute("rx", 4);
+    g.appendChild(r);
+    const t = document.createElementNS(ns, "text");
+    t.setAttribute("y", LC_BASE_Y + LC_LABEL_DY);
+    t.setAttribute("font-size", "10");
+    t.setAttribute("font-family", "var(--mono)");
+    t.textContent = id;
+    g.appendChild(t);
+    list.appendChild(g);
+    return g;
+  }
+
+  function relayoutShards() {
+    // Re-flow shards left-to-right and resize the parent rect so they
+    // always sit fully inside (auto-grow). If the row would exceed the
+    // container's max comfortable width we wrap to a new row.
+    const shards = Array.from(document.querySelectorAll("#lc-shard-list .lc-shard"));
+    const maxRowW = 360; // soft cap before wrapping to a 2nd row
+    const perRow = Math.max(1, Math.floor((maxRowW - LC_PAD_R) / (LC_W + LC_GAP)));
+    let neededWidth = LC_BASE_W;
+    let rows = 1;
+    shards.forEach((g, i) => {
+      const row = Math.floor(i / perRow);
+      const col = i % perRow;
+      const x = LC_X0 + col * (LC_W + LC_GAP);
+      const y = LC_BASE_Y + row * (LC_H + 6);
+      const r = g.querySelector("rect");
+      const t = g.querySelector("text");
+      if (r) { r.setAttribute("x", x); r.setAttribute("y", y); }
+      if (t) { t.setAttribute("x", x + 6); t.setAttribute("y", y + LC_LABEL_DY); }
+      const rowEnd = x + LC_W + LC_PAD_R;
+      neededWidth = Math.max(neededWidth, rowEnd - LC_CONTAINER_X);
+      rows = Math.max(rows, row + 1);
+    });
+    const containerRect = document.getElementById("lc-shards-rect");
+    if (containerRect) {
+      containerRect.setAttribute("width", neededWidth);
+      const baseHeight = 120;
+      const newHeight = Math.max(baseHeight, baseHeight + (rows - 1) * (LC_H + 6));
+      containerRect.setAttribute("height", newHeight);
+    }
+  }
+
+  function render() {
+    const flow = LC_FLOWS[flowKey];
+    const step = flow[idx];
+
+    titleEl.textContent = `Step ${String(idx+1).padStart(2,"0")} · ${step.title}`;
+    descEl.innerHTML = step.desc;
+    numEl.textContent = String(idx+1).padStart(2,"0");
+    totalEl.textContent = String(flow.length).padStart(2,"0");
+    renderProgress();
+
+    // Make sure every shard mentioned in the step config exists, then
+    // re-flow positions so dynamic shards land inside the parent rect
+    // (the parent auto-grows / wraps as needed in relayoutShards).
+    if (step.shards) {
+      Object.keys(step.shards).forEach(id => ensureShard(id));
+    }
+    relayoutShards();
+    document.querySelectorAll("#lc-shard-list .lc-shard").forEach(g => {
+      const id = g.dataset.id;
+      const override = step.shards && step.shards[id];
+      setShardClass(g, override || "ready");
+    });
+
+    allNodes.forEach(n => {
+      const el = document.getElementById(n);
+      if (!el) return;
+      el.classList.remove("active");
+      el.classList.add("dim");
+    });
+    (step.active || []).forEach(n => {
+      const el = document.getElementById(n);
+      if (!el) return;
+      el.classList.add("active");
+      el.classList.remove("dim");
+    });
+
+    document.querySelectorAll("#lc-arrows .stage-arrow").forEach(a => a.classList.remove("show"));
+    (step.arrows || []).forEach(aid => {
+      const a = document.querySelector(`#lc-arrows [data-id="${aid}"]`);
+      if (a) a.classList.add("show");
+    });
+
+    btnPrev.disabled = idx === 0;
+    btnNext.disabled = idx === flow.length - 1;
+  }
+
+  function setFlow(k) {
+    document.querySelectorAll("#lc-shard-list .lc-shard").forEach(g => {
+      const id = g.dataset.id;
+      if (!["dp-0","dp-1","dp-2","dp-3","dp-4","dp-5","dp-6","dp-7"].includes(id)) g.remove();
+    });
+    flowKey = k;
+    idx = 0;
+    tabs.forEach(t => t.classList.toggle("active", t.dataset.flow === k));
+    relayoutShards();
+    render();
+  }
+
+  function stopAuto() {
+    if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+    btnAuto.textContent = "Auto-play";
+    delete btnAuto.dataset.playing;
+  }
+
+  tabs.forEach(t => t.addEventListener("click", () => { stopAuto(); setFlow(t.dataset.flow); }));
+  btnPrev.addEventListener("click",  () => { stopAuto(); if (idx > 0) { idx--; render(); } });
+  btnNext.addEventListener("click",  () => { stopAuto(); if (idx < LC_FLOWS[flowKey].length-1) { idx++; render(); } });
+  btnReset.addEventListener("click", () => { stopAuto(); idx = 0; render(); });
+  btnAuto.addEventListener("click",  () => {
+    if (autoTimer) { stopAuto(); return; }
+    btnAuto.textContent = "Pause";
+    btnAuto.dataset.playing = "1";
+    autoTimer = setInterval(() => {
+      if (idx < LC_FLOWS[flowKey].length - 1) { idx++; render(); }
+      else { stopAuto(); }
+    }, 1800);
+  });
+
+  setFlow("remove");
+})();
+</script>
+
+</body>
+</html>

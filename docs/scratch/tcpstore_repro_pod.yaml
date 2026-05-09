@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hemild-tcpstore-repro-pod
+  namespace: default
+  labels:
+    nrl-k8s/owner: hemild
+    purpose: tcpstore-repro
+  annotations:
+    kai.scheduler/topology: gb300-topology
+    kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+spec:
+  schedulerName: kai-scheduler
+  serviceAccountName: nemo-rl-endpoint-registry
+  imagePullSecrets:
+    - name: nvcr-secret
+  restartPolicy: Never
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-GB300
+  tolerations:
+    - operator: Exists
+  # Single-host (one pod, 4 GPUs in a GB300 node) — NCCL stays on the local
+   # NVLink fabric, no need for DRA RoCE / ComputeDomain claims. Skipping the
+   # roce-preflight initContainer too.
+  containers:
+    - name: repro
+      image: nvcr.io/nvidian/nemo-rl:nightly
+      command: ["/bin/bash", "-c", "sleep infinity"]
+      resources:
+        limits:
+          cpu: "32"
+          memory: 220Gi
+          nvidia.com/gpu: "4"
+        requests:
+          cpu: "32"
+          memory: 220Gi
+          nvidia.com/gpu: "4"
+      env:
+        - {name: NCCL_DEBUG, value: WARN}
+        - {name: NCCL_MNNVL_ENABLE, value: "1"}
+        - {name: NCCL_CUMEM_HOST_ENABLE, value: "0"}
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      volumeMounts:
+        - {mountPath: /dev/shm, name: dshm}
+        - {mountPath: /opt/nemo-rl, name: rl-workspace, subPath: hemild/nemo-rl}
+        - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+  volumes:
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi
+    - name: rl-workspace
+      persistentVolumeClaim:
+        claimName: rl-workspace

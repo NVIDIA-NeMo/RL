@@ -165,7 +165,7 @@ launch:
 
 clusters:
   # -------------------------------------------------------------------------
-  # Generation — GPU head + worker, control-server on 8089.
+  # Generation — GPU head + worker, unified router on 8089.
   # -------------------------------------------------------------------------
   generation:
     name: ${user:}-raycluster-generation-qwen3-4b
@@ -214,7 +214,7 @@ clusters:
                   - {containerPort: 6379,  name: gcs-server}
                   - {containerPort: 8265,  name: dashboard}
                   - {containerPort: 10001, name: client}
-                  - {containerPort: 8089,  name: control-server}
+                  - {containerPort: 8089,  name: gen-router}
                 volumeMounts: *dshm_mounts
             volumes: *dshm_16
       workerGroupSpecs:
