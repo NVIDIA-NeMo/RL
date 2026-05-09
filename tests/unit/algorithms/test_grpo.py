@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -256,6 +257,45 @@ def mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
     )
 
     return stack
+
+
+@contextmanager
+def _patched_logprob_phase(policy):
+    """Provide real tensors for the logprob phase of ``grpo_train``.
+
+    Both PRs #2174 / #2178 (``skip_reference_policy_logprobs_calculation=True``)
+    and PR #2177 (``force_on_policy_ratio=True``) use ``torch.zeros_like(...)``
+    placeholders inside ``grpo_train``. Those calls fail with
+    ``TypeError: zeros_like(): argument 'input' must be Tensor, not MagicMock``
+    when the surrounding inputs come straight from the bare ``mock_grpo_components``
+    fixture. This helper swaps in real tensors for the duration of the test and
+    restores the original mock return values afterwards.
+    """
+    fake_flat = BatchedDataDict(
+        {
+            "token_ids": torch.tensor([[1, 2]]),
+            "advantages": torch.tensor([[0.5, 0.5]]),
+            "generation_logprobs": torch.tensor([[0.0, 0.0]]),
+            "token_loss_mask": torch.tensor([[1, 1]]),
+            "content": ["ok"],
+        }
+    )
+    fake_lengths = torch.tensor([2])
+    saved_lp = policy.get_logprobs.return_value
+    saved_rlp = policy.get_reference_policy_logprobs.return_value
+    policy.get_logprobs.return_value = {"logprobs": torch.zeros(1, 2)}
+    policy.get_reference_policy_logprobs.return_value = {
+        "reference_logprobs": torch.zeros(1, 2)
+    }
+    with patch(
+        "nemo_rl.algorithms.grpo.batched_message_log_to_flat_message",
+        return_value=(fake_flat, fake_lengths),
+    ):
+        try:
+            yield
+        finally:
+            policy.get_logprobs.return_value = saved_lp
+            policy.get_reference_policy_logprobs.return_value = saved_rlp
 
 
 @ray.remote(num_cpus=0)
@@ -1241,7 +1281,10 @@ def test_grpo_train_skips_reference_policy_logprobs_when_configured(
     policy = mock_grpo_components["policy"]
 
     if train_func == async_grpo_train:
-        with mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
+        with (
+            mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+            _patched_logprob_phase(policy),
+        ):
             train_func(
                 policy,
                 None,
@@ -1258,6 +1301,7 @@ def test_grpo_train_skips_reference_policy_logprobs_when_configured(
             )
     else:
         with (
+            _patched_logprob_phase(policy),
             patch(
                 "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
                 return_value=(mock_batch, mock_rollout_metrics),
@@ -1326,7 +1370,10 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
     policy = mock_grpo_components["policy"]
 
     if train_func == async_grpo_train:
-        with mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
+        with (
+            mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+            _patched_logprob_phase(policy),
+        ):
             train_func(
                 policy,
                 None,
@@ -1343,6 +1390,7 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
             )
     else:
         with (
+            _patched_logprob_phase(policy),
             patch(
                 "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
                 return_value=(mock_batch, mock_rollout_metrics),
