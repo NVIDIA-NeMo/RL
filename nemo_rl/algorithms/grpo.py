@@ -22,6 +22,7 @@ from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cas
 import numpy as np
 import ray
 import torch
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
@@ -66,6 +67,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -255,6 +257,16 @@ def setup(
     logger_config = master_config.logger
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
+
+    # NeMo-Gym node accounting. Needed so policy + non-colocated OPD teachers can
+    # reserve their share of nodes without claiming the gym judge nodes.
+    enable_nemo_gym = _should_use_nemo_gym(master_config)
+    if enable_nemo_gym:
+        nemo_gym_num_nodes = env_configs.get("nemo_gym", {}).get("num_gpu_nodes", 0)
+        nemo_gym_num_gpus_per_node = cluster_config["gpus_per_node"]
+    else:
+        nemo_gym_num_nodes = 0
+        nemo_gym_num_gpus_per_node = 0
 
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
@@ -870,6 +882,10 @@ def setup(
             f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
             flush=True,
         )
+
+        if enable_opd_teachers:
+            teacher_worker_groups, alias_to_group_alias, teacher_time = results["teachers"]
+            worker_init_timing_metrics["teacher_init_time_s"] = teacher_time
 
         if enable_opd_teachers:
             teacher_worker_groups, alias_to_group_alias, teacher_time = results["teachers"]
