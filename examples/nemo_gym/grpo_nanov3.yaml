@@ -187,6 +187,7 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
+    ignore_eos: false
     vllm_cfg:
       # NB: can re-enable prefix cache on vllm >= 0.11.2.
       # enable_prefix_caching: false
