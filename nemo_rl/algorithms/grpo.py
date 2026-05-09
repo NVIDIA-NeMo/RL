@@ -1587,6 +1587,9 @@ def grpo_train(
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
                 )
+                # Dynamic sampling should not treat DAPO overlong penalties as task reward variance.
+                dynamic_sampling_rewards = repeated_batch["total_reward"].clone()
+
                 # Process rewards with custom reward function
                 if master_config["grpo"]["reward_shaping"]["enabled"]:
                     repeated_batch = apply_reward_shaping(
@@ -1599,6 +1602,11 @@ def grpo_train(
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
+                    filtering_rewards = (
+                        dynamic_sampling_rewards
+                        if master_config["grpo"]["use_dynamic_sampling"]
+                        else rewards
+                    )
 
                     print("▶ Computing advantages...", flush=True)
                     if master_config["grpo"].get("calculate_advantages_on_gpu"):
@@ -1607,8 +1615,8 @@ def grpo_train(
                         device_id = 0
                         baseline, std = calculate_baseline_and_std_per_prompt(
                             input_ids.cuda(device_id),
-                            rewards.cuda(device_id),
-                            torch.ones_like(rewards).cuda(device_id),
+                            filtering_rewards.cuda(device_id),
+                            torch.ones_like(filtering_rewards).cuda(device_id),
                             leave_one_out_baseline=master_config["grpo"][
                                 "use_leave_one_out_baseline"
                             ],
@@ -1618,8 +1626,8 @@ def grpo_train(
                     else:
                         baseline, std = calculate_baseline_and_std_per_prompt(
                             input_ids,
-                            rewards,
-                            torch.ones_like(rewards),
+                            filtering_rewards,
+                            torch.ones_like(filtering_rewards),
                             leave_one_out_baseline=master_config["grpo"][
                                 "use_leave_one_out_baseline"
                             ],
