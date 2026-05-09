@@ -82,6 +82,7 @@ def _broadcast_batched_data_dict(
     descriptor = payload[0]
     assert descriptor is not None
 
+    # pyrefly: ignore  # bad-assignment
     out: BatchedDataDict[Any] = data if is_leader else BatchedDataDict()
     for entry in descriptor:
         key = entry[0]
@@ -277,6 +278,7 @@ class TQWorkerMixin:
             packed, _ = data.shard_by_batch_size(
                 shards=1,
                 batch_size=None,
+                # pyrefly: ignore  # bad-argument-type
                 sequence_packing_args=spa,
             )
             return packed[0]
@@ -291,6 +293,7 @@ class TQWorkerMixin:
             sharded, _ = data.shard_by_batch_size(
                 shards=1,
                 batch_size=None,
+                # pyrefly: ignore  # bad-argument-type
                 dynamic_batching_args=dba,
             )
             return sharded[0]
