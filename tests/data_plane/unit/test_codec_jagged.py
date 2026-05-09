@@ -97,16 +97,17 @@ def test_materialize_pads_nested_with_field_specific_pad_value() -> None:
     )
 
     bdd = materialize(
-        td, layout="padded",
+        td,
+        layout="padded",
         pad_value_dict={"input_ids": 999, "token_mask": 0},
     )
 
     # Tokens are padded with the requested ID, not 0.
     assert bdd["input_ids"].shape == (3, 4)
-    assert bdd["input_ids"][0, 3].item() == 999      # row 0 needs 1 pad
-    assert bdd["input_ids"][1, 2].item() == 999      # row 1 needs 2 pads
+    assert bdd["input_ids"][0, 3].item() == 999  # row 0 needs 1 pad
+    assert bdd["input_ids"][1, 2].item() == 999  # row 1 needs 2 pads
     assert bdd["input_ids"][1, 3].item() == 999
-    assert bdd["input_ids"][2, 3].item() == 90       # row 2 needs no padding
+    assert bdd["input_ids"][2, 3].item() == 90  # row 2 needs no padding
 
     # Mask uses the default 0 — match the source.
     assert bdd["token_mask"].shape == (3, 4)
@@ -168,12 +169,12 @@ def test_response_from_nested_extracts_response_slice() -> None:
     # Two samples: prompt_len=2, resp_len=3 / prompt_len=1, resp_len=2
     full_rows = [
         torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5]),  # prompt 0,1; resp 2,3,4
-        torch.tensor([1.1, 1.2, 1.3]),             # prompt 0;   resp 1,2
+        torch.tensor([1.1, 1.2, 1.3]),  # prompt 0;   resp 1,2
     ]
     full = torch.nested.as_nested_tensor(full_rows, layout=torch.jagged)
     resp_mask_rows = [
         torch.tensor([1.0, 1.0, 1.0]),  # response_len = 3
-        torch.tensor([1.0, 1.0]),        # response_len = 2
+        torch.tensor([1.0, 1.0]),  # response_len = 2
     ]
     response_mask = torch.nested.as_nested_tensor(resp_mask_rows, layout=torch.jagged)
 

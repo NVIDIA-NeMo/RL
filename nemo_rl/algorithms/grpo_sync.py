@@ -97,12 +97,19 @@ def _apply_dynamic_sampling(
     max_gen_batches: int,
     dp_client: DataPlaneClient,
 ) -> tuple[
-    Optional[KVBatchMeta], Optional[_DSlice],
-    list[torch.Tensor], bool, dict[str, Any], Optional[torch.Tensor],
+    Optional[KVBatchMeta],
+    Optional[_DSlice],
+    list[torch.Tensor],
+    bool,
+    dict[str, Any],
+    Optional[torch.Tensor],
 ]:
-    """One iteration. Returns (pending_meta, pending_slice, pending_rewards,
+    """One iteration.
+
+    Returns (pending_meta, pending_slice, pending_rewards,
     is_complete, ds_metrics, unfiltered_for_log). When complete, the returned
-    pending_* IS the training batch."""
+    pending_* IS the training batch.
+    """
     # Cumulative unfiltered total_reward for legacy metrics["reward"]
     # parity. Reference-only append (no copy) — slice tensors are
     # produced fresh per iteration, not aliased to TQ-owned bulk.
@@ -145,7 +152,9 @@ def _apply_dynamic_sampling(
         )
         pending_meta = pending_meta.slice(0, train_prompts_size)
         pending_slice = pending_slice.slice(0, train_prompts_size)
-        ds_metrics["dynamic_sampling_num_discarded_valid_samples"] = n - train_prompts_size
+        ds_metrics["dynamic_sampling_num_discarded_valid_samples"] = (
+            n - train_prompts_size
+        )
 
     unfiltered_for_log = torch.cat(pending_unfiltered_rewards)[:train_prompts_size]
     return pending_meta, pending_slice, [], True, ds_metrics, unfiltered_for_log
@@ -404,9 +413,7 @@ def grpo_train_sync(
                 # partition exists with the expected schema.
                 policy.prepare_step(
                     num_samples=int(repeated_batch.size),
-                    group_size=master_config["grpo"][
-                        "num_generations_per_prompt"
-                    ],
+                    group_size=master_config["grpo"]["num_generations_per_prompt"],
                 )
 
                 # ── Rollout 1-hop put: actor runs rollout + flatten +
@@ -462,11 +469,13 @@ def grpo_train_sync(
                 # touched by any of these ops).
                 with timer.time("reward_calculation"):
                     slice_data = scale_rewards(
-                        slice_data, master_config["grpo"]["reward_scaling"],
+                        slice_data,
+                        master_config["grpo"]["reward_scaling"],
                     )
                     if master_config["grpo"]["reward_shaping"]["enabled"]:
                         slice_data = apply_reward_shaping(
-                            slice_data, master_config["grpo"]["reward_shaping"],
+                            slice_data,
+                            master_config["grpo"]["reward_shaping"],
                         )
                     if master_config["grpo"]["overlong_filtering"]:
                         lm = slice_data["loss_multiplier"].clone()
@@ -495,9 +504,11 @@ def grpo_train_sync(
                             * master_config["grpo"]["num_generations_per_prompt"]
                         )
                         (
-                            pending_meta, pending_slice,
+                            pending_meta,
+                            pending_slice,
                             pending_unfiltered_rewards,
-                            is_complete, ds_metrics,
+                            is_complete,
+                            ds_metrics,
                             unfiltered_rewards_for_logging,
                         ) = _apply_dynamic_sampling(
                             meta=meta,
@@ -571,7 +582,8 @@ def grpo_train_sync(
                         "skip_reference_policy_logprobs_calculation"
                     ):
                         _ref_lp = policy.get_reference_policy_logprobs_from_meta(
-                            meta, timer=timer,
+                            meta,
+                            timer=timer,
                         )
                         reference_policy_logprobs = _ref_lp["reference_logprobs"]
                     else:
@@ -582,7 +594,8 @@ def grpo_train_sync(
                     # output_ids, attention_mask, position_ids) stays in
                     # TQ — workers will fetch it via ``train_presharded``.
                     extras_bdd = read_columns(
-                        policy._dp_client, meta,
+                        policy._dp_client,
+                        meta,
                         select_fields=["generation_logprobs", "token_mask"],
                         pad_value_dict=_pad_dict,
                     )
@@ -658,7 +671,8 @@ def grpo_train_sync(
                 # sample_mask under the same meta.keys so workers fetch
                 # the union via train_presharded.
                 write_columns(
-                    policy._dp_client, meta,
+                    policy._dp_client,
+                    meta,
                     fields={
                         "advantages": advantages,
                         "sample_mask": sample_mask,
@@ -696,20 +710,27 @@ def grpo_train_sync(
                         # mask / adv columns added later are irrelevant
                         # here.
                         _calib_fields = [
-                            f for f in (meta.fields or [])
-                            if f not in (
-                                "generation_logprobs", "token_mask",
-                                "sample_mask", "prev_logprobs",
-                                "reference_policy_logprobs", "advantages",
+                            f
+                            for f in (meta.fields or [])
+                            if f
+                            not in (
+                                "generation_logprobs",
+                                "token_mask",
+                                "sample_mask",
+                                "prev_logprobs",
+                                "reference_policy_logprobs",
+                                "advantages",
                             )
                         ]
                         calibration_data = read_columns(
-                            policy._dp_client, meta,
+                            policy._dp_client,
+                            meta,
                             select_fields=_calib_fields,
                             pad_value_dict=_pad_dict,
                         )
                         kv_scales_cache = policy.calibrate_qkv_fp8_scales(
-                            calibration_data, include_q=True,
+                            calibration_data,
+                            include_q=True,
                         )["layers"]
                         POLICY_GENERATION_STALE = True
 
@@ -726,7 +747,9 @@ def grpo_train_sync(
                     if "content" in (meta.fields or []):
                         _log_select.append("content")
                     _log_extras = read_columns(
-                        policy._dp_client, meta, select_fields=_log_select,
+                        policy._dp_client,
+                        meta,
+                        select_fields=_log_select,
                         pad_value_dict=_pad_dict,
                     )
                     _log_input_ids = _log_extras["input_ids"]
@@ -734,7 +757,8 @@ def grpo_train_sync(
 
                 # ── Step-end TQ cleanup ────────────────────────────────
                 policy._dp_client.kv_clear(
-                    keys=meta.keys, partition_id=meta.partition_id,
+                    keys=meta.keys,
+                    partition_id=meta.partition_id,
                 )
 
                 is_last_step = total_steps + 1 >= max_num_steps
@@ -779,9 +803,7 @@ def grpo_train_sync(
 
                 # advantages and token_mask are in scope from the
                 # advantage / masking blocks above. No need to re-fetch.
-                response_advantages = torch.masked_select(
-                    advantages, token_mask.bool()
-                )
+                response_advantages = torch.masked_select(advantages, token_mask.bool())
 
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
                 metrics = {
@@ -1033,7 +1055,9 @@ def grpo_train_sync(
             print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
             if master_config["grpo"]["use_dynamic_sampling"]:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
-                print(f"  • Avg Total Reward: {np.mean(unfiltered_rewards.numpy()):.4f}")
+                print(
+                    f"  • Avg Total Reward: {np.mean(unfiltered_rewards.numpy()):.4f}"
+                )
             else:
                 print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(

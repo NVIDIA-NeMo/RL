@@ -21,15 +21,12 @@ from __future__ import annotations
 
 import os
 
-import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.policy.workers.base_policy_worker import (
-    _broadcast_batched_data_dict,
-)
+from nemo_rl.data_plane.worker_mixin import _broadcast_batched_data_dict
 
 
 def _worker(rank: int, world_size: int, tmp_init_file: str, q):
@@ -75,8 +72,7 @@ def test_leader_broadcast_round_trip(tmp_path):
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     procs = [
-        ctx.Process(target=_worker, args=(rank, 2, init_file, q))
-        for rank in range(2)
+        ctx.Process(target=_worker, args=(rank, 2, init_file, q)) for rank in range(2)
     ]
     for p in procs:
         p.start()
@@ -89,15 +85,15 @@ def test_leader_broadcast_round_trip(tmp_path):
 
 
 def test_get_replica_group_default_is_none():
-    """AbstractPolicyWorker._get_replica_group must default to None.
+    """TQWorkerMixin._get_replica_group must default to None.
 
     The base default lets ``_fetch(fetch_policy="leader_broadcast")``
     fall back to the independent path when no backend override exists
     (Phase 1 / FSDP2 with TP=CP=PP=1).
     """
-    from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+    from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 
-    class _Stub(AbstractPolicyWorker):
+    class _Stub(TQWorkerMixin):
         pass
 
     assert _Stub()._get_replica_group() is None

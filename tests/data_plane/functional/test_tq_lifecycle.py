@@ -289,8 +289,7 @@ def test_object_round_trip_backends(tq_client_backends) -> None:
     expected = _object_payload(n)
     for i in range(n):
         assert bdd[field_name][i] == expected[i], (
-            f"row {i} mismatch: got {bdd[field_name][i]!r}, "
-            f"expected {expected[i]!r}"
+            f"row {i} mismatch: got {bdd[field_name][i]!r}, expected {expected[i]!r}"
         )
 
     client.kv_clear(keys=None, partition_id="obj-backend")

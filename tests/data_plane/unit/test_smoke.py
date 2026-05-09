@@ -98,8 +98,7 @@ def test_dataplane_client_abc_surface() -> None:
         if not name.startswith("_") and getattr(member, "__isabstractmethod__", False)
     }
     assert expected_methods.issubset(actual_methods), (
-        f"DataPlaneClient ABC missing methods: "
-        f"{expected_methods - actual_methods}"
+        f"DataPlaneClient ABC missing methods: {expected_methods - actual_methods}"
     )
 
 

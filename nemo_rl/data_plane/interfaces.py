@@ -112,7 +112,9 @@ class KVBatchMeta:
             task_name=self.task_name,
             keys=list(keys),
             fields=self.fields,
-            sequence_lengths=list(sequence_lengths) if sequence_lengths is not None else None,
+            sequence_lengths=list(sequence_lengths)
+            if sequence_lengths is not None
+            else None,
             extra_info=dict(self.extra_info or {}),
         )
 

@@ -120,7 +120,9 @@ def kv_first_write(
 
     bulk = TensorDict(wire, batch_size=[n])
     dp_client.kv_batch_put(
-        keys=keys, partition_id=partition_id, fields=bulk,
+        keys=keys,
+        partition_id=partition_id,
+        fields=bulk,
     )
 
     extras = dict(extra_info or {})
@@ -143,8 +145,10 @@ def kv_first_write(
 
 @ray.remote  # pragma: no cover
 class SyncRolloutActor:
-    """Per-step rollout dispatcher: rollout + flatten + mask + prompt extraction
-    + baseline/std + TQ put. Returns ``(meta, slice, metrics)``.
+    """Per-step rollout dispatcher.
+
+    Runs: rollout + flatten + mask + prompt extraction + baseline/std + TQ put.
+    Returns ``(meta, slice, metrics)``.
 
     Lifecycle: one instance per ``grpo_train_sync`` invocation. The driver
     instantiates with the same handles it would normally pass to
@@ -221,9 +225,7 @@ class SyncRolloutActor:
         # anchor; clear accumulators before every rollout. Mirrors
         # legacy ``grpo_train``.
         if self.policy_generation is not None:
-            if first_iter and hasattr(
-                self.policy_generation, "snapshot_step_metrics"
-            ):
+            if first_iter and hasattr(self.policy_generation, "snapshot_step_metrics"):
                 self.policy_generation.snapshot_step_metrics()
             self.policy_generation.clear_logger_metrics()
 
@@ -239,7 +241,9 @@ class SyncRolloutActor:
         # Rollout dispatch (mirrors grpo_sync.py:294-349).
         if _should_use_nemo_gym(cfg):
             r = run_async_nemo_gym_rollout(
-                **common, max_seq_len=None, max_rollout_turns=None,
+                **common,
+                max_seq_len=None,
+                max_rollout_turns=None,
                 generation_config=cfg["policy"]["generation"],
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
@@ -271,23 +275,27 @@ class SyncRolloutActor:
         # Flatten message_log → bulk tensors + extract prompt-only ids.
         pad = {"pad_value_dict": {"token_ids": self.tokenizer.pad_token_id}}
         flat, input_lengths = batched_message_log_to_flat_message(
-            fb["message_log"], **pad,
+            fb["message_log"],
+            **pad,
             make_sequence_length_divisible_by=cfg["policy"][
                 "make_sequence_length_divisible_by"
             ],
         )
         prompt_flat, _ = batched_message_log_to_flat_message(
-            _extract_prompt_only_messages(fb["message_log"]), **pad,
+            _extract_prompt_only_messages(fb["message_log"]),
+            **pad,
         )
 
         # TQ bulk payload — DP_SEED_FIELDS + multimodal extras.
-        bulk_batch = BatchedDataDict[Any]({
-            "input_ids": flat["token_ids"],
-            "input_lengths": input_lengths,
-            "generation_logprobs": flat["generation_logprobs"],
-            "token_mask": flat["token_loss_mask"],
-            "sample_mask": fb["loss_multiplier"],
-        })
+        bulk_batch = BatchedDataDict[Any](
+            {
+                "input_ids": flat["token_ids"],
+                "input_lengths": input_lengths,
+                "generation_logprobs": flat["generation_logprobs"],
+                "token_mask": flat["token_loss_mask"],
+                "sample_mask": fb["loss_multiplier"],
+            }
+        )
         for k, v in flat.get_multimodal_dict(as_tensors=False).items():
             if isinstance(v, torch.Tensor):
                 bulk_batch[k] = v
@@ -308,7 +316,8 @@ class SyncRolloutActor:
             if isinstance(v, torch.Tensor) or k in bulk_batch:
                 continue
             bulk_batch[k] = (
-                v if isinstance(v, np.ndarray) and v.dtype == object
+                v
+                if isinstance(v, np.ndarray) and v.dtype == object
                 else np.asarray(v, dtype=object)
             )
 
@@ -338,7 +347,8 @@ class SyncRolloutActor:
             slice_extras[k] = fb[k]
 
         meta = kv_first_write(
-            bulk_batch, uids=uids,
+            bulk_batch,
+            uids=uids,
             dp_client=self._dp_client,
             partition_id=partition_id,
             extra_info={"rollout_metrics": rollout_metrics},

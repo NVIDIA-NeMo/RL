@@ -45,7 +45,6 @@ from nemo_rl.data_plane.preshard import (
     shard_meta_for_dp,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
@@ -81,9 +80,7 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
 def _aggregate_logprob_results(
     results: list[BatchedDataDict[Any]],
 ) -> BatchedDataDict[Any]:
-    return BatchedDataDict.from_batches(
-        results, pad_value_dict={"logprobs": 0.0}
-    )
+    return BatchedDataDict.from_batches(results, pad_value_dict={"logprobs": 0.0})
 
 
 def _aggregate_reference_logprob_results(
@@ -165,18 +162,25 @@ class TQPolicy(Policy):
     # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────
 
     def _packing_args(
-        self, mb_tokens_key: str,
+        self,
+        mb_tokens_key: str,
     ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
-        """Resolve (sequence_packing_args, dynamic_batching_args) for the
-        stage identified by ``mb_tokens_key`` (``"logprob_mb_tokens"`` or
-        ``"train_mb_tokens"``)."""
+        """Resolve (sequence_packing_args, dynamic_batching_args) for a given stage.
+
+        The stage is identified by ``mb_tokens_key`` (``"logprob_mb_tokens"`` or
+        ``"train_mb_tokens"``).
+        """
         if getattr(self, "use_dynamic_batches", False):
             args = dict(self.dynamic_batching_args)
-            args["max_tokens_per_microbatch"] = self.cfg["dynamic_batching"][mb_tokens_key]
+            args["max_tokens_per_microbatch"] = self.cfg["dynamic_batching"][
+                mb_tokens_key
+            ]
             return None, args
         if getattr(self, "use_sequence_packing", False):
             args = dict(self.sequence_packing_args)
-            args["max_tokens_per_microbatch"] = self.cfg["sequence_packing"][mb_tokens_key]
+            args["max_tokens_per_microbatch"] = self.cfg["sequence_packing"][
+                mb_tokens_key
+            ]
             return args, None
         return None, None
 
@@ -212,8 +216,16 @@ class TQPolicy(Policy):
                 worker_method,
                 meta=metas,
                 in_sharded_axes=["data_parallel"],
-                replicate_on_axes=["context_parallel", "tensor_parallel", "pipeline_parallel"],
-                output_is_replicated=["context_parallel", "tensor_parallel", "pipeline_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
                 common_kwargs=common_kwargs,
             )
         result = aggregate_fn(self.worker_group.get_all_worker_results(futures))
@@ -283,13 +295,11 @@ class TQPolicy(Policy):
         # for ensuring those columns have been written to TQ before this
         # call (workers + driver delta-writes).
         train_meta = replace(
-            meta, fields=list(DP_SEED_FIELDS), task_name="train",
+            meta,
+            fields=list(DP_SEED_FIELDS),
+            task_name="train",
         )
-        with (
-            timer.time("policy_training/shard_meta")
-            if timer
-            else nullcontext()
-        ):
+        with timer.time("policy_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(
                 train_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),

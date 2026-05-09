@@ -77,7 +77,9 @@ def test_kv_batch_get_after_clear_raises() -> None:
     with pytest.raises(KeyError):
         # NoOp raises KeyError when the partition entry is gone.
         client.kv_batch_get(
-            keys=meta.keys, partition_id="train", select_fields=["input_ids"],
+            keys=meta.keys,
+            partition_id="train",
+            select_fields=["input_ids"],
         )
 
 
@@ -92,7 +94,9 @@ def test_kv_batch_get_unproduced_field_raises() -> None:
     # ``advantages`` has not been written yet (driver delta-write).
     with pytest.raises(KeyError):
         client.kv_batch_get(
-            keys=meta.keys, partition_id="train", select_fields=["advantages"],
+            keys=meta.keys,
+            partition_id="train",
+            select_fields=["advantages"],
         )
 
 
@@ -132,7 +136,9 @@ def test_kv_batch_put_rejects_non_tensor_leaves() -> None:
     )
     with pytest.raises(TypeError, match=r"non-tensor"):
         client.kv_batch_put(
-            keys=["x_g0", "y_g0"], partition_id="train", fields=bad_td,
+            keys=["x_g0", "y_g0"],
+            partition_id="train",
+            fields=bad_td,
         )
 
 
@@ -147,8 +153,10 @@ def test_get_meta_unregistered_task_raises() -> None:
     )
     with pytest.raises(KeyError, match=r"task"):
         client.get_meta(
-            partition_id="train", task_name="trian",  # typo
-            required_fields=["input_ids"], batch_size=2,
+            partition_id="train",
+            task_name="trian",  # typo
+            required_fields=["input_ids"],
+            batch_size=2,
         )
 
 
@@ -174,10 +182,16 @@ def test_double_register_partition_is_idempotent_overwrite() -> None:
     must overwrite cleanly, not append fields."""
     client = NoOpDataPlaneClient()
     client.register_partition(
-        partition_id="train", fields=["a"], num_samples=2, consumer_tasks=["t"],
+        partition_id="train",
+        fields=["a"],
+        num_samples=2,
+        consumer_tasks=["t"],
     )
     client.register_partition(
-        partition_id="train", fields=["b"], num_samples=4, consumer_tasks=["t"],
+        partition_id="train",
+        fields=["b"],
+        num_samples=4,
+        consumer_tasks=["t"],
     )
     rec = client._partitions["train"]
     assert rec.fields == ["b"]
@@ -196,8 +210,10 @@ def test_check_consumption_status_only_true_when_all_consumed() -> None:
 
     # Simulate the worker fetch.
     client.get_meta(
-        partition_id="train", task_name="train",
-        required_fields=["input_ids"], batch_size=meta.size,
+        partition_id="train",
+        task_name="train",
+        required_fields=["input_ids"],
+        batch_size=meta.size,
     )
     assert client.check_consumption_status("train", ["train"])
 
@@ -215,8 +231,10 @@ def test_shard_meta_for_dp_partitions_keys_disjointly() -> None:
     _setup(client, n=8)
     fb = _final_batch(8)
     meta = kv_first_write(
-        fb, uids=[f"u{i}" for i in range(8)],
-        dp_client=client, partition_id="train",
+        fb,
+        uids=[f"u{i}" for i in range(8)],
+        dp_client=client,
+        partition_id="train",
     )
 
     shards, _ = shard_meta_for_dp(meta, dp_world=4, batch_size=8)
@@ -235,8 +253,10 @@ def test_shard_meta_for_dp_keeps_partition_id() -> None:
     _setup(client, n=4)
     fb = _final_batch(4)
     meta = kv_first_write(
-        fb, uids=[f"u{i}" for i in range(4)],
-        dp_client=client, partition_id="train",
+        fb,
+        uids=[f"u{i}" for i in range(4)],
+        dp_client=client,
+        partition_id="train",
     )
     shards, _ = shard_meta_for_dp(meta, dp_world=2, batch_size=4)
     for s in shards:
@@ -253,15 +273,19 @@ def test_kv_first_write_carries_multimodal_extras_through_tq() -> None:
     client = NoOpDataPlaneClient()
     fields = list(DP_SEED_FIELDS) + ["image_features"]
     client.register_partition(
-        partition_id="train", fields=fields,
-        num_samples=4, consumer_tasks=["train"],
+        partition_id="train",
+        fields=fields,
+        num_samples=4,
+        consumer_tasks=["train"],
     )
     fb = _final_batch(4, with_image=True)
     expected = fb["image_features"].clone()
 
     meta = kv_first_write(
-        fb, uids=[f"u{i}" for i in range(4)],
-        dp_client=client, partition_id="train",
+        fb,
+        uids=[f"u{i}" for i in range(4)],
+        dp_client=client,
+        partition_id="train",
     )
     assert "image_features" in meta.fields
 
@@ -281,14 +305,18 @@ def test_kv_batch_put_preserves_bf16_dtype() -> None:
     """Catches silent fp32 promotion in the put path."""
     client = NoOpDataPlaneClient()
     client.register_partition(
-        partition_id="train", fields=["x"],
-        num_samples=2, consumer_tasks=["train"],
+        partition_id="train",
+        fields=["x"],
+        num_samples=2,
+        consumer_tasks=["train"],
     )
     x = torch.randn((2, 4), dtype=torch.bfloat16)
     td = TensorDict({"x": x}, batch_size=[2])
     client.kv_batch_put(keys=["a", "b"], partition_id="train", fields=td)
 
-    out = client.kv_batch_get(keys=["a", "b"], partition_id="train", select_fields=["x"])
+    out = client.kv_batch_get(
+        keys=["a", "b"], partition_id="train", select_fields=["x"]
+    )
     assert out["x"].dtype == torch.bfloat16
 
 
@@ -296,15 +324,19 @@ def test_kv_batch_put_preserves_int64_dtype() -> None:
     """input_ids is int64; never coerce to int32 silently."""
     client = NoOpDataPlaneClient()
     client.register_partition(
-        partition_id="train", fields=["input_ids"],
-        num_samples=2, consumer_tasks=["train"],
+        partition_id="train",
+        fields=["input_ids"],
+        num_samples=2,
+        consumer_tasks=["train"],
     )
     x = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)
     td = TensorDict({"input_ids": x}, batch_size=[2])
     client.kv_batch_put(keys=["a", "b"], partition_id="train", fields=td)
 
     out = client.kv_batch_get(
-        keys=["a", "b"], partition_id="train", select_fields=["input_ids"],
+        keys=["a", "b"],
+        partition_id="train",
+        select_fields=["input_ids"],
     )
     assert out["input_ids"].dtype == torch.long
     assert torch.equal(out["input_ids"], x)
@@ -347,7 +379,10 @@ def test_kv_first_write_rejects_indivisible_batch() -> None:
     fb = _final_batch(5)
     with pytest.raises(ValueError, match=r"divisible"):
         kv_first_write(
-            fb, uids=["a", "b"], dp_client=client, partition_id="train",
+            fb,
+            uids=["a", "b"],
+            dp_client=client,
+            partition_id="train",
         )
 
 
@@ -360,7 +395,9 @@ def test_kv_first_write_meta_sequence_lengths_match_input_lengths() -> None:
     fb["input_lengths"] = torch.tensor([3, 5, 7, 8], dtype=torch.long)
 
     meta = kv_first_write(
-        fb, uids=[f"u{i}" for i in range(4)],
-        dp_client=client, partition_id="train",
+        fb,
+        uids=[f"u{i}" for i in range(4)],
+        dp_client=client,
+        partition_id="train",
     )
     assert meta.sequence_lengths == [3, 5, 7, 8]

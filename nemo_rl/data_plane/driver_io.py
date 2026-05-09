@@ -96,12 +96,8 @@ def write_columns(
     from nemo_rl.data_plane.codec import maybe_pack_jagged, pack_object_array
 
     seq_lens = meta.sequence_lengths
-    lengths = (
-        torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
-    )
-    registered_objects = set(
-        (meta.extra_info or {}).get(META_OBJECT_FIELDS, ())
-    )
+    lengths = torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
+    registered_objects = set((meta.extra_info or {}).get(META_OBJECT_FIELDS, ()))
 
     packed: dict[str, torch.Tensor] = {}
     for k, v in fields.items():
@@ -127,5 +123,7 @@ def write_columns(
 
     td = TensorDict(packed, batch_size=[len(meta.keys)])
     dp_client.kv_batch_put(
-        keys=meta.keys, partition_id=meta.partition_id, fields=td,
+        keys=meta.keys,
+        partition_id=meta.partition_id,
+        fields=td,
     )

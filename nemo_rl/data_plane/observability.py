@@ -67,14 +67,22 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._inner = inner
         self._on_event = on_event or (lambda _: None)
         self._stats: dict[str, int | float] = {
-            "total_bytes": 0, "total_keys": 0, "total_ops": 0,
+            "total_bytes": 0,
+            "total_keys": 0,
+            "total_ops": 0,
         }
 
     def snapshot(self) -> dict[str, Any]:
         return dict(self._stats)
 
-    def _run(self, op: str, partition_id: str, n_keys: int, n_bytes: int,
-             fn: Callable[[], Any]) -> Any:
+    def _run(
+        self,
+        op: str,
+        partition_id: str,
+        n_keys: int,
+        n_bytes: int,
+        fn: Callable[[], Any],
+    ) -> Any:
         t0 = monotonic()
         try:
             out = fn()
@@ -93,12 +101,22 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._emit(op, partition_id, n_keys, n_bytes, t0, "ok")
         return out
 
-    def _emit(self, op: str, partition_id: str, n_keys: int, n_bytes: int,
-              t0: float, status: EventStatus) -> None:
+    def _emit(
+        self,
+        op: str,
+        partition_id: str,
+        n_keys: int,
+        n_bytes: int,
+        t0: float,
+        status: EventStatus,
+    ) -> None:
         event = {
-            "op": op, "partition_id": partition_id,
-            "n_keys": int(n_keys), "n_bytes": int(n_bytes),
-            "wall_ms": (monotonic() - t0) * 1000.0, "status": status,
+            "op": op,
+            "partition_id": partition_id,
+            "n_keys": int(n_keys),
+            "n_bytes": int(n_bytes),
+            "wall_ms": (monotonic() - t0) * 1000.0,
+            "status": status,
         }
         self._on_event(event)
         if status == "ok":
@@ -106,29 +124,62 @@ class MetricsDataPlaneClient(DataPlaneClient):
             self._stats["total_keys"] += n_keys
             self._stats["total_ops"] += 1
 
-    def register_partition(self, partition_id, fields, num_samples,
-                           consumer_tasks, grpo_group_size=None, enums=None):
+    def register_partition(
+        self,
+        partition_id,
+        fields,
+        num_samples,
+        consumer_tasks,
+        grpo_group_size=None,
+        enums=None,
+    ):
         self._run(
-            "register", partition_id, int(num_samples), 0,
+            "register",
+            partition_id,
+            int(num_samples),
+            0,
             lambda: self._inner.register_partition(
-                partition_id, fields, num_samples, consumer_tasks,
-                grpo_group_size=grpo_group_size, enums=enums,
+                partition_id,
+                fields,
+                num_samples,
+                consumer_tasks,
+                grpo_group_size=grpo_group_size,
+                enums=enums,
             ),
         )
 
-    def get_meta(self, partition_id, task_name, required_fields, batch_size,
-                 dp_rank=None, blocking=True, timeout_s=60.0):
+    def get_meta(
+        self,
+        partition_id,
+        task_name,
+        required_fields,
+        batch_size,
+        dp_rank=None,
+        blocking=True,
+        timeout_s=60.0,
+    ):
         return self._run(
-            "get_meta", partition_id, 0, 0,
+            "get_meta",
+            partition_id,
+            0,
+            0,
             lambda: self._inner.get_meta(
-                partition_id, task_name, required_fields, batch_size,
-                dp_rank=dp_rank, blocking=blocking, timeout_s=timeout_s,
+                partition_id,
+                task_name,
+                required_fields,
+                batch_size,
+                dp_rank=dp_rank,
+                blocking=blocking,
+                timeout_s=timeout_s,
             ),
         )
 
     def get_data(self, meta, select_fields=None):
         return self._run(
-            "get_data", meta.partition_id, len(meta.keys), 0,
+            "get_data",
+            meta.partition_id,
+            len(meta.keys),
+            0,
             lambda: self._inner.get_data(meta, select_fields=select_fields),
         )
 
@@ -137,24 +188,38 @@ class MetricsDataPlaneClient(DataPlaneClient):
 
     def kv_batch_put(self, keys, partition_id, fields=None, tags=None):
         return self._run(
-            "put", partition_id, len(keys), _td_bytes(fields),
+            "put",
+            partition_id,
+            len(keys),
+            _td_bytes(fields),
             lambda: self._inner.kv_batch_put(
-                keys, partition_id, fields=fields, tags=tags,
+                keys,
+                partition_id,
+                fields=fields,
+                tags=tags,
             ),
         )
 
     def kv_batch_get(self, keys, partition_id, select_fields=None):
         return self._run(
-            "get", partition_id, len(keys), 0,
+            "get",
+            partition_id,
+            len(keys),
+            0,
             lambda: self._inner.kv_batch_get(
-                keys, partition_id, select_fields=select_fields,
+                keys,
+                partition_id,
+                select_fields=select_fields,
             ),
         )
 
     def kv_clear(self, keys, partition_id):
         n_keys = len(keys) if keys is not None else 0
         self._run(
-            "clear", partition_id, n_keys, 0,
+            "clear",
+            partition_id,
+            n_keys,
+            0,
             lambda: self._inner.kv_clear(keys, partition_id),
         )
 

@@ -112,9 +112,7 @@ def test_materialize_padding_corrupts_object_field_when_object_fields_omitted() 
     pickle bytes by padding with zeros. This is why read_columns reads
     ``meta.extra_info['object_fields']`` and forwards it to materialize.
     """
-    msg_packed = pack_object_array(
-        np.array([{"x": "long"}, {"x": "s"}], dtype=object)
-    )
+    msg_packed = pack_object_array(np.array([{"x": "long"}, {"x": "s"}], dtype=object))
     td = TensorDict({"message_log": msg_packed}, batch_size=[2])
     bdd = materialize(td, layout="padded")  # no object_fields → padded
     assert isinstance(bdd["message_log"], torch.Tensor)

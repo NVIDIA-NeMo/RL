@@ -86,9 +86,7 @@ def test_grpo_sync_engages_tq_policy():
     )
     # TQ engagement happens through the policy's overridden methods —
     # check that the chain reaches a real KVBatchMeta construction.
-    helper_src = _strip_comments_and_docstrings(
-        _read("nemo_rl/data_plane/preshard.py")
-    )
+    helper_src = _strip_comments_and_docstrings(_read("nemo_rl/data_plane/preshard.py"))
     assert "KVBatchMeta(" in helper_src, (
         "preshard.py must still construct KVBatchMeta — TQPolicy "
         "delegates here on each fan-out."
@@ -107,14 +105,14 @@ def test_grpo_sync_requires_data_plane_enabled():
     src = _strip_comments_and_docstrings(_read("nemo_rl/algorithms/grpo_sync.py"))
     # Either a guard or a direct require — at minimum the error must be
     # raised when enabled=False.
-    assert (
-        "raise ValueError" in src or "raise RuntimeError" in src
-    ), "grpo_sync.py should raise when data_plane is not enabled."
+    assert "raise ValueError" in src or "raise RuntimeError" in src, (
+        "grpo_sync.py should raise when data_plane is not enabled."
+    )
     # And the failure message should name the legacy escape hatch so
     # users can self-recover.
-    assert (
-        "grpo_train" in src or "grpo.py" in src
-    ), "grpo_sync.py's enabled-required error should point users at the legacy trainer."
+    assert "grpo_train" in src or "grpo.py" in src, (
+        "grpo_sync.py's enabled-required error should point users at the legacy trainer."
+    )
 
 
 def test_no_feature_gate_pattern_in_either_trainer():
@@ -204,10 +202,8 @@ def test_run_grpo_dispatches_both_trainers():
     # Routing must read the data_plane config block somewhere — check
     # against the original (un-stripped) source so we cover both inline
     # access (`master_config["data_plane"]`) and `.get("data_plane")`.
-    assert (
-        '"data_plane"' in src or "'data_plane'" in src
-    ), (
-        "run_grpo.py should read master_config[\"data_plane\"] to dispatch."
+    assert '"data_plane"' in src or "'data_plane'" in src, (
+        'run_grpo.py should read master_config["data_plane"] to dispatch.'
     )
     assert re.search(r"\.get\(\s*[\"']enabled[\"']", cleaned), (
         "run_grpo.py should branch on the data-plane `enabled` flag."
@@ -254,6 +250,7 @@ def test_pack_per_token_field_is_exported() -> None:
     cannot handle that.
     """
     from nemo_rl.data_plane.codec import pack_per_token_field  # noqa: F401
+
     assert callable(pack_per_token_field), (
         "nemo_rl.data_plane.codec.pack_per_token_field must be callable. "
         "It was added in commit 45f4ffb8 to handle SP-padded-wider write-backs."

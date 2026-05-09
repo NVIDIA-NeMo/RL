@@ -100,7 +100,9 @@ from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
-class MegatronPolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker, ColocatablePolicyInterface):
+class MegatronPolicyWorkerImpl(
+    TQWorkerMixin, AbstractPolicyWorker, ColocatablePolicyInterface
+):
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
 
@@ -142,10 +144,15 @@ class MegatronPolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker, ColocatableP
         # replica group. Done collectively so every rank ends up with
         # the same ranks list and can pass it to new_group().
         my_replica_ranks_t = torch.full(
-            (world_size,), -1, dtype=torch.long, device="cuda",
+            (world_size,),
+            -1,
+            dtype=torch.long,
+            device="cuda",
         )
         my_replica_ranks_t[torch.distributed.get_rank()] = my_dp_rank
-        torch.distributed.all_reduce(my_replica_ranks_t, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(
+            my_replica_ranks_t, op=torch.distributed.ReduceOp.MAX
+        )
         all_dp_ranks = my_replica_ranks_t.tolist()
 
         # Every (dp_rank → ranks) bucket must call new_group on its own

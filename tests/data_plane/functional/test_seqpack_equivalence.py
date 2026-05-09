@@ -140,9 +140,7 @@ def _make_fake_train_data(
             "reference_policy_logprobs": torch.randn(
                 n_samples, max_seqlen, generator=g
             ),
-            "generation_logprobs": torch.randn(
-                n_samples, max_seqlen, generator=g
-            ),
+            "generation_logprobs": torch.randn(n_samples, max_seqlen, generator=g),
         }
     )
 
@@ -179,10 +177,14 @@ def _round_trip_shards_through_tq(
             batch_size=[n],
         )
         tq_client.kv_batch_put(
-            keys=keys, partition_id=partition_id, fields=fields,
+            keys=keys,
+            partition_id=partition_id,
+            fields=fields,
         )
         td_back = tq_client.kv_batch_get(
-            keys=keys, partition_id=partition_id, select_fields=list(names),
+            keys=keys,
+            partition_id=partition_id,
+            select_fields=list(names),
         )
         bdd = materialize(td_back, layout="padded")
         bdd.micro_batch_indices = shard.micro_batch_indices
@@ -197,15 +199,12 @@ def _assert_shards_byte_equal(legacy, recovered, *, expect_metadata: bool) -> No
         f"shard count mismatch: legacy={len(legacy)} tq={len(recovered)}"
     )
     for r, (L, T) in enumerate(zip(legacy, recovered)):
-        L_tensor_keys = {
-            k for k, v in L.data.items() if isinstance(v, torch.Tensor)
-        }
+        L_tensor_keys = {k for k, v in L.data.items() if isinstance(v, torch.Tensor)}
         # TQ only transmits _DP_SEED_FIELDS — non-seed legacy fields are
         # out of scope for this test.
         common = L_tensor_keys & set(_DP_SEED_FIELDS)
         assert common <= set(T.data.keys()), (
-            f"rank {r}: TQ shard missing seed fields "
-            f"{common - set(T.data.keys())}"
+            f"rank {r}: TQ shard missing seed fields {common - set(T.data.keys())}"
         )
         for k in common:
             assert L[k].shape == T[k].shape, (
@@ -214,9 +213,7 @@ def _assert_shards_byte_equal(legacy, recovered, *, expect_metadata: bool) -> No
             assert L[k].dtype == T[k].dtype, (
                 f"rank {r} field {k}: dtype {L[k].dtype} != {T[k].dtype}"
             )
-            assert torch.equal(L[k], T[k]), (
-                f"rank {r} field {k}: byte-level mismatch"
-            )
+            assert torch.equal(L[k], T[k]), f"rank {r} field {k}: byte-level mismatch"
         if expect_metadata:
             assert L.micro_batch_indices == T.micro_batch_indices, (
                 f"rank {r} micro_batch_indices mismatch"
@@ -243,13 +240,19 @@ def test_seqpack_legacy_equals_tq(tq_client):
     data = _make_fake_train_data(n_samples=GBS)
 
     legacy_shards, _ = data.shard_by_batch_size(
-        DP_WORLD, batch_size=GBS, sequence_packing_args=spa,
+        DP_WORLD,
+        batch_size=GBS,
+        sequence_packing_args=spa,
     )
     tq_pre_shards, _ = data.shard_by_batch_size(
-        DP_WORLD, batch_size=GBS, sequence_packing_args=spa,
+        DP_WORLD,
+        batch_size=GBS,
+        sequence_packing_args=spa,
     )
     recovered = _round_trip_shards_through_tq(
-        tq_client, tq_pre_shards, partition_id="seqpack-eq",
+        tq_client,
+        tq_pre_shards,
+        partition_id="seqpack-eq",
     )
     _assert_shards_byte_equal(legacy_shards, recovered, expect_metadata=True)
 
@@ -267,13 +270,19 @@ def test_dynbatch_legacy_equals_tq(tq_client):
     data = _make_fake_train_data(n_samples=GBS)
 
     legacy_shards, _ = data.shard_by_batch_size(
-        DP_WORLD, batch_size=GBS, dynamic_batching_args=dba,
+        DP_WORLD,
+        batch_size=GBS,
+        dynamic_batching_args=dba,
     )
     tq_pre_shards, _ = data.shard_by_batch_size(
-        DP_WORLD, batch_size=GBS, dynamic_batching_args=dba,
+        DP_WORLD,
+        batch_size=GBS,
+        dynamic_batching_args=dba,
     )
     recovered = _round_trip_shards_through_tq(
-        tq_client, tq_pre_shards, partition_id="dynbatch-eq",
+        tq_client,
+        tq_pre_shards,
+        partition_id="dynbatch-eq",
     )
     _assert_shards_byte_equal(legacy_shards, recovered, expect_metadata=True)
 
@@ -287,7 +296,9 @@ def test_no_packing_legacy_equals_tq(tq_client):
     legacy_shards = data.shard_by_batch_size(DP_WORLD, batch_size=GBS)
     tq_pre_shards = data.shard_by_batch_size(DP_WORLD, batch_size=GBS)
     recovered = _round_trip_shards_through_tq(
-        tq_client, tq_pre_shards, partition_id="nopack-eq",
+        tq_client,
+        tq_pre_shards,
+        partition_id="nopack-eq",
     )
     # No packing → no micro_batch_* metadata to compare.
     _assert_shards_byte_equal(legacy_shards, recovered, expect_metadata=False)
