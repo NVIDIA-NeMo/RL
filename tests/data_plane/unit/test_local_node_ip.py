@@ -28,7 +28,6 @@ import os
 
 import pytest
 
-
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -126,6 +125,7 @@ def test_mc_tcp_bind_address_overwrites_existing(monkeypatch) -> None:
     must be overwritten with the local IP.
     """
     import socket
+
     from nemo_rl.data_plane.adapters.transfer_queue import _get_local_node_ip
 
     local_ip = "10.65.4.100"

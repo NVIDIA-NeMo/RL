@@ -25,7 +25,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-
 # ── Module-level state restoration fixture ───────────────────────────────────
 
 
@@ -55,8 +54,9 @@ def test_promote_1d_unsqueezes_on_write(codec_flags) -> None:
     pre-unsqueeze at the wire layer so per-row shape matches the metadata shape.
     """
     # Import the adapter's _to_wire directly so this test stays unit-level.
-    from nemo_rl.data_plane.adapters.transfer_queue import _to_wire
     from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import _to_wire
 
     codec_flags.set_kv_promote_1d(True)
 
@@ -106,8 +106,9 @@ def test_promote_1d_squeezes_on_read_roundtrip(codec_flags) -> None:
 def test_promote_1d_off_leaves_shape_unchanged(codec_flags) -> None:
     """When _KV_PROMOTE_1D is False (the default), 1D tensors pass through
     the wire layer without modification."""
-    from nemo_rl.data_plane.adapters.transfer_queue import _to_wire
     from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import _to_wire
 
     codec_flags.set_kv_promote_1d(False)
 

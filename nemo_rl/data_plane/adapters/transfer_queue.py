@@ -40,7 +40,6 @@ from nemo_rl.data_plane.interfaces import (
     KVBatchMeta,
 )
 
-
 # ──────────────────────────────────────────────────────────────────────────
 # Lazy import of transfer_queue — keeps NeMo-RL importable without TQ
 # installed; failure is deferred to construction time.
