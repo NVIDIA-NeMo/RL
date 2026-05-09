@@ -51,7 +51,7 @@ def test_put_records_bytes_and_count(wrapped_client):
     e = put_events[0]
     assert e["status"] == "ok"
     assert e["n_keys"] == 4
-    assert e["n_bytes"] == 16   # 4 floats * 4 bytes
+    assert e["n_bytes"] == 16  # 4 floats * 4 bytes
     assert e["wall_ms"] >= 0
 
 
@@ -61,7 +61,8 @@ def test_get_records_after_put(wrapped_client):
         partition_id="p", fields=["x"], num_samples=2, consumer_tasks=["read"]
     )
     client.kv_batch_put(
-        keys=["a", "b"], partition_id="p",
+        keys=["a", "b"],
+        partition_id="p",
         fields=TensorDict({"x": torch.ones(2)}, batch_size=[2]),
     )
     out = client.kv_batch_get(keys=["a", "b"], partition_id="p", select_fields=["x"])
@@ -100,12 +101,13 @@ def test_snapshot_accumulates_successful_ops(wrapped_client):
         partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["r"]
     )
     client.kv_batch_put(
-        keys=["a"], partition_id="p",
+        keys=["a"],
+        partition_id="p",
         fields=TensorDict({"x": torch.zeros(1)}, batch_size=[1]),
     )
     snap = client.snapshot()
-    assert snap["total_ops"] >= 2     # register + put
-    assert snap["total_bytes"] >= 4   # 1 float = 4 bytes
+    assert snap["total_ops"] >= 2  # register + put
+    assert snap["total_bytes"] >= 4  # 1 float = 4 bytes
 
 
 def test_default_callback_is_noop():

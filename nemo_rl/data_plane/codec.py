@@ -13,28 +13,28 @@
 # limitations under the License.
 """Wire <-> trainer codec — jagged-on-the-wire bridge.
 
-  * Writer side: variable-length fields are encoded as
-    ``torch.nested.nested_tensor`` with ``layout=torch.jagged`` before
-    ``kv_batch_put``. Padding tax is paid only when a consumer needs a
-    rectangular tensor.
+* Writer side: variable-length fields are encoded as
+``torch.nested.nested_tensor`` with ``layout=torch.jagged`` before
+``kv_batch_put``. Padding tax is paid only when a consumer needs a
+rectangular tensor.
 
-  * Reader side: :func:`materialize` accepts the wire TensorDict and,
-    when ``layout='padded'``, calls
-    :func:`torch.nested.to_padded_tensor` on any nested leaves using
-    the per-field padding value supplied in ``pad_value_dict``. Trainer
-    code consumes the padded BatchedDataDict unchanged.
+* Reader side: :func:`materialize` accepts the wire TensorDict and,
+when ``layout='padded'``, calls
+:func:`torch.nested.to_padded_tensor` on any nested leaves using
+the per-field padding value supplied in ``pad_value_dict``. Trainer
+code consumes the padded BatchedDataDict unchanged.
 
-  * Worker write-backs that produce ``response``-shaped outputs use
-    :func:`response_from_nested` to extract the response slice from a
-    (prompt+response) nested tensor.
+* Worker write-backs that produce ``response``-shaped outputs use
+:func:`response_from_nested` to extract the response slice from a
+(prompt+response) nested tensor.
 
-  * Non-tensor object fields (verl-style ``np.ndarray(dtype=object)``)
-    ride the same wire as variable-length tensors: each row is pickled
-    to ``bytes`` and packed into a jagged uint8 nested tensor via
-    :func:`pack_object_array`. Reader unpacks via
-    :func:`unpack_object_array` and emits the field as an object array
-    in the materialized BatchedDataDict. Backends see only tensors —
-    no per-backend non-tensor support required.
+* Non-tensor object fields (verl-style ``np.ndarray(dtype=object)``)
+ride the same wire as variable-length tensors: each row is pickled
+to ``bytes`` and packed into a jagged uint8 nested tensor via
+:func:`pack_object_array`. Reader unpacks via
+:func:`unpack_object_array` and emits the field as an object array
+in the materialized BatchedDataDict. Backends see only tensors —
+no per-backend non-tensor support required.
 """
 
 from __future__ import annotations
@@ -101,8 +101,10 @@ _KV_PROMOTE_1D = False
 
 
 def set_kv_promote_1d(enabled: bool) -> None:
-    """Adapter hook: when True, writer unsqueezes 1D bulk fields to
-    (N, 1) and reader squeezes the trailing 1 in :func:`materialize`.
+    """Adapter hook: enable/disable 1D→(N,1) promotion for bulk fields.
+
+    When True, writer unsqueezes 1D bulk fields to (N, 1) and reader
+    squeezes the trailing 1 in :func:`materialize`.
 
     Required by backends that go through TQ's KVStorageManager path
     (mooncake_cpu) — see ``_KV_PROMOTE_1D`` above for the schema/data
@@ -157,9 +159,7 @@ def pack_object_array(arr: "np.ndarray | list[Any]") -> torch.Tensor:
     """
     if isinstance(arr, np.ndarray):
         if arr.dtype != object:
-            raise TypeError(
-                f"pack_object_array expects dtype=object; got {arr.dtype}"
-            )
+            raise TypeError(f"pack_object_array expects dtype=object; got {arr.dtype}")
         items: list[Any] = list(arr)
     elif isinstance(arr, list):
         items = arr
@@ -173,9 +173,7 @@ def pack_object_array(arr: "np.ndarray | list[Any]") -> torch.Tensor:
         b = pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL)
         # np.frombuffer + .copy() avoids the "non-writable buffer" warning
         # and severs the lifetime tie to the bytes object.
-        rows.append(
-            torch.from_numpy(np.frombuffer(b, dtype=np.uint8).copy())
-        )
+        rows.append(torch.from_numpy(np.frombuffer(b, dtype=np.uint8).copy()))
     return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
 
@@ -263,9 +261,7 @@ def response_from_nested(
     response_list = []
     for resp_len, seq_offset in zip(response_lens, offsets[1:], strict=True):
         # left-shift output by one token for log_probs / values
-        response_list.append(
-            values[seq_offset - resp_len - 1 : seq_offset - 1]
-        )
+        response_list.append(values[seq_offset - resp_len - 1 : seq_offset - 1])
     return torch.nested.as_nested_tensor(response_list, layout=torch.jagged)
 
 

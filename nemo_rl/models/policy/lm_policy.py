@@ -375,7 +375,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     # ``max_tokens_per_microbatch`` (logprob_mb_tokens vs train_mb_tokens),
     # exactly as the legacy bodies do today.
     def _shard_for_logprob(
-        self, data: BatchedDataDict[Any],
+        self,
+        data: BatchedDataDict[Any],
     ) -> tuple[list["SlicedDataDict"], Optional[list[int]]]:
         """Shard inputs for ``get_logprobs`` / ``get_reference_policy_logprobs``.
 
@@ -413,7 +414,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return sharded_data, unsorted_data_indices
 
     def _shard_for_train(
-        self, data: BatchedDataDict[Any], batch_size: int,
+        self,
+        data: BatchedDataDict[Any],
+        batch_size: int,
     ) -> list["SlicedDataDict"]:
         """Shard inputs for ``train``.
 

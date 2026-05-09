@@ -72,7 +72,8 @@ def test_kv_first_write_writes_seed_fields():
     # Every tensor field in the input lands in TQ under f"{uid}_g0".
     assert meta.keys == [f"u{i}_g0" for i in range(4)]
     fetched = client.kv_batch_get(
-        keys=meta.keys, partition_id="train",
+        keys=meta.keys,
+        partition_id="train",
         select_fields=["input_ids", "input_lengths", "token_mask", "sample_mask"],
     )
     assert fetched["input_ids"].shape == (4, 8)
@@ -87,7 +88,9 @@ def test_kv_first_write_carries_multimodal_extras():
     meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
     assert "pixel_values" in (meta.fields or [])
     fetched = client.kv_batch_get(
-        keys=meta.keys, partition_id="train", select_fields=["pixel_values"],
+        keys=meta.keys,
+        partition_id="train",
+        select_fields=["pixel_values"],
     )
     assert fetched["pixel_values"].shape == (4, 3, 4, 4)
 
@@ -171,6 +174,7 @@ def test_kvbatchmeta_slice_takes_range():
 
 def test_kvbatchmeta_concat_rejects_partition_mismatch():
     import pytest
+
     m1 = _meta(2)
     m2 = KVBatchMeta(
         partition_id="other",

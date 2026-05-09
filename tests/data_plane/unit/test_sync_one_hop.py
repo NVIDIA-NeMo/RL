@@ -27,7 +27,6 @@ Coverage:
 from __future__ import annotations
 
 import torch
-from tensordict import TensorDict
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
@@ -76,7 +75,9 @@ def test_write_columns_lands_in_tq():
     write_columns(client, meta, delta)
 
     fetched = client.kv_batch_get(
-        keys=meta.keys, partition_id="train", select_fields=["advantages"],
+        keys=meta.keys,
+        partition_id="train",
+        select_fields=["advantages"],
     )
     assert torch.equal(fetched["advantages"], torch.full((4,), 7.5))
 
@@ -104,17 +105,28 @@ def test_write_then_read_roundtrip_after_train_window():
     meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
 
     # Simulate the full sync 1-hop trainer-step writes:
-    write_columns(client, meta, {
-        "prev_logprobs": torch.full((4, 8), 0.1),
-        "reference_policy_logprobs": torch.full((4, 8), 0.2),
-        "advantages": torch.full((4,), 0.3),
-    })
+    write_columns(
+        client,
+        meta,
+        {
+            "prev_logprobs": torch.full((4, 8), 0.1),
+            "reference_policy_logprobs": torch.full((4, 8), 0.2),
+            "advantages": torch.full((4,), 0.3),
+        },
+    )
 
     # train_presharded would fetch the union — verify all columns present.
-    fetched = read_columns(client, meta, [
-        "input_ids", "input_lengths",
-        "prev_logprobs", "reference_policy_logprobs", "advantages",
-    ])
+    fetched = read_columns(
+        client,
+        meta,
+        [
+            "input_ids",
+            "input_lengths",
+            "prev_logprobs",
+            "reference_policy_logprobs",
+            "advantages",
+        ],
+    )
     assert torch.allclose(fetched["prev_logprobs"], torch.full((4, 8), 0.1))
     assert torch.allclose(fetched["reference_policy_logprobs"], torch.full((4, 8), 0.2))
     assert torch.allclose(fetched["advantages"], torch.full((4,), 0.3))
@@ -164,9 +176,12 @@ def test_kv_clear_uses_meta_keys_minted_at_rollout():
     client.kv_clear(keys=meta.keys, partition_id="train")
     # Cleared keys should no longer fetch.
     import pytest
+
     with pytest.raises(KeyError):
         client.kv_batch_get(
-            keys=meta.keys, partition_id="train", select_fields=["input_ids"],
+            keys=meta.keys,
+            partition_id="train",
+            select_fields=["input_ids"],
         )
 
 
@@ -178,16 +193,18 @@ def test_kv_clear_uses_meta_keys_minted_at_rollout():
 
 def _slice_data(rewards: list[float], stds: list[float]) -> BatchedDataDict:
     n = len(rewards)
-    return BatchedDataDict({
-        "total_reward": torch.tensor(rewards, dtype=torch.float32),
-        "std": torch.tensor(stds, dtype=torch.float32),
-        "baseline": torch.zeros(n),
-        "input_lengths": torch.tensor([8] * n, dtype=torch.long),
-        "loss_multiplier": torch.ones(n),
-        "truncated": torch.zeros(n, dtype=torch.bool),
-        "length": torch.tensor([8] * n, dtype=torch.long),
-        "prompt_ids_for_adv": torch.zeros(n, 4, dtype=torch.long),
-    })
+    return BatchedDataDict(
+        {
+            "total_reward": torch.tensor(rewards, dtype=torch.float32),
+            "std": torch.tensor(stds, dtype=torch.float32),
+            "baseline": torch.zeros(n),
+            "input_lengths": torch.tensor([8] * n, dtype=torch.long),
+            "loss_multiplier": torch.ones(n),
+            "truncated": torch.zeros(n, dtype=torch.bool),
+            "length": torch.tensor([8] * n, dtype=torch.long),
+            "prompt_ids_for_adv": torch.zeros(n, 4, dtype=torch.long),
+        }
+    )
 
 
 def _seed_meta(client: NoOpDataPlaneClient, prefix: str, n: int) -> KVBatchMeta:
@@ -207,11 +224,14 @@ def test_apply_dynamic_sampling_filters_zero_std():
     sd = _slice_data([1.0, 2.0, 3.0, 4.0], [0.5, 0.0, 0.5, 0.0])
 
     pm, ps, pur, complete, ds_metrics, _ = _apply_dynamic_sampling(
-        meta=meta, slice_data=sd,
-        pending_meta=None, pending_slice=None,
+        meta=meta,
+        slice_data=sd,
+        pending_meta=None,
+        pending_slice=None,
         pending_unfiltered_rewards=[],
         train_prompts_size=4,
-        num_gen_batches=1, max_gen_batches=10,
+        num_gen_batches=1,
+        max_gen_batches=10,
         dp_client=client,
     )
     # Only 2 survivors → not complete (need 4).
@@ -225,14 +245,18 @@ def test_apply_dynamic_sampling_filters_zero_std():
 
     # Dropped uids' TQ payload was cleared.
     import pytest
+
     with pytest.raises(KeyError):
         client.kv_batch_get(
-            keys=[meta.keys[1]], partition_id="train", select_fields=["input_ids"],
+            keys=[meta.keys[1]],
+            partition_id="train",
+            select_fields=["input_ids"],
         )
     # Surviving uids' payload is still alive.
     survivors = client.kv_batch_get(
         keys=[meta.keys[0], meta.keys[2]],
-        partition_id="train", select_fields=["input_ids"],
+        partition_id="train",
+        select_fields=["input_ids"],
     )
     assert survivors["input_ids"].shape == (2, 8)
 
@@ -246,11 +270,14 @@ def test_apply_dynamic_sampling_completes_when_train_size_reached():
     sd = _slice_data([1.0, 2.0, 3.0, 4.0], [0.5, 0.5, 0.5, 0.5])
 
     pm, ps, _, complete, ds_metrics, unfiltered = _apply_dynamic_sampling(
-        meta=meta, slice_data=sd,
-        pending_meta=None, pending_slice=None,
+        meta=meta,
+        slice_data=sd,
+        pending_meta=None,
+        pending_slice=None,
         pending_unfiltered_rewards=[],
         train_prompts_size=4,
-        num_gen_batches=1, max_gen_batches=10,
+        num_gen_batches=1,
+        max_gen_batches=10,
         dp_client=client,
     )
     assert complete is True
@@ -269,11 +296,14 @@ def test_apply_dynamic_sampling_overflow_slices_and_clears():
     sd = _slice_data([1.0] * 6, [0.5] * 6)
 
     pm, ps, _, complete, ds_metrics, _ = _apply_dynamic_sampling(
-        meta=meta, slice_data=sd,
-        pending_meta=None, pending_slice=None,
+        meta=meta,
+        slice_data=sd,
+        pending_meta=None,
+        pending_slice=None,
         pending_unfiltered_rewards=[],
         train_prompts_size=4,  # only need 4; 2 should be discarded
-        num_gen_batches=1, max_gen_batches=10,
+        num_gen_batches=1,
+        max_gen_batches=10,
         dp_client=client,
     )
     assert complete is True
@@ -281,9 +311,12 @@ def test_apply_dynamic_sampling_overflow_slices_and_clears():
     assert ds_metrics.get("dynamic_sampling_num_discarded_valid_samples") == 2
     # Discarded uids (last 2) cleared from TQ.
     import pytest
+
     with pytest.raises(KeyError):
         client.kv_batch_get(
-            keys=[meta.keys[4]], partition_id="train", select_fields=["input_ids"],
+            keys=[meta.keys[4]],
+            partition_id="train",
+            select_fields=["input_ids"],
         )
 
 
@@ -296,12 +329,16 @@ def test_apply_dynamic_sampling_raises_on_max_gen_batches():
     sd = _slice_data([1.0, 2.0], [0.0, 0.0])  # all dropped
 
     import pytest
+
     with pytest.raises(ValueError, match=r"max_gen_batches"):
         _apply_dynamic_sampling(
-            meta=meta, slice_data=sd,
-            pending_meta=None, pending_slice=None,
+            meta=meta,
+            slice_data=sd,
+            pending_meta=None,
+            pending_slice=None,
             pending_unfiltered_rewards=[],
             train_prompts_size=4,
-            num_gen_batches=11, max_gen_batches=10,  # exceeded
+            num_gen_batches=11,
+            max_gen_batches=10,  # exceeded
             dp_client=client,
         )

@@ -108,6 +108,7 @@ def main() -> None:
 
         def _make_policy(**kwargs):
             return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
+
         _policy_factory = _make_policy
     else:
         _policy_factory = None  # setup() defaults to plain Policy
@@ -124,7 +125,10 @@ def main() -> None:
         grpo_state,
         master_config,
     ) = setup(
-        config, tokenizer, dataset, val_dataset,
+        config,
+        tokenizer,
+        dataset,
+        val_dataset,
         policy_factory=_policy_factory,
     )
 

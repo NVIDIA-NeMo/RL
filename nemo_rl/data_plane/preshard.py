@@ -23,12 +23,11 @@ first cross-DP collective.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 import torch
-from tensordict import TensorDict
 
-from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
+from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 # Tensor fields the ``train`` partition schema declares. The rollout
@@ -159,7 +158,11 @@ def shard_meta_for_dp(
         # Per-shard packing metadata — set by ``shard_by_batch_size`` when
         # sequence_packing/dynamic_batching is enabled. Workers' *_presharded
         # paths look these up off ``meta.extra_info``.
-        for attr in ("micro_batch_indices", "micro_batch_lengths", "elem_counts_per_gb"):
+        for attr in (
+            "micro_batch_indices",
+            "micro_batch_lengths",
+            "elem_counts_per_gb",
+        ):
             val = getattr(shard, attr, None)
             if val is not None:
                 rank_extra[attr] = val

@@ -62,9 +62,7 @@ def _broadcast_batched_data_dict(
     # device from the group backend so CPU TQ outputs are moved to GPU
     # before NCCL broadcast.
     backend = torch.distributed.get_backend(group)
-    bcast_device: Any = (
-        torch.cuda.current_device() if backend == "nccl" else "cpu"
-    )
+    bcast_device: Any = torch.cuda.current_device() if backend == "nccl" else "cpu"
 
     if is_leader:
         assert data is not None, "leader must provide non-None data"
@@ -102,7 +100,10 @@ def _broadcast_batched_data_dict(
             torch.distributed.broadcast(tensor, src=src, group=group)
             # Restore non-leader tensors to the leader's source device
             # so downstream code sees the same layout pre-broadcast.
-            if not is_leader and torch.device(src_device).type != torch.device(bcast_device).type:
+            if (
+                not is_leader
+                and torch.device(src_device).type != torch.device(bcast_device).type
+            ):
                 out[key] = tensor.to(src_device)
         else:
             if not is_leader:
@@ -154,8 +155,10 @@ class TQWorkerMixin:
         return None
 
     def _pad_value_dict(self) -> dict[str, Any]:
-        """Per-field pad value used by :func:`materialize` to detile the
-        jagged wire format. Token-id fields use the tokenizer pad id."""
+        """Per-field pad value used by :func:`materialize` to detile the jagged wire format.
+
+        Token-id fields use the tokenizer pad id.
+        """
         pad_id = getattr(getattr(self, "tokenizer", None), "pad_token_id", None)
         if pad_id is None:
             return {}
@@ -215,7 +218,8 @@ class TQWorkerMixin:
                     select_fields=list(meta.fields) if meta.fields else None,
                 )
                 data = materialize(
-                    td, layout=layout,
+                    td,
+                    layout=layout,
                     pad_value_dict=pad_value_dict,
                     pad_to_multiple=pad_to_multiple,
                     object_fields=obj_fields,
@@ -223,7 +227,9 @@ class TQWorkerMixin:
             else:
                 data = None
             data = _broadcast_batched_data_dict(
-                data, src=leader, group=replica_group,
+                data,
+                src=leader,
+                group=replica_group,
             )
             if preprocess is not None:
                 data = preprocess(self, data)
@@ -235,7 +241,8 @@ class TQWorkerMixin:
             select_fields=list(meta.fields) if meta.fields else None,
         )
         data = materialize(
-            td, layout=layout,
+            td,
+            layout=layout,
             pad_value_dict=pad_value_dict,
             pad_to_multiple=pad_to_multiple,
             object_fields=obj_fields,
@@ -245,12 +252,11 @@ class TQWorkerMixin:
         return data
 
     def _apply_packing_prep(self, data: BatchedDataDict[Any]) -> BatchedDataDict[Any]:
-        """Re-derive ``micro_batch_indices`` / ``micro_batch_lengths`` on
-        the local slice via ``shard_by_batch_size(shards=1, ...)``.
+        """Re-derive ``micro_batch_indices`` / ``micro_batch_lengths`` on the local slice.
 
-        The legacy DP path computes those as a side effect of the
-        DP-shard call; the TQ presharded path receives a per-rank slice
-        without them set, so we recompute here using ``self.cfg``.
+        Uses ``shard_by_batch_size(shards=1, ...)``. The legacy DP path computes those
+        as a side effect of the DP-shard call; the TQ presharded path receives a
+        per-rank slice without them set, so we recompute here using ``self.cfg``.
         """
         cfg = getattr(self, "cfg", None)
         if not isinstance(cfg, dict):
@@ -263,11 +269,15 @@ class TQWorkerMixin:
                 "algorithm": seqpack["algorithm"],
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
-                "sequence_length_pad_multiple": cfg["make_sequence_length_divisible_by"],
+                "sequence_length_pad_multiple": cfg[
+                    "make_sequence_length_divisible_by"
+                ],
                 "max_tokens_per_microbatch": seqpack["train_mb_tokens"],
             }
             packed, _ = data.shard_by_batch_size(
-                shards=1, batch_size=None, sequence_packing_args=spa,
+                shards=1,
+                batch_size=None,
+                sequence_packing_args=spa,
             )
             return packed[0]
 
@@ -279,7 +289,9 @@ class TQWorkerMixin:
                 "max_tokens_per_microbatch": dynbatch["train_mb_tokens"],
             }
             sharded, _ = data.shard_by_batch_size(
-                shards=1, batch_size=None, dynamic_batching_args=dba,
+                shards=1,
+                batch_size=None,
+                dynamic_batching_args=dba,
             )
             return sharded[0]
 
@@ -309,8 +321,10 @@ class TQWorkerMixin:
         return self._apply_packing_prep(data)
 
     def _is_replica_leader(self) -> bool:
-        """True iff this rank should perform per-DP-rank-unique
-        side-effects (e.g. TQ write-back). True for non-replicated configs."""
+        """True iff this rank should perform per-DP-rank-unique side-effects.
+
+        Examples include TQ write-back. Always True for non-replicated configs.
+        """
         replica_group = self._get_replica_group()
         if replica_group is None:
             return True
@@ -344,7 +358,9 @@ class TQWorkerMixin:
 
         td = TensorDict(packed, batch_size=[len(meta.keys)])
         self._require_dp_client().kv_batch_put(
-            keys=meta.keys, partition_id=meta.partition_id, fields=td,
+            keys=meta.keys,
+            partition_id=meta.partition_id,
+            fields=td,
         )
 
     def _write_back_result_field(
@@ -396,7 +412,11 @@ class TQWorkerMixin:
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
         return self.train(  # type: ignore[attr-defined]
-            data, loss_fn=loss_fn, eval_mode=eval_mode, gbs=gbs, mbs=mbs,
+            data,
+            loss_fn=loss_fn,
+            eval_mode=eval_mode,
+            gbs=gbs,
+            mbs=mbs,
         )
 
     @wrap_with_nvtx_name("policy_worker/get_logprobs_presharded")
@@ -409,12 +429,16 @@ class TQWorkerMixin:
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
         result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
-            data=data, micro_batch_size=micro_batch_size,
+            data=data,
+            micro_batch_size=micro_batch_size,
         )
         # Canonical TQ column name is "prev_logprobs" (matches what
         # ``train_presharded`` fetches for the loss).
         self._write_back_result_field(
-            meta, result, result_key="logprobs", tq_field="prev_logprobs",
+            meta,
+            result,
+            result_key="logprobs",
+            tq_field="prev_logprobs",
         )
         return result
 
@@ -429,11 +453,13 @@ class TQWorkerMixin:
         data = self._attach_or_repack_pack_metadata(data, meta)
         result: BatchedDataDict[ReferenceLogprobOutputSpec] = (
             self.get_reference_policy_logprobs(  # type: ignore[attr-defined]
-                data=data, micro_batch_size=micro_batch_size,
+                data=data,
+                micro_batch_size=micro_batch_size,
             )
         )
         self._write_back_result_field(
-            meta, result,
+            meta,
+            result,
             result_key="reference_logprobs",
             tq_field="reference_policy_logprobs",
         )

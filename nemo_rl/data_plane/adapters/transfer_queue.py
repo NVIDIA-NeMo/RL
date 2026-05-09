@@ -110,8 +110,9 @@ def _mooncake_transport_config() -> dict:
 
 
 def _connect_existing() -> None:
-    """Worker-process path: connect this process's client to the
-    already-running named controller actor in the Ray cluster. Mirrors
+    """Worker-process path: connect this process's client to the Ray cluster.
+
+    Connects to the already-running named controller actor. Mirrors
     rl-arena/arena/dataplane_client.py's `tq.init()` (no args) call.
     """
     _tq().init()
@@ -121,9 +122,10 @@ _TQ_RUNTIME_ENV_PATCHED = False
 
 
 def _patch_tq_actor_runtime_env() -> None:
-    """Inject Ray ``runtime_env={"pip": ["TransferQueue==0.1.6"]}`` into the
-    ``.options()`` calls on TQ's internal actor classes (``SimpleStorageUnit``,
-    ``TransferQueueController``).
+    """Inject Ray ``runtime_env`` into TQ's internal actor class ``.options()`` calls.
+
+    Injects ``{"pip": ["TransferQueue==0.1.6"]}`` into ``.options()`` for
+    ``SimpleStorageUnit`` and ``TransferQueueController``.
 
     **Why**: TQ spawns these actors via ``Cls.options(...).remote(...)`` with
     no runtime_env. They inherit the *job-level* runtime_env that the driver
@@ -317,6 +319,7 @@ def _to_wire(td: TensorDict) -> TensorDict:
     # metadata-recorded shape. materialize squeezes the trailing 1
     # back on read so consumers see (N,).
     from nemo_rl.data_plane.codec import _KV_PROMOTE_1D as _promote_1d
+
     if _promote_1d:
         new_dict: dict[str, torch.Tensor] = {}
         changed = False
@@ -391,6 +394,7 @@ class TQDataPlaneClient(DataPlaneClient):
                 os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
             os.environ.setdefault("MC_STORE_MEMCPY", "0")
             from nemo_rl.data_plane.codec import set_kv_promote_1d
+
             set_kv_promote_1d(True)
 
         if bootstrap:
