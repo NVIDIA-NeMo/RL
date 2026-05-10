@@ -167,6 +167,41 @@ sequenceDiagram
 5. **Recompute KV Cache After Weight Updates**: While using in-flight weight update, user can choose whether to recompute
 KV caches after weight udpate by configuring `recompute_kv_cache_after_weight_update` configuration.
 
+## Multiple Dataloaders
+
+Standard async GRPO supports `data.use_multiple_dataloader=true`. This uses the
+same [Multiple Dataloaders](grpo.md#multiple-dataloaders) configuration as
+synchronous GRPO:
+
+```bash
+uv run examples/run_grpo.py \
+    --config examples/configs/grpo_multiple_datasets.yaml \
+    grpo.async_grpo.enabled=true \
+    policy.generation.vllm_cfg.async_engine=true \
+    loss_fn.use_importance_sampling_correction=true \
+    data.use_multiple_dataloader=true \
+    data.custom_dataloader=examples.custom_dataloader.custom_dataloader.example_custom_dataloader
+```
+
+The async trajectory collector reserves the target weight version before it
+requests a batch from the dataloader. For custom dataloaders, the wrapper records
+include:
+
+- `generation_weight_version`: policy weight version used for generation
+- `target_weight_version`: trainer step that should consume the generated batch
+- `current_weight_version`: collector weight version when the batch is requested
+- `expected_num_prompts`: required prompt count for the returned batch
+
+Custom dataloaders can use these records to route tasks per target step. The
+`example_async_target_ratio_dataloader` function in
+`examples/custom_dataloader/custom_dataloader.py` shows a small target-aware
+sampler.
+
+Async checkpoints save one dataloader state per task as
+`train_dataloader_<task_name>.pt`, matching synchronous GRPO resume behavior.
+Multiple dataloaders remain unsupported in async NeMo-Gym GRPO because task
+routing is handled by the NeMo-Gym bridge.
+
 ## Why Importance Sampling Correction Is Required for Async
 
 ### The GRPO Objective
