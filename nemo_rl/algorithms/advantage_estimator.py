@@ -25,8 +25,6 @@ Reference papers:
 - GAE: https://arxiv.org/abs/1506.02438 (High-Dimensional Continuous Control Using Generalized Advantage Estimation)
 """
 
-from string import whitespace
-
 import torch
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -229,6 +227,38 @@ class ReinforcePlusPlusAdvantageEstimator:
         return adv
 
 
+class RawRewardAdvantageEstimator:
+    """Advantage estimator that uses the raw reward directly as the advantage.
+
+    No value model, no baselines. Optionally normalizes across the batch.
+    """
+
+    def __init__(self, estimator_config: dict, loss_config: dict):
+        self.normalize_advantages = estimator_config.get("normalize_advantages", True)
+
+    def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
+        """Compute advantages as raw rewards expanded to token-level shape.
+
+        Args:
+            prompt_ids: Tensor of shape [batch_size] (unused).
+            rewards: Tensor of shape [batch_size] containing reward for each sample.
+            mask: Response token mask of shape [batch_size, seq_len].
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            Tuple of (advantages, returns) where returns is None.
+        """
+        adv = rewards.unsqueeze(-1).expand(mask.shape)
+
+        if self.normalize_advantages:
+            adv_mean = (adv * mask).sum() / mask.sum().clamp(min=1)
+            adv_var = ((adv - adv_mean).pow(2) * mask).sum() / mask.sum().clamp(min=1)
+            adv_rstd = adv_var.clamp(min=1e-8).rsqrt()
+            adv = (adv - adv_mean) * adv_rstd
+
+        return adv, None
+
+
 class GeneralizedAdvantageEstimator:
     """Generalized Advantage Estimation (GAE) with temporal bootstrapping.
 
@@ -315,11 +345,7 @@ class GeneralizedAdvantageEstimator:
         )
 
         # Apply KL penalty at every response token
-        if (
-            self.kl_coef > 0
-            and logprobs is not None
-            and reference_logprobs is not None
-        ):
+        if self.kl_coef > 0 and logprobs is not None and reference_logprobs is not None:
             kl = calculate_kl(logprobs, reference_logprobs, self.kl_type)
             token_level_rewards = token_level_rewards - self.kl_coef * kl
 
@@ -329,7 +355,9 @@ class GeneralizedAdvantageEstimator:
         # sequence may end with a non-assistant message.
         last_response_idx = mask.shape[1] - 1 - mask.fliplr().argmax(dim=1)
         has_response = mask.any(dim=1)
-        token_level_rewards[has_response, last_response_idx[has_response]] += rewards[has_response]
+        token_level_rewards[has_response, last_response_idx[has_response]] += rewards[
+            has_response
+        ]
 
         # Zero out prompt/padding positions
         token_level_rewards = token_level_rewards * mask
@@ -382,7 +410,11 @@ class GeneralizedAdvantageEstimator:
             Tuple of (advantages, returns), each of shape [batch_size, seq_len].
         """
         token_level_rewards = self._build_token_level_rewards(
-            rewards, lengths, mask, logprobs, reference_logprobs,
+            rewards,
+            lengths,
+            mask,
+            logprobs,
+            reference_logprobs,
         )
 
         lam_value = self._resolve_lambda_value()
@@ -396,14 +428,22 @@ class GeneralizedAdvantageEstimator:
         )
         if need_decouple:
             _, returns = self._compute_gae(
-                token_level_rewards, values, mask, gae_lambda=lam_value,
+                token_level_rewards,
+                values,
+                mask,
+                gae_lambda=lam_value,
             )
             advantages, _ = self._compute_gae(
-                token_level_rewards, values, mask, gae_lambda=lam_policy,
+                token_level_rewards,
+                values,
+                mask,
+                gae_lambda=lam_policy,
             )
         else:
             advantages, returns = self._compute_gae(
-                token_level_rewards, values, mask,
+                token_level_rewards,
+                values,
+                mask,
             )
 
         # Whiten advantages (optional) and zero out masked positions (always)
@@ -447,7 +487,9 @@ class GeneralizedAdvantageEstimator:
         advantages_reversed = []
 
         for t in reversed(range(gen_len)):
-            delta = token_level_rewards[:, t] + self.gae_gamma * next_values - values[:, t]
+            delta = (
+                token_level_rewards[:, t] + self.gae_gamma * next_values - values[:, t]
+            )
             new_gae_lam = delta + self.gae_gamma * lam * last_gae_lam
 
             # Carry-forward: at masked positions, preserve accumulators from
@@ -461,4 +503,3 @@ class GeneralizedAdvantageEstimator:
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         returns = advantages + values
         return advantages, returns
-

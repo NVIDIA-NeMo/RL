@@ -28,38 +28,44 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
-    GeneralizedAdvantageEstimator, GRPOAdvantageEstimator,
-    ReinforcePlusPlusAdvantageEstimator)
+    GeneralizedAdvantageEstimator,
+    GRPOAdvantageEstimator,
+    RawRewardAdvantageEstimator,
+    ReinforcePlusPlusAdvantageEstimator,
+)
 from nemo_rl.algorithms.grpo import (
-    _should_use_async_rollouts, _should_use_nemo_gym,
-    _should_log_nemo_gym_responses)
+    _should_log_nemo_gym_responses,
+    _should_use_async_rollouts,
+    _should_use_nemo_gym,
+)
 from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.loss_functions import (ClippedPGLossConfig,
-                                               ClippedPGLossDataDict,
-                                               ClippedPGLossFn, MseValueLossFn)
-from nemo_rl.algorithms.reward_functions import (RewardShapingConfig,
-                                                 apply_reward_shaping)
-from nemo_rl.algorithms.utils import (calculate_baseline_and_std_per_prompt,
-                                      log_generation_metrics_to_wandb,
-                                      print_performance_metrics, set_seed)
+from nemo_rl.algorithms.loss_functions import (
+    ClippedPGLossConfig,
+    ClippedPGLossDataDict,
+    ClippedPGLossFn,
+    MseValueLossFn,
+)
+from nemo_rl.algorithms.reward_functions import (
+    RewardShapingConfig,
+    apply_reward_shaping,
+)
+from nemo_rl.algorithms.utils import print_performance_metrics, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
-    batched_message_log_to_flat_message, get_keys_from_message_log)
+    batched_message_log_to_flat_message,
+    get_keys_from_message_log,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.collectives import T
-from nemo_rl.distributed.ray_actor_environment_registry import \
-    get_actor_python_env
-from nemo_rl.distributed.virtual_cluster import (ClusterConfig,
-                                                 RayVirtualCluster)
+from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.experience.rollouts import (run_async_multi_turn_rollout,
-                                         run_async_nemo_gym_rollout,
-                                         run_multi_turn_rollout)
-from nemo_rl.models import value
-from nemo_rl.models.automodel import train
+from nemo_rl.experience.rollouts import (
+    run_async_multi_turn_rollout,
+    run_async_nemo_gym_rollout,
+    run_multi_turn_rollout,
+)
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -69,12 +75,10 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
-from nemo_rl.utils.logger import (Logger, LoggerConfig,
-                                  print_message_log_samples)
+from nemo_rl.utils.logger import Logger, LoggerConfig, print_message_log_samples
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
 # ===============================================================================
 # Configuration
@@ -158,10 +162,10 @@ class GRPOConfig(TypedDict):
     calculate_advantages_on_gpu: NotRequired[bool]
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
-    # Epoch at which policy training begins. Value model trains from epoch 0;
-    # policy training is skipped for epochs < this value. Default 0 (train from start).
-    # VAPO recommends ~50 for value pretraining.
-    policy_training_start_epoch: NotRequired[int]
+    # Number of PPO steps of critic-only warmup before policy training begins.
+    # Value model trains from step 0; policy training is skipped for
+    # total_steps < this value. Default 0 (train from start).
+    policy_training_start_step: NotRequired[int]
 
 
 class GRPOSaveState(TypedDict):
@@ -497,10 +501,21 @@ def setup(
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
 
-    # Prepare checkpoint paths
+    # Prepare checkpoint paths.  During critic warmup the policy is not saved,
+    # so the directory may not exist even when resuming from a valid checkpoint.
     if last_checkpoint_path:
-        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
-        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+        _policy_weights = Path(last_checkpoint_path) / "policy" / "weights"
+        _policy_optim = Path(last_checkpoint_path) / "policy" / "optimizer"
+        weights_path = _policy_weights if _policy_weights.exists() else None
+        optimizer_path = _policy_optim if _policy_optim.exists() else None
+        if weights_path is None:
+            print(
+                f"  ⚠ Policy weights not found in checkpoint {last_checkpoint_path} "
+                f"(likely saved during critic warmup). Using base model weights.",
+                flush=True,
+            )
+        else:
+            print(f"  ✓ Resuming policy from checkpoint: {weights_path}", flush=True)
     else:
         weights_path = None
         optimizer_path = None
@@ -513,7 +528,9 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
-    if value_config is not None and value_config.get("megatron_cfg", {}).get("enabled", False):
+    if value_config is not None and value_config.get("megatron_cfg", {}).get(
+        "enabled", False
+    ):
         total_train_iters = min(
             ppo_config.get("max_num_steps", 10**9),
             ppo_config["max_num_epochs"] * len(dataloader),
@@ -1030,6 +1047,9 @@ def _create_advantage_estimator(master_config: MasterConfig):
         gae_lambda = adv_estimator_config.get("gae_lambda", 0.95)
         gae_gamma = adv_estimator_config.get("gae_gamma", 0.99)
         print(f"  ✓ Using GAE advantage estimator (λ={gae_lambda}, γ={gae_gamma})")
+    elif adv_estimator_name == "raw_reward":
+        adv_estimator = RawRewardAdvantageEstimator(adv_estimator_config, loss_config)
+        print("  ✓ Using raw reward advantage estimator (no value model, no baselines)")
     else:
         raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
 
@@ -1187,7 +1207,7 @@ def _log_mixed_rewards_and_advantages_information(
 def ppo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
-    value_model: ValueInterface,
+    value_model: Optional[ValueInterface],
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer: TokenizerType,
@@ -1242,7 +1262,12 @@ def ppo_train(
     current_epoch = ppo_save_state["current_epoch"]
     max_num_epochs = master_config["ppo"]["max_num_epochs"]
     steps_per_epoch = master_config["ppo"]["steps_per_epoch"]
-    policy_training_start_epoch = master_config["ppo"].get("policy_training_start_epoch", 0)
+    # Number of PPO steps to train only the critic before starting policy
+    # training.  Despite the legacy name, this is compared against total_steps
+    # (not current_epoch) to match veRL's critic_warmup semantics.
+    policy_training_start_step = master_config["ppo"].get(
+        "policy_training_start_step", 0
+    )
     consumed_samples = ppo_save_state["consumed_samples"]
     total_valid_tokens = ppo_save_state.get("total_valid_tokens", 0)
     val_at_start = master_config["ppo"]["val_at_start"]
@@ -1392,9 +1417,7 @@ def ppo_train(
                             max_seq_len=master_config["policy"][
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config["ppo"][
-                                "max_rollout_turns"
-                            ],
+                            max_rollout_turns=master_config["ppo"]["max_rollout_turns"],
                             greedy=False,
                         )
                     else:
@@ -1406,16 +1429,17 @@ def ppo_train(
                             max_seq_len=master_config["policy"][
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config["ppo"][
-                                "max_rollout_turns"
-                            ],
+                            max_rollout_turns=master_config["ppo"]["max_rollout_turns"],
                             greedy=False,
                         )
                     policy_generation.finish_generation()
                     _free, _total = torch.cuda.mem_get_info()
                     _used = (_total - _free) / (1024**3)
                     _total_gb = _total / (1024**3)
-                    print(f"[GPU mem] after finish_generation (vLLM asleep): {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
+                    print(
+                        f"[GPU mem] after finish_generation (vLLM asleep): {_used:.2f}GB / {_total_gb:.2f}GB used",
+                        flush=True,
+                    )
                     if policy_generation is not None:
                         generation_logger_metrics = (
                             policy_generation.get_logger_metrics()
@@ -1441,7 +1465,9 @@ def ppo_train(
                     rewards = repeated_batch["total_reward"]
 
                 with timer.time("data_processing"):
-                    use_overlong_filtering = master_config["ppo"].get("overlong_filtering", False)
+                    use_overlong_filtering = master_config["ppo"].get(
+                        "overlong_filtering", False
+                    )
                     if use_overlong_filtering:
                         loss_multiplier = repeated_batch["loss_multiplier"].clone()
                         truncated = repeated_batch["truncated"]
@@ -1491,21 +1517,28 @@ def ppo_train(
 
                     metrics_logging_data["content"] = flat_messages["content"]
 
-                # PPO: Value model inference
-                memory_tracker.snapshot_start_of_stage("Value inference", dir())
-                print("▶ Computing values...", flush=True)
-                with timer.time("value_inference"):
-                    value_model.prepare_for_inference()
-                    _free, _total = torch.cuda.mem_get_info()
-                    _used = (_total - _free) / (1024**3)
-                    _total_gb = _total / (1024**3)
-                    print(f"[GPU mem] after value prepare_for_inference: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
-                    values = value_model.get_values(train_data)
-                    train_data["values"] = values["values"].squeeze(-1)
-                    value_model.finish_inference()
-                    _free, _total = torch.cuda.mem_get_info()
-                    _used = (_total - _free) / (1024**3)
-                    print(f"[GPU mem] after value finish_inference: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
+                # PPO: Value model inference (skip when no value model)
+                if value_model is not None:
+                    memory_tracker.snapshot_start_of_stage("Value inference", dir())
+                    print("▶ Computing values...", flush=True)
+                    with timer.time("value_inference"):
+                        value_model.prepare_for_inference()
+                        _free, _total = torch.cuda.mem_get_info()
+                        _used = (_total - _free) / (1024**3)
+                        _total_gb = _total / (1024**3)
+                        print(
+                            f"[GPU mem] after value prepare_for_inference: {_used:.2f}GB / {_total_gb:.2f}GB used",
+                            flush=True,
+                        )
+                        values = value_model.get_values(train_data)
+                        train_data["values"] = values["values"].squeeze(-1)
+                        value_model.finish_inference()
+                        _free, _total = torch.cuda.mem_get_info()
+                        _used = (_total - _free) / (1024**3)
+                        print(
+                            f"[GPU mem] after value finish_inference: {_used:.2f}GB / {_total_gb:.2f}GB used",
+                            flush=True,
+                        )
 
                 print(
                     f"  • Average batch reward: {rewards.mean().numpy():.4f}\n"
@@ -1520,7 +1553,10 @@ def ppo_train(
                     _free, _total = torch.cuda.mem_get_info()
                     _used = (_total - _free) / (1024**3)
                     _total_gb = _total / (1024**3)
-                    print(f"[GPU mem] after policy prepare_for_lp_inference: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
+                    print(
+                        f"[GPU mem] after policy prepare_for_lp_inference: {_used:.2f}GB / {_total_gb:.2f}GB used",
+                        flush=True,
+                    )
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
@@ -1552,7 +1588,10 @@ def ppo_train(
                     _free, _total = torch.cuda.mem_get_info()
                     _used = (_total - _free) / (1024**3)
                     _total_gb = _total / (1024**3)
-                    print(f"[GPU mem] after policy finish_inference: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
+                    print(
+                        f"[GPU mem] after policy finish_inference: {_used:.2f}GB / {_total_gb:.2f}GB used",
+                        flush=True,
+                    )
 
                 # Build prompt IDs for advantage estimation (groups responses from same prompt)
                 with timer.time("advantage_calculation"):
@@ -1568,26 +1607,36 @@ def ppo_train(
                     del prompt_only_message_logs
                     del prompt_batched_flat
 
-                    advantages, returns = adv_estimator.compute_advantage(
+                    adv_kwargs = dict(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=train_data["rewards"],
                         mask=train_data["token_mask"],
-                        values=train_data["values"],
                         lengths=input_lengths,
                         reference_logprobs=train_data.get("reference_policy_logprobs"),
                         logprobs=train_data["prev_logprobs"],
                     )
+                    if "values" in train_data:
+                        adv_kwargs["values"] = train_data["values"]
+                    result = adv_estimator.compute_advantage(**adv_kwargs)
+                    if isinstance(result, tuple):
+                        advantages, returns = result
+                    else:
+                        advantages, returns = result, None
                     del prompt_ids_for_adv
 
                     train_data["advantages"] = advantages
-                    train_data["returns"] = returns
+                    if returns is not None:
+                        train_data["returns"] = returns
 
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 _free, _total = torch.cuda.mem_get_info()
                 _used = (_total - _free) / (1024**3)
                 _total_gb = _total / (1024**3)
-                print(f"[GPU mem] baseline before training loop: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
+                print(
+                    f"[GPU mem] baseline before training loop: {_used:.2f}GB / {_total_gb:.2f}GB used",
+                    flush=True,
+                )
                 for step in range(steps_per_epoch):
                     print(
                         f"▶ Step {step + 1}/{steps_per_epoch}...",
@@ -1595,34 +1644,54 @@ def ppo_train(
                     )
 
                     # Train value model first (critic before actor, matching veRL)
-                    with timer.time("value_training_prep"):
-                        value_model.prepare_for_training()
+                    value_results = None
+                    if value_model is not None:
+                        with timer.time("value_training_prep"):
+                            value_model.prepare_for_training()
 
-                    _free, _total = torch.cuda.mem_get_info()
-                    _used = (_total - _free) / (1024**3)
-                    _total_gb = _total / (1024**3)
-                    print(f"[GPU mem] after value prepare_for_training: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
-
-                    with timer.time("value_training"):
-                        print("▶ Training value...", flush=True)
-                        value_results = value_model.train(
-                            train_data,
-                            value_loss_fn,
-                            timer=timer,
+                        _free, _total = torch.cuda.mem_get_info()
+                        _used = (_total - _free) / (1024**3)
+                        _total_gb = _total / (1024**3)
+                        print(
+                            f"[GPU mem] after value prepare_for_training: {_used:.2f}GB / {_total_gb:.2f}GB used",
+                            flush=True,
                         )
 
-                        _free, _total = torch.cuda.mem_get_info()
-                        _used = (_total - _free) / (1024**3)
-                        print(f"[GPU mem] after value train (before finish): {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
+                        with timer.time("value_training"):
+                            print("▶ Training value...", flush=True)
+                            value_results = value_model.train(
+                                train_data,
+                                value_loss_fn,
+                                timer=timer,
+                            )
 
-                        value_model.finish_training()
+                            _free, _total = torch.cuda.mem_get_info()
+                            _used = (_total - _free) / (1024**3)
+                            print(
+                                f"[GPU mem] after value train (before finish): {_used:.2f}GB / {_total_gb:.2f}GB used",
+                                flush=True,
+                            )
 
-                        _free, _total = torch.cuda.mem_get_info()
-                        _used = (_total - _free) / (1024**3)
-                        print(f"[GPU mem] after value finish_training: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
+                            value_model.finish_training()
+
+                            _free, _total = torch.cuda.mem_get_info()
+                            _used = (_total - _free) / (1024**3)
+                            print(
+                                f"[GPU mem] after value finish_training: {_used:.2f}GB / {_total_gb:.2f}GB used",
+                                flush=True,
+                            )
 
                     train_results = None
-                    if current_epoch >= policy_training_start_epoch:
+                    if total_steps >= policy_training_start_step:
+                        if (
+                            total_steps == policy_training_start_step
+                            and policy_training_start_step > 0
+                        ):
+                            print(
+                                f"  ✓ Critic warmup complete ({policy_training_start_step} steps). "
+                                f"Starting policy training.",
+                                flush=True,
+                            )
                         print("▶ Preparing for training...", flush=True)
                         with timer.time("training_prep"):
                             policy.prepare_for_training()
@@ -1630,7 +1699,10 @@ def ppo_train(
 
                         _free, _total = torch.cuda.mem_get_info()
                         _used = (_total - _free) / (1024**3)
-                        print(f"[GPU mem] after policy prepare_for_training: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
+                        print(
+                            f"[GPU mem] after policy prepare_for_training: {_used:.2f}GB / {_total_gb:.2f}GB used",
+                            flush=True,
+                        )
 
                         print("▶ Training policy...", flush=True)
                         with timer.time("policy_training"):
@@ -1643,11 +1715,19 @@ def ppo_train(
 
                         _free, _total = torch.cuda.mem_get_info()
                         _used = (_total - _free) / (1024**3)
-                        print(f"[GPU mem] after policy finish_training: {_used:.2f}GB / {_total_gb:.2f}GB used", flush=True)
+                        print(
+                            f"[GPU mem] after policy finish_training: {_used:.2f}GB / {_total_gb:.2f}GB used",
+                            flush=True,
+                        )
 
                     if train_results is not None:
-                        print(f"    • Policy loss: {train_results['loss'].mean().item():.4f}")
-                    print(f"    • Value loss: {value_results['loss'].mean().item():.4f}")
+                        print(
+                            f"    • Policy loss: {train_results['loss'].mean().item():.4f}"
+                        )
+                    if value_results is not None:
+                        print(
+                            f"    • Value loss: {value_results['loss'].mean().item():.4f}"
+                        )
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -1719,65 +1799,71 @@ def ppo_train(
                     metrics.update(train_results["all_mb_metrics"])
                     if "moe_metrics" in train_results:
                         metrics.update(
-                            {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+                            {
+                                f"moe/{k}": v
+                                for k, v in train_results["moe_metrics"].items()
+                            }
                         )
 
                 # Extract critic metrics from value training results
-                value_mb_metrics = value_results.get("all_mb_metrics", {})
-                critic_metrics = {
-                    "critic/grad_norm": value_results["grad_norm"].numpy(),
-                    "critic/loss": value_results["loss"].numpy(),
-                }
-              
-                for k, v in value_mb_metrics.items():
-                    if k in {
-                        "lr",
-                        "wd",
-                        "global_valid_seqs",
-                        "global_valid_toks",
-                        "grad_norm",
-                    }:
-                        critic_metrics["critic/" + k] = np.mean(v).item()
-                    elif k in {"values_min"}:
-                        critic_metrics["critic/" + k] = np.min(v).item()
-                    elif k in {"values_max"}:
-                        critic_metrics["critic/" + k] = np.max(v).item()
-                    elif isinstance(v, (np.ndarray, list)):
-                        # loss, vf_clipfrac, returns_mean, values_mean,
-                        # returns_sq_mean, residual_sq_mean, etc.
-                        # are normalized by global_valid_toks in the loss fn,
-                        # so summing across microbatches gives the correct global value.
-                        critic_metrics["critic/" + k] = np.sum(v).item()
-                    else:
-                        raise ValueError(f"Unknown metric for value don't know how to handle: {k}")
+                if value_results is not None:
+                    value_mb_metrics = value_results.get("all_mb_metrics", {})
+                    critic_metrics = {
+                        "critic/grad_norm": value_results["grad_norm"].numpy(),
+                        "critic/loss": value_results["loss"].numpy(),
+                    }
 
-                # Compute explained variance from sufficient statistics:
-                # EV = 1 - Var(returns - values) / Var(returns)
-                r_mean = critic_metrics.get("critic/returns_mean", 0)
-                v_mean = critic_metrics.get("critic/values_mean", 0)
-                r_sq = critic_metrics.get("critic/returns_sq_mean", 0)
-                res_sq = critic_metrics.get("critic/residual_sq_mean", 0)
-                var_returns = r_sq - r_mean ** 2
-                var_residual = res_sq - (r_mean - v_mean) ** 2
-                critic_metrics["critic/explained_var"] = (
-                    1.0 - var_residual / max(var_returns, 1e-8)
+                    for k, v in value_mb_metrics.items():
+                        if k in {
+                            "lr",
+                            "wd",
+                            "global_valid_seqs",
+                            "global_valid_toks",
+                            "grad_norm",
+                        }:
+                            critic_metrics["critic/" + k] = np.mean(v).item()
+                        elif k in {"values_min"}:
+                            critic_metrics["critic/" + k] = np.min(v).item()
+                        elif k in {"values_max"}:
+                            critic_metrics["critic/" + k] = np.max(v).item()
+                        elif isinstance(v, (np.ndarray, list)):
+                            critic_metrics["critic/" + k] = np.sum(v).item()
+                        else:
+                            raise ValueError(
+                                f"Unknown metric for value don't know how to handle: {k}"
+                            )
+
+                    # Compute explained variance from sufficient statistics:
+                    # EV = 1 - Var(returns - values) / Var(returns)
+                    r_mean = critic_metrics.get("critic/returns_mean", 0)
+                    v_mean = critic_metrics.get("critic/values_mean", 0)
+                    r_sq = critic_metrics.get("critic/returns_sq_mean", 0)
+                    res_sq = critic_metrics.get("critic/residual_sq_mean", 0)
+                    var_returns = r_sq - r_mean**2
+                    var_residual = res_sq - (r_mean - v_mean) ** 2
+                    critic_metrics["critic/explained_var"] = 1.0 - var_residual / max(
+                        var_returns, 1e-8
+                    )
+
+                    metrics.update(critic_metrics)
+                metrics.update(
+                    {
+                        "reward": rewards.numpy(),
+                        "mean_prompt_length": repeated_batch["length"].numpy(),
+                        "total_num_tokens": input_lengths.numpy(),
+                        "advantages/mean": torch.mean(response_advantages)
+                        .detach()
+                        .item()
+                        if response_advantages.numel() > 0
+                        else 0.0,
+                        "advantages/max": torch.max(response_advantages).detach().item()
+                        if response_advantages.numel() > 0
+                        else 0.0,
+                        "advantages/min": torch.min(response_advantages).detach().item()
+                        if response_advantages.numel() > 0
+                        else 0.0,
+                    }
                 )
-
-                metrics.update(critic_metrics)
-                metrics.update({
-                    "reward": rewards.numpy(),
-                    "mean_prompt_length": repeated_batch["length"].numpy(),
-                    "total_num_tokens": input_lengths.numpy(),
-                    "advantages/mean": torch.mean(response_advantages).detach().item()
-                    if response_advantages.numel() > 0
-                    else 0.0,
-                    "advantages/max": torch.max(response_advantages).detach().item()
-                    if response_advantages.numel() > 0
-                    else 0.0,
-                    "advantages/min": torch.min(response_advantages).detach().item()
-                    if response_advantages.numel() > 0
-                    else 0.0,
-                })
 
                 gen_step_metrics = {}
                 if hasattr(policy_generation, "get_step_metrics"):
@@ -1873,37 +1959,53 @@ def ppo_train(
                             total_steps + 1, ppo_save_state, master_config
                         )
 
-                        # Save policy and value sequentially, reloading
-                        # each to GPU one at a time to avoid OOM.
-                        policy.prepare_for_training()
-                        policy.save_checkpoint(
-                            weights_path=os.path.join(
-                                checkpoint_path, "policy", "weights"
-                            ),
-                            optimizer_path=os.path.join(
-                                checkpoint_path, "policy", "optimizer"
-                            ),
-                            tokenizer_path=os.path.join(
-                                checkpoint_path, "policy", "tokenizer"
-                            ),
-                            checkpointing_cfg=master_config["checkpointing"],
-                        )
-                        policy.finish_training()
+                        # Save policy FIRST, then value.  This ordering
+                        # matters: the resume path uses the presence of
+                        # policy/weights to decide whether the policy was
+                        # trained.  By saving policy first we guarantee that
+                        # if any policy dir exists in a finalized checkpoint
+                        # (tmp→step rename is atomic), its contents are
+                        # complete.  During critic warmup the policy optimizer
+                        # has no state yet (master_param not initialized), so
+                        # we skip it entirely — the resume path will fall back
+                        # to the base model weights.
+                        if total_steps >= policy_training_start_step:
+                            policy.prepare_for_training()
+                            policy.save_checkpoint(
+                                weights_path=os.path.join(
+                                    checkpoint_path, "policy", "weights"
+                                ),
+                                optimizer_path=os.path.join(
+                                    checkpoint_path, "policy", "optimizer"
+                                ),
+                                tokenizer_path=os.path.join(
+                                    checkpoint_path, "policy", "tokenizer"
+                                ),
+                                checkpointing_cfg=master_config["checkpointing"],
+                            )
+                            policy.finish_training()
+                        else:
+                            print(
+                                f"Skipping policy checkpoint (critic warmup: "
+                                f"step {total_steps} < {policy_training_start_step})",
+                                flush=True,
+                            )
 
-                        value_model.prepare_for_training()
-                        value_model.save_checkpoint(
-                            weights_path=os.path.join(
-                                checkpoint_path, "value", "weights"
-                            ),
-                            optimizer_path=os.path.join(
-                                checkpoint_path, "value", "optimizer"
-                            ),
-                            tokenizer_path=os.path.join(
-                                checkpoint_path, "value", "tokenizer"
-                            ),
-                            checkpointing_cfg=master_config["checkpointing"],
-                        )
-                        value_model.finish_training()
+                        if value_model is not None:
+                            value_model.prepare_for_training()
+                            value_model.save_checkpoint(
+                                weights_path=os.path.join(
+                                    checkpoint_path, "value", "weights"
+                                ),
+                                optimizer_path=os.path.join(
+                                    checkpoint_path, "value", "optimizer"
+                                ),
+                                tokenizer_path=os.path.join(
+                                    checkpoint_path, "value", "tokenizer"
+                                ),
+                                checkpointing_cfg=master_config["checkpointing"],
+                            )
+                            value_model.finish_training()
 
                         torch.save(
                             dataloader.state_dict(),
@@ -1923,12 +2025,13 @@ def ppo_train(
             print("\n📊 Training Results:")
             if train_results is not None:
                 print(f"  • Policy Loss: {metrics.get('loss', 'N/A')}")
-            print(f"  • Critic Loss: {metrics.get('critic/loss', 'N/A')}")
-            print(f"  • Critic Grad Norm: {metrics.get('critic/grad_norm', 'N/A')}")
-            if "critic/lr" in metrics:
-                print(f"  • Critic LR: {metrics['critic/lr']:.2e}")
-            if "critic/vf_clipfrac" in metrics:
-                print(f"  • Critic Clip Frac: {metrics['critic/vf_clipfrac']:.4f}")
+            if value_results is not None:
+                print(f"  • Critic Loss: {metrics.get('critic/loss', 'N/A')}")
+                print(f"  • Critic Grad Norm: {metrics.get('critic/grad_norm', 'N/A')}")
+                if "critic/lr" in metrics:
+                    print(f"  • Critic LR: {metrics['critic/lr']:.2e}")
+                if "critic/vf_clipfrac" in metrics:
+                    print(f"  • Critic Clip Frac: {metrics['critic/vf_clipfrac']:.4f}")
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(
                 f"  • Mean Generation Length: {metrics_logging_data['mean_gen_tokens_per_sample']:.4f}",
@@ -1962,7 +2065,7 @@ def ppo_train(
                     else 0
                 )
             performance_metrics = print_performance_metrics(
-                train_results if train_results is not None else value_results,
+                train_results if train_results is not None else (value_results or {}),
                 metrics,
                 timing_metrics,
                 master_config,

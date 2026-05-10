@@ -17,7 +17,6 @@ import random
 import re
 import warnings
 from functools import partial, wraps
-from locale import normalize
 from typing import Any, Optional
 
 import numpy as np
@@ -249,7 +248,7 @@ def masked_var(
     if mean is None:
         mean = masked_mean(values, mask)
     centered_values = values - mean
-    variance = masked_mean(centered_values**2, mask)
+    variance = masked_mean(centered_values.pow(2), mask)
 
     if unbiased:
         normalization_factor = torch.sum(mask)
@@ -681,7 +680,9 @@ def print_performance_metrics(
     # Throughputs
     # =====================================================
 
-    policy_and_reference_logprobs_time = timing_metrics.get("policy_and_reference_logprobs", 0)
+    policy_and_reference_logprobs_time = timing_metrics.get(
+        "policy_and_reference_logprobs", 0
+    )
     policy_training_time = timing_metrics.get("policy_training", 0)
     total_time = timing_metrics["total_step_time"]
     refit_time = (
@@ -732,10 +733,9 @@ def print_performance_metrics(
 
     # Detect which algorithm config key is being used
     algo_config = master_config.get("grpo") or master_config.get("ppo") or {}
-    number_of_samples_per_step = (
-        algo_config.get("num_prompts_per_step", 1)
-        * algo_config.get("num_generations_per_prompt", 1)
-    )
+    number_of_samples_per_step = algo_config.get(
+        "num_prompts_per_step", 1
+    ) * algo_config.get("num_generations_per_prompt", 1)
 
     if colocated_inference:
         training_num_gpus = total_num_gpus
@@ -762,9 +762,7 @@ def print_performance_metrics(
     )
 
     e2e_tokens_per_sec_per_gpu = (
-        total_num_tokens / total_time / total_num_gpus
-        if total_time > 0
-        else 0
+        total_num_tokens / total_time / total_num_gpus if total_time > 0 else 0
     )
     policy_training_tokens_per_sec_per_gpu = (
         total_num_tokens / policy_training_time / training_num_gpus
@@ -772,17 +770,15 @@ def print_performance_metrics(
         else 0
     )
     policy_and_reference_logprobs_tokens_per_sec_per_gpu = (
-        total_num_tokens
-        / policy_and_reference_logprobs_time
-        / training_num_gpus
+        total_num_tokens / policy_and_reference_logprobs_time / training_num_gpus
         if policy_and_reference_logprobs_time > 0
         else 0
     )
-    training_worker_group_time = policy_training_time + policy_and_reference_logprobs_time
+    training_worker_group_time = (
+        policy_training_time + policy_and_reference_logprobs_time
+    )
     training_worker_group_tokens_per_sec_per_gpu = (
-        total_num_tokens
-        / training_worker_group_time
-        / training_num_gpus
+        total_num_tokens / training_worker_group_time / training_num_gpus
         if training_worker_group_time > 0
         else 0
     )
