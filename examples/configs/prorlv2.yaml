@@ -75,6 +75,10 @@ loss_fn:
 
   # Dual-clipping (set to e.g., 3.0 to enable, null to disable)
   ratio_clip_c: null
+  actor_loss_type: "ppo_clip"  # "ppo_clip" or "sapo"
+  sapo_tau_pos: 1.0
+  sapo_tau_neg: 1.05
+  sapo_log_ratio_clamp_value: 20.0
 
   # ============================================================================
   # DAPO: Token-level Loss

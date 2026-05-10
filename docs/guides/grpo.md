@@ -377,6 +377,28 @@ where:
 - c is the dual-clip parameter (ratio_clip_c), which must be greater than 1 and is usually set to 3 empirically.
 - $r_t(\theta)$ is the ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ that measures how much the policy has changed.
 
+### SAPO Actor Loss
+
+GRPO can also use [Soft Adaptive Policy Optimization (SAPO)](https://arxiv.org/abs/2511.20347) as the actor loss by setting `loss_fn.actor_loss_type: "sapo"`. SAPO replaces PPO-style hard clipping with a smooth, temperature-controlled token-level surrogate:
+
+$$
+f_t(r_t) = \frac{4}{\tau_t}\sigma(\tau_t(r_t - 1))
+$$
+
+where $\tau_t$ is `sapo_tau_pos` for positive advantages and `sapo_tau_neg` otherwise. The default values are `sapo_tau_pos: 1.0` and `sapo_tau_neg: 1.05`, matching the paper recommendation.
+
+```yaml
+loss_fn:
+  actor_loss_type: "sapo"
+  sapo_tau_pos: 1.0
+  sapo_tau_neg: 1.05
+  sapo_log_ratio_clamp_value: 20.0
+```
+
+SAPO uses the same `examples/run_grpo.py` entrypoint, rollout data, advantages, reference-policy KL penalty, top-p/top-k filtering, and train/inference importance-sampling correction as the default GRPO loss. The `ratio_clip_min` and `ratio_clip_max` fields remain in the config for compatibility but are ignored by the SAPO actor surrogate.
+
+SAPO v1 is token-level only. It is intentionally rejected with `sequence_level_importance_ratios: true`, `token_level_loss: false`, `disable_ppo_ratio: true`, `force_on_policy_ratio: true`, or `ratio_clip_c` because those settings change the actor objective into a different PPO/GSPO/REINFORCE hybrid.
+
 ### Improvements to the GRPO Loss Formulation for Stability and Accuracy
 
 #### On-Policy KL Approximation
