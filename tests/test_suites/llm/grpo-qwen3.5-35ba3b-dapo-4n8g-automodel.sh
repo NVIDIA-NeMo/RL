@@ -4,7 +4,7 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
-STEPS_PER_RUN=30
+STEPS_PER_RUN=20
 MAX_STEPS=30
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
@@ -25,6 +25,7 @@ uv run examples/run_grpo.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
+    checkpointing.checkpoint_must_save_by=00:03:45:00 \
     $@ \
     2>&1 | tee $RUN_LOG
 
