@@ -233,7 +233,7 @@ explicit = true
 
 [tool.uv]
 preview = true # Enable preview features like extra-build-dependencies
-extra-build-variables = { sglang-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "1", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a", CMAKE_ARGS = "-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DSGL_KERNEL_COMPILE_THREADS=1" } }
+extra-build-variables = { sglang-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "4", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a", CMAKE_ARGS = "-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DSGL_KERNEL_COMPILE_THREADS=1" } }
 no-build-isolation-package = [
   "transformer-engine-torch",
   "transformer-engine",
