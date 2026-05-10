@@ -1,9 +1,12 @@
 eval:
+  rollout_mode: "single_turn"
+  max_rollout_turns: 1
   metric: "pass@k"
   num_tests_per_prompt: 1
   seed: 42
   k_value: 1
   save_path: null
+  save_full_gym_result: false
 
 generation:
   backend: "vllm"

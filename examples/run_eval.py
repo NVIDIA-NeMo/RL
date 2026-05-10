@@ -19,14 +19,28 @@ import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import ray
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
+from nemo_rl.data.datasets import (
+    AllTaskProcessedDataset,
+    load_eval_dataset,
+    load_response_dataset,
+)
 from nemo_rl.data.datasets.eval_datasets import _is_multimodal_dataset
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.nemo_gym import (
+    NemoGymConfig,
+    configure_nemo_gym_generation_config,
+)
 from nemo_rl.environments.utils import create_env
-from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
+from nemo_rl.evals.eval import (
+    NEMO_GYM_ROLLOUT_MODE,
+    MasterConfig,
+    run_env_eval,
+    setup,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config
 
@@ -47,8 +61,20 @@ def parse_args():
     return args, overrides
 
 
-def setup_data(tokenizer, data_config, env_configs):
+def setup_data(tokenizer, data_config, env_configs, rollout_mode):
     print("Setting up data...")
+
+    if rollout_mode == NEMO_GYM_ROLLOUT_MODE:
+        base_dataset = load_response_dataset(data_config)
+        dataset = AllTaskProcessedDataset(
+            dataset=base_dataset.dataset,
+            tokenizer=tokenizer,
+            default_task_data_spec=base_dataset.task_spec,
+            task_data_processors=base_dataset.processor,
+            task_data_preprocessors=getattr(base_dataset, "preprocessor", None),
+            max_seq_length=data_config["max_input_seq_length"],
+        )
+        return dataset, None, tokenizer
 
     # load dataset
     base_dataset = load_eval_dataset(data_config)
@@ -70,6 +96,31 @@ def setup_data(tokenizer, data_config, env_configs):
     )
 
     return dataset, env, tokenizer
+
+
+def setup_nemo_gym_env(vllm_generation, env_configs):
+    """Create the NeMo-Gym env after vLLM exposes OpenAI-compatible servers."""
+    if NEMO_GYM_ROLLOUT_MODE not in env_configs:
+        raise ValueError("env.nemo_gym is required for rollout_mode='nemo_gym'")
+
+    base_urls = [
+        base_url for base_url in vllm_generation.dp_openai_server_base_urls if base_url
+    ]
+    if not base_urls:
+        raise RuntimeError(
+            "No vLLM OpenAI server URLs were reported. "
+            "Set generation.vllm_cfg.async_engine=true and "
+            "generation.vllm_cfg.expose_http_server=true."
+        )
+
+    nemo_gym_config = NemoGymConfig(
+        model_name=vllm_generation.cfg["model_name"],
+        base_urls=base_urls,
+        initial_global_config_dict=env_configs[NEMO_GYM_ROLLOUT_MODE],
+    )
+    env = create_env(env_name=NEMO_GYM_ROLLOUT_MODE, env_config=nemo_gym_config)
+    ray.get(env.health_check.remote())
+    return env
 
 
 def main():
@@ -100,19 +151,27 @@ def main():
     # Init ray
     init_ray()
 
+    rollout_mode = config["eval"]["rollout_mode"]
+
     # Setup tokenizer — get_tokenizer handles both text-only and multimodal
-    is_multimodal = _is_multimodal_dataset(config["data"]["dataset_name"])
+    is_multimodal = (
+        False
+        if rollout_mode == NEMO_GYM_ROLLOUT_MODE
+        else _is_multimodal_dataset(config["data"]["dataset_name"])
+    )
     tokenizer = get_tokenizer(config["tokenizer"], get_processor=is_multimodal)
     config["generation"] = configure_generation_config(
         config["generation"], tokenizer, is_eval=True
     )
+    if rollout_mode == NEMO_GYM_ROLLOUT_MODE:
+        configure_nemo_gym_generation_config(config["generation"])
 
     # Setup data
     (
         dataset,
         env,
         tokenizer,
-    ) = setup_data(tokenizer, config["data"], config["env"])
+    ) = setup_data(tokenizer, config["data"], config["env"], rollout_mode)
 
     # Setup
     (
@@ -121,12 +180,16 @@ def main():
         master_config,
     ) = setup(config, tokenizer, dataset)
 
+    if rollout_mode == NEMO_GYM_ROLLOUT_MODE:
+        env = setup_nemo_gym_env(vllm_generation, config["env"])
+
     # Run evaluation
     run_env_eval(
         vllm_generation,
         dataloader,
         env,
         master_config,
+        tokenizer,
     )
 
 

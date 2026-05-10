@@ -1068,6 +1068,7 @@ class AsyncNemoGymRolloutResult:
     input_ids: torch.Tensor
     final_batch: BatchedDataDict[DatumSpec]
     rollout_metrics: dict[str, Any]
+    raw_results: list[dict[str, Any]] | None = None
 
 
 def _calculate_single_metric(
@@ -1288,4 +1289,5 @@ def run_async_nemo_gym_rollout(
         input_ids=input_ids,
         final_batch=final_batch,
         rollout_metrics=rollout_metrics,
+        raw_results=results,
     )
