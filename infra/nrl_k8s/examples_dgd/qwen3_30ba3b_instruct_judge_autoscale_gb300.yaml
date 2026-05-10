@@ -114,9 +114,6 @@ spec:
             - "4"
             - --gpu-memory-utilization
             - "0.9"
-            - --max-model-len
-            - "8192"
-            - --enforce-eager
             - --dyn-tool-call-parser
             - hermes
             - --kv-events-config
