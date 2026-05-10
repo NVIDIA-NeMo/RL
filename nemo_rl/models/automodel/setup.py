@@ -59,10 +59,10 @@ STRING_TO_DTYPE = {
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     """Validate and maybe auto-set force_hf based on adapter compatibility.
 
-    Custom model implementations (e.g. Qwen2, Llama) use state_dict_adapters to
-    convert between native and HF weight formats. NeMo RL's weight syncing requires
-    the adapter to implement `convert_single_tensor_to_hf`. Some adapters (like
-    CombinedProjectionStateDictAdapter) don't implement this yet.
+    Custom model implementations use state_dict_adapters to convert between
+    native and HF weight formats. NeMo RL's weight syncing requires the adapter
+    to implement `convert_single_tensor_to_hf`. Older or incomplete adapters may
+    not implement this yet.
 
     This function checks the adapter BEFORE model loading to avoid wasting time:
     - force_hf=True: no check needed, HF model won't have an adapter.

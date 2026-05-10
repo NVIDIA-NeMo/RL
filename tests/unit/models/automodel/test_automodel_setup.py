@@ -15,6 +15,8 @@
 """Unit tests for automodel setup utilities."""
 
 import os
+import sys
+import types
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -2029,6 +2031,39 @@ class TestMaybeSetForceHf:
         config.architectures = [arch]
         return config
 
+    def _register_incomplete_adapter(self, monkeypatch):
+        """Register a synthetic custom model with an incomplete adapter."""
+        from nemo_automodel._transformers.registry import ModelRegistry
+
+        root_module = types.ModuleType("nemo_rl_tests")
+        root_module.__path__ = []
+        package_module = types.ModuleType("nemo_rl_tests.incomplete")
+        package_module.__path__ = []
+        adapter_module = types.ModuleType("nemo_rl_tests.incomplete.state_dict_adapter")
+
+        class IncompleteForCausalLM:
+            pass
+
+        class IncompleteStateDictAdapter:
+            pass
+
+        IncompleteForCausalLM.__module__ = "nemo_rl_tests.incomplete.model"
+        adapter_module.IncompleteStateDictAdapter = IncompleteStateDictAdapter
+
+        monkeypatch.setitem(sys.modules, "nemo_rl_tests", root_module)
+        monkeypatch.setitem(sys.modules, "nemo_rl_tests.incomplete", package_module)
+        monkeypatch.setitem(
+            sys.modules,
+            "nemo_rl_tests.incomplete.state_dict_adapter",
+            adapter_module,
+        )
+        monkeypatch.setitem(
+            ModelRegistry.model_arch_name_to_cls,
+            "IncompleteForCausalLM",
+            IncompleteForCausalLM,
+        )
+        return "IncompleteForCausalLM"
+
     def test_force_hf_true_skips_check(self):
         """When force_hf=True, no check is needed."""
         kwargs = {"force_hf": True}
@@ -2051,9 +2086,8 @@ class TestMaybeSetForceHf:
         _maybe_set_force_hf(kwargs, config)
         assert "force_hf" not in kwargs
 
-    def test_qwen2_auto_sets_force_hf(self):
-        """Qwen2's CombinedProjectionStateDictAdapter lacks convert_single_tensor_to_hf,
-        so force_hf should be auto-set when not explicitly configured."""
+    def test_qwen2_adapter_no_force_hf(self):
+        """Qwen2's adapter supports per-tensor conversion."""
         from nemo_automodel._transformers.registry import ModelRegistry
 
         if "Qwen2ForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
@@ -2062,10 +2096,22 @@ class TestMaybeSetForceHf:
         kwargs = {}
         config = self._make_config("Qwen2ForCausalLM")
         _maybe_set_force_hf(kwargs, config)
-        assert kwargs.get("force_hf") is True
+        assert "force_hf" not in kwargs
 
-    def test_llama_auto_sets_force_hf(self):
-        """Llama also uses CombinedProjectionStateDictAdapter."""
+    def test_qwen2_explicit_false_allowed(self):
+        """force_hf=False is allowed when the adapter is compatible."""
+        from nemo_automodel._transformers.registry import ModelRegistry
+
+        if "Qwen2ForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
+            pytest.skip("Qwen2ForCausalLM not in registry")
+
+        kwargs = {"force_hf": False}
+        config = self._make_config("Qwen2ForCausalLM")
+        _maybe_set_force_hf(kwargs, config)
+        assert kwargs["force_hf"] is False
+
+    def test_llama_adapter_no_force_hf(self):
+        """Llama also uses the compatible combined-projection adapter."""
         from nemo_automodel._transformers.registry import ModelRegistry
 
         if "LlamaForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
@@ -2074,17 +2120,23 @@ class TestMaybeSetForceHf:
         kwargs = {}
         config = self._make_config("LlamaForCausalLM")
         _maybe_set_force_hf(kwargs, config)
+        assert "force_hf" not in kwargs
+
+    def test_incomplete_adapter_auto_sets_force_hf(self, monkeypatch):
+        """When an adapter is incomplete, force_hf should still be auto-set."""
+        arch = self._register_incomplete_adapter(monkeypatch)
+
+        kwargs = {}
+        config = self._make_config(arch)
+        _maybe_set_force_hf(kwargs, config)
         assert kwargs.get("force_hf") is True
 
-    def test_qwen2_explicit_false_raises(self):
+    def test_incomplete_adapter_explicit_false_raises(self, monkeypatch):
         """When force_hf is explicitly False and adapter is incompatible, raise."""
-        from nemo_automodel._transformers.registry import ModelRegistry
-
-        if "Qwen2ForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
-            pytest.skip("Qwen2ForCausalLM not in registry")
+        arch = self._register_incomplete_adapter(monkeypatch)
 
         kwargs = {"force_hf": False}
-        config = self._make_config("Qwen2ForCausalLM")
+        config = self._make_config(arch)
         with pytest.raises(RuntimeError, match="force_hf=False"):
             _maybe_set_force_hf(kwargs, config)
 
