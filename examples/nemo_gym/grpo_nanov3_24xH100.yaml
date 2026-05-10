@@ -17,7 +17,7 @@ grpo:
   num_val_generations_per_prompt: 4
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
   max_num_epochs: 1
-  max_num_steps: 3
+  max_num_steps: 10
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10000
@@ -301,21 +301,18 @@ env:
   should_use_nemo_gym: true
   nemo_gym:
     # Minimal config for math-only GRPO training (no tool calling).
-    # Required: the policy model server + the math verifier.
-    # The other resource servers (code_gen, mcqa, workplace_assistant,
-    # instruction_following, structured_outputs) are removed because they
-    # require their own per-server .venv (built via `ng setup`) and aren't
-    # used by the math_with_judge_simple_agent path the DAPO17k dataset
-    # exercises.
+    # Uses the verifiers_agent (prime-intellect verifiers / environments hub)
+    # with the acereason-math environment, paired with the policy model server.
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
-    - resources_servers/math_with_judge/configs/math_with_judge.yaml
-    math_with_judge:
-      resources_servers:
-        math_with_judge:
-          judge_model_server:
-            name: policy_model
-          should_use_judge: false
+    - responses_api_agents/verifiers_agent/configs/acereason-math.yaml
+    # Override agent default max_tokens=16000 — must fit within
+    # policy.max_total_sequence_length (8192) minus the longest prompt.
+    # Aligned with policy.generation.max_new_tokens above.
+    verifiers_agent:
+      responses_api_agents:
+        verifiers_agent:
+          max_tokens: ${policy.generation.max_new_tokens}
 
 logger:
   log_dir: "logs"  # Base directory for all logs
