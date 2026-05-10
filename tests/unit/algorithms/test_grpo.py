@@ -25,7 +25,12 @@ from nemo_rl.algorithms.advantage_estimator import (
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
+    _add_step_counters,
     _default_grpo_save_state,
+    _get_num_optim_steps_per_rl_step,
+    _get_optim_step_metrics,
+    _get_total_optim_steps,
+    _log_optim_step_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
@@ -44,6 +49,115 @@ from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
     create_mock_batch,
 )
+
+
+def _minimal_step_counter_config(train_global_batch_size: int = 4):
+    return {
+        "grpo": {
+            "num_prompts_per_step": 2,
+            "num_generations_per_prompt": 4,
+        },
+        "policy": {
+            "train_global_batch_size": train_global_batch_size,
+        },
+    }
+
+
+def test_get_num_optim_steps_per_rl_step():
+    assert _get_num_optim_steps_per_rl_step(2048, 512) == 4
+    assert _get_num_optim_steps_per_rl_step(1024, 64) == 16
+
+
+@pytest.mark.parametrize(
+    ("train_batch_size", "train_global_batch_size"),
+    [(7, 4), (8, 0), (0, 4)],
+)
+def test_get_num_optim_steps_per_rl_step_rejects_invalid_values(
+    train_batch_size, train_global_batch_size
+):
+    with pytest.raises(ValueError):
+        _get_num_optim_steps_per_rl_step(train_batch_size, train_global_batch_size)
+
+
+def test_add_step_counters():
+    metrics = {"loss": 1.0}
+
+    _add_step_counters(
+        metrics,
+        rl_step=3,
+        optim_step=12,
+        num_optim_steps_per_rl_step=4,
+    )
+
+    assert metrics == {
+        "loss": 1.0,
+        "rl_step": 3,
+        "optim_step": 12,
+        "num_optim_steps_per_rl_step": 4,
+    }
+
+
+def test_get_total_optim_steps_uses_checkpoint_value():
+    save_state = _default_grpo_save_state()
+    save_state["total_steps"] = 5
+    save_state["total_optim_steps"] = 17
+
+    assert _get_total_optim_steps(save_state, _minimal_step_counter_config()) == 17
+
+
+def test_get_total_optim_steps_derives_older_checkpoint_value():
+    save_state = _default_grpo_save_state()
+    save_state["total_steps"] = 5
+    del save_state["total_optim_steps"]
+
+    assert _get_total_optim_steps(save_state, _minimal_step_counter_config()) == 10
+
+
+def test_get_total_optim_steps_uses_current_step_for_older_async_checkpoints():
+    save_state = _default_grpo_save_state()
+    save_state["current_step"] = 5
+    save_state["total_steps"] = 0
+    del save_state["total_optim_steps"]
+
+    assert _get_total_optim_steps(save_state, _minimal_step_counter_config()) == 10
+
+
+def test_get_optim_step_metrics_validates_expected_count():
+    train_results = {"optim_step_metrics": [{"loss": 1.0}, {"loss": 2.0}]}
+
+    assert (
+        _get_optim_step_metrics(train_results, 2) == train_results["optim_step_metrics"]
+    )
+    with pytest.raises(ValueError):
+        _get_optim_step_metrics(train_results, 3)
+
+
+def test_log_optim_step_metrics_uses_issue_requested_counter_names():
+    logger = MagicMock()
+
+    _log_optim_step_metrics(
+        logger,
+        [{"loss": 1.0}, {"loss": 2.0}],
+        rl_step=3,
+        starting_optim_step=10,
+    )
+
+    assert logger.log_metrics.call_args_list[0].args == (
+        {
+            "optim/loss": 1.0,
+            "optim/optim_step_in_rl_step": 1,
+            "rl_step": 3,
+            "optim_step": 10,
+        },
+        10,
+    )
+    assert logger.log_metrics.call_args_list[0].kwargs == {
+        "prefix": "train",
+        "step_metric": "train/optim_step",
+        "step_finished": True,
+    }
+    assert logger.log_metrics.call_args_list[1].args[0]["optim_step"] == 11
+
 
 # ============================================================================
 # Stub classes for async GRPO testing (non-Ray versions for easy mocking)

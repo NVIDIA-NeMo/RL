@@ -65,7 +65,11 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ScoreOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    aggregate_metric_dicts,
+    get_runtime_env_for_policy_worker,
+    unscale_loss_metrics_for_optim_step,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import (
     apply_transformer_engine_patch,
@@ -401,6 +405,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
             losses = []
             all_mb_metrics = []
+            optim_step_metrics = []
             for gb_idx in range(num_global_batches):
                 # Process global batch and compute normalization factors
                 gb_result = process_global_batch(
@@ -448,17 +453,29 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
                 # Extract losses and metrics from results
                 mb_losses = []
+                gb_optim_mb_metrics = []
                 for mb_idx, (loss, loss_metrics) in enumerate(mb_results):
                     # Only process valid (non-dummy) batches for metrics
                     if mb_idx < iterator_len:
+                        optim_loss_metrics = unscale_loss_metrics_for_optim_step(
+                            loss_metrics, num_global_batches
+                        )
                         num_valid_samples = loss_metrics["num_valid_samples"]
                         loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                        optim_loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                        optim_loss_metrics["global_valid_seqs"] = (
+                            global_valid_seqs.item()
+                        )
+                        optim_loss_metrics["global_valid_toks"] = (
+                            global_valid_toks.item()
+                        )
 
                         if num_valid_samples > 0:
                             mb_losses.append(loss.item())
                             all_mb_metrics.append(loss_metrics)
+                            gb_optim_mb_metrics.append(optim_loss_metrics)
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
@@ -486,6 +503,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     self.optimizer.step()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
+                optim_step_metrics.append(aggregate_metric_dicts(gb_optim_mb_metrics))
 
             # release gradient memory before rollouts
             self.optimizer.zero_grad()
@@ -504,6 +522,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 dp_group=self.dp_mesh.get_group(),
                 dtype=self.dtype,
             )
+            metrics["optim_step_metrics"] = optim_step_metrics
 
             return metrics
 

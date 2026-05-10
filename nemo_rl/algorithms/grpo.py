@@ -176,6 +176,7 @@ class GRPOSaveState(TypedDict):
     current_step: int
     current_epoch: int
     total_steps: int
+    total_optim_steps: NotRequired[int]
     total_valid_tokens: int  # Track total number of non-padding tokens during training
     val_reward: NotRequired[
         float
@@ -188,9 +189,105 @@ def _default_grpo_save_state() -> GRPOSaveState:
         "current_step": 0,
         "current_epoch": 0,
         "total_steps": 0,
+        "total_optim_steps": 0,
         "total_valid_tokens": 0,
         "val_reward": -99999999.0,
     }
+
+
+def _get_num_optim_steps_per_rl_step(
+    train_batch_size: int, train_global_batch_size: int
+) -> int:
+    if train_global_batch_size <= 0:
+        raise ValueError(
+            f"train_global_batch_size must be positive, got {train_global_batch_size}"
+        )
+    if train_batch_size <= 0:
+        raise ValueError(f"train batch size must be positive, got {train_batch_size}")
+    if train_batch_size % train_global_batch_size != 0:
+        raise ValueError(
+            "train batch size must be divisible by policy.train_global_batch_size "
+            f"to report optimizer-step metrics, got {train_batch_size=} and "
+            f"{train_global_batch_size=}"
+        )
+    return train_batch_size // train_global_batch_size
+
+
+def _expected_num_optim_steps_per_rl_step(master_config: "MasterConfig") -> int:
+    train_batch_size = (
+        master_config["grpo"]["num_prompts_per_step"]
+        * master_config["grpo"]["num_generations_per_prompt"]
+    )
+    return _get_num_optim_steps_per_rl_step(
+        train_batch_size, master_config["policy"]["train_global_batch_size"]
+    )
+
+
+def _get_total_optim_steps(
+    grpo_save_state: GRPOSaveState, master_config: "MasterConfig"
+) -> int:
+    if "total_optim_steps" in grpo_save_state:
+        return grpo_save_state["total_optim_steps"]
+
+    total_steps = max(grpo_save_state["total_steps"], grpo_save_state["current_step"])
+    try:
+        return total_steps * _expected_num_optim_steps_per_rl_step(master_config)
+    except ValueError as e:
+        warnings.warn(
+            "Could not infer total optimizer steps from an older checkpoint. "
+            f"Falling back to total_steps={total_steps}. Reason: {e}",
+            stacklevel=2,
+        )
+        return total_steps
+
+
+def _add_step_counters(
+    metrics: dict[str, Any],
+    *,
+    rl_step: int,
+    optim_step: int,
+    num_optim_steps_per_rl_step: int,
+) -> None:
+    metrics["rl_step"] = rl_step
+    metrics["optim_step"] = optim_step
+    metrics["num_optim_steps_per_rl_step"] = num_optim_steps_per_rl_step
+
+
+def _get_optim_step_metrics(
+    train_results: dict[str, Any], expected_num_optim_steps: int
+) -> list[dict[str, Any]]:
+    optim_step_metrics = train_results.get("optim_step_metrics")
+    if optim_step_metrics is None:
+        return [{} for _ in range(expected_num_optim_steps)]
+    if len(optim_step_metrics) != expected_num_optim_steps:
+        raise ValueError(
+            "policy.train returned a different number of optimizer-step metric "
+            f"groups than GRPO expected, got {len(optim_step_metrics)} and "
+            f"{expected_num_optim_steps=}"
+        )
+    return optim_step_metrics
+
+
+def _log_optim_step_metrics(
+    logger: Logger,
+    optim_step_metrics: list[dict[str, Any]],
+    *,
+    rl_step: int,
+    starting_optim_step: int,
+) -> None:
+    for optim_step_in_rl_step, metrics in enumerate(optim_step_metrics, start=1):
+        optim_step = starting_optim_step + optim_step_in_rl_step - 1
+        prefixed_metrics = {f"optim/{k}": v for k, v in metrics.items()}
+        prefixed_metrics["optim/optim_step_in_rl_step"] = optim_step_in_rl_step
+        prefixed_metrics["rl_step"] = rl_step
+        prefixed_metrics["optim_step"] = optim_step
+        logger.log_metrics(
+            prefixed_metrics,
+            optim_step,
+            prefix="train",
+            step_metric="train/optim_step",
+            step_finished=True,
+        )
 
 
 class GRPOLoggerConfig(LoggerConfig):
@@ -1349,6 +1446,7 @@ def grpo_train(
     # common config/state times
     current_step = grpo_save_state["current_step"]  # current step within an epoch
     total_steps = grpo_save_state["total_steps"]  # total steps across all epochs
+    total_optim_steps = _get_total_optim_steps(grpo_save_state, master_config)
     max_num_steps = master_config["grpo"][
         "max_num_steps"
     ]  # max number of steps to train for
@@ -1814,6 +1912,15 @@ def grpo_train(
                         loss_fn,
                         timer=timer,
                     )
+                rl_step = total_steps + 1
+                num_optim_steps_per_rl_step = _get_num_optim_steps_per_rl_step(
+                    repeated_batch.size,
+                    master_config["policy"]["train_global_batch_size"],
+                )
+                completed_optim_step = total_optim_steps + num_optim_steps_per_rl_step
+                optim_step_metrics = _get_optim_step_metrics(
+                    train_results, num_optim_steps_per_rl_step
+                )
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -1942,6 +2049,12 @@ def grpo_train(
                 metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
                 metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
                 metrics["masked_correct_pct"] = masked_correct_pct
+                _add_step_counters(
+                    metrics,
+                    rl_step=rl_step,
+                    optim_step=completed_optim_step,
+                    num_optim_steps_per_rl_step=num_optim_steps_per_rl_step,
+                )
 
                 ## Checkpointing
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
@@ -1965,6 +2078,7 @@ def grpo_train(
                     # +1 because step is 0-indexed
                     grpo_save_state["current_step"] = current_step + 1
                     grpo_save_state["total_steps"] = total_steps + 1
+                    grpo_save_state["total_optim_steps"] = completed_optim_step
                     grpo_save_state["current_epoch"] = current_epoch
                     grpo_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
@@ -2163,14 +2277,20 @@ def grpo_train(
                 train_results, metrics, timing_metrics, master_config
             )
 
-            logger.log_metrics(metrics, total_steps + 1, prefix="train")
+            _log_optim_step_metrics(
+                logger,
+                optim_step_metrics,
+                rl_step=rl_step,
+                starting_optim_step=total_optim_steps + 1,
+            )
+            logger.log_metrics(metrics, completed_optim_step, prefix="train")
             logger.log_metrics(
-                performance_metrics, total_steps + 1, prefix="performance"
+                performance_metrics, completed_optim_step, prefix="performance"
             )
             # step_finished=True here since this is the final log of our current step.
             logger.log_metrics(
                 timing_metrics,
-                total_steps + 1,
+                completed_optim_step,
                 prefix="timing/train",
                 step_finished=True,
             )
@@ -2194,6 +2314,7 @@ def grpo_train(
             timer.reset()
             current_step += 1
             total_steps += 1
+            total_optim_steps = completed_optim_step
             if should_save_by_timeout:
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
@@ -2432,6 +2553,7 @@ def async_grpo_train(
 
     # Training state
     step = grpo_save_state["current_step"]
+    total_optim_steps = _get_total_optim_steps(grpo_save_state, master_config)
     weight_version = step  # Tracks refitted weight versions
     consumed_samples = grpo_save_state["consumed_samples"]
     total_valid_tokens = grpo_save_state.get(
@@ -2858,6 +2980,15 @@ def async_grpo_train(
                         loss_fn,
                         timer=timer,
                     )
+                rl_step = step + 1
+                num_optim_steps_per_rl_step = _get_num_optim_steps_per_rl_step(
+                    repeated_batch.size,
+                    master_config["policy"]["train_global_batch_size"],
+                )
+                completed_optim_step = total_optim_steps + num_optim_steps_per_rl_step
+                optim_step_metrics = _get_optim_step_metrics(
+                    train_results, num_optim_steps_per_rl_step
+                )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
@@ -2997,6 +3128,12 @@ def async_grpo_train(
                 metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
                 metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
                 metrics["masked_correct_pct"] = masked_correct_pct
+                _add_step_counters(
+                    metrics,
+                    rl_step=rl_step,
+                    optim_step=completed_optim_step,
+                    num_optim_steps_per_rl_step=num_optim_steps_per_rl_step,
+                )
 
                 # Checkpointing (same as sync version)
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
@@ -3014,6 +3151,8 @@ def async_grpo_train(
                     should_save_by_step or should_save_by_timeout
                 ):
                     grpo_save_state["current_step"] = step + 1
+                    grpo_save_state["total_steps"] = step + 1
+                    grpo_save_state["total_optim_steps"] = completed_optim_step
                     grpo_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
                         grpo_save_state["val_reward"] = val_metrics["accuracy"]
@@ -3168,12 +3307,26 @@ def async_grpo_train(
                 train_results, metrics, timing_metrics, master_config
             )
 
-            logger.log_metrics(performance_metrics, step + 1, prefix="performance")
-            logger.log_metrics(metrics, step + 1, prefix="train")
-            logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
+            _log_optim_step_metrics(
+                logger,
+                optim_step_metrics,
+                rl_step=rl_step,
+                starting_optim_step=total_optim_steps + 1,
+            )
+            logger.log_metrics(
+                performance_metrics, completed_optim_step, prefix="performance"
+            )
+            logger.log_metrics(metrics, completed_optim_step, prefix="train")
+            logger.log_metrics(
+                timing_metrics,
+                completed_optim_step,
+                prefix="timing/train",
+                step_finished=True,
+            )
 
             timer.reset()
             step += 1
+            total_optim_steps = completed_optim_step
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
                 return

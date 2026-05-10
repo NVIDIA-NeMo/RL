@@ -367,8 +367,7 @@ class WandbLogger(LoggerInterface):
 
         # If step_metric is provided, use the corresponding value from metrics as step
         if step_metric and step_metric in metrics:
-            # commit=False so the step does not get incremented
-            self.run.log(metrics, commit=False)
+            self.run.log(metrics, commit=step_finished)
         elif step_finished:
             # Commit param defaults to None. By default if step is set, then commit defaults to False
             # Here, we have an explicit fork for commit in case W&B ever decides to change their default logic.
@@ -911,6 +910,9 @@ class Logger(LoggerInterface):
             wandb_log_dir = os.path.join(self.base_log_dir, "wandb")
             os.makedirs(wandb_log_dir, exist_ok=True)
             self.wandb_logger = WandbLogger(cfg["wandb"], log_dir=wandb_log_dir)
+            self.wandb_logger.define_metric(
+                "train/optim/*", step_metric="train/optim_step"
+            )
             self.loggers.append(self.wandb_logger)
 
         if cfg["swanlab_enabled"]:

@@ -306,6 +306,24 @@ class TestWandbLogger:
         mock_run.log.assert_called_once_with(metrics, commit=False)
 
     @patch("nemo_rl.utils.logger.wandb")
+    def test_log_metrics_with_step_metric_and_step_finished(self, mock_wandb):
+        """Test that custom step metrics can commit completed rows."""
+        cfg = {}
+        logger = WandbLogger(cfg)
+
+        metrics = {"loss": 0.5, "optim_step": 15}
+
+        logger.log_metrics(
+            metrics,
+            step=10,
+            step_metric="optim_step",
+            step_finished=True,
+        )
+
+        mock_run = mock_wandb.init.return_value
+        mock_run.log.assert_called_once_with(metrics, commit=True)
+
+    @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_prefix_and_step_metric(self, mock_wandb):
         """Test logging metrics with both prefix and step metric."""
         cfg = {}
@@ -1285,9 +1303,10 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
 
         # Check that wandb metrics are defined with the step metric
         mock_wandb_instance = mock_wandb_logger.return_value
-        mock_wandb_instance.define_metric.assert_called_once_with(
-            "ray/*", step_metric="ray/ray_step"
-        )
+        assert mock_wandb_instance.define_metric.call_args_list == [
+            call("train/optim/*", step_metric="train/optim_step"),
+            call("ray/*", step_metric="ray/ray_step"),
+        ]
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
@@ -1594,9 +1613,10 @@ class TestLogger:
 
         # Check that wandb metrics are defined with the step metric
         mock_wandb_instance = mock_wandb_logger.return_value
-        mock_wandb_instance.define_metric.assert_called_once_with(
-            "ray/*", step_metric="ray/ray_step"
-        )
+        assert mock_wandb_instance.define_metric.call_args_list == [
+            call("train/optim/*", step_metric="train/optim_step"),
+            call("ray/*", step_metric="ray/ray_step"),
+        ]
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")

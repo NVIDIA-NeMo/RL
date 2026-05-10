@@ -25,11 +25,71 @@ import zmq
 
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
+    aggregate_metric_dicts,
+    aggregate_optim_step_metrics_by_index,
     calculate_aligned_size,
     get_megatron_checkpoint_dir,
     rebuild_cuda_tensor_from_ipc,
     stream_weights_via_ipc_zmq_impl,
+    unscale_loss_metrics_for_optim_step,
 )
+
+
+def test_unscale_loss_metrics_for_optim_step_preserves_min_max_metrics():
+    metrics = {
+        "loss": torch.tensor(0.25),
+        "num_valid_samples": 2.0,
+        "probs_ratio_min": 0.1,
+        "probs_ratio_max": 1.5,
+    }
+
+    unscaled = unscale_loss_metrics_for_optim_step(metrics, num_global_batches=4)
+
+    assert unscaled["loss"].item() == pytest.approx(1.0)
+    assert unscaled["num_valid_samples"] == pytest.approx(8.0)
+    assert unscaled["probs_ratio_min"] == pytest.approx(0.1)
+    assert unscaled["probs_ratio_max"] == pytest.approx(1.5)
+
+
+def test_aggregate_metric_dicts_matches_grpo_reductions():
+    metrics = aggregate_metric_dicts(
+        [
+            {
+                "loss": 1.0,
+                "lr": 0.1,
+                "global_valid_toks": 8,
+                "probs_ratio_min": 0.5,
+                "probs_ratio_max": 1.2,
+            },
+            {
+                "loss": 2.0,
+                "lr": 0.3,
+                "global_valid_toks": 12,
+                "probs_ratio_min": 0.2,
+                "probs_ratio_max": 1.8,
+            },
+        ]
+    )
+
+    assert metrics["loss"] == pytest.approx(3.0)
+    assert metrics["lr"] == pytest.approx(0.2)
+    assert metrics["global_valid_toks"] == pytest.approx(10.0)
+    assert metrics["probs_ratio_min"] == pytest.approx(0.2)
+    assert metrics["probs_ratio_max"] == pytest.approx(1.8)
+
+
+def test_aggregate_optim_step_metrics_by_index_preserves_step_boundaries():
+    metrics = aggregate_optim_step_metrics_by_index(
+        [
+            [{"loss": 1.0, "lr": 0.1}, {"loss": 2.0, "lr": 0.1}],
+            [{"loss": 3.0, "lr": 0.3}, {"loss": 4.0, "lr": 0.3}],
+        ]
+    )
+
+    assert metrics == [
+        {"loss": 4.0, "lr": pytest.approx(0.2)},
+        {"loss": 6.0, "lr": pytest.approx(0.2)},
+    ]
 
 
 class TestGetMegatronCheckpointDir:

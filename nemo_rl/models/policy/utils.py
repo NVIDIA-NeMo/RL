@@ -13,11 +13,14 @@
 # limitations under the License.
 
 import gc
+from collections import defaultdict
+from numbers import Number
 import os
 import traceback
 from enum import Enum
 from typing import Any, Dict, Optional, cast
 
+import numpy as np
 import requests
 import torch
 import torch.distributed as dist
@@ -104,6 +107,90 @@ POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker",
     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
 }
+
+OPTIM_STEP_MEAN_METRIC_NAMES = {
+    "global_valid_seqs",
+    "global_valid_toks",
+    "lr",
+    "wd",
+}
+
+
+def unscale_loss_metrics_for_optim_step(
+    metrics: dict[str, Any], num_global_batches: int
+) -> dict[str, Any]:
+    """Return per-optimizer-step metrics before legacy rollout-level scaling."""
+    if num_global_batches <= 0:
+        raise ValueError(
+            f"num_global_batches must be positive, got {num_global_batches}"
+        )
+
+    unscaled_metrics = {}
+    for name, value in metrics.items():
+        if "_min" in name or "_max" in name:
+            unscaled_metrics[name] = value
+        else:
+            unscaled_metrics[name] = value * num_global_batches
+    return unscaled_metrics
+
+
+def aggregate_metric_dicts(metric_dicts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate metric dictionaries with the same reductions used by GRPO logs."""
+    grouped_metrics: dict[str, list[Any]] = defaultdict(list)
+    for metric_dict in metric_dicts:
+        for name, value in metric_dict.items():
+            grouped_metrics[name].append(_coerce_metric_number(value))
+
+    aggregated_metrics: dict[str, Any] = {}
+    for name, values in grouped_metrics.items():
+        if any(not isinstance(value, Number) for value in values):
+            continue
+        if "_min" in name:
+            aggregated_metrics[name] = min(values)
+        elif "_max" in name:
+            aggregated_metrics[name] = max(values)
+        elif name in OPTIM_STEP_MEAN_METRIC_NAMES:
+            aggregated_metrics[name] = sum(values) / len(values)
+        else:
+            aggregated_metrics[name] = sum(values)
+    return aggregated_metrics
+
+
+def aggregate_optim_step_metrics_by_index(
+    worker_optim_step_metrics: list[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Aggregate optimizer-step metrics from workers while preserving step index."""
+    if not worker_optim_step_metrics:
+        return []
+
+    num_optim_steps = len(worker_optim_step_metrics[0])
+    for metrics in worker_optim_step_metrics:
+        if len(metrics) != num_optim_steps:
+            raise ValueError(
+                "All workers must report the same number of optimizer-step metric "
+                f"groups, got {[len(m) for m in worker_optim_step_metrics]}"
+            )
+
+    return [
+        aggregate_metric_dicts(
+            [metrics[step_idx] for metrics in worker_optim_step_metrics]
+        )
+        for step_idx in range(num_optim_steps)
+    ]
+
+
+def _coerce_metric_number(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return value
+        return value.detach().cpu().item()
+    if isinstance(value, np.ndarray):
+        if value.size != 1:
+            return value
+        return value.item()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:

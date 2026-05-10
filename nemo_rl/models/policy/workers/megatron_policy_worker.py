@@ -86,7 +86,10 @@ from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    aggregate_metric_dicts,
+    get_runtime_env_for_policy_worker,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -299,6 +302,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         with ctx:
             all_mb_metrics = []
+            optim_step_metrics = []
             losses = []
             total_num_microbatches = 0
             for gb_idx in range(num_global_batches):
@@ -399,8 +403,10 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     # keep all microbatch metrics to be normalized later
                     gb_loss_metrics = []
+                    gb_optim_mb_metrics = []
                     mb_losses = []
                     for x in losses_reduced:
+                        optim_loss_metrics = dict(x)
                         loss_metrics = {}
                         for k in x.keys():
                             if "_min" in k or "_max" in k:
@@ -414,19 +420,33 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                         loss_metrics["wd"] = curr_wd
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                        optim_loss_metrics["lr"] = curr_lr
+                        optim_loss_metrics["wd"] = curr_wd
+                        optim_loss_metrics["global_valid_seqs"] = (
+                            global_valid_seqs.item()
+                        )
+                        optim_loss_metrics["global_valid_toks"] = (
+                            global_valid_toks.item()
+                        )
                         mb_losses.append(loss_metrics["loss"])
+                        gb_optim_mb_metrics.append(optim_loss_metrics)
 
                 else:
                     gb_loss_metrics = None
+                    gb_optim_mb_metrics = None
 
                 # Broadcast loss metrics from last stage to all stages
                 gb_loss_metrics = broadcast_loss_metrics_from_last_stage(
                     gb_loss_metrics
                 )
+                gb_optim_mb_metrics = broadcast_loss_metrics_from_last_stage(
+                    gb_optim_mb_metrics
+                )
                 if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     mb_losses = [x["loss"] for x in gb_loss_metrics]
 
                 all_mb_metrics.extend(gb_loss_metrics)
+                optim_step_metrics.append(aggregate_metric_dicts(gb_optim_mb_metrics))
                 losses.append(torch.tensor(mb_losses).sum().item())
 
         if not eval_mode:
@@ -448,6 +468,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             "gpu_name": torch.cuda.get_device_name(),
             "model_dtype": self.dtype,
             "all_mb_metrics": mb_metrics,
+            "optim_step_metrics": optim_step_metrics,
             "grad_norm": torch.tensor([grad_norm]),
         }
         # Collect MoE aux metrics averaged across microbatches
