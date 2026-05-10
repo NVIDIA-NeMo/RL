@@ -62,7 +62,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
-    get_logprobs_from_vocab_parallel_logits,
+    get_next_token_logprobs_from_vocab_parallel_logits,
 )
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
@@ -1162,22 +1162,26 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 placements=[Shard(sequence_dim), Shard(-1)],
                             )
 
-                        token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                            logits,
-                            input_ids_dtensor,
-                            seq_index_tensor,
-                            chunk_size=logprob_chunk_size,
-                            sampling_params=self.sampling_params,
+                        token_logprobs = (
+                            get_next_token_logprobs_from_vocab_parallel_logits(
+                                logits,
+                                input_ids_dtensor,
+                                seq_index_tensor,
+                                chunk_size=logprob_chunk_size,
+                                sampling_params=self.sampling_params,
+                            )
                         )
 
                         assert token_logprobs.shape[1] == seq_len - 1
                     else:
                         if isinstance(logits, DTensor):
-                            token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                                logits,
-                                input_ids,
-                                chunk_size=logprob_chunk_size,
-                                sampling_params=self.sampling_params,
+                            token_logprobs = (
+                                get_next_token_logprobs_from_vocab_parallel_logits(
+                                    logits,
+                                    input_ids,
+                                    chunk_size=logprob_chunk_size,
+                                    sampling_params=self.sampling_params,
+                                )
                             )
                         else:
                             if logprob_chunk_size is not None:
