@@ -1,0 +1,243 @@
+# GRPO recipe for Qwen2.5-7B-Instruct on 2 nodes (1 train + 1 infer),
+# Megatron training + non-colocated SGLang inference via the NCCL bridge.
+# DeepScaler train + AIME2024 validation, 200 steps end-to-end.
+#
+# Layout (16 GPUs = 2 nodes x 8 GPUs):
+#   Training:  1 x 8 = 8 GPUs (Megatron, TP=2 x DP=4, optimizer_cpu_offload=True)
+#   Inference: 1 x 8 = 8 GPUs (SGLang, 2 server replicas x TP=4)
+#
+# 7B / 2 nodes is the smallest meaningful coverage: bridge requires at
+# least 2 physical nodes, ~14 GiB BF16 spans multiple 1-GiB buckets so it
+# exercises bucket boundaries + flush_cache=True on the last bucket, and
+# 200 steps is enough to surface drift / leaks / IS-correction issues.
+#
+# Why DeepScaler + AIME2024:
+#   - DeepScaler (40K curated math RL problems) is the canonical training
+#     dataset for this size class (cf. agentica-org/DeepScaleR-Preview).
+#   - AIME2024 with repeat=16 (480 samples) gives stable pass@1 estimates
+#     with std ~1.4pp at the ~10% baseline range.
+#
+# Env vars expected from the launcher: NRL_SGLANG_NONCOLO_TRANSPORT=nccl,
+# NRL_SGLANG_BRIDGE_PORT (default 29500), NRL_REFIT_BUCKET_BYTES (default
+# 1 GiB), NCCL_TIMEOUT.
+#
+# To run a quick smoke test on this same recipe, override
+# grpo.max_num_steps from the command line (the runner script forwards
+# extra args verbatim):
+#   sbatch grpo_qwen25_7b_sglang_noncolo_deepscaler_job.slurm \
+#       grpo.max_num_steps=30 grpo.val_period=0 grpo.val_at_start=false
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  max_num_steps: 200
+  # 16 prompts x 8 gens = 128 in-flight rollouts; / DP=4 / micro=1 = 32
+  # grad-accum micro-steps per DP rank. More gens-per-prompt tightens the
+  # GRPO leave-one-out baseline variance vs splitting the same rollout
+  # budget across more prompts.
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  val_period: 20
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 480
+  val_batch_size: 32
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  # The noncolo NCCL bridge ships BF16 weights and SGLang's logit
+  # kernels are not bitwise-identical to Megatron's, so the sampler and
+  # trainer policies have a small but non-zero KL gap (~0.13 typical).
+  # Enabling IS correction makes the gradient unbiased w.r.t. that gap.
+  use_importance_sampling_correction: true
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen2.5-7b-2n8g-megatron-sglang-noncolo-nccl-deepscaler
+
+policy:
+  model_name: Qwen/Qwen2.5-7B-Instruct
+  tokenizer:
+    name: Qwen/Qwen2.5-7B-Instruct
+
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  precision: bfloat16
+
+  offload_optimizer_for_logprob: true
+
+  dtensor_cfg:
+    enabled: false
+
+  dynamic_batching:
+    enabled: false
+
+  sequence_packing:
+    enabled: false
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+  logprob_chunk_size: 128
+
+  # DTensor optimizer/scheduler are unused; Megatron reads its own block.
+  optimizer: null
+  scheduler: null
+
+  megatron_cfg:
+    enabled: true
+    use_linear_ce_fusion_loss: false
+    linear_ce_fusion_chunk_size: 128
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    empty_unused_memory_level: 1
+    activation_checkpointing: false
+    # 1 train node: TP=2 x DP=4 = 8 GPUs.
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    num_layers_in_last_pipeline_stage: null
+    num_layers_in_first_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    apply_rope_fusion: false
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+    automodel_kwargs:
+      use_liger_kernel: true
+
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 32
+      alpha: 16
+      dropout: 0.0
+      dropout_position: pre
+      lora_A_init_method: xavier
+      lora_B_init_method: zero
+      a2a_experimental: false
+      lora_dtype: None
+
+    optimizer:
+      optimizer: adam
+      lr: 2.0e-6
+      min_lr: 2.0e-7
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: bfloat16
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: false
+      clip_grad: ${policy.max_grad_norm}
+      # CPU offload requires the FP32-master-from-BF16-model sync that
+      # this PR adds in nemo_rl/models/megatron/setup.py; without that
+      # fix the first optimizer step writes the un-loaded init FP32
+      # master back into BF16 and the model silently reverts to default
+      # init at step 2.
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: cosine
+      lr_warmup_iters: 20
+      lr_warmup_init: 2.0e-7
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      data_parallel_sharding_strategy: optim_grads_params
+      use_custom_fsdp: false
+
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: blockwise
+      fp8_param: false
+
+  # SGLang inference: 1 dedicated node, 2 server replicas x TP=4 (all 8 GPUs).
+  # Qwen2.5-7B has 28 attention heads, so TP must divide 28 (TP=8 would
+  # fail SGLang's total_num_heads % tp_size assertion). The 2 replicas
+  # come from gpus_per_server (4) // total_inference_gpus (8); SGLang's
+  # internal --dp-size must stay at 1 or init_weights_update_group asserts.
+  generation:
+    backend: sglang
+    # 1024 truncates Qwen2.5-7B-Instruct chain-of-thought math answers
+    # mid-thought, leaving no \boxed{...} for the math verifier to parse
+    # (every truncated rollout returns reward=0). 4096 matches
+    # max_total_sequence_length and gives the model room to finish.
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    sglang_cfg:
+      model_path: ${policy.model_name}
+      gpus_per_server: 4
+      dtype: ${policy.precision}
+      kv_cache_dtype: auto
+      context_length: ${policy.max_total_sequence_length}
+      enable_memory_saver: false
+      dp_size: 1
+      pp_size: 1
+      ep_size: 1
+      mem_fraction_static: 0.85
+      max_running_requests: 128
+      max_prefill_tokens: ${policy.max_total_sequence_length}
+      chunked_prefill_size: ${policy.max_total_sequence_length}
+      allow_auto_truncate: true
+      skip_server_warmup: true
+      log_level: warning
+      disable_piecewise_cuda_graph: true
+    sglang_kwargs: {}
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 4
+  train:
+    dataset_name: DeepScaler
+  validation:
+    dataset_name: AIME2024
+    repeat: 16
+
+logger:
+  log_dir: logs/grpo-qwen2.5-7b-2n8g-megatron-sglang-noncolo-nccl-deepscaler
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  num_val_samples_to_print: 4
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen2.5-7b-deepscaler-aime
+  tensorboard:
+    log_dir: tb_logs-grpo-qwen2.5-7b-deepscaler-aime
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+# 2 total Ray nodes; nemo-rl auto-subtracts the 1 inference node from
+# cluster.num_nodes, leaving 1 train node.
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
