@@ -1,0 +1,171 @@
+defaults: "grpo_nanov3.yaml"
+
+# Nano v3 with equivalence_llm_judge on GB300 NVL72.
+# 4 training nodes × 4 GPUs = 16 GPUs + 1 judge node (4 GPUs) = 20 GPUs total.
+# Uses local_vllm_model judge (Qwen3-30B-A3B-Instruct, TP=4).
+#
+# Every sample hits the LLM judge (100% trigger rate), unlike math_with_judge
+# which only falls back to the judge when symbolic verification fails (~30%).
+#
+# Compare with grpo_nanov3_equiv_judge_dynamo_4n4g.yaml (Dynamo version).
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 16
+  max_num_steps: 10
+  val_period: 5
+
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  logprob_chunk_size: 2048
+
+  dtensor_cfg:
+    enabled: false
+
+  optimizer: null
+  scheduler: null
+
+  make_sequence_length_divisible_by: 1
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    bias_activation_fusion: False
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 16
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    sequence_parallel: false
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1e-3
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+    apply_rope_fusion: True
+    defer_fp32_logits: True
+    track_moe_metrics: True
+    moe_per_layer_logging: True
+    moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
+
+    optimizer:
+      optimizer: "adam"
+      lr: 3e-6
+      min_lr: 3e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      clip_grad: ${policy.max_grad_norm}
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: False
+      optimizer_offload_fraction: 0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-7
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    env_vars: null
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  generation:
+    vllm_cfg:
+      async_engine: false
+      kv_cache_dtype: auto
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.4
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: False
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      expose_http_server: true
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: deepseek_r1
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        backend: eager
+    colocated:
+      enabled: true
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    skip_venv_if_present: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/equivalence_llm_judge/configs/equivalence_llm_judge.yaml
+    - resources_servers/math_with_judge/configs/math_with_local_judge.yaml
+    equivalence_llm_judge:
+      resources_servers:
+        equivalence_llm_judge:
+          judge_model_server:
+            type: responses_api_models
+            name: qwen3_30ba3b_instruct_2507_model_server
+          judge_responses_create_params:
+            input: []
+    qwen3_30ba3b_instruct_2507_model_server:
+      responses_api_models:
+        local_vllm_model:
+          hf_home: /mnt/rl-workspace/terryk/hf-cache
+          vllm_serve_kwargs:
+            tensor_parallel_size: 4
+
+data:
+  use_multiple_dataloader: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-nanov3-equiv-judge-4n4g"
+  save_period: 10
+
+logger:
+  log_dir: "logs/grpo-nanov3-equiv-judge-4n4g"
+  wandb:
+    project: nemorl-nanov3-judge
+    name: grpo-nanov3-equiv-judge-4n4g
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4

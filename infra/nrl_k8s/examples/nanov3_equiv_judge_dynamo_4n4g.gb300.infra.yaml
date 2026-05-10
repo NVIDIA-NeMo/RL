@@ -1,0 +1,196 @@
+# Nano v3 GRPO with equivalence_llm_judge via Dynamo — 4 nodes × 4 GPUs on GB300 NVL72.
+#
+# Every sample hits the Dynamo LLM judge (100% trigger rate), unlike
+# nanov3_judge_dynamo_4n4g which uses math_with_judge (~30% fallback).
+#
+# Topology: 4 training workers × 4 GPUs = 16 GPUs in a single RayCluster.
+# Judge runs as an external DynamoGraphDeployment (Qwen3-30B-A3B-Instruct,
+# TP=4 on a separate GB300 node managed by the Dynamo operator).
+#
+# Prereqs:
+#   - Dynamo operator installed in the cluster
+#   - Pre-download the judge model:
+#     HF_HOME=/mnt/rl-workspace/terryk/hf-cache \
+#       uvx --from huggingface-hub hf download Qwen/Qwen3-30B-A3B-Instruct-2507
+#
+# Usage:
+#   RECIPE=examples/nemo_gym/grpo_nanov3_equiv_judge_dynamo_4n4g.yaml
+#   INFRA=infra/nrl_k8s/examples/nanov3_equiv_judge_dynamo_4n4g.gb300.infra.yaml
+#
+#   nrl-k8s cluster down $RECIPE --infra $INFRA
+#   sleep 20
+#   nrl-k8s cluster up $RECIPE --infra $INFRA --wait
+#   nrl-k8s run $RECIPE --infra $INFRA --wait --raycluster --replace
+
+_shared:
+  headNodeSelector: &head_node_selector
+    nodeGroup: customer-cpu
+  workerNodeSelector: &worker_node_selector
+    nvidia.com/gpu.product: NVIDIA-GB300
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                     value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                     value: WARN}
+    - {name: NCCL_MNNVL_ENABLE,              value: "1"}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+  headResources: &head_resources
+    limits:   {cpu: "16", memory: "64Gi"}
+    requests: {cpu: "8", memory: "32Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    limits:
+      cpu: "132"
+      memory: "900Gi"
+      nvidia.com/gpu: "4"
+    requests:
+      cpu: "120"
+      memory: "850Gi"
+      nvidia.com/gpu: "4"
+    claims:
+      - {name: compute-domain-channel}
+      - {name: roce-channel}
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm, name: dshm}
+    - {mountPath: /opt/nemo-rl, name: rl-workspace, subPath: "${user:}/nemo-rl"}
+    - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 32Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+  workerVolumes: &worker_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 64Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+
+image: nvcr.io/nvidian/nemo-rl:664d29c-49528955
+imagePullSecrets: [nvcr-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+submit:
+  submitter: portForward
+
+launch:
+  mode: attach
+  runMode: batch
+  codeSource: image
+  codePath: /opt/nemo-rl
+  attach:
+    training: ${user:}-raycluster-equiv-judge-dyn-gb300
+  peerWatcher: false
+  env: {}
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted — is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
+    export RAY_enable_infeasible_task_early_exit=true
+    export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM
+    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    NEMO_GYM_LOG_DIR=/mnt/rl-workspace/${user:}/gym_logs/${user:}-nanov3-equiv-judge-dynamo-\${TIMESTAMP}
+    LOG=\${LOG_DIR}/${user:}-equiv-judge-dyn-gb300-\${TIMESTAMP}.log
+    CHECKPOINT_DIR=/mnt/rl-workspace/${user:}/results/nanov3-equiv-judge-dynamo-4n4g
+    mkdir -p "\${LOG_DIR}" "\${CHECKPOINT_DIR}" "\${NEMO_GYM_LOG_DIR}"
+
+    python -u examples/nemo_gym/run_grpo_nemo_gym.py \
+      --config examples/nemo_gym/grpo_nanov3_equiv_judge_dynamo_4n4g.yaml \
+      data.train.data_path=/mnt/rl-workspace/terryk/data/equivalence_llm_judge/train.jsonl \
+      data.validation.data_path=/mnt/rl-workspace/terryk/data/equivalence_llm_judge/val.jsonl \
+      checkpointing.checkpoint_dir=\${CHECKPOINT_DIR} \
+      logger.log_dir=\${CHECKPOINT_DIR}/logs \
+      logger.wandb_enabled=true \
+      logger.tensorboard_enabled=true \
+      logger.monitor_gpus=true \
+      logger.wandb.project=nemorl-nanov3-judge \
+      logger.wandb.name=nanov3-equiv-judge-dynamo-4n4g-gb300 \
+      +env.nemo_gym.nemo_gym_log_dir=\${NEMO_GYM_LOG_DIR} \
+      "env.nemo_gym.dynamo_judge.responses_api_models.vllm_model.base_url=http://${user:}-equiv-judge-dyn-frontend:8000/v1" \
+      2>&1 | tee "\${LOG}"
+
+kuberay:
+  training:
+    name: ${user:}-raycluster-equiv-judge-dyn-gb300
+    segmentSize: 1
+    labels:
+      disagg.nemo-rl/cluster: equiv-judge-dyn-gb300
+      disagg.nemo-rl/run: equiv-judge-dyn-gb300
+      kai.scheduler/queue: backfill
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          no-monitor: "true"
+          num-gpus: "0"
+          object-store-memory: "200000000"
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            containers:
+              - name: ray-head
+                env: *shared_head_env
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 4
+          minReplicas: 4
+          maxReplicas: 4
+          numOfHosts: 1
+          rayStartParams:
+            num-gpus: "4"
+            object-store-memory: "200000000"
+          template:
+            metadata:
+              annotations:
+                kai.scheduler/topology: gb300-topology
+                kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+            spec:
+              schedulerName: kai-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              resourceClaims:
+                - name: compute-domain-channel
+                  resourceClaimTemplateName: compute-domain-nanov3-equiv-judge-dynamo
+                - name: roce-channel
+                  resourceClaimTemplateName: roce-nanov3-equiv-judge-dynamo
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_worker_resources
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK]
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes
+
+dynamo:
+  serving:
+    manifest: ../examples_dgd/qwen3_30ba3b_instruct_judge_gb300.yaml
+    name: ${user:}-equiv-judge-dyn
+    readyTimeoutS: 900
