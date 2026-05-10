@@ -55,13 +55,6 @@ def get_username() -> str:
 def _register_nrl_resolvers() -> None:
     if not OmegaConf.has_resolver("user"):
         OmegaConf.register_new_resolver("user", lambda: get_username())
-    if not OmegaConf.has_resolver("mul"):
-        OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
-    if not OmegaConf.has_resolver("div"):
-        OmegaConf.register_new_resolver("div", lambda a, b: a / b)
-    if not OmegaConf.has_resolver("max"):
-        OmegaConf.register_new_resolver("max", lambda a, b: max(a, b))
-
 
 _SHIPPED_DEFAULTS = Path(__file__).parent / "defaults" / "defaults.example.yaml"
 _USER_DEFAULTS = Path(
@@ -215,10 +208,10 @@ def _load_recipe_fallback(recipe_path: Path, overrides: list[str]) -> DictConfig
     """OmegaConf-only loader used when nemo_rl is unavailable.
 
     Handles ``defaults:`` inheritance recursively (same semantics as
-    :func:`nemo_rl.utils.config.load_config_with_inheritance`). Arithmetic
-    resolvers (``mul``, ``div``, ``max``) are registered in
-    :func:`_register_nrl_resolvers` so ``nrl-k8s check`` works without
-    nemo_rl importable.
+    :func:`nemo_rl.utils.config.load_config_with_inheritance`). Custom
+    resolvers like ``${mul:...}`` are NOT registered — those are only
+    needed by NeMo-RL's own entrypoints, which always run inside the Ray
+    container where nemo_rl is importable.
     """
     cfg = _load_with_inheritance(recipe_path)
     if overrides:
@@ -302,7 +295,7 @@ def _pick_infra(cfg: DictConfig) -> DictConfig:
         inner = cfg["infra"]
         if not isinstance(inner, DictConfig):
             raise ValueError("defaults file has non-mapping `infra:` key")
-        return _detach(inner)
+        return inner
     return cfg
 
 
@@ -312,12 +305,7 @@ def _extract_recipe_infra(recipe: DictConfig) -> DictConfig:
     inner = recipe["infra"]
     if not isinstance(inner, DictConfig):
         raise ValueError("recipe `infra:` key must be a mapping")
-    return _detach(inner)
-
-
-def _detach(cfg: DictConfig) -> DictConfig:
-    """Return a parent-free copy so interpolations resolve from this root."""
-    return OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    return inner
 
 
 def _load_yaml_if_present(path: Path, *, required: bool) -> DictConfig | None:

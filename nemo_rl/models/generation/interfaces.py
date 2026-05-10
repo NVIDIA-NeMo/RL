@@ -115,6 +115,27 @@ class ColocationConfig(TypedDict):
     resources: OptionalResourcesConfig
 
 
+class RouterConfig(TypedDict, total=False):
+    """Optional GenerationRouter health-poll + cordon overrides.
+
+    Read by ``examples/run_standalone_generation_server.py`` and forwarded
+    to ``GenerationRouter.__init__``. Any field omitted here falls back to
+    the in-code default (see ``_DEFAULT_*`` constants in
+    ``generation_router.py``).
+    """
+
+    health_poll_interval_s: float
+    health_timeout_s: float
+    failure_threshold: int
+    join_success_threshold: int
+    proxy_timeout_s: float
+    proxy_failure_threshold: int
+    proxy_pool_limit_total: int
+    proxy_pool_limit_per_host: int
+    uvicorn_backlog: int
+    uvicorn_keep_alive_s: int
+
+
 class GenerationConfig(TypedDict):
     """Configuration for generation."""
 
@@ -127,6 +148,18 @@ class GenerationConfig(TypedDict):
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
     colocated: NotRequired[ColocationConfig]
+    # Setting `remote_generation_url` with `colocated.enabled=false` enables
+    # disaggregated HTTP mode: the training cluster sends generation requests
+    # (via OpenAI /v1/completions) and weight-sync / lifecycle calls to a
+    # separate cluster running the unified GenerationRouter at this URL
+    # (data plane + control plane on one port). The router transparently
+    # cordons unhealthy shards and replays in-flight requests, so the
+    # training driver no longer dies on a single failed `ray.get`.
+    remote_generation_url: NotRequired[str]
+    # Router health-poll thresholds. Only consumed by the standalone gen
+    # server (run_standalone_generation_server.py) when it constructs a
+    # GenerationRouter; ignored in colocated mode.
+    router: NotRequired[RouterConfig]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
 

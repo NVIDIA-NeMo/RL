@@ -19,6 +19,7 @@ from collections import defaultdict
 from typing import (
     Any,
     AsyncGenerator,
+    Callable,
     Optional,
     Union,
 )
@@ -439,8 +440,14 @@ class VllmGeneration(GenerationInterface):
             else "init_collective"
         )
 
-        # Prepare rank
-        total_workers = len(self.worker_group.workers)
+        # Prepare rank — over surviving workers only (RL-412: shard may have
+        # been killed by the router after a fault). Dead worker indices
+        # were dropped from worker_group via mark_workers_dead.
+        live_indices = [
+            i for i in range(len(self.worker_group.workers))
+            if i not in self.worker_group.dead_indices
+        ]
+        total_workers = len(live_indices)
         if self.dp_size == 0:
             raise RuntimeError(
                 "Data parallel size is zero, cannot initialize collective."
@@ -463,6 +470,287 @@ class VllmGeneration(GenerationInterface):
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
+
+    def reset_collective(self) -> list[ray.ObjectRef]:
+        """Tear down the weight-sync NCCL group across all vLLM workers.
+
+        Idempotent — workers that don't currently hold a group are no-ops.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            return []
+        method_name = (
+            "reset_collective_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "reset_collective"
+        )
+        return self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+
+    def add_dp_worker(
+        self,
+        dp_shard_idx: Optional[int] = None,
+        pre_append_hook: Optional[Callable[[], None]] = None,
+    ) -> tuple[list[Any], PlacementGroup, list[int], Optional[str]]:
+        """Allocate a fresh placement group + actor(s) and append as a new DP shard.
+
+        RL-412 scale-up path. Supports TP>=1, PP>=1 — for one DP shard with
+        ``model_parallel_size = TP * PP``, allocates a single PACK placement
+        group with ``model_parallel_size`` GPU bundles and spawns one Ray
+        actor per bundle. The first actor (local_rank=0) is the leader: it
+        owns the vLLM engine, drives ``prepare_refit_info`` /
+        ``report_dp_openai_server_base_url``, and is the only entry recorded
+        in ``dp_leader_worker_indices``. The followers reserve their bundles
+        but skip vLLM model loading (matching the initial-cohort layout in
+        ``_create_workers_from_bundle_indices``).
+
+        The KubeRay autoscaler v2 (in-tree) sees the unsatisfiable PG demand
+        and provisions a new worker pod into the gpu-shard worker group.
+        Once the bundle is ready, we spawn the actors via
+        ``RayWorkerGroup.spawn_workers_for_shard`` /
+        ``append_spawned_shard_workers`` and refresh
+        ``sharding_annotations`` + ``dp_openai_server_base_urls`` so
+        subsequent ``init_collective`` / ``generate`` dispatches include the
+        new shard.
+
+        EP>TP (vLLM-internal DP) is not yet supported — that mode introduces
+        an extra layer of internal parallelism inside one DP shard and would
+        need its own bundle/env-var layout.
+
+        Args:
+            dp_shard_idx: Logical DP shard index for the new worker
+                (informational — used to populate worker metadata).
+                Defaults to the post-compaction DP size.
+
+        Returns:
+            ``(actor_handles, placement_group, worker_indices, base_url)``.
+            - ``actor_handles``: every actor for this shard, leader first.
+            - ``placement_group``: the PG; the router holds a reference for
+              cleanup via ``remove_shard``.
+            - ``worker_indices``: indices into ``worker_group._workers``,
+              leader first. Used by the router for ``mark_workers_dead`` /
+              ``ray.kill`` on remove.
+            - ``base_url``: leader's OpenAI server URL (or ``None`` for sync
+              engines).
+        """
+        if self.ep_size > self.tp_size:
+            raise NotImplementedError(
+                "add_dp_worker does not yet support EP>TP (vLLM-internal DP); "
+                f"got ep={self.ep_size}, tp={self.tp_size}."
+            )
+
+        # Allocate a multi-GPU placement group for the new shard. STRICT_PACK
+        # so all TP*PP bundles land on a single pod (one nvl72 clique on
+        # GB200/GB300). Bundle shape mirrors the initial cohort
+        # (cluster._create_placement_groups_internal): one GPU + N CPU per
+        # bundle, where N = max_colocated_worker_groups.
+        # Note: do NOT use lifetime="detached" — caused leaked PGs in earlier
+        # iterations. The router holds a reference via ShardEntry.placement_group
+        # so the PG outlives this call but is still GC'd on daemon exit.
+        cluster = self.worker_group.cluster
+        num_cpus_per_bundle = cluster.max_colocated_worker_groups
+        num_gpus_per_bundle = 1 if cluster.use_gpus else 0
+        bundles = [
+            {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
+            for _ in range(self.model_parallel_size)
+        ]
+        pg = ray.util.placement_group(bundles=bundles, strategy="STRICT_PACK")
+        # Block until ready (caller invokes us via run_in_executor so the
+        # asyncio loop stays responsive while autoscaler v2 schedules the pod).
+        ray.get(pg.ready())
+
+        # Register-only gating: split the spawn vs append phases so vLLM
+        # init (which can take 30-60s on a fresh pod) happens BEFORE the
+        # router's ``_nccl_reinit_in_progress`` gate goes up. Without this
+        # split the gate covers the entire vLLM init, which spikes
+        # train-side step time by ~60-90s on every kill+recover cycle
+        # while train waits on /refit_ready.
+        #
+        # Phase A (UNGATED, slow): spawn ALL TP*PP actor handles, then call
+        # ``prepare_refit_info`` and ``report_dp_openai_server_base_url``
+        # on the LEADER. Setup methods serialize behind the leader's
+        # ``__init__`` (vLLM model load + CUDA graph capture), so the wait
+        # happens here while train is still happily refitting at the
+        # smaller post-remove world.
+        #
+        # Phase B (GATED, fast): pre_append_hook fires (router raises
+        # gate), worker_group append (instant), sharding rebuild
+        # (instant). Total ~5-10s. Then control returns to the router
+        # which inserts the shard table entry and runs reset_collective
+        # — also under the same brief gate.
+        if dp_shard_idx is None:
+            dp_shard_idx = self.worker_group.dp_size
+        bundle_indices_per_worker = list(range(self.model_parallel_size))
+
+        def _cleanup_partial_spawn(
+            spawned_actors: Optional[list[Any]],
+        ) -> None:
+            """Tear down a partially-spawned shard on add failure.
+
+            Phase A failure cleanup (TP>1 correctness): if any setup
+            step between ``spawn_workers_for_shard`` and the final
+            ``append_spawned_shard_workers`` raises, we MUST ray.kill
+            every spawned actor (leader AND followers) before releasing
+            the PG. Relying on Ray's GC to reclaim out-of-scope handles
+            is racy at TP>1 — followers reserve bundles independently
+            of the leader and stay alive on the PG until the PG is
+            removed. Without explicit kills, a recovered shard's
+            ``init_collective`` can dispatch onto the orphaned follower
+            (still in some out-of-band registry) and surface as a stale
+            ``ActorDiedError`` on the next refit. ray.kill is
+            idempotent against already-dead actors, so this is safe to
+            run on the leader-died-before-followers-spawned case too.
+            """
+            from ray.util.placement_group import remove_placement_group
+
+            if spawned_actors:
+                for actor in spawned_actors:
+                    try:
+                        ray.kill(actor, no_restart=True)
+                    except Exception:  # noqa: BLE001
+                        # Already dead / in-flight kill — fine.
+                        pass
+            try:
+                remove_placement_group(pg)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            spawned = self.worker_group.spawn_workers_for_shard(
+                placement_group=pg,
+                bundle_indices=(0, bundle_indices_per_worker),
+                dp_shard_idx=dp_shard_idx,
+            )
+        except Exception:
+            # Spawn failure (rare — usually only on transient ray
+            # gcs/dashboard issues, since the actors' __init__ runs
+            # async). No actors to kill yet; just release the PG so
+            # the autoscaler can reschedule.
+            _cleanup_partial_spawn(spawned_actors=None)
+            raise
+
+        # Leader is always first in the spawned list (local_rank=0).
+        leader_actor = spawned[0][0]
+        # Pre-collected for the cleanup path: every spawned actor
+        # handle, leader-first. Followers are spawned by
+        # ``spawn_workers_for_shard`` on local_rank>=1 in the same TP
+        # group; they live alongside the leader on the same PG and must
+        # be ray.kill'd alongside it on Phase A failure.
+        all_spawned_actors = [tup[0] for tup in spawned]
+
+        # Phase A — drive setup methods on the LEADER handle directly.
+        # These block until the leader's ``__init__`` completes; the actors
+        # are NOT yet in ``worker_group._workers``, so dispatcher methods
+        # (``init_collective``, ``generate``) skip them and the gate stays
+        # DOWN — train continues refitting at the smaller world.
+        cached = getattr(self, "_cached_state_dict_info", None)
+        if cached is not None:
+            prepare_method_name = (
+                "prepare_refit_info_async"
+                if self.cfg["vllm_cfg"]["async_engine"]
+                else "prepare_refit_info"
+            )
+            try:
+                # ``getattr(leader, name).remote(...)`` is the bare-handle
+                # equivalent of ``run_single_worker_single_data`` —
+                # serializes behind the leader's __init__, so this waits
+                # for vLLM to finish loading.
+                prepare_future = getattr(leader_actor, prepare_method_name).remote(
+                    cached
+                )
+                ray.get(prepare_future)
+            except Exception:
+                # __init__ failed (CUDA wait timeout, OOM, etc).
+                # ray.kill all spawned actors (leader + followers) so
+                # the followers don't end up orphaned on the PG, then
+                # release the PG.
+                _cleanup_partial_spawn(spawned_actors=all_spawned_actors)
+                raise
+        else:
+            print(
+                "[vllm_generation.add_dp_worker] WARNING: "
+                "_cached_state_dict_info is None — new shard's "
+                "Worker.state_dict_info will be unset; the next refit "
+                "will raise AttributeError. Ensure prepare_refit_info "
+                "ran on the initial cohort before add_dp_worker.",
+                flush=True,
+            )
+
+        # Pre-warm NCCL library state in the leader's engine_core process.
+        # The cross-cluster ``model_update_group`` is the FIRST NCCL
+        # collective the engine_core ever sees. NCCL's per-process lazy init
+        # (dlopen, IB device probe, cuMemMap) runs on that first call and
+        # adds 15-20s to the first ``init_collective`` after this shard
+        # joins — surfacing as a step-time spike. Calling
+        # ``warmup_nccl_library`` here on the leader (still outside
+        # ``worker_group``, so dispatcher methods don't see it yet) primes
+        # the library state during Phase A, before Phase B raises the
+        # refit gate. Cost: ~1-2s, fully hidden by the existing vLLM init.
+        warmup_method_name = (
+            "warmup_nccl_library_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "warmup_nccl_library"
+        )
+        try:
+            warmup_future = getattr(leader_actor, warmup_method_name).remote()
+            ray.get(warmup_future)
+        except Exception as _e:  # noqa: BLE001 - non-fatal optimization
+            print(
+                f"[vllm_generation.add_dp_worker] warmup_nccl_library "
+                f"raised {type(_e).__name__}: {_e} — continuing without "
+                f"pre-warm; first refit will pay full NCCL init cost",
+                flush=True,
+            )
+
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            try:
+                base_url = ray.get(
+                    leader_actor.report_dp_openai_server_base_url.remote()
+                )
+            except Exception:
+                # Leader died before reporting its OpenAI URL (e.g.
+                # vLLM bind failed, port conflict, late OOM). Followers
+                # are still on the PG — kill them all so the next
+                # add_shard gets a clean PG slot.
+                _cleanup_partial_spawn(spawned_actors=all_spawned_actors)
+                raise
+        else:
+            base_url = None
+
+        # Phase B — gate UP, append all spawned actors, rebuild sharding.
+        # ~5-10s total. Only the leader gets recorded in
+        # ``dp_leader_worker_indices``; followers exist in ``_workers`` but
+        # are skipped by the ``run_rank_0_only_axes`` filter on
+        # ``init_collective`` / ``generate``.
+        worker_indices = self.worker_group.append_spawned_shard_workers(
+            spawned=spawned,
+            pre_append_hook=pre_append_hook,
+        )
+
+        # Rebuild sharding_annotations to cover the new TP/PP layout. The
+        # layout has size dp_size * pp * tp; positions correspond to the
+        # ALIVE workers' global indices. Dead indices are zero (compacted
+        # away inside ``spawn_workers_for_shard``), so this layout has no
+        # gaps.
+        new_dp_size = self.worker_group.dp_size
+        total_workers = new_dp_size * self.pp_size * self.tp_size
+        self.sharding_annotations = NamedSharding(
+            layout=np.arange(total_workers).reshape(
+                new_dp_size, self.pp_size, self.tp_size
+            ),
+            names=["data_parallel", "pipeline_parallel", "tensor_parallel"],
+        )
+        self.worker_group.sharding_annotations = self.sharding_annotations
+        self.dp_size = new_dp_size
+
+        if base_url is not None:
+            self.dp_openai_server_base_urls = (
+                self.dp_openai_server_base_urls or []
+            ) + [base_url]
+
+        actor_handles = [tup[0] for tup in spawned]
+        return actor_handles, pg, worker_indices, base_url
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -771,6 +1059,39 @@ class VllmGeneration(GenerationInterface):
 
         # Wait for all futures to complete
         ray.get(futures)
+
+        # RL-412 scale-up: cache so ``add_dp_worker`` can replay this on a
+        # newly-spawned worker. Without this, the new shard joins NCCL
+        # but its ``Worker`` extension never sees state_dict_info → next
+        # refit's ``update_weights_from_collective`` raises AttributeError
+        # on the new worker.
+        self._cached_state_dict_info = state_dict_info
+
+        # Pre-warm NCCL library state on the initial cohort. With TP=PP=EP=1
+        # disagg there is no intra-shard NCCL, so the first
+        # cross-cluster ``init_collective`` would otherwise pay
+        # NCCL's per-process lazy-init cost (~15-20s). Doing it here
+        # — once, off the hot path — means the very first refit lands
+        # on warm NCCL state and finishes in the steady-state ~2-3s
+        # window. See ``vllm_backend.warmup_nccl_library`` for details.
+        warmup_method_name = (
+            "warmup_nccl_library_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "warmup_nccl_library"
+        )
+        try:
+            warmup_futures = self.worker_group.run_all_workers_single_data(
+                warmup_method_name,
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            )
+            ray.get(warmup_futures)
+        except Exception as _e:  # noqa: BLE001 - non-fatal optimization
+            print(
+                f"[vllm_generation.prepare_refit_info] warmup_nccl_library "
+                f"on initial cohort raised {type(_e).__name__}: {_e} — "
+                f"continuing; first refit will pay full NCCL init cost",
+                flush=True,
+            )
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""

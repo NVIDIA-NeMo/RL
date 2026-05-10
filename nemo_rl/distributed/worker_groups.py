@@ -343,6 +343,23 @@ class RayWorkerGroup:
         self.name_prefix = name_prefix
         self.sharding_annotations = sharding_annotations
         self.dp_leader_worker_indices: list[int] = []
+        # RL-412: indices of workers whose actor has been ray.kill'd by the
+        # router on a shard-down. Dispatch methods skip these so the
+        # surviving workers can still serve init_collective / reset_collective
+        # / generate without raising RayActorError on the dead actor.
+        self._dead_indices: set[int] = set()
+        # RL-412 scale-up: stash the worker builder + env vars so add_worker
+        # (router.add_shard path) can spawn a new vLLM DP shard post-init
+        # using the same configuration as the initial cohort.
+        self._remote_worker_builder = remote_worker_builder
+        self._env_vars: dict[str, str] = dict(env_vars)
+        # Monotonic counter for unique actor names on add_worker. NEVER decremented
+        # — even on failed creates, so a retry never collides with a stale Ray
+        # actor namespace entry from the previous failed attempt. Without this,
+        # ``len(self._workers)`` was reused across retries (since failed actors
+        # don't append) and the second create raised ActorAlreadyExistsError on
+        # the same ``vllm_policy-added-3`` name.
+        self._add_worker_seq: int = 0
 
         # If explicit bundle indices are provided, use those
         if bundle_indices_list is None:
@@ -632,6 +649,360 @@ class RayWorkerGroup:
         """Number of data parallel shards."""
         return len(self.dp_leader_worker_indices)
 
+    @property
+    def dead_indices(self) -> set[int]:
+        """Worker indices removed via mark_workers_dead (RL-412)."""
+        return self._dead_indices
+
+    def mark_workers_dead(self, indices: list[int]) -> None:
+        """Drop these worker indices from the dispatch set.
+
+        Called by the router after ``ray.kill`` on a shard's actor so that
+        subsequent ``run_all_workers_*`` calls don't dispatch onto a dead
+        actor. Also shrinks ``dp_leader_worker_indices`` so ``dp_size``
+        reflects the new shard count, which feeds into init_collective's
+        rank computation.
+        """
+        if not indices:
+            return
+        self._dead_indices.update(indices)
+        self.dp_leader_worker_indices = [
+            i for i in self.dp_leader_worker_indices if i not in self._dead_indices
+        ]
+
+    def spawn_worker_only(
+        self,
+        placement_group: PlacementGroup,
+        bundle_indices: Optional[tuple[int, list[int]]] = None,
+        dp_shard_idx: Optional[int] = None,
+        compact_dead_indices: bool = True,
+    ) -> tuple[Any, str, tuple[int, list[int]], int]:
+        """Phase A of add_worker: spawn the actor handle WITHOUT appending.
+
+        Returns ``(actor_handle, name, bundle_indices, dp_shard_idx)``. The
+        actor's ``__init__`` is queued on Ray and runs asynchronously — the
+        caller can drive setup methods (``prepare_refit_info``,
+        ``report_dp_openai_server_base_url``) directly on the handle while
+        ``__init__`` finishes. Until ``append_spawned_worker`` is called,
+        the actor is INVISIBLE to ``run_all_workers_*`` / ``init_collective``
+        / ``generate`` dispatch — so train-side refits can keep flowing
+        at the smaller (pre-fault) world without blocking.
+        """
+        if self._remote_worker_builder is None:
+            raise RuntimeError(
+                "RayWorkerGroup.spawn_worker_only requires remote_worker_builder to "
+                "have been stashed at __init__ time."
+            )
+        # Compact dead indices first so the appended worker lands at a
+        # contiguous slot. Done in this phase so the indices we hand back
+        # are stable for ``append_spawned_worker``.
+        if compact_dead_indices and self._dead_indices:
+            alive_workers: list[ray.actor.ActorHandle] = []
+            alive_metadata: list[dict[str, Any]] = []
+            old_to_new: dict[int, int] = {}
+            for old_idx, worker in enumerate(self._workers):
+                if old_idx in self._dead_indices:
+                    continue
+                old_to_new[old_idx] = len(alive_workers)
+                alive_workers.append(worker)
+                alive_metadata.append(self._worker_metadata[old_idx])
+            self._workers = alive_workers
+            self._worker_metadata = alive_metadata
+            self.dp_leader_worker_indices = [
+                old_to_new[i]
+                for i in self.dp_leader_worker_indices
+                if i in old_to_new
+            ]
+            self._dead_indices = set()
+
+        new_worker_idx = len(self._workers)
+        if dp_shard_idx is None:
+            dp_shard_idx = len(self.dp_leader_worker_indices)
+        if bundle_indices is None:
+            bundle_indices = (new_worker_idx, [0])
+
+        worker_env_vars = deepcopy(self._env_vars)
+        for k, v in os.environ.items():
+            if k not in worker_env_vars:
+                worker_env_vars[k] = v
+        worker_env_vars.update(
+            {
+                "RANK": str(new_worker_idx),
+                "LOCAL_RANK": "0",
+                "WORLD_SIZE": str(new_worker_idx + 1),
+                "MASTER_ADDR": self.master_address,
+                "MASTER_PORT": str(self.master_port),
+                "NODE_RANK": str(bundle_indices[0]),
+            }
+        )
+        for k in (
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+            "RAY_CLIENT_MODE",
+            "RAY_JOB_ID",
+            "RAY_LD_PRELOAD",
+            "RAY_RAYLET_PID",
+            "RAY_USAGE_STATS_ENABLED",
+        ):
+            worker_env_vars.pop(k, None)
+
+        actor_python_env = get_actor_python_env(
+            self._remote_worker_builder.ray_actor_class_fqn
+        )
+        if actor_python_env.startswith("uv"):
+            py_executable = create_local_venv_on_each_node(
+                py_executable=actor_python_env,
+                venv_name=self._remote_worker_builder.ray_actor_class_fqn,
+            )
+        else:
+            py_executable = actor_python_env
+
+        runtime_env = {
+            "env_vars": worker_env_vars,
+            "py_executable": py_executable,
+        }
+        py_venv = os.path.dirname(os.path.dirname(py_executable))
+        runtime_env["env_vars"]["VIRTUAL_ENV"] = py_venv
+        runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_venv
+
+        # Monotonic name (NOT new_worker_idx) so a failed create doesn't
+        # collide with the next attempt.
+        self._add_worker_seq += 1
+        name = f"{self.name_prefix}-added-{self._add_worker_seq}"
+        extra_options = {"runtime_env": runtime_env, "name": name}
+
+        num_gpus = (
+            1 / self.cluster.max_colocated_worker_groups
+            if self.cluster.use_gpus
+            else 0
+        )
+
+        worker = self._remote_worker_builder(
+            placement_group=placement_group,
+            placement_group_bundle_index=0,
+            num_gpus=num_gpus,
+            bundle_indices=bundle_indices,
+            **extra_options,
+        )
+
+        return worker, name, bundle_indices, dp_shard_idx
+
+    def append_spawned_worker(
+        self,
+        worker: Any,
+        name: str,
+        bundle_indices: tuple[int, list[int]],
+        dp_shard_idx: int,
+        pre_append_hook: Optional[Callable[[], None]] = None,
+    ) -> int:
+        """Phase B of add_worker: append a pre-spawned actor.
+
+        After this call, the worker becomes visible to all
+        ``run_all_workers_*`` dispatches and the next ``init_collective``
+        / ``reset_collective`` will include it. ``pre_append_hook`` fires
+        the instant before the append, so the router can flip its
+        ``_nccl_reinit_in_progress`` gate at the precise moment the gen
+        world size is about to change.
+        """
+        if pre_append_hook is not None:
+            pre_append_hook()
+
+        new_worker_idx = len(self._workers)
+        self._workers.append(worker)
+        self._worker_metadata.append(
+            {
+                "node_idx": bundle_indices[0],
+                "local_rank": 0,
+                "global_rank": new_worker_idx,
+                "name": name,
+                "bundle_indices": bundle_indices,
+                "dp_shard_idx": dp_shard_idx,
+            }
+        )
+        self.dp_leader_worker_indices.append(new_worker_idx)
+        return new_worker_idx
+
+    def spawn_workers_for_shard(
+        self,
+        placement_group: PlacementGroup,
+        bundle_indices: tuple[int, list[int]],
+        dp_shard_idx: Optional[int] = None,
+        compact_dead_indices: bool = True,
+    ) -> list[tuple[Any, str, Optional[tuple[int, list[int]]], int, dict[str, Any]]]:
+        """Phase A for TP/PP > 1: spawn one actor per bundle in a tied group.
+
+        Returns a list of ``(actor, name, worker_bundle_indices, dp_shard_idx,
+        metadata_dict)`` tuples — the leader (local_rank=0) is first and is
+        the only entry with ``worker_bundle_indices`` populated. Followers
+        get ``None`` so they skip vLLM model loading (matching the initial
+        cohort's pattern in ``_create_workers_from_bundle_indices``).
+
+        The actors' ``__init__`` runs asynchronously; until
+        ``append_spawned_shard_workers`` runs they are INVISIBLE to dispatch.
+        """
+        if self._remote_worker_builder is None:
+            raise RuntimeError(
+                "RayWorkerGroup.spawn_workers_for_shard requires "
+                "remote_worker_builder to have been stashed at __init__ time."
+            )
+
+        if compact_dead_indices and self._dead_indices:
+            alive_workers: list[ray.actor.ActorHandle] = []
+            alive_metadata: list[dict[str, Any]] = []
+            old_to_new: dict[int, int] = {}
+            for old_idx, worker in enumerate(self._workers):
+                if old_idx in self._dead_indices:
+                    continue
+                old_to_new[old_idx] = len(alive_workers)
+                alive_workers.append(worker)
+                alive_metadata.append(self._worker_metadata[old_idx])
+            self._workers = alive_workers
+            self._worker_metadata = alive_metadata
+            self.dp_leader_worker_indices = [
+                old_to_new[i]
+                for i in self.dp_leader_worker_indices
+                if i in old_to_new
+            ]
+            self._dead_indices = set()
+
+        node_idx, local_bundle_indices = bundle_indices
+        if not local_bundle_indices:
+            raise ValueError(
+                "spawn_workers_for_shard requires at least one bundle index."
+            )
+        n_workers = len(local_bundle_indices)
+        first_new_worker_idx = len(self._workers)
+        if dp_shard_idx is None:
+            dp_shard_idx = len(self.dp_leader_worker_indices)
+
+        actor_python_env = get_actor_python_env(
+            self._remote_worker_builder.ray_actor_class_fqn
+        )
+        if actor_python_env.startswith("uv"):
+            py_executable = create_local_venv_on_each_node(
+                py_executable=actor_python_env,
+                venv_name=self._remote_worker_builder.ray_actor_class_fqn,
+            )
+        else:
+            py_executable = actor_python_env
+        py_venv = os.path.dirname(os.path.dirname(py_executable))
+
+        # Match the initial-cohort env-var shape — RANK is global per actor,
+        # WORLD_SIZE covers the post-append world. vLLM ignores these (it
+        # discovers internal TP via Ray placement-group bundles), but they
+        # are still set for parity with the initial cohort.
+        post_append_world_size = first_new_worker_idx + n_workers
+
+        spawned: list[
+            tuple[Any, str, Optional[tuple[int, list[int]]], int, dict[str, Any]]
+        ] = []
+
+        num_gpus = (
+            1 / self.cluster.max_colocated_worker_groups
+            if self.cluster.use_gpus
+            else 0
+        )
+
+        for local_rank, bundle_idx in enumerate(local_bundle_indices):
+            global_rank = first_new_worker_idx + local_rank
+
+            worker_env_vars = deepcopy(self._env_vars)
+            for k, v in os.environ.items():
+                if k not in worker_env_vars:
+                    worker_env_vars[k] = v
+            worker_env_vars.update(
+                {
+                    "RANK": str(global_rank),
+                    "LOCAL_RANK": str(bundle_idx),
+                    "WORLD_SIZE": str(post_append_world_size),
+                    "MASTER_ADDR": self.master_address,
+                    "MASTER_PORT": str(self.master_port),
+                    "NODE_RANK": str(node_idx),
+                }
+            )
+            for k in (
+                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+                "RAY_CLIENT_MODE",
+                "RAY_JOB_ID",
+                "RAY_LD_PRELOAD",
+                "RAY_RAYLET_PID",
+                "RAY_USAGE_STATS_ENABLED",
+            ):
+                worker_env_vars.pop(k, None)
+
+            runtime_env = {
+                "env_vars": worker_env_vars,
+                "py_executable": py_executable,
+            }
+            runtime_env["env_vars"]["VIRTUAL_ENV"] = py_venv
+            runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_venv
+
+            self._add_worker_seq += 1
+            name = f"{self.name_prefix}-added-{self._add_worker_seq}"
+            extra_options = {"runtime_env": runtime_env, "name": name}
+
+            # Mirror _create_workers_from_bundle_indices: only the leader
+            # (local_rank=0) gets bundle_indices populated. Followers skip
+            # model loading inside vLLM.
+            worker_bundle_indices: Optional[tuple[int, list[int]]] = None
+            if local_rank == 0:
+                worker_bundle_indices = (node_idx, list(local_bundle_indices))
+
+            worker = self._remote_worker_builder(
+                placement_group=placement_group,
+                placement_group_bundle_index=bundle_idx,
+                num_gpus=num_gpus,
+                bundle_indices=worker_bundle_indices,
+                **extra_options,
+            )
+
+            metadata = {
+                "node_idx": node_idx,
+                "local_rank": local_rank,
+                "global_rank": global_rank,
+                "name": name,
+                "bundle_indices": worker_bundle_indices,
+                "dp_shard_idx": dp_shard_idx,
+            }
+            spawned.append(
+                (worker, name, worker_bundle_indices, dp_shard_idx, metadata)
+            )
+
+        return spawned
+
+    def append_spawned_shard_workers(
+        self,
+        spawned: list[
+            tuple[Any, str, Optional[tuple[int, list[int]]], int, dict[str, Any]]
+        ],
+        pre_append_hook: Optional[Callable[[], None]] = None,
+    ) -> list[int]:
+        """Phase B for TP/PP > 1: append all actors of a shard atomically.
+
+        Only the first actor (local_rank=0) is recorded in
+        ``dp_leader_worker_indices`` so dispatch with
+        ``run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"]``
+        targets the leader while followers get skipped. The pre-append hook
+        fires once, just before the first append, so the router's NCCL gate
+        flips at the precise moment the world size is about to change.
+        """
+        if pre_append_hook is not None:
+            pre_append_hook()
+
+        appended_indices: list[int] = []
+        for worker, name, bundle_indices_resolved, dp_shard_idx_resolved, metadata in (
+            spawned
+        ):
+            new_worker_idx = len(self._workers)
+            self._workers.append(worker)
+            # Refresh global_rank in case prior compaction shifted us.
+            metadata = dict(metadata)
+            metadata["global_rank"] = new_worker_idx
+            self._worker_metadata.append(metadata)
+            if metadata["local_rank"] == 0:
+                self.dp_leader_worker_indices.append(new_worker_idx)
+            appended_indices.append(new_worker_idx)
+        return appended_indices
+
     def run_single_worker_single_data(
         self,
         method_name: str,
@@ -735,6 +1106,8 @@ class RayWorkerGroup:
 
         data_idx = 0
         for worker_idx, worker in enumerate(self.workers):
+            if worker_idx in self._dead_indices:
+                continue
             worker_coords = self.sharding_annotations.get_worker_coords(worker_idx)
 
             # Determine if this worker should receive data
@@ -800,6 +1173,8 @@ class RayWorkerGroup:
             run_rank_0_only_axes = []
 
         for worker_idx, worker in enumerate(self.workers):
+            if worker_idx in self._dead_indices:
+                continue
             worker_coords = self.sharding_annotations.get_worker_coords(worker_idx)
 
             # Determine if this worker should receive data

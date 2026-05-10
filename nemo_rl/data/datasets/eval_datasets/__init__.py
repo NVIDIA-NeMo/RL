@@ -16,7 +16,13 @@ from nemo_rl.data.datasets.eval_datasets.aime import AIMEDataset
 from nemo_rl.data.datasets.eval_datasets.gpqa import GPQADataset
 from nemo_rl.data.datasets.eval_datasets.local_math_dataset import LocalMathDataset
 from nemo_rl.data.datasets.eval_datasets.math import MathDataset
-from nemo_rl.data.datasets.eval_datasets.mmau import MMAUDataset
+
+# MMAU pulls in `soundfile`, which isn't shipped in nemo-rl:nightly. Make
+# the import optional so a recipe that doesn't use MMAU still loads.
+try:
+    from nemo_rl.data.datasets.eval_datasets.mmau import MMAUDataset
+except ImportError:
+    MMAUDataset = None  # type: ignore[assignment]
 from nemo_rl.data.datasets.eval_datasets.mmlu import MMLUDataset
 from nemo_rl.data.datasets.eval_datasets.mmlu_pro import MMLUProDataset
 

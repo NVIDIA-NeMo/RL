@@ -21,6 +21,7 @@ import numpy as np
 import ray
 import torch
 from ray.util.queue import Queue as RayQueue
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
@@ -315,6 +316,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         self.cfg = config
 
+        # RL-412 follow-up: cross-cluster weight-sync NCCL group runs in a
+        # sibling Ray actor (RefitWorker) so a gen peer dying mid-broadcast
+        # only poisons that actor's CUDA context, not the train workers'
+        # Megatron NCCL groups. Lazily spawned on first ``init_collective``.
+        self._refit_worker: Optional[Any] = None
+        self._refit_worker_zmq_address: Optional[str] = None
+        self._refit_worker_node_id: Optional[str] = None
+        self._cross_cluster_world_size: Optional[int] = None
+        # Gate the RefitWorker path on backend (megatron only by default —
+        # the DTensor refit pipeline uses a different broadcast hook). The
+        # ``NRL_USE_REFIT_WORKER`` env var lets us toggle off for debugging.
+        self._use_refit_worker: bool = (
+            megatron_enable
+            and os.getenv("NRL_USE_REFIT_WORKER", "1") == "1"
+        )
+
     def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:
         """Run a method on all workers in parallel with the same data.
 
@@ -353,19 +370,211 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         results = ray.get(futures)
         return results
 
+    def _ensure_refit_worker(self, target_node_id: str, gpu_index: int) -> Any:
+        """Ensure a RefitWorker actor is running on ``target_node_id``.
+
+        - If no actor exists, spawn one with hard NodeAffinitySchedulingStrategy.
+        - If one exists but on a different node, ``ray.kill`` it and respawn.
+        - If one exists on the right node and is alive, reuse it.
+        """
+        from nemo_rl.models.policy.workers.refit_worker import RefitWorker
+
+        if self._refit_worker is not None:
+            # If pinned node hasn't changed, just verify liveness with a
+            # short ping. If liveness check raises, fall through to respawn.
+            if self._refit_worker_node_id == target_node_id:
+                try:
+                    ray.get(self._refit_worker.is_alive.remote(), timeout=10)
+                    return self._refit_worker
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"[lm_policy._ensure_refit_worker] existing actor "
+                        f"liveness ping failed ({type(e).__name__}: {e}); "
+                        f"respawning",
+                        flush=True,
+                    )
+            # Wrong node or unhealthy — kill and rebuild.
+            try:
+                ray.kill(self._refit_worker)
+            except Exception:  # noqa: BLE001
+                pass
+            self._refit_worker = None
+            self._refit_worker_zmq_address = None
+            self._refit_worker_node_id = None
+
+        print(
+            f"[lm_policy._ensure_refit_worker] spawning RefitWorker on "
+            f"node_id={target_node_id} gpu_index={gpu_index}",
+            flush=True,
+        )
+        # Pin the actor onto the same physical GPU as train rank 0 by
+        # setting ``CUDA_VISIBLE_DEVICES`` in its runtime env BEFORE the
+        # process imports torch. ``num_gpus=0`` (set in the @ray.remote
+        # decorator) prevents Ray from carving out yet another GPU; the
+        # env var below is what tells the CUDA runtime which physical
+        # device to bind to.
+        self._refit_worker = RefitWorker.options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=target_node_id, soft=False
+            ),
+            runtime_env={
+                "env_vars": {
+                    # Pin to train rank 0's physical GPU.
+                    "CUDA_VISIBLE_DEVICES": str(gpu_index),
+                    # Tell Ray NOT to overwrite CUDA_VISIBLE_DEVICES
+                    # to "" on this num_gpus=0 actor — without this,
+                    # Ray's GPU manager wins and torch sees no GPUs.
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                }
+            },
+        ).remote(gpu_index=gpu_index)
+        # Verify placement landed where we asked. Raises on placement failure.
+        actual_node = ray.get(
+            self._refit_worker.get_node_id.remote(), timeout=60
+        )
+        if actual_node != target_node_id:
+            raise RuntimeError(
+                f"RefitWorker placement landed on {actual_node!r}, expected "
+                f"{target_node_id!r}; hard NodeAffinity should have prevented this"
+            )
+        self._refit_worker_node_id = actual_node
+        # Bring up the ZMQ REP socket and remember its address — the
+        # train-side rank 0 worker will REQ-connect to it during
+        # ``broadcast_weights_for_collective``.
+        self._refit_worker_zmq_address = ray.get(
+            self._refit_worker.start_zmq_server.remote(), timeout=60
+        )
+        print(
+            f"[lm_policy._ensure_refit_worker] RefitWorker ready, "
+            f"zmq={self._refit_worker_zmq_address}",
+            flush=True,
+        )
+        return self._refit_worker
+
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
-        """Initialize the collective communication."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "init_collective",
-            ip=ip,
-            port=port,
-            world_size=world_size,
-            train_world_size=train_world_size,
+        """Initialize the cross-cluster weight-sync collective.
+
+        Under the RefitWorker architecture (default for the Megatron
+        backend), the cross-cluster group is owned by a sibling Ray
+        actor on the same node + same physical GPU as train rank 0.
+        Train workers do not participate. The new world layout is
+        ``1 + gen_world_size`` (RefitWorker + N gen ranks).
+
+        ``world_size`` here is the legacy total (train + gen) preserved
+        for the gen-side caller's signature; we recompute the actual
+        cross-cluster world internally.
+        """
+        if not self._use_refit_worker:
+            # Legacy path: every train rank participates in the
+            # cross-cluster group. Kept for the DTensor backend.
+            futures = self.worker_group.run_all_workers_single_data(
+                "init_collective",
+                ip=ip,
+                port=port,
+                world_size=world_size,
+                train_world_size=train_world_size,
+            )
+            return futures
+
+        # New cross-cluster world is just RefitWorker (rank 0) + gen ranks.
+        gen_world_size = world_size - train_world_size
+        cross_cluster_world = 1 + gen_world_size
+        self._cross_cluster_world_size = cross_cluster_world
+
+        # Locate train rank 0 (Ray node id + physical GPU index) so the
+        # RefitWorker actor lands on the same node and shares its GPU.
+        rank0 = self.worker_group.workers[0]
+        target_node_id = ray.get(rank0.get_node_id.remote(), timeout=30)
+        # ``report_node_ip_and_gpu_id`` returns (ip, gpu_id). The gpu_id
+        # is what Ray's ``get_gpu_ids()`` returned (may be int or str
+        # depending on Ray version) — coerce to int for the env var.
+        rank0_gpu_info = ray.get(
+            rank0.report_node_ip_and_gpu_id.remote(), timeout=30
         )
-        # this function should co-work with vllm, so we should wait for all futures to complete outside
-        return futures
+        gpu_index = int(rank0_gpu_info[1])
+
+        self._ensure_refit_worker(target_node_id=target_node_id, gpu_index=gpu_index)
+
+        # Train workers do NOT participate in the cross-cluster group
+        # under the RefitWorker architecture — skip dispatching the
+        # base ``init_collective`` to them. Their CUDA contexts stay
+        # fully insulated from cross-cluster failures.
+
+        # Return a single future representing the RefitWorker's NCCL
+        # rendezvous with the gen ranks. ``ensure_collective_synced`` on
+        # the caller side will ``ray.wait`` on this together with the
+        # gen-side futures and surface failure.
+        future = self._refit_worker.init_collective.remote(
+            ip, port, cross_cluster_world, 0
+        )
+        return [future]
+
+    def abort_collective(self) -> list[ray.ObjectRef]:
+        """Abort the cross-cluster weight-sync NCCL group.
+
+        Under the RefitWorker architecture, "abort" means ``ray.kill`` the
+        sibling actor — its CUDA context dies with it (along with any
+        queued NCCL/CUDA error from a dead peer), and the next
+        ``init_collective`` spawns a fresh actor on a clean context. We
+        return ``[]`` because there are no per-worker futures to await:
+        the kill is best-effort-immediate.
+
+        Legacy path (DTensor backend): dispatch ``abort_collective`` on
+        every train worker.
+        """
+        if not self._use_refit_worker:
+            return self.worker_group.run_all_workers_single_data("abort_collective")
+
+        if self._refit_worker is not None:
+            print(
+                "[lm_policy.abort_collective] ray.kill RefitWorker (poisoned "
+                "context dies with the process)",
+                flush=True,
+            )
+            stale_handle = self._refit_worker
+            try:
+                ray.kill(stale_handle)
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[lm_policy.abort_collective] ray.kill raised "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
+            # ``ray.kill`` is asynchronous: it requests termination and
+            # returns immediately, but the actor process may still be
+            # winding down (and crucially, still HOLDING its ZMQ
+            # ipc:///tmp/refit-worker-<pid>.sock and its bound TCPStore
+            # port) for a few seconds. If the next ``init_collective``
+            # races ahead and asks Ray to spawn a fresh RefitWorker
+            # before the old one's resources are released, the new
+            # actor's ``start_zmq_server`` can fail to bind (different
+            # PID → different socket path so usually fine) but more
+            # importantly, the NCCL TCPStore's master_address:port comes
+            # from the train cluster (same machine across respawns) and
+            # the dead actor may still be sitting on a half-open NCCL
+            # socket. Probing the actor with a bounded ``is_alive`` ping
+            # confirms the kill propagated; we swallow the expected
+            # RayActorError here.
+            try:
+                ray.get(stale_handle.is_alive.remote(), timeout=10)
+                print(
+                    "[lm_policy.abort_collective] WARNING: stale RefitWorker "
+                    "still responding to is_alive after ray.kill — "
+                    "Ray scheduler hasn't propagated the kill yet",
+                    flush=True,
+                )
+            except Exception:  # noqa: BLE001 — RayActorError on success
+                pass
+            self._refit_worker = None
+            self._refit_worker_zmq_address = None
+            self._refit_worker_node_id = None
+            self._cross_cluster_world_size = None
+
+        # Train workers don't hold a model_update_group under RefitWorker
+        # mode — return [] so the caller's ``ray.wait`` is a no-op.
+        return []
 
     def get_logprobs(
         self,
@@ -919,13 +1128,61 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> list[ray.ObjectRef]:
-        """Broadcast the weights for collective communication."""
-        futures = self.worker_group.run_all_workers_single_data(
+        """Broadcast the weights for collective communication.
+
+        Under the RefitWorker architecture: dispatch the per-rank-0
+        ``stream_weights_to_refit_worker`` method on every worker (only
+        rank 0 actually pushes — see worker-side fast path), and in
+        parallel dispatch the RefitWorker's ``broadcast_weights_until_complete``
+        which receives via ZMQ and forwards to gen ranks via NCCL. The
+        caller (``grpo.refit_policy_generation``) ``ray.get``s these
+        together with the gen-side futures.
+        """
+        if not self._use_refit_worker:
+            futures = self.worker_group.run_all_workers_single_data(
+                "broadcast_weights_for_collective",
+                kv_scales=kv_scales,
+            )
+            return futures
+
+        if self._refit_worker is None or self._refit_worker_zmq_address is None:
+            raise RuntimeError(
+                "broadcast_weights_for_collective called before "
+                "init_collective spawned the RefitWorker"
+            )
+
+        # Pre-flight: make sure the RefitWorker is actually alive BEFORE we
+        # dispatch the train-side senders. Otherwise the senders connect to
+        # a stale ZMQ socket that nobody is reading from and wedge for the
+        # full ZMQ recv timeout (10 min). Cheap ping (sub-ms when healthy);
+        # raises if the actor is dead so the caller can ``abort_collective``
+        # + ``ensure_collective_synced`` again with a fresh actor.
+        try:
+            ray.get(self._refit_worker.is_alive.remote(), timeout=10)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                "RefitWorker liveness ping failed before "
+                f"broadcast_weights_for_collective ({type(e).__name__}: {e}) — "
+                "actor likely died between init_collective and broadcast; "
+                "caller must abort_collective + re-run ensure_collective_synced"
+            ) from e
+
+        # Sender: only rank 0 actually streams; other ranks no-op via the
+        # worker-side fast path (see ``MegatronPolicyWorker.broadcast_weights_for_collective``).
+        # We still dispatch on all workers so any subclass bookkeeping
+        # runs symmetrically and so ``run_all_workers_single_data``'s
+        # contract holds.
+        sender_futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective",
             kv_scales=kv_scales,
+            refit_worker_zmq_address=self._refit_worker_zmq_address,
         )
-        # this function should co-work with vllm, so we should wait for all futures to complete outside
-        return futures
+        # Receiver / forwarder: kick off the RefitWorker's loop. It
+        # returns when the sender posts COMPLETE.
+        receiver_future = self._refit_worker.broadcast_weights_until_complete.remote(
+            kv_scales=kv_scales
+        )
+        return list(sender_futures) + [receiver_future]
 
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""
@@ -974,6 +1231,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
     def shutdown(self) -> bool:
         """Shut down all HF workers and clean up resources."""
+        # Best-effort kill the sibling RefitWorker so its placement group
+        # is freed before we tear down the train worker group.
+        if self._refit_worker is not None:
+            try:
+                ray.kill(self._refit_worker)
+            except Exception as e:  # noqa: BLE001
+                print(f"Error killing RefitWorker during shutdown: {e}")
+            self._refit_worker = None
+            self._refit_worker_zmq_address = None
+            self._refit_worker_node_id = None
         try:
             # Use the worker group's shutdown method with the worker's cleanup method
             return self.worker_group.shutdown(cleanup_method="shutdown")

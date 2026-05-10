@@ -1,0 +1,77 @@
+# Recipe: Qwen3-30B-A3B disaggregated GRPO (Megatron train + vLLM gen) with
+# RL-412 fault-tolerant generation (router + per-shard lifecycle + autoscaler v2).
+#
+# Inherits from grpo-qwen3-30ba3b-4n4g-async-1off.yaml — the SAME recipe used
+# by the canonical wandb run nvidia/nemorl-single-k8s/8b17617t (which runs
+# at TP=1, PP=1, EP=8, vLLM TP=1, alltoall MoE token dispatcher). That is the
+# only Qwen3-30B parallelism layout validated end-to-end on the disagg+async
+# path; switching to TP=2/PP=2/EP=2/SP=true (the colocated 8n4g-megatron
+# layout) cut step-0 reward roughly in half (0.53 → 0.27 mean). FT machinery
+# layers on top of this proven config so we isolate FT vs base behavior.
+#
+# Topology:
+#   - Training cluster: 8 worker pods × 4 GB300 GPUs = 32 GPUs (Megatron
+#     TP=1 PP=1 EP=8 → DP=4). Doubled from 4 nodes / 16 GPUs to halve
+#     the per-step wall time (more DP, smaller per-DP microbatch).
+#   - Generation cluster: 8 vLLM DP shards × TP=1 = 8 GPUs (each shard is
+#     one pod × 1 GPU). Matches gen.resources.num_nodes=8 × gpus_per_node=1.
+#
+# Fault injection lives on the gen-daemon side at
+# infra/examples/generation_standalone_qwen3_30b_ft.yaml. The schedule
+# block here is informational only — the train driver does not read it.
+#
+# Pair with qwen3_30b_if_fault_tolerant_full.gb300.infra.yaml.
+defaults: ../../../examples/configs/recipes/llm/grpo-qwen3-30ba3b-8n4g-megatron.yaml
+
+grpo:
+  # FULL-SCALE config: 32 train GPUs + 8 gen GPUs. Pair with
+  # qwen3_30b_if_fault_tolerant_full.gb300.infra.yaml and
+  # generation_standalone_qwen3_30b_ft_full.yaml. Use the non-_full
+  # variants for the capacity-constrained 32-GPU test.
+  max_num_steps: 150
+  val_period: 30
+  val_at_start: false
+  val_at_end: false
+  val_batch_size: 32
+  max_val_samples: 32
+
+policy:
+  generation:
+    # Disagg HTTP mode — 8 shards × 1 GPU (TP=1) = 8 gen GPUs.
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 8
+        gpus_per_node: 1
+
+checkpointing:
+  enabled: false
+  save_period: 100
+
+logger:
+  log_dir: logs/ft-qwen3-30b-gb300
+  wandb_enabled: true
+  wandb:
+    project: nemorl-rl-412-fault-tolerant
+    name: ft-qwen3-30b-gb300-full-aggressive
+  tensorboard_enabled: true
+  monitor_gpus: true
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
+
+# RL-412 fault injection — the train driver does NOT read this; the
+# authoritative schedule lives in infra/examples/generation_standalone_qwen3_30b_ft.yaml
+# (loaded by the gen daemon). Documented here for visibility only.
+#
+# Currently disabled while we validate the disagg+async TP=2/PP=2/EP=2
+# steady-state path. Re-enable once steady state is green for ≥3 GRPO steps.
+fault_inject:
+  enabled: false
+  mode: pod-kill
+  schedule:
+    - target_shard: dp-0
+      trigger_after_s: 600
+    - target_shard: dp-1
+      trigger_after_s: 1200

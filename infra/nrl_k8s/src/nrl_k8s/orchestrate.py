@@ -117,6 +117,7 @@ def ensure_cluster(
     *,
     log: callable,
     recreate: bool = False,
+    replace: bool = False,
     wait_ready: bool = True,
     ready_timeout_s: int = 900,
 ) -> str:
@@ -124,8 +125,19 @@ def ensure_cluster(
 
     Unlike :func:`bring_up_cluster`, we never silently patch a live cluster.
     If the RayCluster already exists and its spec matches the rendered one
-    we just wait for readiness. If it exists but drifted we log a warning
-    and reuse anyway — pass ``recreate=True`` to delete + re-apply instead.
+    we just wait for readiness. If it exists but drifted, behavior depends
+    on the flags:
+
+    * ``recreate=True``: delete and re-apply (heavy hammer; tears down all
+      pods, loses Ray state).
+    * ``replace=True`` (default for ``nrl-k8s run --replace``): apply the
+      rendered manifest in-place. KubeRay reconciles spec.replicas back
+      to the YAML target without dropping the live pods that still match.
+      Used to undo the autoscaler-v2 dynamic spec.replicas modification
+      that leaves the cluster at fewer pods than the YAML configures
+      (RL-412 demo: prior run reaped a pod, autoscaler patched
+      spec.replicas to 3, the next ``--replace`` should restore it to 4).
+    * Neither: log a drift warning and reuse as-is.
     """
     cluster = _require_cluster(loaded.infra, role)
     manifest = build_raycluster_manifest(cluster, loaded.infra, role=role)
@@ -155,10 +167,18 @@ def ensure_cluster(
             k8s.delete_raycluster(name, namespace)
             k8s.wait_for_raycluster_gone(name, namespace)
             k8s.apply_raycluster(manifest, namespace)
+        elif replace:
+            log(
+                f"[{role}] --replace: RayCluster {name} has drifted "
+                f"(usually spec.replicas mutated by autoscaler); applying "
+                f"rendered manifest in place to restore the YAML target"
+            )
+            k8s.apply_raycluster(manifest, namespace)
         else:
             log(
                 f"[{role}] warning: live RayCluster {name} has drifted from the "
-                f"rendered manifest; reusing as-is (pass --recreate to replace)"
+                f"rendered manifest; reusing as-is (pass --replace to apply or "
+                f"--recreate to delete + re-create)"
             )
     else:
         log(f"[{role}] RayCluster {name} already exists and matches — reusing")
@@ -353,16 +373,35 @@ def submit_daemon(
             )
 
         # Ray refuses to re-use a submissionId even after terminal state, so
-        # --replace picks a fresh suffix and stops the live one if any.
+        # --replace picks a fresh suffix and stops every live submission
+        # matching the daemon's base id. We can't just check the
+        # canonical id — each prior --replace cycle creates a fresh
+        # `<base>-<ts>` variant and they're all independent submissions
+        # in Ray's view. Looking up only the canonical id sees STOPPED
+        # (from the first cycle) and leaks every subsequent run as a
+        # zombie holding the cluster's GPUs.
         submission_id = daemon.submissionId
-        if replace and existing is not None:
-            if existing is JobStatus.RUNNING:
-                log(f"[{role}] --replace: stopping {daemon.submissionId}")
-                try:
-                    client.stop_job(daemon.submissionId)
-                    _wait_job_stopped(client, daemon.submissionId, log=log, role=role)
-                except Exception as exc:  # noqa: BLE001
-                    log(f"[{role}] warning: stop failed: {exc}")
+        if replace and daemon.submissionId:
+            base_id = daemon.submissionId
+            try:
+                all_jobs = client.list_jobs()
+            except Exception as exc:  # noqa: BLE001
+                log(f"[{role}] --replace: list_jobs failed: {exc}")
+                all_jobs = []
+            for j in all_jobs:
+                sid = getattr(j, "submission_id", None)
+                if not sid:
+                    continue
+                if sid != base_id and not sid.startswith(f"{base_id}-"):
+                    continue
+                jstatus = getattr(j, "status", None)
+                if jstatus is JobStatus.RUNNING:
+                    log(f"[{role}] --replace: stopping {sid}")
+                    try:
+                        client.stop_job(sid)
+                        _wait_job_stopped(client, sid, log=log, role=role)
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"[{role}] warning: stop {sid} failed: {exc}")
             if daemon.submissionId:
                 submission_id = _fresh_submission_id(daemon.submissionId)
                 log(f"[{role}] --replace: using fresh submissionId {submission_id}")
@@ -553,7 +592,9 @@ def run(
         if _get_cluster(loaded.infra, role) is None:
             log(f"[{role}] not defined in recipe — skipping")
             continue
-        name = ensure_cluster(role, loaded, log=log, recreate=recreate)
+        name = ensure_cluster(
+            role, loaded, log=log, recreate=recreate, replace=replace
+        )
         if skip_daemons and role != "training":
             log(f"[{role}] --skip-daemons: not submitting daemon")
             continue

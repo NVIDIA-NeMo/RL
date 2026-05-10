@@ -1,0 +1,79 @@
+# Recipe: Qwen3-4B disaggregated GRPO on instruction_following gym, with
+# RL-412 fault-tolerant generation (router + per-shard lifecycle + autoscaler v2).
+#
+# Topology:
+#   - Training cluster: 1 worker pod × 4 GB300 GPUs. Gym runs as a colocated
+#     Ray actor in the training cluster (no separate gym RayCluster needed).
+#   - Generation cluster: 4 vLLM DP shards, each one pod × 1 GPU. Autoscaler
+#     v2 + minReplicas=0 lets the cluster reclaim the GPU when a shard is
+#     killed, and provision a new pod when add_shard requests a fresh PG.
+#
+# Pair with qwen3_4b_if_fault_tolerant.gb300.infra.yaml.
+defaults: ../../../examples/nemo_gym/grpo_qwen3_4b_instruct_k8s_base.yaml
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+grpo:
+  # Bumped from 8×4=32 → 16×8=128 to test the hypothesis that the
+  # KL drift in the IFWU=false experiment was an artifact of high
+  # gradient variance from small batches. Larger batches → smoother
+  # per-step policy updates → smaller per-step KL.
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  # Long-running validation: 100 steps to exercise multiple fault-inject
+  # cycles end-to-end. With trigger_after_s=180 / recover_after_s=120 /
+  # repeat_every_s=60 we expect 5-10 kill+recover cycles, validating
+  # that the lazy-PG-removed + per-worker-eviction path holds across
+  # repeated NCCL re-rendezvous + scale events.
+  max_num_steps: 100
+  val_period: 30
+  # NemoGym's "what you see is what you get" principle disallows
+  # `max_val_samples`. We point DISAGG_VALID_PATH at a 32-prompt subset
+  # (split off from the full 46k jsonl) — see the gen daemon entrypoint
+  # in qwen3_4b_if_fault_tolerant.gb300.infra.yaml.
+  val_batch_size: 32
+  max_rollout_turns: 1
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+policy:
+  # Must equal num_prompts_per_step × num_generations_per_prompt (16×8=128).
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  dtensor_cfg:
+    activation_checkpointing: true
+  generation:
+    # Disagg HTTP mode — gen lives in a separate RayCluster; the train
+    # cluster discovers it via the remote_generation_url override.
+    colocated:
+      enabled: false
+    vllm_cfg:
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      async_engine: true
+checkpointing:
+  # Disabled: FT validation runs are short and we don't want a stale
+  # step_N to silently auto-resume on the next launch and skip the
+  # whole training loop.
+  enabled: false
+  save_period: 100
+logger:
+  wandb_enabled: true
+  wandb:
+    project: nemorl-rl-412-fault-tolerant
+    name: ft-qwen3-4b-gb300-actor-kill
+  tensorboard_enabled: true
+  monitor_gpus: true
+
+# RL-412 fault injection — picked up by examples/run_standalone_generation_server.py
+# via maybe_launch_fault_injector. Set `enabled: false` in overrides to
+# disable the fault and just baseline the router on the hot path.
+fault_inject:
+  enabled: true
+  mode: pod-kill            # http-error | actor-kill | pod-kill
+  target_shard: dp-0
+  trigger_after_s: 360      # ~6 min — past first refit + several rollouts
+  recover_after_s: null     # only meaningful for http-error

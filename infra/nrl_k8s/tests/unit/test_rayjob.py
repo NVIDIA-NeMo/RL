@@ -1,17 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Tests for :mod:`nrl_k8s.rayjob` — RayJob manifest builder."""
 
 from __future__ import annotations
@@ -109,7 +95,9 @@ class TestSpec:
         assert got["spec"]["ttlSecondsAfterFinished"] == 60
 
     def test_ray_cluster_spec_carries_cluster_body(self) -> None:
-        got = build_rayjob_manifest(_make_cluster(), _make_infra(), entrypoint="x")
+        got = build_rayjob_manifest(
+            _make_cluster(), _make_infra(), entrypoint="x"
+        )
         rcs = got["spec"]["rayClusterSpec"]
         head = rcs["headGroupSpec"]["template"]["spec"]["containers"][0]
         worker = rcs["workerGroupSpecs"][0]["template"]["spec"]["containers"][0]
@@ -146,16 +134,16 @@ class TestLabels:
         assert got["metadata"]["labels"]["team"] == "extra"
 
     def test_managed_by_label_always_present(self) -> None:
-        got = build_rayjob_manifest(_make_cluster(), _make_infra(), entrypoint="x")
+        got = build_rayjob_manifest(
+            _make_cluster(), _make_infra(), entrypoint="x"
+        )
         assert got["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "nrl-k8s"
 
 
 class TestImmutability:
     def test_input_spec_not_mutated(self) -> None:
         spec = _base_spec()
-        original_image = spec["headGroupSpec"]["template"]["spec"]["containers"][0][
-            "image"
-        ]
+        original_image = spec["headGroupSpec"]["template"]["spec"]["containers"][0]["image"]
         cluster = _make_cluster(spec=spec)
         build_rayjob_manifest(cluster, _make_infra(), entrypoint="x")
         assert (

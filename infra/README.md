@@ -78,10 +78,10 @@ python examples/nemo_gym/run_grpo_nemo_gym.py +env.disagg_job_id=my-job logger.w
 ```sh
 cd helm
 helmfile -e prod sync
-kubectl apply -f examples/kai-queue.yaml   # adapt queues to your cluster
+kubectl apply -f examples/kai-queue-prod.yaml
 ```
 
-This installs KAI scheduler, KubeRay, and JobSet. The cluster is expected to already have the GPU Operator (or equivalent GPU provisioning) installed. Edit `kai-queue.yaml` to match your cluster's GPU count and queue hierarchy before applying.
+This installs KAI scheduler, KubeRay, and JobSet. The cluster is expected to already have the GPU Operator (or equivalent GPU provisioning) installed.
 
 ## Architecture
 
@@ -179,7 +179,8 @@ infra/
 │   ├── disagg-jobset.yaml            # Disagg RL + Gym via JobSet (no KubeRay)
 │   ├── endpoint-registry-rbac.yaml   # RBAC for ConfigMap service discovery
 │   ├── gym_standalone_config.yaml    # Gym standalone server config
-│   └── kai-queue.yaml                # Example KAI scheduler queues (adapt to your cluster)
+│   ├── kai-queue.yaml                # 2-GPU kind cluster queues
+│   └── kai-queue-prod.yaml           # 288-GPU NVL72 prod queues
 ```
 
 ## Helmfile environments
@@ -229,4 +230,5 @@ KAI distributes GPU resources using hierarchical fair-share with two phases:
 
 ### Example configs
 
-- `kai-queue.yaml` — Example queue hierarchy (root / rl / backfill). Adapt quotas and names to your cluster.
+- `kai-queue.yaml` — 2-GPU kind cluster (high-prio + low-prio)
+- `kai-queue-prod.yaml` — 288-GPU NVL72 production cluster (priority + community departments)

@@ -1,17 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Tests for :mod:`nrl_k8s.submit` — dashboard access + Ray job submission.
 
 ``dashboard_url`` has two branches (in-cluster DNS vs. laptop port-forward)
@@ -49,9 +35,8 @@ class TestIsInCluster:
 
 class TestDashboardUrlInCluster:
     def test_returns_dns_url_without_spawning(self, monkeypatch) -> None:
-        """In-cluster path returns the head-svc DNS URL without spawning.
-
-        Must not touch ``subprocess.Popen``.
+        """In-cluster path returns the head-svc DNS URL and must not touch
+        ``subprocess.Popen``.
         """
         monkeypatch.setattr(submit, "is_in_cluster", lambda: True)
 
@@ -107,9 +92,8 @@ class TestDashboardUrlLaptop:
 
 class TestTailJobLogs:
     def test_bridges_async_iterator_to_generator(self, monkeypatch) -> None:
-        """``tail_job_logs`` bridges the async Ray iterator to a sync generator.
-
-        Must yield each line then stop cleanly when the iterator is exhausted.
+        """``tail_job_logs`` must yield each line produced by the async Ray
+        iterator, then stop cleanly when the iterator is exhausted.
         """
         fake_lines = ["line one\n", "line two\n", "done\n"]
 

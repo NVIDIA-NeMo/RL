@@ -1,17 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Tests for :mod:`nrl_k8s.orchestrate` — the bring-up / submit pipeline.
 
 Every external system is stubbed: no Kubernetes API, no Ray dashboard, no
@@ -47,7 +33,7 @@ def _infra_payload(
         "namespace": "ns-a",
         "image": "img:1",
         "launch": {"entrypoint": training_entrypoint},
-        "kuberay": {
+        "clusters": {
             "training": {
                 "name": "rc-train",
                 "spec": {
@@ -59,7 +45,7 @@ def _infra_payload(
         },
     }
     if gym_entrypoint is not None:
-        base["kuberay"]["gym"] = {
+        base["clusters"]["gym"] = {
             "name": "rc-gym",
             "spec": {
                 "headGroupSpec": {
@@ -295,7 +281,7 @@ class TestEnsureCluster:
         log_fn, lines = log
         loaded = _loaded()
         rendered = orchestrate.build_raycluster_manifest(
-            loaded.infra.kuberay.training, loaded.infra
+            loaded.infra.clusters.training, loaded.infra
         )
         live = {
             "metadata": {
@@ -325,7 +311,7 @@ class TestEnsureCluster:
         loaded = _loaded()
         # Start from the rendered spec, mutate one field to simulate drift.
         rendered = orchestrate.build_raycluster_manifest(
-            loaded.infra.kuberay.training, loaded.infra
+            loaded.infra.clusters.training, loaded.infra
         )
         drifted = {"metadata": {"name": "rc-train"}, "spec": dict(rendered["spec"])}
         drifted["spec"]["rayVersion"] = "drifted"
@@ -348,7 +334,7 @@ class TestEnsureCluster:
         log_fn, lines = log
         loaded = _loaded()
         rendered = orchestrate.build_raycluster_manifest(
-            loaded.infra.kuberay.training, loaded.infra
+            loaded.infra.clusters.training, loaded.infra
         )
         drifted = {"metadata": {"name": "rc-train"}, "spec": dict(rendered["spec"])}
         drifted["spec"]["rayVersion"] = "drifted"
@@ -363,7 +349,9 @@ class TestEnsureCluster:
         monkeypatch.setattr(orchestrate.k8s, "wait_for_raycluster_gone", gone)
         monkeypatch.setattr(orchestrate.k8s, "wait_for_raycluster_ready", MagicMock())
 
-        orchestrate.ensure_cluster("training", loaded, log=log_fn, recreate=True)
+        orchestrate.ensure_cluster(
+            "training", loaded, log=log_fn, recreate=True
+        )
 
         delete.assert_called_once_with("rc-train", "ns-a")
         gone.assert_called_once()
@@ -409,7 +397,9 @@ class TestRun:
         monkeypatch.setattr(orchestrate, "submit_daemon", MagicMock())
         monkeypatch.setattr(orchestrate, "submit_training", MagicMock())
 
-        orchestrate.run(loaded, log=log_fn, repo_root=Path("/tmp"), recreate=True)
+        orchestrate.run(
+            loaded, log=log_fn, repo_root=Path("/tmp"), recreate=True
+        )
 
         assert ensure.call_args.kwargs["recreate"] is True
 

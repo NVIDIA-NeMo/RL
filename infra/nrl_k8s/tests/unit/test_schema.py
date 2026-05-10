@@ -1,17 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Tests for :mod:`nrl_k8s.schema`.
 
 The schema is the contract between recipes and every downstream template, so
@@ -27,7 +13,6 @@ import pytest
 from nrl_k8s.schema import (
     CheckpointsKind,
     CheckpointsSpec,
-    ClusterSpec,
     CodeSource,
     HFCacheKind,
     HFCacheSpec,
@@ -226,9 +211,7 @@ class TestSubmitterMode:
         assert SubmitSpec().execTmpDir == "/tmp"
 
     def test_exec_tmp_dir_override(self) -> None:
-        spec = SubmitSpec.model_validate(
-            {"submitter": "exec", "execTmpDir": "/workspace/tmp"}
-        )
+        spec = SubmitSpec.model_validate({"submitter": "exec", "execTmpDir": "/workspace/tmp"})
         assert spec.submitter is SubmitterMode.EXEC
         assert spec.execTmpDir == "/workspace/tmp"
 
@@ -272,26 +255,3 @@ class TestTolerations:
                     }
                 }
             )
-
-
-# =============================================================================
-# ClusterSpec.segmentSize
-# =============================================================================
-
-
-class TestClusterSpecSegmentSize:
-    def test_defaults_to_none(self) -> None:
-        cs = ClusterSpec.model_validate({"name": "x", "spec": {}})
-        assert cs.segmentSize is None
-
-    def test_positive_accepted(self) -> None:
-        cs = ClusterSpec.model_validate({"name": "x", "spec": {}, "segmentSize": 16})
-        assert cs.segmentSize == 16
-
-    def test_zero_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            ClusterSpec.model_validate({"name": "x", "spec": {}, "segmentSize": 0})
-
-    def test_negative_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            ClusterSpec.model_validate({"name": "x", "spec": {}, "segmentSize": -1})

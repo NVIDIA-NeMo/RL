@@ -34,15 +34,82 @@ class AbstractPolicyWorker:
             ip: IP address for the process group
             port: Port for the process group
             world_size: Total world size (train_world_size + inference_world_size)
-            train_world_size: Number of training workers (used in inference cluster)
+            train_world_size: Number of training workers participating in the
+                cross-cluster process group.
+
+        NOTE: under the RefitWorker architecture (RL-412 follow-up) the
+        cross-cluster group is owned by a sibling ``RefitWorker`` actor
+        on the same node as train rank 0 — train workers do NOT
+        participate. ``Policy.init_collective`` skips dispatching to
+        train workers in that mode, so this method's body only runs on
+        the legacy DTensor path (or with ``NRL_USE_REFIT_WORKER=0``).
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
+
+        # Idempotent re-init: tear down any prior group (e.g. world size
+        # shrunk after a fault). Order matters:
+        #   1) ``destroy()`` first — NCCL's abort marks pending kernels
+        #      cancelled without waiting; sync'ing first would block on
+        #      ops that NCCL has noticed cannot make progress (their
+        #      peer is gone) and surface ``cudaErrorLaunchFailure`` into
+        #      the CUDA context.
+        #   2) ``cuda.synchronize()`` second, in try/except, to drain and
+        #      swallow the queued async error.
+        #   3) ``cuda.empty_cache()`` third, also try/except'd.
+        old = getattr(self, "model_update_group", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[policy_worker] warning: old model_update_group destroy raised {e}",
+                    flush=True,
+                )
+            try:
+                torch.cuda.synchronize()
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[policy_worker] post-destroy synchronize swallowed: {type(e).__name__}: {e}",
+                    flush=True,
+                )
+            try:
+                torch.cuda.empty_cache()
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[policy_worker] post-destroy empty_cache swallowed: {type(e).__name__}: {e}",
+                    flush=True,
+                )
 
         self.model_update_group = StatelessProcessGroup(
             master_address=ip, port=port, rank=self.rank, world_size=world_size
         )
         device = torch.cuda.current_device()
         self.model_update_group.init_nccl_communicator(device=device)
+
+    def abort_collective(self) -> None:
+        """Abort the cross-cluster weight-sync NCCL group on this worker.
+
+        Legacy path only — under the RefitWorker architecture the
+        cross-cluster group lives in a sibling actor and is torn down
+        via ``ray.kill`` from ``Policy.abort_collective``.
+        """
+        old = getattr(self, "model_update_group", None)
+        if old is None:
+            return
+        cuda_poisoned: Optional[BaseException] = None
+        try:
+            old.destroy()
+        except Exception as e:  # noqa: BLE001
+            cuda_poisoned = e
+            rank = getattr(self, "rank", "?")
+            print(
+                f"[policy_worker.abort_collective] rank={rank} group destroy "
+                f"surfaced {type(e).__name__}: {e}",
+                flush=True,
+            )
+        self.model_update_group = None  # type: ignore[assignment]
+        if cuda_poisoned is not None:
+            raise cuda_poisoned
 
     def is_alive(self) -> bool:
         """Check if the worker is alive."""
@@ -120,6 +187,16 @@ class AbstractPolicyWorker:
         ip = ray._private.services.get_node_ip_address()
         gpu_id = ray.get_gpu_ids()[0]
         return (ip, gpu_id)
+
+    def get_node_id(self) -> str:
+        """Return the Ray node id this worker is running on.
+
+        Used by ``Policy._ensure_refit_worker`` to colocate the
+        cross-cluster ``RefitWorker`` actor on the same node as
+        train rank 0 — chunks then transit via Ray-internal shared
+        memory (zero-copy) instead of over the network.
+        """
+        return ray.get_runtime_context().get_node_id()
 
     # Temporary fix, 'data' is a kwarg due to some sort of ray bug
     @wrap_with_nvtx_name("policy_worker/get_reference_policy_logprobs")

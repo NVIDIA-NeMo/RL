@@ -212,7 +212,55 @@ The validation set you pass in will directly be used for validation with no addi
         base_urls=policy_generation.dp_openai_server_base_urls,
         initial_global_config_dict=config["env"]["nemo_gym"],
     )
-    nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
+    # Support disaggregated Gym: connect to a remote Gym service instead of spawning local subprocesses.
+    # Two modes: (1) static URL via env.remote_gym_url, or (2) K8s endpoint registry via env.disagg_job_id.
+    remote_gym_url = config["env"].get("remote_gym_url")
+    disagg_job_id = config["env"].get("disagg_job_id")
+    if disagg_job_id:
+        import json
+
+        from nemo_rl.distributed.k8s_endpoint_registry import K8sEndpointRegistry
+
+        registry = K8sEndpointRegistry(job_id=disagg_job_id)
+        registry.create(owner_raycluster_name=os.environ.get("RAY_CLUSTER_NAME"))
+
+        # Publish vLLM URLs so the Gym cluster can discover them.
+        vllm_urls = [u for u in policy_generation.dp_openai_server_base_urls if u]
+        registry.set("vllm_base_urls", json.dumps(vllm_urls))
+
+        # Wait for the Gym cluster to register its head server address.
+        print("Waiting for Gym head server to register in endpoint registry...")
+        try:
+            remote_gym_url = registry.get("gym_head_server")
+        except TimeoutError as e:
+            raise TimeoutError(
+                f"Timed out waiting for the Gym cluster to register its head server. "
+                f"Ensure the Gym RayCluster is running and the standalone_gym_server "
+                f"has started with --job-id={disagg_job_id}. Original error: {e}"
+            ) from e
+        print(f"Discovered remote Gym service at: {remote_gym_url}")
+    if remote_gym_url:
+        nemo_gym_config["remote_gym_url"] = remote_gym_url
+        print(f"Using remote Gym service at: {remote_gym_url}")
+    # Schedule NemoGym on a worker node (not the head) to avoid head OOM.
+    # Find a non-head Ray node and use NodeAffinitySchedulingStrategy.
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    head_node_id = ray.get_runtime_context().get_node_id()
+    worker_nodes = [
+        n for n in ray.nodes() if n["Alive"] and n["NodeID"] != head_node_id
+    ]
+    gym_scheduling = {}
+    if worker_nodes:
+        gym_scheduling["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+            node_id=worker_nodes[0]["NodeID"], soft=False
+        )
+        print(
+            f"Scheduling NemoGym on worker node {worker_nodes[0]['NodeManagerAddress']}"
+        )
+    nemo_gym = create_env(
+        env_name="nemo_gym", env_config=nemo_gym_config, num_cpus=4, **gym_scheduling
+    )
     # Blocking wait for NeMo-Gym to spin up
     ray.get(nemo_gym.health_check.remote())
 

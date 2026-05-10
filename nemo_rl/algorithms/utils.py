@@ -474,11 +474,28 @@ def print_performance_metrics(
     # Generate Token Imbalance Visualization
     # =====================================================
     def visualize_per_worker_load(per_worker_token_counts: dict[int, int]) -> float:
+        # In disagg+router mode the train side never sees per-shard
+        # gen_leader_worker_idx (router proxies away that detail), so
+        # the dict can be empty. Skip the histogram instead of dividing
+        # by zero.
+        if not per_worker_token_counts:
+            print(
+                "  • Skipping Token Imbalance per Generation Worker "
+                "(no per-worker counts — disagg/router mode)"
+            )
+            return 0.0
         per_worker_token_counts_list = [
             v for k, v in sorted(per_worker_token_counts.items())
         ]
+        max_count = max(per_worker_token_counts_list)
+        if max_count == 0:
+            print(
+                "  • Skipping Token Imbalance per Generation Worker "
+                "(all per-worker counts are zero)"
+            )
+            return 0.0
         per_worker_load_ratio = [
-            v / max(per_worker_token_counts_list) for v in per_worker_token_counts_list
+            v / max_count for v in per_worker_token_counts_list
         ]
         max_rows_to_print = 1000
         bar_length = 20
@@ -564,8 +581,8 @@ def print_performance_metrics(
         print(
             f"    - Timeline (0: {zero_marker}, {', '.join(f'{1.0 if k == 0 else k * (max_value / len(marker))}-{(k + 1) * (max_value / len(marker))}: {marker[k]}' for k in marker.keys())}):"
         )
-        for dp_idx, metric_values in metric_dict.items():
-            if dp_idx > max_rows_to_print:
+        for row_idx, (dp_idx, metric_values) in enumerate(metric_dict.items()):
+            if row_idx > max_rows_to_print:
                 break
             timeline = []
             length = len(metric_values)
@@ -589,10 +606,10 @@ def print_performance_metrics(
                 timeline.append(m)
             if timeline_interval is not None:
                 print(
-                    f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)} (Active: {active:.2f} s, Idle: {idle:.2f} s)"
+                    f"    - Generation Worker {str(dp_idx):>3}: {''.join(timeline)} (Active: {active:.2f} s, Idle: {idle:.2f} s)"
                 )
             else:
-                print(f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)}")
+                print(f"    - Generation Worker {str(dp_idx):>3}: {''.join(timeline)}")
 
     is_vllm_metrics_logger_enabled = master_config["policy"]["generation"].get(
         "vllm_cfg", {}
@@ -849,3 +866,67 @@ def log_generation_metrics_to_wandb(
             name=generation_metric,
             timeline_interval=timeline_interval,
         )
+
+
+def flatten_router_metrics_for_wandb(
+    router_metrics: dict[str, Any],
+    *,
+    prev_fault_ts: Optional[float] = None,
+) -> tuple[dict[str, float], Optional[float]]:
+    """Flatten the router_metrics blob from get_step_metrics_snapshot() into
+    scalar wandb fields under the ``gen/`` prefix.
+
+    Returns ``(flat_metrics, latest_fault_ts)``. The caller persists
+    ``latest_fault_ts`` across steps and passes it back as ``prev_fault_ts``
+    on the next call so we can mark a single step (the one that crossed the
+    fault boundary) with ``gen/fault_event_this_step = 1``. All other steps
+    log 0 — wandb's time-series chart can then drop a vertical line on the
+    transition.
+
+    Empty input → empty output (co-located mode has no router).
+    """
+    if not router_metrics:
+        return {}, prev_fault_ts
+
+    flat: dict[str, float] = {}
+    for key in (
+        "num_ready_shards",
+        "num_joining_shards",
+        "num_cordoned_shards",
+        "num_draining_shards",
+        "num_total_shards",
+        "total_shards_at_bootstrap",
+        "cumulative_shards_removed",
+        "cumulative_shards_added",
+        "current_gen_world_size",
+    ):
+        if key in router_metrics:
+            flat[key] = float(router_metrics[key])
+    flat["nccl_reinit_in_progress"] = float(
+        bool(router_metrics.get("nccl_reinit_in_progress", False))
+    )
+
+    # Per-shard staleness — log the worst (longest age) so wandb sees the
+    # canary metric. Skip silently if no per_shard breakdown is provided
+    # (older gen daemons).
+    per_shard = router_metrics.get("per_shard") or []
+    ages = [
+        s["last_health_ok_age_s"]
+        for s in per_shard
+        if s.get("last_health_ok_age_s") is not None
+    ]
+    if ages:
+        flat["max_last_health_ok_age_s"] = float(max(ages))
+
+    # Fault marker: 1 on the single step that crossed the latest fault
+    # event (compared to the prior step's snapshot of the timestamp).
+    fault = router_metrics.get("last_fault_event")
+    latest_fault_ts: Optional[float] = (
+        float(fault["monotonic_ts"]) if fault and "monotonic_ts" in fault else None
+    )
+    crossed_fault = (
+        latest_fault_ts is not None and latest_fault_ts != prev_fault_ts
+    )
+    flat["fault_event_this_step"] = 1.0 if crossed_fault else 0.0
+
+    return flat, latest_fault_ts

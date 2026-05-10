@@ -1,17 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Tests for :mod:`nrl_k8s.inspect` — read-only introspection of clusters."""
 
 from __future__ import annotations
@@ -103,9 +89,8 @@ def _patch_dashboard(monkeypatch):
 
 class TestLatestDaemonJob:
     def test_prefers_most_recent_suffixed(self, monkeypatch) -> None:
-        """When both the base id and a suffixed variant exist, pick the most recent.
-
-        Selection is based on start_time.
+        """When both the base id and a suffixed variant exist, pick the
+        most recent by start_time.
         """
         _patch_dashboard(monkeypatch)
 
@@ -141,10 +126,8 @@ class TestLatestDaemonJob:
         assert status is None
 
     def test_any_error_returns_base_and_none(self, monkeypatch) -> None:
-        """Dashboard failures must not crash ``status``.
-
-        We fall back to an 'unknown' row so the CLI can keep rendering
-        the other clusters.
+        """Dashboard failures must not crash ``status`` — we fall back to a
+        'unknown' row so the CLI can keep rendering the other clusters.
         """
 
         @contextlib.contextmanager

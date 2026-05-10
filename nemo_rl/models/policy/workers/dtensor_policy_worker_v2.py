@@ -1076,13 +1076,34 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     def move_to_cuda(self, model: torch.nn.Module) -> torch.nn.Module:
         model = self.move_to_device(model, "cuda")
         gc.collect()
-        torch.cuda.empty_cache()
+        # RL-412: drain queued async CUDA errors here. When a fault hits
+        # mid-step (a vLLM gen worker dies and our cross-cluster NCCL
+        # comm has pending broadcasts to it), the error surfaces on the
+        # FIRST subsequent CUDA op — typically empty_cache. We swallow it
+        # so the next refit's ensure_collective_synced rebuilds the comm
+        # at the new world size; without this, the error short-circuits
+        # the whole training loop before we ever get a chance to refit.
+        try:
+            torch.cuda.empty_cache()
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[policy_worker.move_to_cuda] empty_cache swallowed: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
         return model
 
     def move_to_cpu(self, model: torch.nn.Module) -> torch.nn.Module:
         model = self.move_to_device(model, "cpu")
         gc.collect()
-        torch.cuda.empty_cache()
+        try:
+            torch.cuda.empty_cache()
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[policy_worker.move_to_cpu] empty_cache swallowed: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
         return model
 
     def save_checkpoint(

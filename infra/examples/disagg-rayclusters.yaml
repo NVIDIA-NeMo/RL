@@ -49,7 +49,7 @@ kind: RayCluster
 metadata:
   name: raycluster-rl
   labels:
-    kai.scheduler/queue: rl     # KAI fairshare queue
+    kai.scheduler/queue: high-prio     # KAI fairshare queue
 spec:
   rayVersion: "2.52.0"
   headGroupSpec:
@@ -196,7 +196,7 @@ kind: RayCluster
 metadata:
   name: raycluster-gym
   labels:
-    kai.scheduler/queue: rl
+    kai.scheduler/queue: high-prio
 spec:
   rayVersion: "2.52.0"
   headGroupSpec:

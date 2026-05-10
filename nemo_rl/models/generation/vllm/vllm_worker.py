@@ -16,12 +16,50 @@ import copy
 import gc
 import os
 import sys
+import time
 from importlib.util import find_spec
 from typing import Any, Optional, cast
 
 import ray
 import torch
 from transformers import AutoConfig
+
+
+def _wait_for_cuda(timeout_s: float = 30.0, interval_s: float = 2.0) -> None:
+    """Block until CUDA is initializable on this process, or timeout.
+
+    Handles the kubelet-vs-Ray race where an autoscaler-provisioned pod
+    becomes Ready (and Ray schedules an actor onto it) before the NVIDIA
+    device-plugin + DRA channel claims have wired ``/dev/nvidia*`` into
+    the container. Without this guard the actor crashes immediately on
+    ``torch.cuda.get_device_capability()`` with
+    ``RuntimeError: No CUDA GPUs are available`` and takes the daemon
+    down with it.
+
+    Polls ``torch.cuda.is_available()`` with backoff until at least one
+    device is visible. Raises ``RuntimeError`` after ``timeout_s`` if the
+    pod genuinely has no GPU (e.g. misscheduled).
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                # Touch the device once so any lazy CUDA-context errors
+                # surface here (cleanly, with a real traceback) rather
+                # than in random user code further down.
+                _ = torch.cuda.get_device_capability()
+                return
+        except Exception:  # noqa: BLE001 — torch raises various subtypes
+            pass
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"vLLM worker found no CUDA GPUs on this pod after "
+                f"{timeout_s:.0f}s of waiting. Either the pod was "
+                "misscheduled (host has no GPU), the NVIDIA "
+                "device-plugin failed to wire /dev/nvidia*, or the "
+                "DRA compute-domain claim never bound."
+            )
+        time.sleep(interval_s)
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
@@ -134,6 +172,21 @@ class BaseVllmGenerationWorker:
             extra_env_vars: Additional environment variable names to forward into
                           the vLLM worker subprocess (e.g. for quantization configs).
         """
+        # When the gen RayCluster scales up from minReplicas=0, an autoscaler-
+        # provisioned pod can become "Ready" (and so visible to Ray scheduling)
+        # *before* the NVIDIA device-plugin + DRA channel claims have wired
+        # /dev/nvidia* into the container. The actor lands here and
+        # `torch.cuda.is_available()` returns False — which then crashes the
+        # daemon and the entire run. Wait for CUDA to wire in before giving up.
+        # 60s — DRA + NVIDIA device plugin should wire /dev/nvidia* in
+        # well under a minute on a healthy node. Hitting this timeout
+        # means the pod is broken (DRA driver hung, device plugin race,
+        # hardware issue). Fail fast and let the failure cascade: the
+        # actor dies → vllm_generation.add_dp_worker releases the PG
+        # → router.add_shard catches and returns ``added=False``,
+        # leaving world_size at its pre-add value → training continues.
+        # No retry, no waiting on a node that won't recover.
+        _wait_for_cuda(timeout_s=60, interval_s=2)
         self.cfg = config
         self.model_name = self.cfg["model_name"]
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
@@ -690,6 +743,9 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                 train_world_size,
             ),
         )
+
+    def reset_collective(self) -> None:
+        self.llm.collective_rpc("reset_collective")
 
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(

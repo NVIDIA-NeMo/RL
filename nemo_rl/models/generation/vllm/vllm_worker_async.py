@@ -506,8 +506,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
             # The request sampling params need to exactly match those as are set in NeMo RL.
             # If they do not match, the inference will be off policy and destroy training stability.
-            assert request.temperature == generation_config["temperature"]
-            assert request.top_p == generation_config["top_p"]
+            # When params are None (not sent by client), use the generation config defaults.
+            if request.temperature is None:
+                request.temperature = generation_config["temperature"]
+            if request.top_p is None:
+                request.top_p = generation_config["top_p"]
+            assert request.temperature == generation_config["temperature"], (
+                f"temperature mismatch: request={request.temperature}, config={generation_config['temperature']}"
+            )
+            assert request.top_p == generation_config["top_p"], (
+                f"top_p mismatch: request={request.top_p}, config={generation_config['top_p']}"
+            )
 
             generator = await openai_serving_chat.create_chat_completion(
                 request, raw_request
@@ -568,6 +577,41 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
             elif isinstance(generator, TokenizeResponse):
                 return JSONResponse(content=generator.model_dump())
+
+        ########################################
+        # /v1/completions endpoint (for disaggregated direct-to-shard generation)
+        ########################################
+        from vllm.entrypoints.openai.completion.protocol import (
+            CompletionRequest,
+            CompletionResponse,
+        )
+        from vllm.entrypoints.openai.completion.serving import (
+            OpenAIServingCompletion,
+        )
+
+        openai_serving_completion = OpenAIServingCompletion(
+            engine_client=engine_client,
+            models=openai_serving_models,
+            request_logger=None,
+            return_tokens_as_token_ids=True,
+        )
+
+        @app.post("/v1/completions")
+        async def create_completion(
+            request: CompletionRequest, raw_request: Request
+        ):
+            generator = await openai_serving_completion.create_completion(
+                request, raw_request
+            )
+
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(
+                    content=generator.model_dump(), status_code=generator.error.code
+                )
+            elif isinstance(generator, CompletionResponse):
+                return JSONResponse(content=generator.model_dump())
+
+            return StreamingResponse(content=generator, media_type="text/event-stream")
 
         ########################################
         # Logging
@@ -668,15 +712,140 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         world_size: int,
         train_world_size: int,
     ) -> None:
-        await self.llm.collective_rpc(
-            "init_collective",
-            args=(
-                rank_prefix,
-                ip,
-                port,
-                world_size,
-                train_world_size,
-            ),
+        # RL-412 TP>1 diagnostic: production runs with
+        # ``distributed_executor_backend="ray"`` (RayDistributedExecutor),
+        # which fans out ``collective_rpc`` to vLLM's per-TP-rank Ray actors.
+        # When one of those TP actors dies during the cross-cluster NCCL
+        # rendezvous, the failure can manifest in two distinct ways:
+        #   1. ``collective_rpc`` raises ``RayActorError`` / ``ActorDiedError``
+        #      and we catch it here — the LEADER actor stays alive and the
+        #      router can force-evict cleanly via ``_evict_failed_workers_inline``.
+        #   2. vLLM's executor's internal watchdog (engine_core_proc_died
+        #      hook) tears down the engine and the leader's process exits —
+        #      Ray reports this as a generic actor death with the misleading
+        #      "killed by ray.kill" message, with no traceback to point at
+        #      the real cause.
+        # Without explicit logging at entry/exit, mode (2) is undebuggable:
+        # the leader is just gone. The print statements below mark the
+        # boundaries so the last-line-before-death pinpoints which phase
+        # the engine died in (rendezvous wait? NCCL handshake? post-init
+        # cleanup?). Cheap (one print per init_collective call), and the
+        # bracketing pair is essential when the inner exception never
+        # propagates out.
+        self._install_death_diagnostics_once()
+        import time as _t
+        import traceback as _tb
+        _t0 = _t.monotonic()
+        print(
+            f"[init_collective_async] enter rank_prefix={rank_prefix} "
+            f"world={world_size} train_ws={train_world_size} "
+            f"master={ip}:{port}",
+            flush=True,
+        )
+        try:
+            await self.llm.collective_rpc(
+                "init_collective",
+                args=(
+                    rank_prefix,
+                    ip,
+                    port,
+                    world_size,
+                    train_world_size,
+                ),
+            )
+        except BaseException as e:  # noqa: BLE001 - log even SystemExit/KeyboardInterrupt before re-raising
+            print(
+                f"[init_collective_async] FAILED rank_prefix={rank_prefix} "
+                f"world={world_size} elapsed={_t.monotonic() - _t0:.2f}s "
+                f"{type(e).__name__}: {e}\n{_tb.format_exc()}",
+                flush=True,
+            )
+            raise
+        print(
+            f"[init_collective_async] success rank_prefix={rank_prefix} "
+            f"world={world_size} elapsed={_t.monotonic() - _t0:.2f}s",
+            flush=True,
+        )
+
+    def _install_death_diagnostics_once(self) -> None:
+        """Install atexit + SIGTERM hooks the first time we touch the
+        collective. Distinguishes graceful Python exit (atexit fires) from
+        SIGTERM (handler prints) from SIGKILL / hard process death (no
+        message — only the bracketing ``[init_collective_async] enter``
+        print survives).
+
+        RL-412 TP>1 forensics: the production failure mode is "leader
+        actor disappears mid-init_collective" with Ray reporting only its
+        misleading "killed by ray.kill" message. The diagnostics here
+        narrow down WHERE the death came from:
+          * ``[leader_atexit] exiting cleanly`` → Python interpreter
+            ran its shutdown sequence (sys.exit / completion). vLLM did
+            NOT os._exit; whatever raised propagated to the Ray actor
+            machinery and Ray decided to terminate the actor.
+          * ``[leader_sigterm] received SIGTERM`` → an external sender
+            (kubelet, autoscaler, vLLM watchdog, parent ray.kill which
+            sends SIGTERM before SIGKILL). The leader was healthy
+            until externally signalled.
+          * Neither message → SIGKILL (kubelet OOM, ray.kill's escalation
+            after SIGTERM grace period, or os._exit from inside vLLM).
+            Bracketing prints in init_collective_async still pinpoint
+            the phase.
+        Idempotent — safe to call on every init_collective_async."""
+        if getattr(self, "_death_diagnostics_installed", False):
+            return
+        self._death_diagnostics_installed = True
+        import atexit
+        import os
+        import signal
+        import sys
+        pid = os.getpid()
+        owner = "leader" if getattr(self, "is_model_owner", False) else "follower"
+
+        def _atexit_log() -> None:
+            sys.stderr.write(
+                f"[{owner}_atexit] pid={pid} exiting via Python interpreter shutdown\n"
+            )
+            sys.stderr.flush()
+
+        atexit.register(_atexit_log)
+
+        def _sigterm_handler(signum, frame):  # noqa: ARG001
+            sys.stderr.write(
+                f"[{owner}_sigterm] pid={pid} received signal={signum}\n"
+            )
+            sys.stderr.flush()
+            # Restore default and re-raise so Python exits with the
+            # standard exit code; atexit will still run.
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(pid, signum)
+
+        try:
+            signal.signal(signal.SIGTERM, _sigterm_handler)
+        except Exception:  # noqa: BLE001 - some Ray contexts forbid signal install
+            pass
+
+    async def reset_collective_async(self) -> None:
+        # Symmetric instrumentation with ``init_collective_async`` so a
+        # leader death during reset_collective (e.g., NCCL abort hangs in
+        # the engine's TP workers) is bracketable in the worker log.
+        import time as _t
+        import traceback as _tb
+        _t0 = _t.monotonic()
+        print("[reset_collective_async] enter", flush=True)
+        try:
+            await self.llm.collective_rpc("reset_collective")
+        except BaseException as e:  # noqa: BLE001
+            print(
+                f"[reset_collective_async] FAILED elapsed="
+                f"{_t.monotonic() - _t0:.2f}s "
+                f"{type(e).__name__}: {e}\n{_tb.format_exc()}",
+                flush=True,
+            )
+            raise
+        print(
+            f"[reset_collective_async] success elapsed="
+            f"{_t.monotonic() - _t0:.2f}s",
+            flush=True,
         )
 
     async def generate_async(
@@ -1039,6 +1208,15 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    async def warmup_nccl_library_async(self) -> Any:
+        """Async dispatch of ``warmup_nccl_library`` into the engine_core.
+
+        Pre-warms NCCL per-process state so the first cross-cluster
+        ``init_collective`` doesn't pay the lazy-init cost. See
+        ``vllm_backend.warmup_nccl_library`` for the rationale.
+        """
+        return await self.llm.collective_rpc("warmup_nccl_library", args=tuple())
+
     async def update_weights_via_ipc_zmq_async(
         self,
     ) -> bool:
@@ -1080,6 +1258,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
     async def update_weights_from_collective_async(self) -> bool:
         """Async version of update_weights_from_collective."""
+        # RL-412 TP>1 diagnostic: bracket the broadcast call so a leader
+        # process death during the cross-cluster receive path is
+        # bracketable in the worker log. Pair with
+        # ``init_collective_async`` enter/exit prints to triangulate
+        # which phase a freshly-added shard's leader died in.
+        import time as _t
+        _t0 = _t.monotonic()
+        print("[update_weights_from_collective_async] enter", flush=True)
         try:
             assert self.llm is not None, (
                 "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
@@ -1103,15 +1289,26 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
             if not worker_result:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {worker_result} "
+                    f"elapsed={_t.monotonic() - _t0:.2f}s",
+                    flush=True,
                 )
                 return False
+            print(
+                f"[update_weights_from_collective_async] success elapsed="
+                f"{_t.monotonic() - _t0:.2f}s",
+                flush=True,
+            )
             return True
         except Exception as e:
-            print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
 
-            traceback.print_exc()
+            print(
+                f"[update_weights_from_collective_async] FAILED elapsed="
+                f"{_t.monotonic() - _t0:.2f}s "
+                f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
+                flush=True,
+            )
             return False
 
     async def reset_prefix_cache_async(self):

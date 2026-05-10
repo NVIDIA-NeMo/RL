@@ -1,0 +1,453 @@
+# RL-412 fault-tolerant generation demo on a GB300 NVL72 EKS cluster.
+#
+# Pair with qwen3_4b_if_fault_tolerant.yaml.
+#
+# Topology:
+#   - training: 1 RayCluster, 1 GPU worker (4 GB300 GPUs). Gym runs as a
+#     colocated Ray actor.
+#   - generation: 1 RayCluster with KubeRay autoscaler v2 + 4 worker groups
+#     (one DP shard per group, 1 pod × 1 GPU). Pre-provisioned at boot;
+#     remove_shard kills the actors + frees the PG, autoscaler reclaims
+#     the pod after idleTimeoutSeconds.
+#
+# Both clusters use NVIDIA's DRA pattern from qwen3_30b_math_4n_4gpu.gb300:
+#   - ComputeDomain channel for MNNVL (cross-pod NVLink fabric).
+#   - RoCE channel for cross-node NCCL networking.
+#   - kai-scheduler topology constraint to land workers in one
+#     gb300-topology clique.
+# Without DRA the cross-cluster init_collective hits Cuda failure 800
+# 'operation not permitted' on the IMEX channel device.
+
+_shared:
+  headNodeSelector: &head_node_selector
+    nodeGroup: customer-cpu
+  workerNodeSelector: &worker_node_selector
+    nvidia.com/gpu.product: NVIDIA-GB300
+
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
+
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                     value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+    # Don't hit huggingface.co — flaky GB300-node egress times out on
+    # tokenizer init / list_repo_tree calls and kills daemon bring-up.
+    - {name: HF_HUB_OFFLINE,                 value: "1"}
+    - {name: TRANSFORMERS_OFFLINE,           value: "1"}
+
+  # Worker NCCL env mirrors qwen3_30b_math_4n_4gpu.gb300.infra.yaml exactly,
+  # which is the proven-working cross-pod NCCL setup on this cluster:
+  # the image's NCCL_NET_PLUGIN=aws-ofi binds to RoCE via the
+  # roce-channel DRA claim below, and MNNVL spans pods inside one clique
+  # via compute-domain-channel. Don't override NCCL_NET / NCCL_NET_PLUGIN
+  # here — forcing Socket bypasses RoCE and hangs the cross-cluster
+  # rendezvous (verified with the prior NCCL_NET=Socket attempt).
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                     value: WARN}
+    - {name: NCCL_MNNVL_ENABLE,              value: "1"}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+    # Avoid driver-side BAR1 / page-locked memory leaks on SIGKILL'd
+    # runs (ray-project/ray#23785). Falls back to /dev/shm-based
+    # NCCL host registrations, which we also scrub at run start. Small
+    # one-time setup cost on init; no impact on training hot path.
+    - {name: NCCL_CUMEM_HOST_ENABLE,         value: "0"}
+    # Don't hit huggingface.co during tokenizer init. transformers
+    # ≥4.45 calls list_repo_templates() in from_pretrained() to check
+    # for newer chat templates, which times out on flaky GB300-node
+    # egress and kills add_dp_worker recovery. The full tokenizer is
+    # already in the HF_HOME cache on Lustre — no network needed.
+    - {name: HF_HUB_OFFLINE,                 value: "1"}
+    - {name: TRANSFORMERS_OFFLINE,           value: "1"}
+    # NVRES-style NCCL fault behavior, with lazy-PG removed in grpo:
+    #   - HEARTBEAT_TIMEOUT bounds how long a hung collective on
+    #     model_update_group can wait for a dead peer (default is 600s).
+    #   - RETHROW_CUDA_ERRORS=0 keeps the NCCL watchdog from SIGABRT'ing
+    #     the process on a CUDA error so the router's per-worker
+    #     /update_weights_from_collective eviction logic can catch it.
+    #   - NCCL_NVLS_ENABLE=0 is required by nvidia-resiliency-ext on
+    #     NVLS-capable hardware (GB300 has NVLink SHARP); without it,
+    #     NCCL aborts behave unpredictably. Doc: known-issue KI-7.
+    - {name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC, value: "60"}
+    - {name: TORCH_NCCL_RETHROW_CUDA_ERRORS,   value: "0"}
+    - {name: NCCL_NVLS_ENABLE,                 value: "0"}
+
+  headResources: &head_resources
+    limits:   {cpu: "8",  memory: "32Gi"}
+    requests: {cpu: "2",  memory: "8Gi"}
+
+  # Whole-node 4-GPU worker for training.
+  # NOTE custom claim names (shared-compute-domain / shared-roce). The
+  # nrl-k8s CLI rewrites resourceClaimTemplateName only for the standard
+  # `compute-domain-channel` / `roce-channel` claim names — by using
+  # different names here, the train pods reference the SHARED
+  # ResourceClaimTemplates auto-created from the gen cluster's standard
+  # claims (see resourceClaims block below). That way train + gen pods
+  # share one ComputeDomain (NVLink fabric) and one RoCE template, which
+  # is what cross-cluster NCCL needs to rendezvous on this hardware.
+  gpuWorkerResources: &gpu_worker_resources
+    # SHRUNK from 132/900Gi → 16/128Gi: cluster has free GPUs but heavy
+    # CPU/memory reservation on most nodes; lower requests improve the
+    # chance of landing the gang-scheduled pods. Train workers don't
+    # actually need that much host memory (Megatron is GPU-resident).
+    limits:
+      cpu: "32"
+      memory: "256Gi"
+      nvidia.com/gpu: "4"
+    requests:
+      cpu: "16"
+      memory: "128Gi"
+      nvidia.com/gpu: "4"
+    claims:
+      - {name: shared-compute-domain}
+      - {name: shared-roce}
+
+  # Single-GPU worker for one DP shard. Up to 4 of these may share a node.
+  gpuShardResources: &gpu_shard_resources
+    # SHRUNK from 32/220Gi → 4/32Gi: cluster has free GPUs but heavy
+    # CPU/memory reservation; gen shard at 4B fits comfortably in 32Gi
+    # of host memory (vLLM is GPU-resident, ~10GB host overhead).
+    limits:
+      cpu: "8"
+      memory: "64Gi"
+      nvidia.com/gpu: "1"
+    requests:
+      cpu: "4"
+      memory: "32Gi"
+      nvidia.com/gpu: "1"
+    claims:
+      - {name: compute-domain-channel}
+      - {name: roce-channel}
+
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+
+  genHeadPorts: &gen_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+    # Unified router (data plane + control plane) on a single port.
+    - {containerPort: 8089,  name: gen-router}
+
+  # Mount code from Lustre rather than uploading. /opt/nemo-rl is the
+  # subPath ${user:}/nemo-rl on the rl-workspace PVC — sync local edits
+  # there from the dev pod (kubectl exec ${user:}-dev-pod ...) before
+  # launching. Same pattern as qwen3_30b_math_4n_4gpu.gb300.infra.yaml.
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm, name: dshm}
+    - {mountPath: /opt/nemo-rl, name: rl-workspace, subPath: "${user:}/nemo-rl"}
+    - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 16Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+
+  # RoCE / aws-ofi-nccl pre-flight: fail the pod before ray-worker
+  # starts if the RDMA fabric isn't usable. Three checks:
+  #   1. /dev/infiniband/uverbs* exists (DRA RoCE channel actually wired)
+  #   2. fi_info -p efa enumerates a provider (libfabric can talk to fabric)
+  #   3. libnccl-net.so loads (aws-ofi-nccl plugin shared lib usable)
+  # Any failure → initContainer exits 1 → pod stuck in Init:Error → KubeRay
+  # autoscaler reaps it within idleTimeoutSeconds and provisions a fresh
+  # one. Without this, broken pods join the NCCL group and wedge it for
+  # the full 60s rendezvous timeout (or 5min pre-fix), poisoning the run.
+  # Shared initContainer body — only the resources.claims line differs
+  # between train and gen pods (train pods use the "shared-roce" claim
+  # name, gen pods use "roce-channel"), so we inline the claim name in
+  # each pod template rather than via anchor. fi_info-based check was
+  # ditched: aws-ofi-nccl can't enumerate an EFA provider on this
+  # cluster (libfabric only has tcp/sockets/udp), but NCCL falls back
+  # to the kernel IBVerbs path which works fine. So check for IB verbs
+  # devices + active port instead, which is what NCCL actually needs.
+  # Preflight script lives in the `roce-preflight-script` ConfigMap
+  # (apply via `kubectl apply -f infra/preflight/roce-preflight-configmap.yaml`
+  # before bringing up clusters). Mounting via ConfigMap volume avoids
+  # the OmegaConf-bash-escape mess of inlining the script directly in
+  # YAML — the script source lives at infra/preflight/roce_preflight.sh
+  # and is the single source of truth.
+  rocePreflightVolume: &roce_preflight_volume
+    - name: roce-preflight-script
+      configMap:
+        name: roce-preflight-script
+        defaultMode: 0o755
+
+  workerVolumes: &worker_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 64Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+    - name: roce-preflight-script
+      configMap:
+        name: roce-preflight-script
+        defaultMode: 493  # 0755 — needs to be exec'able
+
+# namespace auto-inferred from kube context (default).
+image: nvcr.io/nvidian/nemo-rl:nightly
+imagePullSecrets: [nvcr-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+submit:
+  submitter: portForward
+
+launch:
+  mode: attach
+  runMode: batch
+  codeSource: image
+  codePath: /opt/nemo-rl
+  attach:
+    generation: ${user:}-raycluster-gen-ft-qwen3-4b-gb300
+    training: ${user:}-raycluster-train-ft-qwen3-4b-gb300
+  peerWatcher: false
+  env: {}
+  # Train driver runs inside the train cluster's head pod under Ray Job
+  # SDK. Code is served from Lustre at /opt/nemo-rl (subPath
+  # ${user:}/nemo-rl), so syncs from the dev pod show up on the next
+  # submission without rebuilding the image. Recipe path is repo-relative.
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    pip install kubernetes -q || true
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted — is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
+    IF_DATA=/mnt/rl-workspace/${user:}/datasets/instruction_following/instruction_following.jsonl
+    IF_VAL=/mnt/rl-workspace/${user:}/datasets/instruction_following/instruction_following_val32.jsonl
+    export DISAGG_TRAIN_PATH=$IF_DATA
+    export DISAGG_VALID_PATH=$IF_VAL
+    export RAY_enable_infeasible_task_early_exit=true
+    export PYTHONPATH=.:3rdparty/Gym-workspace/Gym:3rdparty/Megatron-LM-workspace/Megatron-LM:3rdparty/Automodel-workspace/Automodel
+    python -u examples/nemo_gym/run_grpo_nemo_gym.py \
+      --config infra/nrl_k8s/examples/qwen3_4b_if_fault_tolerant.yaml \
+      +policy.generation.remote_generation_url=http://${user:}-raycluster-gen-ft-qwen3-4b-gb300-head-svc.default.svc.cluster.local:8089 \
+      ++env.nemo_gym.config_paths='[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/instruction_following/configs/instruction_following.yaml]' \
+      ~policy.optimizer.kwargs.foreach \
+      ~policy.optimizer.kwargs.fused
+
+clusters:
+  # ---------------------------------------------------------------------
+  # Training cluster — 1 GPU worker (4 GB300 GPUs), gym colocated as a
+  # Ray actor. kai-scheduler + ComputeDomain + RoCE for cross-pod NCCL.
+  # ---------------------------------------------------------------------
+  training:
+    name: ${user:}-raycluster-train-ft-qwen3-4b-gb300
+    labels:
+      disagg.nemo-rl/cluster: train-ft-qwen3-4b-gb300
+      disagg.nemo-rl/run: ft-qwen3-4b-gb300
+      kai.scheduler/queue: default-queue
+    spec:
+      rayVersion: "2.54.0"
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          no-monitor: "true"
+          num-gpus: "0"
+          object-store-memory: "200000000"
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            containers:
+              - name: ray-head
+                env:
+                  - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
+                  - {name: NCCL_DEBUG,                     value: WARN}
+                  - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+                  # Train driver imports HF tokenizer; flaky egress
+                  # times out list_repo_tree calls. Use cached tokenizer.
+                  - {name: HF_HUB_OFFLINE,                 value: "1"}
+                  - {name: TRANSFORMERS_OFFLINE,           value: "1"}
+                  - name: WANDB_API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: wandb-api-key
+                        key: WANDB_API_KEY
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 1
+          minReplicas: 1
+          maxReplicas: 1
+          rayStartParams:
+            num-gpus: "4"
+            object-store-memory: "200000000"
+          template:
+            metadata:
+              annotations:
+                kai.scheduler/topology: gb300-topology
+                kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+            spec:
+              schedulerName: kai-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              # Train references the SHARED ComputeDomain + RoCE template
+              # auto-created from the gen cluster's standard claims (see
+              # below). The custom claim names (shared-…) prevent the
+              # nrl-k8s CLI from rewriting resourceClaimTemplateName, so
+              # we get a single fabric domain spanning both clusters.
+              resourceClaims:
+                - name: shared-compute-domain
+                  resourceClaimTemplateName: compute-domain-${user:}-raycluster-gen-ft-qwen3-4b-gb300-generation
+                - name: shared-roce
+                  resourceClaimTemplateName: roce-${user:}-raycluster-gen-ft-qwen3-4b-gb300-generation
+              initContainers:
+                - name: roce-preflight
+                  image: nvcr.io/nvidian/nemo-rl:nightly
+                  command: ["/bin/bash", "/preflight/roce_preflight.sh"]
+                  resources:
+                    claims: [{name: shared-roce}]
+                    limits:   {cpu: "1", memory: "256Mi"}
+                    requests: {cpu: "100m", memory: "128Mi"}
+                  volumeMounts:
+                    - {name: roce-preflight-script, mountPath: /preflight}
+                  securityContext:
+                    capabilities: {add: [IPC_LOCK]}
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_worker_resources
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK]
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes
+
+  # ---------------------------------------------------------------------
+  # Generation cluster — autoscaler v2 + 4 worker groups (one per DP
+  # shard). Same DRA + kai-scheduler topology pattern; ComputeDomain
+  # spans the gen pods so cross-cluster NCCL can reach gen ranks.
+  # ---------------------------------------------------------------------
+  generation:
+    name: ${user:}-raycluster-gen-ft-qwen3-4b-gb300
+    labels:
+      disagg.nemo-rl/cluster: gen-ft-qwen3-4b-gb300
+      disagg.nemo-rl/run: ft-qwen3-4b-gb300
+      kai.scheduler/queue: default-queue
+    daemon:
+      submissionId: ft-qwen3-4b-generation-server-v2
+      # Code is at /opt/nemo-rl (mounted from Lustre); no upload needed.
+      entrypoint: |
+        set -eu
+        cd /opt/nemo-rl
+        export DISAGG_JOB_ID=ft-qwen3-4b
+        pip install kubernetes -q || true
+        python -u examples/run_standalone_generation_server.py \
+          --config infra/examples/generation_standalone_qwen3_4b_ft.yaml \
+          --port 8089 --num-gpus 4
+    spec:
+      rayVersion: "2.54.0"
+      enableInTreeAutoscaling: true
+      autoscalerOptions:
+        version: v2
+        upscalingMode: Default
+        # Daemon needs ~3-5 min to bring up vLLM (4B model load + CUDA
+        # graph capture + inductor compile) before it claims the per-shard
+        # placement groups. With a 60s idle reap, autoscaler v2 was
+        # killing the pre-warmed pods before the daemon got to claim them
+        # — daemon then crashed with ResourceInsufficientError. 300s is a
+        # safer default that still gives a tight post-kill reap window
+        # (much faster than the 600s default).
+        idleTimeoutSeconds: 300
+        resources:
+          requests: {cpu: "500m", memory: "512Mi"}
+          limits:   {cpu: "1",    memory: "1Gi"}
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          num-gpus: "0"
+          object-store-memory: "200000000"
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            containers:
+              - name: ray-head
+                env: *shared_head_env
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gen_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      # ONE dynamic worker group for DP shards. KubeRay autoscaler v2
+      # scales it up/down based on placement-group demand from the gen
+      # daemon: each DP shard's PG triggers one new pod; remove_shard
+      # frees the PG, the pod goes idle, autoscaler reaps it after
+      # idleTimeoutSeconds, and add_shard later asks for a new PG which
+      # the autoscaler provisions back up.
+      #
+      # replicas: 4 (not 0): the gen daemon's RayVirtualCluster pre-PG
+      # validation in nemo_rl/distributed/virtual_cluster.py rejects the
+      # request when ``cluster_resources()['GPU'] < requested`` BEFORE
+      # ever calling placement_group(), so an empty cluster never emits
+      # the PG-demand signal autoscaler-v2 needs to spin up. Pre-warming
+      # to 4 pods lets the daemon's PG creation pass; the autoscaler
+      # then maintains 4 as a target. Pair with idleTimeoutSeconds=60
+      # at the autoscalerOptions level so a remove_shard's freed pod
+      # gets reaped within ~60s (the demo's "shrink under load" path)
+      # instead of the 10-minute default.
+      workerGroupSpecs:
+        - groupName: gpu-shard
+          # 4 shards: tests actor-kill on a shard amid 3 survivors so we
+          # get a meaningful throughput drop (25%) and a non-trivial
+          # cross-cluster NCCL re-rendezvous (4→3→4 ranks).
+          replicas: 4
+          minReplicas: 0
+          maxReplicas: 8
+          rayStartParams: {num-gpus: "1", object-store-memory: "200000000"}
+          template:
+            metadata:
+              annotations:
+                kai.scheduler/topology: gb300-topology
+                kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+            spec:
+              schedulerName: kai-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              resourceClaims:
+                - name: compute-domain-channel
+                  resourceClaimTemplateName: compute-domain-ft-qwen3-4b-gen
+                - name: roce-channel
+                  resourceClaimTemplateName: roce-ft-qwen3-4b-gen
+              initContainers:
+                - name: roce-preflight
+                  image: nvcr.io/nvidian/nemo-rl:nightly
+                  command: ["/bin/bash", "/preflight/roce_preflight.sh"]
+                  resources:
+                    claims: [{name: roce-channel}]
+                    limits:   {cpu: "1", memory: "256Mi"}
+                    requests: {cpu: "100m", memory: "128Mi"}
+                  volumeMounts:
+                    - {name: roce-preflight-script, mountPath: /preflight}
+                  securityContext:
+                    capabilities: {add: [IPC_LOCK]}
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_shard_resources
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK]
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes

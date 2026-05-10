@@ -459,8 +459,8 @@ def setup(
     if not colocated_inference:
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
+        # world size includes all training workers and all inference workers
         train_world_size = train_cluster.world_size()
-        # inference cluster + head node of the train cluster
         world_size = train_world_size + inference_nodes * inference_gpus_per_node
         # init collective
         futures_train = student_policy.init_collective(

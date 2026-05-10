@@ -1,17 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Tests for :mod:`nrl_k8s.config` — layered loading of recipe + infra:.
 
 Priority (low → high):
@@ -42,10 +28,8 @@ from nrl_k8s.schema import InfraConfig, SchedulerKind, WorkspaceKind
 
 @pytest.fixture(autouse=True)
 def _no_user_defaults(monkeypatch, tmp_path):
-    """Point ``_USER_DEFAULTS`` at a non-existent file.
-
-    Prevents user-level config from bleeding into tests from whatever
-    laptop this runs on.
+    """Point ``_USER_DEFAULTS`` at a non-existent file so user-level config
+    never bleeds into tests from whatever laptop this runs on.
     """
     monkeypatch.setattr(cfg_mod, "_USER_DEFAULTS", tmp_path / "no-such.yaml")
 
@@ -182,9 +166,8 @@ class TestPrecedence:
 
 class TestRecipeBody:
     def test_infra_is_peeled_off(self, tmp_path) -> None:
-        """The returned recipe must not contain ``infra:``.
-
-        The NeMo-RL entrypoint is never supposed to see it.
+        """The returned recipe must not contain `infra:` — the NeMo-RL
+        entrypoint is never supposed to see it.
         """
         recipe = _write_yaml(
             tmp_path / "recipe.yaml",

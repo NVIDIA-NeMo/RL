@@ -57,8 +57,6 @@ else
   echo "krew already installed"
 fi
 
-export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
-
 $NAMED_KUBECTL krew install ctx
 $NAMED_KUBECTL krew install ns
 $NAMED_KUBECTL krew install stern

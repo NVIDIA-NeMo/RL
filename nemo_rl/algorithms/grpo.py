@@ -43,6 +43,7 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    flatten_router_metrics_for_wandb,
     get_gdpo_reward_component_keys,
     log_generation_metrics_to_wandb,
     print_performance_metrics,
@@ -394,6 +395,12 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
+    # HTTP-only disagg: gen server is external (separate cluster/process).
+    # Implicitly enabled when not colocated and `remote_generation_url` is set.
+    disagg_http_mode = (
+        not colocated_inference
+        and generation_config.get("remote_generation_url") is not None
+    )
 
     env_name_list = extract_necessary_env_names(data_config)
     rm_env_enabled = "reward_model" in env_name_list
@@ -457,8 +464,17 @@ def setup(
         inference_gpus_per_node = inference_resources["gpus_per_node"]
         inference_nodes = inference_resources["num_nodes"]
 
-        # validate and configure resources
-        if policy_nodes == 1:
+        if disagg_http_mode:
+            # External gen server manages its own GPUs. Training cluster uses
+            # ALL gpus from cluster config — no subtraction.
+            inference_nodes = inference_nodes or 1
+            print(
+                f"  ⚡ Disagg HTTP mode: training uses {train_gpus_per_node} GPUs/node, "
+                f"inference is external ({inference_gpus_per_node}×{inference_nodes} GPUs)",
+                flush=True,
+            )
+        elif policy_nodes == 1:
+            # validate and configure resources
             # When policy_nodes == 1, train and inference are on the same node
             assert (
                 inference_gpus_per_node is not None and inference_gpus_per_node > 0
@@ -518,18 +534,26 @@ def setup(
             flush=True,
         )
 
-        # initialize inference cluster
-        inference_cluster = RayVirtualCluster(
-            name="grpo_inference_cluster",
-            bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
-            use_gpus=True,
-            num_gpus_per_node=inference_gpus_per_node,
-            max_colocated_worker_groups=1,
-        )
-        print(
-            f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
-            flush=True,
-        )
+        if disagg_http_mode:
+            # No local inference cluster — gen server is external
+            inference_cluster = None
+            print(
+                "  ✓ No local inference cluster (disagg HTTP mode)",
+                flush=True,
+            )
+        else:
+            # initialize inference cluster
+            inference_cluster = RayVirtualCluster(
+                name="grpo_inference_cluster",
+                bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
+                use_gpus=True,
+                num_gpus_per_node=inference_gpus_per_node,
+                max_colocated_worker_groups=1,
+            )
+            print(
+                f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
+                flush=True,
+            )
 
     # ==========================
     #   Training and Inference
@@ -684,13 +708,35 @@ def setup(
             "hf_config_overrides", {}
         )
 
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_vllm,
-            generation_name="vLLM",
-            init_time_key="vllm_init_time_s",
-            colocated_inference=colocated_inference,
-            worker_init_timing_metrics=worker_init_timing_metrics,
-        )
+        if disagg_http_mode:
+            # HTTP-only disagg: gen server is external, don't create VllmGeneration.
+            # Only initialize policy training workers.
+            from nemo_rl.models.generation.remote_generation import RemoteGeneration
+
+            remote_url = generation_config["remote_generation_url"]
+            assert remote_url, (
+                "remote_generation_url must be set for disaggregated HTTP mode"
+            )
+            policy_generation = RemoteGeneration(
+                generation=None,
+                server_url=remote_url,
+                config=generation_config,
+            )
+            print(
+                f"  ✓ Using HTTP-only RemoteGeneration via unified router {remote_url}",
+                flush=True,
+            )
+
+            policy, policy_time = init_policy()
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        else:
+            policy_generation, policy = initialize_generation_with_policy(
+                init_generation_fn=init_vllm,
+                generation_name="vLLM",
+                init_time_key="vllm_init_time_s",
+                colocated_inference=colocated_inference,
+                worker_init_timing_metrics=worker_init_timing_metrics,
+            )
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
@@ -728,19 +774,83 @@ def setup(
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
-        # world includes all training workers and all inference workers
+        # World size includes all training workers and all inference workers.
+        # Every train rank participates in the cross-cluster
+        # ``model_update_group`` so that the NCCL collectives inside
+        # ``broadcast_weights_for_collective`` (DTensor's ``full_tensor()``,
+        # Megatron-Bridge's HF export gather) all rendezvous in lock-step on
+        # consistent CUDA streams. Only train rank 0's bytes are actually
+        # sent (``src=0`` in ``packed_broadcast_producer``); the other ranks
+        # are silent participants. In disagg HTTP mode, prefer the gen
+        # control server's reported current_gen_world_size — it reflects
+        # any shard already removed by a fault before train booted.
         train_world_size = train_cluster.world_size()
         inference_world_size = inference_nodes * inference_gpus_per_node
+        if disagg_http_mode and hasattr(
+            policy_generation, "_fetch_current_gen_world_size"
+        ):
+            dynamic_inf = policy_generation._fetch_current_gen_world_size()
+            if dynamic_inf is not None and dynamic_inf > 0:
+                if dynamic_inf != inference_world_size:
+                    print(
+                        f"  ↻ gen world size has drifted from config "
+                        f"(config={inference_world_size}, current={dynamic_inf}); "
+                        f"using current for init_collective.",
+                        flush=True,
+                    )
+                inference_world_size = dynamic_inf
         world_size = train_world_size + inference_world_size
+        # RL-412: when the train side runs the RefitWorker split-actor
+        # path (NRL_USE_REFIT_WORKER), only ONE process on the train
+        # side participates in the cross-cluster group (the RefitWorker
+        # actor, rank 0). The gen side must agree on the smaller world
+        # so its rank computation matches. Override the values passed
+        # to BOTH sides' ``init_collective`` so they rendezvous on the
+        # same world. ``policy.init_collective`` already remaps
+        # internally based on ``_use_refit_worker``; this override is
+        # what gets the gen side to align.
+        uses_refit_worker = bool(getattr(policy, "_use_refit_worker", False))
+        if uses_refit_worker:
+            effective_train_ws = 1
+            effective_world_size = effective_train_ws + inference_world_size
+            print(
+                f"  ⓘ RefitWorker mode: cross-cluster world shrinks "
+                f"{train_world_size}+{inference_world_size}={world_size} → "
+                f"{effective_train_ws}+{inference_world_size}={effective_world_size}",
+                flush=True,
+            )
+        else:
+            effective_train_ws = train_world_size
+            effective_world_size = world_size
         # init collective
+        print(
+            f"  → dispatching policy.init_collective(ip={ip} port={port} "
+            f"world_size={effective_world_size} train_world_size={effective_train_ws}) ...",
+            flush=True,
+        )
         futures_train = policy.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
+            ip, port, effective_world_size, train_world_size=effective_train_ws
+        )
+        print(
+            f"  ✓ policy.init_collective dispatched: {len(futures_train)} futures",
+            flush=True,
         )
         futures_inference = policy_generation.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
+            ip, port, effective_world_size, train_world_size=effective_train_ws
         )  # type: ignore
+        print(
+            f"  ✓ policy_generation.init_collective dispatched: "
+            f"{len(futures_inference)} future(s)",
+            flush=True,
+        )
         # wait for all futures to complete
+        print(
+            f"  ⏳ ray.get on {len(futures_train) + len(futures_inference)} "
+            f"init_collective futures ...",
+            flush=True,
+        )
         ray.get(futures_train + futures_inference)
+        print("  ✓ init_collective complete on both sides.", flush=True)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     # prepare refit info
@@ -1113,6 +1223,13 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
+    # Disagg fault-tolerance: if a vLLM DP shard was removed (or added) since
+    # the last refit, the train↔gen NCCL group is stale. Re-init both sides
+    # at the new world size before touching weights. No-op in steady state
+    # (when the world size hasn't changed) and in colocated mode.
+    if not colocated_inference and hasattr(policy_generation, "ensure_collective_synced"):
+        policy_generation.ensure_collective_synced(policy)
+
     if colocated_inference:
         policy.offload_before_refit()
         policy_generation.prepare_for_generation(tags=["weights"])
@@ -1169,12 +1286,131 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+            # RL-412: wrap the cross-cluster broadcast in a retry loop. If
+            # a gen DP shard dies mid-broadcast, NCCL queues an error in
+            # the train workers' CUDA contexts that surfaces later as
+            # SIGABRT during tensor dealloc (c10::TensorImpl::~TensorImpl
+            # crashes when the underlying CUDA context is poisoned).
+            # Catching here, aborting the stale comm, and forcing
+            # ensure_collective_synced at the (now-smaller) world size
+            # before retry keeps the worker process alive and the
+            # training loop intact. One retry is enough; if the new
+            # comm hits the same peer-loss issue the failure is real.
+            broadcast_attempts = 0
+            while True:
+                broadcast_attempts += 1
+                try:
+                    futures_train = policy.broadcast_weights_for_collective(
+                        kv_scales=kv_scales
+                    )
+                    futures_inference = (
+                        policy_generation.update_weights_from_collective()
+                    )
+                    # 30B-class refit on the colocated CUDA-IPC + cross-cluster
+                    # NCCL path takes ~60-120s warm. A wedge (RefitWorker
+                    # respawn race, ZMQ stale handle, peer death between
+                    # init_collective and the broadcast) used to manifest
+                    # as Ray's cryptic "Get timed out: some object(s) not
+                    # ready" surfaced from the scheduler's internal poll
+                    # rather than from this call. Set an explicit upper
+                    # bound here so the wedge raises a clear ``GetTimeoutError``
+                    # the retry loop below catches and converts into an
+                    # ``abort_collective`` + ``ensure_collective_synced``
+                    # cycle. 600s gives 5x headroom on the worst observed
+                    # warm broadcast.
+                    ray.get(futures_train, timeout=600)
+                    results = ray.get(futures_inference, timeout=600)
+                    update_success = all(
+                        result for result in results if result is not None
+                    )
+                    # RL-412: post-broadcast cleanup REMOVED (was "lazy-PG
+                    # teardown"). Previously we destroyed model_update_group
+                    # after every successful broadcast so that a peer dying
+                    # mid-rollout had no live NCCL state to poison Megatron's
+                    # EXPERT_MODEL_PARALLEL_GROUP. The cost was ~3-5s of
+                    # NCCL re-init per refit (5-12 min total over a 150-step
+                    # 30B run).
+                    #
+                    # Replaced by NVIDIA-resiliency-ext-style per-worker
+                    # eviction (see /init_collective and
+                    # /update_weights_from_collective handlers in
+                    # generation_router.py): when a worker raises
+                    # cudaErrorLaunchFailure / DistStoreError mid-collective,
+                    # the gen-side handler identifies that worker via its
+                    # individual future, calls remove_shard (kills its actor
+                    # → its poisoned CUDA context dies with the process →
+                    # PG freed for autoscaler reclaim), and runs
+                    # reset_collective on the survivors to drain any
+                    # queued NCCL errors. The handler then returns 503
+                    # with the new (smaller) current_gen_world_size; train
+                    # side's existing retry in ensure_collective_synced
+                    # catches the HTTPError, aborts its own
+                    # model_update_group (scoped — only the cross-cluster
+                    # PG, not Megatron's internal groups), and re-rendezvouses
+                    # at the smaller world.
+                    #
+                    # The router's health poller (2s interval, 10-failure
+                    # threshold) catches between-refit peer death within
+                    # ~20-50s, so the comm is destroyed via reset_collective
+                    # on survivors before the next refit even starts.
+                    break
+                except Exception as e:  # noqa: BLE001
+                    # RL-412 follow-up: with the RefitWorker architecture
+                    # ``policy.abort_collective`` ``ray.kill``s the sibling
+                    # actor (poisoned CUDA context dies with the process)
+                    # and the next ``ensure_collective_synced`` spawns a
+                    # fresh one. RefitWorker spawn + NCCL re-init is
+                    # ~5-10s, so bumping max retries to 3 buys us one
+                    # extra "real fault" cycle before failing the run.
+                    if broadcast_attempts >= 3 or not hasattr(
+                        policy_generation, "ensure_collective_synced"
+                    ):
+                        raise
+                    print(
+                        f"  ⚠ broadcast failed ({type(e).__name__}: {e}); "
+                        "aborting stale comm and re-syncing at current "
+                        "gen world size before retry",
+                        flush=True,
+                    )
+                    if hasattr(policy, "abort_collective"):
+                        try:
+                            ray.get(policy.abort_collective(), timeout=30)
+                        except Exception as abort_e:  # noqa: BLE001
+                            print(
+                                f"  ! abort_collective raised "
+                                f"{type(abort_e).__name__}: {abort_e}",
+                                flush=True,
+                            )
+                    # ALSO call reset_collective on the gen side: when
+                    # RefitWorker dies mid-broadcast, surviving gen workers
+                    # are wedged in ``update_weights_from_collective``
+                    # (pending NCCL op waiting for a peer that's gone).
+                    # Their actor task queues are blocked; the next
+                    # init_collective dispatched to them queues behind the
+                    # wedge and the rendezvous times out at the
+                    # ``ensure_collective_synced`` budget. Forcing
+                    # ``reset_collective`` (which destroys the stale comm
+                    # in each gen worker) frees them to respond to the
+                    # fresh init_collective on the next attempt. Best-
+                    # effort, bounded — if the call itself wedges (because
+                    # the gen-side actors are wedged in NCCL too), the
+                    # health poller and the explicit eviction logic in
+                    # ``ensure_collective_synced`` will eventually clean up.
+                    if hasattr(policy_generation, "reset_collective"):
+                        try:
+                            reset_futs = policy_generation.reset_collective()
+                            ray.wait(list(reset_futs), timeout=15.0)
+                        except Exception as reset_e:  # noqa: BLE001
+                            print(
+                                f"  ! gen reset_collective dispatch raised "
+                                f"{type(reset_e).__name__}: {reset_e}",
+                                flush=True,
+                            )
+                    # Force ensure_collective_synced to re-init at the
+                    # new world size by clearing the cached value.
+                    if hasattr(policy_generation, "_last_synced_world_size"):
+                        policy_generation._last_synced_world_size = None
+                    policy_generation.ensure_collective_synced(policy)
 
         # check if update is successful
         if not update_success:
@@ -1349,6 +1585,12 @@ def grpo_train(
     # common config/state times
     current_step = grpo_save_state["current_step"]  # current step within an epoch
     total_steps = grpo_save_state["total_steps"]  # total steps across all epochs
+    # Tracks the monotonic timestamp of the most recent fault event we've
+    # surfaced to wandb so we can mark exactly one step with
+    # gen/fault_event_this_step=1 when a new event lands. Resets if the
+    # run restarts (we don't persist this across checkpoints — fault events
+    # are tied to the gen daemon's lifetime, which is also non-persistent).
+    prev_router_fault_ts: Optional[float] = None
     max_num_steps = master_config["grpo"][
         "max_num_steps"
     ]  # max number of steps to train for
@@ -2101,6 +2343,25 @@ def grpo_train(
                     logger,
                 )
 
+            # Disagg-only: surface gen-cluster fault-tolerance counters
+            # (router shard fleet state, cumulative removals, fault
+            # events) to wandb under the gen/ prefix. In co-located mode
+            # there is no router, so router_metrics is empty and this
+            # is a no-op. Use the per-step cache so the spec-decode
+            # snapshot path doesn't trigger a second HTTP fetch.
+            if hasattr(policy_generation, "get_step_metrics_snapshot"):
+                snapshot = policy_generation.get_step_metrics_snapshot(
+                    step=total_steps + 1
+                )
+                router_flat, prev_router_fault_ts = (
+                    flatten_router_metrics_for_wandb(
+                        snapshot.get("router_metrics", {}),
+                        prev_fault_ts=prev_router_fault_ts,
+                    )
+                )
+                if router_flat:
+                    logger.log_metrics(router_flat, total_steps + 1, prefix="gen")
+
             # Plot ISL/OSL/ISL+OSL histograms to wandb
             if (
                 master_config["policy"]["generation"]
@@ -2433,6 +2694,9 @@ def async_grpo_train(
     # Training state
     step = grpo_save_state["current_step"]
     weight_version = step  # Tracks refitted weight versions
+    # Tracks the most recent gen-cluster fault timestamp surfaced to wandb;
+    # see the sync GRPO loop for context. Reset across daemon restarts.
+    prev_router_fault_ts: Optional[float] = None
     consumed_samples = grpo_save_state["consumed_samples"]
     total_valid_tokens = grpo_save_state.get(
         "total_valid_tokens", 0
@@ -3123,6 +3387,21 @@ def async_grpo_train(
                     ],
                     logger,
                 )
+
+            # See the matching block in the sync GRPO loop. Empty in
+            # co-located mode; populated in disagg HTTP mode.
+            if hasattr(policy_generation, "get_step_metrics_snapshot"):
+                snapshot = policy_generation.get_step_metrics_snapshot(
+                    step=step + 1
+                )
+                router_flat, prev_router_fault_ts = (
+                    flatten_router_metrics_for_wandb(
+                        snapshot.get("router_metrics", {}),
+                        prev_fault_ts=prev_router_fault_ts,
+                    )
+                )
+                if router_flat:
+                    logger.log_metrics(router_flat, step + 1, prefix="gen")
 
             # Plot ISL/OSL/ISL+OSL histograms to wandb
             if (

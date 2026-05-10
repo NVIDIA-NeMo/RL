@@ -21,6 +21,12 @@ rules:
 - apiGroups: ["ray.io"]
   resources: ["rayclusters"]
   verbs: ["get", "delete"]
+# RL-412: pod-kill fault-inject mode lists pods by label to map a shard
+# IP to a pod name, then deletes that pod to exercise the autoscaler-v2
+# reclaim path. Scoped to the same namespace as the SA.
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

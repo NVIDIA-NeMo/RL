@@ -1,0 +1,85 @@
+# Stuck-pod watchdog: reaps RayCluster worker pods that are stuck in
+# PodInitializing because of DRA prep failures (FailedPrepareDynamicResources,
+# typically from a wedged IMEX daemon on the target node). Without this,
+# stuck pods sit forever and the RayCluster never reaches steady state
+# unless an operator manually `kubectl delete`s them.
+#
+# Deploy: kubectl apply -f infra/watchdog/watchdog-deployment.yaml
+# (after applying watchdog-rbac.yaml and the script ConfigMap below).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stuck-pod-watchdog
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: stuck-pod-watchdog
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: stuck-pod-watchdog
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: stuck-pod-watchdog
+    namespace: default
+roleRef:
+  kind: Role
+  name: stuck-pod-watchdog
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stuck-pod-watchdog
+  namespace: default
+  labels:
+    app: stuck-pod-watchdog
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stuck-pod-watchdog
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: stuck-pod-watchdog
+    spec:
+      serviceAccountName: stuck-pod-watchdog
+      # Prefer non-GPU nodes so we don't burn capacity on watchdog.
+      nodeSelector:
+        nodeGroup: customer-cpu
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: watchdog
+          image: bitnami/kubectl:latest
+          command: ["/bin/bash", "/script/stuck-pod-watchdog.sh"]
+          env:
+            - {name: NAMESPACE, value: "default"}
+            - {name: LABEL_SELECTOR, value: "ray.io/cluster"}
+            - {name: STUCK_AGE_SECONDS, value: "180"}
+            - {name: POLL_INTERVAL, value: "30"}
+          resources:
+            limits:   {cpu: "200m", memory: "128Mi"}
+            requests: {cpu: "50m",  memory: "64Mi"}
+          volumeMounts:
+            - {name: script, mountPath: /script}
+      volumes:
+        - name: script
+          configMap:
+            name: stuck-pod-watchdog-script
+            defaultMode: 493  # 0755
