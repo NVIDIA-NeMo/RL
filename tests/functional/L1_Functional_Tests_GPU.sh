@@ -67,6 +67,7 @@ run_test      uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_rm_env.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_sglang.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_topp_topk.sh
+run_test fast uv run --no-sync bash ./tests/functional/online_dpo.sh
 run_test      uv run --no-sync bash ./tests/functional/prorlv2.sh
 run_test      uv run --no-sync bash ./tests/functional/qa_distillation_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/rm.sh
