@@ -52,7 +52,11 @@ def main() -> None:
     with open(args.data) as f:
         for line in f:
             msgs = json.loads(line)["responses_create_params"]["input"]
-            ids = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
+            # Two-step: render template to string, then tokenize. Avoids quirks
+            # where apply_chat_template(..., tokenize=True) returns a wrapped
+            # Encoding object whose len() is not the token count.
+            text = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+            ids = tok(text, add_special_tokens=False)["input_ids"]
             lens.append(len(ids))
 
     lens = np.asarray(lens)
@@ -64,21 +68,26 @@ def main() -> None:
 
     # Compute recommendations.
     mtsl = args.max_total_sequence_length
+    prompt_budget = prompt_max + PROMPT_BUFFER
+    max_new = mtsl - prompt_budget - 1
+
     if args.gym:
         max_input = "null"
         max_input_note = "Gym drives the prompt; NeMo-RL data loader is not gating it."
     else:
-        max_input = prompt_max + PROMPT_BUFFER
-        max_input_note = f"max ({prompt_max}) + {PROMPT_BUFFER}-token buffer for tokenizer / template drift."
+        max_input = prompt_budget
+        max_input_note = f"prompt_max ({prompt_max}) + {PROMPT_BUFFER}-token buffer for tokenizer / template drift."
 
-    prompt_budget = (max_input if isinstance(max_input, int) else prompt_max + PROMPT_BUFFER)
-    max_new = mtsl - prompt_budget - 1
+    breakdown = (
+        f"= {mtsl} (mtsl) − {prompt_max} (prompt_max) − {PROMPT_BUFFER} (buffer) − 1 (boundary)"
+    )
 
     print(f"\n{BOLD}✅ Recommended values{RESET}  {DIM}(mode: {'Gym' if args.gym else 'NeMo-RL'}){RESET}")
+    print(f"  measured prompt_max (max tokens after chat template) = {CYAN}{prompt_max}{RESET}")
     print(f"  policy.max_total_sequence_length         = {CYAN}{mtsl}{RESET}")
     print(f"  policy.generation.vllm_cfg.max_model_len = {CYAN}${{policy.max_total_sequence_length}}{RESET}")
     print(f"  data.max_input_seq_length                = {CYAN}{max_input}{RESET}   {DIM}# {max_input_note}{RESET}")
-    print(f"  policy.generation.max_new_tokens         = {CYAN}{max_new}{RESET}   {DIM}# = {mtsl} − {prompt_budget} − 1{RESET}")
+    print(f"  policy.generation.max_new_tokens         = {CYAN}{max_new}{RESET}   {DIM}# {breakdown}{RESET}")
     print(f"  verifiers_agent.max_tokens               = {CYAN}${{policy.generation.max_new_tokens}}{RESET}   {DIM}# alias{RESET}")
     print()
 

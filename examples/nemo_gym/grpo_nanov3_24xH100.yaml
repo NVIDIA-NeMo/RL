@@ -216,16 +216,18 @@ policy:
     # Hard upper bound on generation length. Must satisfy:
     #   actual_max_prompt_len + max_new_tokens + 1 <= max_total_sequence_length
     # where actual_max_prompt_len is the longest prompt your dataset actually
-    # produces after the chat template + tool schemas are applied (measure it).
-    # For this dataset the observed max is ~6201 tokens, so with
+    # produces after the chat template + tool schemas are applied. Use
+    # examples/nemo_gym/measure_prompt_lens.py to measure it.
+    # For acereason-math-mock-train (n=1000), measured prompt_max=1577, so with
     # max_total_sequence_length=8192:
-    #   1791 = 8192 - 6400 - 1   (6400 leaves a small headroom above 6201)
-    # The +1 accounts for the boundary token that nemo-rl appends when packaging
-    # the (prompt + response) trajectory for the logprob stage. Without this cap,
-    # vLLM lets the model fill the remaining context window, and the boundary
-    # token pushes the logprob input one token over max_model_len, causing
+    #   6582 = 8192 - 1577 - 32 - 1
+    # The 32-token buffer absorbs tokenizer / chat-template drift; the +1 is
+    # the boundary token nemo-rl appends when packaging the (prompt + response)
+    # trajectory for the logprob stage. Without this cap, vLLM lets the model
+    # fill the remaining context window, and the boundary token pushes the
+    # logprob input one token over max_model_len, causing
     # VLLMValidationError("input tokens > model context length").
-    max_new_tokens: 1791
+    max_new_tokens: 6582
     temperature: 1.0
     top_p: 1.0
     top_k: null
@@ -273,15 +275,12 @@ policy:
 
 data:
   # Optional hard cap on prompt length; leave as null to skip prompt truncation.
-  # When null, you are responsible for knowing your dataset's actual max prompt
-  # length (after chat template + tool schemas) and setting
-  # policy.generation.max_new_tokens so that:
-  #   actual_max_prompt_len + max_new_tokens + 1 <= max_total_sequence_length
-  # For this dataset the observed max is ~6201 tokens; see the
-  # policy.generation.max_new_tokens comment for the full invariant.
-  # If you set a non-null value, it must be strictly less than
-  # max_total_sequence_length and >= your actual max prompt length, or real
-  # prompts will be truncated.
+  # When Gym drives generation (should_use_nemo_gym: true), the NeMo-RL data
+  # loader is bypassed for prompt construction, so this knob is a no-op for
+  # the rollout path — leave as null. The runtime invariant is still enforced
+  # through policy.generation.max_new_tokens (see comment above).
+  # If you flip to non-Gym mode, set this to your measured max prompt length
+  # plus a small buffer (~32 tokens), strictly less than max_total_sequence_length.
   max_input_seq_length: null
   shuffle: False
   num_workers: 1
