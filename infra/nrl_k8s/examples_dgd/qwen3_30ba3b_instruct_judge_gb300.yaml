@@ -1,0 +1,88 @@
+# DynamoGraphDeployment for Qwen3-30B-A3B-Instruct-2507 as a judge on GB300.
+#
+# Two services:
+#   * Frontend (CPU only, lands on customer-cpu via nodeSelector)
+#   * 1× VllmDecodeWorker (4 GPUs on a GB300 node, TP=4)
+#
+# Used by nanov3_judge_dynamo_4n4g.gb300.infra.yaml as the judge model server
+# for math_with_judge. The Frontend Service URL is referenced in the training
+# config as dynamo_judge.base_url.
+#
+# Pre-download the model to the shared HF cache before first use:
+#   HF_HOME=/mnt/rl-workspace/terryk/hf-cache \
+#     uvx --from huggingface-hub hf download Qwen/Qwen3-30B-A3B-Instruct-2507
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: qwen3-30b-judge-gb300
+  annotations:
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
+          workingDir: /workspace
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-reset-states
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 1
+      resources:
+        requests:
+          gpu: "4"
+          memory: "512Gi"
+        limits:
+          gpu: "4"
+          memory: "700Gi"
+      extraPodSpec:
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB300
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
+          workingDir: /workspace
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - Qwen/Qwen3-30B-A3B-Instruct-2507
+            - --tensor-parallel-size
+            - "4"
+            - --gpu-memory-utilization
+            - "0.9"
+            - --max-model-len
+            - "8192"
+            - --enforce-eager
+            - --dyn-tool-call-parser
+            - hermes
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
+            - name: HF_HOME
+              value: /mnt/rl-workspace/terryk/hf-cache
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace

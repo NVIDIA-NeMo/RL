@@ -1,0 +1,244 @@
+# Nano v3 GRPO with math_with_judge — 4 nodes × 4 GPUs on GB300 NVL72.
+#
+# Tested: 10-step pipeclean with local_vllm_model judge completed (2026-05-09).
+#   Step times: 234s (step 1), ~67-79s (regular), ~149-165s (validation).
+#   KL Error: 0.0007–0.0035 (stable). Zero overhead vs symbolic-only.
+#   wandb: https://wandb.ai/nvidia/nemorl-nanov3-judge
+#
+# Topology: 5 workers × 4 GPUs = 20 GPUs.
+#   4 nodes (16 GPUs) for training (Megatron EP=16, TP=1, PP=1).
+#   1 node (4 GPUs) for local_vllm_model judge (Qwen3-30B-A3B-Instruct, TP=4).
+#
+# math_with_judge: symbolic verification (math-verify) + LLM judge fallback
+#   via a separate Qwen3-30B-A3B-Instruct vLLM instance (local_vllm_model).
+#
+# GB300/aarch64 workarounds (in the entrypoint):
+#   1. Pre-create local_vllm_model venv with --torch-backend cu129 (Gym's
+#      pyproject.toml has torch-backend=auto which picks CPU torch on the
+#      GPU-less head pod; the CLI flag overrides this).
+#   2. Patch vllm/config/device.py to hardcode "cuda" (NVML unavailable on
+#      the CPU head pod, but the actual vLLM server runs on GPU workers).
+#   3. skip_venv_if_present=true so Gym reuses the pre-created venv.
+#   4. hf_home points to shared Lustre HF cache (pre-download the judge
+#      model to avoid slow first-run downloads).
+#
+# NOTE: local_vllm_model actors don't clean up on --replace. Use full
+#   cluster down + cluster up between runs to avoid stale GPU allocations.
+#
+# Data: math-only subset of nvidia/Nemotron-3-Nano-RL-Training-Blend,
+#   filtered to math_with_judge_simple_agent rows only (21816 train,
+#   240 val). Prep:
+#     cd /mnt/rl-workspace/terryk
+#     uvx --from huggingface-hub hf download nvidia/Nemotron-3-Nano-RL-Training-Blend \
+#         --repo-type dataset --local-dir data/nanov3
+#     ./data/nanov3/create_nanov3_jsonl.py --input data/nanov3/train.jsonl \
+#         --output data/nanov3/train-full.jsonl
+#     head -n -1000 data/nanov3/train-full.jsonl > data/nanov3/train-split.jsonl
+#     tail -n 1000 data/nanov3/train-full.jsonl > data/nanov3/val-split.jsonl
+#     # Filter to math only:
+#     python3 -c "import json; [open for split in ...]"  # see YAML below
+#
+# Uses run_grpo_nemo_gym.py (nemo_gym entrypoint, not run_grpo.py).
+#
+# Usage:
+#   RECIPE=examples/nemo_gym/grpo_nanov3_judge_4n4g.yaml
+#   INFRA=infra/nrl_k8s/examples/nanov3_judge_4n4g.gb300.infra.yaml
+#
+#   nrl-k8s cluster down $RECIPE --infra $INFRA
+#   sleep 20
+#   nrl-k8s cluster up $RECIPE --infra $INFRA --wait
+#   nrl-k8s run $RECIPE --infra $INFRA --wait --raycluster --replace
+
+_shared:
+  headNodeSelector: &head_node_selector
+    nodeGroup: customer-cpu
+  workerNodeSelector: &worker_node_selector
+    nvidia.com/gpu.product: NVIDIA-GB300
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                     value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                     value: WARN}
+    - {name: NCCL_MNNVL_ENABLE,              value: "1"}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+  headResources: &head_resources
+    limits:   {cpu: "16", memory: "64Gi"}
+    requests: {cpu: "8", memory: "32Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    limits:
+      cpu: "132"
+      memory: "900Gi"
+      nvidia.com/gpu: "4"
+    requests:
+      cpu: "120"
+      memory: "850Gi"
+      nvidia.com/gpu: "4"
+    claims:
+      - {name: compute-domain-channel}
+      - {name: roce-channel}
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm, name: dshm}
+    - {mountPath: /opt/nemo-rl, name: rl-workspace, subPath: "${user:}/nemo-rl"}
+    - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 32Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+  workerVolumes: &worker_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 64Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+
+image: nvcr.io/nvidian/nemo-rl:664d29c-49528955
+imagePullSecrets: [nvcr-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+submit:
+  submitter: portForward
+
+launch:
+  mode: attach
+  runMode: batch
+  codeSource: image
+  codePath: /opt/nemo-rl
+  attach:
+    training: ${user:}-raycluster-nanov3-judge-gb300
+  peerWatcher: false
+  env: {}
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted — is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
+    export RAY_enable_infeasible_task_early_exit=true
+    export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM
+    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    NEMO_GYM_LOG_DIR=/mnt/rl-workspace/${user:}/gym_logs/${user:}-nanov3-judge-\${TIMESTAMP}
+    LOG=\${LOG_DIR}/${user:}-nanov3-judge-gb300-\${TIMESTAMP}.log
+    CHECKPOINT_DIR=/mnt/rl-workspace/${user:}/results/nanov3-judge-4n4g
+    mkdir -p "\${LOG_DIR}" "\${CHECKPOINT_DIR}" "\${NEMO_GYM_LOG_DIR}"
+
+    # Pre-create local_vllm_model venv with CUDA torch (aarch64 has CUDA wheels).
+    # pyproject.toml has torch-backend=auto which picks CPU on the GPU-less head pod.
+    # --torch-backend cu129 forces CUDA torch. device.py patch skips NVML detection.
+    # skip_venv_if_present=true in config means Gym reuses this venv.
+    GYM_DIR=/opt/nemo-rl/3rdparty/Gym-workspace/Gym
+    LOCAL_VLLM_DIR=\${GYM_DIR}/responses_api_models/local_vllm_model
+    LOCAL_VLLM_VENV=\${LOCAL_VLLM_DIR}/.venv
+    if [ ! -f "\${LOCAL_VLLM_VENV}/.gb300_patched_v4" ]; then
+      echo "Pre-creating local_vllm_model venv with CUDA torch for GB300..."
+      rm -rf "\${LOCAL_VLLM_VENV}" 2>/dev/null || true
+      cd \${GYM_DIR}
+      uv venv --seed --allow-existing --python 3.13.13 "\${LOCAL_VLLM_VENV}"
+      uv pip install --torch-backend cu129 --python "\${LOCAL_VLLM_VENV}/bin/python" \
+        -e "\${LOCAL_VLLM_DIR}" "ray[default]==2.54.0" openai==2.6.1 "tqdm>=4.66"
+      # Patch vllm device.py: NVML unavailable on CPU head, hardcode cuda
+      DEVICE_PY=`find "\${LOCAL_VLLM_VENV}" -path "*/vllm/config/device.py" | head -1`
+      if [ -n "\${DEVICE_PY}" ]; then
+        sed -i 's/current_platform.device_type/"cuda"/g' "\${DEVICE_PY}"
+        sed -i 's/if not self.device_type:/if False:/g' "\${DEVICE_PY}"
+        echo "Patched \${DEVICE_PY}"
+      fi
+      touch "\${LOCAL_VLLM_VENV}/.gb300_patched_v4"
+      cd /opt/nemo-rl
+      echo "Done: local_vllm_model venv ready"
+    else
+      echo "local_vllm_model venv already set up, reusing"
+    fi
+
+    python -u examples/nemo_gym/run_grpo_nemo_gym.py \
+      --config examples/nemo_gym/grpo_nanov3_judge_4n4g.yaml \
+      data.train.data_path=/mnt/rl-workspace/terryk/data/nanov3/train-split-math.jsonl \
+      data.validation.data_path=/mnt/rl-workspace/terryk/data/nanov3/val-split-math.jsonl \
+      checkpointing.checkpoint_dir=\${CHECKPOINT_DIR} \
+      logger.log_dir=\${CHECKPOINT_DIR}/logs \
+      logger.wandb_enabled=true \
+      logger.tensorboard_enabled=true \
+      logger.monitor_gpus=true \
+      logger.wandb.project=nemorl-nanov3-judge \
+      logger.wandb.name=nanov3-judge-4n4g-gb300 \
+      +env.nemo_gym.nemo_gym_log_dir=\${NEMO_GYM_LOG_DIR} \
+      2>&1 | tee "\${LOG}"
+
+kuberay:
+  training:
+    name: ${user:}-raycluster-nanov3-judge-gb300
+    segmentSize: 1
+    labels:
+      disagg.nemo-rl/cluster: nanov3-judge-gb300
+      disagg.nemo-rl/run: nanov3-judge-gb300
+      kai.scheduler/queue: backfill
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          no-monitor: "true"
+          num-gpus: "0"
+          object-store-memory: "200000000"
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            containers:
+              - name: ray-head
+                env: *shared_head_env
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 5
+          minReplicas: 5
+          maxReplicas: 5
+          numOfHosts: 1
+          rayStartParams:
+            num-gpus: "4"
+            object-store-memory: "200000000"
+          template:
+            metadata:
+              annotations:
+                kai.scheduler/topology: gb300-topology
+                kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+            spec:
+              schedulerName: kai-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              resourceClaims:
+                - name: compute-domain-channel
+                  resourceClaimTemplateName: compute-domain-nanov3-judge
+                - name: roce-channel
+                  resourceClaimTemplateName: roce-nanov3-judge
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_worker_resources
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK]
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes
