@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-import textwrap
+import copy
 from unittest.mock import MagicMock
 
 import pytest
@@ -69,230 +69,93 @@ def _infra(**overrides) -> InfraConfig:
     )
 
 
-_DGD_YAML = textwrap.dedent(
-    """\
-    apiVersion: nvidia.com/v1alpha1
-    kind: DynamoGraphDeployment
-    metadata:
-      name: agg-from-disk
-    spec:
-      services:
-        Frontend:
-          componentType: frontend
-          replicas: 1
-          extraPodSpec:
-            mainContainer:
-              image: registry/upstream:1.0
-              command: ["python3", "-m", "dynamo.frontend"]
-        VllmDecodeWorker:
-          componentType: worker
-          replicas: 4
-          extraPodSpec:
-            mainContainer:
-              command: ["python3", "-m", "dynamo.vllm"]
-              args: ["--model", "Qwen/Qwen3-0.6B"]
-          resources:
-            limits:
-              gpu: "1"
-    """
-)
-
-
-# =============================================================================
-# load_dgd_manifest
-# =============================================================================
-
-
-class TestLoadDgdManifest:
-    def test_happy_path(self, tmp_path):
-        f = tmp_path / "dgd.yaml"
-        f.write_text(_DGD_YAML)
-        doc = dgd.load_dgd_manifest("dgd.yaml", base_dir=tmp_path)
-        assert doc["kind"] == "DynamoGraphDeployment"
-        assert doc["metadata"]["name"] == "agg-from-disk"
-
-    def test_picks_dgd_doc_in_multidoc(self, tmp_path):
-        f = tmp_path / "dgd.yaml"
-        # First doc is a benchmark Pod; the DGD comes second.
-        f.write_text(
-            textwrap.dedent(
-                """\
-                apiVersion: v1
-                kind: Pod
-                metadata:
-                  name: benchmark
-                ---
-                """
-            )
-            + _DGD_YAML
-        )
-        doc = dgd.load_dgd_manifest("dgd.yaml", base_dir=tmp_path)
-        assert doc["kind"] == "DynamoGraphDeployment"
-
-    def test_rejects_no_dgd_doc(self, tmp_path):
-        f = tmp_path / "dgd.yaml"
-        f.write_text("apiVersion: v1\nkind: Pod\nmetadata: {name: x}\n")
-        with pytest.raises(ValueError, match="no document with kind=DynamoGraphDeployment"):
-            dgd.load_dgd_manifest("dgd.yaml", base_dir=tmp_path)
-
-    def test_rejects_wrong_apiversion(self, tmp_path):
-        f = tmp_path / "dgd.yaml"
-        f.write_text(
-            "apiVersion: nvidia.com/v1beta1\n"
-            "kind: DynamoGraphDeployment\n"
-            "metadata: {name: x}\n"
-        )
-        with pytest.raises(ValueError, match="expected apiVersion"):
-            dgd.load_dgd_manifest("dgd.yaml", base_dir=tmp_path)
-
-    def test_resolves_relative_path(self, tmp_path):
-        sub = tmp_path / "sub"
-        sub.mkdir()
-        (sub / "dgd.yaml").write_text(_DGD_YAML)
-        doc = dgd.load_dgd_manifest("sub/dgd.yaml", base_dir=tmp_path)
-        assert doc["metadata"]["name"] == "agg-from-disk"
-
-    def test_resolves_absolute_path(self, tmp_path):
-        f = tmp_path / "dgd.yaml"
-        f.write_text(_DGD_YAML)
-        doc = dgd.load_dgd_manifest(str(f), base_dir=tmp_path / "unused")
-        assert doc["metadata"]["name"] == "agg-from-disk"
-
-    def test_missing_file(self, tmp_path):
-        with pytest.raises(FileNotFoundError):
-            dgd.load_dgd_manifest("nope.yaml", base_dir=tmp_path)
-
-
 # =============================================================================
 # build_dgd_manifest
 # =============================================================================
 
+_INLINE_SPEC = {
+    "services": {
+        "Frontend": {
+            "componentType": "frontend",
+            "replicas": 1,
+            "extraPodSpec": {
+                "mainContainer": {
+                    "image": "registry/upstream:1.0",
+                    "command": ["python3", "-m", "dynamo.frontend"],
+                },
+            },
+        },
+        "VllmDecodeWorker": {
+            "componentType": "worker",
+            "replicas": 4,
+            "extraPodSpec": {
+                "mainContainer": {
+                    "command": ["python3", "-m", "dynamo.vllm"],
+                    "args": ["--model", "Qwen/Qwen3-0.6B"],
+                },
+            },
+        },
+    },
+}
+
 
 class TestBuildDgdManifest:
-    def _write(self, tmp_path, body=_DGD_YAML):
-        f = tmp_path / "dgd.yaml"
-        f.write_text(body)
-        return f
+    def _spec(self, **kw) -> DynamoGraphSpec:
+        return DynamoGraphSpec(spec=copy.deepcopy(_INLINE_SPEC), name="my-dgd", **kw)
 
-    def test_envelope_preserved(self, tmp_path):
-        self._write(tmp_path)
-        spec = DynamoGraphSpec(manifest="dgd.yaml")
-        m = dgd.build_dgd_manifest(spec, _infra(), tmp_path)
+    def test_envelope_built(self):
+        m = dgd.build_dgd_manifest(self._spec(), _infra())
         assert m["apiVersion"] == "nvidia.com/v1alpha1"
         assert m["kind"] == "DynamoGraphDeployment"
-        assert m["metadata"]["name"] == "agg-from-disk"
+        assert m["metadata"]["name"] == "my-dgd"
         assert m["metadata"]["namespace"] == "test-ns"
 
-    def test_name_override(self, tmp_path):
-        self._write(tmp_path)
-        spec = DynamoGraphSpec(manifest="dgd.yaml", name="my-dgd")
-        m = dgd.build_dgd_manifest(spec, _infra(), tmp_path)
-        assert m["metadata"]["name"] == "my-dgd"
+    def test_spec_deep_copied(self):
+        spec = self._spec()
+        original_replicas = spec.spec["services"]["VllmDecodeWorker"]["replicas"]
+        m = dgd.build_dgd_manifest(spec, _infra())
+        m["spec"]["services"]["VllmDecodeWorker"]["replicas"] = 999
+        assert spec.spec["services"]["VllmDecodeWorker"]["replicas"] == original_replicas
 
-    def test_overrides_deep_merged(self, tmp_path):
-        self._write(tmp_path)
-        spec = DynamoGraphSpec(
-            manifest="dgd.yaml",
-            overrides={"services": {"VllmDecodeWorker": {"replicas": 1}}},
-        )
-        m = dgd.build_dgd_manifest(spec, _infra(), tmp_path)
+    def test_image_default_when_unset(self):
+        m = dgd.build_dgd_manifest(self._spec(), _infra())
         services = m["spec"]["services"]
-        # Override applied:
-        assert services["VllmDecodeWorker"]["replicas"] == 1
-        # Sibling field on the same service preserved:
-        assert services["VllmDecodeWorker"]["componentType"] == "worker"
-        # Other service untouched:
-        assert services["Frontend"]["replicas"] == 1
+        assert services["Frontend"]["extraPodSpec"]["mainContainer"]["image"] == "registry/upstream:1.0"
+        assert services["VllmDecodeWorker"]["extraPodSpec"]["mainContainer"]["image"] == "registry/img:tag"
 
-    def test_image_default_when_unset(self, tmp_path):
-        # Frontend authors its own image; VllmDecodeWorker doesn't.
-        self._write(tmp_path)
-        m = dgd.build_dgd_manifest(
-            DynamoGraphSpec(manifest="dgd.yaml"), _infra(), tmp_path
-        )
-        services = m["spec"]["services"]
-        # Author-set image survives:
-        assert (
-            services["Frontend"]["extraPodSpec"]["mainContainer"]["image"]
-            == "registry/upstream:1.0"
-        )
-        # Worker had no image — defaulted to infra.image:
-        assert (
-            services["VllmDecodeWorker"]["extraPodSpec"]["mainContainer"]["image"]
-            == "registry/img:tag"
-        )
-
-    def test_image_pull_secrets_propagated(self, tmp_path):
-        self._write(tmp_path)
-        m = dgd.build_dgd_manifest(
-            DynamoGraphSpec(manifest="dgd.yaml"), _infra(), tmp_path
-        )
+    def test_image_pull_secrets(self):
+        m = dgd.build_dgd_manifest(self._spec(), _infra())
         for svc in m["spec"]["services"].values():
             assert svc["extraPodSpec"]["imagePullSecrets"] == [{"name": "pull-secret"}]
 
-    def test_service_account_when_set(self, tmp_path):
-        self._write(tmp_path)
-        infra = _infra(serviceAccount="my-sa")
-        m = dgd.build_dgd_manifest(
-            DynamoGraphSpec(manifest="dgd.yaml"), infra, tmp_path
-        )
-        for svc in m["spec"]["services"].values():
-            assert svc["extraPodSpec"]["serviceAccountName"] == "my-sa"
-
-    def test_managed_by_label(self, tmp_path):
-        self._write(tmp_path)
-        m = dgd.build_dgd_manifest(
-            DynamoGraphSpec(manifest="dgd.yaml"), _infra(), tmp_path
-        )
+    def test_managed_by_label(self):
+        m = dgd.build_dgd_manifest(self._spec(), _infra())
         assert m["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "nrl-k8s"
 
-    def test_user_labels_merged(self, tmp_path):
-        self._write(tmp_path)
-        spec = DynamoGraphSpec(manifest="dgd.yaml", labels={"team": "rl"})
-        m = dgd.build_dgd_manifest(spec, _infra(), tmp_path)
+    def test_user_labels_merged(self):
+        spec = self._spec(labels={"team": "rl"})
+        m = dgd.build_dgd_manifest(spec, _infra())
         assert m["metadata"]["labels"]["team"] == "rl"
         assert m["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "nrl-k8s"
 
-    def test_no_auto_service_field(self, tmp_path):
-        # The dynamo operator owns Service creation; the manifest should not
-        # carry any additional Service envelope.
-        self._write(tmp_path)
-        m = dgd.build_dgd_manifest(
-            DynamoGraphSpec(manifest="dgd.yaml"), _infra(), tmp_path
-        )
-        # The output is a DGD manifest, not a multi-doc with a Service appended.
-        assert m["kind"] == "DynamoGraphDeployment"
-        assert "Service" not in (m.get("spec", {}).get("services") or {})
+    def test_user_annotations_merged(self):
+        spec = self._spec(annotations={"nvidia.com/kai-scheduler-queue": "backfill"})
+        m = dgd.build_dgd_manifest(spec, _infra())
+        assert m["metadata"]["annotations"]["nvidia.com/kai-scheduler-queue"] == "backfill"
 
-    def test_owner_ref_attached_when_provided(self, tmp_path):
-        self._write(tmp_path)
+    def test_owner_ref_attached(self):
         owner = dgd.build_owner_reference(
             api_version="ray.io/v1",
             kind="RayCluster",
             name="rc-train",
             uid="abc-123",
         )
-        m = dgd.build_dgd_manifest(
-            DynamoGraphSpec(manifest="dgd.yaml"),
-            _infra(),
-            tmp_path,
-            owner_ref=owner,
-        )
-        refs = m["metadata"]["ownerReferences"]
-        assert len(refs) == 1
-        ref = refs[0]
-        assert ref["apiVersion"] == "ray.io/v1"
-        assert ref["kind"] == "RayCluster"
-        assert ref["name"] == "rc-train"
-        assert ref["uid"] == "abc-123"
-        # Operator already controls the DGD; we're a non-controlling owner.
-        assert ref["controller"] is False
+        m = dgd.build_dgd_manifest(self._spec(), _infra(), owner_ref=owner)
+        assert len(m["metadata"]["ownerReferences"]) == 1
+        assert m["metadata"]["ownerReferences"][0]["name"] == "rc-train"
 
-    def test_no_owner_ref_when_unset(self, tmp_path):
-        self._write(tmp_path)
-        m = dgd.build_dgd_manifest(
-            DynamoGraphSpec(manifest="dgd.yaml"), _infra(), tmp_path
-        )
+    def test_no_owner_ref_when_unset(self):
+        m = dgd.build_dgd_manifest(self._spec(), _infra())
         assert "ownerReferences" not in m["metadata"]
 
 
@@ -326,15 +189,9 @@ class TestBuildOwnerReference:
 
 
 class TestResolveDgdName:
-    def test_returns_explicit_name(self, tmp_path):
-        # Manifest doesn't even need to exist when name is set.
-        spec = DynamoGraphSpec(manifest="missing.yaml", name="explicit")
-        assert dgd.resolve_dgd_name(spec, tmp_path) == "explicit"
-
-    def test_falls_back_to_manifest(self, tmp_path):
-        (tmp_path / "dgd.yaml").write_text(_DGD_YAML)
-        spec = DynamoGraphSpec(manifest="dgd.yaml")
-        assert dgd.resolve_dgd_name(spec, tmp_path) == "agg-from-disk"
+    def test_returns_name(self):
+        spec = DynamoGraphSpec(spec={"services": {}}, name="my-dgd")
+        assert dgd.resolve_dgd_name(spec) == "my-dgd"
 
 
 # =============================================================================

@@ -471,30 +471,16 @@ class TestResetEndpointRegistry:
 # =============================================================================
 
 
-_DGD_MANIFEST = """\
-apiVersion: nvidia.com/v1alpha1
-kind: DynamoGraphDeployment
-metadata:
-  name: from-disk
-spec:
-  services:
-    Frontend:
-      componentType: frontend
-      replicas: 1
-      extraPodSpec:
-        mainContainer:
-          command: ["python3", "-m", "dynamo.frontend"]
-"""
 
-
-def _loaded_with_dgd(tmp_path: Path, *, name: str | None = None) -> LoadedConfig:
+def _loaded_with_dgd(tmp_path: Path, *, name: str = "my-dgd") -> LoadedConfig:
     from omegaconf import OmegaConf
 
-    manifest_path = tmp_path / "dgd.yaml"
-    manifest_path.write_text(_DGD_MANIFEST)
     payload = _infra_payload()
     payload["dynamo"] = {
-        "serving": {"manifest": "dgd.yaml", **({"name": name} if name else {})}
+        "serving": {
+            "spec": {"services": {"Frontend": {"replicas": 1}, "VllmDecodeWorker": {"replicas": 2}}},
+            "name": name,
+        }
     }
     infra = InfraConfig.model_validate(payload)
     return LoadedConfig(
@@ -518,20 +504,20 @@ class TestEnsureDgd:
 
         name = orchestrate.ensure_dgd("serving", loaded, log=log_fn)
 
-        assert name == "from-disk"
+        assert name == "my-dgd"
         apply.assert_called_once()
-        wait.assert_called_once_with("from-disk", "ns-a", timeout_s=600)
+        wait.assert_called_once_with("my-dgd", "ns-a", timeout_s=600)
 
     def test_reuses_when_live_matches(self, tmp_path, monkeypatch, log) -> None:
         log_fn, lines = log
         loaded = _loaded_with_dgd(tmp_path)
         # Build the rendered manifest first to use it as the live spec.
         rendered = orchestrate.dgd_mod.build_dgd_manifest(
-            loaded.infra.dynamo["serving"], loaded.infra, tmp_path
+            loaded.infra.dynamo["serving"], loaded.infra
         )
         live = {
             "metadata": {
-                "name": "from-disk",
+                "name": "my-dgd",
                 "labels": {"nrl-k8s/owner": orchestrate.get_username()},
             },
             "spec": rendered["spec"],
@@ -553,7 +539,7 @@ class TestEnsureDgd:
         loaded = _loaded_with_dgd(tmp_path)
         live = {
             "metadata": {
-                "name": "from-disk",
+                "name": "my-dgd",
                 "labels": {"nrl-k8s/owner": orchestrate.get_username()},
             },
             "spec": {"services": {}},  # drifted from rendered
@@ -582,7 +568,7 @@ class TestDeleteDgd:
 
         orchestrate.delete_dgd("serving", loaded, log=log_fn)
 
-        delete.assert_called_once_with("from-disk", "ns-a")
+        delete.assert_called_once_with("my-dgd", "ns-a")
 
     def test_uses_explicit_name_override(self, tmp_path, monkeypatch, log) -> None:
         log_fn, _ = log
@@ -601,7 +587,7 @@ class TestInjectDynamoIntoRecipe:
         loaded = _loaded_with_dgd(tmp_path)
         orchestrate._inject_dynamo_into_recipe(loaded, log=log_fn)
         assert loaded.recipe.policy.generation.backend == "dynamo"
-        assert loaded.recipe.policy.generation.dynamo_cfg.dgd_name == "from-disk"
+        assert loaded.recipe.policy.generation.dynamo_cfg.dgd_name == "my-dgd"
 
     def test_explicit_name_lands_in_recipe(self, tmp_path, log) -> None:
         log_fn, _ = log
@@ -624,12 +610,10 @@ class TestInjectDynamoIntoRecipe:
         from omegaconf import OmegaConf
 
         log_fn, _ = log
-        manifest_path = tmp_path / "dgd.yaml"
-        manifest_path.write_text(_DGD_MANIFEST)
         payload = _infra_payload()
         payload["dynamo"] = {
-            "a": {"manifest": "dgd.yaml", "name": "name-a"},
-            "b": {"manifest": "dgd.yaml", "name": "name-b"},
+            "a": {"spec": {"services": {}}, "name": "name-a"},
+            "b": {"spec": {"services": {}}, "name": "name-b"},
         }
         infra = InfraConfig.model_validate(payload)
         loaded = LoadedConfig(
@@ -651,7 +635,7 @@ class TestRunInvokesDgds:
         log_fn, _ = log
         loaded = _loaded_with_dgd(tmp_path)
 
-        ensure_dgd = MagicMock(return_value="from-disk")
+        ensure_dgd = MagicMock(return_value="my-dgd")
         monkeypatch.setattr(orchestrate, "ensure_dgd", ensure_dgd)
         monkeypatch.setattr(orchestrate, "ensure_cluster", MagicMock(return_value="rc-train"))
         monkeypatch.setattr(
@@ -673,7 +657,7 @@ class TestRunInvokesDgds:
         log_fn, _ = log
         loaded = _loaded_with_dgd(tmp_path)
 
-        ensure_dgd = MagicMock(return_value="from-disk")
+        ensure_dgd = MagicMock(return_value="my-dgd")
         monkeypatch.setattr(orchestrate, "ensure_dgd", ensure_dgd)
         monkeypatch.setattr(orchestrate, "ensure_cluster", MagicMock(return_value="rc-train"))
         monkeypatch.setattr(

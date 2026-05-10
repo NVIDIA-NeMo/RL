@@ -299,29 +299,27 @@ class TestClusterSpecSegmentSize:
 
 
 class TestDynamoGraphSpec:
-    def test_minimal_payload(self) -> None:
-        spec = DynamoGraphSpec.model_validate({"manifest": "dgd.yaml"})
-        assert spec.manifest == "dgd.yaml"
-        assert spec.name is None
-        assert spec.overrides == {}
+    def test_minimal(self) -> None:
+        spec = DynamoGraphSpec.model_validate(
+            {"spec": {"services": {"Frontend": {}}}, "name": "my-dgd"}
+        )
+        assert spec.spec == {"services": {"Frontend": {}}}
+        assert spec.name == "my-dgd"
         assert spec.readyTimeoutS == 600
 
-    def test_missing_manifest_rejected(self) -> None:
+    def test_missing_name_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            DynamoGraphSpec.model_validate({})
+            DynamoGraphSpec.model_validate({"spec": {"services": {}}})
+
+    def test_missing_spec_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            DynamoGraphSpec.model_validate({"name": "x"})
 
     def test_unknown_key_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            DynamoGraphSpec.model_validate({"manifest": "x.yaml", "manifesto": "typo"})
-
-    def test_overrides_accepts_arbitrary_dict(self) -> None:
-        spec = DynamoGraphSpec.model_validate(
-            {
-                "manifest": "x.yaml",
-                "overrides": {"services": {"VllmDecodeWorker": {"replicas": 2}}},
-            }
-        )
-        assert spec.overrides["services"]["VllmDecodeWorker"]["replicas"] == 2
+            DynamoGraphSpec.model_validate(
+                {"spec": {}, "name": "x", "manifesto": "typo"}
+            )
 
 
 class TestInfraConfigDynamoField:
@@ -331,7 +329,7 @@ class TestInfraConfigDynamoField:
 
     def test_dynamo_accepted(self) -> None:
         payload = _min_infra() | {
-            "dynamo": {"serving": {"manifest": "dgd.yaml", "name": "my-dgd"}}
+            "dynamo": {"serving": {"spec": {"services": {}}, "name": "my-dgd"}}
         }
         cfg = InfraConfig.model_validate(payload)
         assert "serving" in cfg.dynamo

@@ -332,9 +332,8 @@ def ensure_dgd(
     untethered lifetimes.
     """
     spec = _require_dgd(loaded.infra, dgd_key)
-    base_dir = loaded.infra_source_path.parent
     manifest = dgd_mod.build_dgd_manifest(
-        spec, loaded.infra, base_dir, owner_ref=owner_ref
+        spec, loaded.infra, owner_ref=owner_ref
     )
     name = manifest["metadata"]["name"]
     namespace = loaded.infra.namespace
@@ -394,8 +393,7 @@ def delete_dgd(
     via owner references — we don't need to clean those up explicitly.
     """
     spec = _require_dgd(loaded.infra, dgd_key)
-    base_dir = loaded.infra_source_path.parent
-    name = spec.name or dgd_mod.resolve_dgd_name(spec, base_dir)
+    name = dgd_mod.resolve_dgd_name(spec)
     namespace = loaded.infra.namespace
     log(f"[dynamo:{dgd_key}] deleting DynamoGraphDeployment {name}")
     dgd_mod.delete_dgd(name, namespace)
@@ -764,8 +762,7 @@ def _inject_dynamo_into_recipe(loaded: LoadedConfig, *, log: callable) -> None:
     if len(loaded.infra.dynamo) != 1:
         return
     ((dgd_key, spec),) = loaded.infra.dynamo.items()
-    base_dir = loaded.infra_source_path.parent
-    resolved_name = dgd_mod.resolve_dgd_name(spec, base_dir)
+    resolved_name = dgd_mod.resolve_dgd_name(spec)
     OmegaConf.update(
         loaded.recipe, "policy.generation.backend", "dynamo", merge=False
     )

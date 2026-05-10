@@ -453,30 +453,17 @@ class DeploymentSpec(_StrictModel):
 
 
 class DynamoGraphSpec(_StrictModel):
-    """Pointer to a DynamoGraphDeployment manifest on disk.
+    """A DynamoGraphDeployment managed alongside RayClusters.
 
-    Unlike ``ClusterSpec`` / ``DeploymentSpec`` (which embed an inline
-    ``.spec`` body), this references a standalone DGD manifest file by
-    path — typically one of the recipes in ``dynamo/recipes/...``. nrl-k8s
-    loads the manifest, deep-merges ``overrides`` onto its ``.spec``,
-    optionally renames it, and patches cross-cutting infra fields before
-    applying.
-
-    Repo-relative paths resolve against the directory of the YAML file
-    that declares the ``dynamo:`` block (the standalone infra YAML when
-    split, or the recipe YAML when bundled).
+    ``spec`` is the inline DGD ``.spec`` body — the CLI wraps it in
+    ``apiVersion: nvidia.com/v1alpha1``, ``kind: DynamoGraphDeployment``,
+    ``metadata.name/namespace`` and patches cross-cutting fields (image,
+    imagePullSecrets, serviceAccount) from the top-level ``infra`` keys
+    before applying.
     """
 
-    # Path to a standalone DGD manifest file. Repo-relative paths resolve
-    # against the directory of the file declaring this block.
-    manifest: str
-    # Optional override for ``metadata.name``. Defaults to the manifest's
-    # value. OmegaConf interpolation (e.g. ``${user:}``) is handled by the
-    # config loader before the value reaches pydantic.
-    name: str | None = None
-    # Deep-merged onto the loaded manifest's ``.spec`` before apply. Use to
-    # retune replicas / resources without forking the DGD recipe.
-    overrides: dict[str, Any] = Field(default_factory=dict)
+    name: str
+    spec: dict[str, Any]
     labels: dict[str, str] = Field(default_factory=dict)
     annotations: dict[str, str] = Field(default_factory=dict)
     readyTimeoutS: int = 600

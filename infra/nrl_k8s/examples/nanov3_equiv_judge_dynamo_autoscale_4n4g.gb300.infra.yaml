@@ -204,6 +204,78 @@ kuberay:
 
 dynamo:
   serving:
-    manifest: ../examples_dgd/qwen3_30ba3b_instruct_judge_autoscale_gb300.yaml
     name: ${user:}-equiv-judge-as
     readyTimeoutS: 900
+    annotations:
+      nvidia.com/kai-scheduler-queue: backfill
+    spec:
+      services:
+        Frontend:
+          componentType: frontend
+          replicas: 1
+          resources:
+            requests: {cpu: "2", memory: "4Gi"}
+            limits:   {cpu: "4", memory: "8Gi"}
+          extraPodSpec:
+            mainContainer:
+              image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
+              workingDir: /workspace
+              command: [python3, -m, dynamo.frontend]
+              args: [--router-reset-states]
+        Planner:
+          componentType: planner
+          replicas: 1
+          resources:
+            requests: {cpu: "1", memory: "2Gi"}
+            limits:   {cpu: "2", memory: "4Gi"}
+          extraPodSpec:
+            mainContainer:
+              image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
+              command: [bash, -c]
+              args:
+                - |
+                  python3 -c "import filterpy, pmdarima, prophet, sklearn, kubernetes_asyncio" 2>/dev/null || \
+                    pip install --quiet \
+                      filterpy==1.4.5 pmdarima==2.1.1 prophet==1.2.1 \
+                      scikit-learn==1.7.2 'scipy>=1.14.0,<2.0' \
+                      kubernetes_asyncio==32.0.0 prometheus-api-client==0.6.0 \
+                      plotly aiofiles
+                  exec python3 -m dynamo.planner --config '{"environment":"kubernetes","backend":"vllm","mode":"agg","optimization_target":"sla","enable_throughput_scaling":false,"enable_load_scaling":true,"ttft":30000.0,"itl":5000.0,"throughput_adjustment_interval":60,"load_adjustment_interval":15,"min_endpoint":1,"decode_engine_num_gpu":4,"model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507","profile_results_dir":"/workspace/profiling_results"}'
+              volumeMounts:
+                - {mountPath: /workspace/profiling_results, name: planner-profile-data, readOnly: true}
+            volumes:
+              - name: planner-profile-data
+                configMap: {name: planner-profile-data}
+        VllmDecodeWorker:
+          componentType: worker
+          replicas: 4
+          resources:
+            requests: {gpu: "4", memory: "512Gi"}
+            limits:   {gpu: "4", memory: "700Gi"}
+          scalingAdapter:
+            enabled: true
+          extraPodSpec:
+            nodeSelector: *worker_node_selector
+            mainContainer:
+              image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
+              workingDir: /workspace
+              command: [python3, -m, dynamo.vllm]
+              args:
+                - --model
+                - Qwen/Qwen3-30B-A3B-Instruct-2507
+                - --tensor-parallel-size
+                - "4"
+                - --gpu-memory-utilization
+                - "0.9"
+                - --dyn-tool-call-parser
+                - hermes
+                - --kv-events-config
+                - '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}'
+              env:
+                - {name: DYN_HEALTH_CHECK_ENABLED, value: "false"}
+                - {name: HF_HOME, value: "/mnt/rl-workspace/${user:}/hf-cache"}
+              volumeMounts:
+                - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+            volumes:
+              - name: rl-workspace
+                persistentVolumeClaim: {claimName: rl-workspace}

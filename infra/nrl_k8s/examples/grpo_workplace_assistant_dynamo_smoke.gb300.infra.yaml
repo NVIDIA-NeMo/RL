@@ -175,6 +175,52 @@ kuberay:
 
 dynamo:
   serving:
-    manifest: ../examples_dgd/qwen3_4b_thinking_gb300.yaml
     name: ${user:}-dynamo-wpa-smoke
     readyTimeoutS: 900
+    annotations:
+      nvidia.com/kai-scheduler-queue: backfill
+    spec:
+      services:
+        Frontend:
+          componentType: frontend
+          replicas: 1
+          resources:
+            requests: {cpu: "2", memory: "4Gi"}
+            limits:   {cpu: "4", memory: "8Gi"}
+          extraPodSpec:
+            nodeSelector: *head_node_selector
+            mainContainer:
+              image: jwillthomson/dynamo-arm-rl-tokenize-endpoint-07c4f28:latest
+              workingDir: /workspace
+              command: [python3, -m, dynamo.frontend]
+              args: [--router-reset-states]
+        VllmDecodeWorker:
+          componentType: worker
+          replicas: 1
+          envFromSecret: jothomson-secrets
+          resources:
+            requests: {gpu: "1", memory: "64Gi"}
+            limits:   {gpu: "1", memory: "128Gi"}
+          extraPodSpec:
+            nodeSelector: *worker_node_selector
+            mainContainer:
+              image: jwillthomson/dynamo-arm-rl-tokenize-endpoint-07c4f28:latest
+              workingDir: /workspace
+              command: [python3, -m, dynamo.vllm]
+              args:
+                - --model
+                - Qwen/Qwen3-4B-Thinking-2507
+                - --tensor-parallel-size
+                - "1"
+                - --gpu-memory-utilization
+                - "0.85"
+                - --max-model-len
+                - "16384"
+                - --enforce-eager
+                - --dyn-tool-call-parser
+                - hermes
+                - --dyn-reasoning-parser
+                - qwen3
+              env:
+                - {name: DYN_HEALTH_CHECK_ENABLED, value: "false"}
+                - {name: HF_HOME, value: /tmp/hf-cache}

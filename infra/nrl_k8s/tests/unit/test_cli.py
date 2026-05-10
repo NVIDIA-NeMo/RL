@@ -500,7 +500,7 @@ def _loaded_with_dynamo(tmp_path: Path):
         {
             "namespace": "ns-a",
             "image": "img:1",
-            "dynamo": {"serving": {"manifest": "dgd.yaml", "name": "my-dgd"}},
+            "dynamo": {"serving": {"spec": {"services": {}}, "name": "my-dgd"}},
         }
     )
     return LoadedConfig(

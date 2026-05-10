@@ -191,6 +191,51 @@ kuberay:
 
 dynamo:
   serving:
-    manifest: ../examples_dgd/qwen3_30ba3b_instruct_judge_gb300.yaml
     name: ${user:}-equiv-judge-dyn
     readyTimeoutS: 900
+    annotations:
+      nvidia.com/kai-scheduler-queue: backfill
+    spec:
+      services:
+        Frontend:
+          componentType: frontend
+          replicas: 1
+          resources:
+            requests: {cpu: "2", memory: "4Gi"}
+            limits:   {cpu: "4", memory: "8Gi"}
+          extraPodSpec:
+            nodeSelector: *head_node_selector
+            mainContainer:
+              image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
+              workingDir: /workspace
+              command: [python3, -m, dynamo.frontend]
+              args: [--router-reset-states]
+        VllmDecodeWorker:
+          componentType: worker
+          replicas: 1
+          resources:
+            requests: {gpu: "4", memory: "512Gi"}
+            limits:   {gpu: "4", memory: "700Gi"}
+          extraPodSpec:
+            nodeSelector: *worker_node_selector
+            mainContainer:
+              image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
+              workingDir: /workspace
+              command: [python3, -m, dynamo.vllm]
+              args:
+                - --model
+                - Qwen/Qwen3-30B-A3B-Instruct-2507
+                - --tensor-parallel-size
+                - "4"
+                - --gpu-memory-utilization
+                - "0.9"
+                - --dyn-tool-call-parser
+                - hermes
+              env:
+                - {name: DYN_HEALTH_CHECK_ENABLED, value: "false"}
+                - {name: HF_HOME, value: "/mnt/rl-workspace/${user:}/hf-cache"}
+              volumeMounts:
+                - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+            volumes:
+              - name: rl-workspace
+                persistentVolumeClaim: {claimName: rl-workspace}

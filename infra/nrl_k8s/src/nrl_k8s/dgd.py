@@ -32,14 +32,12 @@ auto-create one here.
 
 from __future__ import annotations
 
+import copy
 import time
-from pathlib import Path
 from typing import Any
 
-import yaml
 from kubernetes import client
 from kubernetes.client.exceptions import ApiException
-from omegaconf import OmegaConf
 
 from ._logging import redact
 from ._retry import with_retries
@@ -63,43 +61,8 @@ _MANAGED_BY_LABEL = {"app.kubernetes.io/managed-by": "nrl-k8s"}
 
 
 # =============================================================================
-# Manifest loading + building
+# Manifest building
 # =============================================================================
-
-
-def load_dgd_manifest(path: str | Path, base_dir: Path) -> dict[str, Any]:
-    """Read a standalone DGD manifest from disk.
-
-    Repo-relative paths resolve against ``base_dir``. Multi-document YAML
-    files (which dynamo recipes often have — a ``DynamoGraphDeployment``
-    plus a benchmark Pod) are filtered down to the first DGD doc.
-    """
-    p = Path(path)
-    resolved = p if p.is_absolute() else (base_dir / p).resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(
-            f"DGD manifest not found: {resolved} "
-            f"(resolved from {path!r} relative to {base_dir})"
-        )
-
-    with resolved.open() as f:
-        docs = list(yaml.safe_load_all(f))
-
-    for doc in docs:
-        if not isinstance(doc, dict):
-            continue
-        if doc.get("kind") == DGD_KIND:
-            if doc.get("apiVersion") != DGD_API_VERSION:
-                raise ValueError(
-                    f"{resolved}: expected apiVersion={DGD_API_VERSION}, got "
-                    f"{doc.get('apiVersion')!r}"
-                )
-            return doc
-
-    raise ValueError(
-        f"{resolved}: no document with kind={DGD_KIND} found "
-        f"(saw kinds: {[d.get('kind') for d in docs if isinstance(d, dict)]})"
-    )
 
 
 def _walk_service_pod_specs(spec: dict[str, Any]) -> list[dict[str, Any]]:
@@ -186,58 +149,36 @@ def build_owner_reference(
 def build_dgd_manifest(
     dgd: DynamoGraphSpec,
     infra: InfraConfig,
-    base_dir: Path,
     *,
     owner_ref: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the full DGD manifest ready for ``apply_dgd``.
 
-    Steps, in order:
-      1. Load the referenced manifest from disk.
-      2. Deep-merge ``dgd.overrides`` onto its ``.spec``.
-      3. Override ``metadata.name`` if ``dgd.name`` is set.
-      4. Set ``metadata.namespace = infra.namespace``.
-      5. Merge ``dgd.labels`` / ``dgd.annotations`` and the ``managed-by`` label.
-      6. Attach ``ownerReferences`` if provided so K8s GC cascades when the
-         owning resource (typically the training RayCluster) is deleted.
-      7. Patch cross-cutting fields (image / imagePullSecrets / serviceAccount)
-         across every service's ``extraPodSpec``.
+    Wraps the inline ``dgd.spec`` in the K8s envelope (apiVersion / kind /
+    metadata), then applies cross-cutting patches (namespace, labels,
+    annotations, ownerReferences, image, imagePullSecrets, serviceAccount).
     """
-    raw = load_dgd_manifest(dgd.manifest, base_dir)
-
-    # Deep-merge overrides via OmegaConf so nested service-replicas / resource
-    # tweaks compose cleanly with the upstream recipe.
-    raw_spec = raw.get("spec") or {}
-    if dgd.overrides:
-        merged = OmegaConf.merge(
-            OmegaConf.create(raw_spec),
-            OmegaConf.create(dgd.overrides),
-        )
-        raw["spec"] = OmegaConf.to_container(merged, resolve=True)
-    else:
-        raw["spec"] = dict(raw_spec)
-
-    metadata = raw.setdefault("metadata", {})
-    if dgd.name:
-        metadata["name"] = dgd.name
-    if "name" not in metadata:
-        raise ValueError(
-            f"DGD manifest {dgd.manifest!r} has no metadata.name and "
-            f"DynamoGraphSpec.name was not set."
-        )
-    metadata["namespace"] = infra.namespace
-    metadata["labels"] = {
-        **_MANAGED_BY_LABEL,
-        **infra.labels,
-        **(metadata.get("labels") or {}),
-        **dgd.labels,
+    raw: dict[str, Any] = {
+        "apiVersion": DGD_API_VERSION,
+        "kind": DGD_KIND,
+        "metadata": {
+            "name": dgd.name,
+            "namespace": infra.namespace,
+            "labels": {
+                **_MANAGED_BY_LABEL,
+                **infra.labels,
+                **dgd.labels,
+            },
+        },
+        "spec": copy.deepcopy(dgd.spec),
     }
-    annotations = {**infra.annotations, **(metadata.get("annotations") or {}), **dgd.annotations}
+
+    annotations = {**infra.annotations, **dgd.annotations}
     if annotations:
-        metadata["annotations"] = annotations
+        raw["metadata"]["annotations"] = annotations
 
     if owner_ref is not None:
-        metadata["ownerReferences"] = [owner_ref]
+        raw["metadata"]["ownerReferences"] = [owner_ref]
 
     spec = raw["spec"]
     _patch_dgd_images(spec, infra.image)
@@ -248,22 +189,9 @@ def build_dgd_manifest(
     return raw
 
 
-def resolve_dgd_name(dgd: DynamoGraphSpec, base_dir: Path) -> str:
-    """Return the DGD's effective ``metadata.name``.
-
-    Used by the orchestrator to stamp the resolved name into the recipe
-    before staging the working_dir, without re-doing the full manifest build.
-    """
-    if dgd.name:
-        return dgd.name
-    raw = load_dgd_manifest(dgd.manifest, base_dir)
-    name = (raw.get("metadata") or {}).get("name")
-    if not name:
-        raise ValueError(
-            f"DGD manifest {dgd.manifest!r} has no metadata.name; set "
-            f"DynamoGraphSpec.name explicitly."
-        )
-    return name
+def resolve_dgd_name(dgd: DynamoGraphSpec) -> str:
+    """Return the DGD's ``metadata.name``."""
+    return dgd.name
 
 
 # =============================================================================

@@ -69,8 +69,41 @@ kuberay:
 
 dynamo:
   serving:
-    # Path resolves against this infra YAML's directory.
-    manifest: ../examples_dgd/qwen3_0.6b_kind.yaml
-    # Override the manifest's metadata.name so the run is user-scoped.
     name: ${user:}-dynamo-smoke
     readyTimeoutS: 600
+    spec:
+      services:
+        Frontend:
+          componentType: frontend
+          replicas: 1
+          resources:
+            requests: {cpu: "2", memory: "4Gi"}
+            limits:   {cpu: "4", memory: "8Gi"}
+          extraPodSpec:
+            mainContainer:
+              image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.2
+              workingDir: /workspace
+              command: [python3, -m, dynamo.frontend]
+        VllmDecodeWorker:
+          componentType: worker
+          replicas: 1
+          resources:
+            requests: {gpu: "1"}
+            limits:   {gpu: "1"}
+          extraPodSpec:
+            mainContainer:
+              image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.2
+              workingDir: /workspace
+              command: [python3, -m, dynamo.vllm]
+              args:
+                - --model
+                - Qwen/Qwen3-0.6B
+                - --tensor-parallel-size
+                - "1"
+                - --gpu-memory-utilization
+                - "0.85"
+                - --enforce-eager
+                - --max-model-len
+                - "8192"
+              env:
+                - {name: DYN_HEALTH_CHECK_ENABLED, value: "false"}

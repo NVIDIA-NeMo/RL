@@ -259,9 +259,7 @@ def check(
 
     dgd_manifests: dict[str, dict] = {}
     for key, dgd_spec in loaded.infra.dynamo.items():
-        dgd_manifests[key] = dgd_mod.build_dgd_manifest(
-            dgd_spec, loaded.infra, loaded.infra_source_path.parent
-        )
+        dgd_manifests[key] = dgd_mod.build_dgd_manifest(dgd_spec, loaded.infra)
 
     if output_path is not None:
         _dump_check_output(
@@ -663,9 +661,7 @@ def _run_rayjob(
         # the live path stamps them at apply time.
         for dgd_key, dgd_spec in loaded.infra.dynamo.items():
             click.echo("---")
-            dgd_manifest = dgd_mod.build_dgd_manifest(
-                dgd_spec, loaded.infra, loaded.infra_source_path.parent
-            )
+            dgd_manifest = dgd_mod.build_dgd_manifest(dgd_spec, loaded.infra)
             click.echo(yaml.safe_dump(dgd_manifest, sort_keys=False).rstrip())
         return
 
@@ -973,9 +969,7 @@ def cluster_up(
             if kind == "kuberay":
                 manifest = build_raycluster_manifest(spec, loaded.infra, role=key)
             elif kind == "dynamo":
-                manifest = dgd_mod.build_dgd_manifest(
-                    spec, loaded.infra, loaded.infra_source_path.parent
-                )
+                manifest = dgd_mod.build_dgd_manifest(spec, loaded.infra)
             else:
                 manifest = build_deployment_manifest(spec, loaded.infra)
             click.echo(yaml.safe_dump(manifest, sort_keys=False).rstrip())
