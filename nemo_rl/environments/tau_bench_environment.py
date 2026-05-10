@@ -68,6 +68,8 @@ class TauBenchEnvConfig(TypedDict):
         judge_api_key: API key for the judge model server. Ignored when user_strategy is "mock".
         judge_weight: Blend weight: 0.0 = pure tau-bench reward, 1.0 = pure judge score.
         mock_latency_s: Seconds to sleep per simulated LLM call in mock mode (default 0.0).
+        mock_stop_prob: Probability that the mock user simulator ends the conversation on
+            any given turn by emitting ###STOP### (default 0.2).
     """
 
     num_workers: int
@@ -83,6 +85,7 @@ class TauBenchEnvConfig(TypedDict):
     judge_api_key: NotRequired[str]
     judge_weight: NotRequired[float]
     mock_latency_s: NotRequired[float]
+    mock_stop_prob: NotRequired[float]
 
 
 class TauBenchEnvMetadata(TypedDict):
@@ -124,6 +127,7 @@ class TauBenchWorker:
         judge_base_url: Optional[str],
         judge_api_key: str,
         mock_latency_s: float = 0.0,
+        mock_stop_prob: float = 0.2,
     ) -> None:
         self._env_name = env_name
         self._task_split = task_split
@@ -145,6 +149,7 @@ class TauBenchWorker:
             import litellm as _litellm
 
             _latency = mock_latency_s
+            _stop_prob = mock_stop_prob
             _responses = [
                 "I need help with a recent order.",
                 "Can you look into this for me?",
@@ -172,7 +177,8 @@ class TauBenchWorker:
 
             def _mock_completion(*args: Any, **kwargs: Any) -> "_Resp":
                 time.sleep(_latency)
-                return _Resp(random.choice(_responses))
+                content = "###STOP###" if random.random() < _stop_prob else random.choice(_responses)
+                return _Resp(content)
 
             _litellm.completion = _mock_completion  # type: ignore[method-assign]
         else:
@@ -459,6 +465,7 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
                 judge_base_url=cfg.get("judge_base_url"),
                 judge_api_key=cfg.get("judge_api_key", "dummy"),
                 mock_latency_s=cfg.get("mock_latency_s", 0.0),
+                mock_stop_prob=cfg.get("mock_stop_prob", 0.2),
             )
             for _ in range(self._num_workers)
         ]

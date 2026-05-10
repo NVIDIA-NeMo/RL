@@ -91,11 +91,12 @@ env:
     judge_base_url: null # unused when judge_model="mock"
     judge_api_key: null # unused when judge_model="mock"
     judge_weight: 0.3   # 70% task-completion + 30% judge score
-    mock_latency_s: 0.5 # how much time to wait before returning mock user/judge generations
+    mock_latency_s: 0.1 # how much time to wait before returning mock user/judge generations
+    mock_stop_prob: 0.4
 
 logger:
   log_dir: "logs"
-  wandb_enabled: true #false
+  wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false
   swanlab_enabled: false
