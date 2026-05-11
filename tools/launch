@@ -181,7 +181,7 @@ sbatch \\
     --account=$ACCOUNT \\
     --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} \\
     --partition=$PARTITION \\
-    --time=0:${NUM_MINUTES}:0 ${GRES_ARG}\\
+    --time=$NUM_MINUTES ${GRES_ARG}\\
     --output=slurm-${NOW}-%j-${JOB_NAME}-${i}.${NUM_RUNS}.out \\
     ray.sub
 EOF
