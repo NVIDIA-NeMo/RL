@@ -351,6 +351,68 @@ def list_dgds(namespace: str, label_selector: str | None = None) -> list[dict]:
     return resp.get("items", [])
 
 
+def _all_dgd_pods_ready(name: str, namespace: str) -> bool:
+    """True if every pod owned by the DGD has all containers Ready.
+
+    The DGD operator marks ``.status.state == successful`` once it has
+    reconciled the desired-vs-observed pod count, but that fires BEFORE
+    the pods' containers have passed their readiness probes. Without
+    this gate, ``wait_for_dgd_ready`` can return while pods are still
+    in ``ContainerCreating`` / image-pull / readiness-probe-failing,
+    and the caller hits "connection refused" on the first request.
+    """
+    core = client.CoreV1Api()
+    try:
+        pods = with_retries(
+            lambda: core.list_namespaced_pod(
+                namespace=namespace,
+                label_selector=f"nvidia.com/dynamo-graph-deployment-name={name}",
+            )
+        ).items
+    except ApiException:
+        return False
+    if not pods:
+        return False
+    for pod in pods:
+        statuses = (pod.status.container_statuses or []) if pod.status else []
+        if not statuses:
+            return False
+        if not all(cs.ready for cs in statuses):
+            return False
+    return True
+
+
+def _frontend_http_ready(name: str, namespace: str) -> bool:
+    """True if the DGD frontend's :8000 listener answers a real request.
+
+    The pod can be Ready (its kubelet probe is just a TCP connect)
+    well before the python ``dynamo.frontend`` process has bound to
+    the OpenAI port. We confirm with an HTTP request via the K8s API
+    server's service proxy — works without standing up our own
+    port-forward, and 503 / 404 / 200 all indicate the listener is
+    accepting connections.
+    """
+    svc_name = f"{name}-frontend"
+    core = client.CoreV1Api()
+    try:
+        core.connect_get_namespaced_service_proxy_with_path(
+            name=f"{svc_name}:8000",
+            namespace=namespace,
+            path="v1/models",
+        )
+        return True
+    except ApiException as e:
+        # 503 (no upstream yet), 502 (proxy can't reach pod), connection
+        # refused — all "not ready". A 404 from the OpenAI endpoint
+        # itself means the listener IS up and answering, just doesn't
+        # recognize the path — treat as ready.
+        if e.status == 404:
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def wait_for_dgd_ready(
     name: str,
     namespace: str,
@@ -358,28 +420,40 @@ def wait_for_dgd_ready(
     timeout_s: int = 600,
     poll_s: int = 5,
 ) -> None:
-    """Block until ``.status.state == successful`` or time out.
+    """Block until the DGD is operator-successful AND its pods + frontend
+    are actually serving, or time out.
 
-    Raises ``RuntimeError`` immediately on ``failed`` so the caller doesn't
-    keep waiting on a dead DGD.
+    Three-gate check: operator state must be ``successful``, every pod
+    owned by the DGD must have all containers Ready, and the frontend
+    service must answer an HTTP request via the API server proxy. The
+    middle and last gates close the race where the operator reports
+    success before pods are actually accepting traffic.
+
+    Raises ``RuntimeError`` immediately on ``failed`` so the caller
+    doesn't keep waiting on a dead DGD.
     """
     deadline = time.monotonic() + timeout_s
     state: str | None = None
     while time.monotonic() < deadline:
         obj = get_dgd(name, namespace)
         state = (obj or {}).get("status", {}).get("state")
-        if state == _DGD_STATE_TERMINAL_GOOD:
-            return
         if state == _DGD_STATE_TERMINAL_BAD:
             conds = (obj or {}).get("status", {}).get("conditions", [])
             raise RuntimeError(
                 f"DynamoGraphDeployment {name} in {namespace} reached state=failed; "
                 f"conditions={conds!r}"
             )
+        if (
+            state == _DGD_STATE_TERMINAL_GOOD
+            and _all_dgd_pods_ready(name, namespace)
+            and _frontend_http_ready(name, namespace)
+        ):
+            return
         time.sleep(poll_s)
     raise TimeoutError(
         f"DynamoGraphDeployment {name} in {namespace} never reached state="
-        f"{_DGD_STATE_TERMINAL_GOOD!r} (last seen: {state!r}) after {timeout_s}s"
+        f"{_DGD_STATE_TERMINAL_GOOD!r} with all pods Ready + frontend HTTP-ready "
+        f"(last seen: {state!r}) after {timeout_s}s"
     )
 
 
