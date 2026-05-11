@@ -95,6 +95,46 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+@contextmanager
+def _meta_metadata_context():
+    """Skip real GPU work during metadata enumeration.
+
+    Bridge's ``export_hf_weights`` does PP/TP/EP gathers to materialize
+    full unsharded tensors, but the refit-info builders only need shape+dtype.
+    Patch the allocators to redirect to ``meta`` and turn the collectives into
+    no-ops.  Subsequent shape-only ops on meta tensors propagate correctly,
+    while peak memory stays at zero extra GiB.
+    """
+    real_all_gather = torch.distributed.all_gather
+    real_broadcast = torch.distributed.broadcast
+    real_empty_like = torch.empty_like
+    real_zeros_like = torch.zeros_like
+
+    def _meta_empty_like(t, *a, **k):
+        return torch.empty(t.shape, dtype=t.dtype, device="meta")
+
+    def _meta_zeros_like(t, *a, **k):
+        return torch.zeros(t.shape, dtype=t.dtype, device="meta")
+
+    def _noop_all_gather(tensor_list, tensor, *a, **k):
+        return None
+
+    def _noop_broadcast(tensor, src, *a, **k):
+        return None
+
+    torch.distributed.all_gather = _noop_all_gather
+    torch.distributed.broadcast = _noop_broadcast
+    torch.empty_like = _meta_empty_like
+    torch.zeros_like = _meta_zeros_like
+    try:
+        yield
+    finally:
+        torch.distributed.all_gather = real_all_gather
+        torch.distributed.broadcast = real_broadcast
+        torch.empty_like = real_empty_like
+        torch.zeros_like = real_zeros_like
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
@@ -968,8 +1008,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
         # Reuse shared iterator that appends FP8 KV/Q scales when enabled
-        for name, tensor in self._iter_params_with_optional_kv_scales():
-            refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
+        with _meta_metadata_context():
+            for name, tensor in self._iter_params_with_optional_kv_scales():
+                refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
         return refit_param_info_hf
 
@@ -1350,11 +1391,12 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         state_dict_metadata = {}
-        for name, tensor in self._iter_params_with_optional_kv_scales():
-            state_dict_metadata[name] = {
-                "shape": list(tensor.shape),
-                "dtype": str(self.dtype),
-            }
+        with _meta_metadata_context():
+            for name, tensor in self._iter_params_with_optional_kv_scales():
+                state_dict_metadata[name] = {
+                    "shape": list(tensor.shape),
+                    "dtype": str(self.dtype),
+                }
 
         pp_size = train_parallelism.get("pp_size", 1)
         layer_to_pp_stage = (
@@ -1371,42 +1413,34 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         )
         return self.nccl_reshard_refit_info
 
-    def get_src_dtensor(self, param_info):
-        """Get a DTensorRef for a source parameter to use with xferdtensor_golden.
+    def _get_src_local_tensor(self, param_info, expert_groups, gen_tp_size):
+        """Get the TP/EP-local source tensor for one param.
 
-        Takes a ``param_info`` dict (from ``nccl_reshard_refit_info``) and
-        returns a DTensorRef wrapping the TP-local shard with the global shape.
-        The returned object satisfies the xferdtensor_golden interface:
-        ``.shape`` is the global shape and ``._local_tensor`` is the local shard.
-
-        Must be called after ``_param_map`` is populated (inside ``nccl_reshard_refit``).
+        For fused MoE entries (``_moe_kind`` set), build the fused tensor on
+        demand from ``_param_map``.  For everything else, return the existing
+        ``_param_map`` view directly.  Returns ``None`` if not on this rank
+        (e.g. layer owned by a different PP stage and PP filtering didn't
+        already skip the param).
         """
-        from nemo_rl.distributed.nccl_reshard_utils import DTensorRef
-
         name = param_info["name"]
-        # Check fused MoE expert params first
-        if hasattr(self, "_fused_expert_map") and name in self._fused_expert_map:
-            tensor = self._fused_expert_map[name]
-        else:
-            tensor = self._param_map[name]
-        return DTensorRef(local_tensor=tensor, global_shape=param_info["global_shape"])
+        kind = param_info.get("_moe_kind")
+        if kind:
+            return self._fuse_one_moe_param(kind, name, expert_groups, gen_tp_size)
+        return self._param_map.get(name)
 
-    def _fuse_expert_params(self):
-        """Build fused MoE expert tensors (w13/w2) from individual expert params.
+    def _build_expert_groups(self):
+        """Group individual expert params from ``_param_map`` by (prefix, proj_type).
 
-        Called after ``_param_map`` is populated with individual expert params.
-        Groups individual expert params by (prefix, projection_type) from the
-        current worker's ``_param_map`` (rank-agnostic — works regardless of
-        which expert indices this EP rank owns).
+        Pure regex grouping — no tensor allocations.  Returns
+        ``{(prefix, proj): [(expert_idx, param_name), ...]}`` sorted by
+        expert index.  Used by ``_fuse_one_moe_param`` to look up the
+        constituent gate/up/down tensors for a fused w13/w2 entry.
         """
         import re
 
         expert_re = re.compile(
             r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
         )
-        self._fused_expert_map = {}
-
-        # Group individual expert params from _param_map by (prefix, proj_type)
         groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
         for name in self._param_map:
             m = expert_re.match(name)
@@ -1415,65 +1449,60 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 idx = int(m.group(2))
                 proj = m.group(3)
                 groups.setdefault((prefix, proj), []).append((idx, name))
-
-        # Sort each group by expert index
         for key in groups:
             groups[key].sort()
+        return groups
 
-        # Build fused tensors for each fused entry in refit_info
-        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
-            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
-                layer_name
-            ]:
-                kind = param_info.get("_moe_kind")
-                if not kind:
-                    continue
-                fused_name = param_info["name"]
-                if fused_name in self._fused_expert_map:
-                    continue
+    def _fuse_one_moe_param(self, kind, fused_name, expert_groups, gen_tp_size):
+        """Build a single fused MoE tensor (w13 or w2) on demand.
 
-                if kind == "w13":
-                    # w13: fuse gate + up per expert, then stack.
-                    # vLLM expects per-rank w13[:, :P] = gate[r*P:(r+1)*P] and
-                    # w13[:, P:2P] = up[r*P:(r+1)*P] (P = intermediate / gen_tp_size).
-                    # Build the global tensor so that contiguous Shard(1) slicing
-                    # by gen TP yields that layout: dim 1 must be
-                    # [gate[0:P], up[0:P], gate[P:2P], up[P:2P], ...].
-                    prefix = fused_name.rsplit(".w13_weight", 1)[0]
-                    gate_group = groups.get((prefix, "gate_proj"), [])
-                    up_group = groups.get((prefix, "up_proj"), [])
-                    gen_tp_size = self.nccl_reshard_refit_info.get("gen_tp_size", 1)
-                    expert_tensors = []
-                    for (_, gn), (_, un) in zip(gate_group, up_group):
-                        gate = self._param_map[gn]
-                        up = self._param_map[un]
-                        if gen_tp_size > 1:
-                            inter, hidden = gate.shape
-                            assert inter % gen_tp_size == 0, (
-                                f"intermediate {inter} not divisible by gen_tp_size {gen_tp_size}"
-                            )
-                            P = inter // gen_tp_size
-                            stacked = torch.cat(
-                                [
-                                    gate.view(gen_tp_size, P, hidden),
-                                    up.view(gen_tp_size, P, hidden),
-                                ],
-                                dim=1,
-                            )  # [gen_tp_size, 2P, hidden]
-                            expert_tensors.append(
-                                stacked.reshape(2 * inter, hidden).contiguous()
-                            )
-                        else:
-                            expert_tensors.append(torch.cat([gate, up], dim=0))
-                    if expert_tensors:
-                        self._fused_expert_map[fused_name] = torch.stack(expert_tensors)
-                elif kind == "w2":
-                    # w2: stack down_proj per expert
-                    prefix = fused_name.rsplit(".w2_weight", 1)[0]
-                    down_group = groups.get((prefix, "down_proj"), [])
-                    expert_tensors = [self._param_map[n] for _, n in down_group]
-                    if expert_tensors:
-                        self._fused_expert_map[fused_name] = torch.stack(expert_tensors)
+        Returns the local (TP/EP) shard of the fused tensor, or ``None`` if
+        no local experts contribute to this fused entry (e.g. the layer is
+        not on this PP rank).  Caller is responsible for releasing the
+        returned tensor after the per-param transfer completes — this lets
+        peak memory stay at ~one fused tensor instead of the full
+        ``_fused_expert_map``.
+        """
+        if kind == "w13":
+            # vLLM expects per-rank w13[:, :P] = gate[r*P:(r+1)*P] and
+            # w13[:, P:2P] = up[r*P:(r+1)*P] (P = intermediate / gen_tp_size).
+            # Build the global tensor so that contiguous Shard(1) slicing
+            # by gen TP yields that layout: dim 1 must be
+            # [gate[0:P], up[0:P], gate[P:2P], up[P:2P], ...].
+            prefix = fused_name.rsplit(".w13_weight", 1)[0]
+            gate_group = expert_groups.get((prefix, "gate_proj"), [])
+            up_group = expert_groups.get((prefix, "up_proj"), [])
+            expert_tensors = []
+            for (_, gn), (_, un) in zip(gate_group, up_group):
+                gate = self._param_map[gn]
+                up = self._param_map[un]
+                if gen_tp_size > 1:
+                    inter, hidden = gate.shape
+                    assert inter % gen_tp_size == 0, (
+                        f"intermediate {inter} not divisible by gen_tp_size {gen_tp_size}"
+                    )
+                    P = inter // gen_tp_size
+                    stacked = torch.cat(
+                        [
+                            gate.view(gen_tp_size, P, hidden),
+                            up.view(gen_tp_size, P, hidden),
+                        ],
+                        dim=1,
+                    )  # [gen_tp_size, 2P, hidden]
+                    expert_tensors.append(
+                        stacked.reshape(2 * inter, hidden).contiguous()
+                    )
+                else:
+                    expert_tensors.append(torch.cat([gate, up], dim=0))
+            return torch.stack(expert_tensors) if expert_tensors else None
+
+        if kind == "w2":
+            prefix = fused_name.rsplit(".w2_weight", 1)[0]
+            down_group = expert_groups.get((prefix, "down_proj"), [])
+            expert_tensors = [self._param_map[n] for _, n in down_group]
+            return torch.stack(expert_tensors) if expert_tensors else None
+
+        raise ValueError(f"Unknown _moe_kind: {kind!r}")
 
     @torch.no_grad()
     def nccl_reshard_refit(self, kv_scales=None):
@@ -1490,13 +1519,19 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 "FP8 kvcache is not currently supported for nccl_reshard refit path."
             )
 
+        from nemo_rl.distributed.nccl_reshard_utils import DTensorRef
+
         # Build map of param_name -> TP-local shard (no PP broadcast / TP gather)
         self._param_map = {}
         for name, tensor in self._iter_local_hf_params():
             self._param_map[name] = tensor
 
-        # Fuse individual MoE expert params into w13/w2 stacked tensors
-        self._fuse_expert_params()
+        # MoE: precompute the (prefix, proj) -> [(idx, name)] grouping once.
+        # The actual fused w13/w2 tensors are built lazily inside the loop
+        # below — one at a time, freed immediately after the transfer — so
+        # peak memory stays at one fused param instead of all layers'.
+        expert_groups = self._build_expert_groups()
+        gen_tp_size = self.nccl_reshard_refit_info.get("gen_tp_size", 1)
 
         use_per_stage = hasattr(self, "pp_comm_group")
 
@@ -1511,7 +1546,16 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 else:
                     group = self.model_update_group
 
-                src_tensor = self.get_src_dtensor(param_info)
+                local = self._get_src_local_tensor(
+                    param_info, expert_groups, gen_tp_size
+                )
+                src_tensor = (
+                    DTensorRef(
+                        local_tensor=local, global_shape=param_info["global_shape"]
+                    )
+                    if local is not None
+                    else None
+                )
                 xferdtensor_golden(
                     src_tensor,
                     param_info["src_mesh_info"],
@@ -1521,10 +1565,12 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     param_info["dst_placements"],
                     group,
                 )
+                # Drop refs to the per-iteration fused tensor so its CUDA
+                # memory is released back to the caching allocator before
+                # the next iteration's fusion allocates.
+                del local, src_tensor
 
         del self._param_map
-        if hasattr(self, "_fused_expert_map"):
-            del self._fused_expert_map
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)

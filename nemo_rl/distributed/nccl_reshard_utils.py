@@ -417,7 +417,12 @@ def build_mesh_info(
 ) -> tuple:
     """Build a ``MeshInfo`` and *dim_map* from a parallelism config.
 
-    Dimension ordering (inner->outer): tp, ep, dp, pp.
+    Dimension ordering (inner->outer): ep, tp, dp, pp.  EP is innermost so
+    that ``global_rank % ep_size`` recovers the EP coord — matching
+    Megatron-Core's rank layout for MoE configs.  TP is next innermost,
+    matching the standard ``tp_rank = global_rank // ep_size % tp_size``
+    layout that Megatron uses for non-expert params when EP=1.
+
     Trivial (size-1) dimensions are dropped.
 
     Returns:
@@ -623,23 +628,46 @@ def build_nccl_reshard_refit_info(
     state_dict_metadata = fuse_expert_params_in_metadata(state_dict_metadata)
 
     pp_size = train_parallelism.get("pp_size", 1)
+    tp_size = train_parallelism.get("tp_size", 1)
+    ep_size = train_parallelism.get("ep_size", 1)
     use_per_stage = layer_to_pp_stage is not None and pp_size > 1
+
+    # Megatron-Core with ETP=1 gives non-expert and expert params *different*
+    # rank-to-coord layouts on the same physical ranks: for non-expert params,
+    # ranks are partitioned (tp, dp); for expert params, ranks are partitioned
+    # (ep, edp).  TP and EP are not jointly indexable on a single rectangular
+    # mesh (the coords aren't independent — e.g. EP4×TP2 has tp=r%2 AND
+    # ep=r%4 on the same rank).  We therefore build two src meshes per stage
+    # and pick per-param based on whether the param is a MoE expert weight.
+    def _build_train_src_meshes(num_gpus: int, rank_offset: int, stage_pp: int):
+        ne_mesh, ne_dim_map = build_mesh_info(
+            num_gpus,
+            rank_offset=rank_offset,
+            tp_size=tp_size,
+            ep_size=1,
+            pp_size=stage_pp,
+        )
+        ex_mesh, ex_dim_map = build_mesh_info(
+            num_gpus,
+            rank_offset=rank_offset,
+            tp_size=1,
+            ep_size=ep_size,
+            pp_size=stage_pp,
+        )
+        return (ne_mesh, ne_dim_map), (ex_mesh, ex_dim_map)
 
     if use_per_stage:
         # Per-PP-stage meshes: within each sub-group, train ranks are
         # 0..train_ranks_per_stage-1 and gen ranks follow immediately after.
         train_ranks_per_stage = train_world_size // pp_size
-        per_stage_parallelism = {
-            "tp_size": train_parallelism.get("tp_size", 1),
-            "ep_size": train_parallelism.get("ep_size", 1),
-            "pp_size": 1,
-        }
-        per_stage_src = {}
+        per_stage_src_nonexpert = {}
+        per_stage_src_expert = {}
         for s in range(pp_size):
-            mesh, dim_map = build_mesh_info(
-                train_ranks_per_stage, rank_offset=0, **per_stage_parallelism
+            ne, ex = _build_train_src_meshes(
+                train_ranks_per_stage, rank_offset=0, stage_pp=1
             )
-            per_stage_src[s] = (mesh, dim_map)
+            per_stage_src_nonexpert[s] = ne
+            per_stage_src_expert[s] = ex
 
         # dst mesh: gen ranks start at train_ranks_per_stage within each sub-group
         dst_mesh, dst_dim_map = build_mesh_info(
@@ -648,14 +676,9 @@ def build_nccl_reshard_refit_info(
             **{k: gen_parallelism.get(k, 1) for k in ("tp_size", "ep_size", "pp_size")},
         )
     else:
-        # Single global mesh (PP=1 or no per-stage mapping)
-        src_mesh, src_dim_map = build_mesh_info(
-            train_world_size,
-            rank_offset=0,
-            **{
-                k: train_parallelism.get(k, 1)
-                for k in ("tp_size", "ep_size", "pp_size")
-            },
+        # Single global mesh pair (PP=1 or no per-stage mapping)
+        (src_mesh_ne, src_dim_map_ne), (src_mesh_ex, src_dim_map_ex) = (
+            _build_train_src_meshes(train_world_size, rank_offset=0, stage_pp=pp_size)
         )
         dst_mesh, dst_dim_map = build_mesh_info(
             gen_world_size,
@@ -667,10 +690,15 @@ def build_nccl_reshard_refit_info(
     for name, meta in state_dict_metadata.items():
         layer = _extract_layer_name(name)
         ndim = len(meta["shape"])
+        expert = is_expert_param(name)
 
         if use_per_stage:
             stage = layer_to_pp_stage.get(layer, 0)
-            stage_src_mesh, stage_src_dim_map = per_stage_src[stage]
+            stage_src_mesh, stage_src_dim_map = (
+                per_stage_src_expert[stage]
+                if expert
+                else per_stage_src_nonexpert[stage]
+            )
             info = {
                 "name": name,
                 "global_shape": tuple(meta["shape"]),
@@ -682,12 +710,17 @@ def build_nccl_reshard_refit_info(
                 "dst_placements": get_placements(name, dst_dim_map, ndim),
             }
         else:
+            this_src_mesh, this_src_dim_map = (
+                (src_mesh_ex, src_dim_map_ex)
+                if expert
+                else (src_mesh_ne, src_dim_map_ne)
+            )
             info = {
                 "name": name,
                 "global_shape": tuple(meta["shape"]),
                 "dtype": meta["dtype"],
-                "src_mesh_info": src_mesh,
-                "src_placements": get_placements(name, src_dim_map, ndim),
+                "src_mesh_info": this_src_mesh,
+                "src_placements": get_placements(name, this_src_dim_map, ndim),
                 "dst_mesh_info": dst_mesh,
                 "dst_placements": get_placements(name, dst_dim_map, ndim),
             }
