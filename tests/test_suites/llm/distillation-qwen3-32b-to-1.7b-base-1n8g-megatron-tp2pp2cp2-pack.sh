@@ -8,6 +8,8 @@ STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=60
+MODEL_FAMILY=qwen3
+TEST_TYPE=distillation
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

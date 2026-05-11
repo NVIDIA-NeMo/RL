@@ -8,6 +8,8 @@ STEPS_PER_RUN=20  # step_time ~ 10sec
 MAX_STEPS=20
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=30 # Usually 15 minutes is enough for 20 steps, but we add a buffer of 3 minutes in metrics check (30min to buffer for initial ckpt download)
+MODEL_FAMILY=nemotron-nano-v3
+TEST_TYPE=sft
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

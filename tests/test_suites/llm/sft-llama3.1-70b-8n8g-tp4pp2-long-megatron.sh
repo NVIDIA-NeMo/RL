@@ -8,6 +8,8 @@ STEPS_PER_RUN=300
 MAX_STEPS=300
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
+MODEL_FAMILY=llama3.1
+TEST_TYPE=sft
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

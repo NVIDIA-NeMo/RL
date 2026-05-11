@@ -9,6 +9,8 @@ STEPS_PER_RUN=50
 MAX_STEPS=50
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
 NUM_MINUTES=180
+MODEL_FAMILY=qwen3
+TEST_TYPE=grpo
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

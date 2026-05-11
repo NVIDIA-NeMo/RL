@@ -8,6 +8,8 @@ STEPS_PER_RUN=40
 MAX_STEPS=40
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
+MODEL_FAMILY=deepscaler
+TEST_TYPE=grpo
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

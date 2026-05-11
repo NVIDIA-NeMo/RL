@@ -9,6 +9,8 @@ STEPS_PER_RUN=20  # step_time ~ 15sec
 MAX_STEPS=20
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=60
+MODEL_FAMILY=nemotron-nano-v3
+TEST_TYPE=sft
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
