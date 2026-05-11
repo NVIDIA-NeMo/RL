@@ -16,7 +16,7 @@ import contextlib
 import gc
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Optional
+from typing import Any, Generator, Iterable, Optional
 
 import ray
 import torch
@@ -55,6 +55,7 @@ from nemo_rl.models.automodel.train import (
     LogprobsPostProcessor,
     LossPostProcessor,
     ScorePostProcessor,
+    GlobalTopkLogitsPostProcessor,
     TopkLogitsPostProcessor,
     aggregate_training_statistics,
     automodel_forward_backward,
@@ -345,6 +346,7 @@ class DTensorPolicyWorkerV2Impl(
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         if gbs is None:
@@ -361,7 +363,7 @@ class DTensorPolicyWorkerV2Impl(
         num_global_batches = int(total_dataset_size.item()) // gbs
 
         # Validate sequence dimension
-        sequence_dim, _ = check_sequence_dim(data)
+        sequence_dim, _ = check_sequence_dim(data, skip_keys=skip_keys)
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -788,6 +790,106 @@ class DTensorPolicyWorkerV2Impl(
             torch.cat(all_topk_idx_padded, dim=0)
             if len(all_topk_idx_padded) > 1
             else all_topk_idx_padded[0]
+        ).cpu()
+        return ret
+
+    def get_global_topk_logits(
+        self,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        """Return per-sample global top-k teacher logits.
+
+        Computes one ``vocab_topk`` subset per sample (max over positions,
+        then top-k over vocab) and returns the full sequence's logits at
+        those columns. Used by cross-tokenizer distillation to enable
+        chunk-averaged KL with a stable vocab axis.
+
+        Returns:
+            BatchedDataDict with:
+              - ``topk_logits``: [B, S, k]
+              - ``topk_indices``: [B, k] (per-sample, position-independent)
+
+        v0: TP=1, CP=1, no sequence packing.
+        """
+        topk_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
+
+        out_topk_vals: list[torch.Tensor] = []
+        out_topk_idx: list[torch.Tensor] = []
+        self.model.eval()
+
+        post_processor = GlobalTopkLogitsPostProcessor(
+            cfg=self.cfg,
+            device_mesh=self.device_mesh,
+            cp_mesh=self.cp_mesh,
+            tp_mesh=self.tp_mesh,
+            cp_size=self.cp_size,
+            k=k,
+            enable_seq_packing=self.enable_seq_packing,
+        )
+
+        with torch.no_grad():
+            data.to("cuda")
+            processed_iterator, iterator_len = get_microbatch_iterator(
+                data,
+                self.cfg,
+                topk_batch_size,
+                self.dp_mesh,
+                tokenizer=self.tokenizer,
+                cp_size=self.cp_size,
+            )
+            for batch_idx, processed_mb in enumerate(processed_iterator):
+                processed_inputs = processed_mb.processed_inputs
+                with get_train_context(
+                    cp_size=self.cp_size,
+                    cp_mesh=self.cp_mesh,
+                    cp_buffers=processed_inputs.cp_buffers,
+                    sequence_dim=sequence_dim,
+                    dtype=self.dtype,
+                    autocast_enabled=self.autocast_enabled,
+                ):
+                    (vals, idx), _metrics, _ = forward_with_post_processing_fn(
+                        model=self.model,
+                        post_processing_fn=post_processor,
+                        processed_mb=processed_mb,
+                        is_reward_model=False,
+                        allow_flash_attn_args=self.allow_flash_attn_args,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                    )
+                if batch_idx >= iterator_len:
+                    continue
+                out_topk_vals.append(vals.cpu())
+                out_topk_idx.append(idx.cpu())
+
+        ret = BatchedDataDict[Any]()
+        # Pad each microbatch's vals along the sequence dim to the common
+        # length so concatenation on dim 0 matches the input batch shape.
+        # idx has no sequence dim and concatenates directly.
+        all_vals_padded = []
+        target_seq_len = seq_dim_size
+        for vals in out_topk_vals:
+            pad_needed = target_seq_len - vals.shape[1]
+            if pad_needed > 0:
+                vals = torch.nn.functional.pad(
+                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
+                )
+            all_vals_padded.append(vals)
+        ret["topk_logits"] = (
+            torch.cat(all_vals_padded, dim=0)
+            if len(all_vals_padded) > 1
+            else all_vals_padded[0]
+        ).cpu()
+        ret["topk_indices"] = (
+            torch.cat(out_topk_idx, dim=0)
+            if len(out_topk_idx) > 1
+            else out_topk_idx[0]
         ).cpu()
         return ret
 

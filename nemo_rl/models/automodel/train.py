@@ -58,6 +58,7 @@ PostProcessingFunction = Union[
     "LossPostProcessor",
     "LogprobsPostProcessor",
     "TopkLogitsPostProcessor",
+    "GlobalTopkLogitsPostProcessor",
     "ScorePostProcessor",
 ]
 
@@ -323,7 +324,12 @@ def forward_with_post_processing_fn(
     # Score computations should use unscaled logits
     if isinstance(
         post_processing_fn,
-        (LossPostProcessor, LogprobsPostProcessor, TopkLogitsPostProcessor),
+        (
+            LossPostProcessor,
+            LogprobsPostProcessor,
+            TopkLogitsPostProcessor,
+            GlobalTopkLogitsPostProcessor,
+        ),
     ):
         # Temperature scaling is element-wise, directly applying it here.
         # Other sampling parameters like top-k and top-p need the logits from whole vocabulary,
@@ -341,7 +347,8 @@ def forward_with_post_processing_fn(
             sequence_dim=sequence_dim,
         )
     elif isinstance(
-        post_processing_fn, (LogprobsPostProcessor, TopkLogitsPostProcessor)
+        post_processing_fn,
+        (LogprobsPostProcessor, TopkLogitsPostProcessor, GlobalTopkLogitsPostProcessor),
     ):
         result = post_processing_fn(
             logits=logits,
@@ -926,6 +933,88 @@ class TopkLogitsPostProcessor:
             vals = unpacked_vals
             idx = unpacked_idx
 
+        return vals, idx
+
+
+class GlobalTopkLogitsPostProcessor:
+    """Post-processor for global top-k logits (single vocab subset per sample).
+
+    Used by cross-tokenizer distillation: the teacher's vocab axis is reduced
+    to one ``vocab_topk`` subset *per sample* (max over positions, then top-k
+    over vocab) so the same vocab columns are kept across every position.
+    This makes chunk-averaged KL well-defined when student and teacher chunks
+    span multiple positions — every position carries the same vocab axis.
+
+    Output:
+        vals: ``[B, S, k]`` teacher logits at the selected ``k`` columns.
+        idx:  ``[B, k]`` teacher vocab ids selected per sample.
+
+    v0 limitation: only the no-TP, no-CP, no-seq-packing path is implemented.
+    The post-processor asserts on the unsupported configurations because
+    distributed global top-k requires TP-aware reduction that isn't on the
+    smoke-test path.
+    """
+
+    def __init__(
+        self,
+        cfg: PolicyConfig,
+        device_mesh: Any,
+        cp_mesh: Any,
+        tp_mesh: Any,
+        cp_size: int,
+        k: int,
+        enable_seq_packing: bool = False,
+    ):
+        self.cfg = cfg
+        self.device_mesh = device_mesh
+        self.cp_mesh = cp_mesh
+        self.tp_mesh = tp_mesh
+        self.cp_size = cp_size
+        self.k = k
+        self.enable_seq_packing = enable_seq_packing
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        data_dict: BatchedDataDict[Any],
+        processed_inputs: Any,
+        original_batch_size: int,
+        original_seq_len: int,
+        sequence_dim: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.cp_size > 1:
+            raise NotImplementedError(
+                "GlobalTopkLogitsPostProcessor: context_parallel_size > 1 is "
+                "not supported in v0."
+            )
+        if self.enable_seq_packing:
+            raise NotImplementedError(
+                "GlobalTopkLogitsPostProcessor: sequence packing is not "
+                "supported in v0."
+            )
+        if isinstance(logits, DTensor):
+            tp_group = self.tp_mesh.get_group() if self.tp_mesh is not None else None
+            tp_size = (
+                torch.distributed.get_world_size(tp_group)
+                if tp_group is not None
+                else 1
+            )
+            if tp_size > 1:
+                raise NotImplementedError(
+                    "GlobalTopkLogitsPostProcessor: tensor_parallel_size > 1 "
+                    "is not supported in v0."
+                )
+            logits = logits.to_local()
+
+        full_logits = logits.to(torch.float32)  # [B, S, V]
+        # Per-sample max over positions, then top-k over vocab.
+        per_vocab_max = full_logits.max(dim=1).values  # [B, V]
+        _, idx = torch.topk(per_vocab_max, k=self.k, dim=-1)  # [B, k]
+        # Gather the selected k columns at every position for each sample.
+        # full_logits: [B, S, V], idx: [B, k] -> vals: [B, S, k].
+        b, s, _ = full_logits.shape
+        idx_expanded = idx.unsqueeze(1).expand(-1, s, -1)  # [B, S, k]
+        vals = torch.gather(full_logits, dim=-1, index=idx_expanded)
         return vals, idx
 
 

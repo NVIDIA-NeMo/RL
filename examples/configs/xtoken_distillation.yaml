@@ -1,0 +1,176 @@
+# Single-teacher cross-tokenizer off-policy distillation.
+#
+# Defaults: Llama-3.2-1B (student) <- Qwen3-4B (teacher), arrow-text corpus,
+# P-KL loss mode (gold_loss=false, xtoken_loss=false). Override the model
+# names, tokenizers, and arrow_files via Hydra CLI for other pairs.
+
+distillation:
+  num_prompts_per_step: 64
+  max_num_steps: 5000
+  max_num_epochs: 1
+  topk_logits_k: 64           # must equal loss_fn.vocab_topk
+  seed: 42
+  val_period: 0               # validation disabled by default
+  val_at_start: false
+  val_at_end: false
+
+loss_fn:
+  projection_matrix_path: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/avenkateshha/nemo_rl/RL/cross_tokenizer_data/llama_qwen_best_special_exact_map_remapped.pt"
+  # Loss-mode selection (mutually exclusive):
+  #   gold_loss=false, xtoken_loss=false  -> P-KL (full-vocab projection KL)
+  #   gold_loss=true,  xtoken_loss=false  -> gold-loss (NotImplementedError in v0)
+  #   gold_loss=false, xtoken_loss=true   -> xtoken-loss (NotImplementedError in v0)
+  gold_loss: false
+  xtoken_loss: false
+  temperature: 1.0
+  vocab_topk: 64
+  reverse_kl: false
+  exact_token_match_only: false
+  project_teacher_to_student: false
+  kl_loss_weight: 1.0
+  ce_loss_scale: 0.1
+  dynamic_loss_scaling: true
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "checkpoints/xtoken-distillation"
+  metric_name: "train:loss"
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 600
+  checkpoint_must_save_by: null
+  save_optimizer: true
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+policy:
+  model_name: "meta-llama/Llama-3.2-1B"
+  tokenizer:
+    name: "meta-llama/Llama-3.2-1B"
+    chat_template: null
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 1
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.001
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      foreach: false
+      fused: false
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.02
+        end_factor: 1.0
+        total_iters: 250
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+      kwargs:
+        T_max: 4750
+        eta_min: 0.0
+    - milestones: [250]
+  generation: null
+
+teacher:
+  model_name: "Qwen/Qwen3-4B"
+  tokenizer:
+    name: "Qwen/Qwen3-4B"
+    chat_template: null
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 1
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.001
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      foreach: false
+      fused: false
+  generation: null
+
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  num_workers: 4
+  train:
+    dataset_name: "arrow_text"
+    processor: "kd_data_processor"
+    arrow_files: null            # set via Hydra CLI, e.g. data.train.arrow_files=/path/glob/*.arrow
+    text_key: "text"
+    characters_per_sample: 16384
+  validation: null
+
+logger:
+  log_dir: "logs/xtoken-distillation"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  swanlab_enabled: false
+  mlflow_enabled: false
+  tensorboard_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "x_token"
+    name: "xtoken-distillation"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

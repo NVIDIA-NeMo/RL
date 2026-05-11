@@ -15,7 +15,7 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Any, Optional, Union
+from typing import Any, Iterable, Optional, Union
 
 import numpy as np
 import ray
@@ -601,6 +601,62 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return stacked
 
+    def get_global_topk_logits(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> BatchedDataDict[Any]:
+        """Dispatch get_global_topk_logits to workers.
+
+        Returns a BatchedDataDict with:
+          - ``topk_logits``: ``[B, S, k]``
+          - ``topk_indices``: ``[B, k]`` per-sample global vocab subset.
+
+        Used by cross-tokenizer distillation; intentionally doesn't support
+        dynamic batching or sequence packing in v0.
+        """
+        if self.use_dynamic_batches or self.use_sequence_packing:
+            raise NotImplementedError(
+                "get_global_topk_logits does not support dynamic batching or "
+                "sequence packing in v0."
+            )
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        with timer.time("get_global_topk_logits/shard_data") if timer else nullcontext():
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+            )
+        with (
+            timer.time("get_global_topk_logits/submit")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_global_topk_logits",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+            )
+        worker_batches = self.worker_group.get_all_worker_results(futures)
+        all_vals = [wb["topk_logits"] for wb in worker_batches]
+        all_idx = [wb["topk_indices"] for wb in worker_batches]
+        stacked: BatchedDataDict[Any] = BatchedDataDict()
+        stacked["topk_logits"] = torch.cat(all_vals, dim=0)
+        stacked["topk_indices"] = torch.cat(all_idx, dim=0)
+        return stacked
+
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -609,8 +665,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
+        skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
-        """Train the policy on a batch of data with a given loss function."""
+        """Train the policy on a batch of data with a given loss function.
+
+        Args:
+            skip_keys: Keys whose tensors are not student-sequence-aligned at
+                dim 1 and must be excluded from the worker's sequence-dim
+                pre-flight check. Used by cross-tokenizer distillation to
+                pass through teacher / alignment auxiliaries that ride on
+                the same data dict.
+        """
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
@@ -648,6 +713,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "eval_mode": eval_mode,
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
+                    "skip_keys": skip_keys,
                 },
             )
         results = self.worker_group.get_all_worker_results(futures)

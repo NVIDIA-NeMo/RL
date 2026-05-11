@@ -707,6 +707,35 @@ def nemo_gym_data_processor(
     return output
 
 
+def kd_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int | None,
+    idx: int,
+) -> DatumSpec:
+    """Process a raw-text datum for cross-tokenizer distillation.
+
+    The cross-tokenizer collator does the actual tokenization (twice — once
+    with the student tokenizer, once with the teacher tokenizer), so this
+    processor only carries the raw text forward. ``message_log`` is left
+    empty for compatibility with :class:`DatumSpec`; the collator reads
+    ``raw_text`` instead.
+    """
+    text = datum_dict["text"]
+    output: DatumSpec = {
+        "message_log": [],
+        "length": len(text),
+        "extra_env_info": None,
+        "loss_multiplier": 1.0,
+        "idx": idx,
+        "raw_text": text,  # consumed by CrossTokenizerCollator
+    }
+    if "task_name" in datum_dict:
+        output["task_name"] = datum_dict["task_name"]
+    return output
+
+
 # Processor registry. Key is the processor name, value is the processor function.
 # Note: We cast the literal dict to Dict[str, TaskDataProcessFnCallable] because
 # type checkers see each concrete function's signature as a distinct callable type.
@@ -718,6 +747,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
     {
         "default": math_hf_data_processor,
         "helpsteer3_data_processor": helpsteer3_data_processor,
+        "kd_data_processor": kd_data_processor,
         "math_data_processor": math_data_processor,
         "math_hf_data_processor": math_hf_data_processor,
         "multichoice_qa_processor": multichoice_qa_processor,
