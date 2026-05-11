@@ -43,7 +43,7 @@ dependencies = [
   "sympy>=1.14.0",
   "pillow>=12.1.1",
   "torchvision==0.26.0",
-  "transformers==5.3.0",
+  "transformers==5.5.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -273,7 +273,8 @@ override-dependencies = [
   "opentelemetry-api>=1.33.1",
   # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
   # Override until vllm officially relaxes the constraint (https://github.com/vllm-project/vllm/issues/30466).
-  "transformers==5.3.0",
+  # Bumped to 5.5.0: AutoModel requires transformers.models.gemma4 (added in 5.5).
+  "transformers==5.5.0",
   #Override till we can upgrade sglang version to address CVE GHSA-7rgv-gqhr-fxg3
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs
