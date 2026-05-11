@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar
+from typing import Any, Literal, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
 
@@ -88,6 +88,16 @@ class ClippedPGLossConfig(TypedDict):
     ratio_clip_max: float
     # Dual-clipping value (should be >1 if enabled; usually set to 3 empirically). None to disable.
     ratio_clip_c: float | None
+    # Actor loss surrogate. "ppo_clip" preserves existing PPO/GRPO/DAPO behavior.
+    # "sapo" enables Soft Adaptive Policy Optimization.
+    actor_loss_type: Literal["ppo_clip", "sapo"]
+    # SAPO temperatures for positive and non-positive advantages.
+    # Recommended defaults from the SAPO paper are tau_pos=1.0 and tau_neg=1.05.
+    sapo_tau_pos: float
+    sapo_tau_neg: float
+    # Optional SAPO-only clamp applied to log policy ratios before exponentiation.
+    # Set to null to disable the numerical guardrail.
+    sapo_log_ratio_clamp_value: float | None
     use_on_policy_kl_approximation: bool
     use_importance_sampling_correction: bool
     truncated_importance_sampling_ratio: float | None
@@ -134,6 +144,7 @@ class ClippedPGLossFn(LossFunction):
 
     - PPO (Clipped) - https://arxiv.org/abs/1707.06347
     - GRPO - https://arxiv.org/abs/2402.03300
+    - SAPO (set actor_loss_type = "sapo") - https://arxiv.org/abs/2511.20347
     - REINFORCE/RLOO (set disable_ppo_ratio = True and ignores ratio_clip_min/ratio_clip_max) - https://arxiv.org/abs/2402.14740
     - GSPO (set sequence_level_importance_ratios = True and token_level_loss = False) - https://arxiv.org/abs/2507.18071
     - Truly on-policy (set force_on_policy_ratio = True to force ratio = 1.0, requires one update per rollout)
@@ -174,6 +185,10 @@ class ClippedPGLossFn(LossFunction):
         self.ratio_clip_min = cfg["ratio_clip_min"]
         self.ratio_clip_max = cfg["ratio_clip_max"]
         self.ratio_clip_c = cfg["ratio_clip_c"]  # set to None to disable dual-clipping
+        self.actor_loss_type = cfg["actor_loss_type"]
+        self.sapo_tau_pos = cfg["sapo_tau_pos"]
+        self.sapo_tau_neg = cfg["sapo_tau_neg"]
+        self.sapo_log_ratio_clamp_value = cfg["sapo_log_ratio_clamp_value"]
         self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
         self.reference_policy_kl_type = cfg["reference_policy_kl_type"]
         self.kl_input_clamp_value = cfg["kl_input_clamp_value"]
@@ -209,6 +224,7 @@ class ClippedPGLossFn(LossFunction):
             assert self.loss_type == LossType.SEQUENCE_LEVEL, (
                 "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
             )
+        self._validate_actor_loss_config()
         if self.truncated_importance_sampling_ratio is not None:
             assert self.use_importance_sampling_correction, (
                 "truncated_importance_sampling_ratio is only supported when use_importance_sampling_correction is True"
@@ -243,6 +259,50 @@ class ClippedPGLossFn(LossFunction):
                     f"Set truncated_importance_sampling_ratio to enable truncated importance sampling.",
                     flush=True,
                 )
+
+    def _validate_actor_loss_config(self) -> None:
+        if self.actor_loss_type not in ("ppo_clip", "sapo"):
+            raise ValueError(
+                "actor_loss_type must be 'ppo_clip' or 'sapo', "
+                f"got {self.actor_loss_type!r}"
+            )
+
+        if self.actor_loss_type != "sapo":
+            return
+
+        if self.sequence_level_importance_ratios:
+            raise ValueError(
+                "actor_loss_type='sapo' is token-level only and is incompatible "
+                "with sequence_level_importance_ratios=True"
+            )
+        if self.loss_type != LossType.TOKEN_LEVEL:
+            raise ValueError("actor_loss_type='sapo' requires token_level_loss=True")
+        if self.disable_ppo_ratio:
+            raise ValueError(
+                "actor_loss_type='sapo' is incompatible with disable_ppo_ratio=True"
+            )
+        if self.force_on_policy_ratio:
+            raise ValueError(
+                "actor_loss_type='sapo' is incompatible with force_on_policy_ratio=True"
+            )
+        if self.ratio_clip_c is not None:
+            raise ValueError(
+                "actor_loss_type='sapo' is incompatible with ratio_clip_c because "
+                "dual clipping is a hard-clipped PPO objective"
+            )
+        if self.sapo_tau_pos <= 0 or self.sapo_tau_neg <= 0:
+            raise ValueError(
+                "sapo_tau_pos and sapo_tau_neg must both be positive, got "
+                f"{self.sapo_tau_pos} and {self.sapo_tau_neg}"
+            )
+        if (
+            self.sapo_log_ratio_clamp_value is not None
+            and self.sapo_log_ratio_clamp_value <= 0
+        ):
+            raise ValueError(
+                "sapo_log_ratio_clamp_value must be positive or null, got "
+                f"{self.sapo_log_ratio_clamp_value}"
+            )
 
     def __call__(
         self,
@@ -378,47 +438,89 @@ class ClippedPGLossFn(LossFunction):
         else:
             kl = torch.tensor(0.0)
 
-        # Calculate clipped loss function if ppo ratio is enabled.
-        if self.force_on_policy_ratio:
-            # Force ratio to 1.0 for truly on-policy behavior
-            # Use curr_logprobs twice so ratio=1 but gradients still flow
-            log_ratios = curr_logprobs - curr_logprobs.detach()
-            ratios = log_ratios.exp()  # = exp(0) = 1.0, but depends on curr_logprobs
-            ratios_clamped = ratios
-        elif not self.disable_ppo_ratio:
+        sapo_metrics_tensors: dict[str, torch.Tensor] = {}
+        if self.actor_loss_type == "sapo":
             log_ratios = curr_logprobs - prev_logprobs
-            if self.sequence_level_importance_ratios:
-                seq_log_ratio_mean = masked_mean(
-                    log_ratios,
-                    token_mask,
-                    dim=-1,
-                ).unsqueeze(-1)
-                seq_ratio = seq_log_ratio_mean.exp()
-                ratios = seq_ratio.repeat(1, advantages.shape[1])
+            if self.sapo_log_ratio_clamp_value is None:
+                sapo_loss_log_ratios = log_ratios
+                sapo_log_ratio_clipped = torch.zeros_like(log_ratios)
             else:
-                ratios = log_ratios.exp()
-            ratios_clamped = ratios.clamp(
-                1.0 - self.ratio_clip_min, 1.0 + self.ratio_clip_max
+                sapo_loss_log_ratios = log_ratios.clamp(
+                    -self.sapo_log_ratio_clamp_value,
+                    self.sapo_log_ratio_clamp_value,
+                )
+                sapo_log_ratio_clipped = (sapo_loss_log_ratios != log_ratios).to(
+                    log_ratios.dtype
+                )
+
+            ratios = torch.exp(sapo_loss_log_ratios)
+            ratios = torch.nan_to_num(
+                ratios,
+                nan=0.0,
+                posinf=torch.finfo(ratios.dtype).max,
+                neginf=0.0,
             )
+            ratios_clamped = ratios
+            sapo_temperature = torch.where(
+                advantages > 0,
+                torch.full_like(advantages, self.sapo_tau_pos),
+                torch.full_like(advantages, self.sapo_tau_neg),
+            )
+            sapo_sigmoid = torch.sigmoid(sapo_temperature * (ratios - 1.0))
+            sapo_objective_gate = (4.0 / sapo_temperature) * sapo_sigmoid
+            clip_loss = -advantages * sapo_objective_gate
+            sapo_metrics_tensors = {
+                "sapo_objective_gate": sapo_objective_gate.detach(),
+                "sapo_gradient_weight": (
+                    4.0 * sapo_sigmoid * (1.0 - sapo_sigmoid) * ratios
+                ).detach(),
+                "sapo_temperature": sapo_temperature,
+                "sapo_log_ratio_clipped_fraction": sapo_log_ratio_clipped,
+            }
         else:
-            ratios = curr_logprobs
-            ratios_clamped = curr_logprobs
+            # Calculate clipped loss function if ppo ratio is enabled.
+            if self.force_on_policy_ratio:
+                # Force ratio to 1.0 for truly on-policy behavior
+                # Use curr_logprobs twice so ratio=1 but gradients still flow
+                log_ratios = curr_logprobs - curr_logprobs.detach()
+                ratios = (
+                    log_ratios.exp()
+                )  # = exp(0) = 1.0, but depends on curr_logprobs
+                ratios_clamped = ratios
+            elif not self.disable_ppo_ratio:
+                log_ratios = curr_logprobs - prev_logprobs
+                if self.sequence_level_importance_ratios:
+                    seq_log_ratio_mean = masked_mean(
+                        log_ratios,
+                        token_mask,
+                        dim=-1,
+                    ).unsqueeze(-1)
+                    seq_ratio = seq_log_ratio_mean.exp()
+                    ratios = seq_ratio.repeat(1, advantages.shape[1])
+                else:
+                    ratios = log_ratios.exp()
+                ratios_clamped = ratios.clamp(
+                    1.0 - self.ratio_clip_min, 1.0 + self.ratio_clip_max
+                )
+            else:
+                ratios = curr_logprobs
+                ratios_clamped = curr_logprobs
 
-        loss1 = -advantages * ratios
-        loss2 = -advantages * ratios_clamped
+            loss1 = -advantages * ratios
+            loss2 = -advantages * ratios_clamped
 
-        # Determine which value to use for clipping (max for pessimistic estimate)
-        clip_loss = torch.max(loss1, loss2)
+            # Determine which value to use for clipping (max for pessimistic estimate)
+            clip_loss = torch.max(loss1, loss2)
 
-        # Dual-clipping see https://arxiv.org/pdf/1912.09729
-        if self.ratio_clip_c is not None:
-            assert self.ratio_clip_c > 1, (
-                f"ratio_clip_c must exceed 1 representing a lower bound of the ratios, got {self.ratio_clip_c}."
-            )
-            loss3 = -advantages * self.ratio_clip_c
-            clip_loss = torch.where(
-                advantages < 0, torch.min(clip_loss, loss3), clip_loss
-            )
+            # Dual-clipping see https://arxiv.org/pdf/1912.09729
+            if self.ratio_clip_c is not None:
+                assert self.ratio_clip_c > 1, (
+                    f"ratio_clip_c must exceed 1 representing a lower bound of the ratios, got {self.ratio_clip_c}."
+                )
+                loss3 = -advantages * self.ratio_clip_c
+                clip_loss = torch.where(
+                    advantages < 0, torch.min(clip_loss, loss3), clip_loss
+                )
 
         # -------------------------------------------------------------
         # Off-policy (actor) importance-sampling correction
@@ -599,6 +701,14 @@ class ClippedPGLossFn(LossFunction):
                 probs_ratio_max = float("-inf")
                 probs_ratio_clamped_min = float("inf")
                 probs_ratio_clamped_max = float("-inf")
+            sapo_metrics = {
+                name: masked_mean(
+                    tensor,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+                for name, tensor in sapo_metrics_tensors.items()
+            }
 
         # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
         # by either sequence or token count, depending on particular metric.
@@ -621,6 +731,7 @@ class ClippedPGLossFn(LossFunction):
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
+                **sapo_metrics,
                 **_is_filter_metrics,
             },
         )

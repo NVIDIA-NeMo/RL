@@ -32,6 +32,10 @@ basic_pg_loss_test_config: ClippedPGLossConfig = {
     "ratio_clip_min": 0.2,
     "ratio_clip_max": 0.2,
     "ratio_clip_c": None,
+    "actor_loss_type": "ppo_clip",
+    "sapo_tau_pos": 1.0,
+    "sapo_tau_neg": 1.05,
+    "sapo_log_ratio_clamp_value": 20.0,
     "disable_ppo_ratio": False,
     "reference_policy_kl_penalty": 0.0,  # Disable KL
     "reference_policy_kl_type": "k3",
@@ -412,6 +416,69 @@ def _setup_clipped_pg_test_data(batch_size=1, seq_len=4, vocab_size=8, device="c
     return data, batch_size, seq_len, vocab_size
 
 
+def _setup_direct_clipped_pg_test_data(
+    curr_logprobs,
+    advantages,
+    prev_logprobs=None,
+    generation_logprobs=None,
+    token_mask=None,
+    sample_mask=None,
+):
+    """Sets up CPU-compatible data for direct ClippedPGLossFn tests."""
+    batch_size, effective_seq_len = curr_logprobs.shape
+    device = curr_logprobs.device
+    dtype = curr_logprobs.dtype
+
+    if prev_logprobs is None:
+        prev_logprobs = torch.zeros_like(curr_logprobs)
+    if generation_logprobs is None:
+        generation_logprobs = prev_logprobs.clone()
+    if token_mask is None:
+        token_mask = torch.ones_like(curr_logprobs)
+    else:
+        token_mask = token_mask.to(device=device, dtype=dtype)
+    if sample_mask is None:
+        sample_mask = torch.ones(batch_size, device=device, dtype=dtype)
+    else:
+        sample_mask = sample_mask.to(device=device, dtype=dtype)
+
+    leading_zeros = torch.zeros((batch_size, 1), device=device, dtype=dtype)
+    input_ids = torch.zeros(
+        (batch_size, effective_seq_len + 1),
+        device=device,
+        dtype=torch.int64,
+    )
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "token_mask": torch.cat([leading_zeros, token_mask], dim=1),
+            "sample_mask": sample_mask,
+            "advantages": torch.cat([leading_zeros, advantages], dim=1),
+            "prev_logprobs": torch.cat([leading_zeros, prev_logprobs], dim=1),
+            "reference_policy_logprobs": torch.cat(
+                [leading_zeros, torch.zeros_like(curr_logprobs)],
+                dim=1,
+            ),
+            "generation_logprobs": torch.cat(
+                [leading_zeros, generation_logprobs],
+                dim=1,
+            ),
+        }
+    )
+    global_valid_toks = torch.sum(
+        data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+    )
+    global_valid_seqs = torch.sum(data["sample_mask"])
+    return data, global_valid_seqs, global_valid_toks
+
+
+def _sapo_loss_test_config(**overrides):
+    cfg = deepcopy(basic_pg_loss_test_config)
+    cfg["actor_loss_type"] = "sapo"
+    cfg.update(overrides)
+    return cfg
+
+
 # Helper to create logits that yield specific target log probs after log_softmax
 def _create_exact_logits(
     target_curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
@@ -635,6 +702,180 @@ def test_clipped_pg_loss_force_on_policy_ratio():
     assert metrics["probs_ratio_max"] == 1.0
     assert metrics["probs_ratio_clamped_min"] == 1.0
     assert metrics["probs_ratio_clamped_max"] == 1.0
+
+
+def test_clipped_pg_loss_sapo_forward_and_metrics():
+    """Tests SAPO forward values, masking, and metrics on CPU."""
+    curr_logprobs = torch.log(torch.tensor([[0.5, 1.0, 1.5], [2.0, 0.7, 1.2]]))
+    prev_logprobs = torch.zeros_like(curr_logprobs)
+    advantages = torch.tensor([[1.0, -2.0, 0.0], [10.0, 10.0, 10.0]])
+    token_mask = torch.tensor([[1.0, 0.0, 1.0], [1.0, 1.0, 1.0]])
+    sample_mask = torch.tensor([1.0, 0.0])
+    data, global_valid_seqs, global_valid_toks = _setup_direct_clipped_pg_test_data(
+        curr_logprobs=curr_logprobs,
+        advantages=advantages,
+        prev_logprobs=prev_logprobs,
+        token_mask=token_mask,
+        sample_mask=sample_mask,
+    )
+
+    loss_fn = ClippedPGLossFn(_sapo_loss_test_config())
+    loss, metrics = loss_fn(
+        next_token_logprobs=curr_logprobs,
+        data=data,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+    )
+
+    ratios = torch.exp(curr_logprobs - prev_logprobs)
+    tau = torch.where(advantages > 0, torch.tensor(1.0), torch.tensor(1.05))
+    objective_gate = (4.0 / tau) * torch.sigmoid(tau * (ratios - 1.0))
+    expected_loss = (
+        torch.sum(-advantages * objective_gate * token_mask * sample_mask.unsqueeze(-1))
+        / global_valid_toks
+    )
+
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(
+        torch.tensor(metrics["probs_ratio"]),
+        torch.tensor(1.0),
+    )
+    torch.testing.assert_close(
+        torch.tensor(metrics["sapo_objective_gate"]),
+        torch.mean(objective_gate[0, [0, 2]]),
+    )
+    torch.testing.assert_close(
+        torch.tensor(metrics["sapo_temperature"]),
+        torch.tensor((1.0 + 1.05) / 2),
+    )
+    assert metrics["sapo_log_ratio_clipped_fraction"] == 0.0
+
+
+def test_clipped_pg_loss_sapo_gradient():
+    """Tests SAPO gradients with respect to current log probabilities."""
+    curr_logprobs = torch.log(torch.tensor([[0.5, 1.0, 1.5]])).requires_grad_(True)
+    prev_logprobs = torch.zeros_like(curr_logprobs)
+    advantages = torch.tensor([[1.0, -2.0, 3.0]])
+    data, global_valid_seqs, global_valid_toks = _setup_direct_clipped_pg_test_data(
+        curr_logprobs=curr_logprobs,
+        advantages=advantages,
+        prev_logprobs=prev_logprobs,
+    )
+
+    loss_fn = ClippedPGLossFn(_sapo_loss_test_config())
+    loss, _ = loss_fn(
+        next_token_logprobs=curr_logprobs,
+        data=data,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+    )
+    loss.backward()
+
+    ratios = torch.exp(curr_logprobs.detach() - prev_logprobs)
+    tau = torch.where(advantages > 0, torch.tensor(1.0), torch.tensor(1.05))
+    sigmoid = torch.sigmoid(tau * (ratios - 1.0))
+    expected_grad = -advantages * ratios * 4.0 * sigmoid * (1.0 - sigmoid)
+    expected_grad = expected_grad / global_valid_toks
+    torch.testing.assert_close(curr_logprobs.grad, expected_grad)
+
+
+def test_clipped_pg_loss_sapo_importance_sampling_correction():
+    """Tests SAPO actor loss with train/inference importance correction."""
+    curr_logprobs = torch.log(torch.tensor([[0.5, 1.0, 1.5]]))
+    prev_logprobs = torch.zeros_like(curr_logprobs)
+    generation_logprobs = torch.tensor([[0.2, -0.3, 0.1]])
+    advantages = torch.tensor([[1.0, -2.0, 3.0]])
+    data, global_valid_seqs, global_valid_toks = _setup_direct_clipped_pg_test_data(
+        curr_logprobs=curr_logprobs,
+        advantages=advantages,
+        prev_logprobs=prev_logprobs,
+        generation_logprobs=generation_logprobs,
+    )
+
+    loss_fn = ClippedPGLossFn(
+        _sapo_loss_test_config(use_importance_sampling_correction=True)
+    )
+    loss, _ = loss_fn(
+        next_token_logprobs=curr_logprobs,
+        data=data,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+    )
+
+    ratios = torch.exp(curr_logprobs - prev_logprobs)
+    tau = torch.where(advantages > 0, torch.tensor(1.0), torch.tensor(1.05))
+    objective_gate = (4.0 / tau) * torch.sigmoid(tau * (ratios - 1.0))
+    actor_importance_weights = torch.exp(prev_logprobs - generation_logprobs)
+    expected_loss = torch.mean(actor_importance_weights * -advantages * objective_gate)
+    torch.testing.assert_close(loss, expected_loss)
+
+
+def test_clipped_pg_loss_sapo_extreme_log_ratios_are_finite():
+    """Tests SAPO log-ratio clamping keeps loss and metrics finite."""
+    curr_logprobs = torch.tensor([[1000.0, -1000.0]])
+    advantages = torch.tensor([[1.0, -1.0]])
+    data, global_valid_seqs, global_valid_toks = _setup_direct_clipped_pg_test_data(
+        curr_logprobs=curr_logprobs,
+        advantages=advantages,
+    )
+
+    loss_fn = ClippedPGLossFn(_sapo_loss_test_config())
+    loss, metrics = loss_fn(
+        next_token_logprobs=curr_logprobs,
+        data=data,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+    )
+
+    assert torch.isfinite(loss)
+    for key in (
+        "probs_ratio",
+        "probs_ratio_min",
+        "probs_ratio_max",
+        "sapo_objective_gate",
+        "sapo_gradient_weight",
+    ):
+        assert torch.isfinite(torch.tensor(metrics[key])), key
+    assert metrics["sapo_log_ratio_clipped_fraction"] == 1.0
+
+    unclamped_loss_fn = ClippedPGLossFn(
+        _sapo_loss_test_config(sapo_log_ratio_clamp_value=None)
+    )
+    unclamped_loss, unclamped_metrics = unclamped_loss_fn(
+        next_token_logprobs=curr_logprobs,
+        data=data,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+    )
+
+    assert torch.isfinite(unclamped_loss)
+    assert torch.isfinite(torch.tensor(unclamped_metrics["probs_ratio_max"]))
+    assert unclamped_metrics["sapo_log_ratio_clipped_fraction"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("config_overrides", "match"),
+    [
+        (
+            {"sequence_level_importance_ratios": True, "token_level_loss": False},
+            "sequence_level_importance_ratios",
+        ),
+        ({"token_level_loss": False}, "token_level_loss"),
+        ({"disable_ppo_ratio": True}, "disable_ppo_ratio"),
+        ({"force_on_policy_ratio": True}, "force_on_policy_ratio"),
+        ({"ratio_clip_c": 3.0}, "ratio_clip_c"),
+        ({"sapo_tau_pos": 0.0}, "sapo_tau_pos"),
+        ({"sapo_tau_neg": -1.0}, "sapo_tau_pos"),
+        ({"sapo_log_ratio_clamp_value": 0.0}, "sapo_log_ratio_clamp_value"),
+    ],
+)
+def test_clipped_pg_loss_sapo_rejects_incompatible_configs(
+    config_overrides,
+    match,
+):
+    """Tests SAPO rejects settings that would change the objective semantics."""
+    with pytest.raises(ValueError, match=match):
+        ClippedPGLossFn(_sapo_loss_test_config(**config_overrides))
 
 
 @pytest.mark.parametrize("kl_type", ["k1", "k2", "k3"])

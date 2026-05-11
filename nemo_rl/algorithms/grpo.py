@@ -389,6 +389,14 @@ def setup(
         os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
         print("  ✓ force_on_policy_ratio enabled")
 
+    if loss_config["actor_loss_type"] == "sapo":
+        print(
+            "  ✓ SAPO actor loss enabled: "
+            f"tau_pos={loss_config['sapo_tau_pos']}, "
+            f"tau_neg={loss_config['sapo_tau_neg']}",
+            flush=True,
+        )
+
     # ==========================
     #          Cluster
     # ==========================

@@ -31,6 +31,10 @@ loss_fn:
   ratio_clip_min: 0.2
   ratio_clip_max: 0.2
   ratio_clip_c: null
+  actor_loss_type: "ppo_clip"  # "ppo_clip" or "sapo"
+  sapo_tau_pos: 1.0
+  sapo_tau_neg: 1.05
+  sapo_log_ratio_clamp_value: 20.0
   # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
   use_on_policy_kl_approximation: false
   # Async GRPO requires importance sampling correction enabled

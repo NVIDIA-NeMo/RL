@@ -26,6 +26,10 @@ loss_fn:
   use_importance_sampling_correction: false
   token_level_loss: true
   ratio_clip_c: null
+  actor_loss_type: "ppo_clip"  # "ppo_clip" or "sapo"
+  sapo_tau_pos: 1.0
+  sapo_tau_neg: 1.05
+  sapo_log_ratio_clamp_value: 20.0
 
 checkpointing:
   enabled: false
