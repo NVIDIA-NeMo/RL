@@ -567,29 +567,16 @@ def vlm_hf_data_processor(
 
     # this is the id-tokenized and image processed conversation template for the policy
     if _uses_image_placeholder and images:
+        # Dynamic-resolution path: keep pixel_values in float32 to match vLLM's
+        # DynamicResolutionImageTiler bit-for-bit. vLLM stores/normalizes in
+        # float32 and only casts at the vision_model boundary; matching that
+        # rounding order tightens rollout/train logprob agreement. The model
+        # forward dispatches on imgs_sizes and handles the bf16 cast.
         message: dict = processor(
             text=string_formatted_dialog,
             images=images,
             return_tensors="pt",
         )
-        if "pixel_values" in message:
-            if "imgs_sizes" in message:
-                # Dynamic-resolution path (NemotronH_Nano_Omni_Reasoning_V3Processor):
-                # matches vLLM's DynamicResolutionImageTiler bit-for-bit. Keep
-                # pixel_values in float32 — vLLM also stores/normalizes in float32
-                # and only casts at the vision_model boundary, and matching that
-                # rounding order tightens rollout/train logprob agreement. The
-                # model forward dispatches on imgs_sizes and handles the bf16 cast.
-                pass
-            else:
-                # Tile-based path (legacy NemotronNanoVLV2Processor): pre-cast to
-                # bf16 and synthesize image_flags. Without image_flags on the
-                # crash-recovery path, autograd through the vision encoder has
-                # tripped CUDA illegal memory access.
-                message["pixel_values"] = message["pixel_values"].to(torch.bfloat16)
-                if "image_flags" not in message:
-                    num_tiles = message["pixel_values"].shape[0]
-                    message["image_flags"] = torch.ones(num_tiles, 1, dtype=torch.long)
     else:
         message: dict = processor.apply_chat_template(
             [user_message_for_tokenize],
@@ -603,12 +590,11 @@ def vlm_hf_data_processor(
     user_message["token_ids"] = message["input_ids"][0]
     # add all keys and values to the user message, and the list of keys
     multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    # image_flags / imgs_sizes are not declared in model_input_names by the
-    # NemotronOmni checkpoint's bundled image_processor, so append them
-    # explicitly when present. Both pack along dim=0 (per-image/per-tile).
-    for extra_key in ("image_flags", "imgs_sizes"):
-        if extra_key in message and extra_key not in multimodal_keys:
-            multimodal_keys.append(extra_key)
+    # imgs_sizes is not declared in model_input_names by the NemotronOmni
+    # checkpoint's bundled image_processor, so append it explicitly when
+    # present. It packs along dim=0 (per-image).
+    if "imgs_sizes" in message and "imgs_sizes" not in multimodal_keys:
+        multimodal_keys.append("imgs_sizes")
     for key in multimodal_keys:
         if key in message:
             user_message[key] = PackedTensor(

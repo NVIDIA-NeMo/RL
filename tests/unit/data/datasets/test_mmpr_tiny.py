@@ -128,25 +128,6 @@ class TestMMPRTinyDataset:
             MMPRTinyDataset(download_dir="")
 
 
-class TestPromptFileFormatCompatibility:
-    """Tests that the prompt file is compatible with str.format()."""
-
-    def test_prompt_file_has_single_format_placeholder(self):
-        with open("examples/prompts/mmpr_tiny_cot_nemotron_omni.txt") as f:
-            prompt = f.read()
-
-        result = prompt.format("What is the measure of angle BAC?")
-        assert "\\boxed{}" in result
-        assert "What is the measure of angle BAC?" in result
-
-    def test_prompt_file_does_not_crash_with_format(self):
-        with open("examples/prompts/mmpr_tiny_cot_nemotron_omni.txt") as f:
-            prompt = f.read()
-
-        # Should not raise IndexError or KeyError
-        prompt.format("test question")
-
-
 def _make_stub_nemotron_processor():
     """Build a minimal stub whose class name is NemotronNanoVLV2Processor.
 
@@ -161,6 +142,7 @@ def _make_stub_nemotron_processor():
 
     class NemotronNanoVLV2Processor:
         image_token = "<image>"
+        model_input_names = ["input_ids", "pixel_values"]
 
         def __init__(self):
             self.image_processor = _ImageProcessor()
@@ -202,6 +184,11 @@ def tiny_image_path(tmp_path):
 _RAW_QUESTION = "<image>\nWhat is the measure of angle BAC?"
 # The clean question after <image> stripping by format_mmpr_tiny_dataset
 _CLEAN_QUESTION = "What is the measure of angle BAC?"
+# Inline prompt template for tests — double-braces escape the literal \boxed{}
+# so str.format leaves it intact, and the single {} slot takes the question.
+_TEST_PROMPT_TEMPLATE = (
+    "Solve step by step. Put your final answer in \\boxed{{}}.\n\nQuestion: {}"
+)
 
 
 def _run_processor(tiny_image_path):
@@ -210,10 +197,8 @@ def _run_processor(tiny_image_path):
     from nemo_rl.data.interfaces import TaskDataSpec
     from nemo_rl.data.processors import vlm_hf_data_processor
 
-    task_data_spec = TaskDataSpec(
-        task_name="mmpr-tiny",
-        prompt_file="examples/prompts/mmpr_tiny_cot_nemotron_omni.txt",
-    )
+    task_data_spec = TaskDataSpec(task_name="mmpr-tiny")
+    task_data_spec.prompt = _TEST_PROMPT_TEMPLATE
     processor = _make_stub_nemotron_processor()
     sample = {
         "images": [tiny_image_path],
@@ -270,10 +255,7 @@ class TestVLMProcessorMMPRTiny:
         """
         result, processor = _run_processor(tiny_image_path)
 
-        # Build expected prompted question from the real prompt file
-        with open("examples/prompts/mmpr_tiny_cot_nemotron_omni.txt") as f:
-            prompt_template = f.read()
-        prompted_question = prompt_template.format(_CLEAN_QUESTION)
+        prompted_question = _TEST_PROMPT_TEMPLATE.format(_CLEAN_QUESTION)
 
         # The placeholder-style path should produce: "<image>\n<prompted_question>"
         expected_tokenizer_input = "<image>\n" + prompted_question
