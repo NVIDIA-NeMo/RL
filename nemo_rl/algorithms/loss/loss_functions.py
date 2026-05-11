@@ -1095,7 +1095,12 @@ class CrossTokenizerDistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     # Per-sample global top-k teacher logits (same vocab columns at every
     # teacher position) so chunk-averaged KL has a stable vocab axis.
-    teacher_topk_logits: torch.Tensor    # [B, T_t, k]
+    # Either teacher_topk_logits OR teacher_topk_logits_ipc must be present
+    # (the trainer chooses which transport by calling get_global_topk_logits
+    # vs get_global_topk_logits_ipc); indices always travel on the CPU/Ray
+    # path since they're tiny.
+    teacher_topk_logits: NotRequired[torch.Tensor]   # [B, T_t, k]
+    teacher_topk_logits_ipc: NotRequired[list[dict[str, Any]]]  # list[B] of handle dicts
     teacher_topk_indices: torch.Tensor   # [B, k] in teacher vocab
     alignment_student_spans: torch.Tensor      # [B, max_pairs, 2]
     alignment_teacher_spans: torch.Tensor      # [B, max_pairs, 2]
@@ -1441,9 +1446,28 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         v_t = projected_full.shape[-1]
         projected_full = projected_full.reshape(b, t_s, v_t)   # [B, T_s, V_t]
 
-        # Per-sample slice to global top-k teacher columns.
+        # Per-sample slice to global top-k teacher columns. Teacher logits
+        # either arrive as a dense [B, T_t, k] tensor (CPU/Ray transport,
+        # for k=64) or as a list[B] of per-sample CUDA IPC handles (for
+        # k=8192 where the CPU round-trip would be ~6 GB/step).
         teacher_topk_indices = data["teacher_topk_indices"]    # [B, k]
-        teacher_topk_logits = data["teacher_topk_logits"].float()  # [B, T_t, k]
+        if "teacher_topk_logits_ipc" in data:
+            handles = data["teacher_topk_logits_ipc"]   # list[mbs] of dicts
+            assert len(handles) == teacher_topk_indices.shape[0], (
+                f"IPC handle list length ({len(handles)}) must match "
+                f"teacher_topk_indices batch dim "
+                f"({teacher_topk_indices.shape[0]}). Sharding pairing has "
+                f"diverged — investigate before trusting the loss."
+            )
+            from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+            consumer_device = torch.cuda.current_device()
+            vals_per_sample = [
+                rebuild_cuda_tensor_from_ipc(h["logits_ipc"], consumer_device)
+                for h in handles
+            ]
+            teacher_topk_logits = torch.stack(vals_per_sample, dim=0).float()
+        else:
+            teacher_topk_logits = data["teacher_topk_logits"].float()  # [B, T_t, k]
         _, k = teacher_topk_indices.shape
         t_t = teacher_topk_logits.shape[1]
         idx_for_proj = teacher_topk_indices.unsqueeze(1).expand(-1, t_s, -1)

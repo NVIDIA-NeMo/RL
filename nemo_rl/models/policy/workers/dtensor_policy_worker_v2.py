@@ -66,7 +66,10 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ScoreOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    get_handle_from_tensor,
+    get_runtime_env_for_policy_worker,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import (
     apply_transformer_engine_patch,
@@ -239,6 +242,12 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         # Initialize checkpoint manager
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
+
+        # Per-step stash for cross-tokenizer teacher logits exported via
+        # CUDA IPC. Holds references to the [B_r, T_t, k] tensors so they
+        # survive across the student's train call. Released by
+        # release_ipc_buffer().
+        self._teacher_ipc_buffer: Optional[list[torch.Tensor]] = None
 
         # Validate configuration and prepare runtime settings
         runtime_config = validate_and_prepare_config(
@@ -879,6 +888,134 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             else out_topk_idx[0]
         ).cpu()
         return ret
+
+    def get_global_topk_logits_ipc(
+        self,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Cross-tokenizer teacher forward; logits leave via CUDA IPC.
+
+        Same per-sample global top-k math as :meth:`get_global_topk_logits`,
+        but the per-sample ``[T_t, k]`` logits views are exported as CUDA IPC
+        handles instead of moved to CPU. Top-k *indices* are tiny
+        (``[B_r, k]`` int64 ~= 6 MB for k=8192, B_r=96/dp_size) and go back
+        through Ray on CPU like before — cheap, simpler, and bookkeeping
+        between handles and indices is preserved by returning both from this
+        single call.
+
+        Lifetime: the source ``[B_r, T_t, k]`` CUDA tensor is stashed in
+        ``self._teacher_ipc_buffer`` so it outlives the consumer's
+        ``rebuild_cuda_tensor_from_ipc`` call. The driver releases it via
+        :meth:`release_ipc_buffer` after the student training step finishes.
+
+        Returns:
+            dict with:
+              - ``per_sample_handles``: ``list[B_r]`` of dicts each carrying
+                a single ``logits_ipc`` handle tuple plus shape/dtype.
+              - ``topk_indices``: CPU tensor ``[B_r, k]``.
+        """
+        topk_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
+
+        out_vals: list[torch.Tensor] = []
+        out_idx: list[torch.Tensor] = []
+        self.model.eval()
+
+        post_processor = GlobalTopkLogitsPostProcessor(
+            cfg=self.cfg,
+            device_mesh=self.device_mesh,
+            cp_mesh=self.cp_mesh,
+            tp_mesh=self.tp_mesh,
+            cp_size=self.cp_size,
+            k=k,
+            enable_seq_packing=self.enable_seq_packing,
+        )
+
+        with torch.no_grad():
+            data.to("cuda")
+            processed_iterator, iterator_len = get_microbatch_iterator(
+                data,
+                self.cfg,
+                topk_batch_size,
+                self.dp_mesh,
+                tokenizer=self.tokenizer,
+                cp_size=self.cp_size,
+            )
+            for batch_idx, processed_mb in enumerate(processed_iterator):
+                processed_inputs = processed_mb.processed_inputs
+                with get_train_context(
+                    cp_size=self.cp_size,
+                    cp_mesh=self.cp_mesh,
+                    cp_buffers=processed_inputs.cp_buffers,
+                    sequence_dim=sequence_dim,
+                    dtype=self.dtype,
+                    autocast_enabled=self.autocast_enabled,
+                ):
+                    (vals, idx), _metrics, _ = forward_with_post_processing_fn(
+                        model=self.model,
+                        post_processing_fn=post_processor,
+                        processed_mb=processed_mb,
+                        is_reward_model=False,
+                        allow_flash_attn_args=self.allow_flash_attn_args,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                    )
+                if batch_idx >= iterator_len:
+                    continue
+                # Keep vals on CUDA for IPC; pad seq dim now so the stash
+                # tensor matches the canonical [B_r, T_t, k] shape.
+                pad_needed = seq_dim_size - vals.shape[1]
+                if pad_needed > 0:
+                    vals = torch.nn.functional.pad(
+                        vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
+                    )
+                out_vals.append(vals.contiguous())
+                out_idx.append(idx.cpu())
+
+        final_vals = (
+            torch.cat(out_vals, dim=0) if len(out_vals) > 1 else out_vals[0]
+        )  # CUDA [B_r, T_t, k]
+        final_idx = (
+            torch.cat(out_idx, dim=0) if len(out_idx) > 1 else out_idx[0]
+        )  # CPU [B_r, k]
+
+        # Stash the full tensor so per-sample views remain valid across the
+        # student's train call. Cleared by release_ipc_buffer().
+        if self._teacher_ipc_buffer is None:
+            self._teacher_ipc_buffer = []
+        self._teacher_ipc_buffer.append(final_vals)
+
+        per_sample_handles: list[dict[str, Any]] = []
+        for i in range(final_vals.shape[0]):
+            view_i = final_vals[i]  # [T_t, k] view; dim-0 slice of row-major
+            per_sample_handles.append(
+                {
+                    "logits_ipc": get_handle_from_tensor(view_i),
+                    "shape": tuple(view_i.shape),
+                    "dtype": view_i.dtype,
+                }
+            )
+        return {
+            "per_sample_handles": per_sample_handles,
+            "topk_indices": final_idx,
+        }
+
+    def release_ipc_buffer(self) -> None:
+        """Drop the stashed teacher logits and reclaim GPU memory.
+
+        Called by the driver after the student finishes consuming the
+        previous step's IPC handles. Must precede the next IPC step or
+        memory grows unboundedly.
+        """
+        self._teacher_ipc_buffer = None
+        gc.collect()
+        torch.cuda.empty_cache()
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:
