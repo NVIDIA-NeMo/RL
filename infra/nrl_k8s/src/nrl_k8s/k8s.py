@@ -57,6 +57,40 @@ def load_kubeconfig() -> None:
         config.load_kube_config()
 
 
+class ApiUnreachableError(RuntimeError):
+    """Raised when the Kubernetes API server cannot be reached or rejects credentials."""
+
+
+@functools.cache
+def check_api_reachable() -> None:
+    """Verify that we can reach the API server and our credentials are valid.
+
+    Cached for the lifetime of the process so repeated calls (e.g. from
+    multiple CLI sub-steps) don't re-probe.
+    """
+    load_kubeconfig()
+    try:
+        client.VersionApi().get_code()
+    except ApiException as exc:
+        if exc.status == 401:
+            raise ApiUnreachableError(
+                "Kubernetes credentials are expired or invalid (HTTP 401). "
+                "Re-authenticate and try again — e.g. `aws sso login`."
+            ) from exc
+        if exc.status == 403:
+            raise ApiUnreachableError(
+                "Kubernetes credentials lack permission to reach the API "
+                "server (HTTP 403). Check your kubeconfig context and "
+                "re-authenticate — e.g. `aws sso login`."
+            ) from exc
+        raise
+    except Exception as exc:
+        raise ApiUnreachableError(
+            f"Cannot reach the Kubernetes API server: {exc}. "
+            "Check your kubeconfig context and network connectivity."
+        ) from exc
+
+
 def custom_objects_api() -> client.CustomObjectsApi:
     load_kubeconfig()
     return client.CustomObjectsApi()
@@ -710,8 +744,10 @@ def delete_service(name: str, namespace: str, *, ignore_missing: bool = True) ->
 
 
 __all__ = [
+    "ApiUnreachableError",
     "apply_compute_domain",
     "apply_deployment",
+    "check_api_reachable",
     "apply_raycluster",
     "apply_rayjob",
     "apply_resource_claim_template",

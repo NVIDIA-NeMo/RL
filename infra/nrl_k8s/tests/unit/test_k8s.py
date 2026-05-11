@@ -34,11 +34,13 @@ from nrl_k8s import k8s
 
 
 @pytest.fixture(autouse=True)
-def _reset_load_kubeconfig_cache():
+def _reset_caches():
     """Drop the @functools.cache memoisation between tests."""
     k8s.load_kubeconfig.cache_clear()
+    k8s.check_api_reachable.cache_clear()
     yield
     k8s.load_kubeconfig.cache_clear()
+    k8s.check_api_reachable.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -95,6 +97,55 @@ class TestLoadKubeconfig:
         k8s.load_kubeconfig()
 
         kubeconfig.assert_called_once_with()
+
+
+# =============================================================================
+# check_api_reachable
+# =============================================================================
+
+
+class TestCheckApiReachable:
+    def test_succeeds_when_api_server_responds(self, monkeypatch) -> None:
+        fake_version = MagicMock()
+        fake_version.get_code.return_value = MagicMock()
+        monkeypatch.setattr(k8s.client, "VersionApi", lambda: fake_version)
+        k8s.check_api_reachable()
+
+    def test_raises_on_401_unauthorized(self, monkeypatch) -> None:
+        fake_version = MagicMock()
+        fake_version.get_code.side_effect = _api_exc(401)
+        monkeypatch.setattr(k8s.client, "VersionApi", lambda: fake_version)
+        with pytest.raises(k8s.ApiUnreachableError, match="expired or invalid"):
+            k8s.check_api_reachable()
+
+    def test_raises_on_403_forbidden(self, monkeypatch) -> None:
+        fake_version = MagicMock()
+        fake_version.get_code.side_effect = _api_exc(403)
+        monkeypatch.setattr(k8s.client, "VersionApi", lambda: fake_version)
+        with pytest.raises(k8s.ApiUnreachableError, match="lack permission"):
+            k8s.check_api_reachable()
+
+    def test_raises_on_connection_error(self, monkeypatch) -> None:
+        fake_version = MagicMock()
+        fake_version.get_code.side_effect = ConnectionRefusedError("connection refused")
+        monkeypatch.setattr(k8s.client, "VersionApi", lambda: fake_version)
+        with pytest.raises(k8s.ApiUnreachableError, match="Cannot reach"):
+            k8s.check_api_reachable()
+
+    def test_result_is_cached(self, monkeypatch) -> None:
+        fake_version = MagicMock()
+        fake_version.get_code.return_value = MagicMock()
+        monkeypatch.setattr(k8s.client, "VersionApi", lambda: fake_version)
+        k8s.check_api_reachable()
+        k8s.check_api_reachable()
+        fake_version.get_code.assert_called_once()
+
+    def test_reraises_non_auth_api_errors(self, monkeypatch) -> None:
+        fake_version = MagicMock()
+        fake_version.get_code.side_effect = _api_exc(500)
+        monkeypatch.setattr(k8s.client, "VersionApi", lambda: fake_version)
+        with pytest.raises(ApiException):
+            k8s.check_api_reachable()
 
 
 # =============================================================================
@@ -177,7 +228,9 @@ class TestWaitForReady:
 
 
 class TestWaitForRayJobRayClusterName:
-    def test_returns_name_when_status_populated(self, mock_custom_api, monkeypatch) -> None:
+    def test_returns_name_when_status_populated(
+        self, mock_custom_api, monkeypatch
+    ) -> None:
         # First poll: rayjob exists but status.rayClusterName not yet set;
         # second poll: KubeRay has populated it.
         mock_custom_api.get_namespaced_custom_object.side_effect = [

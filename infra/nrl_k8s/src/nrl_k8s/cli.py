@@ -715,9 +715,7 @@ def _run_rayjob(
         )
         for dgd_key in loaded.infra.dynamo:
             try:
-                orchestrate.ensure_dgd(
-                    dgd_key, loaded, log=click.echo, owner_ref=owner
-                )
+                orchestrate.ensure_dgd(dgd_key, loaded, log=click.echo, owner_ref=owner)
             except ApiException as exc:
                 _explain_and_exit(exc, context=f"dynamo.{dgd_key} apply failed")
 
@@ -1006,9 +1004,7 @@ def cluster_up(
                         repo_root=Path.cwd(),
                     )
             elif kind == "dynamo":
-                orchestrate.ensure_dgd(
-                    key, loaded, log=click.echo, wait_ready=wait
-                )
+                orchestrate.ensure_dgd(key, loaded, log=click.echo, wait_ready=wait)
             else:
                 orchestrate.ensure_deployment(key, loaded, log=click.echo)
         except ApiException as exc:
@@ -1421,6 +1417,7 @@ def dev_connect(image: str, namespace: str | None) -> None:
     if namespace is None:
         namespace = _infer_namespace()
 
+    _check_api_or_exit()
     _check_dev_pod_rbac(namespace)
 
     phase = k8s.get_pod_phase(pod_name, namespace)
@@ -1470,6 +1467,8 @@ def dev_stop(namespace: str | None) -> None:
     pod_name = f"{user}-dev-pod"
     if namespace is None:
         namespace = _infer_namespace()
+
+    _check_api_or_exit()
 
     phase = k8s.get_pod_phase(pod_name, namespace)
     if phase is None:
@@ -1749,10 +1748,21 @@ def _check_dev_pod_rbac(namespace: str) -> None:
     )
 
 
+def _check_api_or_exit() -> None:
+    """Fail fast with a clear message when the API server is unreachable or creds are expired."""
+    from . import k8s
+
+    try:
+        k8s.check_api_reachable()
+    except k8s.ApiUnreachableError as exc:
+        _cli_error(str(exc))
+
+
 def _preflight_or_exit(namespace: str) -> None:
     """Fail fast when kubectl is missing or RBAC is wrong — before we spawn anything."""
     from . import submit
 
+    _check_api_or_exit()
     try:
         submit.kubectl_preflight(namespace)
     except RuntimeError as exc:
