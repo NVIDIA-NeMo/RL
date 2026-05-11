@@ -36,7 +36,7 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
 )
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -963,6 +963,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
         model_config.inference_sampling_seed = (node_idx * 1024) + local_rank
 
+        # For hybrid (e.g. Mamba+Attention, Nemotron-H) models, populate the
+        # Mamba inference state config so DynamicInferenceContext sets
+        # is_hybrid_model=True. Returns None for pure-attention models.
+        mamba_inference_state_config = MambaInferenceStateConfig.from_model(self.model)
+
         inference_config = InferenceConfig(
             max_sequence_length=self.cfg["generation"]["max_new_tokens"],
             buffer_size_gb=mcore_generation_config["buffer_size_gb"],
@@ -976,6 +981,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             max_tokens=mcore_generation_config["max_tokens"],
             materialize_only_last_token_logits=False,
             use_flashinfer_fused_rope=False,
+            mamba_inference_state_config=mamba_inference_state_config,
         )
 
         dynamic_context = DynamicInferenceContext(model_config, inference_config)

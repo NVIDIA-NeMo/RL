@@ -26,6 +26,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
+    _update_flextron_reward_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
@@ -708,6 +709,68 @@ def test_dapo_dynamic_sampling_disabled():
     assert result_batch.size == 6
     assert is_batch_complete == True
     assert batch_cache is None  # No caching when disabled
+
+
+def test_flextron_reward_metrics_carry_forward_missing_groups():
+    """Test Flextron reward metrics include every configured route."""
+    master_config = {
+        "policy": {
+            "megatron_cfg": {
+                "flex_routers": [
+                    {"mlp_int_list": 1856, "emb_int_list": 2688},
+                    {"mlp_int_list": 960, "emb_int_list": 1920},
+                ],
+                "flextron_sampling_rates": [0.5, 0.3, 0.2],
+            }
+        }
+    }
+
+    metrics = {}
+    previous_rewards = _update_flextron_reward_metrics(
+        metrics,
+        rewards=torch.tensor([1.0, 2.0, 4.0]),
+        router_ids=torch.tensor([0, 2, 2]),
+        master_config=master_config,
+        previous_rewards={},
+    )
+
+    assert metrics == {
+        "flextron/reward/base_model": 1.0,
+        "flextron/reward/router_1": 0.0,
+        "flextron/reward/router_2": 3.0,
+    }
+    assert previous_rewards == {0: 1.0, 2: 3.0}
+
+    metrics = {}
+    previous_rewards = _update_flextron_reward_metrics(
+        metrics,
+        rewards=torch.tensor([5.0]),
+        router_ids=torch.tensor([1]),
+        master_config=master_config,
+        previous_rewards=previous_rewards,
+    )
+
+    assert metrics == {
+        "flextron/reward/base_model": 1.0,
+        "flextron/reward/router_1": 5.0,
+        "flextron/reward/router_2": 3.0,
+    }
+    assert previous_rewards == {0: 1.0, 1: 5.0, 2: 3.0}
+
+
+def test_flextron_reward_metrics_skip_when_flextron_is_disabled():
+    """Test Flextron reward metrics are only emitted for Flextron configs."""
+    metrics = {}
+    previous_rewards = _update_flextron_reward_metrics(
+        metrics,
+        rewards=torch.tensor([1.0]),
+        router_ids=torch.tensor([0]),
+        master_config={"policy": {"megatron_cfg": {}}},
+        previous_rewards={0: 2.0},
+    )
+
+    assert metrics == {}
+    assert previous_rewards == {0: 2.0}
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():

@@ -124,6 +124,24 @@ def test_nested_route_masks_hidden_and_mlp_intermediate_dims():
     assert router.active_router_id is None
 
 
+def test_inference_mode_mask_does_not_break_grad_enabled_forward():
+    model = _DummyModel()
+    router = FrozenFlextronRouter(model=model, model_cfg=_router_config())
+    hidden_states = torch.arange(4, dtype=torch.float32).unsqueeze(0)
+
+    with torch.inference_mode(), router.use_router(1):
+        model(hidden_states)
+
+    grad_hidden_states = hidden_states.clone().requires_grad_()
+    with router.use_router(1):
+        output = model(grad_hidden_states)
+
+    output.sum().backward()
+
+    assert grad_hidden_states.grad is not None
+    assert router.active_router_id is None
+
+
 def test_router_ids_can_be_sampled_or_read_from_batch():
     model = _DummyModel()
     router = FrozenFlextronRouter(model=model, model_cfg=_router_config())

@@ -1,0 +1,43 @@
+defaults: ../../grpo_math_1B_flex.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-toy-flextron
+policy:
+  model_name: /data/toy_models/nemotron-nano-toy-model
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 512
+  megatron_cfg:
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 4
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    flex_routers:
+      - mlp_int_list: 96
+        emb_int_list: 96
+      - mlp_int_list: 64
+        emb_int_list: 64
+    flextron_sampling_rates: [0.5, 0.3, 0.2]
+    peft:
+      enabled: false
+  sequence_packing:
+    enabled: false
+  generation:
+    backend: megatron
+    mcore_generation_config:
+      buffer_size_gb: 4
+    vllm_cfg:
+      enabled: false
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.7
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nanov3-toy-flextron
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1

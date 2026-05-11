@@ -480,6 +480,18 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
+    # Megatron's TextGenerationController asserts that this flag is True when
+    # cuda_graph_impl == "local" and EP > 1 (and transformer_impl is not
+    # "inference_optimized"); see Megatron-LM
+    # megatron/core/inference/text_generation_controllers/text_generation_controller.py.
+    # cuda_graph_impl is hardcoded to "local" in megatron_policy_worker, so the
+    # value is fully derivable here — no user knob.
+    if (
+        model_cfg.expert_model_parallel_size > 1
+        and getattr(model_cfg, "transformer_impl", None) != "inference_optimized"
+    ):
+        model_cfg.moe_pad_experts_for_cuda_graph_inference = True
+
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
     if "mtp_num_layers" in config["megatron_cfg"]:

@@ -59,6 +59,9 @@ class FrozenFlextronRouter:
         self._mask_cache: dict[
             tuple[torch.device, torch.dtype, int, int], torch.Tensor
         ] = {}
+        self._zero_tensor_cache: dict[
+            tuple[torch.device, torch.dtype, tuple[int, ...]], torch.Tensor
+        ] = {}
         self._route_index_by_global_layer = self._build_route_index_by_global_layer()
         self._model_with_decoder = self._unwrap_model_with_decoder(model)
 
@@ -76,15 +79,73 @@ class FrozenFlextronRouter:
     def sample_router_ids(
         self, *, batch_size: int, device: torch.device | str | None = None
     ) -> torch.Tensor:
-        """Sample route ids from configured `[base, *routers]` probabilities."""
+        """Sample route ids from configured `[base, *routers]` probabilities.
+
+        Sampling is performed only on the model-parallel source rank and the
+        result is broadcast across the model-parallel group, so every TP/PP/CP/EP
+        rank in the same DP replica routes each sample through the same Flextron
+        submodel. Independent sampling would mismatch the per-rank route choices
+        and hang the model-parallel NCCL collectives that follow.
+        """
         if not self.enabled:
             return torch.zeros(batch_size, dtype=torch.long, device=device)
 
-        rates = torch.tensor(
-            self.flextron_sampling_rates, dtype=torch.float32, device=device
-        )
-        probs = rates / rates.sum()
-        return torch.multinomial(probs, num_samples=batch_size, replacement=True)
+        mp_group, mp_src_rank = self._model_parallel_broadcast_target()
+        # NCCL broadcast requires the buffer to live on the current CUDA device;
+        # the caller's `device` (e.g. the input_ids tensor) may still be CPU, so
+        # sample/broadcast on CUDA and move to `device` only at the end.
+        if mp_group is not None:
+            broadcast_device: torch.device | str = torch.device(
+                "cuda", torch.cuda.current_device()
+            )
+        else:
+            broadcast_device = device if device is not None else "cpu"
+
+        is_src = mp_group is None or torch.distributed.get_rank() == mp_src_rank
+        if is_src:
+            rates = torch.tensor(
+                self.flextron_sampling_rates,
+                dtype=torch.float32,
+                device=broadcast_device,
+            )
+            probs = rates / rates.sum()
+            router_ids = torch.multinomial(
+                probs, num_samples=batch_size, replacement=True
+            ).to(dtype=torch.long)
+        else:
+            router_ids = torch.empty(
+                batch_size, dtype=torch.long, device=broadcast_device
+            )
+
+        if mp_group is not None:
+            torch.distributed.broadcast(router_ids, src=mp_src_rank, group=mp_group)
+
+        if device is not None and router_ids.device != torch.device(device):
+            router_ids = router_ids.to(device=device)
+        return router_ids
+
+    @staticmethod
+    def _model_parallel_broadcast_target() -> (
+        tuple[torch.distributed.ProcessGroup | None, int | None]
+    ):
+        """Return the model-parallel group and src rank for router-id broadcast.
+
+        Returns `(None, None)` when torch.distributed is not initialized or the
+        Megatron parallel state has not been set up (e.g. unit tests), so the
+        caller falls back to local sampling.
+        """
+        if not (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        ):
+            return None, None
+        try:
+            from megatron.core import parallel_state
+
+            mp_group = parallel_state.get_model_parallel_group()
+            mp_src_rank = parallel_state.get_model_parallel_src_rank()
+        except (ImportError, AssertionError, AttributeError):
+            return None, None
+        return mp_group, mp_src_rank
 
     def get_router_ids(
         self, data: BatchedDataDict[Any], *, device: torch.device | str | None = None
@@ -381,6 +442,7 @@ class FrozenFlextronRouter:
         try:
             from megatron.core import parallel_state
 
+            # TODO: @rohitrango, check if this is correct for MoE TP versus MLP/attn TP
             if hasattr(parallel_state, "get_expert_tensor_parallel_rank"):
                 rank = parallel_state.get_expert_tensor_parallel_rank()
             else:
@@ -403,5 +465,6 @@ class FrozenFlextronRouter:
         if mask is None:
             mask = torch.zeros(local_dim, dtype=dtype, device=device)
             mask[:local_keep_dim] = 1
-            self._mask_cache[key] = mask
+            if not torch.is_inference_mode_enabled():
+                self._mask_cache[key] = mask
         return mask

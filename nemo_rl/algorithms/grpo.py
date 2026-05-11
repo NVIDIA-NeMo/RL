@@ -1072,6 +1072,57 @@ def _create_advantage_estimator(master_config: MasterConfig):
     return adv_estimator
 
 
+def _get_flextron_reward_metric_keys(master_config: MasterConfig) -> dict[int, str]:
+    """Return reward metric keys for configured Flextron routes."""
+    megatron_cfg = master_config["policy"].get("megatron_cfg") or {}
+    flex_routers = megatron_cfg.get("flex_routers")
+    sampling_rates = megatron_cfg.get("flextron_sampling_rates")
+    if (
+        not isinstance(flex_routers, list)
+        or not flex_routers
+        or not isinstance(sampling_rates, list)
+    ):
+        return {}
+
+    metric_keys = {0: "flextron/reward/base_model"}
+    for router_id in range(1, len(sampling_rates)):
+        metric_keys[router_id] = f"flextron/reward/router_{router_id}"
+    return metric_keys
+
+
+def _update_flextron_reward_metrics(
+    metrics: dict[str, Any],
+    rewards: torch.Tensor,
+    router_ids: torch.Tensor | None,
+    master_config: MasterConfig,
+    previous_rewards: dict[int, float],
+) -> dict[int, float]:
+    """Add per-Flextron-route reward metrics, carrying forward missing routes."""
+    metric_keys = _get_flextron_reward_metric_keys(master_config)
+    if not metric_keys or router_ids is None:
+        return previous_rewards
+
+    flat_rewards = rewards.detach().to(dtype=torch.float32, device="cpu").reshape(-1)
+    flat_router_ids = router_ids.detach().to(dtype=torch.long, device="cpu").reshape(-1)
+    if flat_rewards.numel() != flat_router_ids.numel():
+        raise ValueError(
+            "Flextron reward logging requires one reward per router id; got "
+            f"{flat_rewards.numel()} rewards and {flat_router_ids.numel()} router ids."
+        )
+
+    updated_rewards = previous_rewards.copy()
+    for router_id, metric_key in metric_keys.items():
+        route_rewards = flat_rewards[flat_router_ids == router_id]
+        if route_rewards.numel() > 0:
+            reward_value = route_rewards.mean().item()
+            updated_rewards[router_id] = reward_value
+        else:
+            reward_value = previous_rewards.get(router_id, 0.0)
+        metrics[metric_key] = reward_value
+
+    return updated_rewards
+
+
 def _extract_prompt_only_messages(message_logs: list) -> list:
     """Extract only prompt messages (user/system) from message logs.
 
@@ -1366,6 +1417,7 @@ def grpo_train(
     val_at_end = master_config["grpo"]["val_at_end"]
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    previous_flextron_rewards: dict[int, float] = {}
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -1940,6 +1992,13 @@ def grpo_train(
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
 
+                previous_flextron_rewards = _update_flextron_reward_metrics(
+                    metrics,
+                    rewards,
+                    train_data.get("flex_router_ids"),
+                    master_config,
+                    previous_flextron_rewards,
+                )
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
@@ -2449,6 +2508,7 @@ def async_grpo_train(
     val_at_start = master_config["grpo"]["val_at_start"]
     val_at_end = master_config["grpo"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    previous_flextron_rewards: dict[int, float] = {}
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -3000,6 +3060,13 @@ def async_grpo_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
+                previous_flextron_rewards = _update_flextron_reward_metrics(
+                    metrics,
+                    rewards,
+                    train_data.get("flex_router_ids"),
+                    master_config,
+                    previous_flextron_rewards,
+                )
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
