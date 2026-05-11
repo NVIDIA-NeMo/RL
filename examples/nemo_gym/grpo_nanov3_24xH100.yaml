@@ -17,7 +17,7 @@ grpo:
   num_val_generations_per_prompt: 4
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
   max_num_epochs: 1
-  max_num_steps: 10
+  max_num_steps: 5
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10000
@@ -81,7 +81,7 @@ checkpointing:
   higher_is_better: true
   keep_top_k: 1000000
   save_period: 10
-  checkpoint_must_save_by: "00:00:50:00"
+  checkpoint_must_save_by: "00:04:00:00"
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true
