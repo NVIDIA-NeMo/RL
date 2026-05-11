@@ -33,9 +33,11 @@ transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
 from tensordict import NonTensorStack
 
-from nemo_rl.data_plane import build_data_plane_client
+from nemo_rl.data_plane import build_data_plane_client, materialize
 from nemo_rl.data_plane.column_io import read_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.sync_rollout_actor import kv_first_write
 
 # ── loud-skip helpers ─────────────────────────────────────────────────────────
 
@@ -353,3 +355,65 @@ def test_object_and_tensor_mixed_round_trip_backends(tq_client_backends) -> None
     assert "ids" not in only_msg
 
     client.kv_clear(keys=None, partition_id="mix-backend")
+
+
+def test_routed_experts_jagged_round_trip(tq_client) -> None:
+    tq_client.register_partition(
+        partition_id="r3",
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "token_mask",
+            "sample_mask",
+            "generation_logprobs",
+            "routed_experts",
+        ],
+        num_samples=3,
+        consumer_tasks=["read"],
+    )
+
+    lengths = torch.tensor([5, 3, 4], dtype=torch.long)
+    final_batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(3 * 5, dtype=torch.long).reshape(3, 5),
+            "input_lengths": lengths,
+            "token_mask": torch.ones(3, 5, dtype=torch.long),
+            "sample_mask": torch.ones(3, dtype=torch.long),
+            "generation_logprobs": torch.zeros(3, 5),
+            "routed_experts": torch.arange(3 * 5 * 2 * 2, dtype=torch.int32).reshape(
+                3, 5, 2, 2
+            ),
+        }
+    )
+    meta = kv_first_write(
+        final_batch,
+        uids=["a", "b", "c"],
+        dp_client=tq_client,
+        partition_id="r3",
+        pad_to_multiple=4,
+    )
+
+    wire = tq_client.kv_batch_get(
+        keys=meta.keys,
+        partition_id="r3",
+        select_fields=["input_ids", "routed_experts"],
+    )
+    materialized = materialize(
+        wire,
+        pad_value_dict={"input_ids": -1},
+        pad_to_multiple=int((meta.extra_info or {})["pad_to_multiple"]),
+    )
+
+    assert materialized["input_ids"].shape == (3, 8)
+    assert materialized["routed_experts"].shape == (3, 8, 2, 2)
+    for row, seq_len in enumerate(lengths.tolist()):
+        assert torch.equal(
+            materialized["input_ids"][row, :seq_len],
+            final_batch["input_ids"][row, :seq_len],
+        )
+        assert torch.equal(
+            materialized["routed_experts"][row, :seq_len],
+            final_batch["routed_experts"][row, :seq_len],
+        )
+
+    tq_client.kv_clear(keys=None, partition_id="r3")

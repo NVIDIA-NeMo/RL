@@ -40,7 +40,11 @@ import ray
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, LP_SEED_FIELDS
+from nemo_rl.data_plane.schema import (
+    DP_TRAIN_FIELDS,
+    LP_SEED_FIELDS,
+    fields_with_optional_routed_experts,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
@@ -124,6 +128,9 @@ class TQPolicy(Policy):
         self.dp_cfg = dp_cfg
         self._dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
         self._tq_partition_id = tq_partition_id
+        self._router_replay_enabled = bool(
+            (self.cfg.get("router_replay") or {}).get("enabled", False)
+        )
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -164,7 +171,9 @@ class TQPolicy(Policy):
         """
         self._dp_client.register_partition(
             partition_id=self._tq_partition_id,
-            fields=list(DP_TRAIN_FIELDS),
+            fields=fields_with_optional_routed_experts(
+                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            ),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
             grpo_group_size=group_size,
@@ -205,6 +214,7 @@ class TQPolicy(Policy):
         timer_prefix: str,
         timer: Optional[Timer],
         common_kwargs: dict[str, Any],
+        include_router_replay: bool = False,
     ) -> BatchedDataDict[Any]:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
@@ -213,7 +223,14 @@ class TQPolicy(Policy):
         multimodal). The same shape is used for both prev_lp and ref_lp.
         """
         spa, dba = self._packing_args("logprob_mb_tokens")
-        lp_meta = replace(meta, fields=list(LP_SEED_FIELDS), task_name=task_name)
+        lp_meta = replace(
+            meta,
+            fields=fields_with_optional_routed_experts(
+                LP_SEED_FIELDS,
+                enabled=self._router_replay_enabled and include_router_replay,
+            ),
+            task_name=task_name,
+        )
         with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
             metas, unsorted_indices = shard_meta_for_dp(
                 lp_meta,
@@ -258,6 +275,7 @@ class TQPolicy(Policy):
             timer_prefix="get_logprobs",
             timer=timer,
             common_kwargs={"micro_batch_size": micro_batch_size},
+            include_router_replay=True,
         )
 
     def get_reference_policy_logprobs_from_meta(
@@ -313,7 +331,9 @@ class TQPolicy(Policy):
         # call (workers + driver delta-writes).
         train_meta = replace(
             meta,
-            fields=list(DP_TRAIN_FIELDS),
+            fields=fields_with_optional_routed_experts(
+                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            ),
             task_name="train",
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():

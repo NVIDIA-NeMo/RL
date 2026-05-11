@@ -51,6 +51,11 @@ import ray
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.data_plane.schema import (
+    ROLLOUT_SEED_FIELDS,
+    ROUTED_EXPERTS_FIELD,
+    fields_with_optional_routed_experts,
+)
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -138,6 +143,51 @@ def kv_first_write(
         sequence_lengths=[int(s) for s in lengths.tolist()],
         extra_info=extras,
     )
+
+
+def _build_rollout_bulk_batch(
+    flat: BatchedDataDict[Any],
+    *,
+    input_lengths: torch.Tensor,
+    sample_mask: torch.Tensor,
+    router_replay_enabled: bool,
+) -> BatchedDataDict[Any]:
+    """Build the rollout first-write tensor payload from the configured schema."""
+    expected_fields = fields_with_optional_routed_experts(
+        ROLLOUT_SEED_FIELDS,
+        enabled=router_replay_enabled,
+    )
+    field_sources = {
+        "input_ids": flat["token_ids"],
+        "input_lengths": input_lengths,
+        "generation_logprobs": flat["generation_logprobs"],
+        "token_mask": flat["token_loss_mask"],
+        "sample_mask": sample_mask,
+    }
+    if ROUTED_EXPERTS_FIELD in flat:
+        field_sources[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
+
+    missing_fields = [field for field in expected_fields if field not in field_sources]
+    if missing_fields:
+        if ROUTED_EXPERTS_FIELD in missing_fields and router_replay_enabled:
+            raise RuntimeError(
+                "policy.router_replay.enabled=true requires routed_experts in "
+                "the rollout bulk payload, but rollout flattening did not "
+                "produce that field. Check vLLM routed-expert capture and the "
+                "message-log flattening path."
+            )
+        raise RuntimeError(
+            "Rollout bulk payload is missing required fields: "
+            f"{missing_fields}. Expected fields: {expected_fields}."
+        )
+
+    bulk_batch = BatchedDataDict[Any](
+        {field: field_sources[field] for field in expected_fields}
+    )
+    for k, v in flat.get_multimodal_dict(as_tensors=False).items():
+        if isinstance(v, torch.Tensor):
+            bulk_batch[k] = v
+    return bulk_batch
 
 
 @ray.remote  # pragma: no cover
@@ -284,22 +334,18 @@ class SyncRolloutActor:
             **pad,
         )
 
-        # TQ bulk payload — DP_TRAIN_FIELDS + multimodal extras.
-        bulk_batch = BatchedDataDict[Any](
-            {
-                "input_ids": flat["token_ids"],
-                "input_lengths": input_lengths,
-                "generation_logprobs": flat["generation_logprobs"],
-                "token_mask": flat["token_loss_mask"],
-                "sample_mask": fb["loss_multiplier"],
-            }
+        router_replay_enabled = bool(
+            (cfg["policy"].get("router_replay") or {}).get("enabled", False)
         )
-        for k, v in flat.get_multimodal_dict(as_tensors=False).items():
-            if isinstance(v, torch.Tensor):
-                bulk_batch[k] = v
-        # ``content`` (raw assistant text per sample) — rides TQ as a
-        # NonTensorStack so the driver can fetch it back at jsonl time
-        # (kv_first_write wraps it via NonTensorStack).
+        bulk_batch = _build_rollout_bulk_batch(
+            flat,
+            input_lengths=input_lengths,
+            sample_mask=fb["loss_multiplier"],
+            router_replay_enabled=router_replay_enabled,
+        )
+        # ``content`` (raw assistant text per sample) — rides TQ as an
+        # object array so the driver can fetch it back at jsonl time
+        # (kv_first_write passes object arrays through the TQ wire path).
         if "content" in flat:
             bulk_batch["content"] = np.asarray(flat["content"], dtype=object)
 

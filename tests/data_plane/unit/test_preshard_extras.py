@@ -28,13 +28,24 @@ identity preserved across shards).
 from __future__ import annotations
 
 import torch
+from tensordict import TensorDict
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.codec import materialize, maybe_pack_jagged
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+from nemo_rl.data_plane.schema import (
+    DP_TRAIN_FIELDS,
+    LP_SEED_FIELDS,
+    ROLLOUT_SEED_FIELDS,
+    ROUTED_EXPERTS_FIELD,
+    fields_with_optional_routed_experts,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.sync_rollout_actor import kv_first_write
+from nemo_rl.experience.sync_rollout_actor import (
+    _build_rollout_bulk_batch,
+    kv_first_write,
+)
 
 
 def _final_batch(n_samples: int = 4, *, with_extras: bool = False) -> BatchedDataDict:
@@ -93,6 +104,57 @@ def test_kv_first_write_carries_multimodal_extras():
     assert fetched["pixel_values"].shape == (4, 3, 4, 4)
 
 
+def test_kv_first_write_packs_routed_experts_like_input_ids():
+    client = NoOpDataPlaneClient()
+    _setup_partition(client, num_samples=4)
+    fb = _final_batch(4)
+    lengths = torch.tensor([8, 6, 8, 5], dtype=torch.long)
+    fb["input_lengths"] = lengths
+    fb["routed_experts"] = torch.arange(4 * 8 * 2 * 2, dtype=torch.int32).reshape(
+        4, 8, 2, 2
+    )
+    uids = [f"u{i}" for i in range(4)]
+
+    meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
+
+    rows = client._partitions["train"].rows
+    for i, key in enumerate(meta.keys):
+        seq_len = int(lengths[i].item())
+        assert rows[key]["input_ids"].shape == (seq_len,)
+        assert rows[key]["routed_experts"].shape == (seq_len, 2, 2)
+        assert torch.equal(rows[key]["input_ids"], fb["input_ids"][i, :seq_len])
+        assert torch.equal(
+            rows[key]["routed_experts"],
+            fb["routed_experts"][i, :seq_len],
+        )
+
+
+def test_routed_experts_jagged_materialize_preserves_trailing_dims():
+    lengths = torch.tensor([3, 5], dtype=torch.long)
+    input_ids = torch.arange(2 * 5, dtype=torch.long).reshape(2, 5)
+    routed_experts = torch.arange(2 * 5 * 2 * 2, dtype=torch.int32).reshape(2, 5, 2, 2)
+    td = TensorDict(
+        {
+            "input_ids": maybe_pack_jagged(input_ids, lengths),
+            "routed_experts": maybe_pack_jagged(routed_experts, lengths),
+        },
+        batch_size=[2],
+    )
+
+    materialized = materialize(
+        td,
+        pad_value_dict={"input_ids": -1},
+        pad_to_multiple=4,
+    )
+
+    assert materialized["input_ids"].shape == (2, 8)
+    assert materialized["routed_experts"].shape == (2, 8, 2, 2)
+    assert torch.equal(materialized["input_ids"][0, :3], input_ids[0, :3])
+    assert torch.equal(materialized["input_ids"][0, 3:], torch.full((5,), -1))
+    assert torch.equal(materialized["routed_experts"][0, :3], routed_experts[0, :3])
+    assert torch.equal(materialized["routed_experts"][1, :5], routed_experts[1, :5])
+
+
 def test_kv_first_write_keys_match_uids_x_ngen():
     """Keys are f"{uid}_g{i}"; n_gen inferred from sample_mask shape vs uids."""
     client = NoOpDataPlaneClient()
@@ -101,6 +163,86 @@ def test_kv_first_write_keys_match_uids_x_ngen():
     uids = ["a", "b", "c"]
     meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
     assert meta.keys == ["a_g0", "a_g1", "b_g0", "b_g1", "c_g0", "c_g1"]
+
+
+def _flat_rollout_batch(*, with_routed_experts: bool) -> BatchedDataDict:
+    flat: BatchedDataDict = BatchedDataDict()
+    flat["token_ids"] = torch.zeros((2, 4), dtype=torch.long)
+    flat["generation_logprobs"] = torch.zeros((2, 4), dtype=torch.float32)
+    flat["token_loss_mask"] = torch.ones((2, 4), dtype=torch.bool)
+    if with_routed_experts:
+        flat["routed_experts"] = torch.zeros((2, 4, 3, 2), dtype=torch.int32)
+    return flat
+
+
+def test_build_rollout_bulk_batch_requires_routed_experts_when_enabled():
+    flat = _flat_rollout_batch(with_routed_experts=False)
+
+    try:
+        _build_rollout_bulk_batch(
+            flat,
+            input_lengths=torch.tensor([4, 3], dtype=torch.long),
+            sample_mask=torch.ones((2,), dtype=torch.bool),
+            router_replay_enabled=True,
+        )
+    except RuntimeError as exc:
+        assert "requires routed_experts" in str(exc)
+    else:
+        raise AssertionError("Expected missing routed_experts to raise")
+
+
+def test_build_rollout_bulk_batch_drops_routed_experts_when_disabled():
+    flat = _flat_rollout_batch(with_routed_experts=True)
+
+    bulk = _build_rollout_bulk_batch(
+        flat,
+        input_lengths=torch.tensor([4, 3], dtype=torch.long),
+        sample_mask=torch.ones((2,), dtype=torch.bool),
+        router_replay_enabled=False,
+    )
+
+    assert list(bulk.keys()) == list(ROLLOUT_SEED_FIELDS)
+    assert ROUTED_EXPERTS_FIELD not in bulk
+
+
+def test_build_rollout_bulk_batch_includes_routed_experts_when_enabled():
+    flat = _flat_rollout_batch(with_routed_experts=True)
+
+    bulk = _build_rollout_bulk_batch(
+        flat,
+        input_lengths=torch.tensor([4, 3], dtype=torch.long),
+        sample_mask=torch.ones((2,), dtype=torch.bool),
+        router_replay_enabled=True,
+    )
+
+    expected_fields = fields_with_optional_routed_experts(
+        ROLLOUT_SEED_FIELDS,
+        enabled=True,
+    )
+    assert list(bulk.keys()) == expected_fields
+    assert torch.equal(bulk[ROUTED_EXPERTS_FIELD], flat[ROUTED_EXPERTS_FIELD])
+
+
+# ── optional router replay field selection ────────────────────────────
+
+
+def test_rollout_seed_fields_are_dp_seed_subset():
+    assert set(ROLLOUT_SEED_FIELDS).issubset(DP_TRAIN_FIELDS)
+
+
+def test_fields_with_optional_routed_experts_disabled():
+    fields = fields_with_optional_routed_experts(LP_SEED_FIELDS, enabled=False)
+    assert fields == list(LP_SEED_FIELDS)
+    assert ROUTED_EXPERTS_FIELD not in fields
+
+
+def test_fields_with_optional_routed_experts_enabled_once():
+    fields = fields_with_optional_routed_experts(DP_TRAIN_FIELDS, enabled=True)
+    assert fields[-1] == ROUTED_EXPERTS_FIELD
+    assert fields.count(ROUTED_EXPERTS_FIELD) == 1
+
+    fields = fields_with_optional_routed_experts(fields, enabled=True)
+    assert fields.count(ROUTED_EXPERTS_FIELD) == 1
 
 
 # ── shard_meta_for_dp invariants ──────────────────────────────────────

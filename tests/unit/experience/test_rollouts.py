@@ -37,7 +37,9 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.experience.rollouts import (
+    _attach_routed_experts_to_message_log_prefix,
     _calculate_single_metric,
+    _dummy_routed_experts_for_tokens,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -98,6 +100,78 @@ class TestCalculateSingleMetric:
         result = _calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
 
         assert result["test/stddev"] == 0.0
+
+
+def test_routed_experts_message_log_stays_token_aligned():
+    message_log = [
+        {"role": "user", "content": "abc", "token_ids": torch.tensor([1, 2, 3])},
+        {"role": "assistant", "content": "de", "token_ids": torch.tensor([4, 5])},
+    ]
+    routed_experts = torch.arange(7 * 2 * 1, dtype=torch.int32).reshape(7, 2, 1)
+
+    prefix_len = _attach_routed_experts_to_message_log_prefix(
+        message_log, routed_experts
+    )
+    assert prefix_len == 5
+    message_log.append(
+        {
+            "role": "assistant",
+            "content": "fg",
+            "token_ids": torch.tensor([6, 7]),
+            "routed_experts": routed_experts[5:7],
+        }
+    )
+
+    flat, lengths = batched_message_log_to_flat_message([message_log])
+    assert lengths.tolist() == [7]
+    assert torch.equal(flat["routed_experts"][0], routed_experts)
+
+
+def test_dummy_routed_experts_keep_env_observation_token_aligned():
+    message_log = [
+        {
+            "role": "user",
+            "content": "abc",
+            "token_ids": torch.tensor([1, 2, 3]),
+            "routed_experts": torch.arange(3 * 2 * 3, dtype=torch.int32).reshape(
+                3, 2, 3
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "de",
+            "token_ids": torch.tensor([4, 5]),
+            "routed_experts": torch.arange(
+                3 * 2 * 3, 5 * 2 * 3, dtype=torch.int32
+            ).reshape(2, 2, 3),
+        },
+    ]
+    obs_tokens = torch.tensor([6, 7, 8])
+    message_log.append(
+        {
+            "role": "environment",
+            "content": "obs",
+            "token_ids": obs_tokens,
+            "routed_experts": _dummy_routed_experts_for_tokens(
+                obs_tokens, message_log[0]["routed_experts"]
+            ),
+        }
+    )
+
+    flat, lengths = batched_message_log_to_flat_message([message_log])
+
+    assert lengths.tolist() == [8]
+    assert torch.equal(
+        flat["routed_experts"][0, 5:8],
+        torch.tensor(
+            [
+                [[0, 1, 2], [0, 1, 2]],
+                [[0, 1, 2], [0, 1, 2]],
+                [[0, 1, 2], [0, 1, 2]],
+            ],
+            dtype=torch.int32,
+        ),
+    )
 
 
 @pytest.fixture(scope="function")

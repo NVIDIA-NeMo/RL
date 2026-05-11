@@ -13,7 +13,7 @@
 # limitations under the License.
 """Shared constants and type aliases for the data-plane meta contract."""
 
-from typing import Literal
+from typing import Literal, Sequence
 
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
 Layout = Literal["padded", "jagged"]
@@ -43,6 +43,15 @@ DP_TRAIN_FIELDS = (
     "sample_mask",
 )
 
+# Subset written by the rollout actor's first `kv_batch_put`.
+ROLLOUT_SEED_FIELDS = (
+    "input_ids",
+    "input_lengths",
+    "generation_logprobs",
+    "token_mask",
+    "sample_mask",
+)
+
 # Subset fetched by logprob / ref-logprob workers.
 LP_SEED_FIELDS = (
     "input_ids",
@@ -50,3 +59,17 @@ LP_SEED_FIELDS = (
     "token_mask",
     "sample_mask",
 )
+
+ROUTED_EXPERTS_FIELD = "routed_experts"
+
+
+def fields_with_optional_routed_experts(
+    fields: Sequence[str],
+    *,
+    enabled: bool,
+) -> list[str]:
+    """Return `fields` plus routed experts when router replay is enabled."""
+    out = list(fields)
+    if enabled and ROUTED_EXPERTS_FIELD not in out:
+        out.append(ROUTED_EXPERTS_FIELD)
+    return out

@@ -82,6 +82,10 @@ from nemo_rl.models.megatron.draft.utils import (
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
+from nemo_rl.models.megatron.router_replay import (
+    router_replay_enabled,
+    validate_router_replay_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -411,6 +415,7 @@ def setup_model_config(
     """Handle all the model configuration logic."""
     pretrained_ckpt = config.get("pretrained_checkpoint")
     fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else None
+    validate_router_replay_config(config)
 
     if fmt == "megatron_lm":
         # For megatron_lm format: build the model config from the HF architecture.
@@ -473,6 +478,13 @@ def setup_model_config(
 
         model_cfg = cfg_from_pretrained.model
         cfg_from_pretrained.logger = LoggerConfig()
+
+    if router_replay_enabled(config) and getattr(
+        model_cfg, "virtual_pipeline_model_parallel_size", None
+    ) not in (None, 1):
+        raise ValueError(
+            "router_replay.enabled does not support virtual pipeline parallelism yet."
+        )
 
     # Apply parallelism settings
     _apply_parallelism_config(model_cfg, config)
@@ -586,6 +598,7 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     ]
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
+    model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:

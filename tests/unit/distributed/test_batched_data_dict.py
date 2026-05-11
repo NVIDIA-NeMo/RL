@@ -646,6 +646,38 @@ def test_from_batches_pads_3d_tensors_along_sequence_dim():
     assert torch.equal(stacked_logits, expected)
 
 
+def test_from_batches_pads_4d_sequence_tensors_preserving_trailing_dims():
+    """from_batches should not flatten rank-4 token-aligned tensors."""
+
+    pad_value = -1
+    batch1 = BatchedDataDict(
+        {
+            "routed_experts": torch.arange(2 * 3 * 2 * 1, dtype=torch.int32).reshape(
+                2, 3, 2, 1
+            )
+        }
+    )
+    batch2 = BatchedDataDict(
+        {
+            "routed_experts": (
+                100 + torch.arange(1 * 5 * 2 * 1, dtype=torch.int32).reshape(1, 5, 2, 1)
+            )
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches(
+        [batch1, batch2], pad_value_dict={"routed_experts": pad_value}
+    )
+
+    assert stacked["routed_experts"].shape == (3, 5, 2, 1)
+    assert torch.equal(stacked["routed_experts"][:2, :3], batch1["routed_experts"])
+    assert torch.equal(
+        stacked["routed_experts"][:2, 3:],
+        torch.full((2, 2, 2, 1), pad_value, dtype=torch.int32),
+    )
+    assert torch.equal(stacked["routed_experts"][2:], batch2["routed_experts"])
+
+
 @pytest.mark.parametrize("pad_to_multiple_of", [1, 32, 64, 256])
 def test_sequence_packing_microbatch_boundaries(pad_to_multiple_of):
     """Test that microbatch boundaries are correctly maintained across chunks with random sequences."""

@@ -24,9 +24,41 @@ import os
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-
-from nemo_rl.data_plane.worker_mixin import _broadcast_batched_data_dict
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.worker_mixin import (
+    TQWorkerMixin,
+    _broadcast_batched_data_dict,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from tensordict import TensorDict
+
+
+class _FetchClient:
+    def __init__(self, rank: int, q):
+        self.rank = rank
+        self.q = q
+
+    def kv_batch_get(self, keys, partition_id, select_fields=None):
+        if self.rank != 0:
+            raise AssertionError("non-leader unexpectedly fetched from TQ")
+        self.q.put(
+            ("fetch", self.rank, tuple(keys), partition_id, tuple(select_fields))
+        )
+        return TensorDict(
+            {
+                "input_ids": torch.arange(12, dtype=torch.long).reshape(3, 4),
+                "input_lengths": torch.tensor([4, 3, 2], dtype=torch.int32),
+            },
+            batch_size=[3],
+        )
+
+
+class _FetchWorkerStub(TQWorkerMixin):
+    def __init__(self, rank: int, q):
+        self._dp_client = _FetchClient(rank, q)
+
+    def _get_replica_group(self):
+        return dist.group.WORLD
 
 
 def _worker(rank: int, world_size: int, tmp_init_file: str, q):
@@ -60,6 +92,22 @@ def _worker(rank: int, world_size: int, tmp_init_file: str, q):
             out["input_lengths"], torch.tensor([4, 3, 2], dtype=torch.int32)
         )
         assert out["scalar_meta"] == "step_42"
+
+        meta = KVBatchMeta(
+            partition_id="train",
+            task_name="train",
+            keys=["s0", "s1", "s2"],
+            fields=["input_ids", "input_lengths"],
+        )
+        fetched = _FetchWorkerStub(rank, q)._fetch(
+            meta, fetch_policy="leader_broadcast"
+        )
+        assert torch.equal(
+            fetched["input_ids"], torch.arange(12, dtype=torch.long).reshape(3, 4)
+        )
+        assert torch.equal(
+            fetched["input_lengths"], torch.tensor([4, 3, 2], dtype=torch.int32)
+        )
         q.put((rank, "ok"))
     except Exception as e:  # pragma: no cover — surface failures to parent
         q.put((rank, f"err: {type(e).__name__}: {e}"))
@@ -80,8 +128,13 @@ def test_leader_broadcast_round_trip(tmp_path):
         p.join(timeout=30)
         assert p.exitcode == 0, f"worker exited with {p.exitcode}"
 
-    results = sorted([q.get() for _ in range(2)])
-    assert results == [(0, "ok"), (1, "ok")], results
+    results = [q.get() for _ in range(3)]
+    ok_results = sorted(r for r in results if len(r) == 2)
+    fetch_results = [r for r in results if len(r) == 5]
+    assert ok_results == [(0, "ok"), (1, "ok")], results
+    assert fetch_results == [
+        ("fetch", 0, ("s0", "s1", "s2"), "train", ("input_ids", "input_lengths"))
+    ]
 
 
 def test_get_replica_group_default_is_none():

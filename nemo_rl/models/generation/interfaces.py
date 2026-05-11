@@ -213,6 +213,9 @@ class GenerationOutputSpec(TypedDict):
         torch.Tensor
     )  # Length of full valid sequence (input + generated response)
     logprobs: torch.Tensor
+    routed_experts: NotRequired[
+        torch.Tensor
+    ]  # Full-sequence-aligned MoE expert ids [B, S, num_moe_layers, topk]
     truncated: NotRequired[
         torch.Tensor
     ]  # Whether each sequence was truncated and hit max_tokens without stop token

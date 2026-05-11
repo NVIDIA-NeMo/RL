@@ -132,20 +132,16 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 tensor_or_list = torch.cat(list_of_tensors)
             elif isinstance(list_of_tensors[0], torch.Tensor):
                 pad_value = pad_value_dict.get(k, 0)
-                # We now add the following if statement to handle the 3D case in distillation
-                # (i.e., teacher top-k logits and indices); the else branch is the original code.
-                if list_of_tensors[0].ndim == 3:
-                    # For 3D tensors, pad only along the sequence dimension (the 1st dimension here),
-                    # keeping the feature dimension.
+                if list_of_tensors[0].ndim >= 3:
+                    # For sequence tensors with trailing feature dimensions, pad only
+                    # along the sequence dimension and preserve the trailing layout.
                     max_seq_len = max(tensor.shape[1] for tensor in list_of_tensors)
                     padded_tensors = []
                     for tensor in list_of_tensors:
-                        # Pad along the 1st dimension to max_seq_len.
                         pad_length = max_seq_len - tensor.shape[1]
                         padded = torch.nn.functional.pad(
                             tensor,
-                            # Only pad the last two dimensions (sequence length).
-                            (0, 0, 0, pad_length),
+                            (0, 0) * (tensor.ndim - 2) + (0, pad_length),
                             mode="constant",
                             value=pad_value,
                         )
