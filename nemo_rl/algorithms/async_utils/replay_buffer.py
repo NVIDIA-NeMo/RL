@@ -207,11 +207,6 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 "avg_trajectory_age": avg_trajectory_age,
             }
 
-    def evict(self) -> None:
-        """Evict old trajectories."""
-        # Adding for backward compatibility.
-        pass
-
     def size(self) -> int:
         """Return current buffer size."""
         with self._lock:

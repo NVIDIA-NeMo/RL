@@ -51,10 +51,6 @@ class ReplayBufferProtocol(Protocol):
         """
         ...
 
-    def evict(self) -> None:
-        """Evict old trajectories."""
-        ...
-
     def size(self) -> int:
         """Return current buffer size."""
         ...
