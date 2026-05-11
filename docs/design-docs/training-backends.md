@@ -35,12 +35,8 @@ _Note_: When using Megatron, the optimizer and learning rate schedule are config
 ### DTensor Backend
 To enable DTensor (FSDP2) training:
 
-1. Set `policy.dtensor_config.enabled=True`.
+1. Set `policy.dtensor_cfg.enabled=True`.
 2. Refer to [examples/configs/grpo_math_1B.yaml](../../examples/configs/grpo_math_1B.yaml) for a configuration example.
-
-## Backend Priority
-
-**Megatron takes precedence over DTensor.** If both backends are enabled simultaneously (`policy.megatron_cfg.enabled=True` and `policy.dtensor_config.enabled=True`), the Megatron backend will be used.
 
 ## Configuration Examples
 
@@ -72,7 +68,7 @@ export HF_HOME="/shared/nfs/huggingface"
 
 ### Best Practices ###
 
-- **Mount in checkpoint directory**: If you are using Docker, make sure the Megatron checkpoint path is covered by `-v`/`--mount`. Similarly, if you are using SLURM+pyxis, ensure `--container-mounts` includes this path.
+- **Mount the checkpoint directory**: If you are using Docker, make sure the Megatron checkpoint path is covered by `-v`/`--mount`. Similarly, if you are using SLURM+pyxis, ensure `--container-mounts` includes this path.
 - **Use shared storage**: Ensure the checkpoint directory is accessible from all nodes (e.g., NFS, shared filesystem).
 - **Prefer HF_HOME**: If you already have `HF_HOME` mounted across nodes, this reduces the number of environment variables to manage.
 - **Sufficient space**: Ensure adequate disk space for the converted model checkpoints.

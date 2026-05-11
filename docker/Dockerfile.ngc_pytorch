@@ -3,8 +3,8 @@
 #
 # Usage:
 # Self-contained build (default: builds from main): docker buildx build -f docker/Dockerfile.ngc_pytorch --tag <registry>/nemo-rl:latest --push .
-# Self-contained build (specific git ref): docker buildx build -f docker/Dockerfile.ngc_pytorch --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push .
-# Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL): docker buildx build -f docker/Dockerfile.ngc_pytorch --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push https://github.com/NVIDIA-NeMo/RL.git
+# Self-contained build (specific git ref): docker buildx build -f docker/Dockerfile.ngc_pytorch --build-arg NRL_GIT_REF=r0.6.0 --tag <registry>/nemo-rl:r0.6.0 --push .
+# Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL): docker buildx build -f docker/Dockerfile.ngc_pytorch --build-arg NRL_GIT_REF=r0.6.0 --tag <registry>/nemo-rl:r0.6.0 --push https://github.com/NVIDIA-NeMo/RL.git
 # Local NeMo RL source override: docker buildx build --build-context nemo-rl=. -f docker/Dockerfile.ngc_pytorch --tag <registry>/nemo-rl:latest --push .
 #
 # If installing new dependencies in the container, then use "uv pip install new-dependency"
@@ -108,6 +108,7 @@ uv sync --link-mode symlink --locked --inexact --no-install-project $UV_NO_INSTA
 uv sync --link-mode symlink --locked --inexact --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra mcore --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra automodel --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --inexact --extra modelopt --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 EOF
 

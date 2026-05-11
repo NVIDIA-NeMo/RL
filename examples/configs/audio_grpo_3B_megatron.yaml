@@ -1,0 +1,87 @@
+# Audio GRPO 3B Megatron Configuration
+# Inherits from grpo_math_1B_megatron.yaml and overrides audio-specific settings.
+defaults: "grpo_math_1B_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_steps: 1000
+  max_val_samples: 32
+  val_batch_size: 32
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/audio_grpo_3B_megatron
+  keep_top_k: 10
+  save_period: 400
+
+policy:
+  model_name: Qwen/Qwen2.5-Omni-3B
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  generation_batch_size: 32
+  logprob_batch_size: 4
+  max_total_sequence_length: 2048
+
+  sequence_packing:
+    enabled: false
+
+  generation:
+    max_new_tokens: 1024
+    vllm_cfg:
+      # Audio/multimodal models require tokenizer to be initialized before generation
+      skip_tokenizer_init: False
+      limit_mm_per_prompt:
+        audio: 1
+    vllm_kwargs:
+      # Disable mm processor cache to avoid vLLM cache eviction assertion error during validation.
+      mm_processor_cache_gb: 0
+
+  megatron_cfg:
+    converter_type: Qwen2_5OmniForConditionalGeneration
+    apply_rope_fusion: false
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-7
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-7
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+
+data:
+  num_workers: 0
+  train:
+    dataset_name: avqa
+    split: train
+  validation:
+    dataset_name: avqa
+    split: validation
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: "vlm_hf_data_processor"
+    env_name: "vlm"
+
+env:
+  vlm:
+    num_workers: 8
+    reward_functions:
+    - name: format
+      weight: 0.2
+    - name: exact_alnum
+      weight: 0.8
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb:
+    project: grpo-dev
+    name: audio-grpo-3b-megatron
+  swanlab:
+    project: grpo-dev
+    name: audio-grpo-3b-megatron
+
+cluster:
+  gpus_per_node: 2

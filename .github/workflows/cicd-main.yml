@@ -39,7 +39,7 @@ on:
         default: ""
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -480,6 +480,24 @@ jobs:
           SUMMARY=$(echo $JOB_RESULTS | jq 'to_entries[] | .key + ": " + .value.result' | tr -d '"')
           echo '🤖: CICD Result for test level: ${{ needs.pre-flight.outputs.test_level }}' >> $GITHUB_STEP_SUMMARY
           echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$TEST_LEVEL" == "none" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **No tests were run.** This PR does not have a CI label." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "To trigger tests, add one of the following labels to your PR:" >> $GITHUB_STEP_SUMMARY
+            echo "| Label | What it runs |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------|-------------|" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:docs\` | Doc tests only |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:Lfast\` | Fast subset (reuses main container) |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:L0\` | Unit tests + docs + lint |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:L1\` | L0 + functional tests |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:L2\` | L1 + convergence tests |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "This check will remain failed until a CI label is added." >> $GITHUB_STEP_SUMMARY
+          fi
+
           test "$ALL_SUCCESS" = "true" || test "$CI_SKIP" = "true"
 
   notify-nightly-failure:
@@ -519,6 +537,11 @@ jobs:
       matrix:
         flag: [doc-test, unit-test, e2e]
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -526,12 +549,13 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           pattern: coverage-${{ matrix.flag }}-*
+          path: coverage-downloads
 
       - name: Check if artifacts were downloaded
         id: check-artifacts
         run: |
-          # Check if any coverage directories were downloaded
-          if ls coverage-* 1> /dev/null 2>&1; then
+          # Check if any .coverage files were downloaded
+          if find coverage-downloads -name ".coverage" -type f 2>/dev/null | grep -q .; then
             echo "artifacts-found=true" >> $GITHUB_OUTPUT
             echo "Found coverage artifacts for ${{ matrix.flag }}"
           else
@@ -545,12 +569,10 @@ jobs:
         run: |
           pip install coverage
 
-          ls -al .
-          ls -al coverage-*/
-          coverage combine --keep $(ls coverage-*/.coverage)
+          find coverage-downloads -name ".coverage" -type f
+          coverage combine --keep $(find coverage-downloads -name ".coverage" -type f)
           coverage report -i --show-missing
-          rm -rf coverage-*
-          ls -al
+          rm -rf coverage-downloads
 
       - name: Skip coverage processing
         if: ${{ steps.check-artifacts.outputs.artifacts-found == 'false' }}
@@ -564,6 +586,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
+          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
         if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}

@@ -67,7 +67,7 @@ NeMo RL SFT uses Hugging Face chat templates to format the individual examples. 
     tokenizer:
       chat_template: NULL
     ```
-3. Use a custom template: If you would like to use a custom template, create a string template in [Jinja format](https://huggingface.co/docs/transformers/v4.34.0/en/chat_templating#how-do-i-create-a-chat-template), and add that string to the config. For example,
+3. Use a custom template: If you would like to use a custom template, create a string template in [Jinja format](https://huggingface.co/docs/transformers/en/chat_templating_writing), and add that string to the config. For example,
 
     ```yaml
     tokenizer:
@@ -339,7 +339,12 @@ For more details on LoRA, see [LoRA: Low-Rank Adaptation of Large Language Model
 
 ### Exporting a LoRA Checkpoint to Hugging Face Format
 
-After training with LoRA on the Megatron backend, use the LoRA merger script to fold the adapter weights into the base model and produce a standalone Hugging Face checkpoint for inference or evaluation. See the [Checkpointing documentation](../design-docs/checkpointing.md#merging-megatron-lora-adapter-checkpoints-to-hugging-face-format) for full usage details.
+After training with LoRA on the Megatron backend, the `convert_lora_to_hf.py` script supports two export modes:
+
+- **Merged**: fold the adapter into the base model and export a single standalone HuggingFace checkpoint for inference or evaluation.
+- **Adapter-only**: export only the adapter weights in HuggingFace PEFT format, keeping the base model separate (e.g. for use with vLLM's LoRA support).
+
+See the [Checkpointing documentation](../design-docs/checkpointing.md#converting-megatron-lora-adapter-checkpoints-to-hugging-face-format) for full usage details and examples.
 
 ## Optimizations
 
