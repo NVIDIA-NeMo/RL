@@ -724,21 +724,7 @@ def setup_model_and_optimizer(
         if rank == 0:
             print("Froze visual encoder parameters for text-only training")
 
-    # NemotronOmni: freeze audio towers when training on non-audio data.
-    # Without this, their params are in the optimizer but never receive grads;
-    # the optimizer doesn't create state for them, so the saved checkpoint lacks
-    # those entries, and `dcp.load` fails on resume with "Missing key in checkpoint
-    # state_dict: optim.state.sound_encoder.*.step". Frozen + filtered-out of the
-    # optimizer below sidesteps this entirely.
-    for attr in ("sound_encoder", "sound_projection"):
-        mod = getattr(model, attr, None) or getattr(
-            getattr(model, "model", None), attr, None
-        )
-        if mod is not None:
-            for param in mod.parameters():
-                param.requires_grad_(False)
-            if rank == 0:
-                print(f"Froze {attr} parameters (image-only training)")
+    # Audio tower freeze is driven by automodel_kwargs.freeze_config.freeze_audio_tower in YAML.
 
     # NemotronOmni RADIO: patch_generator.video_embedder is only called for
     # video inputs; image-only training never exercises it. Without freezing,

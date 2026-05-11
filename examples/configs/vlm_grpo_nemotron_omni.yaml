@@ -42,6 +42,10 @@ policy:
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
+      freeze_config:
+        freeze_vision_tower: false
+        freeze_audio_tower: true  # NemotronOmni: freeze sound_encoder/sound_projection on image-only data
+        freeze_language_model: false
   generation:
     max_new_tokens: 4096
     bad_words: ["<image>", "<img>", "</img>", "<so_embedding>", "<so_start>", "<so_end>"]
