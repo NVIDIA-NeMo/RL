@@ -79,10 +79,10 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  "vllm==0.17.1",
+  "vllm==0.18.0",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.4",
-  "flashinfer-cubin==0.6.4",
+  "flashinfer-python==0.6.8.post1",
+  "flashinfer-cubin==0.6.8.post1",
   "nvidia-cutlass-dsl>=4.4.0.dev1",
 ]
 sglang = [
@@ -256,9 +256,9 @@ override-dependencies = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
   # Note: flashinfer versions are pinned per-extra (vllm uses 0.6.4, sglang uses 0.6.7.post2)
   # since vllm and sglang extras are mutually exclusive and have different requirements.
-  # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm (0.6.4) and sglang (0.6.7.post2)
-  "flashinfer-python>=0.5.0",
-  "flashinfer-cubin>=0.5.0",
+  # Override megatron-core's flashinfer~=0.6.0 constraint to allow both vllm (0.6.8.post1) and sglang (0.6.7.post2)
+  "flashinfer-python>=0.6.0",
+  "flashinfer-cubin>=0.6.0",
   # sglang 0.5.10 requires nvidia-cutlass-dsl>=4.4.1 (via flashinfer 0.6.7.post2 which uses CUTLASS 4.4.2).
   # Override to >=4.4.1 so uv can resolve to a version satisfying both vllm and sglang.
   "nvidia-cutlass-dsl>=4.4.1",
