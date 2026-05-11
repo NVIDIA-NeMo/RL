@@ -786,6 +786,25 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
     print("\nSliding Puzzle VLLM Test assertions passed.")
 
 
+def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
+    class _FakePolicyGeneration:
+        cfg = {"vllm_cfg": {"max_model_len": 100}}
+
+    # stop_strings is truthy so the function hits the next assert and exits
+    # right after emitting the warning — keeps this test free of any rollout work.
+    with pytest.warns(UserWarning, match="greater than the"):
+        with pytest.raises(AssertionError, match="Stop strings"):
+            run_async_nemo_gym_rollout(
+                policy_generation=_FakePolicyGeneration(),
+                input_batch={"extra_env_info": []},
+                tokenizer=None,
+                task_to_env={},
+                generation_config={"stop_strings": "x", "max_new_tokens": 50},
+                max_seq_len=200,
+                max_rollout_turns=None,
+            )
+
+
 @pytest.mark.nemo_gym
 def test_run_async_nemo_gym_rollout(
     nemo_gym,  # noqa: F811
