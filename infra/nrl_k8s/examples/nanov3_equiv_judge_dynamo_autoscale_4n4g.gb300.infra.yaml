@@ -38,6 +38,11 @@
 _shared:
   headNodeSelector: &head_node_selector
     nodeGroup: customer-cpu
+  # DGD Frontend/Planner land on Karpenter-managed amd64 CPU nodes (nodePool
+  # "cpu") to avoid contention with Ray head pods on the static customer-cpu
+  # ARM nodes. The vllm-runtime image is multi-arch so amd64 works fine.
+  frontendNodeSelector: &frontend_node_selector
+    karpenter.sh/nodepool: cpu
   workerNodeSelector: &worker_node_selector
     nvidia.com/gpu.product: NVIDIA-GB300
   userSecretEnvFrom: &user_secret_env_from
@@ -217,6 +222,7 @@ dynamo:
             requests: {cpu: "2", memory: "4Gi"}
             limits:   {cpu: "4", memory: "8Gi"}
           extraPodSpec:
+            nodeSelector: *frontend_node_selector
             mainContainer:
               image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
               workingDir: /workspace
@@ -229,6 +235,7 @@ dynamo:
             requests: {cpu: "1", memory: "2Gi"}
             limits:   {cpu: "2", memory: "4Gi"}
           extraPodSpec:
+            nodeSelector: *frontend_node_selector
             mainContainer:
               image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
               command: [bash, -c]
