@@ -1,0 +1,269 @@
+# mini-swe-agent + Dynamo smoke infra for nrl-k8s on a GB300 cluster.
+#
+# Same training shape as the WPA dynamo smoke (1 GB300 worker × 1 GPU,
+# Megatron TP=1, single Dynamo decode worker on a separate GB300) plus
+# the setup needed for `singularity exec` to actually run SWE-bench
+# arm64 SIF containers from /mnt/rl-workspace/jothomson/swebench_containers/.
+#
+# Required setup (on BOTH head + GPU worker pod templates):
+#   * `lifecycle.postStart` apt-installs `singularity-container`. Both
+#     pods need it because mini_swe_agent's `runner_ray_remote` uses
+#     scheduling_strategy="SPREAD" — rollout runners land on the worker
+#     too. postStart blocks pod-Ready, so neither pod joins the Ray
+#     cluster until install completes (no race with rollout submission).
+#   * `securityContext.privileged: true` — singularity SIF extraction
+#     calls mount(2) with MS_PRIVATE which needs CAP_SYS_ADMIN. Without
+#     it, you see: "Failed to set mount propagation: Permission denied".
+#
+# Notes:
+#   * arm64 has no apptainer .deb; `singularity-container` is the
+#     correct package on Debian/Ubuntu arm64. SIF format and `build`
+#     CLI are interchangeable with apptainer.
+#   * Coverage of the SWE-bench Verified arm64 SIF pool is 281/500;
+#     instances missing from the pool error inside the gym and score 0.
+#     That's fine for a smoke — we're proving the pipeline runs, not
+#     measuring quality.
+#   * etcd / nats are NOT installed here (the slurm script needs them
+#     because it runs Dynamo inline; in k8s the dynamo-operator owns
+#     etcd/nats lifecycle for the platform).
+
+_shared:
+  headNodeSelector: &head_node_selector
+    nodeGroup: customer-cpu
+  workerNodeSelector: &worker_node_selector
+    nvidia.com/gpu.product: NVIDIA-GB300
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                    value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                    value: WARN}
+    # MNNVL across the 2 GB300 worker pods. ComputeDomain DRA
+    # channel sets up the NVLink clique so NCCL can fan out
+    # cross-pod traffic over NVLink instead of the (much slower)
+    # TCP fallback.
+    - {name: NCCL_MNNVL_ENABLE,             value: "1"}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+  headResources: &head_resources
+    # Bumped from the 16Gi smoke default — head OOMKilled on the
+    # first 2-node attempt because the Ray driver coordinating 8
+    # cross-pod Megatron workers + the gym head server + mini_swe
+    # SPREAD runners pushes peak memory past 16Gi.
+    limits:   {cpu: "48",  memory: "128Gi"}
+    requests: {cpu: "16",  memory: "64Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    # Training: TP=4 × DP=2 across 2 GB300 nodes (8 GPUs total).
+    # AdamW state sharded across all 8 ranks via the distributed
+    # optimizer, fitting in HBM.
+    limits:
+      cpu: "132"
+      memory: "900Gi"
+      nvidia.com/gpu: "4"
+    requests:
+      cpu: "120"
+      memory: "850Gi"
+      nvidia.com/gpu: "4"
+    claims:
+      - {name: compute-domain-channel}
+      - {name: roce-channel}
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm,           name: dshm}
+    - {mountPath: /opt/nemo-rl,       name: rl-workspace, subPath: "${user:}/nemo-rl"}
+    - {mountPath: /mnt/rl-workspace,  name: rl-workspace}
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 8Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+  workerVolumes: &worker_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 16Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+  # postStart hook: install `singularity-container` + `squashfuse` and
+  # mknod /dev/loop[0-7] before the pod becomes Ready. SIF mount needs
+  # one of:
+  #   * squashfuse binary on PATH (FUSE-based, no kernel loop needed) — this
+  #     is what singularity tries first
+  #   * /dev/loopN device files (kernel loop+squashfs path) — fallback
+  # The default container /dev only has null/zero/etc; mknod is allowed
+  # because securityContext.privileged is set on both pod templates.
+  # Idempotent: each step skips if already done.
+  singularityPostStart: &singularity_post_start
+    postStart:
+      exec:
+        command:
+          - /bin/bash
+          - -lc
+          - |
+            set -eu
+            exec >>/tmp/postStart.log 2>&1
+            if ! command -v singularity >/dev/null 2>&1 || ! command -v squashfuse >/dev/null 2>&1; then
+              echo "[postStart] installing singularity-container + squashfuse (arm64)..."
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                singularity-container squashfuse
+            fi
+            command -v singularity >/dev/null 2>&1 || { echo "[postStart] singularity install failed"; exit 1; }
+            command -v squashfuse  >/dev/null 2>&1 || { echo "[postStart] squashfuse install failed";  exit 1; }
+            echo "[postStart] singularity: $(singularity --version)"
+            echo "[postStart] squashfuse:  $(squashfuse --help 2>&1 | head -1 || echo present)"
+            # Loop devices for SIF mount fallback path. mknod requires
+            # CAP_MKNOD (covered by privileged: true). Major 7 = loop.
+            for i in 0 1 2 3 4 5 6 7; do
+              [ -e /dev/loop$i ] || mknod -m 0660 /dev/loop$i b 7 $i || true
+            done
+            ls -l /dev/loop* 2>&1 | head -10
+  privilegedSecurityContext: &privileged_security_context
+    privileged: true
+    capabilities:
+      add: [IPC_LOCK]
+
+image: nvcr.io/nvidian/nemo-rl:664d29c-49528955
+imagePullSecrets: [nvcr-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+submit:
+  submitter: portForward
+
+launch:
+  mode: attach
+  runMode: batch
+  codeSource: image
+  codePath: /opt/nemo-rl
+  attach:
+    training: ${user:}-rc-mini-swe-nemotron-v3
+  peerWatcher: false
+  env: {}
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted — is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
+    # singularity-container is installed by the pod's lifecycle.postStart
+    # hook (head + worker), so it must be on PATH by the time the entrypoint
+    # runs. Verify before proceeding.
+    command -v singularity >/dev/null 2>&1 || {
+      echo "ERROR: singularity not found on PATH; postStart hook failed?" >&2
+      exit 1
+    }
+    echo "[setup] singularity: $(singularity --version 2>&1 | head -1)"
+
+    export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM
+    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    LOG=\${LOG_DIR}/${user:}-mini-swe-nemotron-v3-\${TIMESTAMP}.log
+    mkdir -p "\${LOG_DIR}"
+
+    PIPE=$(mktemp -u)
+    mkfifo "\${PIPE}"
+    tee "\${LOG}" < "\${PIPE}" &
+    TEE_PID=$!
+
+    RC=0
+    python -u examples/nemo_gym/run_grpo_nemo_gym.py \
+      --config examples/nemo_gym/grpo_mini_swe_nemotron_v3.yaml \
+      +policy.generation.dynamo_cfg.dgd_name=${user:}-mini-swe-nm3 \
+      > "\${PIPE}" 2>&1 || RC=$?
+
+    wait "\${TEE_PID}" || true
+    rm -f "\${PIPE}"
+    exit "\${RC}"
+
+kuberay:
+  training:
+    name: ${user:}-rc-mini-swe-nemotron-v3
+    labels:
+      disagg.nemo-rl/cluster: mini-swe-nemotron-v3
+      disagg.nemo-rl/run: mini-swe-nemotron-v3
+      kai.scheduler/queue: backfill
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          no-monitor: "true"
+          num-gpus: "0"
+          object-store-memory: "100000000"
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            containers:
+              - name: ray-head
+                env: *shared_head_env
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+                lifecycle: *singularity_post_start
+                securityContext: *privileged_security_context
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 2
+          minReplicas: 2
+          maxReplicas: 2
+          numOfHosts: 1
+          rayStartParams:
+            num-gpus: "4"
+            object-store-memory: "100000000"
+          template:
+            metadata:
+              annotations:
+                # KAI gang-schedules both worker pods into the same
+                # gb300-topology so ComputeDomain spans all 8 GPUs.
+                # Required because Megatron TP=4 DP=2 needs cross-node
+                # NCCL (the AdamW state is then sharded across the 8
+                # ranks via use_distributed_optimizer, bringing it
+                # from 90GB→45GB per GPU and avoiding the device OOM
+                # we hit at 1n4g).
+                kai.scheduler/topology: gb300-topology
+                kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+            spec:
+              schedulerName: kai-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              resourceClaims:
+                - name: compute-domain-channel
+                  resourceClaimTemplateName: compute-domain-mini-swe-nemotron-v3
+                - name: roce-channel
+                  resourceClaimTemplateName: roce-mini-swe-nemotron-v3
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_worker_resources
+                  securityContext: *privileged_security_context
+                  lifecycle: *singularity_post_start
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes
+
+dynamo:
+  serving:
+    # Nemotron-3-Nano-30B-A3B-BF16 DGD: 1 decoder, nemotron parsers,
+    # mamba_ssm_cache=float32. Model pre-staged on shared Lustre.
+    #
+    # Name kept short: DGD-name + service-name (`VllmDecodeWorker`,
+    # 16 chars) must be <=45 to satisfy the pod-name validator.
+    # 'jothomson-mini-swe-nm3' (22) + 16 = 38, well under cap.
+    manifest: ../examples_dgd/nemotron_nano_v3_gb300.yaml
+    name: ${user:}-mini-swe-nm3
+    readyTimeoutS: 1200
