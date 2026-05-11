@@ -83,58 +83,61 @@ class NcclExtension(WorkerExtension):
     # ------------------------------------------------------------------ #
 
     @control_action_decorator
-    def update_weights_from_nccl(self) -> bool:
+    def update_weights_from_collective(self) -> bool:
         """Receive weights via NCCL broadcast, then update model parameters.
-
-        Weights arrive in HuggingFace key format (individual q/k/v_proj,
-        gate/up_proj) and are fused into TRT-LLM's internal layout (qkv_proj,
-        gate_up_proj) during the copy.
 
         packed_broadcast_consumer uses double-buffered NCCL transfer across
         multiple CUDA streams. A full device sync is required before reading
         the received tensors on the default stream to avoid a data race.
+
+        post_unpack_func is called with List[Tuple[str, Tensor]] per chunk;
+        TRT-LLM's model_loader.reload expects a dict-like (weight_mapper
+        does weights.items() / weights[name]), so we convert per chunk.
         """
         assert hasattr(self, "state_dict_info") and self.state_dict_info is not None, (
             "state_dict_info not set — call prepare_refit_info first"
         )
-
         model_engine = self.engine.model_engine
-        all_weights: dict[str, torch.Tensor] = {}
+        model = model_engine.model
 
-        def _accumulate(weights_list: list[tuple[str, torch.Tensor]]):
-            for name, tensor in weights_list:
-                all_weights[name] = tensor
+        def load_model_weight_func(weight_list):
+            # packed_broadcast_consumer runs NCCL broadcast on a non-default
+            # stream (streams[buffer_idx]); model_loader.reload internally
+            # spawns a ThreadPoolExecutor whose worker threads each use their
+            # own per-thread default stream and won't see the broadcast's
+            # writes without an explicit sync. Without this sync, worker
+            # threads read partially-written tensors → corrupted refit →
+            # KL divergence blow-up between generation and policy.
+            torch.cuda.current_stream().synchronize()
+            model_engine.model_loader.reload(
+                model, dict(weight_list), allow_partial_loading=True,
+            )
 
         try:
+            for module in model.modules():
+                if hasattr(module, "pre_reload_weights") and not getattr(module, "_weights_removed", False):
+                    module.pre_reload_weights()
             packed_broadcast_consumer(
                 iterator=iter(self.state_dict_info.items()),
                 group=self.model_update_group,
                 src=0,
-                post_unpack_func=_accumulate,
+                post_unpack_func=load_model_weight_func,
             )
-
-            for pn, pp in model_engine.model.named_parameters():
-                if pn in all_weights:
-                    pp.data.copy_(all_weights[pn])
-                elif pn.endswith("qkv_proj.weight"):
-                    prefix = pn.replace("qkv_proj.weight", "")
-                    q = all_weights.get(f"{prefix}q_proj.weight")
-                    k = all_weights.get(f"{prefix}k_proj.weight")
-                    v = all_weights.get(f"{prefix}v_proj.weight")
-                    if q is not None and k is not None and v is not None:
-                        pp.data.copy_(torch.cat([q, k, v], dim=0))
-                elif pn.endswith("gate_up_proj.weight"):
-                    prefix = pn.replace("gate_up_proj.weight", "")
-                    g = all_weights.get(f"{prefix}gate_proj.weight")
-                    u = all_weights.get(f"{prefix}up_proj.weight")
-                    if g is not None and u is not None:
-                        pp.data.copy_(torch.cat([g, u], dim=0))
-
+            for module in model.modules():
+                if hasattr(module, "process_weights_after_loading") and not getattr(
+                    module, "_weights_removed", False
+                ):
+                    module.process_weights_after_loading()
+                if hasattr(module, "post_load_weights") and not getattr(module, "_weights_removed", False):
+                    module.post_load_weights()
             torch.cuda.current_stream().synchronize()
             self.engine.reset_prefix_cache()
         except Exception as e:
-            print(f"Error in NcclExtension.update_weights_from_nccl: {e}")
-            import traceback; traceback.print_exc()
+            print(
+                f"Error in NcclExtension.update_weights_from_collective: {e}"
+            )
+            import traceback
+            traceback.print_exc()
             return False
 
         return True

@@ -59,11 +59,12 @@ policy:
   generation:
     backend: trtllm
     trtllm_cfg:
-      tensor_parallel_size: 1
+      tensor_parallel_size: 2
       precision: ${policy.precision}
       max_model_len: ${policy.max_total_sequence_length}
       max_batch_size: 16
       max_num_tokens: 4096
+      async_engine: true
     colocated:
       enabled: false
       resources:
@@ -71,12 +72,12 @@ policy:
         num_nodes: 1
 
 logger:
-  log_dir: logs/grpo-qwen3-1.7b-2n4g-megatron-trtllm
+  log_dir: logs/grpo-qwen3-1.7b-2n4g-megatron-trtllm-tp2
   monitor_gpus: false
   wandb_enabled: true
   wandb:
     project: grpo-trtllm-v2
-    name: grpo-qwen3-1.7b-2n4g-megatron-trtllm
+    name: grpo-qwen3-1.7b-2n4g-megatron-trtllm-tp2
 
 cluster:
   gpus_per_node: 4

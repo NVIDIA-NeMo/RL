@@ -42,6 +42,7 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     # (overridable via NEMO_RL_CONTAINER_PYTHON) instead of the driver's
     # uv venv (cp313, which has no tensorrt_llm wheel for cp313).
     "nemo_rl.models.generation.trtllm.trtllm_worker.TrtllmGenerationWorker": PY_EXECUTABLES.CONTAINER_SYSTEM,
+    "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker": PY_EXECUTABLES.CONTAINER_SYSTEM,
     "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.math_environment.MathMultiRewardEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.vlm_environment.VLMEnvironment": PY_EXECUTABLES.SYSTEM,

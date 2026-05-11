@@ -25,6 +25,11 @@ class TrtllmSpecificArgs(TypedDict):
     max_batch_size: NotRequired[int]
     max_num_tokens: NotRequired[int]
     expose_http_server: NotRequired[bool]
+    # Use tensorrt_llm._torch.async_llm.AsyncLLM instead of the sync LLM.
+    # Async mode allows true concurrent generation (one in-flight request per
+    # prompt) and exposes llm.release()/llm.resume()/llm.update_weights() for
+    # the upcoming colocated mode. Defaults to false (sync LLM, current behavior).
+    async_engine: NotRequired[bool]
 
 
 class TrtllmConfig(GenerationConfig):

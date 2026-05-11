@@ -39,9 +39,13 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.trtllm.config import TrtllmConfig
 
 
-@ray.remote(num_cpus=0)
-class TrtllmGenerationWorker:
-    """Nemo-RL Ray actor that owns a single ``tensorrt_llm.LLM`` engine."""
+class TrtllmGenerationWorkerImpl:
+    """Plain (non-actor) implementation of the TRT-LLM generation worker.
+
+    Held separately from ``@ray.remote``-wrapped :class:`TrtllmGenerationWorker`
+    so the async sibling :class:`TrtllmAsyncGenerationWorkerImpl` can subclass
+    it (Ray rejects inheritance between two ``@ray.remote`` actor classes).
+    """
 
     @staticmethod
     def configure_worker(
@@ -147,10 +151,6 @@ class TrtllmGenerationWorker:
 
         self.llm = tensorrt_llm.LLM(**llm_kwargs)
 
-        self._http_thread = None
-        self._http_base_url = None
-        self._http_server = None
-
     # ------------------------------------------------------------------ #
     #  Lifecycle
     # ------------------------------------------------------------------ #
@@ -159,12 +159,15 @@ class TrtllmGenerationWorker:
         return True
 
     def post_init(self) -> None:
+        """Hook called once after construction (overridden by async subclass)."""
         if self.is_model_owner and self.cfg["trtllm_cfg"].get("expose_http_server"):
-            self.start_http_server()
+            raise RuntimeError(
+                "trtllm_cfg.expose_http_server is only supported with "
+                "async_engine=true (TrtllmAsyncGenerationWorker)."
+            )
 
     def shutdown(self) -> bool:
         try:
-            self.stop_http_server()
             if self.llm is not None:
                 del self.llm
                 self.llm = None
@@ -175,40 +178,23 @@ class TrtllmGenerationWorker:
             print(f"Error during TRT-LLM shutdown: {e}")
             return False
 
-    # ------------------------------------------------------------------ #
-    #  HTTP server for NeMo Gym
-    # ------------------------------------------------------------------ #
-
-    def start_http_server(self, port: int = 0) -> str:
-        """Start an OpenAI-compatible HTTP server backed by ``self.llm``."""
-        if self._http_base_url is not None:
-            return self._http_base_url
-
-        from transformers import AutoTokenizer
-
-        from nemo_rl.models.generation.trtllm.trtllm_http_server import start_server
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name, trust_remote_code=True,
-        )
-        self._http_thread, self._http_base_url, self._http_server = start_server(
-            llm=self.llm,
-            tokenizer=tokenizer,
-            model_name=self.model_name,
-            port=port,
-        )
-        print(f"[TrtllmWorker] HTTP server started: {self._http_base_url}", flush=True)
-        return self._http_base_url
-
-    def stop_http_server(self) -> None:
-        if self._http_server is not None:
-            self._http_server.should_exit = True
-            self._http_server = None
-            self._http_thread = None
-            self._http_base_url = None
-
     def report_dp_openai_server_base_url(self) -> Optional[str]:
-        return self._http_base_url
+        """Sync workers don't expose an HTTP server (overridden by async)."""
+        return None
+
+    # ------------------------------------------------------------------ #
+    #  Collective RPC dispatch (overridden by TrtllmAsyncGenerationWorker)
+    # ------------------------------------------------------------------ #
+
+    def _collective_rpc(self, method: str, *, args: tuple = ()):
+        """Dispatch a TRT-LLM collective_rpc call.
+
+        The sync ``LLM`` exposes the private ``_collective_rpc``; the async
+        subclass overrides this to use the public async ``collective_rpc``
+        through a background event loop.
+        """
+        assert self.llm is not None
+        return self.llm._collective_rpc(method, args=args)
 
     # ------------------------------------------------------------------ #
     #  Collective init / refit
@@ -222,22 +208,17 @@ class TrtllmGenerationWorker:
         world_size: int,
         train_world_size: int,
     ) -> None:
-        assert self.llm is not None
-        self.llm._collective_rpc(
+        self._collective_rpc(
             "init_collective",
             args=(rank_prefix, ip, port, world_size, train_world_size),
         )
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        assert self.llm is not None
-        self.llm._collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        self._collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     def update_weights_from_collective(self) -> bool:
-        assert self.llm is not None
         try:
-            results = self.llm._collective_rpc(
-                "update_weights_from_nccl", args=tuple(),
-            )
+            results = self._collective_rpc("update_weights_from_collective")
             worker_result = results[0] if results else True
             if not worker_result:
                 print(f"Error: TRT-LLM worker failed to update weights. Result: {worker_result}")
@@ -250,8 +231,7 @@ class TrtllmGenerationWorker:
             return False
 
     def report_device_id(self) -> list[str]:
-        assert self.llm is not None
-        return self.llm._collective_rpc("report_device_id", args=tuple())
+        return self._collective_rpc("report_device_id")
 
     # ------------------------------------------------------------------ #
     #  Generation
@@ -284,7 +264,7 @@ class TrtllmGenerationWorker:
             prompts.append({"prompt_token_ids": token_ids})
 
         sampling_params = self._build_sampling_params(greedy=greedy)
-        outputs = self.llm.generate(prompts, sampling_params=sampling_params)
+        outputs = self._generate_impl(prompts, sampling_params)
 
         output_ids_list = []
         logprobs_list = []
@@ -332,6 +312,10 @@ class TrtllmGenerationWorker:
 
         return BatchedDataDict[GenerationOutputSpec](result)
 
+    def _generate_impl(self, prompts, sampling_params):
+        """Run a batch of prompts on the sync LLM (overridden by the async subclass)."""
+        return self.llm.generate(prompts, sampling_params=sampling_params)
+
     # ------------------------------------------------------------------ #
     #  Prefix cache
     # ------------------------------------------------------------------ #
@@ -339,7 +323,7 @@ class TrtllmGenerationWorker:
     def reset_prefix_cache(self) -> bool:
         if self.llm is not None:
             try:
-                self.llm._collective_rpc("reset_prefix_cache", args=tuple())
+                self._collective_rpc("reset_prefix_cache")
             except Exception:
                 pass
         gc.collect()
@@ -364,3 +348,10 @@ class TrtllmGenerationWorker:
             end_id=stop_ids[0] if stop_ids else None,
             logprobs=True,
         )
+
+
+@ray.remote(num_cpus=0)
+class TrtllmGenerationWorker(TrtllmGenerationWorkerImpl):
+    """Ray actor wrapper around :class:`TrtllmGenerationWorkerImpl`."""
+
+    pass

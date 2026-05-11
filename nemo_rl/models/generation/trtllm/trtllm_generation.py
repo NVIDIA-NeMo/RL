@@ -72,7 +72,11 @@ class TrtllmGeneration(GenerationInterface):
         strategy = "PACK"  # non-colocated
         cluster._init_placement_groups(strategy=strategy, use_unified_pg=False)
 
-        worker_cls = "nemo_rl.models.generation.trtllm.trtllm_worker.TrtllmGenerationWorker"
+        self.async_engine = self.cfg["trtllm_cfg"].get("async_engine", False)
+        if self.async_engine:
+            worker_cls = "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker"
+        else:
+            worker_cls = "nemo_rl.models.generation.trtllm.trtllm_worker.TrtllmGenerationWorker"
         worker_builder = RayWorkerBuilder(worker_cls, config)
 
         env_vars: dict[str, str] = {"NCCL_CUMEM_ENABLE": "1"}
@@ -97,9 +101,11 @@ class TrtllmGeneration(GenerationInterface):
                 env_vars=env_vars,
             )
 
-        # post-init on workers (starts HTTP server when expose_http_server=true)
+        # post-init on workers (starts HTTP server when expose_http_server=true,
+        # finishes async engine setup for the async worker variant).
+        post_init_method = "post_init_async" if self.async_engine else "post_init"
         futures = self.worker_group.run_all_workers_single_data(
-            "post_init",
+            post_init_method,
             run_rank_0_only_axes=["tensor_parallel"],
         )
         ray.get(futures)
@@ -138,7 +144,7 @@ class TrtllmGeneration(GenerationInterface):
 
     def _report_device_id(self) -> list[list[str]]:
         futures = self.worker_group.run_all_workers_single_data(
-            "report_device_id",
+            "report_device_id_async" if self.async_engine else "report_device_id",
             run_rank_0_only_axes=["tensor_parallel"],
         )
         return ray.get(futures)
@@ -168,7 +174,7 @@ class TrtllmGeneration(GenerationInterface):
         rank_prefix_list = list(range(0, total_workers, workers_per_group))
 
         return self.worker_group.run_all_workers_multiple_data(
-            "init_collective",
+            "init_collective_async" if self.async_engine else "init_collective",
             rank_prefix=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel"],
             common_kwargs={
@@ -190,7 +196,7 @@ class TrtllmGeneration(GenerationInterface):
             dp_size, allow_uneven_shards=True,
         )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
-            "generate",
+            "generate_async" if self.async_engine else "generate",
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=None,
@@ -215,7 +221,7 @@ class TrtllmGeneration(GenerationInterface):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         try:
             futures = self.worker_group.run_all_workers_single_data(
-                "reset_prefix_cache",
+                "reset_prefix_cache_async" if self.async_engine else "reset_prefix_cache",
                 run_rank_0_only_axes=["tensor_parallel"],
             )
             results = ray.get(futures)
@@ -226,7 +232,7 @@ class TrtllmGeneration(GenerationInterface):
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         futures = self.worker_group.run_all_workers_single_data(
-            "prepare_refit_info",
+            "prepare_refit_info_async" if self.async_engine else "prepare_refit_info",
             state_dict_info=state_dict_info,
             run_rank_0_only_axes=["tensor_parallel"],
         )
@@ -236,14 +242,15 @@ class TrtllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group not initialised")
         return self.worker_group.run_all_workers_single_data(
-            "update_weights_from_collective",
+            "update_weights_from_collective_async" if self.async_engine
+            else "update_weights_from_collective",
             run_rank_0_only_axes=["tensor_parallel"],
         )
 
     def invalidate_kv_cache(self) -> bool:
         try:
             futures = self.worker_group.run_all_workers_single_data(
-                "reset_prefix_cache",
+                "reset_prefix_cache_async" if self.async_engine else "reset_prefix_cache",
                 run_rank_0_only_axes=["tensor_parallel"],
             )
             results = ray.get(futures)
