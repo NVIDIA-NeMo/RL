@@ -8,7 +8,7 @@ distillation:
   num_prompts_per_step: 64
   max_num_steps: 5000
   max_num_epochs: 1
-  topk_logits_k: 64           # must equal loss_fn.vocab_topk
+  topk_logits_k: 8192         # must equal loss_fn.vocab_topk
   seed: 42
   val_period: 0               # validation disabled by default
   val_at_start: false
@@ -23,7 +23,7 @@ loss_fn:
   gold_loss: false
   xtoken_loss: false
   temperature: 1.0
-  vocab_topk: 64
+  vocab_topk: 8192
   reverse_kl: false
   exact_token_match_only: false
   project_teacher_to_student: false

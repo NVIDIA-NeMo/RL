@@ -72,6 +72,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 XTOKEN_NON_STUDENT_SEQ_KEYS: frozenset[str] = frozenset(
     {
         "teacher_topk_logits",
+        "teacher_topk_logits_ipc",
         "teacher_topk_indices",
         "teacher_input_ids",
         "teacher_token_mask",
@@ -415,13 +416,18 @@ def xtoken_distillation_train(
                         token_mask=batch["teacher_token_mask"],
                         sample_mask=batch["sample_mask"],
                     )
-                    # Per-sample global top-k: same vocab columns at every
-                    # teacher position, so chunk-averaged KL has a stable
-                    # vocab axis. teacher_topk_logits: [B, T_t, k];
-                    # teacher_topk_indices: [B, k].
-                    teacher_topk = teacher_policy.get_global_topk_logits(
-                        teacher_data, k=topk_logits_k, timer=timer
+                    # IPC transport: per-sample [T_t, k] logit views are
+                    # exported as CUDA IPC handles and consumed by the
+                    # student in-process. Indices are tiny and go through
+                    # the standard CPU/Ray path.
+                    teacher_handles, teacher_indices = (
+                        teacher_policy.get_global_topk_logits_ipc(
+                            teacher_data, k=topk_logits_k, timer=timer
+                        )
                     )
+                    # Model offload frees the teacher's PARAMS to CPU; the
+                    # IPC-stashed logit tensors live in worker Python state
+                    # and survive this call.
                     teacher_policy.offload_after_refit()
 
                 # Pack student-side training data with teacher topk and the
@@ -431,8 +437,8 @@ def xtoken_distillation_train(
                     input_lengths=batch["input_lengths"],
                     token_mask=batch["token_mask"],
                     sample_mask=batch["sample_mask"],
-                    teacher_topk_logits=teacher_topk["topk_logits"],
-                    teacher_topk_indices=teacher_topk["topk_indices"],
+                    teacher_topk_logits_ipc=teacher_handles,
+                    teacher_topk_indices=teacher_indices,
                     alignment_student_spans=batch["alignment_student_spans"],
                     alignment_teacher_spans=batch["alignment_teacher_spans"],
                     alignment_pair_valid=batch["alignment_pair_valid"],
@@ -447,18 +453,27 @@ def xtoken_distillation_train(
                     alignment_teacher_chunk_id=batch["alignment_teacher_chunk_id"],
                     alignment_num_chunks=batch["alignment_num_chunks"],
                 )
+                # `.to("cpu")` is a no-op on the IPC handle list (lists are
+                # not tensors) and on the CPU indices tensor.
                 train_data.to("cpu")
 
                 with timer.time("training_prep"):
                     student_policy.prepare_for_training()
 
                 with timer.time("policy_training"):
-                    train_results = student_policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                        skip_keys=XTOKEN_NON_STUDENT_SEQ_KEYS,
-                    )
+                    try:
+                        train_results = student_policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                            skip_keys=XTOKEN_NON_STUDENT_SEQ_KEYS,
+                        )
+                    finally:
+                        # Producer-side CUDA tensors must be freed before
+                        # the next teacher forward — otherwise memory grows
+                        # unboundedly. Always release, even on student
+                        # failure.
+                        teacher_policy.release_ipc_buffer()
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
@@ -662,8 +677,10 @@ def validate(
                 token_mask=batch["teacher_token_mask"],
                 sample_mask=batch["sample_mask"],
             )
-            teacher_topk = teacher_policy.get_global_topk_logits(
-                teacher_data, k=topk_logits_k
+            teacher_handles, teacher_indices = (
+                teacher_policy.get_global_topk_logits_ipc(
+                    teacher_data, k=topk_logits_k
+                )
             )
 
             train_data: BatchedDataDict[Any] = BatchedDataDict(
@@ -671,8 +688,8 @@ def validate(
                 input_lengths=batch["input_lengths"],
                 token_mask=batch["token_mask"],
                 sample_mask=batch["sample_mask"],
-                teacher_topk_logits=teacher_topk["topk_logits"],
-                teacher_topk_indices=teacher_topk["topk_indices"],
+                teacher_topk_logits_ipc=teacher_handles,
+                teacher_topk_indices=teacher_indices,
                 alignment_student_spans=batch["alignment_student_spans"],
                 alignment_teacher_spans=batch["alignment_teacher_spans"],
                 alignment_pair_valid=batch["alignment_pair_valid"],
@@ -689,12 +706,15 @@ def validate(
             )
             train_data.to("cpu")
             student_policy.prepare_for_training()
-            results = student_policy.train(
-                train_data,
-                loss_fn,
-                eval_mode=True,
-                skip_keys=XTOKEN_NON_STUDENT_SEQ_KEYS,
-            )
+            try:
+                results = student_policy.train(
+                    train_data,
+                    loss_fn,
+                    eval_mode=True,
+                    skip_keys=XTOKEN_NON_STUDENT_SEQ_KEYS,
+                )
+            finally:
+                teacher_policy.release_ipc_buffer()
             losses.append(float(results["loss"].numpy()))
             mb_metrics = results.get("all_mb_metrics", {})
             if "kl_loss" in mb_metrics:
