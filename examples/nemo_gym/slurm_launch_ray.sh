@@ -43,8 +43,17 @@ CONTAINER=/lustre/fsw/general_sa/xiyu/containers/nemo-rl-v0.6.0_prime_verifiers.
 
 mkdir -p "${RESULT_DIR}/checkpoints" "${RESULT_DIR}/logs"
 
-# Mount EOS_ROOT at the same path inside the container so config paths work unchanged.
-MOUNTS="${CODE_DIR}:${CODE_DIR},${EOS_ROOT}:${EOS_ROOT},${HF_HOME_DIR}:/opt/hf_home"
+# Mounts:
+#   - CODE_DIR -> /opt/nemo-rl: overlays the image-baked NeMo-RL tree (which
+#     includes 3rdparty/Gym-workspace/Gym at the OLD submodule pin) with our
+#     Lustre checkout. Required so Ray actor venvs — whose editable finders
+#     hard-code absolute paths under /opt/nemo-rl/... — see our bumped Gym
+#     (e.g. wiki-search.yaml) instead of the image-baked one.
+#   - CODE_DIR -> CODE_DIR: kept so any code that hard-codes the absolute
+#     lustre path of the repo (recipes, scripts) keeps working.
+#   - EOS_ROOT -> EOS_ROOT: data, results, checkpoints at their stable paths.
+#   - HF_HOME_DIR -> /opt/hf_home: HF cache at the image-expected path.
+MOUNTS="${CODE_DIR}:/opt/nemo-rl,${CODE_DIR}:${CODE_DIR},${EOS_ROOT}:${EOS_ROOT},${HF_HOME_DIR}:/opt/hf_home"
 
 cd "${CODE_DIR}"
 
