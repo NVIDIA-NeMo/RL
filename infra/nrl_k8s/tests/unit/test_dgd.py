@@ -395,6 +395,33 @@ class TestDeleteDgd:
             dgd.delete_dgd("foo", "ns")
 
 
+class TestPatchDgdOwnerRef:
+    OWNER = {
+        "apiVersion": "ray.io/v1",
+        "kind": "RayCluster",
+        "name": "rc",
+        "uid": "abc-123",
+        "controller": True,
+        "blockOwnerDeletion": True,
+    }
+
+    def test_happy_path(self, mock_custom_api):
+        mock_custom_api.patch_namespaced_custom_object.return_value = {"ok": True}
+        dgd.patch_dgd_owner_ref("foo", "ns", self.OWNER)
+        kwargs = mock_custom_api.patch_namespaced_custom_object.call_args.kwargs
+        assert kwargs["group"] == "nvidia.com"
+        assert kwargs["version"] == "v1alpha1"
+        assert kwargs["plural"] == "dynamographdeployments"
+        assert kwargs["namespace"] == "ns"
+        assert kwargs["name"] == "foo"
+        assert kwargs["body"] == {"metadata": {"ownerReferences": [self.OWNER]}}
+
+    def test_error_propagates(self, mock_custom_api):
+        mock_custom_api.patch_namespaced_custom_object.side_effect = _api_exc(500)
+        with pytest.raises(ApiException):
+            dgd.patch_dgd_owner_ref("foo", "ns", self.OWNER)
+
+
 class TestWaitForDgdReady:
     def test_returns_when_successful(self, mock_custom_api, monkeypatch):
         monkeypatch.setattr(dgd.time, "sleep", lambda _s: None)

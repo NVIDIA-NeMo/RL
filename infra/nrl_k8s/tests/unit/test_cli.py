@@ -396,6 +396,167 @@ class TestRayJob:
         assert "entrypoint" in result.output
 
 
+class TestRayJobWithDynamo:
+    """``run --rayjob`` with DGDs: apply DGD first, then RayJob, then back-fill ownerRef."""
+
+    @staticmethod
+    def _recipe_with_dgd(tmp_path: Path) -> Path:
+        spec = {
+            "headGroupSpec": {
+                "template": {"spec": {"containers": [{"name": "h", "image": "old"}]}}
+            }
+        }
+        # build_dgd_manifest reads the referenced file, but we mock ensure_dgd
+        # entirely so the file contents don't matter — only that it exists.
+        (tmp_path / "dgd.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "nvidia.com/v1alpha1",
+                    "kind": "DynamoGraphDeployment",
+                    "metadata": {"name": "my-dgd"},
+                    "spec": {"services": {}},
+                }
+            )
+        )
+        infra = {
+            "namespace": "ns",
+            "image": "img:new",
+            "kuberay": {"training": {"name": "rc-train", "spec": spec}},
+            "dynamo": {"serving": {"manifest": "dgd.yaml", "name": "my-dgd"}},
+            "launch": {"entrypoint": "echo"},
+        }
+        return _write_recipe(tmp_path, {"infra": infra})
+
+    @staticmethod
+    def _patch_happy_path(monkeypatch, call_log: list[tuple[str, object]]):
+        """Wire up all downstream mocks; record each call in order."""
+        monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
+        # Pre-flight checks: no stale RayJob, no name collision. The CLI
+        # calls these before the dynamo/rayjob loop.
+        monkeypatch.setattr("nrl_k8s.k8s.get_rayjob", lambda name, ns: None)
+        # Note: get_raycluster is patched per-test because the back-fill flow
+        # needs it to return the *actual* RayCluster object — see below.
+        monkeypatch.setattr(
+            "nrl_k8s.orchestrate.ensure_dra_resources",
+            lambda *a, **kw: call_log.append(("ensure_dra", None)),
+        )
+
+        def _fake_ensure_dgd(dgd_key, loaded, *, log, owner_ref):
+            call_log.append(("ensure_dgd", (dgd_key, owner_ref)))
+            return "my-dgd"
+
+        monkeypatch.setattr("nrl_k8s.orchestrate.ensure_dgd", _fake_ensure_dgd)
+
+        def _fake_apply_rayjob(manifest, ns):
+            call_log.append(("apply_rayjob", manifest["metadata"]["name"]))
+            return manifest
+
+        monkeypatch.setattr("nrl_k8s.k8s.apply_rayjob", _fake_apply_rayjob)
+
+        def _fake_wait_rc_name(job_name, namespace):
+            call_log.append(("wait_rc_name", job_name))
+            return "rc-train-xyz"  # KubeRay auto-suffixes
+
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.wait_for_rayjob_raycluster_name", _fake_wait_rc_name
+        )
+
+        # get_raycluster:
+        #   pre-flight collision check (name="rc-train") → None (no collision)
+        #   back-fill lookup        (name="rc-train-xyz") → live object
+        def _fake_get_rc(name, ns):
+            if name == "rc-train-xyz":
+                return {"metadata": {"name": name, "uid": "uid-xyz"}}
+            return None
+
+        monkeypatch.setattr("nrl_k8s.k8s.get_raycluster", _fake_get_rc)
+
+        def _fake_patch_owner(name, namespace, owner_ref):
+            call_log.append(("patch_owner", (name, owner_ref)))
+
+        monkeypatch.setattr("nrl_k8s.dgd.patch_dgd_owner_ref", _fake_patch_owner)
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.wait_for_rayjob_terminal",
+            lambda *a, **kw: {
+                "status": {"jobDeploymentStatus": "Complete", "jobStatus": "SUCCEEDED"}
+            },
+        )
+
+    def test_dgd_applied_before_rayjob_then_owner_backfilled(
+        self, tmp_path, monkeypatch
+    ):
+        recipe = self._recipe_with_dgd(tmp_path)
+        call_log: list[tuple[str, object]] = []
+        self._patch_happy_path(monkeypatch, call_log)
+
+        runner = CliRunner()
+        result = runner.invoke(cli.main, ["run", str(recipe), "--rayjob", "--no-wait"])
+        assert result.exit_code == 0, result.output
+
+        ops = [c[0] for c in call_log]
+        # DGD must apply BEFORE the RayJob.
+        assert ops.index("ensure_dgd") < ops.index("apply_rayjob")
+        # RayJob must apply BEFORE we look up the RayCluster.
+        assert ops.index("apply_rayjob") < ops.index("wait_rc_name")
+        # OwnerRef back-fill happens AFTER the RayCluster lookup.
+        assert ops.index("wait_rc_name") < ops.index("patch_owner")
+
+        # The initial ensure_dgd was called with no owner_ref (RayCluster
+        # doesn't exist yet).
+        ensure_call = next(c for c in call_log if c[0] == "ensure_dgd")
+        _, owner_at_apply = ensure_call[1]
+        assert owner_at_apply is None
+
+        # The back-fill patched in an ownerRef pointing at the live RC.
+        patch_call = next(c for c in call_log if c[0] == "patch_owner")
+        name, owner = patch_call[1]
+        assert name == "my-dgd"
+        assert owner["kind"] == "RayCluster"
+        assert owner["name"] == "rc-train-xyz"
+        assert owner["uid"] == "uid-xyz"
+
+    def test_dgd_apply_failure_rolls_back_and_skips_rayjob(
+        self, tmp_path, monkeypatch
+    ):
+        recipe = self._recipe_with_dgd(tmp_path)
+        call_log: list[tuple[str, object]] = []
+        self._patch_happy_path(monkeypatch, call_log)
+
+        # ensure_dgd blows up; no DGDs were successfully applied so there's
+        # nothing to roll back — but apply_rayjob must NOT be called.
+        def _boom(*a, **kw):
+            raise RuntimeError("dgd apply exploded")
+
+        monkeypatch.setattr("nrl_k8s.orchestrate.ensure_dgd", _boom)
+
+        runner = CliRunner()
+        result = runner.invoke(cli.main, ["run", str(recipe), "--rayjob", "--no-wait"])
+        assert result.exit_code == 1
+        assert "apply_rayjob" not in [c[0] for c in call_log]
+
+    def test_rayjob_apply_failure_rolls_back_dgds(self, tmp_path, monkeypatch):
+        recipe = self._recipe_with_dgd(tmp_path)
+        call_log: list[tuple[str, object]] = []
+        self._patch_happy_path(monkeypatch, call_log)
+
+        deleted: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            "nrl_k8s.dgd.delete_dgd",
+            lambda name, ns: deleted.append((name, ns)),
+        )
+
+        def _boom(manifest, ns):
+            raise RuntimeError("rayjob apply exploded")
+
+        monkeypatch.setattr("nrl_k8s.k8s.apply_rayjob", _boom)
+
+        runner = CliRunner()
+        result = runner.invoke(cli.main, ["run", str(recipe), "--rayjob", "--no-wait"])
+        assert result.exit_code == 1
+        # The DGD we brought up must be torn back down.
+        assert deleted == [("my-dgd", "ns")]
+
+
 class TestRunCommand:
     """`nrl-k8s run` delegates to orchestrate.run with the CLI's resolved flags."""
 
