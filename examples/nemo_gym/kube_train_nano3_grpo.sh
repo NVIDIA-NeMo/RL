@@ -33,7 +33,9 @@ set +a
 # formula's upper bound under-counts. Set MAX_NEW_TOKENS conservatively below
 # the formula's ceiling to leave real input headroom for prompt growth.
 
-# For Acereason (single-turn math; prompt_max=1577 on acereason-math-mock-train, n=1000)
+# ==============================================
+# Acereason (single-turn math)
+# ==============================================
 # DATASET_NAME=acereason
 # DATA_DIR=/workspace/data/prime_intellect/acereason
 # TRAIN_FILE=${DATA_DIR}/acereason-math-mock-train.jsonl
@@ -42,6 +44,9 @@ set +a
 # MAX_TOTAL_SEQ_LENGTH=8192
 # MAX_NEW_TOKENS=6582   # 8192 - 1577 - 32 - 1
 
+# ==============================================
+# Wiki-search (multi-turn RAG)
+# ==============================================
 # For wiki-search (multi-turn RAG; prompt_max=65 on wiki-search-mock-train, n=300)
 # MAX_TOTAL_SEQ_LENGTH kept at 8192 — the proven activation-memory budget for
 # this recipe (PP=1, 3-node, 24xH100). An earlier attempt at 16384 OOM'd in
@@ -70,7 +75,8 @@ JUDGE_MODEL=nvidia/nvidia/Nemotron-3-Nano-30B-A3B
 MODEL_CONFIG=responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
 NEMO_GYM_CONFIG_PATHS="[${MODEL_CONFIG},${AGENT_CONFIG}]"
 
-# Jduge mode overries is only necessary where LLM as a jduge is needed (e..g in wiki-search but not in )
+# To override any config inside hte Nemo Gym YAML, you can do something liket his: 
+# ++env.nemo_gym.verifiers_agent.responses_api_agents.verifiers_agent.vf_env_args.judge_model="${JUDGE_MODEL}"
 uv run run_grpo_nemo_gym.py \
   --config grpo_nanov3_24xH100.yaml \
   data.train.data_path=${TRAIN_FILE} \
@@ -80,7 +86,6 @@ uv run run_grpo_nemo_gym.py \
   policy.max_total_sequence_length=${MAX_TOTAL_SEQ_LENGTH} \
   policy.generation.max_new_tokens=${MAX_NEW_TOKENS} \
   env.nemo_gym.config_paths="${NEMO_GYM_CONFIG_PATHS}" \
-  ++env.nemo_gym.verifiers_agent.responses_api_agents.verifiers_agent.vf_env_args.judge_model="${JUDGE_MODEL}" \
   logger.log_dir=${RESULT_DIR}/logs/${JOB_ID}-logs/training \
   checkpointing.checkpoint_dir=${RESULT_DIR}/checkpoints \
   logger.wandb_enabled=True \
