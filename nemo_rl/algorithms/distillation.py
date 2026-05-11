@@ -180,6 +180,11 @@ def setup(
     """
     # Extract configuration
     policy_config = master_config["policy"]
+    checkpointing_pretrained = master_config.get("checkpointing", {}).get(
+        "pretrained_checkpoint"
+    )
+    if checkpointing_pretrained is not None:
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
     teacher_config = master_config["teacher"]
     generation_config = master_config["policy"]["generation"]
     loss_config = master_config["loss_fn"]
