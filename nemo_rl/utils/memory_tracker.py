@@ -16,7 +16,12 @@ from typing import List, Optional
 
 from psutil import Process
 from pydantic import BaseModel, Field
-from ray.scripts.scripts import memory_summary
+
+# Commented out: kept for reference. The Ray plasma snapshot it powered was
+# disabled in get_snapshot_str() to avoid 60s gRPC DEADLINE_EXCEEDED stalls
+# under heavy plasma load. Re-import and restore the call if you want the
+# Plasma summary back for debugging — see the comment in get_snapshot_str().
+# from ray.scripts.scripts import memory_summary
 
 
 class MemoryTrackerDataPoint(BaseModel):
@@ -40,7 +45,19 @@ class MemoryTrackerDataPoint(BaseModel):
         ]
 
     def get_snapshot_str(self) -> str:
-        ray_memory_summary = memory_summary(stats_only=True, num_entries=5)
+        # Ray's FormatGlobalMemoryInfo gRPC has a hardcoded 60s deadline and
+        # has been observed to time out (DEADLINE_EXCEEDED) under heavy plasma
+        # load between training stages, parking the driver for up to 60s and
+        # deflating performance/tokens_per_sec for that step. The Plasma
+        # snapshot itself is read-only telemetry that never touches actor
+        # state, training tensors, or any metric, and it duplicates info
+        # already visible via `ray status` and the wandb GPU/RAM panels —
+        # so we skip it entirely. The local CPU tracker (driver RSS + new
+        # variables) is unaffected.
+        # To restore: uncomment the line below and the `memory_summary` import
+        # at the top of this file, and remove the placeholder assignment.
+        # ray_memory_summary = memory_summary(stats_only=True, num_entries=5)
+        ray_memory_summary = "<skipped: Ray plasma snapshot disabled to avoid monitor timeouts>"
         return f"""💭 Driver CPU memory tracker for {self.stage}:
 - Mem usage before                  {self.memory_used_before_stage_gb:>7.2f} GB
 - Mem usage after                   {self.memory_used_after_stage_gb:>7.2f} GB
