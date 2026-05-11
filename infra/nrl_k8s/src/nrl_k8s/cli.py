@@ -658,6 +658,15 @@ def run(
     invocations. ``--mode interactive`` (default) uses port-forward +
     working_dir upload and tails logs; ``--mode batch`` uses kubectl exec +
     in-image code and returns as soon as the driver is running via nohup.
+
+    **Recipe path substitution.** ``nrl-k8s run RECIPE`` rewrites
+    ``--config <path>.yaml`` in the training entrypoint to point at
+    the user-supplied RECIPE (translated to its in-pod path:
+    ``nrl_k8s_run.yaml`` in ``--code-source upload``, repo-relative in
+    ``image`` / ``lustre``). Without this, the pod would silently run
+    whatever recipe the infra entrypoint hardcoded; with it, the CLI
+    argument is authoritative and existing infras keep working
+    unchanged. Daemon entrypoints (gym/generation) are not rewritten.
     """
     from . import orchestrate
     from . import submit as submit_mod
