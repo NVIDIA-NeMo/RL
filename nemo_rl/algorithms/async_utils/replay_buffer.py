@@ -238,8 +238,9 @@ class ReplayBufferNew(ReplayBufferImpl):
     Differences from ReplayBuffer:
     - _evict(): Stale rows (trainer_version - weight_version > max_staleness) are evicted
       at the start of every sample() call.
-    - sample(): selects freshest-first from whatever remains in the buffer
-      instead of requiring target_weight_version == current_weight_version.
+    - sample(): selects trajectories in freshest-first order (default) or FIFO order,
+      controlled by the sample_freshest_first flag, from whatever remains in the buffer
+      after eviction.
 
     TODO: remove when cleaning up
     - max_age_steps won't be used in ReplayBufferNew;
@@ -248,11 +249,15 @@ class ReplayBufferNew(ReplayBufferImpl):
       which causes generation pauses; ReplayBufferNew intentionally avoids this.
     """
 
-    def __init__(self, max_size: int, max_staleness: int):
+    def __init__(
+        self, max_size: int, max_staleness: int, sample_freshest_first: bool = True
+    ):
         super().__init__(max_size)
         if max_staleness < 0:
             raise ValueError(f"max_staleness must be non-negative, got {max_staleness}")
         self.max_staleness = max_staleness
+        # will move to StalenessSampler when we implement it
+        self.sample_freshest_first = sample_freshest_first
 
     def _evict(self, current_weight_version: int) -> None:
         """Evict rows where trainer_version - weight_version > max_staleness.
@@ -284,11 +289,13 @@ class ReplayBufferNew(ReplayBufferImpl):
             if not self.trajectories:
                 return None
 
-            all_indices = sorted(
-                range(len(self.trajectory_versions)),
-                key=lambda i: self.trajectory_versions[i],
-                reverse=True,
-            )
+            all_indices = range(len(self.trajectory_versions))
+            if self.sample_freshest_first:
+                all_indices = sorted(
+                    all_indices,
+                    key=lambda i: self.trajectory_versions[i],
+                    reverse=True,
+                )
 
             if len(all_indices) < num_prompt_groups:
                 print(

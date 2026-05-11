@@ -436,18 +436,24 @@ class TestReplayBufferNew:
         self._add(buf, "x", weight_version=4)
 
         # trainer=6: age = 6 - 4 = 2 ≤ 3 → should survive
-        self._sample(buf, num_groups=2, trainer_version=6)
+        # should return None since there is only 1 row
+        result = self._sample(buf, num_groups=2, trainer_version=6)
+        assert result is None
 
+        # this sample should still be there
         assert ray.get(buf.size.remote()) == 1
         ray.kill(buf)
 
     # ------------------------------------------------------------------
-    # sample() — freshest-first, no target_weight_version gate
+    # sample()
     # ------------------------------------------------------------------
 
-    def test_sample_freshest_first(self):
+    @pytest.mark.parametrize("sample_freshest_first", [True, False])
+    def test_sample_freshest_first(self, sample_freshest_first):
         """sample() returns the freshest trajectories first."""
-        buf = ReplayBufferNew.remote(max_size=10, max_staleness=5)
+        buf = ReplayBufferNew.remote(
+            max_size=10, max_staleness=5, sample_freshest_first=sample_freshest_first
+        )
         for gen_v in [3, 4, 5]:
             self._add(buf, f"v{gen_v}", weight_version=gen_v)
 
@@ -455,20 +461,10 @@ class TestReplayBufferNew:
 
         assert result is not None
         data = [t["batch"]["data"] for t in result["trajectories"]]
-        assert data == ["v5", "v4"]
-        ray.kill(buf)
-
-    def test_sample_ignores_target_weight_version(self):
-        """sample() does not filter by target_weight_version."""
-        buf = ReplayBufferNew.remote(max_size=10, max_staleness=5)
-        # All target_weight_versions point far into the future — none equal trainer_version=3
-        for gen_v in [1, 2, 3]:
-            self._add(buf, f"v{gen_v}", weight_version=gen_v)
-
-        result = self._sample(buf, num_groups=2, trainer_version=3)
-
-        assert result is not None
-        assert len(result["trajectories"]) == 2
+        if sample_freshest_first:
+            assert data == ["v5", "v4"]
+        else:
+            assert data == ["v3", "v4"]
         ray.kill(buf)
 
     def test_sample_returns_none_when_insufficient(self):
