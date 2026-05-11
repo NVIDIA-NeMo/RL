@@ -505,7 +505,9 @@ def submit_training(
     # merging, never the pod. Daemon entrypoints (gym/generation) are
     # not touched here; they have their own configs and go through a
     # separate submission path.
-    entrypoint = _rewrite_entrypoint_recipe(launch.entrypoint, loaded, repo_root, upload=upload, log=log)
+    entrypoint = _rewrite_entrypoint_recipe(
+        launch.entrypoint, loaded, repo_root, upload=upload, log=log
+    )
 
     try:
         handle = submitter.submit(
@@ -538,9 +540,7 @@ def default_run_id(role: str) -> str:
 # can substitute it. The mandatory ``\s|=`` after ``--config`` keeps us
 # from accidentally matching Hydra's ``--config-name`` /
 # ``--config-dir`` / ``--config-path``.
-_CONFIG_FLAG_RE = re.compile(
-    r"(--config(?:\s+|=))(['\"]?)([^\s'\"]+\.ya?ml)\2"
-)
+_CONFIG_FLAG_RE = re.compile(r"(--config(?:\s+|=))(['\"]?)([^\s'\"]+\.ya?ml)\2")
 
 
 def _recipe_path_in_pod(
@@ -576,10 +576,10 @@ def _rewrite_entrypoint_recipe(
     upload: bool,
     log: callable,
 ) -> str:
-    """Rewrite ``--config <path>.yaml`` flags in the train entrypoint to
-    point at the CLI's RECIPE.
+    """Rewrite ``--config <path>.yaml`` flags in the train entrypoint.
 
-    Without this rewrite, ``nrl-k8s run RECIPE_A --infra X`` silently
+    Rewrites flags to point at the CLI's RECIPE. Without this rewrite,
+    ``nrl-k8s run RECIPE_A --infra X`` silently
     runs whatever recipe the entrypoint hardcoded — RECIPE_A would only
     affect client-side validation + Hydra override merging, never the
     pod. Substituting the path in-place makes the CLI argument

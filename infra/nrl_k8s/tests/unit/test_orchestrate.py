@@ -518,9 +518,7 @@ class TestRewriteEntrypointRecipe:
         loaded.source_path = recipe
         return loaded
 
-    def test_rewrites_hardcoded_config_to_cli_recipe(
-        self, tmp_path: Path, log
-    ) -> None:
+    def test_rewrites_hardcoded_config_to_cli_recipe(self, tmp_path: Path, log) -> None:
         log_fn, lines = log
         repo = tmp_path / "repo"
         loaded = self._loaded_for(repo, "infra/recipes/x.yaml")
@@ -585,10 +583,7 @@ class TestRewriteEntrypointRecipe:
         log_fn, lines = log
         repo = tmp_path / "repo"
         loaded = self._loaded_for(repo, "x.yaml")
-        ep = (
-            "python train.py --config-name=foo --config-dir=bar "
-            "--config-path conf"
-        )
+        ep = "python train.py --config-name=foo --config-dir=bar --config-path conf"
 
         result = orchestrate._rewrite_entrypoint_recipe(
             ep, loaded, repo, upload=False, log=log_fn
