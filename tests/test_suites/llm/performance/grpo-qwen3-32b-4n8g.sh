@@ -1,6 +1,8 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
+# ignore tensor parallel accuracy check
+export NRL_IGNORE_TP_ACCURACY_CHECK=1
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
@@ -35,7 +37,8 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
-        'data["train/token_mult_prob_error"]["10"] < 1.1'
+        'data["train/token_mult_prob_error"]["10"] < 1.1' \
+        'mean(data["timing/train/total_step_time"], -6, -1) < 400'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

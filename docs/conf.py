@@ -35,7 +35,7 @@ from sphinx.application import Sphinx
 project = "NeMo-RL"
 copyright = "2026, NVIDIA Corporation"
 author = "NVIDIA Corporation"
-release = "latest"
+release = "nightly"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -117,6 +117,12 @@ html_extra_path = ["project.json", "versions1.json"]
 linkcheck_ignore = [
     ".*github\\.com.*",
     ".*githubusercontent\\.com.*",
+]
+
+# PyTorch docs anchor IDs change between stable versions; verify the page
+# loads but skip anchor validation to avoid spurious failures on redirects.
+linkcheck_anchors_ignore_for_url = [
+    "https://docs.pytorch.org/.*",
 ]
 
 

@@ -37,6 +37,20 @@ except ImportError:
     )
 
 
+def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor:
+    """Apply GPT-OSS down_proj transpose fix to the weight.
+
+    This is a workaround for the issue that the down_proj layout is not the same across different frameworks.
+        - HF needs [in, out] layout.
+        - Megatron needs [in, out] layout.
+        - vLLM needs [out, in] layout.
+    See https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/3271 for more details.
+    """
+    if key.endswith("mlp.experts.down_proj"):
+        weight = weight.transpose(-2, -1).contiguous()
+    return weight
+
+
 class VllmInternalWorkerExtension:
     def init_collective(
         self,
@@ -137,6 +151,69 @@ class VllmInternalWorkerExtension:
             target_device,
         )
 
+    @staticmethod
+    def _split_policy_and_draft_weights(
+        weights: list[tuple[str, torch.Tensor]],
+    ) -> tuple[list[tuple[str, torch.Tensor]], list[tuple[str, torch.Tensor]]]:
+        """Split trainer-owned draft weights from policy weights.
+
+        This path is only used for the Eagle3 online-training flow, where the
+        trainer exports draft parameters under a `draft.` prefix before sending
+        them to vLLM.
+        This implementation is specific to the eagle model. For MTP, we can add
+        similar logic to this function to split weights and send it to the drafter.
+        The "draft." prefix is added here https://github.com/isomap/RL/blob/d3a5e1396d00f82fb888d9ec6800687a23bb4017/nemo_rl/models/policy/workers/megatron_policy_worker.py#L967-L997
+        """
+        policy_weights = []
+        draft_weights = []
+        for key, tensor in weights:
+            if key.startswith("draft."):
+                draft_weights.append((key.removeprefix("draft."), tensor))
+            else:
+                policy_weights.append((key, tensor))
+        return policy_weights, draft_weights
+
+    def _load_draft_weights(
+        self, draft_weights: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        if not draft_weights:
+            return
+
+        draft_owner = getattr(self.model_runner, "drafter", None)
+        draft_model = getattr(draft_owner, "model", None) if draft_owner else None
+
+        if draft_model is None:
+            print(
+                "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
+            )
+            return
+        draft_model.load_weights(weights=draft_weights)
+
+    def _load_weights(self, weights):
+        """Load weights with GptOss transpose fix, FP8, and draft-weight support.
+
+        Applies GPT-OSS down_proj transpose if needed, splits policy/draft
+        weights, applies FP8 conversion if needed, and loads draft weights
+        into the drafter model.
+        """
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if (
+            "GptOssForCausalLM"
+            in self.model_runner.vllm_config.model_config.architectures
+        ):
+            for idx, (key, weight) in enumerate(weights):
+                weight = fix_gpt_oss_export_transpose(key, weight)
+                weights[idx] = (key, weight)
+
+        policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            fp8.load_weights(policy_weights, self.model_runner)
+        else:
+            self.model_runner.model.load_weights(weights=policy_weights)
+
+        self._load_draft_weights(draft_weights)
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
@@ -168,23 +245,33 @@ class VllmInternalWorkerExtension:
                 ipc_handle, list_keys, used_bytes = payload
                 buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
 
+                weight = None
                 weights = []
                 offset = 0
                 for key in list_keys:
                     shape, dtype = self.state_dict_info[key]  # pyrefly
                     if isinstance(shape, list):
                         shape = torch.Size(shape)
+
+                    # Get the weight from the buffer
                     size_in_bytes = dtype.itemsize * shape.numel()
-                    weights.append(
-                        (
-                            key,
-                            buffer[offset : offset + size_in_bytes]
-                            .view(dtype=dtype)
-                            .view(shape),
-                        )
+                    weight = (
+                        buffer[offset : offset + size_in_bytes]
+                        .view(dtype=dtype)
+                        .view(shape)
                     )
+                    # apply gpt-oss transpose fix
+                    if (
+                        "GptOssForCausalLM"
+                        in self.model_runner.vllm_config.model_config.architectures
+                    ):
+                        weight = fix_gpt_oss_export_transpose(key, weight)
+                    weights.append((key, weight))
+
+                    # Move offset to the next weight
                     aligned_size = calculate_aligned_size(size_in_bytes)
                     offset += aligned_size
+
                 assert offset == used_bytes, (
                     "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
@@ -199,7 +286,8 @@ class VllmInternalWorkerExtension:
                 # copied the data, Python may not garbage collect these view objects immediately.
                 # If sender reuses the buffer before GC runs, old views would read corrupted data.
                 # Explicit del ensures immediate cleanup before sending ACK.
-                del weights, buffer
+                del weight, weights, buffer
+                weight = None
                 weights = None
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
@@ -243,7 +331,7 @@ class VllmInternalWorkerExtension:
             "Please call prepare_refit_info when initializing the worker."
         )
 
-        load_model_weight_func = lambda x: self._load_model_weights(x)
+        load_model_weight_func = self._load_weights
 
         try:
             packed_broadcast_consumer(

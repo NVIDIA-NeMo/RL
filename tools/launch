@@ -28,6 +28,7 @@
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath $SCRIPT_DIR/..)
+set -x
 
 # Function to extract config from a script
 extract_config() {
@@ -143,7 +144,7 @@ for SCRIPT in $SCRIPTS; do
         echo "Submitting $i/$NUM_RUNS job with ${NUM_NODES} nodes for $(basename $SCRIPT)"
         JOB_NAME=$(basename $SCRIPT .sh)
 
-        EXTRA_SCRIPT_ARGS=(
+        script_args=(
             logger.wandb.name=$(basename $SCRIPT .sh)
             ++git_meta=$(git log -1 --format='%h-%f' HEAD)
             # Record the container just for provenance
@@ -152,7 +153,7 @@ for SCRIPT in $SCRIPTS; do
             ${EXTRA_SCRIPT_ARGS:-}
         )
         if [[ -n "${IS_RELEASE}" ]]; then
-            EXTRA_SCRIPT_ARGS+=(
+            script_args+=(
                 logger.wandb.project=nemo-rl-release
             )
         fi
@@ -172,7 +173,7 @@ cd \$SCRIPT_DIR
 ${EXTRA_ENV:-} \\
 HF_HOME=$HF_HOME \\
 HF_DATASETS_CACHE=$HF_DATASETS_CACHE \\
-COMMAND="uv run $rel_script ${EXTRA_SCRIPT_ARGS[@]}" \\
+COMMAND="uv run $rel_script ${script_args[@]}" \\
 CONTAINER=$CONTAINER \\
 MOUNTS="$SNAPSHOT_DIR:$SNAPSHOT_DIR${MOUNTS}" \\
 sbatch \\

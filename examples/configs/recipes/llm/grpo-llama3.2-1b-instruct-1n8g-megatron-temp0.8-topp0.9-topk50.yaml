@@ -1,0 +1,15 @@
+defaults: grpo-llama3.2-1b-instruct-1n8g-megatron.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+  make_sequence_length_divisible_by: 2
+  generation:
+    temperature: 0.8
+    top_p: 0.9
+    top_k: 50
+logger:
+  log_dir: logs/grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50
+  wandb:
+    name: grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50

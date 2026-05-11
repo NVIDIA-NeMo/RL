@@ -4,8 +4,10 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
-STEPS_PER_RUN=40
-MAX_STEPS=40
+# Reduced from 40→30 steps: ~252s/step × 40 = 168min leaves too little margin
+# for startup + metrics in 240min (max SLURM allocation). 30 steps = 126min.
+STEPS_PER_RUN=30
+MAX_STEPS=30
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
 # ===== END CONFIG =====

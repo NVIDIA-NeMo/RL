@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import math
 import os
 import time
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import ray
 from ray.util.placement_group import PlacementGroup
@@ -531,8 +532,11 @@ class RayWorkerGroup:
                     "env_vars": worker_env_vars,
                     "py_executable": py_executable,
                 }
-                runtime_env["env_vars"]["VIRTUAL_ENV"] = py_executable
-                runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_executable
+                py_venv = os.path.dirname(
+                    os.path.dirname(py_executable)
+                )  # to remove the "bin/python" suffix
+                runtime_env["env_vars"]["VIRTUAL_ENV"] = py_venv
+                runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_venv
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 
@@ -652,7 +656,13 @@ class RayWorkerGroup:
         )
 
         worker = self.workers[worker_idx]
-        method = getattr(worker, method_name)
+        try:
+            method = getattr(worker, method_name)
+        except AttributeError as e:
+            print(
+                f"Supported methods: {list(worker._method_shells.keys())}", flush=True
+            )
+            raise e
         return method.remote(*args, **kwargs)
 
     def run_all_workers_multiple_data(
@@ -737,7 +747,14 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
+                try:
+                    method = getattr(worker, method_name)
+                except AttributeError as e:
+                    print(
+                        f"Supported methods: {list(worker._method_shells.keys())}",
+                        flush=True,
+                    )
+                    raise e
                 worker_args = [arg[data_idx] for arg in args]
                 worker_kwargs = {key: value[data_idx] for key, value in kwargs.items()}
                 futures.append(
@@ -775,6 +792,8 @@ class RayWorkerGroup:
             "See https://github.com/NVIDIA-NeMo/RL/issues/582 for more details."
         )
 
+        kwargs = {key: ray.put(value) for key, value in kwargs.items()}
+
         futures = []
 
         if run_rank_0_only_axes is None:
@@ -793,7 +812,14 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
+                try:
+                    method = getattr(worker, method_name)
+                except AttributeError as e:
+                    print(
+                        f"Supported methods: {list(worker._method_shells.keys())}",
+                        flush=True,
+                    )
+                    raise e
                 futures.append(method.remote(*args, **kwargs))
 
         return futures
@@ -851,6 +877,31 @@ class RayWorkerGroup:
             replicate_on_axes = []
         if output_is_replicated is None:
             output_is_replicated = []
+
+        replicate_degrees = math.prod(
+            [self.sharding_annotations.get_axis_size(ax) for ax in replicate_on_axes]
+        )
+        if replicate_degrees > 1:
+            # Use ray.put to serialize all the arguments. This can reduce the cost
+            # of repeated serialization when we send same arguments to multiple workers.
+            def _map_nested_value_list(
+                nested_value_list: Any, depth: int, map_fn: Callable[[Any], Any]
+            ) -> list[Any]:
+                if depth < 0:
+                    raise ValueError(f"Depth is less than 0: {depth}")
+                if depth == 0:
+                    return map_fn(nested_value_list)
+                return [
+                    _map_nested_value_list(v, depth - 1, map_fn)
+                    for v in nested_value_list
+                ]
+
+            kwargs_after_ray_put = dict()
+            for key, nested_value_list in kwargs.items():
+                kwargs_after_ray_put[key] = _map_nested_value_list(
+                    nested_value_list, len(in_sharded_axes), ray.put
+                )
+            kwargs = kwargs_after_ray_put
 
         futures = []
 
@@ -996,10 +1047,11 @@ class RayWorkerGroup:
                 print(
                     f"Error during graceful shutdown: {e}. Falling back to force termination."
                 )
-                force = True
 
-        # Force kill any remaining workers
-        if force or cleanup_method is None:
+        # Always kill actors to release named actor registrations and resources.
+        # Even after successful graceful cleanup, actors remain alive in Ray's registry
+        # which prevents creating new actors with the same name.
+        if True:
             initializers_to_kill = []
             for worker in self._workers:
                 if hasattr(worker, "_RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC"):

@@ -3,7 +3,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=2
+NUM_NODES=1
 GPUS_PER_NODE=8
 STEPS_PER_RUN=10
 MAX_STEPS=10

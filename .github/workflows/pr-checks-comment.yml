@@ -28,13 +28,3 @@ jobs:
       head_sha: "${{ github.event.pull_request.head.sha }}"
       max_retries: 30
       sleep_duration: 10
-
-  automodel-integration-comment:
-    name: Post automodel integration comment
-    uses: ./.github/workflows/_pr_comment.yml
-    with:
-      pr_number: "${{ github.event.number }}"
-      artifact_name: automodel-integration-check
-      head_sha: "${{ github.event.pull_request.head.sha }}"
-      max_retries: 30
-      sleep_duration: 10

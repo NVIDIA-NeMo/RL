@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, NotRequired, TypedDict
+from typing import Literal, NotRequired, TypedDict, Union
 
 
 class ResponseDatasetConfig(TypedDict):
@@ -57,6 +57,11 @@ class DataConfig(TypedDict):
     # This saturates CPU threads without consuming too much memory
     # However, setting it too high might cause memory issues for long seqlens.
     num_workers: NotRequired[int]
+    # multiple dataloader configs
+    # currently only supported for GRPO
+    use_multiple_dataloader: NotRequired[bool]
+    num_prompts_per_dataloader: NotRequired[int]
+    custom_dataloader: NotRequired[str]
     # dataset configs
     train: ResponseDatasetConfig | PreferenceDatasetConfig | list[ResponseDatasetConfig]
     validation: NotRequired[
@@ -161,12 +166,24 @@ class LocalMathEvalDataConfig(TypedDict):
     system_prompt_file: NotRequired[str | None]
 
 
+class MMAUEvalDataConfig(TypedDict):
+    """Config for MMAU (Massive Multitask Audio Understanding) datasets."""
+
+    max_input_seq_length: int
+    dataset_name: Literal["mmau", "TwinkStart/MMAU"]
+    split: NotRequired[str | None]
+    prompt_file: NotRequired[str | None]
+    system_prompt_file: NotRequired[str | None]
+    env_name: NotRequired[str]
+
+
 # Union type for all eval dataset configs
-EvalDataConfigType = (
-    MMLUEvalDataConfig
-    | MMLUProEvalDataConfig
-    | AIMEEvalDataConfig
-    | GPQAEvalDataConfig
-    | MathEvalDataConfig
-    | LocalMathEvalDataConfig
-)
+EvalDataConfigType = Union[
+    MMLUEvalDataConfig,
+    MMLUProEvalDataConfig,
+    AIMEEvalDataConfig,
+    GPQAEvalDataConfig,
+    MathEvalDataConfig,
+    MMAUEvalDataConfig,
+    LocalMathEvalDataConfig,
+]

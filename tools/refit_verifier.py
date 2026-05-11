@@ -155,10 +155,12 @@ def setup_configs(args, tokenizer):
         "learning_rate": 0.0001,
         "logprob_batch_size": 1,
         "generation": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": None,
             "max_total_sequence_length": args.max_sequence_length,
             "max_new_tokens": args.max_sequence_length,
             "do_sample": False,
-            "temperature": 1.0,
             "pad_token_id": tokenizer.eos_token_id,
             "colocated": {
                 "enabled": True,
@@ -219,6 +221,7 @@ def setup_configs(args, tokenizer):
             "moe_per_layer_logging": False,
             "freeze_moe_router": False,
             "apply_rope_fusion": False,
+            "gradient_accumulation_fusion": False,
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,

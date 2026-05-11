@@ -84,8 +84,11 @@ def main() -> None:
     assert config["policy"]["generation"] is not None, (
         "A generation config is required for GRPO"
     )
+    has_refit_draft_weights = bool(config["policy"]["draft"]["enabled"])
     config["policy"]["generation"] = configure_generation_config(
-        config["policy"]["generation"], tokenizer
+        config["policy"]["generation"],
+        tokenizer,
+        has_refit_draft_weights=has_refit_draft_weights,
     )
 
     # setup data
@@ -132,6 +135,12 @@ def main() -> None:
                     raise NotImplementedError(
                         f"{feature} is not supported with async GRPO"
                     )
+
+        # Async GRPO does not support multiple dataloaders
+        if config["data"]["use_multiple_dataloader"]:
+            raise NotImplementedError(
+                "use_multiple_dataloader is not supported with async GRPO"
+            )
 
         from nemo_rl.algorithms.grpo import async_grpo_train
 

@@ -19,15 +19,15 @@ import ray
 import torch
 from transformers import AutoModelForCausalLM
 
-from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.loss_functions import ClippedPGLossFn, NLLLoss
+from nemo_rl.algorithms.loss import ClippedPGLossFn, NLLLossFn
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from tests.unit.test_utils import SimpleLoss
+from tests.unit.test_utils import SimpleLossFn
 
 
 def create_test_config(
@@ -54,9 +54,9 @@ def create_test_config(
         "generation": {
             "backend": "hf",
             "temperature": 1.0,
-            "max_new_tokens": 16,  # Small number of tokens for testing
             "top_p": 1.0,
             "top_k": None,
+            "max_new_tokens": 16,  # Small number of tokens for testing
             "stop_token_ids": None,
             "stop_strings": None,
             "colocated": {
@@ -267,7 +267,7 @@ def _base_setup_impl(request, cluster):
 
         if mode == "train":
             # Create loss function
-            loss_fn: LossFunction = SimpleLoss()
+            loss_fn: LossFunction = SimpleLossFn()
             yield policy, data, loss_fn
         elif mode == "logprob":
             token_logprobs = calculate_token_logprobs(model_name, data)
@@ -373,7 +373,9 @@ class TestSingleGPUCluster:
         cluster.shutdown()
 
     @pytest.mark.timeout(360)
-    @pytest.mark.parametrize("use_v2", [True, False])
+    @pytest.mark.parametrize(
+        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
+    )
     def test_dtensor_single_gpu_training(
         self, use_v2, single_gpu_cluster, tiny_llama_model_path
     ):
@@ -424,7 +426,7 @@ class TestSingleGPUCluster:
 
             # Create test batch
             data = create_test_batch(mode="train")
-            loss_fn = SimpleLoss()
+            loss_fn = SimpleLossFn()
 
             # Test training
             policy.prepare_for_training()
@@ -450,7 +452,9 @@ class TestSingleGPUCluster:
             policy.shutdown()
 
     @pytest.mark.timeout(360)
-    @pytest.mark.parametrize("use_v2", [True, False])
+    @pytest.mark.parametrize(
+        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
+    )
     def test_dtensor_single_gpu_logprob(
         self, use_v2, single_gpu_cluster, tiny_llama_model_path
     ):
@@ -615,7 +619,7 @@ class TestTwoGPUCluster:
             ("tiny_qwen3_model_path", 2, 1, False, False, False),
             ("tiny_gemma3_model_path", 2, 1, False, True, False),
             ("tiny_gemma3_model_path", 2, 1, False, False, False),
-            # TP=1, CP=2
+            # TP=1, CP=2 — skipped: CP=2 hits DTensor redistribute assertion with transformers v5 (hemil)
             ("tiny_qwen2_model_path", 1, 2, False, True, False),
             ("tiny_qwen2_model_path", 1, 2, False, False, False),
             ("tiny_llama_model_path", 1, 2, False, False, False),
@@ -772,8 +776,12 @@ class TestTwoGPUCluster:
     @pytest.mark.parametrize(
         "policy_setup",
         [
-            {"dtensor_v2": True, "enable_loras": False},
-            {"dtensor_v2": True, "enable_loras": True},
+            pytest.param(
+                {"dtensor_v2": True, "enable_loras": False}, marks=pytest.mark.automodel
+            ),
+            pytest.param(
+                {"dtensor_v2": True, "enable_loras": True}, marks=pytest.mark.automodel
+            ),
             {"dtensor_v2": False, "enable_loras": False},
         ],
         indirect=True,
@@ -860,18 +868,23 @@ class TestTwoGPUCluster:
             )
 
     @pytest.mark.timeout(360)
-    @pytest.mark.parametrize("use_v2", [True, False])
+    @pytest.mark.parametrize(
+        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
+    )
     def test_dtensor_worker_training(self, use_v2, training_setup):
         policy, data, loss_fn = training_setup
         _test_dtensor_worker_training(policy, data, loss_fn)
 
     @pytest.mark.timeout(360)
+    @pytest.mark.automodel
     def test_dtensor_worker_training_with_lora(self, training_with_lora_setup):
         policy, data, loss_fn = training_with_lora_setup
         _test_dtensor_worker_training(policy, data, loss_fn)
 
     @pytest.mark.timeout(360)
-    @pytest.mark.parametrize("use_v2", [True, False])
+    @pytest.mark.parametrize(
+        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
+    )
     def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(
         self, use_v2, logprob_setup
     ):
@@ -879,11 +892,14 @@ class TestTwoGPUCluster:
         _test_dtensor_worker_logprob(policy, data, logprobs)
 
     @pytest.mark.timeout(360)
+    @pytest.mark.automodel
     def test_dtensor_worker_logprob_with_lora(self, logprob_with_lora_setup):
         policy, data, logprobs = logprob_with_lora_setup
         _test_dtensor_worker_logprob(policy, data, logprobs)
 
-    @pytest.mark.parametrize("use_v2", [True, False])
+    @pytest.mark.parametrize(
+        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
+    )
     def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(
         self, use_v2, two_gpu_cluster, tiny_llama_tied_model_path
     ):
@@ -977,8 +993,8 @@ class TestTwoGPUCluster:
             tokenizer=tokenizer,
         )
 
-        # Test NLLLoss and ClippedPGLossFn with mbs=1
-        nll_loss_fn = NLLLoss()
+        # Test NLLLossFn and ClippedPGLossFn with mbs=1
+        nll_loss_fn = NLLLossFn()
         pg_loss_fn = ClippedPGLossFn(
             {
                 "ratio_clip_min": 0.2,
@@ -1022,7 +1038,7 @@ class TestTwoGPUCluster:
             tokenizer=tokenizer,
         )
 
-        # Test NLLLoss and ClippedPGLossFn with mbs=2
+        # Test NLLLossFn and ClippedPGLossFn with mbs=2
         policy_mbs2.prepare_for_training()
         mbs2_nll_results = policy_mbs2.train(data, nll_loss_fn)
         mbs2_nll_loss = mbs2_nll_results["loss"]
@@ -1037,7 +1053,9 @@ class TestTwoGPUCluster:
         policy_mbs2.worker_group.shutdown()
 
     @pytest.mark.timeout(300)
-    @pytest.mark.parametrize("use_v2", [True, False])
+    @pytest.mark.parametrize(
+        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
+    )
     def test_dtensor_v1_policy_flops_range_check(
         self, tiny_llama_model_path, two_gpu_cluster, use_v2
     ):
@@ -1087,7 +1105,7 @@ class TestTwoGPUCluster:
         )
 
         # Create loss function
-        loss_fn = SimpleLoss()
+        loss_fn = SimpleLossFn()
 
         try:
             # Prepare for training

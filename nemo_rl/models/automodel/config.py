@@ -19,6 +19,24 @@ from typing import Any, NamedTuple, Optional
 import torch
 from nemo_automodel.components._peft.lora import PeftConfig
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+
+
+class DistributedContext(NamedTuple):
+    """Distributed context returned by setup_distributed().
+
+    Contains the device meshes and distributed configuration needed for
+    model parallelization and training.
+    """
+
+    device_mesh: Any  # DeviceMesh
+    moe_mesh: Any  # Optional[DeviceMesh]
+    fsdp2_config: Any  # FSDP2Config
+    moe_config: Any  # Optional[MoEParallelizerConfig]
+    dp_size: int
+    tp_size: int
+    cp_size: int
+
 
 class RuntimeConfig(NamedTuple):
     """Runtime configuration for model training and inference.
@@ -48,6 +66,9 @@ class RuntimeConfig(NamedTuple):
     # Generation configuration
     is_generation_colocated: Optional[bool]
 
+    # Sampling parameters
+    sampling_params: Optional[TrainingSamplingParams]
+
     # Reward model flag
     is_reward_model: bool
 
@@ -60,7 +81,6 @@ class ModelAndOptimizerState(NamedTuple):
     """
 
     model: torch.nn.Module
-    model_state_dict_keys: list[str]
     optimizer: Optional[torch.optim.Optimizer]
     scheduler: Optional[Any]
     is_hf_model: bool

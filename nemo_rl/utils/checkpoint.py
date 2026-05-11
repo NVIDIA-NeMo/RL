@@ -49,6 +49,7 @@ class CheckpointingConfig(TypedDict):
     model_cache_dir (str): Directory for model cache (for safetensors format).
     model_repo_id (str): Repository ID for the model (for safetensors format).
     is_peft (bool): Whether the model uses PEFT.
+    save_optimizer (bool): Whether to save optimizer state with checkpoints.
     """
 
     enabled: bool
@@ -58,6 +59,7 @@ class CheckpointingConfig(TypedDict):
     save_period: int
     keep_top_k: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
+    save_optimizer: NotRequired[bool]  # Default: True
     # New nemo-automodel integration fields
     model_save_format: NotRequired[str | None]  # Default: "safetensors"
     save_consolidated: NotRequired[bool]  # Default: False
@@ -65,6 +67,7 @@ class CheckpointingConfig(TypedDict):
     model_repo_id: NotRequired[str]  # Default: ""
     is_peft: NotRequired[bool]  # Default: False
     peft_config: NotRequired[Any]  # Default: None
+    is_async: NotRequired[bool]  # Default: False
 
 
 class CheckpointManager:
@@ -98,6 +101,7 @@ class CheckpointManager:
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
+        self.save_optimizer = config["save_optimizer"]
 
         # Store nemo-automodel specific config options
         self.model_save_format = config.get("model_save_format", "safetensors")
@@ -105,6 +109,47 @@ class CheckpointManager:
         self.model_cache_dir = config.get("model_cache_dir", "")
         self.model_repo_id = config.get("model_repo_id", "")
         self.is_peft = config.get("is_peft", False)
+
+    @staticmethod
+    def get_resume_paths(
+        last_checkpoint_path: Optional[PathLike],
+    ) -> tuple[Optional[Path], Optional[Path]]:
+        """Get weights and optimizer paths for resuming from a checkpoint.
+
+        Args:
+            last_checkpoint_path: Path to the last checkpoint, or None if starting fresh.
+
+        Returns:
+            Tuple of (weights_path, optimizer_path). Both are None if no checkpoint.
+            optimizer_path is None if checkpoint exists but optimizer state was not saved.
+        """
+        if last_checkpoint_path:
+            weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+            optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+
+            # DTensor path
+            if optimizer_path.exists():
+                return weights_path, optimizer_path
+
+            # Megatron path
+            common_pt_path = weights_path / "iter_0000000" / "common.pt"
+            if common_pt_path.exists():
+                common_pt_obj = torch.load(common_pt_path, map_location="cpu")
+                if "optimizer" in common_pt_obj:
+                    # In Megatron, optimizer_path is only a flag to indicate that the optimizer
+                    # state is embedded in the weights_path. We will actually load the optimizer
+                    # state from the weights_path.
+                    return weights_path, optimizer_path
+
+            warnings.warn(
+                f"Optimizer state not found at {optimizer_path} (DTensor path), and no embedded "
+                f"optimizer state detected under {weights_path} (Megatron path). "
+                "Optimizer will be freshly initialized.",
+                stacklevel=2,
+            )
+            optimizer_path = None
+            return weights_path, optimizer_path
+        return None, None
 
     def init_tmp_checkpoint(
         self,

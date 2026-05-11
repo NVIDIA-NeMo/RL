@@ -22,14 +22,16 @@ REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 # Parse command line arguments
 GIT_URL=${1:-https://github.com/vllm-project/vllm.git}
 GIT_REF=${2:-cc99baf14dacc2497d0c5ed84e076ef2c37f6a4d}
-# NOTE: VLLM_USE_PRECOMPILED=1 didn't always seem to work since the wheels were sometimes built against an incompatible torch/cuda combo.
-# This commit was chosen as one close to the v0.10 release: git merge-base --fork-point origin/main tags/v0.10.0
+# Specifying an explicit wheel URL avoids relying on vllm's nightly wheel discovery, which
+# fails when building from a fork (setup.py can't find the base commit on main) and falls back
+# to the "nightly" wheel — a moving target that may not have wheels for all architectures.
+# The v0.16.0 release wheels are pinned here for stability.
 if [[ -n "${3:-}" ]]; then
   VLLM_PRECOMPILED_WHEEL_LOCATION="$3"
 elif [[ "$(uname -m)" == "aarch64" ]]; then
-  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_aarch64.whl"
+  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.16.0/vllm-0.16.0-cp38-abi3-manylinux_2_31_aarch64.whl"
 else
-  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_x86_64.whl"
+  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.16.0/vllm-0.16.0-cp38-abi3-manylinux_2_31_x86_64.whl"
 fi
 export VLLM_PRECOMPILED_WHEEL_LOCATION
 
@@ -73,7 +75,7 @@ uv run --no-project use_existing_torch.py
 echo "Installing dependencies..."
 uv pip install --upgrade pip
 uv pip install numpy setuptools setuptools_scm
-uv pip install torch==2.9.0 --torch-backend=cu129
+uv pip install torch==2.10.0 --torch-backend=cu129
 
 # Install vLLM using precompiled wheel
 echo "Installing vLLM with precompiled wheel..."

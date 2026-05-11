@@ -40,13 +40,8 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
+    resolve_generation_worker_cls,
 )
-
-# Global thresholds for top_k and top_p validation.
-# While top-k/p are not supported, these values allow for token filtering while the logprobs should be compatible.
-# See https://github.com/NVIDIA-NeMo/RL/issues/69 and https://github.com/NVIDIA-NeMo/RL/issues/237 for more details.
-TOP_K_THRESHOLD = 8000  # Allow top_k >= 8000 (effectively no filtering)
-TOP_P_THRESHOLD = 0.99  # Allow top_p >= 0.99 (close to 1.0)
 
 
 class VllmGeneration(GenerationInterface):
@@ -92,30 +87,16 @@ class VllmGeneration(GenerationInterface):
                 )
 
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
-        # The vLLM sampler patch only supports temperature scaling and does not handle top_p/top_k correctly.
-        # However, we allow values above certain thresholds for token filtering purposes.
-        top_k = self.cfg["top_k"]
-        if top_k is not None and top_k != -1 and top_k < TOP_K_THRESHOLD:
+        top_k: int | None = self.cfg["top_k"]
+        if top_k is not None and top_k != -1 and top_k < 1:
             raise ValueError(
-                (
-                    f"top_k sampling with values < {TOP_K_THRESHOLD} is not supported because the vLLM V1 engine "
-                    "does not return logprobs after top_k filtering. Values >= {TOP_K_THRESHOLD} are allowed "
-                    "for token filtering purposes. If you understand the implications and still want to use "
-                    f"a lower top_k value, please manually comment out this check. Got top_k={top_k}. "
-                    "See https://github.com/NVIDIA-NeMo/RL/issues/69 for more details."
-                )
+                f"top_k valid values: i) None or -1: no filtering. ii) >= 1: top-k filtering. Got top_k={top_k}."
             )
 
-        top_p: float = self.cfg.get("top_p", 1.0)
-        if top_p < TOP_P_THRESHOLD:
+        top_p: float = self.cfg["top_p"]
+        if top_p <= 0 or top_p > 1.0:
             raise ValueError(
-                (
-                    f"top_p sampling with values < {TOP_P_THRESHOLD} is not supported because the vLLM V1 engine "
-                    "does not return logprobs after top_p filtering. Values >= {TOP_P_THRESHOLD} are allowed "
-                    "for token filtering purposes. If you understand the implications and still want to use "
-                    f"a lower top_p value, please manually comment out this check. Got top_p={top_p}. "
-                    "See https://github.com/NVIDIA-NeMo/RL/issues/69 for more details."
-                )
+                f"top_p valid values: i) 1.0: no filtering. ii) (0, 1]: top-p filtering. Got top_p={top_p}."
             )
 
         # Ensure all required VllmConfig fields are present
@@ -163,6 +144,7 @@ class VllmGeneration(GenerationInterface):
             worker_cls = (
                 "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
             )
+        worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
         worker_builder = RayWorkerBuilder(worker_cls, config)
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
@@ -607,6 +589,13 @@ class VllmGeneration(GenerationInterface):
         if not data_validation_fn(data):
             return
 
+        # VllmAsyncGenerationWorker.generate_async: one sample per call.
+        assert data.size == 1, (
+            f"{method_name} is restricted to handle only single samples, "
+            f"but received batch_size={data.size}. Please handle batching "
+            f"outside this method."
+        )
+
         # Determine the leader worker for the current data parallel shard
         leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
             self.current_generate_dp_shard_idx
@@ -621,88 +610,42 @@ class VllmGeneration(GenerationInterface):
         )
 
         # Increment the round-robin worker group index
-        self.current_generate_dp_shard_idx += 1
-        self.current_generate_dp_shard_idx %= self.worker_group.dp_size
+        self.current_generate_dp_shard_idx = (
+            self.current_generate_dp_shard_idx + 1
+        ) % self.worker_group.dp_size
 
-        # Create a queue to collect sample results from the worker as they complete
-        result_queue = asyncio.Queue()
-        finished = False
-
-        async def consume_worker_generator(worker_idx, worker_gen):
-            """Consume a single worker generator and put sample results in the queue."""
-            nonlocal finished
-            worker_name = f"Worker-{worker_idx}"
-            try:
-                async for sample_result_ref in worker_gen:
-                    sample_result = await sample_result_ref
-                    # sample_result is a tuple: (original_idx, BatchedDataDict)
-                    # Tag the result with worker index for downstream attribution
-                    original_idx, result_batch = sample_result
-                    # Use a length-one list so BatchedDataDict.from_batches can merge without shape errors
-                    result_batch["gen_leader_worker_idx"] = [int(worker_idx)]
-                    sample_result = (original_idx, result_batch)
-                    await result_queue.put(("sample", sample_result))
-            except Exception as e:
-                # Log the error before putting it in the queue for better debugging
-                import traceback
-
-                print(f"Exception in worker {worker_name}")
-                traceback.print_exc()
-                await result_queue.put(("error", e))
-            finally:
-                finished = True
-                await result_queue.put(("worker_done", None))
-
-        # Start the task to consume the worker generator
-        worker_task = asyncio.create_task(
-            consume_worker_generator(leader_worker_idx, worker_gen_proxy)
-        )
-
-        # Yield sample results as they become available from the worker
         timeout_seconds = float(
-            os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "600")
-        )  # Default 10 minutes
+            os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "900")
+        )  # Default 15 minutes
 
-        while not finished:
-            try:
-                msg_type, item = await asyncio.wait_for(
-                    result_queue.get(), timeout=timeout_seconds
-                )
-            except asyncio.TimeoutError:
-                print(
-                    f"Timeout waiting for results after {timeout_seconds}s. Worker has not finished."
-                )
-                print(
-                    f"For longer sequences, increase the timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
-                )
-                # Cancel the task
-                if not worker_task.done():
-                    worker_task.cancel()
-                await asyncio.gather(worker_task, return_exceptions=True)
-                raise RuntimeError(
-                    f"Timeout waiting for worker results after {timeout_seconds}s. "
-                    f"For longer sequences, increase timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
-                )
+        try:
+            sample_result_ref = await anext(worker_gen_proxy)
+        except StopAsyncIteration:
+            raise RuntimeError(
+                f"Worker produced no output for the given sample {data}."
+            )
 
-            if msg_type == "sample":
-                # Yield individual sample result immediately
-                yield item
-            elif msg_type == "error":
-                # Cancel the task and propagate error
-                if not worker_task.done():
-                    worker_task.cancel()
-                await asyncio.gather(worker_task, return_exceptions=True)
-                raise item
-            elif msg_type == "worker_done":
-                # Worker finished, just continue the loop
-                pass
-            else:
-                raise RuntimeError(f"Unexpected message type: {msg_type}")
+        # Materialize the result from Ray's object store. ``anext`` above
+        # resolves when the worker yields, but the object bytes have not yet
+        # crossed the network to the driver — this is where that happens, and
+        # where a Ray deadlock / unreachable worker would manifest, hence the
+        # timeout.
+        try:
+            sample_result = await asyncio.wait_for(
+                sample_result_ref, timeout=timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"Timeout waiting for worker results after {timeout_seconds}s. "
+                f"For longer sequences, increase timeout by setting: "
+                f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
+                f"{int(timeout_seconds * 2)}"
+            )
 
-        # Verify the task is actually done
-        assert worker_task.done(), (
-            f"Worker task {leader_worker_idx} should be done but isn't"
-        )
+        # sample_result is a tuple: (original_idx, BatchedDataDict).
+        original_idx, result_batch = sample_result
+        result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
+        yield (original_idx, result_batch)
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

@@ -1,0 +1,81 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_generations_per_prompt: 8
+  max_num_epochs: 10
+  max_num_steps: 10000
+  use_leave_one_out_baseline: false
+  batch_multiplier: 2
+  use_dynamic_sampling: true
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 1024
+    max_response_length: 8192
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.5-397ba17b-32n8g-megatron
+policy:
+  model_name: Qwen/Qwen3.5-397B-A17B
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  dtensor_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  optimizer: null
+  scheduler: null
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 8
+    num_layers_in_first_pipeline_stage: 6
+    num_layers_in_last_pipeline_stage: 6
+    expert_model_parallel_size: 32
+    activation_checkpointing: true
+    sequence_parallel: true
+    moe_token_dispatcher_type: allgather
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-07
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      tensor_parallel_size: 16
+      expert_parallel_size: 64
+      enable_expert_parallel: true
+      max_model_len: 8192
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3.5-397ba17b-32n8g-megatron
+cluster:
+  gpus_per_node: 8
+  num_nodes: 32

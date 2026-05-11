@@ -14,11 +14,13 @@ policy:
     tensor_model_parallel_size: 8
   dtensor_cfg:
     enabled: false
-  make_sequence_length_divisible_by: 1
+  make_sequence_length_divisible_by: 8
   generation:
     max_new_tokens: 512
     vllm_cfg:
       max_model_len: 512
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: float32  # needed to avoid SSM state overflows in vllm 5.2.0
   sequence_packing:
     enabled: false
 data:

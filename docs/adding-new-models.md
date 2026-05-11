@@ -148,7 +148,7 @@ Test that vLLM yields near-identical token log-probabilities when comparing deco
 
 ```sh
 # Run that is expected to pass
-uv run --extra vllm tools/model_diagnostics/2.long_generation_decode_vs_prefill.py Qwen/Qwen2.5-1.5B
+uv run --extra vllm tools/model_diagnostics/2.long_generation_decode_vs_prefill.py --model Qwen/Qwen2.5-1.5B
 # ...
 # [Qwen/Qwen2.5-1.5B] ALL GOOD!
 ```
@@ -205,7 +205,7 @@ uv run --extra vllm tools/model_diagnostics/4.vllm_precision_compilation_test.py
 ...
 # Eager and cuda graph mode lps with torch inductor precision flag: FAILED - Arrays are different  
 ...
-# Eager and cuda graph mode lps with use_inductor disabled: PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
+# Eager and cuda graph mode lps with backend=eager: PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
 ```
 
 See example for model `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`
@@ -268,8 +268,8 @@ nan location mismatch:
        [-8.610202e+00, -1.067061e+01, -4.593382e-01, ..., -1.060957e-05,...
 ====================================================================================================
 ...
-Eager and cuda graph mode lps with use_inductor disabled (prompt lps): PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
-Eager and cuda graph mode lps with use_inductor disabled (generation lps): PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
+Eager and cuda graph mode lps with backend=eager (prompt lps): PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
+Eager and cuda graph mode lps with backend=eager (generation lps): PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
 ```
 
 **What this script tests:**
@@ -280,19 +280,19 @@ The script is to compare both prompt and generation logprobs under the following
    - **⚠️ Commonly fails**: This comparison often shows discrepancies due to compilation optimizations
 2. **Torch Inductor Precision**: Tests with `TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1` environment variable
    - **⚠️ May help**: This flag may help but typically doesn't resolve all the numerical differences
-3. **Inductor Disabled**: Verifies that disabling Torch Inductor compilation (`use_inductor=False`) maintains output consistency
+3. **Inductor Disabled**: Verifies that disabling Torch Inductor compilation (`backend="eager"`) maintains output consistency
    - **✅ Usually works well**: This configuration often produces results very close to eager mode
-   - **Note**: `use_inductor=False` disables Inductor compilation but keeps CUDA graph capture active for compatible operations
+   - **Note**: `backend="eager"` disables Inductor compilation but keeps CUDA graph capture active for compatible operations
 
 **Performance vs Accuracy Trade-offs:**
 
 The different compilation modes offer distinct trade-offs between accuracy and performance:
 
 - **Eager Mode** (`enforce_eager=True`): Highest accuracy (ground truth) but slowest execution
-- **CUDA Graph Mode with Inductor Disabled** (`enforce_eager=False` and `compilation_config={"use_inductor": False}`): Near-eager accuracy with significant speedup from CUDA graph optimization
-- **CUDA Graph Mode with Inductor Enabled** (`enforce_eager=False` and `compilation_config={"use_inductor": True}`): Potentially fastest execution with custom Triton kernels (since Triton is the current backend of Inductor), but may introduce numerical differences. For accuracy improvement, try the torch inductor precision flag: `export TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1`
+- **CUDA Graph Mode with Inductor Disabled** (`enforce_eager=False` and `compilation_config={"backend": "eager"}`): Near-eager accuracy with significant speedup from CUDA graph optimization
+- **CUDA Graph Mode with Inductor Enabled** (`enforce_eager=False` and `compilation_config={"backend": "inductor"}` or default): Potentially fastest execution with custom Triton kernels (since Triton is the current backend of Inductor), but may introduce numerical differences. For accuracy improvement, try the torch inductor precision flag: `export TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1`
 
-**Note**: Performance characteristics vary by model. For example, `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` shows similar speed performance between `use_inductor=True` and `use_inductor=False`, making the accuracy-preserving option preferable.
+**Note**: Performance characteristics vary by model. For example, `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` shows similar speed performance between `backend="inductor"` and `backend="eager"`, making the accuracy-preserving option preferable.
 
 **Why this matters:**
 
@@ -312,3 +312,53 @@ The different compilation modes offer distinct trade-offs between accuracy and p
 - **Focus on patterns** - some models are more sensitive than others
 - **Use as guidance** - helps choose reliable compilation settings
 - **Balance precision vs performance** - choose what works for your use case
+
+## [5.prefix_caching_nan.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/model_diagnostics/5.prefix_caching_nan.py)
+
+Tests that prefix caching doesn't produce NaN logprobs when prior generation is rolled back into the prompt (the standard RL / multi-turn pattern). In vLLM >= 0.14, the second request can return all-NaN logprobs with `token_id=0` (`<unk>`) for every token after the first.
+
+```sh
+# Single version (requires 2+ GPUs for TP=2)
+uv run --no-project --with "vllm==0.14.0" tools/model_diagnostics/5.prefix_caching_nan.py
+
+# Test across multiple vLLM versions:
+for ver in 0.11.2 0.13.0 0.14.0 0.15.0 0.15.1; do
+    uv run --no-project --with "vllm==$ver" tools/model_diagnostics/5.prefix_caching_nan.py 2>&1 | tee "prefix_caching_nan_vllm_${ver}.log"
+done
+```
+
+Expected pass output (vLLM 0.13.0):
+```
+Iteration 1 — prompt length: 13990 chars
+  tokens: 2048, finish_reason: length
+  text (first 100): '3001 3002 3003 3004 3005 3006 3007 3008 3009 3010 3011 3012 3013 3014 3015 3016 3017 3018 3019 3020 '
+
+Iteration 2 — prompt length: 16038 chars
+  tokens: 2048, finish_reason: length
+  text (first 100): '1 3412 3413 3414 3415 3416 3417 3418 3419 3420 3421 3422 3423 3424 3425 3426 3427 3428 3429 3430 343'
+
+[nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16] ALL GOOD!
+```
+
+Expected fail output (vLLM 0.14.0):
+```
+Iteration 1 — prompt length: 13990 chars
+  tokens: 2048, finish_reason: length
+  text (first 100): '3000\n\nAssistant: 2600 2601 2602 2603 2604 2605 2606 2607 2609 2610 ...'
+
+Iteration 2 — prompt length: 16047 chars
+  tokens: 2048, finish_reason: length
+  text (first 100): '3'
+
+  Sample logprobs from iteration 2:
+    token[0] id=1051: logprob=-0.0005862186080776155 decoded='3'
+    token[1] id=0: logprob=nan decoded='<unk>'
+    token[2] id=0: logprob=nan decoded='<unk>'
+    token[2047] id=0: logprob=nan decoded='<unk>'
+
+AssertionError: FAIL: 2047/2048 logprobs are NaN on iteration 2 (prefix caching is broken in vLLM 0.14.0)
+```
+
+Note: the `ERROR ... Engine core proc EngineCore_DP0 died unexpectedly` message that may appear after the assertion is just vLLM's engine shutting down ungracefully after the process exits — it is not a separate issue.
+
+The script generates from a counting prompt, appends the output back into the prompt, and generates again. On the second generation, prefix caching reuses the KV cache from the first request's prefix. The bug causes the cached prefix to produce corrupted activations, resulting in `token_id=0` (`<unk>`) with `logprob=nan` for all tokens after the first.
