@@ -26,6 +26,10 @@ def _validate_flextron_config(config: PolicyConfig, model_cfg: Any) -> None:
     megatron_cfg = config["megatron_cfg"]
     flex_routers = megatron_cfg.get("flex_routers", None)
     sampling_rates = megatron_cfg.get("flextron_sampling_rates", None)
+    if flex_routers == []:
+        flex_routers = None
+    if sampling_rates == []:
+        sampling_rates = None
 
     if flex_routers is None and sampling_rates is None:
         return

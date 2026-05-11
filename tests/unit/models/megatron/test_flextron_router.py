@@ -157,3 +157,22 @@ def test_router_ids_can_be_sampled_or_read_from_batch():
     )
     assert router.get_router_ids(data).tolist() == [0, 1]
     assert router.grouped_indices(torch.tensor([1, 0, 1])) == {1: [0, 2], 0: [1]}
+
+
+def test_router_sampling_uses_one_route_for_whole_batch(monkeypatch):
+    model = _DummyModel()
+    router = FrozenFlextronRouter(model=model, model_cfg=_router_config())
+    sampled_num_samples = []
+
+    def fake_multinomial(
+        probs: torch.Tensor, num_samples: int, replacement: bool = False
+    ) -> torch.Tensor:
+        sampled_num_samples.append(num_samples)
+        return torch.tensor([1], dtype=torch.long, device=probs.device)
+
+    monkeypatch.setattr(torch, "multinomial", fake_multinomial)
+
+    sampled = router.sample_router_ids(batch_size=4)
+
+    assert sampled.tolist() == [1, 1, 1, 1]
+    assert sampled_num_samples == [1]

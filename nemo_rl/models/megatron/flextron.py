@@ -79,29 +79,37 @@ class FrozenFlextronRouter:
     def sample_router_ids(
         self, *, batch_size: int, device: torch.device | str | None = None
     ) -> torch.Tensor:
-        """Sample route ids from configured `[base, *routers]` probabilities.
+        """Sample one route id from configured `[base, *routers]` probabilities.
 
-        Sampling is performed only on the model-parallel source rank and the
-        result is broadcast across the model-parallel group, so every TP/PP/CP/EP
-        rank in the same DP replica routes each sample through the same Flextron
-        submodel. Independent sampling would mismatch the per-rank route choices
-        and hang the model-parallel NCCL collectives that follow.
+        Sampling is performed only on global rank 0 and the result is broadcast
+        across the default process group, so every DP/TP/PP/CP/EP rank routes
+        the current batch through the same Flextron submodel. Independent
+        sampling would mismatch per-rank route choices and hang the
+        model-parallel NCCL collectives that follow.
         """
         if not self.enabled:
             return torch.zeros(batch_size, dtype=torch.long, device=device)
 
-        mp_group, mp_src_rank = self._model_parallel_broadcast_target()
+        src_rank = 0
+        distributed_initialized = self._distributed_is_initialized()
         # NCCL broadcast requires the buffer to live on the current CUDA device;
         # the caller's `device` (e.g. the input_ids tensor) may still be CPU, so
         # sample/broadcast on CUDA and move to `device` only at the end.
-        if mp_group is not None:
+        backend = (
+            str(torch.distributed.get_backend()).lower()
+            if distributed_initialized
+            else ""
+        )
+        if backend == "nccl":
             broadcast_device: torch.device | str = torch.device(
                 "cuda", torch.cuda.current_device()
             )
         else:
             broadcast_device = device if device is not None else "cpu"
 
-        is_src = mp_group is None or torch.distributed.get_rank() == mp_src_rank
+        is_src = (
+            not distributed_initialized or torch.distributed.get_rank() == src_rank
+        )
         if is_src:
             rates = torch.tensor(
                 self.flextron_sampling_rates,
@@ -109,43 +117,26 @@ class FrozenFlextronRouter:
                 device=broadcast_device,
             )
             probs = rates / rates.sum()
-            router_ids = torch.multinomial(
-                probs, num_samples=batch_size, replacement=True
+            router_id = torch.multinomial(
+                probs, num_samples=1, replacement=True
             ).to(dtype=torch.long)
         else:
-            router_ids = torch.empty(
-                batch_size, dtype=torch.long, device=broadcast_device
-            )
+            router_id = torch.empty(1, dtype=torch.long, device=broadcast_device)
 
-        if mp_group is not None:
-            torch.distributed.broadcast(router_ids, src=mp_src_rank, group=mp_group)
+        if distributed_initialized:
+            torch.distributed.broadcast(router_id, src=src_rank)
 
+        router_ids = router_id.expand(batch_size).clone()
         if device is not None and router_ids.device != torch.device(device):
             router_ids = router_ids.to(device=device)
         return router_ids
 
     @staticmethod
-    def _model_parallel_broadcast_target() -> (
-        tuple[torch.distributed.ProcessGroup | None, int | None]
-    ):
-        """Return the model-parallel group and src rank for router-id broadcast.
-
-        Returns `(None, None)` when torch.distributed is not initialized or the
-        Megatron parallel state has not been set up (e.g. unit tests), so the
-        caller falls back to local sampling.
-        """
-        if not (
+    def _distributed_is_initialized() -> bool:
+        """Return whether torch.distributed can be used for router broadcast."""
+        return bool(
             torch.distributed.is_available() and torch.distributed.is_initialized()
-        ):
-            return None, None
-        try:
-            from megatron.core import parallel_state
-
-            mp_group = parallel_state.get_model_parallel_group()
-            mp_src_rank = parallel_state.get_model_parallel_src_rank()
-        except (ImportError, AssertionError, AttributeError):
-            return None, None
-        return mp_group, mp_src_rank
+        )
 
     def get_router_ids(
         self, data: BatchedDataDict[Any], *, device: torch.device | str | None = None
