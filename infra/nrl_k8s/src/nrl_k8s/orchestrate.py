@@ -496,11 +496,24 @@ def submit_training(
     if run_id:
         env_vars.setdefault("NRL_K8S_RUN_ID", run_id)
 
+    # Make the CLI's RECIPE argument actually control what runs in the
+    # pod. Rewrites ``--config <something>.yaml`` in the train entrypoint
+    # to point at the user-supplied recipe (translated to its in-pod
+    # path). Without this rewrite, ``nrl-k8s run RECIPE_A --infra X``
+    # silently runs whatever recipe the entrypoint hardcoded — RECIPE_A
+    # would only affect client-side validation + Hydra override
+    # merging, never the pod. Daemon entrypoints (gym/generation) are
+    # not touched here; they have their own configs and go through a
+    # separate submission path.
+    entrypoint = _rewrite_entrypoint_recipe(
+        launch.entrypoint, loaded, repo_root, upload=upload, log=log
+    )
+
     try:
         handle = submitter.submit(
             name,
             infra.namespace,
-            entrypoint=launch.entrypoint,
+            entrypoint=entrypoint,
             run_id=run_id or "",
             env_vars=env_vars,
             working_dir=wd,
@@ -520,6 +533,89 @@ def submit_training(
 def default_run_id(role: str) -> str:
     """Human-readable default id when the user didn't supply ``--run-id``."""
     return f"{role}-{int(time.time())}"
+
+
+# ``--config <path>.yaml`` (with optional ``=`` separator and surrounding
+# quotes) — captures the path so :func:`_rewrite_entrypoint_recipe`
+# can substitute it. The mandatory ``\s|=`` after ``--config`` keeps us
+# from accidentally matching Hydra's ``--config-name`` /
+# ``--config-dir`` / ``--config-path``.
+_CONFIG_FLAG_RE = re.compile(r"(--config(?:\s+|=))(['\"]?)([^\s'\"]+\.ya?ml)\2")
+
+
+def _recipe_path_in_pod(
+    loaded: LoadedConfig, repo_root: Path, *, upload: bool
+) -> str | None:
+    """Translate the user's recipe path to the path the pod should read.
+
+    * ``upload`` mode — ``nrl_k8s_run.yaml`` (the staged copy of the
+      resolved recipe inside the working_dir; see the
+      ``stage_workdir(extra_files=...)`` call in :func:`submit_training`).
+    * ``image`` / ``lustre`` mode — the recipe path relative to the
+      repo root. The entrypoint's standard ``cd /opt/nemo-rl`` (or
+      equivalent) puts that path at the working directory inside the
+      pod, since Lustre/in-image code mounts mirror the repo tree.
+
+    Returns ``None`` if the recipe lives outside the repo root in
+    image/lustre mode — we can't translate the path so the caller
+    leaves the entrypoint alone.
+    """
+    if upload:
+        return "nrl_k8s_run.yaml"
+    try:
+        return loaded.source_path.resolve().relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def _rewrite_entrypoint_recipe(
+    entrypoint: str,
+    loaded: LoadedConfig,
+    repo_root: Path,
+    *,
+    upload: bool,
+    log: callable,
+) -> str:
+    """Rewrite ``--config <path>.yaml`` flags in the train entrypoint.
+
+    Rewrites flags to point at the CLI's RECIPE. Without this rewrite,
+    ``nrl-k8s run RECIPE_A --infra X`` silently
+    runs whatever recipe the entrypoint hardcoded — RECIPE_A would only
+    affect client-side validation + Hydra override merging, never the
+    pod. Substituting the path in-place makes the CLI argument
+    authoritative without forcing every infra YAML to be updated.
+
+    Behaviour:
+    * Replaces every ``--config <path>.yaml`` (or ``--config=<path>.yaml``,
+      with optional surrounding quotes) with the in-pod path of the
+      user-supplied recipe. Hydra's ``--config-name`` / ``--config-dir``
+      / ``--config-path`` are not matched.
+    * Logs the substitution at info level when the original path
+      differs from the new one, so the rewrite is visible in the
+      submission log.
+    * No-op when the recipe lives outside the repo root in image/lustre
+      mode (can't translate path) or when the entrypoint has no
+      ``--config <yaml>`` to replace.
+    * Quoting is preserved — if the original had ``--config "foo.yaml"``
+      the result has ``--config "<new>"``.
+    """
+    new_path = _recipe_path_in_pod(loaded, repo_root, upload=upload)
+    if new_path is None:
+        return entrypoint
+
+    seen: set[str] = set()
+
+    def _sub(match: re.Match) -> str:
+        flag, quote, original = match.group(1), match.group(2), match.group(3)
+        if original != new_path and original not in seen:
+            log(
+                f"[training] rewrote `--config {original}` -> "
+                f"`--config {new_path}` from CLI recipe arg"
+            )
+            seen.add(original)
+        return f"{flag}{quote}{new_path}{quote}"
+
+    return _CONFIG_FLAG_RE.sub(_sub, entrypoint)
 
 
 def run(

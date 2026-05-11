@@ -136,7 +136,7 @@ tests/test_suites/llm/sft-nanov3-30BA3B-2n8g-fsdp2.sh
 tests/test_suites/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.sh
 
 # Yarn
-tests/test_suites/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-64k.sh
+tests/test_suites/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-128k.sh
 
 #######
 # DPO #
