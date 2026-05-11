@@ -20,6 +20,7 @@ passed to :func:`nrl_k8s.config.load_recipe_with_infra` as an override.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 from dataclasses import dataclass
@@ -842,23 +843,56 @@ def _run_rayjob(
     _check_head_svc_collision(job_name, namespace, creating="rayjob")
 
     orchestrate.ensure_dra_resources("training", loaded, log=click.echo)
+
+    # DGDs go up BEFORE the RayJob: KubeRay starts submitting the driver
+    # entrypoint as soon as the RayCluster head is Ready, but the gym's
+    # first request races whatever inference resources we asked for. By
+    # ensuring DGDs are already serving before the RayJob is applied,
+    # the entrypoint can hit the frontend immediately. We back-fill the
+    # ownerReference pointing at the RayCluster once it exists (see below)
+    # so K8s GC still cascades when the RayCluster is shut down.
+    dgd_names: list[str] = []
+    for dgd_key in loaded.infra.dynamo:
+        try:
+            name = orchestrate.ensure_dgd(
+                dgd_key, loaded, log=click.echo, owner_ref=None
+            )
+        except (ApiException, Exception) as exc:  # noqa: BLE001
+            # Roll back any DGDs we already brought up — they have no parent
+            # at this point so K8s GC won't reap them.
+            for stranded in dgd_names:
+                click.echo(
+                    f"[dynamo] rolling back DGD {stranded} after apply failure",
+                    err=True,
+                )
+                with contextlib.suppress(Exception):
+                    dgd_mod.delete_dgd(stranded, namespace)
+            _explain_and_exit(exc, context=f"dynamo.{dgd_key} apply failed")
+        else:
+            dgd_names.append(name)
+
     click.echo(f"[run --rayjob] applying RayJob {job_name} in {namespace}")
     try:
         k8s.apply_rayjob(manifest, namespace)
-    except ApiException as exc:
-        _explain_and_exit(exc, context=f"rayjob {job_name} apply failed")
-    except Exception as exc:  # noqa: BLE001
+    except (ApiException, Exception) as exc:  # noqa: BLE001
+        # RayJob never made it — clean up the DGDs we just stood up so
+        # the next attempt isn't blocked by a stale name collision.
+        for stranded in dgd_names:
+            click.echo(
+                f"[dynamo] rolling back DGD {stranded} after RayJob apply failure",
+                err=True,
+            )
+            with contextlib.suppress(Exception):
+                dgd_mod.delete_dgd(stranded, namespace)
         _explain_and_exit(exc, context=f"rayjob {job_name} apply failed")
 
-    # If the recipe declares any DGDs, wait for KubeRay to spawn the
-    # RayCluster, look up its UID, then apply each DGD with an ownerReference
-    # pointing at the RayCluster. K8s GC cascades the DGD when the RayCluster
-    # is deleted (e.g. when shutdownAfterJobFinishes fires), so the inference
-    # GPUs free at the same moment as the training GPUs. Note: KubeRay starts
-    # submitting the entrypoint as soon as the RayCluster is ready, so the
-    # entrypoint should tolerate a brief window where DGD pods are still
-    # coming up — usually a /health curl-loop in the recipe.
-    if loaded.infra.dynamo:
+    # Back-fill the ownerReference on each DGD now that the RayCluster
+    # exists. K8s GC reconciles owner refs continuously, so adding the
+    # ref after the fact still produces cascade-delete-on-RayCluster-shutdown,
+    # which is what we want: when KubeRay tears down the cluster after
+    # the job finishes (shutdownAfterJobFinishes), the DGDs go with it and
+    # the inference GPUs free at the same moment as the training GPUs.
+    if dgd_names:
         click.echo(
             f"[run --rayjob] waiting for RayJob {job_name} to spawn its RayCluster ..."
         )
@@ -879,13 +913,20 @@ def _run_rayjob(
             name=rc_name,
             uid=rc_uid,
         )
-        for dgd_key in loaded.infra.dynamo:
+        for dgd_name in dgd_names:
             try:
-                orchestrate.ensure_dgd(
-                    dgd_key, loaded, log=click.echo, owner_ref=owner
-                )
+                dgd_mod.patch_dgd_owner_ref(dgd_name, namespace, owner)
             except ApiException as exc:
-                _explain_and_exit(exc, context=f"dynamo.{dgd_key} apply failed")
+                # Non-fatal: the DGD is serving and the RayJob is running.
+                # Worst case the user has to `kubectl delete dgd <name>`
+                # after the run if cascade-delete didn't fire. Surface
+                # loudly so it's not silently lost.
+                click.echo(
+                    f"[dynamo] warning: failed to back-fill ownerRef on DGD "
+                    f"{dgd_name} (status={exc.status}); cascade-delete on "
+                    f"RayCluster shutdown will not fire — clean up manually.",
+                    err=True,
+                )
 
     job_id_cmd = f"$(kubectl get rayjob {job_name} -n {namespace} -o jsonpath='{{.status.jobId}}')"
     click.echo(

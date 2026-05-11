@@ -301,6 +301,42 @@ def apply_dgd(manifest: dict[str, Any], namespace: str) -> dict[str, Any]:
         raise
 
 
+def patch_dgd_owner_ref(
+    name: str,
+    namespace: str,
+    owner_ref: dict[str, Any],
+) -> None:
+    """Back-fill ``metadata.ownerReferences`` on an existing DGD.
+
+    Used by the ``--rayjob`` flow: we apply the DGD *before* the RayJob (so
+    the gym frontend is reachable by the time KubeRay fires the driver
+    entrypoint), but the RayCluster doesn't exist yet at that point so we
+    can't ownerRef the DGD at apply time. Once the RayCluster has been
+    created and we have its UID, we PATCH the ownerRef in.
+
+    K8s GC re-evaluates owner refs every reconcile, so adding the ref late
+    still gives the cascade-delete-when-RayCluster-disappears behavior we
+    want — the DGD just isn't anchored to its eventual owner during the
+    brief window between apply and back-fill.
+
+    Uses a strategic-merge ``application/merge-patch+json`` body so we
+    cleanly replace the (empty) ownerReferences list without disturbing the
+    rest of metadata.
+    """
+    api = custom_objects_api()
+    body = {"metadata": {"ownerReferences": [owner_ref]}}
+    with_retries(
+        lambda: api.patch_namespaced_custom_object(
+            group=DGD_GROUP,
+            version=DGD_VERSION,
+            namespace=namespace,
+            plural=DGD_PLURAL,
+            name=name,
+            body=body,
+        )
+    )
+
+
 def get_dgd(name: str, namespace: str) -> dict[str, Any] | None:
     api = custom_objects_api()
     try:
