@@ -1,0 +1,73 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  max_num_steps: 30
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  val_period: 8
+  val_batch_size: 8
+  max_val_samples: 8
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  checkpoint_dir: results/grpo-glm5.1-64n8g-megatron-2048
+  save_period: 10
+policy:
+  model_name: zai-org/GLM-5.1
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  logprob_chunk_size: 2048
+  dtensor_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  optimizer: null
+  scheduler: null
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 8
+    num_layers_in_first_pipeline_stage: 9
+    num_layers_in_last_pipeline_stage: 9
+    expert_model_parallel_size: 64
+    sequence_parallel: true
+    activation_checkpointing: true
+    moe_token_dispatcher_type: allgather
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    optimizer:
+      lr: 5.0e-07
+      min_lr: 5.0e-08
+      weight_decay: 0.0
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_warmup_iters: 2
+      lr_warmup_init: 5.0e-08
+  generation:
+    max_new_tokens: 512
+    vllm_cfg:
+      tensor_parallel_size: 32
+      expert_parallel_size: 128
+      gpu_memory_utilization: 0.5
+      max_model_len: 2048
+      enforce_eager: true
+    vllm_kwargs:
+      max_num_batched_tokens: 2048
+      max_num_seqs: 4
+data:
+  max_input_seq_length: 512
+logger:
+  log_dir: logs/grpo-glm5.1-64n8g-megatron
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb:
+    project: nemo-rl-glm
+    name: grpo-glm5.1-64n8g-megatron
+cluster:
+  gpus_per_node: 8
+  num_nodes: 64
