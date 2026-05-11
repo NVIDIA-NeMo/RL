@@ -1317,7 +1317,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
           - ``account_for_embedding_in_pipeline_split``
           - ``account_for_loss_in_pipeline_split``
         """
-        config = self.megatron_bridge.transformer_config
+        # Read from the runtime model's config rather than the bridge's
+        # default — the user's per-stage layout overrides
+        # (num_layers_in_first/last_pipeline_stage) are applied to the model
+        # in setup but never make it into bridge.transformer_config.
+        config = self.model.config
 
         assert getattr(config, "pipeline_model_parallel_layout", None) is None, (
             "nccl_reshard_refit does not support custom pipeline_model_parallel_layout yet"

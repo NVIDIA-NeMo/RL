@@ -415,6 +415,13 @@ class VllmInternalWorkerExtension:
             (["q_proj.weight", "k_proj.weight", "v_proj.weight"], "qkv_proj.weight"),
             (["q_proj.bias", "k_proj.bias", "v_proj.bias"], "qkv_proj.bias"),
             (["gate_proj.weight", "up_proj.weight"], "gate_up_proj.weight"),
+            # DeepSeek MLA down-projections fused on the vLLM side as
+            # `fused_qkv_a_proj` (MergedColumnParallelLinear with
+            # ``disable_tp=True`` → each TP rank holds the full concat).
+            (
+                ["q_a_proj.weight", "kv_a_proj_with_mqa.weight"],
+                "fused_qkv_a_proj.weight",
+            ),
             # FP8 blockwise scale siblings (paired with the weights above).
             # vLLM-FP8 stores `<vllm_name>.weight_scale_inv` next to the FP8
             # weight, with shape `[output//block, input//block]`. The same
@@ -469,6 +476,12 @@ class VllmInternalWorkerExtension:
                             naive_local_sizes = [gs // tp_size for gs in global_sizes]
                             if sum(naive_local_sizes) == local_dim0:
                                 local_sizes = naive_local_sizes
+                            elif local_dim0 == global_dim0:
+                                # Fully replicated merge (e.g. DeepSeek MLA's
+                                # fused_qkv_a_proj with disable_tp=True): the
+                                # vLLM param holds the full concat on every TP
+                                # rank, so local == global per component.
+                                local_sizes = list(global_sizes)
                             else:
                                 # KV head replication: q divides evenly, k/v are replicated
                                 local_sizes = [global_sizes[0] // tp_size]
@@ -578,6 +591,11 @@ class VllmInternalWorkerExtension:
             all_replicate = [Replicate() for _ in dst_placements]
             tp_rank = torch.distributed.get_rank()
             tp_size = torch.distributed.get_world_size()
+            # When the merged vLLM param holds the full concat on every TP
+            # rank (e.g. MergedColumnParallelLinear with disable_tp=True), the
+            # slice into vllm_param covers the FULL global tensor — no TP
+            # local-slicing needed.
+            is_replicated_merge = dim0_slice.stop - dim0_slice.start == global_shape[0]
 
             def finalize(
                 _buf=buf,
@@ -586,10 +604,14 @@ class VllmInternalWorkerExtension:
                 _slice=dim0_slice,
                 _tp_rank=tp_rank,
                 _tp_size=tp_size,
+                _replicated=is_replicated_merge,
             ):
-                local_data = self._compute_tp_local_slice(
-                    _buf, _name, _tp_rank, _tp_size
-                )
+                if _replicated:
+                    local_data = _buf
+                else:
+                    local_data = self._compute_tp_local_slice(
+                        _buf, _name, _tp_rank, _tp_size
+                    )
                 _vllm_param.data[_slice].copy_(local_data)
 
             return DTensorRef(buf, global_shape), all_replicate, finalize

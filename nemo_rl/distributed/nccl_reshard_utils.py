@@ -112,14 +112,18 @@ COLUMN_PARALLEL_SUFFIXES = [
     "v_proj.weight",
     "gate_proj.weight",
     "up_proj.weight",
-    # DeepSeek MLA projections
-    "q_a_proj.weight",
+    # DeepSeek MLA up-projections (column-parallel on output: num_heads * head_dim)
     "q_b_proj.weight",
-    "kv_a_proj_with_mqa.weight",
     "kv_b_proj.weight",
     # Fused MoE expert params (vLLM naming: gate+up fused)
     "w13_weight",
 ]
+
+# DeepSeek MLA down-projections.  vLLM creates these as ReplicatedLinear (or
+# merges them into ``fused_qkv_a_proj`` with ``disable_tp=True``), so the full
+# tensor lives on every TP rank.  Megatron with TP=1 also keeps them
+# unsharded, so leaving them out of COLUMN_PARALLEL_SUFFIXES gives the right
+# "all Replicate" placement on both sides.
 
 # Row-parallel suffixes: TP shards along dim 1 (input dimension)
 ROW_PARALLEL_SUFFIXES = [
