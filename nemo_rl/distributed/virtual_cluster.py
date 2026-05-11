@@ -41,7 +41,15 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 
 
 class PY_EXECUTABLES:
+    # Driver's own interpreter (under `uv run` this is the uv-managed venv).
+    # Used by environment actors that share the driver's deps (math_verify, ...).
     SYSTEM = sys.executable
+
+    # Base image's pre-baked system Python — for actors that need a package
+    # installed at image build time but missing from the uv venv (e.g.
+    # tensorrt_llm in the trtllm_base image's cp312 dist-packages). Defaults
+    # to sys.executable so unset → behaves like SYSTEM.
+    CONTAINER_SYSTEM = os.environ.get("NEMO_RL_CONTAINER_PYTHON", sys.executable)
 
     # Use NeMo-RL direct dependencies.
     BASE = f"uv run --locked --directory {git_root}"

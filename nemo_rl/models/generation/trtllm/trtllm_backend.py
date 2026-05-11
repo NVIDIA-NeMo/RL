@@ -55,17 +55,21 @@ class NcclExtension(WorkerExtension):
         world_size: int,
         train_world_size: int,
     ) -> None:
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.utils import StatelessProcessGroup
+        # Use nemo-rl's own StatelessProcessGroup (backed by nccl4py) instead
+        # of vllm.distributed.* — TrtllmGenerationWorker runs under the
+        # container's system python where vllm isn't installed, but nccl4py
+        # is in nemo-rl core deps. The exposed `.broadcast(tensor, src=...)`
+        # method matches what packed_broadcast_consumer calls.
+        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         rank = train_world_size + rank_prefix + local_rank
 
-        pg = StatelessProcessGroup.create(
-            host=ip, port=port, rank=rank, world_size=world_size,
+        pg = StatelessProcessGroup(
+            master_address=ip, port=port, rank=rank, world_size=world_size,
         )
-        device = torch.device("cuda", self.device_id)
-        self.model_update_group = PyNcclCommunicator(pg, device=device)
+        pg.init_nccl_communicator(device=self.device_id)
+        self.model_update_group = pg
 
     # ------------------------------------------------------------------ #
     #  Refit metadata (weight name → (shape, dtype) mapping)

@@ -35,6 +35,7 @@ class StatelessProcessGroup:
     def init_nccl_communicator(self, device: int):
         UNIQUE_ID_KEY = "nccl_unique_id"
 
+        print(f"[StatelessPG] rank={self.rank} world_size={self.world_size} master={self.master_address}:{self.port} BEGIN unique_id exchange", flush=True)
         if self.rank == 0:
             unique_id = get_unique_id()
             unique_id_bytes = unique_id.as_bytes
@@ -45,6 +46,7 @@ class StatelessProcessGroup:
             self.tcp_store.wait([UNIQUE_ID_KEY])
             unique_id_bytes = self.tcp_store.get(UNIQUE_ID_KEY)
             unique_id = UniqueId.from_bytes(unique_id_bytes)
+        print(f"[StatelessPG] rank={self.rank} unique_id obtained, calling Communicator.init device={device}", flush=True)
 
         with torch.cuda.device(device):
             self.nccl_communicator = Communicator.init(
@@ -52,6 +54,7 @@ class StatelessProcessGroup:
                 rank=self.rank,
                 unique_id=unique_id,
             )
+            print(f"[StatelessPG] rank={self.rank} Communicator.init RETURNED", flush=True)
             # warmup and check if broadcast is working
             stream = torch.cuda.current_stream()
             if self.rank == 0:

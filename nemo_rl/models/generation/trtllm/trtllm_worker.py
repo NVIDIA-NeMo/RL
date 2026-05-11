@@ -52,15 +52,26 @@ class TrtllmGenerationWorker:
         # Ray actors that each need a GPU.  The outer actor therefore
         # gives up its GPU reservation.
         resources: dict[str, Any] = {"num_gpus": 0, "num_cpus": 0}
+        # TRT-LLM's CudaRunner derives NVRTC -I include paths via
+        # `popen("pip show tensorrt_llm")`. With /opt/nemo_rl_venv/bin ahead of
+        # /usr/bin on PATH (uv run prepends the venv), pip resolves to the venv
+        # pip which has no tensorrt_llm installed, breaking fmha JIT
+        # ("cuda.h: no directories in search list"). Force /usr/bin first so
+        # `pip` is the system pip that can locate tensorrt_llm in
+        # /usr/local/lib/python3.12/dist-packages.
+        worker_path = "/usr/bin:" + os.environ.get("PATH", "")
         env_vars: dict[str, str] = {
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
             "NCCL_CUMEM_ENABLE": "1",
+            "PATH": worker_path,
         }
         init_kwargs: dict[str, Any] = {}
 
         if bundle_indices is not None:
+            # Pass bundle_indices through __init__ kwargs; the worker resolves the
+            # parent placement group via get_current_placement_group() and hands both
+            # to TRT-LLM as ray_placement_config (instead of TRTLLM_RAY_BUNDLE_INDICES).
             init_kwargs["bundle_indices"] = bundle_indices[1]
-            env_vars["TRTLLM_RAY_BUNDLE_INDICES"] = ",".join(str(i) for i in bundle_indices[1])
             node_idx = bundle_indices[0]
             if len(bundle_indices[1]) == 1:
                 seed = node_idx * 1024 + bundle_indices[1][0]
@@ -89,6 +100,8 @@ class TrtllmGenerationWorker:
 
         import tensorrt_llm
         from tensorrt_llm import SamplingParams as TrtSamplingParams
+        from tensorrt_llm.llmapi.llm_args import RayPlacementConfig
+        from ray.util.placement_group import get_current_placement_group
 
         self.TrtSamplingParams = TrtSamplingParams
 
@@ -96,14 +109,23 @@ class TrtllmGenerationWorker:
         tp_size = trtllm_cfg["tensor_parallel_size"]
 
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-        os.environ["TRTLLM_RAY_BUNDLE_INDICES"] = ",".join(str(i) for i in bundle_indices)
 
-        from ray.util.placement_group import get_current_placement_group
-        _pg = get_current_placement_group()
-        print(f"[TrtllmWorker DEBUG] bundle_indices={bundle_indices}, "
-              f"TRTLLM_RAY_BUNDLE_INDICES={os.environ.get('TRTLLM_RAY_BUNDLE_INDICES')}, "
-              f"get_current_placement_group()={_pg}, "
-              f"bundle_specs={_pg.bundle_specs if _pg else 'N/A'}", flush=True)
+        # Hand TRT-LLM the parent placement group + this worker's bundle indices
+        # directly via ray_placement_config (path 0 in RayExecutor._get_placement_group),
+        # instead of the env-var path (TRTLLM_RAY_BUNDLE_INDICES). This avoids env-var
+        # coupling and lets TRT-LLM see the exact PG the outer Ray actor is scheduled on
+        # — i.e. the nemo-rl inference cluster's PG.
+        pg = get_current_placement_group()
+        assert pg is not None, (
+            "TrtllmGenerationWorker must be scheduled inside a Ray placement group; "
+            "got None from get_current_placement_group()."
+        )
+        ray_placement_config = RayPlacementConfig(
+            placement_groups=[pg],
+            placement_bundle_indices=[list(bundle_indices)],
+        )
+        print(f"[TrtllmWorker] bundle_indices={bundle_indices}, "
+              f"pg={pg}, bundle_specs={pg.bundle_specs}", flush=True)
 
         precision = trtllm_cfg.get("precision", "bfloat16")
         max_batch_size = trtllm_cfg.get("max_batch_size", 64)
@@ -119,6 +141,7 @@ class TrtllmGenerationWorker:
             max_seq_len=trtllm_cfg["max_model_len"],
             orchestrator_type="ray",
             ray_worker_extension_cls="nemo_rl.models.generation.trtllm.trtllm_backend.NcclExtension",
+            ray_placement_config=ray_placement_config,
             trust_remote_code=True,
         )
 
