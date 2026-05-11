@@ -1,0 +1,15 @@
+# Arm 2/3 of the SAPO vs GRPO reproduction on Qwen3-30B-A3B:
+# SAPO with ASYMMETRIC tau (tau_pos=1.0, tau_neg=1.05). Replaces the hard
+# PPO clip with a smooth temperature-controlled sigmoid gate. This is the
+# recommended SAPO setting per arXiv:2511.20347 (Eq. 5-6 + Fig. 5 ablation).
+defaults: grpo-qwen3-30ba3b-2n8g-megatron-sapo-repro-base.yaml
+
+loss_fn:
+  sapo_enabled: true
+  sapo_tau_pos: 1.0
+  sapo_tau_neg: 1.05
+
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-2n8g-megatron-sapo-asym
+  wandb:
+    name: grpo-qwen3-30ba3b-2n8g-megatron-sapo-asym

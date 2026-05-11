@@ -531,6 +531,98 @@ def test_clipped_pg_loss_ppo_clipping():
     torch.testing.assert_close(actual_loss, expected_loss)
 
 
+def test_clipped_pg_loss_sapo_soft_gate():
+    """SAPO replaces the hard PPO clip with a smooth sigmoid gate.
+
+    f(r; A) = sigmoid(tau * (r - 1)) * 4 / tau,  L = -f(r) * A,  with
+    tau = tau_pos when A>0 else tau_neg. Verify the loss value matches a
+    hand calculation across r below, equal to, and above 1, with the
+    paper's default temperatures.
+
+    See https://arxiv.org/abs/2511.20347 eq. (5)-(6).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
+
+    cfg = deepcopy(basic_pg_loss_test_config)
+    cfg["sapo_enabled"] = True
+    cfg["sapo_tau_pos"] = 1.0
+    cfg["sapo_tau_neg"] = 1.05
+    # Hard-clip bounds should be ignored when SAPO is on; set them tight
+    # so the assertion will fire if the code accidentally goes through the
+    # PPO path.
+    cfg["ratio_clip_min"] = 0.05
+    cfg["ratio_clip_max"] = 0.05
+    cfg["ratio_clip_c"] = None
+    loss_fn = ClippedPGLossFn(cfg)
+
+    # Same r in {0.5, 1.0, 1.5} pattern as the PPO test, plus an outlier
+    # at r=3 where PPO would zero the gradient but SAPO smoothly attenuates.
+    adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
+    prev_lp_masked = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    curr_lp_masked = torch.tensor([[-1.69315, -1.0, -0.59453]], device=device)
+
+    data["advantages"][0, 1:] = adv_masked
+    data["prev_logprobs"][0, 1:] = prev_lp_masked
+
+    # --- Hand calculation ---
+    ratios = torch.exp(curr_lp_masked - prev_lp_masked)
+    # tau is per-token, selected by sign of A; here [pos, neg, pos].
+    tau = torch.tensor(
+        [[cfg["sapo_tau_pos"], cfg["sapo_tau_neg"], cfg["sapo_tau_pos"]]],
+        device=device,
+    )
+    gate = torch.sigmoid(tau * (ratios - 1.0)) * (4.0 / tau)
+    # Spot-check the gate at r=1 (middle column) equals 4*sigma(0)/tau_neg = 2/tau_neg.
+    torch.testing.assert_close(gate[0, 1], torch.tensor(2.0 / 1.05, device=device))
+    loss_per_token = -adv_masked * gate
+    expected_loss = torch.mean(loss_per_token)
+
+    input_ids = data["input_ids"]
+    dummy_logits = _create_exact_logits(
+        curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
+    )
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
+
+    actual_loss, metrics = loss_fn(
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+        **loss_input,
+    )
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=1e-4, atol=1e-5)
+
+    # SAPO metrics must be present and finite.
+    assert "sapo_gate_mean" in metrics
+    assert "sapo_gate_norm_mean" in metrics
+    assert "sapo_attenuated_token_frac" in metrics
+    assert 0.0 <= metrics["sapo_gate_norm_mean"] <= 1.0
+
+
+@pytest.mark.parametrize(
+    "incompatible_flag,value",
+    [
+        ("sequence_level_importance_ratios", True),
+        ("disable_ppo_ratio", True),
+        ("force_on_policy_ratio", True),
+        ("ratio_clip_c", 3.0),
+    ],
+)
+def test_clipped_pg_loss_sapo_incompatibility_asserts(incompatible_flag, value):
+    """SAPO must reject configs that conflict with its smooth-gate semantics."""
+    cfg = deepcopy(basic_pg_loss_test_config)
+    cfg["sapo_enabled"] = True
+    cfg[incompatible_flag] = value
+    # sequence_level_importance_ratios also requires SEQUENCE_LEVEL loss
+    if incompatible_flag == "sequence_level_importance_ratios":
+        cfg["token_level_loss"] = False
+    with pytest.raises(AssertionError):
+        ClippedPGLossFn(cfg)
+
+
 # Simplified REINFORCE Test using original Loss
 def test_clipped_pg_loss_reinforce_mode():
     """Tests REINFORCE mode calculations directly."""

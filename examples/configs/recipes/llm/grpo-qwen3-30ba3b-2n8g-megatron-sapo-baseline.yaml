@@ -1,0 +1,11 @@
+# Arm 1/3 of the SAPO vs GRPO reproduction on Qwen3-30B-A3B:
+# vanilla GRPO baseline with hard PPO-style clipping at [0.8, 1.2].
+defaults: grpo-qwen3-30ba3b-2n8g-megatron-sapo-repro-base.yaml
+
+loss_fn:
+  sapo_enabled: false
+
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-2n8g-megatron-sapo-baseline
+  wandb:
+    name: grpo-qwen3-30ba3b-2n8g-megatron-sapo-baseline
