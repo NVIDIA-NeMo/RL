@@ -168,9 +168,6 @@ class VllmGeneration(GenerationInterface):
         if self.ep_size > self.tp_size:
             env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
 
-        if os.environ.get("NRL_REFIT_FINITE_CHECK") == "1":
-            env_vars["NRL_REFIT_FINITE_CHECK"] = "1"
-
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
             # For parallelism, create node-aware worker groups

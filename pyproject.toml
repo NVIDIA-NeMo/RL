@@ -58,9 +58,6 @@ dependencies = [
   "pybase64",                                                                                                         # for sglang refit
   "nvidia-cudnn-cu12==9.19.0.56; sys_platform != 'darwin'",                                                           # for transformer-engine no build isolation
   # nvidia-resiliency-ext removed: no Python 3.13 wheels available (v0.5.0 only has cp310-cp312)
-  "setuptools_scm",
-  "mathruler",
-  "pylatexenc",     # transitive dep of mathruler (not declared in its metadata)
 ]
 
 [project.optional-dependencies]
@@ -236,7 +233,6 @@ no-build-isolation-package = [
   "deep_ep",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
   "sglang-kernel",
-  "vllm",
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd

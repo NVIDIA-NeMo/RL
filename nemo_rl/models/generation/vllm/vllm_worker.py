@@ -420,7 +420,7 @@ class BaseVllmGenerationWorker:
             state writeback and before decode consumes those states. This is a
             narrow workaround for that handoff, unlike CUDA_LAUNCH_BLOCKING.
             """
-            enabled = os.environ.get("NRL_MAMBA_PREFILL_DECODE_SYNC", "0")
+            enabled = os.environ.get("NRL_MAMBA_PREFILL_DECODE_SYNC", "1")
             if enabled.lower() not in ("1", "true", "yes", "on"):
                 return
 

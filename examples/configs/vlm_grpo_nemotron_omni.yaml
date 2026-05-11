@@ -13,7 +13,7 @@ checkpointing:
   save_optimizer: true
 
 policy:
-  model_name: /lustre/fsw/portfolios/coreai/users/yuekaiz/HF/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
   train_global_batch_size: 32
   train_micro_batch_size: 1
   logprob_batch_size: 1
