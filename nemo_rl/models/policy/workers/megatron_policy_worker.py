@@ -1415,6 +1415,15 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             gen_world_size,
             layer_to_pp_stage=layer_to_pp_stage,
         )
+
+        # Cache the param map + expert grouping now (depends only on model
+        # topology, not weight values, so it can be computed once at setup
+        # and reused for every refit).
+        self._param_map = {
+            name: tensor for name, tensor in self._iter_local_hf_params()
+        }
+        self._expert_groups = self._build_expert_groups()
+
         return self.nccl_reshard_refit_info
 
     def _get_src_local_tensor(self, param_info, expert_groups, gen_tp_size):
@@ -1440,19 +1449,15 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         expert index.  Used by ``_fuse_one_moe_param`` to look up the
         constituent gate/up/down tensors for a fused w13/w2 entry.
         """
-        import re
+        from nemo_rl.distributed.nccl_reshard_utils import _INDIVIDUAL_EXPERT_RE
 
-        expert_re = re.compile(
-            r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
-        )
         groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
         for name in self._param_map:
-            m = expert_re.match(name)
+            m = _INDIVIDUAL_EXPERT_RE.match(name)
             if m:
-                prefix = m.group(1)
-                idx = int(m.group(2))
-                proj = m.group(3)
-                groups.setdefault((prefix, proj), []).append((idx, name))
+                groups.setdefault((m.group(1), m.group(3)), []).append(
+                    (int(m.group(2)), name)
+                )
         for key in groups:
             groups[key].sort()
         return groups
@@ -1525,18 +1530,10 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         from nemo_rl.distributed.nccl_reshard_utils import DTensorRef
 
-        # Build map of param_name -> TP-local shard (no PP broadcast / TP gather)
-        self._param_map = {}
-        for name, tensor in self._iter_local_hf_params():
-            self._param_map[name] = tensor
-
-        # MoE: precompute the (prefix, proj) -> [(idx, name)] grouping once.
-        # The actual fused w13/w2 tensors are built lazily inside the loop
-        # below — one at a time, freed immediately after the transfer — so
-        # peak memory stays at one fused param instead of all layers'.
-        expert_groups = self._build_expert_groups()
+        # _param_map and _expert_groups are built once in
+        # prepare_nccl_reshard_refit_info; weight values change but the
+        # name → view mapping is stable across refits.
         gen_tp_size = self.nccl_reshard_refit_info.get("gen_tp_size", 1)
-
         use_per_stage = hasattr(self, "pp_comm_group")
 
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
@@ -1551,7 +1548,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     group = self.model_update_group
 
                 local = self._get_src_local_tensor(
-                    param_info, expert_groups, gen_tp_size
+                    param_info, self._expert_groups, gen_tp_size
                 )
                 src_tensor = (
                     DTensorRef(
@@ -1569,12 +1566,10 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     param_info["dst_placements"],
                     group,
                 )
-                # Drop refs to the per-iteration fused tensor so its CUDA
-                # memory is released back to the caching allocator before
-                # the next iteration's fusion allocates.
+                # Drop refs to the per-iteration fused MoE tensor so its CUDA
+                # memory returns to the caching allocator before the next
+                # iteration's fusion allocates.
                 del local, src_tensor
-
-        del self._param_map
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)

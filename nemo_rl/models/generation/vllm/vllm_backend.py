@@ -91,36 +91,16 @@ class VllmInternalWorkerExtension:
 
         local_rank = torch.distributed.get_rank()
         gen_rank_in_group = train_ranks_per_stage + rank_prefix + local_rank
-        print(
-            f"[GEN init_pp_comm_groups] rank_prefix={rank_prefix}, local_rank={local_rank}, "
-            f"gen_rank_in_group={gen_rank_in_group}, sub_world_size={sub_world_size}, "
-            f"pp_size={pp_size}, device={self.device}",
-            flush=True,
-        )
 
         self.pp_comm_groups = {}  # pyrefly: ignore[implicitly-defined-attribute]
         for stage in range(pp_size):
-            print(
-                f"[GEN init_pp_comm_groups] gen_rank={gen_rank_in_group} creating stage {stage} "
-                f"TCPStore at {pp_ips[stage]}:{pp_ports[stage]}",
-                flush=True,
-            )
             group = StatelessProcessGroup(
                 master_address=pp_ips[stage],
                 port=pp_ports[stage],
                 rank=gen_rank_in_group,
                 world_size=sub_world_size,
             )
-            print(
-                f"[GEN init_pp_comm_groups] gen_rank={gen_rank_in_group} stage {stage} "
-                f"TCPStore created, starting NCCL init",
-                flush=True,
-            )
             group.init_nccl_communicator(device=self.device)
-            print(
-                f"[GEN init_pp_comm_groups] gen_rank={gen_rank_in_group} stage {stage} DONE",
-                flush=True,
-            )
             self.pp_comm_groups[stage] = group
 
     def report_device_id(self) -> str:
@@ -384,6 +364,13 @@ class VllmInternalWorkerExtension:
             normalize_refit_info_placements(refit_info)
         )
 
+        # HF→vLLM mapping depends only on model structure and the (now
+        # normalized) refit_info — cache it here so each refit step doesn't
+        # repeat the per-param suffix matching against vLLM params.
+        self._hf_to_vllm = self._build_hf_to_vllm_mapping(  # pyrefly: ignore[implicitly-defined-attribute]
+            self.nccl_reshard_refit_info
+        )
+
     def _build_hf_to_vllm_mapping(self, refit_info):
         """Build mapping from HF param names to vLLM (param, dim0_slice).
 
@@ -630,10 +617,7 @@ class VllmInternalWorkerExtension:
         """
         from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
 
-        self._hf_to_vllm = self._build_hf_to_vllm_mapping(  # pyrefly: ignore[implicitly-defined-attribute]
-            self.nccl_reshard_refit_info
-        )
-
+        # self._hf_to_vllm is built once in prepare_nccl_reshard_refit_info.
         use_per_stage = hasattr(self, "pp_comm_groups") and self.pp_comm_groups
 
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
@@ -663,7 +647,6 @@ class VllmInternalWorkerExtension:
         # Ensure all NCCL broadcasts and copy_ ops complete before vLLM resumes.
         torch.cuda.synchronize()
         self._maybe_process_fp8_kv_cache()
-        del self._hf_to_vllm
         return True
 
     def cleanup(self) -> None:

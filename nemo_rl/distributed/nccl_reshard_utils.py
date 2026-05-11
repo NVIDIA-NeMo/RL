@@ -628,7 +628,6 @@ def build_nccl_reshard_refit_info(
         ``{"layer_names": [...], "per_layer_params": {layer: [param_info, ...]},
            "pp_size": int}``
     """
-    # Fuse individual MoE expert params into combined w13/w2 entries.
     state_dict_metadata = fuse_expert_params_in_metadata(state_dict_metadata)
 
     pp_size = train_parallelism.get("pp_size", 1)
