@@ -1,0 +1,1039 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Cross-tokenizer token alignment.
+
+Ports the alignment algorithm from the PyTorch tokenalign reference
+(``train_distillation_ddp.py`` companion ``tokenalign.py``). The DP kernel,
+canonicalization helpers, anchor optimization, and post-processing are kept
+faithful so loss-side parity with that reference is preserved. Anything
+unrelated to running cross-tokenizer alignment for off-policy distillation
+(rule tracking, learnable projection, MSE loss, multiple compute_loss
+variants, accuracy, translation) is dropped.
+
+Public surface:
+    - :class:`AlignmentBatch` — dense-padded per-batch alignment payload that
+      covers all three loss modes (P-KL, gold_loss, xtoken_loss).
+    - :class:`TokenAligner` — owns the two tokenizers and the projection
+      matrix, exposes :meth:`align` for the collator.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Any, List, Tuple
+
+import numpy as np
+import torch
+
+# Visual byte representations used by some BPE tokenizers (especially for
+# emojis / non-ASCII bytes). Copied from the PT reference verbatim — these
+# constants are content-coupled to the tokenizers we align across.
+VISUAL_BYTE_MAP = {
+    "ð": 240, "Ɩ": 241, "Ɨ": 242, "Ƙ": 243, "ƙ": 244, "ƚ": 245, "ƛ": 246, "Ɯ": 247,
+    "Ɲ": 248, "ƞ": 249, "Ɵ": 250, "Ơ": 251, "ơ": 252, "Ƣ": 253, "ƣ": 254, "Ƥ": 255,
+    "Ł": 156, "ł": 157, "Ń": 158, "ń": 159, "ĺ": 149, "Ļ": 150, "ļ": 151, "Ľ": 152,
+    "ľ": 153, "Ŀ": 154, "ŀ": 155, "Ĭ": 135, "ĭ": 136, "Į": 137, "į": 138, "İ": 139,
+    "ı": 140, "Ĳ": 141, "ĳ": 142, "Ĵ": 143, "ĵ": 144, "Ķ": 145, "ķ": 146, "ĸ": 147,
+    "Ĺ": 148, "ĥ": 128, "Ħ": 129, "ħ": 130, "Ĩ": 131, "ĩ": 132, "Ī": 133, "ī": 134,
+    "Ģ": 162, "ģ": 163, "Ĝ": 28, "ĝ": 29, "Ğ": 30, "ğ": 31,
+}
+
+# Multi-token encoding artifacts (mojibake patterns) where the broken byte
+# sequence spans tokens. Patterns are checked left-to-right with the first
+# match wins. From PT reference; trimmed to the high-frequency entries.
+_MULTI_TOKEN_ARTIFACT_FIXES = [
+    (["ĠâĪ", "ĳ"], ["Ġ∑"]), (["âĪ", "ĳ"], ["∑"]),
+    (["ĠâĪ", "ı"], ["Ġ∏"]), (["âĪ", "ı"], ["∏"]),
+    (["ĠâĪ", "Ĥ"], ["Ġ∂"]), (["âĪ", "Ĥ"], ["∂"]),
+    (["ĠâĪ", "ĩ"], ["Ġ∇"]), (["âĪ", "ĩ"], ["∇"]),
+    (["ĠâĪ", "ŀ"], ["Ġ∞"]), (["âĪ", "ŀ"], ["∞"]),
+    (["ĠâĪ", "ļ"], ["Ġ√"]), (["âĪ", "ļ"], ["√"]),
+    (["ĠâĪ", "«"], ["Ġ∫"]), (["âĪ", "«"], ["∫"]),
+    (["Ġâī", "ł"], ["Ġ≠"]), (["âī", "ł"], ["≠"]),
+    (["Ġä¸", "Ń"], ["Ġ中"]), (["ä¸", "Ń"], ["中"]),
+    (["æĸ", "ĩ"], ["文"]), (["Ġæĸ", "ĩ"], ["Ġ文"]),
+]
+
+# Per-token canonicalizations applied after multi-token artifact fixes.
+_UNICODE_FIXES = {
+    "Ã±": "ñ", "Ã¡": "á", "Ã©": "é", "Ã­": "í", "Ã³": "ó", "Ãº": "ú",
+    "Ã": "À", "Ã¢": "â", "Ã§": "ç",
+    "Ã¨": "è", "Ã«": "ë", "Ã®": "î", "Ã´": "ô",
+    "Ã¹": "ù", "Ã»": "û", "Ã¿": "ÿ",
+    "ä¸Ń": "中", "æĸĩ": "文", "æĹ¥æľ¬": "日本", "èªŀ": "語",
+    "ÐłÑĥÑģ": "Рус", "ÑģÐºÐ¸Ð¹": "ский",
+    "Ø§ÙĦØ¹Ø±Ø¨ÙĬØ©": "العربية",
+    "à¤¹": "ह", "à¤¿à¤Ĥ": "हिं", "à¤¦à¥Ģ": "दी",
+    "âĪĳ": "∑", "âĪı": "∏", "âĪĤ": "∂", "âĪĩ": "∇",
+    "âĪŀ": "∞", "âĪļ": "√", "âĪ«": "∫", "âīĪ": "≈",
+    "âīł": "≠", "âī¤": "≤", "âī¥": "≥",
+}
+
+_SPECIAL_TOKEN_MAP = {
+    "<|begin_of_text|>": "<bos>",
+    "<bos>": "<bos>",
+    "<pad>": "",
+}
+
+
+@dataclass
+class AlignmentBatch:
+    """Per-batch alignment payload covering all three loss modes.
+
+    The collator hands this dataclass directly to the loss fn alongside the
+    tokenized batch. Tensors are dense-padded to the batch maximum so DTensor
+    V2 can shard on dim 0 without knowing about cross-tokenizer specifics.
+
+    Attributes:
+        student_spans: ``[B, max_pairs, 2]`` long tensor with
+            ``(start, end)`` indices into the student-tokenized sequence.
+            Empty side of an alignment pair (insertion/deletion) gets
+            ``(-1, -1)``.
+        teacher_spans: Like ``student_spans`` but for teacher positions.
+        pair_valid: ``[B, max_pairs]`` bool. False on padding entries.
+        pair_is_correct: ``[B, max_pairs]`` bool. True when canonicalized
+            student span text matches canonicalized teacher span text.
+        student_exact_partition_mask: ``[B, T_s]`` bool. True at student
+            tokens that sit on a 1-1 exact-match pair (gold_loss partition).
+        teacher_exact_partition_mask: ``[B, T_t]`` bool. Counterpart.
+        student_chunk_id: ``[B, T_s]`` long. Chunk index (= pair index) the
+            student token belongs to; ``-1`` if not in any chunk
+            (insertion-only pair on student side).
+        teacher_chunk_id: ``[B, T_t]`` long. Counterpart.
+        num_chunks: ``[B]`` long. Number of valid chunks in each sample.
+    """
+
+    student_spans: torch.Tensor
+    teacher_spans: torch.Tensor
+    pair_valid: torch.Tensor
+    pair_is_correct: torch.Tensor
+    student_exact_partition_mask: torch.Tensor
+    teacher_exact_partition_mask: torch.Tensor
+    student_chunk_id: torch.Tensor
+    teacher_chunk_id: torch.Tensor
+    num_chunks: torch.Tensor
+
+
+class TokenAligner:
+    """Aligns student and teacher tokenizations of the same source text.
+
+    The alignment algorithm is a Needleman-Wunsch DP over canonicalized token
+    strings, augmented with multi-token combination scoring (one student
+    token can match a span of teacher tokens and vice versa, up to
+    ``max_comb_len``) and anchor-based segmentation for long sequences.
+
+    Construction loads the projection matrix from disk into memory. The
+    raw COO components (indices, values, shape) are stored picklable so the
+    aligner can be pickled into DataLoader worker processes; the loss fn is
+    expected to materialize the actual ``torch.sparse_coo_tensor`` on the
+    training device on first use.
+
+    Args:
+        student_tokenizer: HF tokenizer for the student model.
+        teacher_tokenizer: HF tokenizer for the teacher model.
+        projection_matrix_path: Path to a ``.pt`` file holding either the
+            sparse multi-token format (dict[(student_id, teacher_id)] -> count)
+            or the dense top-k format (dict with ``indices`` and
+            ``likelihoods`` tensors, shape ``[V_student, top_k]``).
+        max_comb_len: Maximum span length considered when matching one token
+            on one side against multiple tokens on the other.
+    """
+
+    def __init__(
+        self,
+        student_tokenizer,
+        teacher_tokenizer,
+        projection_matrix_path: str,
+        max_comb_len: int = 4,
+    ):
+        self.student_tokenizer = student_tokenizer
+        self.teacher_tokenizer = teacher_tokenizer
+        self.max_combination_len = max_comb_len
+        self.projection_matrix_path = projection_matrix_path
+
+        # Loaded lazily by load_projection_matrix(); the loss fn calls that
+        # explicitly on its training device. We store the raw COO components
+        # so this aligner remains picklable across DataLoader workers (no
+        # CUDA tensors, no nn.Parameter).
+        self._projection_indices: torch.Tensor | None = None
+        self._projection_values: torch.Tensor | None = None
+        self._projection_shape: Tuple[int, int] | None = None
+
+    # ------------------------------------------------------------------ #
+    # Projection matrix loading
+    # ------------------------------------------------------------------ #
+    def load_projection_matrix(
+        self, device: torch.device | str = "cpu"
+    ) -> torch.Tensor:
+        """Materialize the projection matrix as a sparse COO tensor.
+
+        Args:
+            device: Device to place the tensor on.
+
+        Returns:
+            A ``torch.sparse_coo_tensor`` of shape
+            ``(V_student, V_teacher)``.
+        """
+        if self._projection_indices is None:
+            self._load_projection_components()
+        assert self._projection_indices is not None
+        assert self._projection_values is not None
+        assert self._projection_shape is not None
+        sparse = torch.sparse_coo_tensor(
+            self._projection_indices,
+            self._projection_values,
+            self._projection_shape,
+            device=device,
+            dtype=torch.float32,
+        ).coalesce()
+        return sparse
+
+    def _load_projection_components(self) -> None:
+        """Load and normalize the projection matrix into COO components."""
+        if not os.path.exists(self.projection_matrix_path):
+            raise FileNotFoundError(
+                f"Projection matrix file not found: {self.projection_matrix_path}"
+            )
+        data = torch.load(
+            self.projection_matrix_path, map_location="cpu", weights_only=False
+        )
+        v_student = len(self.student_tokenizer)
+        v_teacher = len(self.teacher_tokenizer)
+
+        if isinstance(data, dict) and "indices" in data and "likelihoods" in data:
+            # Dense top-k format: indices [V_student, top_k] holds teacher
+            # token ids; likelihoods [V_student, top_k] holds the projection
+            # weights. We unfold to COO so the loss fn can use a uniform
+            # sparse-matmul path regardless of file format.
+            top_indices: torch.Tensor = data["indices"].long()
+            top_likelihoods: torch.Tensor = data["likelihoods"].float()
+            assert top_indices.shape == top_likelihoods.shape, (
+                f"indices/likelihoods shape mismatch: "
+                f"{top_indices.shape} vs {top_likelihoods.shape}"
+            )
+            v_student_file, top_k = top_indices.shape
+            assert v_student_file == v_student, (
+                f"projection rows ({v_student_file}) != student vocab "
+                f"({v_student}) for tokenizer "
+                f"{getattr(self.student_tokenizer, 'name_or_path', '?')}"
+            )
+            student_idx = (
+                torch.arange(v_student).unsqueeze(1).expand(-1, top_k).reshape(-1)
+            )
+            teacher_idx = top_indices.reshape(-1)
+            values = top_likelihoods.reshape(-1)
+            # Drop entries that point at out-of-range teacher ids; the dense
+            # format pads with 0 in some checkpoints, so we keep only valid
+            # rows.
+            keep = teacher_idx < v_teacher
+            self._projection_indices = torch.stack(
+                [student_idx[keep], teacher_idx[keep]], dim=0
+            )
+            self._projection_values = values[keep]
+            self._projection_shape = (v_student, v_teacher)
+        elif isinstance(data, dict) and all(
+            isinstance(k, tuple) and len(k) == 2 for k in data.keys()
+        ):
+            # Sparse multi-token format: dict[(student_id, teacher_id)] -> count.
+            keys = list(data.keys())
+            values = list(data.values())
+            student_idx = torch.tensor([k[0] for k in keys], dtype=torch.long)
+            teacher_idx = torch.tensor([k[1] for k in keys], dtype=torch.long)
+            self._projection_indices = torch.stack([student_idx, teacher_idx], dim=0)
+            self._projection_values = torch.tensor(values, dtype=torch.float32)
+            self._projection_shape = (v_student, v_teacher)
+        else:
+            raise ValueError(
+                f"Unrecognized projection matrix format at "
+                f"{self.projection_matrix_path}; expected dict with "
+                f"'indices'/'likelihoods' tensors or "
+                f"dict[(student_id, teacher_id)] -> count."
+            )
+
+    # ------------------------------------------------------------------ #
+    # Public alignment API
+    # ------------------------------------------------------------------ #
+    def align(
+        self,
+        student_ids: torch.Tensor,
+        teacher_ids: torch.Tensor,
+    ) -> AlignmentBatch:
+        """Align a batch of student/teacher token id tensors.
+
+        Args:
+            student_ids: ``[B, T_s]`` long tensor.
+            teacher_ids: ``[B, T_t]`` long tensor.
+
+        Returns:
+            An :class:`AlignmentBatch` with all fields populated for the
+            three loss modes.
+        """
+        assert student_ids.dim() == 2 and teacher_ids.dim() == 2
+        assert student_ids.shape[0] == teacher_ids.shape[0], (
+            f"student/teacher batch size mismatch: "
+            f"{student_ids.shape[0]} vs {teacher_ids.shape[0]}"
+        )
+        b, t_s = student_ids.shape
+        _, t_t = teacher_ids.shape
+
+        student_token_lists: List[List[str]] = [
+            self.student_tokenizer.convert_ids_to_tokens(student_ids[i].tolist())
+            for i in range(b)
+        ]
+        teacher_token_lists: List[List[str]] = [
+            self.teacher_tokenizer.convert_ids_to_tokens(teacher_ids[i].tolist())
+            for i in range(b)
+        ]
+
+        per_sample_pairs: List[List[Tuple[Any, ...]]] = []
+        for s_toks, t_toks in zip(student_token_lists, teacher_token_lists):
+            pairs = self._align_single(s_toks, t_toks)
+            per_sample_pairs.append(pairs)
+
+        return self._pairs_to_batch(per_sample_pairs, b=b, t_s=t_s, t_t=t_t)
+
+    @staticmethod
+    def _pairs_to_batch(
+        per_sample_pairs: List[List[Tuple[Any, ...]]],
+        *,
+        b: int,
+        t_s: int,
+        t_t: int,
+    ) -> AlignmentBatch:
+        """Pack per-sample alignment lists into dense-padded tensors."""
+        max_pairs = max((len(p) for p in per_sample_pairs), default=0)
+        # Guarantee at least one slot so downstream tensor shapes stay sane.
+        max_pairs = max(max_pairs, 1)
+
+        student_spans = torch.full((b, max_pairs, 2), -1, dtype=torch.long)
+        teacher_spans = torch.full((b, max_pairs, 2), -1, dtype=torch.long)
+        pair_valid = torch.zeros((b, max_pairs), dtype=torch.bool)
+        pair_is_correct = torch.zeros((b, max_pairs), dtype=torch.bool)
+        student_partition = torch.zeros((b, t_s), dtype=torch.bool)
+        teacher_partition = torch.zeros((b, t_t), dtype=torch.bool)
+        student_chunk_id = torch.full((b, t_s), -1, dtype=torch.long)
+        teacher_chunk_id = torch.full((b, t_t), -1, dtype=torch.long)
+        num_chunks = torch.zeros((b,), dtype=torch.long)
+
+        for batch_i, pairs in enumerate(per_sample_pairs):
+            num_chunks[batch_i] = len(pairs)
+            for pair_i, pair in enumerate(pairs):
+                # Pair shape: (s_tokens, t_tokens, s_start, s_end, t_start,
+                # t_end, is_correct).
+                _, _, s_start, s_end, t_start, t_end, is_correct = pair
+                if s_start != -1 and s_end != -1:
+                    student_spans[batch_i, pair_i, 0] = s_start
+                    student_spans[batch_i, pair_i, 1] = s_end
+                    if 0 <= s_start < t_s and 0 < s_end <= t_s:
+                        student_chunk_id[batch_i, s_start:s_end] = pair_i
+                if t_start != -1 and t_end != -1:
+                    teacher_spans[batch_i, pair_i, 0] = t_start
+                    teacher_spans[batch_i, pair_i, 1] = t_end
+                    if 0 <= t_start < t_t and 0 < t_end <= t_t:
+                        teacher_chunk_id[batch_i, t_start:t_end] = pair_i
+                pair_valid[batch_i, pair_i] = True
+                pair_is_correct[batch_i, pair_i] = bool(is_correct)
+                # gold_loss partition: tokens on a 1-1 exact-match pair.
+                if (
+                    is_correct
+                    and s_start != -1
+                    and t_start != -1
+                    and (s_end - s_start) == 1
+                    and (t_end - t_start) == 1
+                ):
+                    if 0 <= s_start < t_s:
+                        student_partition[batch_i, s_start] = True
+                    if 0 <= t_start < t_t:
+                        teacher_partition[batch_i, t_start] = True
+
+        return AlignmentBatch(
+            student_spans=student_spans,
+            teacher_spans=teacher_spans,
+            pair_valid=pair_valid,
+            pair_is_correct=pair_is_correct,
+            student_exact_partition_mask=student_partition,
+            teacher_exact_partition_mask=teacher_partition,
+            student_chunk_id=student_chunk_id,
+            teacher_chunk_id=teacher_chunk_id,
+            num_chunks=num_chunks,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Per-sample alignment pipeline
+    # ------------------------------------------------------------------ #
+    def _align_single(
+        self,
+        seq1: List[str],
+        seq2: List[str],
+        exact_match_score: float = 3.0,
+        combination_score_multiplier: float = 1.5,
+        gap_penalty: float = -1.5,
+        anchor_lengths: Tuple[int, ...] = (3,),
+    ) -> List[Tuple[Any, ...]]:
+        """Run canonicalize -> anchor-DP -> post-process for one sample.
+
+        Returns:
+            A list of pairs ``(s_tokens, t_tokens, s_start, s_end, t_start,
+            t_end, is_correct)``. Insertions/deletions use ``-1`` for the
+            empty side's start/end.
+        """
+        seq1_canon = _canonicalize_sequence(seq1)
+        seq2_canon = _canonicalize_sequence(seq2)
+
+        kwargs = dict(
+            exact_match_score=exact_match_score,
+            combination_score_multiplier=combination_score_multiplier,
+            gap_penalty=gap_penalty,
+            max_combination_len=self.max_combination_len,
+            ignore_leading_char_diff=False,
+        )
+
+        aligned, _ = self._align_with_anchors(
+            seq1_canon, seq2_canon, anchor_lengths=anchor_lengths, **kwargs
+        )
+        aligned = _post_process_alignment(
+            aligned,
+            exact_match_score=exact_match_score,
+            combination_score_multiplier=combination_score_multiplier,
+            gap_penalty=gap_penalty,
+            max_combination_len=self.max_combination_len,
+        )
+        # Attach is_correct mask using canonicalized comparison so that
+        # ignore_leading_char_diff=True semantics are baked in upstream.
+        is_correct = _alignment_mask(aligned)
+        return [(s_t, t_t, s0, s1, t0, t1, m) for (s_t, t_t, s0, s1, t0, t1), m in zip(aligned, is_correct)]
+
+    # ------------------------------------------------------------------ #
+    # Anchor-based segmentation
+    # ------------------------------------------------------------------ #
+    def _align_with_anchors(
+        self,
+        seq1: List[str],
+        seq2: List[str],
+        anchor_lengths: Tuple[int, ...] = (3,),
+        **kwargs,
+    ) -> Tuple[List[Tuple[Any, ...]], float]:
+        """Optimize long alignments by pinning unique n-gram matches as anchors.
+
+        Falls back to plain DP when no anchors exist or when
+        ``anchor_lengths`` is empty.
+        """
+        if not anchor_lengths:
+            return _align_dp(seq1, seq2, **kwargs)
+
+        # Find unique n-gram matches in both sequences.
+        all_potential_anchors: List[Tuple[int, int, int]] = []
+        for anchor_len in anchor_lengths:
+            if anchor_len == 1:
+                s1_counts: dict[str, List[int]] = {}
+                s2_counts: dict[str, List[int]] = {}
+                for i, t in enumerate(seq1):
+                    s1_counts.setdefault(t, []).append(i)
+                for j, t in enumerate(seq2):
+                    s2_counts.setdefault(t, []).append(j)
+                for token in s1_counts.keys() & s2_counts.keys():
+                    if len(s1_counts[token]) == 1 and len(s2_counts[token]) == 1:
+                        all_potential_anchors.append(
+                            (s1_counts[token][0], s2_counts[token][0], 1)
+                        )
+            else:
+                s1_ngrams: dict[Tuple[str, ...], List[int]] = {}
+                s2_ngrams: dict[Tuple[str, ...], List[int]] = {}
+                for i in range(len(seq1) - anchor_len + 1):
+                    s1_ngrams.setdefault(tuple(seq1[i : i + anchor_len]), []).append(i)
+                for j in range(len(seq2) - anchor_len + 1):
+                    s2_ngrams.setdefault(tuple(seq2[j : j + anchor_len]), []).append(j)
+                for ngram in s1_ngrams.keys() & s2_ngrams.keys():
+                    if len(s1_ngrams[ngram]) == 1 and len(s2_ngrams[ngram]) == 1:
+                        i = s1_ngrams[ngram][0]
+                        j = s2_ngrams[ngram][0]
+                        if (
+                            i + anchor_len <= len(seq1)
+                            and j + anchor_len <= len(seq2)
+                            and seq1[i : i + anchor_len] == seq2[j : j + anchor_len]
+                        ):
+                            all_potential_anchors.append((i, j, anchor_len))
+
+        # Greedy non-conflicting selection, preferring longer anchors.
+        all_potential_anchors.sort(key=lambda x: (-x[2], x[0], x[1]))
+        used_seq1: set[int] = set()
+        used_seq2: set[int] = set()
+        selected: List[Tuple[int, int, int]] = []
+        for i, j, k in all_potential_anchors:
+            r1 = set(range(i, i + k))
+            r2 = set(range(j, j + k))
+            if not (r1 & used_seq1) and not (r2 & used_seq2):
+                selected.append((i, j, k))
+                used_seq1.update(r1)
+                used_seq2.update(r2)
+        selected.sort()
+
+        # Validate monotonic ordering.
+        validated: List[Tuple[int, int, int]] = []
+        last_j = -1
+        for i, j, k in selected:
+            if j > last_j and seq1[i : i + k] == seq2[j : j + k]:
+                validated.append((i, j, k))
+                last_j = j + k - 1
+
+        if not validated:
+            return _align_dp(seq1, seq2, **kwargs)
+
+        full_alignment: List[Tuple[Any, ...]] = []
+        last_i, last_j = 0, 0
+        for i, j, k in validated:
+            seg1, seg2 = seq1[last_i:i], seq2[last_j:j]
+            if seg1 or seg2:
+                aligned_segment, _ = _align_dp(seg1, seg2, **kwargs)
+                full_alignment.extend(
+                    _shift_pairs(aligned_segment, last_i, last_j)
+                )
+            # Anchor itself splits to 1-1 matches.
+            for kk in range(k):
+                full_alignment.append(
+                    (
+                        [seq1[i + kk]],
+                        [seq2[j + kk]],
+                        i + kk,
+                        i + kk + 1,
+                        j + kk,
+                        j + kk + 1,
+                    )
+                )
+            last_i, last_j = i + k, j + k
+
+        seg1, seg2 = seq1[last_i:], seq2[last_j:]
+        if seg1 or seg2:
+            aligned_segment, _ = _align_dp(seg1, seg2, **kwargs)
+            full_alignment.extend(_shift_pairs(aligned_segment, last_i, last_j))
+
+        return full_alignment, 0.0
+
+
+# =====================================================================
+# Module-level helpers (canonicalization, DP kernel, post-process).
+# Kept module-level so they pickle cleanly into DataLoader worker processes.
+# =====================================================================
+
+
+def _canonical_token(token: str) -> str:
+    """Return a canonical representation of a tokenizer token."""
+    if not token:
+        return token
+
+    # Normalize space prefixes.
+    if token.startswith(" "):
+        token = "Ġ" + token[1:]
+    elif token.startswith("_"):
+        token = "Ġ" + token[1:]
+    elif token.startswith("▁"):
+        token = "Ġ" + token[1:]
+
+    # Newline and whitespace normalization.
+    if token == "Ċ":
+        token = "\n"
+    elif token == "\\n":
+        token = "\n"
+    elif token == "ĉ":
+        token = "\n"
+    elif token == "Ġ\n":
+        token = "\n"
+    elif "Ċ" in token:
+        token = token.replace("Ċ", "\n")
+    elif "\\n" in token:
+        token = token.replace("\\n", "\n")
+
+    if token == "Ġ,":
+        token = ","
+    elif token == "Ġ.":
+        token = "."
+    elif token == "Ġ;":
+        token = ";"
+    elif token == "Ġ:":
+        token = ":"
+
+    # SentencePiece byte fallback like <0x20>.
+    if token.startswith("<0x") and token.endswith(">") and len(token) == 6:
+        try:
+            byte_val = int(token[3:5], 16)
+            if 0 <= byte_val <= 255:
+                return chr(byte_val)
+        except ValueError:
+            pass
+
+    for broken, fixed in _UNICODE_FIXES.items():
+        if broken in token:
+            token = token.replace(broken, fixed)
+
+    if token in _SPECIAL_TOKEN_MAP:
+        return _SPECIAL_TOKEN_MAP[token]
+
+    return token
+
+
+def _canonicalize_sequence(seq: List[str]) -> List[str]:
+    """Canonicalize every token in a sequence, including byte-merging."""
+    merged = _merge_encoding_artifacts(seq)
+    canon = [_canonical_token(t) for t in merged]
+    return _merge_consecutive_bytes(canon)
+
+
+def _merge_encoding_artifacts(tokens: List[str]) -> List[str]:
+    """Merge known multi-token mojibake patterns into single tokens."""
+    if not tokens:
+        return tokens
+    result: List[str] = []
+    i = 0
+    while i < len(tokens):
+        matched = False
+        for pattern, replacement in _MULTI_TOKEN_ARTIFACT_FIXES:
+            pl = len(pattern)
+            if i + pl <= len(tokens) and tokens[i : i + pl] == pattern:
+                result.extend(replacement)
+                i += pl
+                matched = True
+                break
+        if not matched:
+            result.append(tokens[i])
+            i += 1
+    return result
+
+
+def _get_byte_value(token_char: str) -> int | None:
+    """Return the byte value (0..255) for a single character, or None."""
+    if len(token_char) != 1:
+        return None
+    char_ord = ord(token_char)
+    if char_ord < 256:
+        return char_ord
+    return VISUAL_BYTE_MAP.get(token_char)
+
+
+def _merge_consecutive_bytes(tokens: List[str]) -> List[str]:
+    """Merge consecutive byte-fallback tokens back into Unicode characters."""
+    if not tokens:
+        return tokens
+    result: List[str] = []
+    byte_buffer: List[str] = []
+    for token in tokens:
+        clean = token.lstrip("Ġ")
+        if not clean:
+            all_bytes = False
+        else:
+            all_bytes = all(_get_byte_value(c) is not None for c in clean)
+        if all_bytes:
+            byte_buffer.append(token)
+        else:
+            if byte_buffer:
+                result.extend(_try_merge_byte_buffer(byte_buffer))
+                byte_buffer = []
+            result.append(token)
+    if byte_buffer:
+        result.extend(_try_merge_byte_buffer(byte_buffer))
+    return result
+
+
+def _try_merge_byte_buffer(byte_tokens: List[str]) -> List[str]:
+    """Decode 2-4 buffered byte tokens as a single UTF-8 character."""
+    if not byte_tokens:
+        return []
+    if len(byte_tokens) == 1:
+        token = byte_tokens[0]
+        clean = token.lstrip("Ġ")
+        if len(clean) <= 1:
+            return byte_tokens
+
+    space_prefix = "Ġ" if byte_tokens[0].startswith("Ġ") else ""
+    raw_bytes: List[int] = []
+    for token in byte_tokens:
+        clean = token.lstrip("Ġ")
+        for c in clean:
+            v = _get_byte_value(c)
+            if v is None:
+                return byte_tokens
+            raw_bytes.append(v)
+
+    if len(raw_bytes) < 2 or len(raw_bytes) > 4:
+        return byte_tokens
+    try:
+        decoded = bytes(raw_bytes).decode("utf-8")
+        if len(decoded) == 1 and ord(decoded) > 127:
+            return [space_prefix + decoded]
+        return byte_tokens
+    except UnicodeDecodeError:
+        return byte_tokens
+
+
+def _strings_equal_flexible(s1: str, s2: str, ignore_leading_char_diff: bool) -> bool:
+    """Compare two strings, optionally after canonicalization."""
+    if not ignore_leading_char_diff:
+        return s1 == s2
+    return _canonical_token(s1) == _canonical_token(s2)
+
+
+def _align_dp(
+    seq1: List[str],
+    seq2: List[str],
+    *,
+    exact_match_score: float,
+    combination_score_multiplier: float,
+    gap_penalty: float,
+    max_combination_len: int,
+    ignore_leading_char_diff: bool,
+) -> Tuple[List[Tuple[Any, ...]], float]:
+    """Needleman-Wunsch DP with up-to-``max_combination_len`` token spans."""
+    n1, n2 = len(seq1), len(seq2)
+    dp = np.zeros((n1 + 1, n2 + 1), dtype=np.float32)
+    trace = np.full((n1 + 1, n2 + 1), "", dtype=object)
+
+    for i in range(1, n1 + 1):
+        dp[i, 0] = dp[i - 1, 0] + gap_penalty
+        trace[i, 0] = "up"
+    for j in range(1, n2 + 1):
+        dp[0, j] = dp[0, j - 1] + gap_penalty
+        trace[0, j] = "left"
+
+    joined_seq1 = {
+        (i - k, i): "".join(seq1[i - k : i])
+        for i in range(n1 + 1)
+        for k in range(1, min(i, max_combination_len) + 1)
+    }
+    joined_seq2 = {
+        (j - k, j): "".join(seq2[j - k : j])
+        for j in range(n2 + 1)
+        for k in range(1, min(j, max_combination_len) + 1)
+    }
+
+    for i in range(1, n1 + 1):
+        for j in range(1, n2 + 1):
+            s1_val, s2_val = seq1[i - 1], seq2[j - 1]
+            match_score = (
+                exact_match_score
+                if _strings_equal_flexible(s1_val, s2_val, ignore_leading_char_diff)
+                else -exact_match_score
+            )
+            score_diag = dp[i - 1, j - 1] + match_score
+            score_up = dp[i - 1, j] + gap_penalty
+            score_left = dp[i, j - 1] + gap_penalty
+
+            max_score = score_diag
+            best_move = "diag"
+            if score_up > max_score:
+                max_score = score_up
+                best_move = "up"
+            if score_left > max_score:
+                max_score = score_left
+                best_move = "left"
+
+            for k in range(2, min(j + 1, max_combination_len + 1)):
+                key = (j - k, j)
+                if key in joined_seq2 and _strings_equal_flexible(
+                    s1_val, joined_seq2[key], ignore_leading_char_diff
+                ):
+                    cand = dp[i - 1, j - k] + combination_score_multiplier * k
+                    if cand > max_score:
+                        max_score = cand
+                        best_move = f"comb_s1_over_s2_{k}"
+
+            for k in range(2, min(i + 1, max_combination_len + 1)):
+                key = (i - k, i)
+                if key in joined_seq1 and _strings_equal_flexible(
+                    s2_val, joined_seq1[key], ignore_leading_char_diff
+                ):
+                    cand = dp[i - k, j - 1] + combination_score_multiplier * k
+                    if cand > max_score:
+                        max_score = cand
+                        best_move = f"comb_s2_over_s1_{k}"
+
+            dp[i, j] = max_score
+            trace[i, j] = best_move
+
+    aligned: List[Tuple[Any, ...]] = []
+    i, j = n1, n2
+    while i > 0 or j > 0:
+        move = trace[i, j]
+        if move == "diag":
+            aligned.append(([seq1[i - 1]], [seq2[j - 1]], i - 1, i, j - 1, j))
+            i -= 1
+            j -= 1
+        elif move == "up":
+            aligned.append(([seq1[i - 1]], [], i - 1, i, -1, -1))
+            i -= 1
+        elif move == "left":
+            aligned.append(([], [seq2[j - 1]], -1, -1, j - 1, j))
+            j -= 1
+        elif move.startswith("comb_s1_over_s2_"):
+            k = int(move.rsplit("_", 1)[-1])
+            aligned.append(([seq1[i - 1]], seq2[j - k : j], i - 1, i, j - k, j))
+            i -= 1
+            j -= k
+        elif move.startswith("comb_s2_over_s1_"):
+            k = int(move.rsplit("_", 1)[-1])
+            aligned.append((seq1[i - k : i], [seq2[j - 1]], i - k, i, j - 1, j))
+            i -= k
+            j -= 1
+        else:
+            break
+    aligned.reverse()
+    return aligned, float(dp[n1, n2])
+
+
+def _shift_pairs(
+    pairs: List[Tuple[Any, ...]], shift_s: int, shift_t: int
+) -> List[Tuple[Any, ...]]:
+    """Offset start/end indices of pairs after segment-level alignment."""
+    out = []
+    for s_toks, t_toks, s_start, s_end, t_start, t_end in pairs:
+        ns = s_start + shift_s if s_start != -1 else -1
+        ne = s_end + shift_s if s_end != -1 else -1
+        nts = t_start + shift_t if t_start != -1 else -1
+        nte = t_end + shift_t if t_end != -1 else -1
+        # Split coarse same-token spans into 1-1 matches.
+        if (
+            len(s_toks) > 1
+            and len(s_toks) == len(t_toks)
+            and s_toks == t_toks
+            and ns >= 0
+            and nts >= 0
+        ):
+            for k in range(len(s_toks)):
+                out.append(
+                    (
+                        [s_toks[k]],
+                        [t_toks[k]],
+                        ns + k,
+                        ns + k + 1,
+                        nts + k,
+                        nts + k + 1,
+                    )
+                )
+        else:
+            out.append((s_toks, t_toks, ns, ne, nts, nte))
+    return out
+
+
+def _alignment_mask(aligned_pairs: List[Tuple[Any, ...]]) -> List[bool]:
+    """Compute is_correct for each pair using canonicalized text comparison."""
+    out: List[bool] = []
+    for s_toks, t_toks, *_rest in aligned_pairs:
+        s_canon = "".join(_canonical_token(tk) for tk in s_toks) if s_toks else ""
+        t_canon = "".join(_canonical_token(tk) for tk in t_toks) if t_toks else ""
+        out.append(_strings_equal_flexible(s_canon, t_canon, ignore_leading_char_diff=False))
+    return out
+
+
+def _post_process_alignment(
+    aligned_pairs: List[Tuple[Any, ...]],
+    *,
+    exact_match_score: float,
+    combination_score_multiplier: float,
+    gap_penalty: float,
+    max_combination_len: int,
+    end_mismatch_threshold: float = 0.2,
+) -> List[Tuple[Any, ...]]:
+    """Post-process: combine misaligned consecutive pairs and re-align bad spans.
+
+    Mirrors ``post_process_alignment_optimized`` from the PT reference but
+    inlined as a module-level function so the aligner stays simple.
+    """
+    if not aligned_pairs:
+        return []
+
+    # Step 1: combine consecutive misaligned pairs (away from sequence end).
+    pair_strings = _build_pair_strings(aligned_pairs)
+    aligned_pairs = _combine_consecutive_misaligned(
+        aligned_pairs, pair_strings, end_mismatch_threshold
+    )
+    pair_strings = _build_pair_strings(aligned_pairs)
+
+    # Step 2: split exact-token coarse alignments and re-align small bad spans.
+    processed: List[Tuple[Any, ...]] = []
+    align_cache: dict[Tuple[Tuple[str, ...], Tuple[str, ...]], Tuple[List[Tuple[Any, ...]], bool]] = {}
+    i = 0
+    while i < len(aligned_pairs):
+        s1_toks, s2_toks, *_rest = aligned_pairs[i]
+        if len(s1_toks) > 1 and len(s1_toks) == len(s2_toks) and s1_toks == s2_toks:
+            s1_start, s1_end, s2_start, s2_end = aligned_pairs[i][2:6]
+            for k in range(len(s1_toks)):
+                processed.append(
+                    (
+                        [s1_toks[k]],
+                        [s2_toks[k]],
+                        s1_start + k,
+                        s1_start + k + 1,
+                        s2_start + k,
+                        s2_start + k + 1,
+                    )
+                )
+            i += 1
+            continue
+
+        bad_start = -1
+        for j in range(i, len(aligned_pairs)):
+            if not pair_strings[j][2]:
+                bad_start = j
+                break
+        if bad_start == -1:
+            processed.extend(aligned_pairs[i:])
+            break
+        processed.extend(aligned_pairs[i:bad_start])
+
+        found = False
+        max_chunk = min(10, len(aligned_pairs) - bad_start)
+        for chunk_size in range(2, max_chunk + 1):
+            chunk = aligned_pairs[bad_start : bad_start + chunk_size]
+            chunk_s1, chunk_s2, s1_idx, s2_idx = _flatten_chunk(chunk)
+            chunk_s1_str = "".join(_canonical_token(t) for t in chunk_s1)
+            chunk_s2_str = "".join(_canonical_token(t) for t in chunk_s2)
+            if not _strings_equal_flexible(
+                chunk_s1_str, chunk_s2_str, ignore_leading_char_diff=False
+            ):
+                continue
+            cache_key = (tuple(chunk_s1), tuple(chunk_s2))
+            if cache_key in align_cache:
+                sub_pairs, perfect = align_cache[cache_key]
+            else:
+                sub_pairs, _ = _align_dp(
+                    chunk_s1,
+                    chunk_s2,
+                    exact_match_score=exact_match_score,
+                    combination_score_multiplier=combination_score_multiplier,
+                    gap_penalty=gap_penalty,
+                    max_combination_len=max_combination_len,
+                    ignore_leading_char_diff=False,
+                )
+                perfect = all(
+                    _strings_equal_flexible(
+                        "".join(_canonical_token(t) for t in p[0]),
+                        "".join(_canonical_token(t) for t in p[1]),
+                        ignore_leading_char_diff=False,
+                    )
+                    for p in sub_pairs
+                )
+                align_cache[cache_key] = (sub_pairs, perfect)
+
+            s1_chunk_start = min(s1_idx[::2]) if s1_idx else -1
+            s2_chunk_start = min(s2_idx[::2]) if s2_idx else -1
+            if perfect:
+                for s1_t, s2_t, ss, se, ts, te in sub_pairs:
+                    ns = s1_chunk_start + ss if ss != -1 else -1
+                    ne = s1_chunk_start + se if se != -1 else -1
+                    nts = s2_chunk_start + ts if ts != -1 else -1
+                    nte = s2_chunk_start + te if te != -1 else -1
+                    processed.append((s1_t, s2_t, ns, ne, nts, nte))
+            else:
+                s1_chunk_end = max(s1_idx[1::2]) if s1_idx else -1
+                s2_chunk_end = max(s2_idx[1::2]) if s2_idx else -1
+                processed.append(
+                    (
+                        chunk_s1,
+                        chunk_s2,
+                        s1_chunk_start,
+                        s1_chunk_end,
+                        s2_chunk_start,
+                        s2_chunk_end,
+                    )
+                )
+            i = bad_start + chunk_size
+            found = True
+            break
+        if not found:
+            processed.append(aligned_pairs[bad_start])
+            i = bad_start + 1
+    return processed
+
+
+def _build_pair_strings(
+    aligned_pairs: List[Tuple[Any, ...]],
+) -> List[Tuple[str, str, bool]]:
+    """Precompute (s_str, t_str, is_match) for each pair."""
+    out: List[Tuple[str, str, bool]] = []
+    for s_toks, t_toks, *_rest in aligned_pairs:
+        s_canon = "".join(_canonical_token(t) for t in s_toks) if s_toks else ""
+        t_canon = "".join(_canonical_token(t) for t in t_toks) if t_toks else ""
+        is_match = _strings_equal_flexible(s_canon, t_canon, ignore_leading_char_diff=False)
+        out.append((s_canon, t_canon, is_match))
+    return out
+
+
+def _combine_consecutive_misaligned(
+    aligned_pairs: List[Tuple[Any, ...]],
+    pair_strings: List[Tuple[str, str, bool]],
+    end_mismatch_threshold: float,
+) -> List[Tuple[Any, ...]]:
+    """Combine consecutive misaligned pairs into single multi-token chunks."""
+    if not aligned_pairs or len(aligned_pairs) < 2:
+        return aligned_pairs
+    end_boundary = int(len(aligned_pairs) * (1 - end_mismatch_threshold))
+    out: List[Tuple[Any, ...]] = []
+    i = 0
+    while i < len(aligned_pairs):
+        if (
+            i < end_boundary
+            and not pair_strings[i][2]
+            and i + 1 < len(aligned_pairs)
+        ):
+            run = [i]
+            j = i + 1
+            while (
+                j < end_boundary
+                and j < len(aligned_pairs)
+                and not pair_strings[j][2]
+            ):
+                run.append(j)
+                j += 1
+            if len(run) >= 2:
+                combined_s1: List[str] = []
+                combined_s2: List[str] = []
+                s1_idx: List[int] = []
+                s2_idx: List[int] = []
+                for idx in run:
+                    s1_t, s2_t, s1s, s1e, s2s, s2e, *_rest = aligned_pairs[idx]
+                    combined_s1.extend(s1_t)
+                    combined_s2.extend(s2_t)
+                    if s1_t and s1s != -1:
+                        s1_idx.extend([s1s, s1e])
+                    if s2_t and s2s != -1:
+                        s2_idx.extend([s2s, s2e])
+                cs1_start = min(s1_idx[::2]) if s1_idx else -1
+                cs1_end = max(s1_idx[1::2]) if s1_idx else -1
+                cs2_start = min(s2_idx[::2]) if s2_idx else -1
+                cs2_end = max(s2_idx[1::2]) if s2_idx else -1
+                out.append(
+                    (combined_s1, combined_s2, cs1_start, cs1_end, cs2_start, cs2_end)
+                )
+                i = j
+                continue
+        out.append(aligned_pairs[i])
+        i += 1
+    return out
+
+
+def _flatten_chunk(
+    chunk: List[Tuple[Any, ...]],
+) -> Tuple[List[str], List[str], List[int], List[int]]:
+    """Concatenate tokens and collect span indices across a chunk of pairs."""
+    chunk_s1: List[str] = []
+    chunk_s2: List[str] = []
+    s1_idx: List[int] = []
+    s2_idx: List[int] = []
+    for s1_t, s2_t, s1s, s1e, s2s, s2e, *_rest in chunk:
+        chunk_s1.extend(s1_t)
+        chunk_s2.extend(s2_t)
+        if s1_t:
+            s1_idx.extend([s1s, s1e])
+        if s2_t:
+            s2_idx.extend([s2s, s2e])
+    return chunk_s1, chunk_s2, s1_idx, s2_idx
