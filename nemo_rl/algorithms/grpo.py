@@ -1090,6 +1090,51 @@ def _get_flextron_reward_metric_keys(master_config: MasterConfig) -> dict[int, s
     return metric_keys
 
 
+def _get_flextron_router_metric_keys(master_config: MasterConfig) -> dict[int, str]:
+    """Return router-selection metric prefixes for configured Flextron routes."""
+    megatron_cfg = master_config["policy"].get("megatron_cfg") or {}
+    flex_routers = megatron_cfg.get("flex_routers")
+    sampling_rates = megatron_cfg.get("flextron_sampling_rates")
+    if (
+        not isinstance(flex_routers, list)
+        or not flex_routers
+        or not isinstance(sampling_rates, list)
+    ):
+        return {}
+
+    metric_keys = {0: "flextron/router/base_model"}
+    for router_id in range(1, len(sampling_rates)):
+        metric_keys[router_id] = f"flextron/router/router_{router_id}"
+    return metric_keys
+
+
+def _update_flextron_router_selection_metrics(
+    metrics: dict[str, Any],
+    router_ids: torch.Tensor | None,
+    master_config: MasterConfig,
+) -> None:
+    """Add per-iteration Flextron router-selection metrics."""
+    metric_keys = _get_flextron_router_metric_keys(master_config)
+    if not metric_keys or router_ids is None:
+        return
+
+    flat_router_ids = router_ids.detach().to(dtype=torch.long, device="cpu").reshape(-1)
+    if flat_router_ids.numel() == 0:
+        return
+
+    unique_router_ids = torch.unique(flat_router_ids, sorted=True)
+    metrics["flextron/router/selected_id"] = (
+        int(unique_router_ids[0].item()) if unique_router_ids.numel() == 1 else -1
+    )
+    metrics["flextron/router/num_selected_routes"] = int(unique_router_ids.numel())
+
+    num_router_ids = flat_router_ids.numel()
+    for router_id, metric_prefix in metric_keys.items():
+        count = int((flat_router_ids == router_id).sum().item())
+        metrics[f"{metric_prefix}_count"] = count
+        metrics[f"{metric_prefix}_fraction"] = count / num_router_ids
+
+
 def _update_flextron_reward_metrics(
     metrics: dict[str, Any],
     rewards: torch.Tensor,
@@ -1998,6 +2043,11 @@ def grpo_train(
                     train_data.get("flex_router_ids"),
                     master_config,
                     previous_flextron_rewards,
+                )
+                _update_flextron_router_selection_metrics(
+                    metrics,
+                    train_data.get("flex_router_ids"),
+                    master_config,
                 )
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
@@ -3066,6 +3116,11 @@ def async_grpo_train(
                     train_data.get("flex_router_ids"),
                     master_config,
                     previous_flextron_rewards,
+                )
+                _update_flextron_router_selection_metrics(
+                    metrics,
+                    train_data.get("flex_router_ids"),
+                    master_config,
                 )
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:

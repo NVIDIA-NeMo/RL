@@ -27,6 +27,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
     _update_flextron_reward_metrics,
+    _update_flextron_router_selection_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
@@ -771,6 +772,84 @@ def test_flextron_reward_metrics_skip_when_flextron_is_disabled():
 
     assert metrics == {}
     assert previous_rewards == {0: 2.0}
+
+
+def test_flextron_router_selection_metrics_log_selected_route():
+    """Test Flextron router selection metrics identify the selected route."""
+    master_config = {
+        "policy": {
+            "megatron_cfg": {
+                "flex_routers": [
+                    {"mlp_int_list": 1856, "emb_int_list": 2688},
+                    {"mlp_int_list": 960, "emb_int_list": 1920},
+                ],
+                "flextron_sampling_rates": [0.5, 0.3, 0.2],
+            }
+        }
+    }
+
+    metrics = {}
+    _update_flextron_router_selection_metrics(
+        metrics,
+        router_ids=torch.tensor([2, 2, 2]),
+        master_config=master_config,
+    )
+
+    assert metrics == {
+        "flextron/router/selected_id": 2,
+        "flextron/router/num_selected_routes": 1,
+        "flextron/router/base_model_count": 0,
+        "flextron/router/base_model_fraction": 0.0,
+        "flextron/router/router_1_count": 0,
+        "flextron/router/router_1_fraction": 0.0,
+        "flextron/router/router_2_count": 3,
+        "flextron/router/router_2_fraction": 1.0,
+    }
+
+
+def test_flextron_router_selection_metrics_log_mixed_routes():
+    """Test Flextron router selection metrics summarize mixed route batches."""
+    master_config = {
+        "policy": {
+            "megatron_cfg": {
+                "flex_routers": [
+                    {"mlp_int_list": 1856, "emb_int_list": 2688},
+                    {"mlp_int_list": 960, "emb_int_list": 1920},
+                ],
+                "flextron_sampling_rates": [0.5, 0.3, 0.2],
+            }
+        }
+    }
+
+    metrics = {}
+    _update_flextron_router_selection_metrics(
+        metrics,
+        router_ids=torch.tensor([0, 1, 1, 2]),
+        master_config=master_config,
+    )
+
+    assert metrics == {
+        "flextron/router/selected_id": -1,
+        "flextron/router/num_selected_routes": 3,
+        "flextron/router/base_model_count": 1,
+        "flextron/router/base_model_fraction": 0.25,
+        "flextron/router/router_1_count": 2,
+        "flextron/router/router_1_fraction": 0.5,
+        "flextron/router/router_2_count": 1,
+        "flextron/router/router_2_fraction": 0.25,
+    }
+
+
+def test_flextron_router_selection_metrics_skip_when_flextron_is_disabled():
+    """Test Flextron router selection metrics only emit for Flextron configs."""
+    metrics = {}
+    _update_flextron_router_selection_metrics(
+        metrics,
+        router_ids=torch.tensor([0]),
+        master_config={"policy": {"megatron_cfg": {}}},
+    )
+
+    assert metrics == {}
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
