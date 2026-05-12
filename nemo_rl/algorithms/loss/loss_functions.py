@@ -115,7 +115,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     #   "tis"          – clamp IS weights to max
     #   "icepop"       – zero out tokens with IS weight outside [min, max]
     #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
-    truncated_importance_sampling_type: Optional[str] = "tis"
+    truncated_importance_sampling_type: Optional[str] = None
     truncated_importance_sampling_ratio: Optional[float] = None
     # Lower bound for ICE-POP / seq-mask-tis filtering
     truncated_importance_sampling_ratio_min: Optional[float] = None
@@ -218,12 +218,9 @@ class ClippedPGLossFn(LossFunction):
                 "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
             )
 
-        if self.truncated_importance_sampling_ratio is not None:
+        if self.truncated_importance_sampling_type is not None:
             assert self.use_importance_sampling_correction, (
-                "truncated_importance_sampling_ratio is only supported when use_importance_sampling_correction is True"
-            )
-            assert self.truncated_importance_sampling_ratio > 0, (
-                "truncated_importance_sampling_ratio should be positive"
+                "truncated importance sampling is only supported when use_importance_sampling_correction is True"
             )
             assert self.truncated_importance_sampling_type in (
                 "tis",
@@ -233,24 +230,18 @@ class ClippedPGLossFn(LossFunction):
                 f"truncated_importance_sampling_type must be 'tis', 'icepop', or 'seq-mask-tis', "
                 f"got {self.truncated_importance_sampling_type}"
             )
+            assert (
+                self.truncated_importance_sampling_ratio is not None
+                and self.truncated_importance_sampling_ratio > 0
+            ), "truncated_importance_sampling_ratio should be positive"
+            if self.truncated_importance_sampling_type in ("icepop", "seq-mask-tis"):
+                assert self.truncated_importance_sampling_ratio_min is not None, (
+                    "truncated_importance_sampling_ratio_min should be set when truncated_importance_sampling_type is 'icepop' or 'seq-mask-tis'"
+                )
             if self.truncated_importance_sampling_type == "seq-mask-tis":
                 assert not self.sequence_level_importance_ratios, (
                     "seq-mask-tis uses token-level IS correction with sequence-level masking, "
                     "and is incompatible with sequence_level_importance_ratios=True"
-                )
-        else:
-            # Warn user that TIS-related parameters are ignored when truncated_importance_sampling_ratio is not set
-            ignored_params = []
-            if self.truncated_importance_sampling_type is not None:
-                ignored_params.append("truncated_importance_sampling_type")
-            if self.truncated_importance_sampling_ratio_min is not None:
-                ignored_params.append("truncated_importance_sampling_ratio_min")
-            if ignored_params:
-                print(
-                    f"[WARN] truncated_importance_sampling_ratio is not set, so the following "
-                    f"parameters are ignored: {', '.join(ignored_params)}. "
-                    f"Set truncated_importance_sampling_ratio to enable truncated importance sampling.",
-                    flush=True,
                 )
 
     def __call__(
