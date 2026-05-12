@@ -397,7 +397,7 @@ def setup(
 
     # Validate skip_reference_policy_logprobs_calculation
     if grpo_config.get("skip_reference_policy_logprobs_calculation"):
-        assert loss_config["reference_policy_kl_penalty"] == 0, (
+        assert loss_config.reference_policy_kl_penalty == 0, (
             "grpo.skip_reference_policy_logprobs_calculation=True requires "
             "loss_fn.reference_policy_kl_penalty == 0"
         )
@@ -570,7 +570,7 @@ def setup(
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Define initialization functions that will be used in all paths
-    init_reference_model = loss_config["reference_policy_kl_penalty"] > 0
+    init_reference_model = loss_config.reference_policy_kl_penalty > 0
 
     # Auto-enable skip_reference_policy_logprobs_calculation when the reference model is not loaded.
     if not init_reference_model and not grpo_config.get(
@@ -1750,9 +1750,7 @@ def grpo_train(
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
-                skip_prev_logprobs = master_config.loss_fn.get(
-                    "force_on_policy_ratio", False
-                )
+                skip_prev_logprobs = master_config.loss_fn.force_on_policy_ratio
                 if skip_prev_logprobs:
                     print(
                         "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
@@ -2843,9 +2841,7 @@ def async_grpo_train(
 
                 # Training phase (same as sync version)
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
-                skip_prev_logprobs = master_config.loss_fn.get(
-                    "force_on_policy_ratio", False
-                )
+                skip_prev_logprobs = master_config.loss_fn.force_on_policy_ratio
                 if skip_prev_logprobs:
                     print(
                         "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
