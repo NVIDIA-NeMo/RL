@@ -1540,7 +1540,7 @@ def grpo_train(
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
-                            max_seq_len=master_config["policy"][
+                            max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
                             generation_config=generation_config,
@@ -2307,7 +2307,7 @@ def validate(
                     input_batch=val_batch,
                     tokenizer=tokenizer,
                     task_to_env=val_task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                    max_seq_len=master_config.policy["max_total_sequence_length"],
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
@@ -2862,7 +2862,7 @@ def async_grpo_train(
                         )["logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
 
-                    if not master_config["grpo"].get(
+                    if not master_config.grpo.get(
                         "skip_reference_policy_logprobs_calculation"
                     ):
                         reference_logprobs = policy.get_reference_policy_logprobs(
