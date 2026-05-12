@@ -130,6 +130,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
+        self.generation_sampling_seed = self._get_generation_sampling_seed(
+            self.rank, worker_sharding_annotations
+        )
 
         # Step 1: Setup distributed
         setup_distributed()
@@ -250,6 +253,19 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+
+    @staticmethod
+    def _get_generation_sampling_seed(
+        rank: int, worker_sharding_annotations: NamedSharding
+    ) -> int:
+        """Use one sampling seed per data-parallel replica.
+
+        Dynamic Megatron generation samples on every model-parallel rank. The
+        seed must therefore be identical across TP/PP/CP ranks so they make the
+        same request-finish decisions, while still varying across DP replicas.
+        """
+        worker_coords = worker_sharding_annotations.get_worker_coords(rank)
+        return worker_coords["data_parallel"]
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -958,10 +974,13 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         model_config = self.model.config
         model_config.cuda_graph_impl = "local"
 
-        local_rank = torch.cuda.current_device()
-        num_gpus_per_node = torch.cuda.device_count()
-        node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
-        model_config.inference_sampling_seed = (node_idx * 1024) + local_rank
+        # TODO: @rohitrango, changing this to dataparallel works for mamba, otherwise it hangs for multi-node runs
+        # why does this happen though
+        # local_rank = torch.cuda.current_device()
+        # num_gpus_per_node = torch.cuda.device_count()
+        # node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
+        # model_config.inference_sampling_seed = (node_idx * 1024) + local_rank
+        model_config.inference_sampling_seed = self.generation_sampling_seed
 
         # For hybrid (e.g. Mamba+Attention, Nemotron-H) models, populate the
         # Mamba inference state config so DynamicInferenceContext sets

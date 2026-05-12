@@ -54,6 +54,50 @@ class _DummyLayer(torch.nn.Module):
         return hidden_states + 1
 
 
+class _DummyFinalNorm(torch.nn.Module):
+    def __init__(self, eps: float = 1.0e-5) -> None:
+        super().__init__()
+        self.eps = eps
+        self.seen_eps: list[float] = []
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.seen_eps.append(self.eps)
+        return hidden_states
+
+
+class _DummyInProj(torch.nn.Module):
+    def __init__(self, eps: float = 1.0e-5) -> None:
+        super().__init__()
+        self.eps = eps
+        self.last_input: torch.Tensor | None = None
+        self.seen_eps: list[float] = []
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
+        self.last_input = hidden_states
+        self.seen_eps.append(self.eps)
+        return hidden_states + 1, None
+
+
+class MambaMixer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_proj = _DummyInProj()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        projected, _ = self.in_proj(hidden_states)
+        return projected
+
+
+class _DummyMambaLayer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layer_number = 1
+        self.mixer = MambaMixer()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.mixer(hidden_states)
+
+
 class _DummyDecoder(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -63,7 +107,7 @@ class _DummyDecoder(torch.nn.Module):
                 _DummyLayer(2, has_mlp=False),
             ]
         )
-        self.final_norm = torch.nn.Identity()
+        self.final_norm = _DummyFinalNorm()
 
 
 class _DummyModel(torch.nn.Module):
@@ -77,15 +121,49 @@ class _DummyModel(torch.nn.Module):
         return self.decoder.final_norm(hidden_states)
 
 
+class _DummyMambaDecoder(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_DummyMambaLayer()])
+
+
+class _DummyMambaModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.decoder = _DummyMambaDecoder()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for layer in self.decoder.layers:
+            hidden_states = layer(hidden_states)
+        return hidden_states
+
+
 def _router_config() -> SimpleNamespace:
     return SimpleNamespace(
         hybrid_layer_pattern="E*",
         hidden_size=4,
         ffn_hidden_size=6,
+        layernorm_epsilon=1.0e-5,
         flex_routers=[
             {
                 "emb_int_list": [2, 3],
                 "mlp_int_list": [4],
+            }
+        ],
+        flextron_sampling_rates=[0.0, 1.0],
+    )
+
+
+def _mamba_router_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        hybrid_layer_pattern="M",
+        hidden_size=4,
+        ffn_hidden_size=6,
+        layernorm_epsilon=1.0e-5,
+        flex_routers=[
+            {
+                "emb_int_list": [2],
+                "mlp_int_list": [],
             }
         ],
         flextron_sampling_rates=[0.0, 1.0],
@@ -115,12 +193,39 @@ def test_nested_route_masks_hidden_and_mlp_intermediate_dims():
     with router.use_router(1):
         output = model(hidden_states)
 
-    assert torch.equal(output[:, :2], torch.tensor([[2.0, 3.0]]))
+    expected_scale = (2 / 4) ** 0.5
+    torch.testing.assert_close(
+        output[:, :2],
+        torch.tensor([[2.0, 3.0]]) * expected_scale,
+    )
     assert torch.equal(output[:, 2:], torch.zeros(1, 2))
+    assert model.decoder.final_norm.seen_eps == [5.0e-6]
+    assert model.decoder.final_norm.eps == 1.0e-5
     layer = model.decoder.layers[0]
     assert layer.mlp is not None
     assert torch.equal(layer.mlp.last_fc1_output[:, :4], torch.ones(1, 4))
     assert torch.equal(layer.mlp.last_fc1_output[:, 4:], torch.zeros(1, 2))
+    assert router.active_router_id is None
+
+
+def test_mamba_route_hooks_in_proj_pre_and_post():
+    model = _DummyMambaModel()
+    router = FrozenFlextronRouter(model=model, model_cfg=_mamba_router_config())
+    hidden_states = torch.arange(4, dtype=torch.float32).unsqueeze(0)
+
+    with router.use_router(1):
+        output = model(hidden_states)
+
+    expected_scale = (2 / 4) ** 0.5
+    expected_in_proj_input = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
+    expected_output = torch.tensor([[1.0, 2.0, 0.0, 0.0]]) * expected_scale
+    in_proj = model.decoder.layers[0].mixer.in_proj
+    assert len(router._handles) == 4
+    assert in_proj.last_input is not None
+    torch.testing.assert_close(in_proj.last_input, expected_in_proj_input)
+    torch.testing.assert_close(output, expected_output)
+    assert in_proj.seen_eps == [5.0e-6]
+    assert in_proj.eps == 1.0e-5
     assert router.active_router_id is None
 
 

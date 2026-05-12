@@ -30,14 +30,40 @@ from nemo_rl.algorithms.loss import (
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.workers.megatron_policy_worker import (
+    MegatronPolicyWorkerImpl,
+)
 from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
 
 pytestmark = pytest.mark.mcore
+
+
+def test_generation_sampling_seed_is_shared_across_model_parallel_ranks() -> None:
+    sharding = NamedSharding(
+        layout=np.arange(16).reshape(2, 2, 2, 2),
+        names=[
+            "pipeline_parallel",
+            "data_parallel",
+            "context_parallel",
+            "tensor_parallel",
+        ],
+    )
+
+    for dp_rank in range(sharding.get_axis_size("data_parallel")):
+        ranks = sharding.get_ranks_by_coord(data_parallel=dp_rank)
+        seeds = {
+            MegatronPolicyWorkerImpl._get_generation_sampling_seed(rank, sharding)
+            for rank in ranks
+        }
+
+        assert seeds == {dp_rank}
+
 
 basic_pg_loss_test_config: ClippedPGLossConfig = {
     "ratio_clip_min": 0.2,

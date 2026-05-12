@@ -26,10 +26,10 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 _FLEXTRON_MLP_LAYER_TYPES = frozenset(("E",))
 _FLEXTRON_EMB_LAYER_TYPES = frozenset(("M", "E", "*"))
 _FLEXTRON_HIDDEN_MODULE_CLASS_NAMES = frozenset(
-    ("MambaMixer", "MoELayer", "SelfAttention", "TEGroupedMLP")
+    ("MoELayer", "SelfAttention", "TEGroupedMLP")
 )
 _FLEXTRON_HIDDEN_MODULE_NAMES = frozenset(
-    ("attention", "mamba_mixer", "mixer", "mlp", "self_attention")
+    ("attention", "mamba_mixer", "mixer", "mlp", "self_attention",)
 )
 
 
@@ -228,12 +228,33 @@ class FrozenFlextronRouter:
         if self._model_with_decoder is None:
             return
 
+        # print_attached_modules = (
+        #     not self._distributed_is_initialized()
+        #     or torch.distributed.get_rank() == 0
+        # )
+        print_attached_modules = False # TODO: @rohitrango, change this later to verify the code modifies the correct modules
+
         for local_idx, layer in enumerate(self._model_with_decoder.decoder.layers):
             global_idx = self._global_layer_idx(layer, local_idx)
             if global_idx >= len(self._route_index_by_global_layer):
                 continue
 
+            module_name_by_id = {
+                id(module): module_name
+                for module_name, module in layer.named_modules()
+            }
             for hidden_module in self._iter_hidden_mask_modules(layer):
+                if print_attached_modules:
+                    module_name = module_name_by_id.get(id(hidden_module), "")
+                    module_path = f"decoder.layers.{local_idx}"
+                    if module_name:
+                        module_path = f"{module_path}.{module_name}"
+                    print(
+                        "Flextron attaching hidden pre/post hooks to "
+                        f"{module_path} "
+                        f"(global_layer={global_idx}, "
+                        f"class={hidden_module.__class__.__qualname__})"
+                    )
                 self._handles.append(
                     hidden_module.register_forward_pre_hook(
                         self._make_hidden_pre_hook(global_idx)
@@ -245,7 +266,41 @@ class FrozenFlextronRouter:
                     )
                 )
 
+            for in_proj in self._iter_mamba_in_proj_modules(layer):
+                if print_attached_modules:
+                    module_name = module_name_by_id.get(id(in_proj), "")
+                    module_path = f"decoder.layers.{local_idx}"
+                    if module_name:
+                        module_path = f"{module_path}.{module_name}"
+                    print(
+                        "Flextron attaching Mamba in_proj pre/post hooks to "
+                        f"{module_path} "
+                        f"(global_layer={global_idx}, "
+                        f"class={in_proj.__class__.__qualname__})"
+                    )
+                self._handles.append(
+                    in_proj.register_forward_pre_hook(
+                        self._make_mamba_in_proj_pre_hook(global_idx)
+                    )
+                )
+                self._handles.append(
+                    in_proj.register_forward_hook(
+                        self._make_mamba_in_proj_post_hook(global_idx)
+                    )
+                )
+
             for linear_fc1 in self._iter_linear_fc1_modules(layer):
+                if print_attached_modules:
+                    module_name = module_name_by_id.get(id(linear_fc1), "")
+                    module_path = f"decoder.layers.{local_idx}"
+                    if module_name:
+                        module_path = f"{module_path}.{module_name}"
+                    print(
+                        "Flextron attaching MLP post hook to "
+                        f"{module_path} "
+                        f"(global_layer={global_idx}, "
+                        f"class={linear_fc1.__class__.__qualname__})"
+                    )
                 self._handles.append(
                     linear_fc1.register_forward_hook(
                         self._make_mlp_post_hook(global_idx)
@@ -254,12 +309,29 @@ class FrozenFlextronRouter:
 
         final_norm = getattr(self._model_with_decoder.decoder, "final_norm", None)
         if final_norm is not None:
+            if print_attached_modules:
+                print(
+                    "Flextron attaching final norm pre/post hooks to "
+                    "decoder.final_norm "
+                    f"(class={final_norm.__class__.__qualname__})"
+                )
             self._handles.append(
                 final_norm.register_forward_pre_hook(self._final_norm_pre_hook)
             )
             self._handles.append(
                 final_norm.register_forward_hook(self._final_norm_post_hook)
             )
+
+        if print_attached_modules:
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+                if torch.distributed.get_rank() == 0:
+                    input(
+                        "[rank 0] Flextron hooks attached; press Enter to continue..."
+                    )
+                torch.distributed.barrier()
+            else:
+                input("Flextron hooks attached; press Enter to continue...")
 
     def _iter_hidden_mask_modules(
         self, layer: torch.nn.Module
@@ -274,6 +346,8 @@ class FrozenFlextronRouter:
             if id(module) in yielded_ids:
                 continue
             class_name = module.__class__.__name__
+            if class_name == "MambaMixer":
+                continue
             leaf_name = module_name.rsplit(".", maxsplit=1)[-1]
             if (
                 class_name in _FLEXTRON_HIDDEN_MODULE_CLASS_NAMES
@@ -281,6 +355,19 @@ class FrozenFlextronRouter:
             ):
                 yielded_ids.add(id(module))
                 yield module
+
+    def _iter_mamba_in_proj_modules(
+        self, layer: torch.nn.Module
+    ) -> Iterator[torch.nn.Module]:
+        yielded_ids = set()
+        for module in layer.modules():
+            if module.__class__.__name__ != "MambaMixer":
+                continue
+            in_proj = getattr(module, "in_proj", None)
+            if in_proj is None or id(in_proj) in yielded_ids:
+                continue
+            yielded_ids.add(id(in_proj))
+            yield in_proj
 
     def _iter_linear_fc1_modules(
         self, layer: torch.nn.Module
@@ -317,6 +404,34 @@ class FrozenFlextronRouter:
 
         return hook
 
+    def _make_mamba_in_proj_pre_hook(self, global_layer_idx: int):
+        def hook(module, inputs):
+            emb_int = self._active_emb_int(global_layer_idx)
+            if emb_int is None or not inputs:
+                return inputs
+
+            layernorm_epsilon = getattr(self.model_cfg, "layernorm_epsilon", None)
+            if layernorm_epsilon is not None:
+                emb_effective_per = emb_int / self.model_cfg.hidden_size
+                module.eps = layernorm_epsilon * emb_effective_per
+            return self._mask_first_tensor(inputs, emb_int)
+
+        return hook
+
+    def _make_mamba_in_proj_post_hook(self, global_layer_idx: int):
+        def hook(module, inputs, output):
+            emb_int = self._active_emb_int(global_layer_idx)
+            if emb_int is None:
+                return output
+
+            layernorm_epsilon = getattr(self.model_cfg, "layernorm_epsilon", None)
+            if layernorm_epsilon is not None:
+                module.eps = layernorm_epsilon
+            emb_effective_per = emb_int / self.model_cfg.hidden_size
+            return self._scale_output(output, emb_effective_per**0.5)
+
+        return hook
+
     def _make_mlp_post_hook(self, global_layer_idx: int):
         def hook(module, inputs, output):
             mlp_int = self._active_mlp_int(global_layer_idx)
@@ -332,13 +447,24 @@ class FrozenFlextronRouter:
         emb_int = self._final_norm_emb_int()
         if emb_int is None or not inputs:
             return inputs
+        layernorm_epsilon = getattr(self.model_cfg, "layernorm_epsilon", None)
+        if layernorm_epsilon is not None:
+            emb_effective_per = emb_int / self.model_cfg.hidden_size
+            module.eps = layernorm_epsilon * emb_effective_per
         return self._mask_first_tensor(inputs, emb_int)
 
     def _final_norm_post_hook(self, module, inputs, output):
         emb_int = self._final_norm_emb_int()
         if emb_int is None:
             return output
-        return self._mask_output(output, emb_int)
+        layernorm_epsilon = getattr(self.model_cfg, "layernorm_epsilon", None)
+        if layernorm_epsilon is not None:
+            module.eps = layernorm_epsilon
+        emb_effective_per = emb_int / self.model_cfg.hidden_size
+        return self._scale_output(
+            self._mask_output(output, emb_int),
+            emb_effective_per**0.5,
+        )
 
     def _active_route(self) -> dict[str, list[int]] | None:
         if self.active_router_id is None or self.active_router_id == 0:
@@ -390,6 +516,13 @@ class FrozenFlextronRouter:
                 self._mask_tensor(output[0], keep_dim, full_dim=full_dim),
                 *output[1:],
             )
+        return output
+
+    def _scale_output(self, output: Any, scale: float) -> Any:
+        if torch.is_tensor(output):
+            return output * scale
+        if isinstance(output, tuple) and output and torch.is_tensor(output[0]):
+            return (output[0] * scale, *output[1:])
         return output
 
     def _mask_tensor(
