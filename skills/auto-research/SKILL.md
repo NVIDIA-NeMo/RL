@@ -15,7 +15,7 @@ Treat dependencies as ready, but choose the runtime deliberately. Use the recipe
 1. Inspect the current git state and identify unrelated user changes before branching.
 2. Use a shared branch prefix. Prefer a user-provided one; otherwise create a suggestive default such as `autoresearch/2026-03-24-dapo-qwen2p5`.
 3. Read the target recipe, its parents, and the relevant code paths in `examples/run_grpo.py`, `nemo_rl/models/`, `nemo_rl/algorithms/`, `nemo_rl/environments/`, and `docs/`. For Nemo-gym recipes, also inspect `examples/nemo_gym/` entrypoints, configs, and launch scripts.
-4. Translate any user stop rule into explicit values you can monitor, such as the requested number of experiments as `target_experiments`, `campaign_deadline`, `per_experiment_timeout`, or `target_metric`.
+4. Translate any user stop rule into explicit values you can monitor, such as the requested number of experiments as `target_experiment_count`, `campaign_deadline`, `per_experiment_timeout`, or `target_metric`.
 5. Verify required data, checkpoints, runtime inputs, and the launcher.
 6. Create an untracked TSV log and per-experiment log directory.
 7. Run a baseline first on `<prefix>/baseline` if none exists.
