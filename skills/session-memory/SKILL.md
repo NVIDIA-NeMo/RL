@@ -47,7 +47,7 @@ ls -dt session/* 2>/dev/null | head
 
 2. If the user is resuming work, read the latest relevant `session_state.md`, `timeline.md`, and `handoff.md`.
 3. If no relevant session exists, create a new timestamped directory.
-4. Write an initial `session_state.md` with the user goal, repo path, branch, and known constraints.
+4. Write an initial `session_state.md` with the user's overall goal, current subtask, loaded skills, repo path, branch, and known constraints.
 
 Do not treat session notes as the only source of truth. Verify important claims against git state, files, and command output before acting.
 
@@ -77,7 +77,13 @@ Prefer updating the same files rather than creating many small checkpoint files.
 - Updated: <local timestamp>
 
 ## Goal
-<Current user goal in one or two sentences.>
+<Stable overall user goal in one or two sentences. Preserve this across follow-up steering unless the user explicitly changes it.>
+
+## Current Subtask
+<Immediate task or steering request currently being handled.>
+
+## Loaded Skills
+- `<skill-name>` - <why it was loaded and any important instructions to preserve.>
 
 ## Current Status
 <What is true now. Include completed work and verification status.>
