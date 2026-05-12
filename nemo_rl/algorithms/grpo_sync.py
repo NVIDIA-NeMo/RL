@@ -53,7 +53,6 @@ from nemo_rl.algorithms.grpo import (
     _should_log_nemo_gym_responses,
     _should_use_nemo_gym,
     compute_and_apply_seq_logprob_error_masking,
-    refit_policy_generation,
     scale_rewards,
 )
 from nemo_rl.algorithms.loss import (
@@ -82,6 +81,7 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
+from nemo_rl.weight_sync import WeightSynchronizer
 
 # ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
 # Slice-only formulation of nemo_rl.algorithms.grpo.dynamic_sampling: filter
@@ -349,6 +349,7 @@ def grpo_train_sync(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    weight_sync: Optional[WeightSynchronizer] = None,
 ) -> None:
     """Run GRPO training algorithm — TransferQueue-mediated.
 
@@ -373,12 +374,9 @@ def grpo_train_sync(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
-    NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
         policy_generation = policy  # type: ignore
-        NEED_REFIT = False
-    POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 
     if master_config.grpo.get("skip_reference_policy_logprobs_calculation"):
@@ -463,9 +461,8 @@ def grpo_train_sync(
         print("\n🔍 Running initial validation...", flush=True)
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
-        if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
-            POLICY_GENERATION_STALE = False
+        if weight_sync is not None and weight_sync.is_stale:
+            weight_sync.sync_weights()
         else:
             policy_generation.prepare_for_generation()
         val_metrics, validation_timings = validate_sync(
@@ -538,7 +535,7 @@ def grpo_train_sync(
                     flush=True,
                 )
                 with timer.time("prepare_for_generation/total"):
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                    if weight_sync is not None and weight_sync.is_stale:
                         if sync_kv_scales and kv_scales_cache is None:
                             # KV-scale calibration uses message_log of the
                             # current step's PROMPTS (pre-generation), which
@@ -571,14 +568,10 @@ def grpo_train_sync(
                                 calibration_data, include_q=True
                             )["layers"]
 
-                        refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
+                        weight_sync.sync_weights(
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
-                        POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
                             policy.offload_after_refit()
@@ -856,7 +849,8 @@ def grpo_train_sync(
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
                     policy.prepare_for_training()
-                    POLICY_GENERATION_STALE = True
+                    if weight_sync is not None:
+                        weight_sync.mark_stale()
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
@@ -892,7 +886,8 @@ def grpo_train_sync(
                             calibration_data,
                             include_q=True,
                         )["layers"]
-                        POLICY_GENERATION_STALE = True
+                        if weight_sync is not None:
+                            weight_sync.mark_stale()
 
                 # Stash input_ids and content before clear_samples so the
                 # late log_data jsonl block can use them. The clear below
@@ -928,14 +923,10 @@ def grpo_train_sync(
                     val_at_end and is_last_step
                 ):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
+                    if weight_sync is not None and weight_sync.is_stale:
+                        weight_sync.sync_weights(
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
-                        POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
                             policy.offload_after_refit()
