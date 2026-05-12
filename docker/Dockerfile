@@ -140,18 +140,17 @@ fi
 # to warm the uv cache, then at the end just sync the default dependencies.
 # Do everything in one layer to prevent large layers.
 
-# The venv is symlinked to avoid bloating the layer size
-uv sync --link-mode symlink --locked --no-install-project
+uv sync --locked --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
-    uv sync --link-mode symlink --locked --extra vllm --no-install-project
+    uv sync --locked --extra vllm --no-install-project
 fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    uv sync --link-mode symlink --locked --extra sglang --no-install-project
+    uv sync --locked --extra sglang --no-install-project
 fi
-uv sync --link-mode symlink --locked --extra mcore --no-install-project
-uv sync --link-mode symlink --locked --extra automodel --no-install-project
-uv sync --link-mode symlink --locked --extra modelopt --no-install-project
-uv sync --link-mode symlink --locked --all-groups --no-install-project
+uv sync --locked --extra mcore --no-install-project
+uv sync --locked --extra automodel --no-install-project
+uv sync --locked --extra modelopt --no-install-project
+uv sync --locked --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
@@ -197,7 +196,7 @@ COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN <<"EOF" bash -exu
+RUN --mount=type=cache,target=/root/.cache/uv <<"EOF" bash -exu
 NEGATIVE_FILTERS=""
 if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
     NEGATIVE_FILTERS="$NEGATIVE_FILTERS vllm"
@@ -206,9 +205,9 @@ if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
     NEGATIVE_FILTERS="$NEGATIVE_FILTERS sglang"
 fi
 if [[ -n "$NEGATIVE_FILTERS" ]]; then
-    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
+    uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
 else
-    UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+    uv run nemo_rl/utils/prefetch_venvs.py
 fi
 EOF
 
