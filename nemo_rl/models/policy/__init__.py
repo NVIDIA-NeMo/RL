@@ -253,6 +253,11 @@ class MegatronConfig(TypedDict):
     linear_ce_fusion_chunk_size: NotRequired[int]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
+    # When True, enables fully deterministic training (bit-exact reproducibility).
+    # Sets deterministic_mode=True in mcore, disables cross-entropy fusion and
+    # TP comm overlap. Also sets NCCL_ALGO=Ring, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0,
+    # and CUBLAS_WORKSPACE_CONFIG=:4096:8 in worker env vars automatically.
+    deterministic_mode: NotRequired[bool]
 
 
 class DraftConfigDisabled(TypedDict):

@@ -198,6 +198,11 @@ policy:
       fp8_recipe: "blockwise"
       fp8_param: false
 
+    # Set to true to enable fully deterministic (bit-exact) training.
+    # Automatically sets NCCL_ALGO=Ring, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0,
+    # and CUBLAS_WORKSPACE_CONFIG=:4096:8 in worker env vars.
+    deterministic_mode: false
+
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   add_bos: true

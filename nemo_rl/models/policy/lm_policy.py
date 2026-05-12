@@ -113,7 +113,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
-            env_vars = config["megatron_cfg"].get("env_vars", {})
+            env_vars = dict(config["megatron_cfg"].get("env_vars", {}) or {})
+
+            if config["megatron_cfg"].get("deterministic_mode", False):
+                env_vars.setdefault("NCCL_ALGO", "Ring")
+                env_vars.setdefault("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+                env_vars.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(

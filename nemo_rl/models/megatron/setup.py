@@ -23,6 +23,7 @@ import torch
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
 from megatron.bridge.peft.lora import LoRA
+from megatron.bridge.recipes.utils import apply_determinism_overrides
 from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.checkpointing import (
     _load_checkpoint_from_path,
@@ -519,6 +520,10 @@ def setup_model_config(
     )
 
     _validate_dtype_config(dtype, megatron_cfg.model, megatron_cfg.optimizer)
+
+    # Apply determinism overrides if requested
+    if config["megatron_cfg"].get("deterministic_mode", False):
+        apply_determinism_overrides(megatron_cfg)
 
     return megatron_cfg, model_cfg
 
