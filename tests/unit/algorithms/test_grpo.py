@@ -1256,6 +1256,10 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
         "SGLangGeneration",
         lambda *_args, **_kwargs: DummySGLangGeneration(),
     )
+    mock_weight_sync = MagicMock()
+    monkeypatch.setattr(
+        grpo_mod, "create_weight_synchronizer", lambda **_kwargs: mock_weight_sync
+    )
     monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
 
     generation_resources = {
@@ -1481,6 +1485,9 @@ def test_grpo_train_collects_generation_logger_metrics(
     master_config.grpo["val_at_start"] = False
     master_config.grpo["use_dynamic_sampling"] = False
 
+    mock_weight_sync = MagicMock()
+    mock_weight_sync.is_stale = True
+
     grpo_mod.grpo_train(
         mock_grpo_components["policy"],
         policy_generation,
@@ -1494,8 +1501,10 @@ def test_grpo_train_collects_generation_logger_metrics(
         mock_grpo_components["checkpointer"],
         _default_grpo_save_state(),
         master_config,
+        weight_sync=mock_weight_sync,
     )
 
+    assert mock_weight_sync.sync_weights.called
     assert policy_generation.clear_logger_metrics.called
     policy_generation.finish_generation.assert_called_once_with(discard_weights=True)
     assert policy_generation.get_logger_metrics.called

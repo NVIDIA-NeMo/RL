@@ -196,6 +196,7 @@ The validation set you pass in will directly be used for validation with no addi
         policy,
         policy_generation,
         cluster,
+        weight_sync,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -282,6 +283,7 @@ The validation set you pass in will directly be used for validation with no addi
             grpo_save_state=grpo_state,
             master_config=master_config,
             max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+            weight_sync=weight_sync,
         )
     else:
         print("🚀 Running synchronous GRPO training")
@@ -300,6 +302,7 @@ The validation set you pass in will directly be used for validation with no addi
             checkpointer,
             grpo_state,
             master_config,
+            weight_sync=weight_sync,
         )
 
 

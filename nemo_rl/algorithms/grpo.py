@@ -85,6 +85,7 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 # ===============================================================================
 # Configuration
@@ -227,6 +228,7 @@ def setup(
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
     tuple[RayVirtualCluster, RayVirtualCluster],
+    Optional[WeightSynchronizer],
     StatefulDataLoader | MultipleDataloaderWrapper,
     Optional[StatefulDataLoader],
     ClippedPGLossFn,
@@ -238,7 +240,8 @@ def setup(
     """Main entry point for running GRPO algorithm.
 
     Returns:
-        tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, logger, master_config, val_dataloader
+        tuple of policy, policy_generation, clusters, weight_sync, dataloader,
+        val_dataloader, loss_fn, logger, checkpointer, grpo_save_state, master_config
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
@@ -758,30 +761,23 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
-        t0 = time.perf_counter()
-        ip, port = train_cluster.get_master_address_and_port()
-        print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
-        # world includes all training workers and all inference workers
-        train_world_size = train_cluster.world_size()
-        inference_world_size = inference_nodes * inference_gpus_per_node
-        world_size = train_world_size + inference_world_size
-        # init collective
-        futures_train = policy.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )
-        futures_inference = policy_generation.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )  # type: ignore
-        # wait for all futures to complete
-        ray.get(futures_train + futures_inference)
-        worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
-
-    # prepare refit info
-    state_dict_info = policy.prepare_refit_info()
+    # Create weight synchronizer and initialize communication channels
+    weight_sync: Optional[WeightSynchronizer] = None
     if policy_generation is not None:
-        policy_generation.prepare_refit_info(state_dict_info)
+        weight_sync = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            train_cluster=train_cluster if not colocated_inference else None,
+            inference_cluster=inference_cluster if not colocated_inference else None,
+        )
+        t0 = time.perf_counter()
+        weight_sync.init_communicator()
+        if not colocated_inference:
+            worker_init_timing_metrics["collective_init_time_s"] = (
+                time.perf_counter() - t0
+            )
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -820,6 +816,7 @@ def setup(
         policy,
         policy_generation,
         (train_cluster, inference_cluster),
+        weight_sync,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -1138,6 +1135,10 @@ def refit_policy_generation(
 ) -> None:
     """Refit the policy generation interface with the latest policy weights.
 
+    .. deprecated::
+        Use :class:`~nemo_rl.weight_sync.WeightSynchronizer` and call
+        ``sync_weights()`` instead.
+
     Args:
         policy: The policy to provide weights to the inference engine.
         policy_generation: The inference engine to refit.
@@ -1147,6 +1148,12 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
+    warnings.warn(
+        "refit_policy_generation() is deprecated. "
+        "Use WeightSynchronizer.sync_weights() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if colocated_inference:
         policy.offload_before_refit()
         policy_generation.prepare_for_generation(tags=["weights"])
@@ -1350,6 +1357,7 @@ def grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    weight_sync: Optional[WeightSynchronizer] = None,
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer()
@@ -1362,13 +1370,10 @@ def grpo_train(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
-    NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
         policy_generation = policy  # type: ignore
-        NEED_REFIT = False
-    POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
-    assert policy_generation is not None
+    assert policy_generation is not None  # for mypy type check
 
     # Check if we need to sync KV cache scales
     # When fallback to policy as the policy_generation, we use getattr to check.
@@ -1404,9 +1409,8 @@ def grpo_train(
         print("\n🔍 Running initial validation...", flush=True)
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
-        if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
-            POLICY_GENERATION_STALE = False
+        if weight_sync is not None and weight_sync.is_stale:
+            weight_sync.sync_weights()
         else:
             policy_generation.prepare_for_generation()
         val_metrics, validation_timings = validate(
@@ -1483,7 +1487,7 @@ def grpo_train(
                     flush=True,
                 )
                 with timer.time("prepare_for_generation/total"):
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                    if weight_sync is not None and weight_sync.is_stale:
                         # Compute KV scales if needed for FP8 quantization
                         if sync_kv_scales and kv_scales_cache is None:
                             print("▶ Computing KV cache scales...", flush=True)
@@ -1515,14 +1519,10 @@ def grpo_train(
                                 calibration_data, include_q=True
                             )["layers"]
 
-                        refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
+                        weight_sync.sync_weights(
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
-                        POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
                             policy.offload_after_refit()  # unload optimizer to make space for generation
@@ -1881,7 +1881,8 @@ def grpo_train(
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
                     policy.prepare_for_training()  # set model train and reload optim to GPU
-                    POLICY_GENERATION_STALE = True
+                    if weight_sync is not None:
+                        weight_sync.mark_stale()
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
@@ -1902,7 +1903,8 @@ def grpo_train(
                             train_data, include_q=True
                         )["layers"]
                         # Set generation as stale to force refit with new scales
-                        POLICY_GENERATION_STALE = True
+                        if weight_sync is not None:
+                            weight_sync.mark_stale()
 
                 is_last_step = total_steps + 1 >= max_num_steps
                 if not master_config.data["use_multiple_dataloader"]:
@@ -1916,14 +1918,10 @@ def grpo_train(
                     val_at_end and is_last_step
                 ):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
+                    if weight_sync is not None and weight_sync.is_stale:
+                        weight_sync.sync_weights(
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
-                        POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
                             policy.offload_after_refit()  # unload optimizer to make space for generation
@@ -2488,6 +2486,7 @@ def async_grpo_train(
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
     max_trajectory_age_steps: int = 1,
+    weight_sync: Optional[WeightSynchronizer] = None,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
 
@@ -2505,6 +2504,7 @@ def async_grpo_train(
         grpo_save_state: Training state
         master_config: Master configuration
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
+        weight_sync: Optional WeightSynchronizer for weight transfer
     """
     # Ensure we are running with a compatible async generation backend
     assert _should_use_async_rollouts(master_config), (
@@ -2531,13 +2531,10 @@ def async_grpo_train(
         fit_last_save_time=True,
     )
     timeout.start_iterations()
-    NEED_REFIT = True
 
     # Setup generation interface
     if policy_generation is None:
         policy_generation = policy
-        NEED_REFIT = False
-    POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 
     # Training state
@@ -2658,12 +2655,11 @@ def async_grpo_train(
     )
 
     print("⏳ Preparing policy generation for training...")
-    if NEED_REFIT and POLICY_GENERATION_STALE:
+    if weight_sync is not None and weight_sync.is_stale:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            weight_sync.sync_weights()
             print("✅ Policy generation refit completed successfully")
-            POLICY_GENERATION_STALE = False
         except Exception as e:
             print(f"❌ Policy generation refit failed: {e}")
             import traceback
@@ -2984,7 +2980,8 @@ def async_grpo_train(
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
                     policy.prepare_for_training()
-                    POLICY_GENERATION_STALE = True
+                    if weight_sync is not None:
+                        weight_sync.mark_stale()
 
                 print("▶ Training policy...")
                 with timer.time("policy_training"):
@@ -2996,7 +2993,7 @@ def async_grpo_train(
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
-                if NEED_REFIT:
+                if weight_sync is not None:
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
@@ -3012,10 +3009,7 @@ def async_grpo_train(
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
-                        refit_policy_generation(
-                            policy, policy_generation, colocated_inference
-                        )
-                        POLICY_GENERATION_STALE = False
+                        weight_sync.sync_weights()
 
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
@@ -3037,11 +3031,8 @@ def async_grpo_train(
                     # Pause trajectory collection during validation to reduce memory pressure
                     trajectory_collector.pause.remote()
 
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            policy, policy_generation, colocated_inference
-                        )
-                        POLICY_GENERATION_STALE = False
+                    if weight_sync is not None and weight_sync.is_stale:
+                        weight_sync.sync_weights()
                     else:
                         policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(

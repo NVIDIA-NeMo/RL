@@ -254,6 +254,7 @@ def main():
         policy,
         policy_generation,
         cluster,
+        weight_sync,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -276,6 +277,7 @@ def main():
         checkpointer,
         grpo_state,
         master_config,
+        weight_sync=weight_sync,
     )
 
 
