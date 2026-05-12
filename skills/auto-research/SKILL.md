@@ -12,7 +12,7 @@ Treat dependencies as ready, but choose the runtime deliberately. Use the recipe
 
 Use the `session-memory` skill for every auto-research campaign. Start or resume a session record before branching, then checkpoint after forming the plan, before and after meaningful edits or long-running launches, when the user changes direction, and before handoff or final summary.
 
-After a context compaction, handoff, disconnect, or long gap, reload this skill and any companion skills already in use, read the latest session-memory handoff, and restate the overall objective, stop rules, current branch, and latest result before continuing. Treat follow-up steering as additive unless the user explicitly changes the main objective.
+After context compaction, handoff, disconnect, or a long gap, reload this skill and any companion skills already in use, read the latest `session-memory` handoff, and restate the overall objective, stop rules, current branch, and latest result before continuing. Treat follow-up steering as additive unless the user explicitly changes the main objective.
 
 ## Workflow
 

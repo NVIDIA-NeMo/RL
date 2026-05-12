@@ -29,7 +29,7 @@ mkdir -p session/<session_date_time>
 Use local time from the machine. Reuse the same session directory for all checkpoints in the same conversation unless the user explicitly starts a new session.
 
 Expected files:
-- `session_state.md` - current goal, status, plan, assumptions, blockers, and next actions.
+- `session_state.md` - overall goal, current subtask, loaded skills, status, plan, assumptions, blockers, and next actions.
 - `timeline.md` - append-only log of major actions, commands, results, and decisions.
 - `files.md` - files inspected, files changed, and why they matter.
 - `handoff.md` - concise resume instructions for the next agent.
