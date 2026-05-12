@@ -1,17 +1,17 @@
 ---
 name: session-memory
-description: Manage durable working-session memory for coding agents. Use when a user asks to preserve or recover agent context across disconnects, VS Code restarts, long-running work, handoffs, or any session where important state should be periodically written under the repo's session directory.
+description: Manage durable working-session memory for coding agents. Use when a user asks to preserve or recover agent context across disconnects, VS Code restarts, long-running work, handoffs, or any session where important state should be written periodically under the repo's session directory.
 when_to_use: Preserving or recovering coding-agent context; creating checkpoints for long-running work, handoffs, disconnects, VS Code restarts, branch switches, or nontrivial edits.
 ---
 
 # Session Memory
 
-Keep a durable, human-readable record of the current working session so another agent can resume after a disconnect with minimal loss.
+Keep a durable, human-readable record of the current working session so another agent can resume after a disconnect with minimal context loss.
 
 ## When To Use
 
 Use this skill when:
-- The user asks to preserve, recover, dump, checkpoint, or manage agent memory.
+- The user asks to preserve, recover, checkpoint, or manage agent memory.
 - Work is long-running, experimental, or likely to span disconnects.
 - You are about to make nontrivial edits, run long jobs, switch branches, or pause for user input.
 - You resume in a repo that already has `./session/` directories.

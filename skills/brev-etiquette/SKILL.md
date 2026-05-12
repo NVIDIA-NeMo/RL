@@ -1,16 +1,16 @@
 ---
 name: brev-etiquette
-description: Brev instance operating guidance for NeMo-RL agents working in /home/ubuntu/RL with limited workspace disk, a larger /ephemeral volume, and optional root .env secrets. Use when running auto-research campaigns, experiments, training jobs, model or dataset downloads, shared cache-heavy commands, log-producing runs, checkpoint generation, W&B or Hugging Face authenticated workflows, or any workflow that may create large files on a Brev machine.
+description: Brev instance operating guidance for NeMo-RL agents working in /home/ubuntu/RL with limited workspace disk, a larger /ephemeral volume, and optional root .env secrets. Use when running auto-research campaigns, experiments, training jobs, model or dataset downloads, shared cache-heavy commands, log-producing runs, checkpoint generation, W&B or Hugging Face authenticated workflows, or any workflow that may create large files on Brev.
 when_to_use: Running on a Brev instance; launching auto-research campaigns or long jobs; managing large logs, checkpoints, caches, datasets, Ray temp files, W&B files, or Hugging Face auth on Brev.
 ---
 
 # Brev Etiquette
 
-Operate as though `/home/ubuntu/RL` is the source checkout and `/ephemeral` is the working storage for generated experiment state. Keep the repo small, reproducible, and easy to inspect; move bulky run outputs to `/ephemeral` before launching anything expensive.
+Operate as though `/home/ubuntu/RL` is the source checkout and `/ephemeral` is the working storage for generated experiment state. Keep the repo small, reproducible, and easy to inspect. Move bulky run outputs to `/ephemeral` before launching anything expensive.
 
 ## Storage Rules
 
-- Keep code edits, small config changes, committed experiment hypotheses, and concise reproducibility records in `/home/ubuntu/RL`.
+- Keep code edits, small config changes, committed experiment hypotheses, and concise reproducibility records under `/home/ubuntu/RL`.
 - Put generated experiment assets under `/ephemeral`, including checkpoints, run logs, Ray temp directories, W&B offline files, profiler traces, evaluation dumps, rollout samples, and per-experiment artifacts.
 - Keep reusable caches under one shared `/ephemeral` cache root per user, not under each experiment. This includes Hugging Face models, dataset caches, PyTorch caches, Triton caches, `uv` caches, and pip caches.
 - Before a campaign or long run, check capacity with `df -h /home/ubuntu/RL /ephemeral` and avoid starting if `/ephemeral` is missing or nearly full.
@@ -35,7 +35,7 @@ fi
 
 ## Auto-Research Pattern
 
-When using `auto-research`, keep the git ledger in the repo and the heavy evidence on `/ephemeral`.
+When using `auto-research`, keep the git ledger in the repo and heavy evidence on `/ephemeral`.
 
 ```bash
 if [ -f /home/ubuntu/RL/.env ]; then

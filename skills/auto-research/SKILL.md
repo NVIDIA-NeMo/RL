@@ -1,22 +1,22 @@
 ---
 name: auto-research
-description: "Autonomous NeMo RL research agent workflow for directed hypothesis testing and open-ended discovery. Guides agents through the full experiment lifecycle: understanding recipes and environments, wiring RL or Nemo-gym runs, launching reproducible baselines and iterations, analyzing results, preserving human oversight, and using git plus TSV logs as the research ledger."
-when_to_use: auto research; run experiments; test these hypotheses; find a better recipe; improve accuracy; long-running NeMo-RL or Nemo-gym research campaigns; autonomous discovery; directed execution.
+description: "Autonomous NeMo-RL research agent workflow for directed hypothesis testing and open-ended discovery. Guides agents through the full experiment lifecycle: understanding recipes and environments, wiring RL or NeMo-gym runs, launching reproducible baselines and iterations, analyzing results, preserving human oversight, and using git plus TSV logs as the research ledger."
+when_to_use: auto research; run experiments; test these hypotheses; find a better recipe; improve accuracy; long-running NeMo-RL or NeMo-gym research campaigns; autonomous discovery; directed execution.
 ---
 
 # Auto Research
 
-Run iterative NeMo RL experiments in this repository against the user's stated objective, such as accuracy, reward, throughput, latency, stability, or another recipe-specific metric, with git as the research ledger.
+Run iterative NeMo-RL experiments in this repository against the user's stated objective, such as accuracy, reward, throughput, latency, stability, or another recipe-specific metric, with git as the research ledger.
 
 Treat dependencies as ready, but choose the runtime deliberately. Use the recipe's authoritative metric as the source of truth. Keep changes small, reproducible, and simple. Preserve unrelated user work.
 
-Use `session-memory` for every auto-research campaign. Start or resume a session record before branching, then checkpoint after forming the plan, before and after meaningful edits or long-running launches, when the user changes direction, and before handing off or summarizing results.
+Use `session-memory` for every auto-research campaign. Start or resume a session record before branching, then checkpoint after forming the plan, before and after meaningful edits or long-running launches, when the user changes direction, and before handoff or final summary.
 
 ## Workflow
 
 1. Inspect the current git state and identify unrelated user changes before branching.
 2. Use a shared branch prefix. Prefer a user-provided one; otherwise create a suggestive default such as `autoresearch/2026-03-24-dapo-qwen2p5`.
-3. Read the target recipe, its parents, and the relevant code paths in `examples/run_grpo.py`, `nemo_rl/models/`, `nemo_rl/algorithms/`, `nemo_rl/environments/`, and `docs/`. For Nemo-gym recipes, also inspect `examples/nemo_gym/` entrypoints, configs, and launch scripts.
+3. Read the target recipe, its parents, and the relevant code paths in `examples/run_grpo.py`, `nemo_rl/models/`, `nemo_rl/algorithms/`, `nemo_rl/environments/`, and `docs/`. For NeMo-gym recipes, also inspect `examples/nemo_gym/` entrypoints, configs, and launch scripts.
 4. Translate any user stop rule into explicit values you can monitor, such as the requested number of experiments as `target_experiment_count`, `campaign_deadline`, `per_experiment_timeout`, or `target_metric`.
 5. Verify required data, checkpoints, runtime inputs, and the launcher.
 6. Create an untracked TSV log and per-experiment log directory.
@@ -24,7 +24,7 @@ Use `session-memory` for every auto-research campaign. Start or resume a session
 
 For GPU, CPU-heavy, distributed, or long-running work, choose the execution environment deliberately. Run locally when the current machine has suitable GPUs and capacity; otherwise follow the user's requested environment, use `launch-nemo-rl` for nrl-k8s/Kubernetes, use the environment's native launcher for Slurm, or clarify with the user before launching. Use CPU-only local runs only for light inspection, dry runs, and short non-GPU checks.
 
-If the user mentions Brev, or `/home/ubuntu/RL` exists and `/ephemeral` is available as a volume, treat the machine as a Brev instance and use `brev-etiquette` before creating experiment directories, caches, logs, checkpoints, or authenticated runtime state.
+If the user mentions Brev, or if `/home/ubuntu/RL` exists and `/ephemeral` is available as a volume, treat the machine as a Brev instance and use `brev-etiquette` before creating experiment directories, caches, logs, checkpoints, or authenticated runtime state.
 
 ## Branching
 
@@ -71,7 +71,7 @@ Examples:
 
 ## Priorities
 
-Prefer ideas with high expected accuracy gain and low complexity cost:
+Prefer ideas with high expected objective gain and low complexity cost:
 - correctness and backend compatibility
 - prompt and rollout formatting
 - batch, sequence, and precision layout
