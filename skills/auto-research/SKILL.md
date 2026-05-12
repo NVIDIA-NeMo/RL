@@ -10,7 +10,9 @@ Run iterative NeMo-RL experiments in this repository against the user's stated o
 
 Treat dependencies as ready, but choose the runtime deliberately. Use the recipe's authoritative metric as the source of truth. Keep changes small, reproducible, and simple. Preserve unrelated user work.
 
-Use `session-memory` for every auto-research campaign. Start or resume a session record before branching, then checkpoint after forming the plan, before and after meaningful edits or long-running launches, when the user changes direction, and before handoff or final summary.
+Use the `session-memory` skill for every auto-research campaign. Start or resume a session record before branching, then checkpoint after forming the plan, before and after meaningful edits or long-running launches, when the user changes direction, and before handoff or final summary.
+
+After a context compaction, handoff, disconnect, or long gap, reload this skill and any companion skills already in use, read the latest session-memory handoff, and restate the overall objective, stop rules, current branch, and latest result before continuing. Treat follow-up steering as additive unless the user explicitly changes the main objective.
 
 ## Workflow
 
@@ -86,6 +88,7 @@ All else equal, prefer simpler wins and avoid brittle hardware-specific hacks.
 
 - Do not conclude a training idea failed from an underpowered smoke run. If a run uses tiny batch sizes, very few optimizer steps, or otherwise non-representative settings, treat it as plumbing validation only; scale to a meaningful batch size and train long enough to test the hypothesis before marking it `discard`.
 - Do not repeatedly pay batch-scheduler setup costs for tight edit-run-debug loops. If Slurm batch jobs have a large startup tax and failures require quick iteration, use the documented interactive Slurm pattern or ask the user before resubmitting more batch jobs.
+- Do not let context compaction or follow-up steering questions erase the original campaign goal. Refresh `session-memory`, reload active skills, and preserve the main objective unless the user explicitly changes it.
 
 ## Stop
 
