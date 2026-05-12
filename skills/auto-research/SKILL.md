@@ -20,7 +20,7 @@ Treat dependencies as ready, but choose the runtime deliberately. Use the recipe
 6. Create an untracked TSV log and per-experiment log directory.
 7. Run a baseline first on `<prefix>/baseline` if none exists.
 
-For GPU, CPU-heavy, distributed, or long-running work, use the relevant runtime before launching: `launch-nemo-rl` for nrl-k8s/Kubernetes, or the environment's native launcher for Slurm. Run locally only for light inspection, dry runs, and short non-GPU checks.
+For GPU, CPU-heavy, distributed, or long-running work, choose the execution environment deliberately. Run locally when the current machine has suitable GPUs and capacity; otherwise follow the user's requested environment, use `launch-nemo-rl` for nrl-k8s/Kubernetes, use the environment's native launcher for Slurm, or clarify with the user before launching. Use CPU-only local runs only for light inspection, dry runs, and short non-GPU checks.
 
 ## Branching
 
