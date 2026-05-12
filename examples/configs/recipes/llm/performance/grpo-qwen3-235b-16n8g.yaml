@@ -7,6 +7,7 @@ grpo:
   max_val_samples: 16
 loss_fn:
   use_importance_sampling_correction: true
+  force_on_policy_ratio: true
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-235b-16n8g
 policy:
