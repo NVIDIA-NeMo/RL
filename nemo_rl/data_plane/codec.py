@@ -55,7 +55,7 @@ if TYPE_CHECKING:
 
 # Stringly-typed extra_info key for the object-encoded field set;
 # referenced by the writer (kv_first_write), driver-side reader
-# (driver_io.read_columns) and worker-side reader (worker_mixin._fetch).
+# (column_io.read_columns) and worker-side reader (worker_mixin._fetch).
 META_OBJECT_FIELDS = "object_fields"
 
 
@@ -202,7 +202,7 @@ def select_object_fields(
     """Filter ``meta.extra_info[META_OBJECT_FIELDS]`` to a request set.
 
     Single chokepoint for the read-side filter so :func:`materialize`
-    decodes the right keys regardless of caller (driver_io,
+    decodes the right keys regardless of caller (column_io,
     worker_mixin). ``requested=None`` returns the full registered set.
     """
     extras = meta.extra_info or {}
