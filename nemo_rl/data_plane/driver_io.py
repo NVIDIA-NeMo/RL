@@ -28,6 +28,8 @@ from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data_plane.codec import (
     META_OBJECT_FIELDS,
     materialize,
+    maybe_pack_jagged,
+    pack_object_array,
     select_object_fields,
 )
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
@@ -96,7 +98,6 @@ def write_columns(
     """
     if not fields:
         return
-    from nemo_rl.data_plane.codec import maybe_pack_jagged, pack_object_array
 
     seq_lens = meta.sequence_lengths
     lengths = torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
