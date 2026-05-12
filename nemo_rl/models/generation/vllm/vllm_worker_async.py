@@ -496,6 +496,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             request_logger=None,
             chat_template=None,
             chat_template_content_format="auto",
+            # vLLM 0.20's OpenAIServingRender rejects requests with
+            # `tool_choice="auto"` (a common NeMo-Gym default) unless
+            # `enable_auto_tools=True` is set on the serving instance. Enable it
+            # so simple chat requests without a configured tool parser still
+            # validate; if no `tool_parser` is configured the request flow is
+            # unaffected because no parsing actually runs.
+            enable_auto_tools=True,
         )
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
@@ -509,6 +516,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             chat_template_content_format=serving_chat_kwargs[
                 "chat_template_content_format"
             ],
+            enable_auto_tools=serving_chat_kwargs["enable_auto_tools"],
         )
         serving_chat_kwargs.update(
             dict(
