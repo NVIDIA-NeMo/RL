@@ -635,8 +635,10 @@ def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
     device = "cuda"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["force_on_policy_ratio"] = True
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        force_on_policy_ratio=True,
+    )
     loss_fn = ClippedPGLossFn(cfg)
 
     curr_lp = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
