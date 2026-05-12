@@ -52,8 +52,8 @@ policy:
       - mlp_int_list: 960
         emb_int_list: 1920
     # Sampling rates for [base_model, 23B nested route, 12B nested route].
-    # flextron_sampling_rates: [0.5, 0.3, 0.2]
-    flextron_sampling_rates: [1.0, 0.0, 0.0]
+    flextron_sampling_rates: [0.5, 0.3, 0.2]
+    # flextron_sampling_rates: [1.0, 0.0, 0.0]
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
@@ -177,7 +177,7 @@ logger:
   tensorboard_enabled: false
   wandb:
     project: "grpo-dev"
-    name: "grpo-flex-dev-logger"
+    name: "nanov3-flex-debug"
 
 cluster:
   gpus_per_node: 8

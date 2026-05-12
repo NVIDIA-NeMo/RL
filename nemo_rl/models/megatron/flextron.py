@@ -317,6 +317,33 @@ class FrozenFlextronRouter:
             return None
         return min(emb_values)
 
+    def _final_norm_pre_hook(
+        self, module: torch.nn.Module, inputs: tuple[Any, ...]
+    ) -> tuple[Any, ...]:
+        emb_int = self._final_norm_emb_int()
+        if emb_int is None or not inputs:
+            return inputs
+
+        layernorm_epsilon = getattr(self.model_cfg, "layernorm_epsilon", None)
+        if layernorm_epsilon is not None and hasattr(module, "eps"):
+            emb_effective_per = emb_int / self.model_cfg.hidden_size
+            module.eps = layernorm_epsilon * emb_effective_per
+        return self._mask_first_tensor(inputs, emb_int)
+
+    def _final_norm_post_hook(
+        self, module: torch.nn.Module, inputs: tuple[Any, ...], output: Any
+    ) -> Any:
+        del inputs
+        emb_int = self._final_norm_emb_int()
+        if emb_int is None:
+            return output
+
+        layernorm_epsilon = getattr(self.model_cfg, "layernorm_epsilon", None)
+        if layernorm_epsilon is not None and hasattr(module, "eps"):
+            module.eps = layernorm_epsilon
+        emb_effective_per = emb_int / self.model_cfg.hidden_size
+        return self._scale_output(output, emb_effective_per**0.5)
+
     def _mask_first_tensor(
         self, inputs: tuple[Any, ...], keep_dim: int
     ) -> tuple[Any, ...]:
