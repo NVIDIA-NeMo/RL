@@ -46,7 +46,10 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
     TopkLogitsOutputSpec,
 )
-from nemo_rl.models.policy.utils import resolve_policy_worker_cls
+from nemo_rl.models.policy.utils import (
+    aggregate_optim_step_metrics_by_index,
+    resolve_policy_worker_cls,
+)
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
@@ -692,6 +695,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             for k, v in r["all_mb_metrics"].items():
                 all_mb_metrics[k].extend(v)
         aggregated_results["all_mb_metrics"] = dict(all_mb_metrics)
+        worker_optim_step_metrics = [r.get("optim_step_metrics", []) for r in results]
+        if any(worker_optim_step_metrics):
+            aggregated_results["optim_step_metrics"] = (
+                aggregate_optim_step_metrics_by_index(worker_optim_step_metrics)
+            )
+        else:
+            aggregated_results["optim_step_metrics"] = []
 
         return aggregated_results
 
