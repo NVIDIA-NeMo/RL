@@ -52,8 +52,8 @@ client.kv_batch_put(
                       batch_size=[2]),
 )
 
-# Consumer — task-mediated discovery + tensor fetch.
-meta = client.get_meta(
+# Consumer — task-mediated discovery + claim (advances per-task cursor).
+meta = client.claim_meta(
     partition_id="train",
     task_name="train",
     required_fields=["input_ids", "advantages"],
@@ -101,8 +101,9 @@ Everything goes through `DataPlaneClient`
 
 ### Task-mediated (consumer-counter aware)
 
-- `get_meta(partition_id, task_name, required_fields, batch_size) → KVBatchMeta`
-  discovers samples ready for `task_name`; advances TQ's per-task counter.
+- `claim_meta(partition_id, task_name, required_fields, batch_size) → KVBatchMeta`
+  discovers and claims samples ready for `task_name`; advances TQ's
+  per-task consumption cursor as a side effect.
 - `get_data(meta, select_fields) → TensorDict` resolves a meta to data.
 - `check_consumption_status(...) → bool`.
 

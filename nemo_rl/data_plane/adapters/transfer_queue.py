@@ -209,7 +209,7 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
 
     # polling_mode=True: controller returns empty BatchMeta instead of raising
     # TimeoutError when no samples are ready yet. The client-side blocking
-    # loop in `get_meta` drives the retry cadence.
+    # loop in `claim_meta` drives the retry cadence.
     controller_overlay = {"controller": {"polling_mode": True}}
 
     if backend == "simple":
@@ -407,7 +407,7 @@ class TQDataPlaneClient(DataPlaneClient):
         else:
             _connect_existing()
         self._tq = _tq()
-        self._poll_interval_s = cfg.get("get_meta_poll_interval_s", 0.5)
+        self._poll_interval_s = cfg.get("claim_meta_poll_interval_s", 0.5)
         self._partitions: dict[str, _PartitionRecord] = {}
         self._closed = False
 
@@ -433,7 +433,7 @@ class TQDataPlaneClient(DataPlaneClient):
             enums=dict(enums) if enums else {},
         )
 
-    def get_meta(
+    def claim_meta(
         self,
         partition_id: str,
         task_name: str,
@@ -469,7 +469,7 @@ class TQDataPlaneClient(DataPlaneClient):
                 )
             if time.time() >= deadline:
                 raise TimeoutError(
-                    f"get_meta(partition={partition_id}, task={task_name}) "
+                    f"claim_meta(partition={partition_id}, task={task_name}) "
                     f"timed out after {timeout_s}s"
                 )
             time.sleep(self._poll_interval_s)

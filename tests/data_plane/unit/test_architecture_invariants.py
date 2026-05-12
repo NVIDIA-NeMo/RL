@@ -307,7 +307,7 @@ def test_pack_per_token_field_is_wired_into_writeback() -> None:
     "method",
     [
         "register_partition",
-        "get_meta",
+        "claim_meta",
         "get_data",
         "kv_batch_put",
         "kv_batch_get",
