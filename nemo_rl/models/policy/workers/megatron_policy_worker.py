@@ -2146,17 +2146,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
 
         # Yield the original parameters first.
-        _iter_step = getattr(self, "_iter_params_call_count", 0)
-        self._iter_params_call_count = _iter_step + 1
-        _param_names = []
         for name, tensor in base_iter:
-            _param_names.append((name, tensor.shape, tensor.dtype))
             yield name, tensor
-
-        #if self.rank == 0:
-        #    print(f"[refit-params] call {_iter_step}: {len(_param_names)} params from export_hf_weights")
-        #    for name, shape, dtype in _param_names:
-        #        print(f"  {name}: {shape} {dtype}")
 
         # Check whether FP8 KV cache is enabled.
         use_fp8_kv_cache = False
@@ -2296,14 +2287,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         except ImportError:
             pass
 
-        # Null out TE global CUDA tensors. The memory snapshot confirms these are
-        # alive after offload: _cublas_workspace is ~33 MB, _dummy_wgrads holds
-        # weight-shaped scratch tensors. Nulling them lets empty_cache() reclaim them.
-        import transformer_engine.pytorch.module.base as te_base
-        te_base._cublas_workspace = None
-        te_base._multi_stream_cublas_workspace = []
-        te_base._dummy_wgrads = {}
-
         print(
             f"[_clear_fp8_caches] Cleared {workspace_count} workspace modules on rank {self.rank}"
         )
@@ -2353,20 +2336,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         """Offload as much as possible on the CPU."""
         no_grad = torch.no_grad()
         no_grad.__enter__()
-
         self.model = self.move_model(self.model, "cpu")
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
-
-        # Clear Megatron's persistent all-gather scratch buffer (~200 MB, grows to
-        # the max sequence length seen and never frees on its own). Memory snapshot
-        # confirmed this is the largest single live block after offload.
-        try:
-            from megatron.core.parallel_state import get_global_memory_buffer
-            get_global_memory_buffer().buffer.clear()
-        except Exception:
-            pass
 
         # Clear RotaryEmbedding's @lru_cache(maxsize=32). The cache accumulates one
         # entry per unique (max_seq_len, offset, packed_seq) seen, and each entry is
@@ -2427,25 +2400,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         print(
             f"GPU Memory after refit complete: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
-
-        step = getattr(self, "_offload_after_refit_count", 0)
-        self._offload_after_refit_count = step + 1
-
-        if self.rank == 0 and step == 0:
-            # Step 1 ended cleanly (0GB). Start recording now so that whatever
-            # allocates the ~0.33GB before step 2's offload has a stack trace.
-            # stacks='all' captures C++ frames needed for backward-pass allocations.
-            torch.cuda.memory._record_memory_history(max_entries=1000000, stacks="all")
-            print("[snapshot] memory history recording started after step 1 offload")
-
-        if self.rank == 0 and step == 1 and allocated > 0:
-            # Dump snapshot at end of step 2 offload when fragmentation appears.
-            # Load the resulting .pkl with https://pytorch.org/memory_viz
-            snapshot_path = f"fp8_logs/memsnapshot_rank{self.rank}_step{step}.pkl"
-            torch.cuda.memory._dump_snapshot(snapshot_path)
-            torch.cuda.memory._record_memory_history(enabled=None)
-            print(f"[snapshot] dumped memory snapshot to {snapshot_path}")
-
         no_grad.__exit__(None, None, None)
 
     @torch.no_grad()
