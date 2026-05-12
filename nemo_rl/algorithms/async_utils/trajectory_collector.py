@@ -88,6 +88,17 @@ class AsyncTrajectoryCollector:
         # Track how many prompt-group workers are still in flight per target weight.
         self._generating_target_counts: dict[int, int] = {}
 
+        # Failure tracking for generation workers. _failure_lock guards both
+        # _failure_count and _fatal_error and is acquired only inside
+        # _run_prompt_group_worker's except path and inside check_health; it
+        # is never held while taking _generation_check_lock.
+        self._failure_lock: _threading.Lock = _threading.Lock()
+        self._failure_count: int = 0
+        self._fatal_error: Optional[BaseException] = None
+        self._max_generation_failures: int = int(
+            self.master_config["grpo"]["async_grpo"]["max_generation_failures"]
+        )
+
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
 
@@ -378,6 +389,21 @@ class AsyncTrajectoryCollector:
     def get_weight_version(self) -> int:
         return self.current_weight_version
 
+    def check_health(self) -> None:
+        """Raise the stored fatal worker error, if any.
+
+        Called by the trainer between sampling iterations. When a generation
+        worker has recorded a fatal failure (cumulative count exceeded
+        max_generation_failures), this re-raises it so the training job dies
+        instead of stalling on an empty replay buffer. Safe to call
+        repeatedly: returns silently when no fatal error is set, and raises
+        every time once one is.
+        """
+        with self._failure_lock:
+            err = self._fatal_error
+        if err is not None:
+            raise err
+
     def pause(self) -> None:
         """Pause trajectory collection."""
         self._manual_pause_cleared.clear()  # Signal collection to pause
@@ -541,38 +567,59 @@ class AsyncTrajectoryCollector:
             }
 
             # Use exponential backoff when buffer is full
-            try:
-                backoff_delay = 0.01
-                while self.running:
-                    status = ray.get(
-                        self.replay_buffer.add.remote(
-                            trajectory_group,
-                            generation_weight_version,
-                            target_weight_version,
-                        )
+            backoff_delay = 0.01
+            while self.running:
+                status = ray.get(
+                    self.replay_buffer.add.remote(
+                        trajectory_group,
+                        generation_weight_version,
+                        target_weight_version,
                     )
-                    if status == "success":
-                        print(
-                            f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, target_weight {target_weight_version})"
-                        )
-                        break
-                    elif status == "full":
-                        # Exponential backoff up to 0.5 second
-                        time.sleep(min(backoff_delay, 0.5))
-                        backoff_delay *= 1.5
-                    else:
-                        # Unexpected status, wait briefly
-                        time.sleep(0.01)
-            except Exception as e:
-                print(f"❌ Failed to enqueue per-prompt group to buffer: {e}")
-                import traceback
-
-                traceback.print_exc()
+                )
+                if status == "success":
+                    print(
+                        f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, target_weight {target_weight_version})"
+                    )
+                    break
+                elif status == "full":
+                    # Exponential backoff up to 0.5 second
+                    time.sleep(min(backoff_delay, 0.5))
+                    backoff_delay *= 1.5
+                else:
+                    # Unexpected status, wait briefly
+                    time.sleep(0.01)
         except Exception as e:
-            print(f"❌ Error in prompt group worker: {e}")
             import traceback
 
-            traceback.print_exc()
+            tb = traceback.format_exc()
+            with self._failure_lock:
+                self._failure_count += 1
+                count = self._failure_count
+                threshold = self._max_generation_failures
+                fatal = count > threshold
+                if fatal and self._fatal_error is None:
+                    self._fatal_error = RuntimeError(
+                        f"AsyncTrajectoryCollector aborting: "
+                        f"{count} generation-worker failure(s) exceeded "
+                        f"max_generation_failures={threshold}. "
+                        f"Last failure on prompt_idx={prompt_idx}, "
+                        f"target_weight={target_weight_version}: {e!r}"
+                    )
+            print(
+                f"[AsyncTrajectoryCollector] generation worker FAILED "
+                f"(failure {count}, tolerating {threshold}) "
+                f"prompt_idx={prompt_idx} "
+                f"target_weight={target_weight_version} "
+                f"generation_weight={generation_weight_version}\n{tb}",
+                flush=True,
+            )
+            if fatal:
+                print(
+                    f"[AsyncTrajectoryCollector] FATAL: failure count {count} "
+                    f"exceeds threshold {threshold}; trainer will be notified on "
+                    f"next check_health() call.",
+                    flush=True,
+                )
         finally:
             # Track worker completion. Decrementing on every worker exit (success
             # or error) means a target with N missing prompt groups is freed up
