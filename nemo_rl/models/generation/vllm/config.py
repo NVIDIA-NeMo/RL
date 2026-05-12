@@ -39,6 +39,12 @@ class VllmSpecificArgs(TypedDict):
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
+    # Enable per-worker vLLM metrics logging (inflight batch sizes, KV cache usage, etc.).
+    # Works for both sync and async engines.
+    enable_vllm_metrics_logger: NotRequired[bool]
+    # Polling interval in seconds for the background metrics logger thread.
+    # Required when enable_vllm_metrics_logger is True.
+    vllm_metrics_logger_interval: NotRequired[float]
 
 
 class VllmConfig(GenerationConfig):
