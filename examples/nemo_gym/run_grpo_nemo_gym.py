@@ -211,6 +211,7 @@ The validation set you pass in will directly be used for validation with no addi
         model_name=policy_generation.cfg["model_name"],
         base_urls=policy_generation.dp_openai_server_base_urls,
         initial_global_config_dict=config["env"]["nemo_gym"],
+        enforce_monotonicity=policy_generation.cfg.get("vllm_cfg", {}).get("enforce_monotonicity", True),
     )
     nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
     # Blocking wait for NeMo-Gym to spin up
