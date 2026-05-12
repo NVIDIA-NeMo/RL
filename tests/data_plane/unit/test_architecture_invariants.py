@@ -271,7 +271,7 @@ def test_pack_per_token_field_is_wired_into_writeback() -> None:
 
     Known sites still using maybe_pack_jagged as of commit 45f4ffb8:
       - nemo_rl/data_plane/worker_mixin.py:336
-      - nemo_rl/data_plane/driver_io.py:85
+      - nemo_rl/data_plane/column_io.py:85
       - nemo_rl/experience/sync_rollout_actor.py:107
 
     If this test FAILS (i.e., the xfail is not triggered), the SP-padded-wider
@@ -281,7 +281,7 @@ def test_pack_per_token_field_is_wired_into_writeback() -> None:
     """
     sites = [
         "nemo_rl/data_plane/worker_mixin.py",
-        "nemo_rl/data_plane/driver_io.py",
+        "nemo_rl/data_plane/column_io.py",
         "nemo_rl/experience/sync_rollout_actor.py",
     ]
     found_in_any = False

@@ -33,7 +33,7 @@ transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
 from nemo_rl.data_plane import build_data_plane_client
 from nemo_rl.data_plane.codec import META_OBJECT_FIELDS, pack_object_array
-from nemo_rl.data_plane.driver_io import read_columns
+from nemo_rl.data_plane.column_io import read_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 
 # ── loud-skip helpers ─────────────────────────────────────────────────────────

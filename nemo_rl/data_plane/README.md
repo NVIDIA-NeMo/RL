@@ -330,7 +330,7 @@ critical path; flag for the next data-plane optimization round.
 |----------------------------------|----------------------------------------------------------------------|
 | Stable boundary                  | `nemo_rl/data_plane/interfaces.py`                                   |
 | Adapter (TransferQueue impl)     | `nemo_rl/data_plane/adapters/transfer_queue.py`                      |
-| Driver-side helpers              | `nemo_rl/data_plane/driver_io.py` (`read_columns`, `write_columns`)  |
+| Column helpers above DP client   | `nemo_rl/data_plane/column_io.py` (`read_columns`, `write_columns`)  |
 | First-write helper + rollout actor | `nemo_rl/experience/sync_rollout_actor.py`                         |
 | DP-rank meta sharding            | `nemo_rl/data_plane/preshard.py`                                     |
 | Worker fetch + write-back        | `nemo_rl/data_plane/worker_mixin.py`                                 |

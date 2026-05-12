@@ -11,11 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Driver-side TQ I/O helpers: fetch a slice + materialize, write deltas back.
+"""Column-level helpers above :class:`DataPlaneClient`.
 
-Fetch the columns the driver consumes, transform, write deltas. Worker-
-side dispatches use the equivalents on ``AbstractPolicyWorker``
-(``self._fetch(meta)`` / ``self._write_back``).
+These are thin wrappers around :meth:`kv_batch_get` / :meth:`kv_batch_put`
+that operate on **columns** (named fields) of a partition — not on the
+driver process specifically. The driver uses them to fetch a slice and
+materialize / write deltas back; worker-side dispatches use the
+equivalents on ``AbstractPolicyWorker`` (``self._fetch(meta)`` /
+``self._write_back``).
+
+  * :func:`read_columns` — ``kv_batch_get + materialize`` (decode jagged
+    + object-array fields into a :class:`BatchedDataDict`).
+  * :func:`write_columns` — encode jagged / object-array fields and
+    ``kv_batch_put`` the result.
 """
 
 from typing import Any, Literal, Sequence
