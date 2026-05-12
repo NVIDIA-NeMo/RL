@@ -14,7 +14,7 @@
 
 import threading as _threading
 from collections import Counter
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import ray
 
@@ -87,6 +87,13 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         """Get set of target weight versions that already have trajectories."""
         with self._lock:
             return set(self.target_weight_versions)
+
+    def _remove_indices(self, indices: Iterable[int]) -> None:
+        """Remove trajectories at the given indices."""
+        for idx in sorted(indices, reverse=True):
+            self.trajectory_versions.pop(idx)
+            self.target_weight_versions.pop(idx)
+            self.trajectories.pop(idx)
 
     def sample(
         self,
@@ -191,13 +198,9 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 f"🎯 All selected trajectories target step {current_weight_version} (100% target match)"
             )
 
-            sampled_items = [self.trajectories[i] for i in selected]
-
             # Remove selected items in reverse order to maintain correct indices
-            for idx in sorted(selected, reverse=True):
-                self.trajectory_versions.pop(idx)
-                self.target_weight_versions.pop(idx)
-                self.trajectories.pop(idx)
+            sampled_items = [self.trajectories[i] for i in selected]
+            self._remove_indices(selected)
             print(
                 f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
             )
@@ -261,9 +264,7 @@ class ReplayBufferNew(ReplayBufferImpl):
         """
         min_valid = current_weight_version - self.max_staleness
         stale = [i for i, v in enumerate(self.trajectory_versions) if v < min_valid]
-        for idx in sorted(stale, reverse=True):
-            self.trajectory_versions.pop(idx)
-            self.trajectories.pop(idx)
+        self._remove_indices(stale)
 
     def sample(
         self,
@@ -304,10 +305,9 @@ class ReplayBufferNew(ReplayBufferImpl):
             avg_trajectory_age = current_weight_version - sum(sampled_weights) / len(
                 sampled_weights
             )
+
             sampled_items = [self.trajectories[i] for i in selected]
-            for idx in sorted(selected, reverse=True):
-                self.trajectory_versions.pop(idx)
-                self.trajectories.pop(idx)
+            self._remove_indices(selected)
 
             return {
                 "trajectories": sampled_items,
