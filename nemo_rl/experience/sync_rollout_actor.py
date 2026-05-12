@@ -87,8 +87,8 @@ def kv_first_write(
     The padding tax is paid only when a consumer calls
     :func:`materialize(layout='padded', pad_value_dict=...)`.
 
-    Non-tensor object fields (``np.ndarray(dtype=object)`` — verl-style)
-    are pickled per-row and packed into a jagged uint8 nested tensor via
+    Non-tensor object fields (``np.ndarray(dtype=object)``) are pickled
+    per-row and packed into a jagged uint8 nested tensor via
     :func:`pack_object_array`. Their names are recorded in
     ``meta.extra_info['object_fields']`` so consumers (read_columns /
     materialize) decode them back to object arrays. Backends only ever
@@ -216,8 +216,10 @@ class SyncRolloutActor:
         )
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import (
+            MESSAGE_LOG_BULK_FIELDS,
             add_loss_mask_to_message_log,
             batched_message_log_to_flat_message,
+            decompose_message_log,
         )
 
         # Per-step generation-side metric hooks: snapshot once on the
@@ -305,15 +307,19 @@ class SyncRolloutActor:
         if "content" in flat:
             bulk_batch["content"] = np.asarray(flat["content"], dtype=object)
 
-        # Type-driven dispatch (verl pattern): producer-emitted type IS
-        # the schema. torch.Tensor and np.ndarray(object) pass through;
-        # everything else (typically Python lists from rollouts.py) is
-        # treated as object data and pickled per-row in kv_first_write.
-        # Skip keys already in bulk_batch (e.g. sample_mask ←
-        # loss_multiplier remap). To make a list ride the wire as a
-        # compact tensor, emit it as torch.tensor(...) at rollouts.py.
+        # Split `message_log` into per-field arrays instead of pickling
+        # the list-of-dicts-with-tensors per row. Consumer rebuilds
+        # `message_log` on read; external API stays the same.
+        decomposed = decompose_message_log(fb["message_log"])
+        for k in MESSAGE_LOG_BULK_FIELDS:
+            bulk_batch[k] = decomposed[k]
+
+        # Pass through remaining non-tensor fb fields as object arrays;
+        # `message_log` is excluded since its tensors live in the
+        # decomposed fields above (per-row pickle of dict-with-tensors
+        # would smuggle aliased views into the wire).
         for k, v in fb.items():
-            if isinstance(v, torch.Tensor) or k in bulk_batch:
+            if isinstance(v, torch.Tensor) or k in bulk_batch or k == "message_log":
                 continue
             bulk_batch[k] = (
                 v
@@ -338,6 +344,9 @@ class SyncRolloutActor:
             "length": length,
             "input_lengths": input_lengths,
             "prompt_ids_for_adv": prompt_flat["token_ids"],
+            # Computed by decompose_message_log above; feeds
+            # apply_reward_shaping on the driver without a TQ fetch.
+            "response_token_lengths": decomposed["response_token_lengths"],
         }
         # GDPO multi-reward components: scale_rewards iterates these
         # keys driver-side and the GDPO advantage estimator reads them

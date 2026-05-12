@@ -14,6 +14,7 @@
 import warnings
 from typing import Any, Optional, Union, cast
 
+import numpy as np
 import torch
 from datasets import Dataset
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -687,3 +688,138 @@ def remap_dataset_keys(
         lambda x: {v: x[k] for k, v in mapping_dict.items()},
         remove_columns=list(mapping_dict.keys()),
     )
+
+
+# ── Decomposed wire format for `message_log` ──────────────────────────
+#
+# `message_log` mixes torch.Tensor with Python objects at the per-row
+# level (`{"role": str, "content": str, "token_ids": Tensor, ...}` per
+# turn). Shipping that shape per-row through pickle serializes the
+# *underlying storage* of view-aliased tensor slices — for a vllm batched
+# output arena that's ~100 MB per row instead of the slice's ~10 KB.
+#
+# The helpers below split `message_log` into per-field arrays at the
+# wire boundary (token tensors flat in `bulk_batch`, role/content
+# strings as object arrays, per-turn lengths as one slim tensor) and
+# rebuild the list-of-dicts shape on the consumer from local-arena
+# views. No tensor ever reaches per-row pickle.
+
+# Fields ridden by `bulk_batch` and consumed by
+# :func:`reconstruct_message_log` to rebuild the list-of-dicts view.
+MESSAGE_LOG_BULK_FIELDS = ("turn_lengths", "turn_roles", "turn_contents")
+# Slim per-sample field carried alongside the slice (not the bulk wire);
+# consumed by :func:`apply_reward_shaping` on the driver.
+MESSAGE_LOG_SLICE_FIELD = "response_token_lengths"
+
+
+def decompose_message_log(
+    message_log_batch: list[LLMMessageLogType],
+) -> dict[str, Any]:
+    """Split a list-of-lists-of-dicts ``message_log`` into per-field arrays.
+
+    Returns a dict with:
+
+    - ``turn_lengths`` — ``torch.LongTensor(B, max_turns)``, zero in unused slots.
+    - ``turn_roles`` — ``np.ndarray(object, (B,))`` of ``list[str]``.
+    - ``turn_contents`` — ``np.ndarray(object, (B,))`` of ``list[str]``.
+    - ``response_token_lengths`` — ``torch.LongTensor(B,)``, assistant-turn
+      length per sample (0 if no assistant turn). Consumed by
+      :func:`nemo_rl.algorithms.reward_functions.apply_reward_shaping`.
+    """
+    batch_size = len(message_log_batch)
+    max_turns = max((len(ml) for ml in message_log_batch), default=0)
+
+    turn_roles = np.empty(batch_size, dtype=object)
+    turn_contents = np.empty(batch_size, dtype=object)
+    # Build Python lists in the hot loop; one tensor allocation at the end
+    # avoids per-turn 0-d tensor writes inside the loop.
+    turn_lengths_lol: list[list[int]] = [[0] * max_turns for _ in range(batch_size)]
+    response_lengths: list[int] = [0] * batch_size
+
+    for i, ml in enumerate(message_log_batch):
+        roles: list[str] = []
+        contents: list[str] = []
+        lengths_i = turn_lengths_lol[i]
+        for t, m in enumerate(ml):
+            role = m["role"]  # required; surface bad data loudly here
+            roles.append(role)
+            contents.append(m.get("content", ""))
+            tok = m.get("token_ids")
+            if tok is None:
+                continue
+            length = int(tok.shape[0]) if isinstance(tok, torch.Tensor) else len(tok)
+            lengths_i[t] = length
+            if role == "assistant" and response_lengths[i] == 0:
+                response_lengths[i] = length
+        turn_roles[i] = roles
+        turn_contents[i] = contents
+
+    return {
+        "turn_lengths": torch.tensor(turn_lengths_lol, dtype=torch.long),
+        "turn_roles": turn_roles,
+        "turn_contents": turn_contents,
+        "response_token_lengths": torch.tensor(response_lengths, dtype=torch.long),
+    }
+
+
+def attach_message_log_view(batch: BatchedDataDict[Any]) -> None:
+    """Attach ``batch['message_log']`` in place if decomposed fields are present.
+
+    Rebuilds ``message_log`` as views into the consumer-local ``input_ids``
+    / ``generation_logprobs``. Aliasing is harmless because the local
+    tensors own their storage and consumers do not re-pickle ``message_log``.
+    No-op when the decomposed fields are absent (legacy pickle-shipped path).
+    """
+    if "input_ids" not in batch or any(k not in batch for k in MESSAGE_LOG_BULK_FIELDS):
+        return
+    batch["message_log"] = reconstruct_message_log(
+        input_ids=batch["input_ids"],
+        turn_lengths=batch["turn_lengths"],
+        turn_roles=batch["turn_roles"],
+        turn_contents=batch["turn_contents"],
+        generation_logprobs=batch.get("generation_logprobs"),
+    )
+
+
+def reconstruct_message_log(
+    input_ids: Tensor,
+    turn_lengths: Tensor,
+    turn_roles: "np.ndarray",
+    turn_contents: "np.ndarray",
+    generation_logprobs: Optional[Tensor] = None,
+) -> list[LLMMessageLogType]:
+    """Inverse of :func:`decompose_message_log`.
+
+    Per-turn ``token_ids`` and ``generation_logprobs`` are **views** into
+    the consumer-local ``input_ids`` / ``generation_logprobs`` tensors.
+    The aliasing is harmless because the local tensors own their storage
+    (decoded from the wire) and consumers do not re-pickle ``message_log``.
+    """
+    batch_size = int(input_ids.shape[0])
+    # Single host-side materialization — avoids a per-turn .item() sync.
+    turn_lengths_list = turn_lengths.tolist()
+    out: list[LLMMessageLogType] = []
+    for i in range(batch_size):
+        roles_i = turn_roles[i]
+        contents_i = turn_contents[i]
+        lengths_i = turn_lengths_list[i]
+        turns: LLMMessageLogType = []
+        offset = 0
+        for t, role in enumerate(roles_i):
+            length = lengths_i[t]
+            if length == 0:
+                turns.append({"role": role, "content": contents_i[t]})
+                continue
+            turn: dict[str, Any] = {
+                "role": role,
+                "content": contents_i[t],
+                "token_ids": input_ids[i, offset : offset + length],
+            }
+            if generation_logprobs is not None and role == "assistant":
+                turn["generation_logprobs"] = generation_logprobs[
+                    i, offset : offset + length
+                ]
+            offset += length
+            turns.append(turn)
+        out.append(turns)
+    return out

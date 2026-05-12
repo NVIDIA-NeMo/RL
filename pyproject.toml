@@ -66,7 +66,11 @@ dependencies = [
   # automatically include them. Removes the need for a `[data-plane]`
   # extra and the corresponding plumbing in the per-worker venv builder.
   "tensordict",
-  "TransferQueue==0.1.6",
+  # Pinned to b266d39 (post-0.1.6, pre-0.1.7) for PR #77's MooncakeStore
+  # refactor: `clear` switched from unanchored `remove_by_regex` to
+  # exact-key `batch_remove`, which fixes a collateral-key-deletion bug
+  # that breaks DAPO + mooncake_cpu. Bump to the 0.1.7 tag when released.
+  "TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@b266d39",
   # Backs data_plane.backend="mooncake_cpu". Default backend is "simple"
   # (in-process), but the mooncake_cpu path needs the `mooncake_master`
   # binary that ships in this wheel at <site-packages>/mooncake/. Bundled
