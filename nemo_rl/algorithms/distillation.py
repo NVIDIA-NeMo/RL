@@ -180,6 +180,11 @@ def setup(
     """
     # Extract configuration
     policy_config = master_config["policy"]
+    checkpointing_pretrained = master_config.get("checkpointing", {}).get(
+        "pretrained_checkpoint"
+    )
+    if checkpointing_pretrained is not None:
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
     teacher_config = master_config["teacher"]
     generation_config = master_config["policy"]["generation"]
     loss_config = master_config["loss_fn"]
@@ -975,8 +980,9 @@ def validate(
 
         max_batches = (
             master_config["distillation"]["max_val_samples"]
-            // master_config["distillation"]["val_batch_size"]
-        )
+            + master_config["distillation"]["val_batch_size"]
+            - 1
+        ) // master_config["distillation"]["val_batch_size"]
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break

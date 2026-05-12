@@ -267,12 +267,12 @@ class ClippedPGLossFn(LossFunction):
                 "curr_logprobs_unfiltered", curr_logprobs
             )
 
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
         # For truly on-policy training, use curr_logprobs as prev_logprobs
         # This avoids computing prev_logprobs upstream
         if self.force_on_policy_ratio:
             prev_logprobs = curr_logprobs.detach()
-
-        mask = token_mask * sample_mask.unsqueeze(-1)
 
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics

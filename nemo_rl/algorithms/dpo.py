@@ -136,6 +136,11 @@ def setup(
     )
 
     policy_config = master_config["policy"]
+    checkpointing_pretrained = master_config.get("checkpointing", {}).get(
+        "pretrained_checkpoint"
+    )
+    if checkpointing_pretrained is not None:
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
     # Add a guardrail for linear CE fusion loss: if sequence packing is enabled for DPO in the future,
     # we need to validate the fusion path with cu_seqlens-based logprob aggregation first and then remove this guardrail.
     if policy_config["sequence_packing"]["enabled"]:

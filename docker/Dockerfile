@@ -16,7 +16,7 @@
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 
-ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.05-cuda12.9-devel-ubuntu24.04
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -112,6 +112,10 @@ ENV UV_LINK_MODE=copy
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
+## CUDA 13 moved standard library headers under include/cccl; expose that path so
+## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
+ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
+
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
@@ -146,6 +150,7 @@ if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
 fi
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --extra automodel --no-install-project
+uv sync --link-mode symlink --locked --extra modelopt --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
