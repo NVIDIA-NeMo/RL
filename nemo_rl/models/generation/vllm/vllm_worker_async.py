@@ -359,7 +359,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 return super().model_post_init(context)
 
         class NeMoRLOpenAIServingMixin:
-            async def _preprocess_chat(
+            # NOTE: vLLM 0.20 moved chat preprocessing from
+            # OpenAIServing._preprocess_chat to OpenAIServingRender.preprocess_chat,
+            # so this override now applies via the render subclass. The new
+            # signature adds `reasoning_parser` and the keyword-only
+            # `skip_mm_cache`; both are forwarded to super().
+            async def preprocess_chat(
                 self,
                 request,
                 messages,
@@ -368,6 +373,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 default_template_kwargs,
                 tool_dicts=None,
                 tool_parser=None,
+                reasoning_parser=None,
+                *,
+                skip_mm_cache: bool = False,
             ):
                 # Materialize the message tool calls so we can deepcopy below.
                 for message in messages:
@@ -379,7 +387,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
                 # res is (conversation, [engine_prompt])
                 try:
-                    res = await super()._preprocess_chat(
+                    res = await super().preprocess_chat(
                         request=request,
                         messages=messages,
                         default_template=default_template,
@@ -387,6 +395,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         default_template_kwargs=default_template_kwargs,
                         tool_dicts=tool_dicts,
                         tool_parser=tool_parser,
+                        reasoning_parser=reasoning_parser,
+                        skip_mm_cache=skip_mm_cache,
                     )
                 except ValueError as e:
                     if "maximum context length" in str(e):
@@ -431,7 +441,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
 
                 # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
-                corresponding_res = await super()._preprocess_chat(
+                corresponding_res = await super().preprocess_chat(
                     request=modified_request,
                     messages=messages_to_last_assistant_message,
                     default_template=default_template,
@@ -439,6 +449,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     default_template_kwargs=default_template_kwargs,
                     tool_dicts=tool_dicts,
                     tool_parser=tool_parser,
+                    reasoning_parser=reasoning_parser,
+                    skip_mm_cache=skip_mm_cache,
                 )
                 actual_corresponding_token_ids = corresponding_res[1][0][
                     "prompt_token_ids"
@@ -469,8 +481,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         ):
             required_prefix_token_ids: Optional[List[int]] = None
 
-        # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingChat
-        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingMixin, OpenAIServingChat):
+        # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
+        # OpenAIServingRender.preprocess_chat, so the prefix-token override
+        # belongs on the render. Keep OpenAIServingChat/Tokenization as plain
+        # subclasses.
+        class NeMoRLOpenAIServingChat(OpenAIServingChat):
+            pass
+
+        class NeMoRLOpenAIServingRender(NeMoRLOpenAIServingMixin, OpenAIServingRender):
             pass
 
         serving_chat_default_kwargs = dict(
@@ -482,7 +500,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
-        openai_serving_render = OpenAIServingRender(
+        openai_serving_render = NeMoRLOpenAIServingRender(
             model_config=engine_client.model_config,
             renderer=engine_client.renderer,
             model_registry=openai_serving_models.registry,
@@ -549,10 +567,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
         ]
 
-        # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingTokenization
-        class NeMoRLOpenAIServingTokenization(
-            NeMoRLOpenAIServingMixin, OpenAIServingTokenization
-        ):
+        # Tokenize path delegates to OpenAIServingRender.preprocess_chat in
+        # vLLM 0.20, where the prefix-token override lives. No mixin needed here.
+        class NeMoRLOpenAIServingTokenization(OpenAIServingTokenization):
             pass
 
         serving_tokenization_kwargs = dict(
