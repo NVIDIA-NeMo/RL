@@ -1,8 +1,8 @@
 # GRPO Algorithm Configuration
 defaults: ./grpo_math_1B.yaml
 grpo:
-  num_prompts_per_step: 1
-  num_generations_per_prompt: 8
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 16
 
 checkpointing:
   enabled: true
@@ -16,7 +16,7 @@ policy:
   train_global_batch_size: 8
   train_micro_batch_size: 1
   logprob_batch_size: ${policy.train_micro_batch_size}
-  max_total_sequence_length: 512
+  max_total_sequence_length: 2048
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
@@ -144,7 +144,7 @@ policy:
       kv_cache_dtype: "auto"
       tensor_parallel_size: 8
       pipeline_parallel_size: 1
-      expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
+      expert_parallel_size: 8  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
       gpu_memory_utilization: 0.7
       max_model_len: ${policy.max_total_sequence_length}
       # when enforce_eager is False, it is optional to set ++policy.generation.vllm_kwargs.compilation_config.backend=eager for better accuracy,

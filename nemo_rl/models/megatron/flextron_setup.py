@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import warnings
 from typing import Any
 
 from nemo_rl.models.policy import PolicyConfig
@@ -103,7 +103,7 @@ def _validate_flextron_generation_backend(
     if generation_cfg.get("backend") != "vllm":
         return
     if any(rate > 0 for rate in sampling_rates[1:]):
-        raise ValueError(
+        warnings.warn(
             "policy.generation.backend='vllm' cannot be used with nonzero "
             "nested Flextron sampling rates. Use backend='megatron' or set all "
             "policy.megatron_cfg.flextron_sampling_rates[1:] values to 0."
