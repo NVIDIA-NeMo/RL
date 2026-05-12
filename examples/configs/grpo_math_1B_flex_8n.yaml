@@ -1,0 +1,26 @@
+# GRPO Algorithm Configuration
+defaults: ./grpo_math_1B_flex.yaml
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 16
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-flextron-8n"
+
+policy:
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: false
+  wandb:
+    project: "grpo-dev"
+    name: "nanov3-flex-8node-debug"
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8
