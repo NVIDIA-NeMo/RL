@@ -59,6 +59,9 @@ class TaskDataSpec:
     prompt_file: Optional[PathLike] = None
 
     system_prompt_file: Optional[PathLike] = None
+    # Optional task-local default stop strings used when a processor does not
+    # emit per-datum stop strings explicitly.
+    default_stop_strings: Optional[list[str]] = None
 
     def __post_init__(self) -> None:
         def load_prompt_file(
@@ -82,6 +85,11 @@ class TaskDataSpec:
         default_attrs = {
             "system_prompt": from_spec.system_prompt,
             "prompt": from_spec.prompt,
+            "default_stop_strings": (
+                list(from_spec.default_stop_strings)
+                if from_spec.default_stop_strings is not None
+                else None
+            ),
         }
 
         for attr_name, default_value in default_attrs.items():

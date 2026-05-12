@@ -129,6 +129,14 @@ class AllTaskProcessedDataset:
             entry, task_data_spec, self.tokenizer, self.max_seq_length, idx
         )
 
+        # Preserve explicit processor-authored stop strings. Otherwise fill in
+        # task-local defaults derived from the bound environment config.
+        if (
+            "stop_strings" not in datum_spec
+            and task_data_spec.default_stop_strings is not None
+        ):
+            datum_spec["stop_strings"] = list(task_data_spec.default_stop_strings)
+
         # Check the first processed item for BOS token assertion
         if (
             not self._bos_checked

@@ -30,6 +30,32 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
 
 
+def get_default_stop_strings_from_env_config(
+    env_config: Optional[dict[str, Any]],
+) -> Optional[list[str]]:
+    """Extract task-local default stop strings from an environment config.
+
+    Supports both built-in env shapes like:
+        env.<name>.stop_strings
+
+    and custom env shapes like:
+        env.<name>.config.stop_strings
+    """
+    if not isinstance(env_config, dict):
+        return None
+
+    candidate_values = [env_config.get("stop_strings")]
+    nested_config = env_config.get("config")
+    if isinstance(nested_config, dict):
+        candidate_values.append(nested_config.get("stop_strings"))
+
+    for candidate in candidate_values:
+        if isinstance(candidate, list) and len(candidate) > 0:
+            return list(candidate)
+
+    return None
+
+
 # TODO: @yukih: unify to setup_data after dataset refactored
 def setup_response_data(
     tokenizer: AutoProcessor | AutoTokenizer,
@@ -109,6 +135,11 @@ def setup_response_data(
         )
         # bind task_name to task_data_processors and task_to_env
         task_name = data.task_name
+        if has_envs:
+            default_stop_strings = get_default_stop_strings_from_env_config(
+                env_configs.get(cfg["env_name"])
+            )
+            data.task_spec.default_stop_strings = default_stop_strings
         task_data_processors[task_name] = (data.task_spec, data.processor)
         if hasattr(data, "preprocessor") and data.preprocessor is not None:
             task_data_preprocessors[task_name] = data.preprocessor
@@ -187,6 +218,11 @@ def setup_response_data(
             )
             # bind task_name to task_data_processors and task_to_env
             task_name = val_data.task_name
+            if has_envs:
+                default_stop_strings = get_default_stop_strings_from_env_config(
+                    env_configs.get(cfg["env_name"])
+                )
+                val_data.task_spec.default_stop_strings = default_stop_strings
             val_task_data_processors[task_name] = (
                 val_data.task_spec,
                 val_data.processor,
