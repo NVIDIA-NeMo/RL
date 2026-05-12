@@ -98,6 +98,63 @@ class _DummyMambaLayer(torch.nn.Module):
         return self.mixer(hidden_states)
 
 
+class _DummyPreMlpLayerNorm(torch.nn.Module):
+    def __init__(self, eps: float = 1.0e-5) -> None:
+        super().__init__()
+        self.eps = eps
+        self.last_input: torch.Tensor | None = None
+        self.seen_eps: list[float] = []
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.last_input = hidden_states
+        self.seen_eps.append(self.eps)
+        return hidden_states + 1
+
+
+class MoELayer(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return hidden_states + 2, None
+
+
+class _DummyGroupedFc1(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
+        ffn_states = torch.arange(
+            6,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        ).unsqueeze(0)
+        return ffn_states, None
+
+
+class TEGroupedMLP(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear_fc1 = _DummyGroupedFc1()
+        self.last_input: torch.Tensor | None = None
+        self.last_fc1_output: torch.Tensor | None = None
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
+        self.last_input = hidden_states
+        ffn_states, _ = self.linear_fc1(hidden_states)
+        self.last_fc1_output = ffn_states
+        return hidden_states + 3, None
+
+
+class TransformerLayer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layer_number = 1
+        self.pre_mlp_layernorm = _DummyPreMlpLayerNorm()
+        self.moe_layer = MoELayer()
+        self.grouped_mlp = TEGroupedMLP()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.pre_mlp_layernorm(hidden_states)
+        moe_output, _ = self.moe_layer(hidden_states)
+        grouped_output, _ = self.grouped_mlp(hidden_states)
+        return moe_output + grouped_output
+
+
 class _DummyDecoder(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -138,6 +195,23 @@ class _DummyMambaModel(torch.nn.Module):
         return hidden_states
 
 
+class _DummyMoEDecoder(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = torch.nn.ModuleList([TransformerLayer()])
+
+
+class _DummyMoEModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.decoder = _DummyMoEDecoder()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for layer in self.decoder.layers:
+            hidden_states = layer(hidden_states)
+        return hidden_states
+
+
 def _router_config() -> SimpleNamespace:
     return SimpleNamespace(
         hybrid_layer_pattern="E*",
@@ -164,6 +238,22 @@ def _mamba_router_config() -> SimpleNamespace:
             {
                 "emb_int_list": [2],
                 "mlp_int_list": [],
+            }
+        ],
+        flextron_sampling_rates=[0.0, 1.0],
+    )
+
+
+def _moe_router_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        hybrid_layer_pattern="E",
+        hidden_size=4,
+        ffn_hidden_size=6,
+        layernorm_epsilon=1.0e-5,
+        flex_routers=[
+            {
+                "emb_int_list": [2],
+                "mlp_int_list": [4],
             }
         ],
         flextron_sampling_rates=[0.0, 1.0],
@@ -226,6 +316,41 @@ def test_mamba_route_hooks_in_proj_pre_and_post():
     torch.testing.assert_close(output, expected_output)
     assert in_proj.seen_eps == [5.0e-6]
     assert in_proj.eps == 1.0e-5
+    assert router.active_router_id is None
+
+
+def test_moe_route_hooks_layernorm_moe_and_grouped_mlp():
+    model = _DummyMoEModel()
+    router = FrozenFlextronRouter(model=model, model_cfg=_moe_router_config())
+    hidden_states = torch.arange(4, dtype=torch.float32).unsqueeze(0)
+
+    with router.use_router(1):
+        output = model(hidden_states)
+
+    expected_scale = (2 / 4) ** 0.5
+    expected_norm_input = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
+    expected_grouped_input = torch.tensor(
+        [[expected_scale, 2 * expected_scale, 0.0, 0.0]]
+    )
+    expected_fc1_output = torch.tensor([[0.0, 1.0, 2.0, 3.0, 0.0, 0.0]])
+    expected_output = torch.tensor(
+        [[5 + 2 * expected_scale, 5 + 4 * expected_scale, 0.0, 0.0]]
+    )
+
+    layer = model.decoder.layers[0]
+    assert len(router._handles) == 6
+    assert layer.pre_mlp_layernorm.last_input is not None
+    torch.testing.assert_close(layer.pre_mlp_layernorm.last_input, expected_norm_input)
+    assert layer.pre_mlp_layernorm.seen_eps == [5.0e-6]
+    assert layer.pre_mlp_layernorm.eps == 1.0e-5
+    assert layer.grouped_mlp.last_input is not None
+    assert layer.grouped_mlp.last_fc1_output is not None
+    torch.testing.assert_close(layer.grouped_mlp.last_input, expected_grouped_input)
+    torch.testing.assert_close(
+        layer.grouped_mlp.last_fc1_output,
+        expected_fc1_output,
+    )
+    torch.testing.assert_close(output, expected_output)
     assert router.active_router_id is None
 
 

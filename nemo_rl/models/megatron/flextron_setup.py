@@ -186,8 +186,9 @@ def _resolve_flextron_int_list(
     if isinstance(value, int):
         _validate_flextron_int_value(value, field_path=field_path, max_value=max_value)
         per_layer_values = [value] * len(main_layer_pattern)
+
     elif isinstance(value, list):
-        if len(value) != len(main_layer_pattern):
+        if len(value) != len([x for x in main_layer_pattern if x in eligible_layer_types]):
             raise ValueError(
                 f"{field_path} must be an int or a list with one value per main "
                 f"hybrid layer ({len(main_layer_pattern)}); got {len(value)} values."
@@ -199,6 +200,7 @@ def _resolve_flextron_int_list(
                 item, field_path=item_path, max_value=max_value
             )
             per_layer_values.append(item)
+
     else:
         raise TypeError(f"{field_path} must be an int or list[int].")
 
