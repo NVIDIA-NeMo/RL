@@ -2276,7 +2276,7 @@ def validate(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
-        assert val_dataloader is not None or master_config.dpo["val_period"] == 0, (
+        assert val_dataloader is not None or master_config.grpo["val_period"] == 0, (
             "val_dataloader is None, so dpo.val_period must be 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
