@@ -12,7 +12,7 @@
 #   Local NeMo RL source override:
 #     docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
 #
-# Optional build args to skip vLLM, SGLang dependencies:
+# Optional build args to skip vLLM or SGLang dependencies:
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 
@@ -55,7 +55,6 @@ apt install -y --only-upgrade gnupg
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
-
 
 # CMake (for sglang build)
 RUN GITHUB_ARTIFACTORY=github.com \
@@ -103,7 +102,7 @@ ARG BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION
 ARG BUILD_CUSTOM_FLASHINFER
 ARG BUILD_CUSTOM_FLASHINFER_URL
 ARG BUILD_CUSTOM_FLASHINFER_REF
-# Skip building vLLM, SGLang dependencies (set to any non-empty value to skip)
+# Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
 

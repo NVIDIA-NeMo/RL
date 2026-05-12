@@ -19,7 +19,9 @@ weight sync. Colocated: shares GPUs with the policy and uses sleep/wakeup
 to time-multiplex GPU memory between training and inference phases.
 """
 
-from typing import Any, Optional, Union
+import asyncio
+import os
+from typing import Any, AsyncGenerator, Optional, Union
 
 import numpy as np
 import ray
@@ -150,6 +152,9 @@ class TrtllmGeneration(GenerationInterface):
         )
         ray.get(futures)
 
+        # Round-robin DP shard used by generate_async for per-sample dispatch.
+        self.current_generate_dp_shard_idx = 0
+
         self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
 
         self.device_uuids = self._report_device_id()
@@ -254,6 +259,64 @@ class TrtllmGeneration(GenerationInterface):
         if missing:
             raise ValueError(f"Missing generation output keys: {missing}")
         return combined
+
+    async def generate_async(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Yield a single-sample generation result.
+
+        Called by run_async_multi_turn_rollout, which dispatches one sample at
+        a time per coroutine. The async worker's max_concurrency lets multiple
+        in-flight Ray calls share the same AsyncLLM, which batches them
+        internally via asyncio.gather.
+        """
+        if not self.async_engine:
+            raise RuntimeError(
+                "generate_async requires trtllm_cfg.async_engine=true."
+            )
+
+        if "input_ids" not in data or "input_lengths" not in data:
+            raise AssertionError(
+                "input_ids and input_lengths are required in data for generate_async"
+            )
+        if len(data["input_ids"]) == 0:
+            return
+        assert data.size == 1, (
+            f"generate_async expects single-sample data, got batch_size={data.size}."
+        )
+
+        leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
+            self.current_generate_dp_shard_idx
+        )
+        worker_result_ref = self.worker_group.run_single_worker_single_data(
+            method_name="generate_async",
+            worker_idx=leader_worker_idx,
+            data=data,
+            greedy=greedy,
+        )
+        self.current_generate_dp_shard_idx = (
+            self.current_generate_dp_shard_idx + 1
+        ) % self.worker_group.dp_size
+
+        timeout_seconds = float(
+            os.environ.get("NRL_TRTLLM_ASYNC_TIMEOUT_SECONDS", "900")
+        )
+        try:
+            result = await asyncio.wait_for(
+                worker_result_ref, timeout=timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"TRT-LLM async generation timed out after {timeout_seconds}s. "
+                f"Tune with NRL_TRTLLM_ASYNC_TIMEOUT_SECONDS."
+            )
+
+        result["gen_leader_worker_idx"] = [int(leader_worker_idx)]
+        # Worker.generate_async returns a single-sample BatchedDataDict; idx in
+        # the input batch is always 0 (caller already split per-sample).
+        yield (0, result)
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake inference workers up. No-op for non-colocated."""

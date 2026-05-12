@@ -1031,8 +1031,8 @@ def scale_rewards(
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
-    Returns True if vLLM backend is used with async_engine enabled,
-    or if TRT-LLM backend has expose_http_server enabled.
+    Returns True if the inference backend supports per-sample async generation
+    (vLLM or TRT-LLM with async_engine enabled).
     """
     generation_config = master_config["policy"]["generation"]
     if generation_config is None:
@@ -1046,7 +1046,7 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
 
     if backend == "trtllm":
         trtllm_cfg = generation_config.get("trtllm_cfg", {})
-        return trtllm_cfg.get("expose_http_server", False)
+        return trtllm_cfg.get("async_engine", False)
 
     return False
 
@@ -1060,7 +1060,7 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
 
     assert _should_use_async_rollouts(master_config), (
         "❌ Error: NeMo-Gym requires either vllm with `async_engine: true` "
-        "or trtllm with `expose_http_server: true`!"
+        "or trtllm with `async_engine: true`!"
     )
 
     generation_config = master_config["policy"]["generation"]

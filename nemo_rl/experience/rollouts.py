@@ -143,16 +143,20 @@ async def generate_responses_async(
         # Ensure the key exists even if it's None, matching GenerationDatumSpec
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
 
-    # Check if this is vLLM with async_engine enabled
+    # Async generation requires a backend that supports per-sample streaming
+    # (vLLM async_engine or TRT-LLM async_engine).
+    cfg = getattr(policy_generation, "cfg", None)
     use_async_generation = (
-        hasattr(policy_generation, "cfg")
-        and "vllm_cfg" in policy_generation.cfg
-        and policy_generation.cfg["vllm_cfg"]["async_engine"]
+        cfg is not None
         and hasattr(policy_generation, "generate_async")
+        and (
+            ("vllm_cfg" in cfg and cfg["vllm_cfg"].get("async_engine", False))
+            or ("trtllm_cfg" in cfg and cfg["trtllm_cfg"].get("async_engine", False))
+        )
     )
 
     assert use_async_generation, (
-        "Async generation is not enabled. Please enable async generation by setting async_engine=True in the vllm_cfg section of the policy config."
+        "Async generation is not enabled. Set async_engine=True in vllm_cfg or trtllm_cfg."
     )
 
     # Use async generation with per-sample streaming

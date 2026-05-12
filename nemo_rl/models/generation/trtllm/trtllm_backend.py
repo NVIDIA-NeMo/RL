@@ -24,6 +24,7 @@ Injected into TRT-LLM's RayGPUWorker via ``ray_worker_extension_cls``.
 """
 
 import gc
+import os
 import traceback
 from typing import Any
 
@@ -39,6 +40,12 @@ from nemo_rl.models.policy.utils import (
     rebuild_cuda_tensor_from_ipc,
 )
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+
+# Disable TRT-LLM weight loader's ThreadPoolExecutor: serial loading keeps
+# all copies on the caller's stream (same as NCCL writes), so the existing
+# stream-level sync in packed_broadcast_consumer covers them without us
+# needing defensive cross-stream synchronize() calls. Also lower peak memory.
+os.environ.setdefault("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", "True")
 
 
 class NcclExtension(WorkerExtension):
@@ -93,11 +100,6 @@ class NcclExtension(WorkerExtension):
         model = model_engine.model
 
         def load_model_weight_func(weight_list):
-            # packed_broadcast_consumer runs NCCL broadcast on a non-default
-            # stream; model_loader.reload spawns a ThreadPoolExecutor whose
-            # worker threads use per-thread default streams. Without this
-            # sync those threads would read partially-written tensors.
-            torch.cuda.current_stream().synchronize()
             model_engine.model_loader.reload(
                 model, dict(weight_list), allow_partial_loading=True,
             )
@@ -201,9 +203,6 @@ class NcclExtension(WorkerExtension):
                     "Likely stale state_dict_info (wrong shape/dtype for some key)."
                 )
 
-                # Trainer writes the IPC buffer on its own stream; sync
-                # before reload so loader threads see the data.
-                torch.cuda.current_stream().synchronize()
                 model_engine.model_loader.reload(
                     model, weights, allow_partial_loading=True,
                 )

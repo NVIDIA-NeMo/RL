@@ -411,7 +411,7 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
         })
 
 
-@ray.remote(num_cpus=0, max_concurrency=8)
+@ray.remote(num_cpus=0)
 class TrtllmAsyncGenerationWorker(TrtllmAsyncGenerationWorkerImpl):
     """Ray actor wrapper around :class:`TrtllmAsyncGenerationWorkerImpl`."""
 
