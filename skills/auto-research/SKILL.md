@@ -1,6 +1,7 @@
 ---
 name: auto-research
 description: Autonomous NeMo RL experiment driver for accuracy-focused recipe search in this repository. Use when coding agents should inspect recipe inheritance and backend code paths, run repeatable experiments, and record each hypothesis on its own git branch under a shared prefix with a TSV experiment log.
+when_to_use: Running autonomous experiment campaigns; iterating on recipe accuracy; investigating NeMo-RL built-in environment or Nemo-gym recipes; 'auto research', 'experiment loop', 'hypothesis testing', 'accuracy search'.
 ---
 
 # Auto Research
@@ -13,13 +14,13 @@ Treat dependencies as ready, but choose the runtime deliberately. Use the recipe
 
 1. Inspect the current git state and identify unrelated user changes before branching.
 2. Use a shared branch prefix. Prefer a user-provided one; otherwise create a suggestive default such as `autoresearch/2026-03-24-dapo-qwen2p5`.
-3. Read the target recipe, its parents, and the relevant code paths in `examples/run_grpo.py`, `nemo_rl/models/`, `nemo_rl/algorithms/`, and `docs/`.
+3. Read the target recipe, its parents, and the relevant code paths in `examples/run_grpo.py`, `nemo_rl/models/`, `nemo_rl/algorithms/`, `nemo_rl/environments/`, and `docs/`. For Nemo-gym recipes, also inspect `examples/nemo_gym/` entrypoints, configs, and launch scripts.
 4. Translate any user stop rule into explicit values you can monitor, such as `target_experiments`, `campaign_deadline`, `per_experiment_timeout`, or `target_metric`.
 5. Verify required data, checkpoints, runtime inputs, and the launcher.
 6. Create an untracked TSV log and per-experiment log directory.
 7. Run a baseline first on `<prefix>/baseline` if none exists.
 
-For GPU, CPU-heavy, distributed, or long-running work, use the relevant runtime skill before launching: `slurm` on a Slurm head node or `launch-nemo-rl` for nrl-k8s/Kubernetes. Run locally only for light inspection, dry runs, and short non-GPU checks.
+For GPU, CPU-heavy, distributed, or long-running work, use the relevant runtime before launching: `launch-nemo-rl` for nrl-k8s/Kubernetes, or the environment's native launcher for Slurm. Run locally only for light inspection, dry runs, and short non-GPU checks.
 
 ## Branching
 
@@ -48,7 +49,7 @@ uv run <entrypoint> > "$LOG_DIR/run.log" 2>&1
 
 7. If the user gave a per-experiment wall-clock limit, enforce it explicitly. Prefer a recipe-level timeout when one already exists; otherwise wrap the command with an external timeout. If both exist, honor the tighter limit.
 8. Extract the primary metric with a command appropriate for the actual log format. If extraction is empty, inspect the last log lines and the recipe's logging path before marking the run.
-9. Record branch, parent commit, commit, recipe, metric name, metric value, memory, elapsed time, launcher or job id, command, log path, status, and description in the TSV, along with enough timing or count information to evaluate the stop rule.
+9. Record index, branch, parent commit, commit, recipe, metric name, metric value, memory (GB), elapsed time (minutes), launcher, job id, command, log path, status, and description in the TSV, along with enough timing or count information to evaluate the stop rule.
 10. Periodically print user-facing progress updates during the campaign. Include the current branch, latest known result, attempted experiment count, remaining experiment count if applicable, remaining campaign time if applicable, and whether any stop condition has been met yet.
 11. Re-check the monitored stop conditions after the experiment completes and state the result explicitly, for example `stop condition not yet met: 17/24 attempted, 6h12m remaining` or `stop condition met: 24/24 attempted`.
 12. Mark the result as `keep`, `discard`, or `crash`, then move to the next branch unless a user-specified stop condition has been clearly met.

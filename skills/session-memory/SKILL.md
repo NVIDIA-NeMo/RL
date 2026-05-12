@@ -1,6 +1,7 @@
 ---
 name: session-memory
 description: Manage durable working-session memory for coding agents. Use when a user asks to preserve or recover agent context across disconnects, VS Code restarts, long-running work, handoffs, or any session where important state should be periodically written under the repo's session directory.
+when_to_use: Preserving or recovering coding-agent context; creating checkpoints for long-running work, handoffs, disconnects, VS Code restarts, branch switches, or nontrivial edits.
 ---
 
 # Session Memory

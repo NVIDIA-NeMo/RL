@@ -30,7 +30,7 @@ Prefer targeted staging and one hypothesis-focused commit before the run:
 
 ```bash
 git add path/to/file1 path/to/file2
-git commit -m "prompt: compact answer schema"
+git commit -s -m "prompt: compact answer schema"
 ```
 
 ## Per-Experiment Rhythm
@@ -81,7 +81,7 @@ If no baseline exists for the shared prefix, create one first:
 
 ```bash
 git checkout -b autoresearch/2026-03-24-dapo-qwen2p5/baseline <base-commit>
-git commit --allow-empty -m "baseline: record starting point"
+git commit -s --allow-empty -m "baseline: record starting point"
 ```
 
 Run the unmodified recipe from this branch and record it as the first attempted row in the ledger. Use the baseline commit as the parent for clean A/B experiments.
