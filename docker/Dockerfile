@@ -125,7 +125,7 @@ COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashi
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
-RUN --mount=type=ssh <<"EOF" bash -exu
+RUN --mount=type=ssh --mount=type=cache,target=/root/.cache/uv <<"EOF" bash -exu
 uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
