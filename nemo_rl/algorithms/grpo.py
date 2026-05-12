@@ -49,6 +49,7 @@ from nemo_rl.algorithms.utils import (
     set_seed,
 )
 from nemo_rl.data import DataConfig
+from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -206,6 +207,7 @@ class MasterConfig(TypedDict):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    data_plane: NotRequired[DataPlaneConfig]
 
 
 # ===============================================================================
