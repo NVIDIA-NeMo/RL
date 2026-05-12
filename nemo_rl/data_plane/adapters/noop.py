@@ -82,7 +82,7 @@ class _Partition:
     enums: dict[str, list[str]]
     rows: dict[str, dict[str, torch.Tensor]] = field(default_factory=dict)
     tags: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # per-task set of keys already returned by get_meta(mode='fetch')
+    # per-task set of keys already returned by claim_meta (TQ ``mode='fetch'``)
     consumed: dict[str, set[str]] = field(default_factory=dict)
 
 
@@ -111,7 +111,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
             consumed={t: set() for t in consumer_tasks},
         )
 
-    def get_meta(
+    def claim_meta(
         self,
         partition_id: str,
         task_name: str,

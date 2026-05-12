@@ -71,7 +71,7 @@ def test_register_put_get_clear(client: DataPlaneClient):
         client.kv_batch_get(keys=keys, partition_id="p", select_fields=["x"])
 
 
-def test_get_meta_advances_consumption(client: DataPlaneClient):
+def test_claim_meta_advances_consumption(client: DataPlaneClient):
     client.register_partition(
         partition_id="p",
         fields=["x"],
@@ -81,7 +81,7 @@ def test_get_meta_advances_consumption(client: DataPlaneClient):
     fields = TensorDict({"x": torch.tensor([10, 20])}, batch_size=[2])
     client.kv_batch_put(keys=["a", "b"], partition_id="p", fields=fields)
 
-    meta = client.get_meta(
+    meta = client.claim_meta(
         partition_id="p", task_name="read", required_fields=["x"], batch_size=2
     )
     assert isinstance(meta, KVBatchMeta)

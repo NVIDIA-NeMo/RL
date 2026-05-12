@@ -213,7 +213,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             ),
         )
 
-    def get_meta(
+    def claim_meta(
         self,
         partition_id,
         task_name,
@@ -224,11 +224,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         timeout_s=60.0,
     ):
         return self._run(
-            "get_meta",
+            "claim_meta",
             partition_id,
             0,
             0,
-            lambda: self._inner.get_meta(
+            lambda: self._inner.claim_meta(
                 partition_id,
                 task_name,
                 required_fields,

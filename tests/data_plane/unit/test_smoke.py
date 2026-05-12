@@ -82,7 +82,7 @@ def test_dataplane_client_abc_surface() -> None:
     expected_methods = {
         # task-mediated
         "register_partition",
-        "get_meta",
+        "claim_meta",
         "get_data",
         "check_consumption_status",
         # direct-by-key

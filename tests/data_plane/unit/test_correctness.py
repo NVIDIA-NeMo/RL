@@ -141,7 +141,7 @@ def test_kv_batch_put_rejects_non_tensor_leaves() -> None:
         )
 
 
-def test_get_meta_unregistered_task_raises() -> None:
+def test_claim_meta_unregistered_task_raises() -> None:
     """Catches typo'd consumer task names early."""
     client = NoOpDataPlaneClient()
     client.register_partition(
@@ -151,7 +151,7 @@ def test_get_meta_unregistered_task_raises() -> None:
         consumer_tasks=["lp"],
     )
     with pytest.raises(KeyError, match=r"task"):
-        client.get_meta(
+        client.claim_meta(
             partition_id="train",
             task_name="trian",  # typo
             required_fields=["input_ids"],
@@ -208,7 +208,7 @@ def test_check_consumption_status_only_true_when_all_consumed() -> None:
     assert not client.check_consumption_status("train", ["train"])
 
     # Simulate the worker fetch.
-    client.get_meta(
+    client.claim_meta(
         partition_id="train",
         task_name="train",
         required_fields=["input_ids"],

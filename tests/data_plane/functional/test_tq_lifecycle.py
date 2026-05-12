@@ -14,7 +14,7 @@
 """Single-node TQ smoke — Stage 1 acceptance.
 
 Mirrors the recipe in the integration plan §3 / Stage 1:
-register → put → get_meta → get_data → check_consumption → clear.
+register → put → claim_meta → get_data → check_consumption → clear.
 
 Skipped when the ``transfer_queue`` package is not installed so CI without
 the data-plane extra still passes.
@@ -123,7 +123,7 @@ def test_smoke_round_trip(tq_client) -> None:
         fields=TensorDict({"x": torch.arange(4)}, batch_size=[4]),
     )
 
-    meta = tq_client.get_meta(
+    meta = tq_client.claim_meta(
         partition_id="smoke",
         task_name="read",
         required_fields=["x"],
@@ -162,7 +162,7 @@ def test_smoke_round_trip_backends(tq_client_backends) -> None:
         fields=TensorDict({"x": torch.arange(4)}, batch_size=[4]),
     )
 
-    meta = client.get_meta(
+    meta = client.claim_meta(
         partition_id="smoke-backend",
         task_name="read",
         required_fields=["x"],
@@ -202,7 +202,7 @@ def test_smoke_round_trip_1d_fields(tq_client) -> None:
         fields=TensorDict({"reward": reward}, batch_size=[n]),
     )
 
-    meta = tq_client.get_meta(
+    meta = tq_client.claim_meta(
         partition_id="smoke-1d",
         task_name="read",
         required_fields=["reward"],

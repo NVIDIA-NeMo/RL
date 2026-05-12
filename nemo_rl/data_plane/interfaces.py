@@ -44,7 +44,7 @@ class DataPlaneConfig(TypedDict):
     controller_address: NotRequired[str]
     storage_capacity: NotRequired[int]
     num_storage_units: NotRequired[int]
-    get_meta_poll_interval_s: NotRequired[float]
+    claim_meta_poll_interval_s: NotRequired[float]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
 
@@ -73,7 +73,7 @@ class KVBatchMeta:
     our object unmodified.
 
     Two roles:
-      * Result type returned by :meth:`DataPlaneClient.get_meta` — callers
+      * Result type returned by :meth:`DataPlaneClient.claim_meta` — callers
         extract ``.keys`` / ``.partition_id`` and pass them to
         :meth:`kv_batch_get` / :meth:`get_data`.
       * Argument type for the per-DP-rank fetch entrypoints.
@@ -164,7 +164,7 @@ class DataPlaneClient(ABC):
 
     A. *Task-mediated* — used by stages that wait for upstream production
        via the per-task consumer counter:
-       :meth:`register_partition`, :meth:`get_meta`, :meth:`get_data`,
+       :meth:`register_partition`, :meth:`claim_meta`, :meth:`get_data`,
        :meth:`check_consumption_status`.
     B. *Direct-by-key* — used by stages that already know the exact uids
        (e.g. driver-side fan-out to DP ranks):
@@ -199,7 +199,7 @@ class DataPlaneClient(ABC):
         """
 
     @abstractmethod
-    def get_meta(
+    def claim_meta(
         self,
         partition_id: str,
         task_name: str,
@@ -209,13 +209,17 @@ class DataPlaneClient(ABC):
         blocking: bool = True,
         timeout_s: float = 60.0,
     ) -> KVBatchMeta:
-        """Discover samples ready for ``task_name``.
+        """Discover and **claim** up to ``batch_size`` ready samples for ``task_name``.
 
-        Advances TQ's per-task consumption counter as a side effect of the
-        underlying ``mode='fetch'`` call. ``dp_rank`` is preserved on the
-        ABC for forward compatibility but the current path uses
-        driver-side balancing via :func:`shard_meta_for_dp` instead of
-        TQ's ``RankAwareSampler``.
+        Side effect: advances ``task_name``'s per-sample consumption cursor
+        for the returned uids (TQ's ``mode='fetch'``). Subsequent
+        :meth:`claim_meta` calls for the same task will not return these
+        uids again. Does NOT delete samples — they remain readable via
+        :meth:`kv_batch_get` until :meth:`kv_clear`.
+
+        ``dp_rank`` is preserved on the ABC for forward compatibility but
+        the current path uses driver-side balancing via
+        :func:`shard_meta_for_dp` instead of TQ's ``RankAwareSampler``.
         """
 
     @abstractmethod
@@ -273,7 +277,7 @@ class DataPlaneClient(ABC):
         """Direct fetch by uids.
 
         Used by per-DP-rank slice fetches. Does NOT advance any per-task
-        consumption counter — that only happens via :meth:`get_meta`.
+        consumption cursor — that only happens via :meth:`claim_meta`.
         """
 
     @abstractmethod

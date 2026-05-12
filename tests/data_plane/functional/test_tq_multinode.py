@@ -83,7 +83,7 @@ def test_multinode_round_trip() -> None:
 
         ray.get(produce.remote(["a", "b", "c", "d"]))
 
-        meta = driver.get_meta(
+        meta = driver.claim_meta(
             partition_id="mn",
             task_name="read",
             required_fields=["x"],
