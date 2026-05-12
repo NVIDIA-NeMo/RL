@@ -115,17 +115,18 @@ def main():
 
     is_random_dataset = config["data"].get("dataset_name") == "random"
 
-    # For the random path we don't need real model weights — vLLM can use dummy
-    # weights since outputs are not validated against any ground truth.
-    if is_random_dataset:
-        config["generation"]["vllm_cfg"]["load_format"] = "dummy"
-
     # Setup tokenizer — get_tokenizer handles both text-only and multimodal
     is_multimodal = _is_multimodal_dataset(config["data"]["dataset_name"])
     tokenizer = get_tokenizer(config["tokenizer"], get_processor=is_multimodal)
     config["generation"] = configure_generation_config(
         config["generation"], tokenizer, is_eval=True
     )
+
+    # configure_generation_config sets load_format to 'auto' based on is_eval. 
+    # But for the random dataset case, we don't need real model weights — vLLM can use dummy
+    # weights since outputs are not validated against any ground truth.
+    if is_random_dataset:
+        config["generation"]["vllm_cfg"]["load_format"] = "dummy"
 
     # Setup data
     (
