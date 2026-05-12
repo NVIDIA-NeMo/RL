@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data_plane.codec import (
     META_OBJECT_FIELDS,
     materialize,
@@ -64,13 +65,15 @@ def read_columns(
         select_fields=list(select_fields),
     )
     pad_mult = int((meta.extra_info or {}).get("pad_to_multiple", 1))
-    return materialize(
+    data = materialize(
         td,
         layout=layout,
         pad_value_dict=pad_value_dict,
         pad_to_multiple=pad_mult,
         object_fields=select_object_fields(meta, select_fields),
     )
+    attach_message_log_view(data)
+    return data
 
 
 def write_columns(

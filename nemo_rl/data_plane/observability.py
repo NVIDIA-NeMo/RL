@@ -19,7 +19,10 @@ callback on each operation. Each event is a flat dict::
     {"op", "partition_id", "n_keys", "n_bytes", "wall_ms", "status"}
 
 Plug wandb / file logging / debug print at the call site by passing
-``on_event=<your function>``. ``snapshot()`` returns cumulative totals.
+``on_event=<your function>``. ``snapshot()`` returns cumulative
+totals **plus** live memory consumption: ``bytes_outstanding`` (sum of
+bytes currently held in TQ, i.e. put minus cleared) and
+``peak_bytes_outstanding`` (high-water mark over the run lifetime).
 """
 
 from __future__ import annotations
@@ -70,10 +73,67 @@ class MetricsDataPlaneClient(DataPlaneClient):
             "total_bytes": 0,
             "total_keys": 0,
             "total_ops": 0,
+            "bytes_outstanding": 0,
+            "peak_bytes_outstanding": 0,
+            # Anomaly trackers — a wire-format regression that bloats
+            # bytes per row (cf. message_log view-aliasing pickle bug)
+            # shows up as a sudden spike in ``max_bytes_per_key_seen``.
+            "max_bytes_per_key_seen": 0,
+            "last_put_bytes_per_key": 0,
         }
+        # Nested per-partition / per-key live byte counts. Populated on
+        # successful ``kv_batch_put``; popped on successful ``kv_clear``.
+        # Bounded by the live key population, not cumulative traffic.
+        self._bytes_by_partition: dict[str, dict[str, int]] = {}
 
     def snapshot(self) -> dict[str, Any]:
-        return dict(self._stats)
+        """Cumulative totals plus live ``bytes_outstanding`` / ``peak_bytes_outstanding``."""
+        out = dict(self._stats)
+        out["n_keys_outstanding"] = sum(
+            len(d) for d in self._bytes_by_partition.values()
+        )
+        return out
+
+    def bytes_outstanding_by_partition(self) -> dict[str, int]:
+        """Per-partition breakdown of currently-held bytes."""
+        return {p: sum(d.values()) for p, d in self._bytes_by_partition.items()}
+
+    def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:
+        """Attribute put bytes per key so a later ``kv_clear`` can subtract.
+
+        Called *after* the underlying RPC succeeds so a failed put never
+        leaves the accounting inflated.
+        """
+        if not keys or n_bytes <= 0:
+            return
+        per_key, remainder = divmod(n_bytes, len(keys))
+        partition_dict = self._bytes_by_partition.setdefault(partition_id, {})
+        for i, key in enumerate(keys):
+            share = per_key + (1 if i < remainder else 0)
+            partition_dict[key] = partition_dict.get(key, 0) + share
+        self._stats["bytes_outstanding"] += n_bytes
+        if self._stats["bytes_outstanding"] > self._stats["peak_bytes_outstanding"]:
+            self._stats["peak_bytes_outstanding"] = self._stats["bytes_outstanding"]
+
+    def _record_clear(self, partition_id: str, keys: list[str] | None) -> None:
+        """Reverse the put accounting for ``keys`` (``None`` clears the partition).
+
+        Called *after* the underlying RPC succeeds so a failed clear
+        keeps the accounting consistent with TQ's actual state.
+        """
+        partition_dict = self._bytes_by_partition.get(partition_id)
+        if partition_dict is None:
+            return
+        if keys is None:
+            freed = sum(partition_dict.values())
+            del self._bytes_by_partition[partition_id]
+        else:
+            freed = 0
+            for key in keys:
+                freed += partition_dict.pop(key, 0)
+            if not partition_dict:
+                del self._bytes_by_partition[partition_id]
+        self._stats["bytes_outstanding"] -= freed
 
     def _run(
         self,
@@ -123,6 +183,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
             self._stats["total_bytes"] += n_bytes
             self._stats["total_keys"] += n_keys
             self._stats["total_ops"] += 1
+            if op == "put" and n_keys:
+                per_key = n_bytes // n_keys
+                self._stats["last_put_bytes_per_key"] = per_key
+                if per_key > self._stats["max_bytes_per_key_seen"]:
+                    self._stats["max_bytes_per_key_seen"] = per_key
 
     def register_partition(
         self,
@@ -187,18 +252,24 @@ class MetricsDataPlaneClient(DataPlaneClient):
         return self._inner.check_consumption_status(partition_id, task_names)
 
     def kv_batch_put(self, keys, partition_id, fields=None, tags=None):
-        return self._run(
+        n_bytes = _td_bytes(fields)
+        # Materialize keys once: ``_run`` consumes its lambda and we
+        # also need to attribute bytes per key after success.
+        keys_list = keys if isinstance(keys, list) else list(keys)
+        out = self._run(
             "put",
             partition_id,
-            len(keys),
-            _td_bytes(fields),
+            len(keys_list),
+            n_bytes,
             lambda: self._inner.kv_batch_put(
-                keys,
+                keys_list,
                 partition_id,
                 fields=fields,
                 tags=tags,
             ),
         )
+        self._record_put(partition_id, keys_list, n_bytes)
+        return out
 
     def kv_batch_get(self, keys, partition_id, select_fields=None):
         return self._run(
@@ -214,14 +285,18 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
 
     def kv_clear(self, keys, partition_id):
-        n_keys = len(keys) if keys is not None else 0
+        keys_list = (
+            keys if (keys is None or isinstance(keys, list)) else list(keys)
+        )
+        n_keys = len(keys_list) if keys_list is not None else 0
         self._run(
             "clear",
             partition_id,
             n_keys,
             0,
-            lambda: self._inner.kv_clear(keys, partition_id),
+            lambda: self._inner.kv_clear(keys_list, partition_id),
         )
+        self._record_clear(partition_id, keys_list)
 
     def close(self) -> None:
         self._inner.close()

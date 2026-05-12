@@ -34,6 +34,7 @@ import torch
 FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 Layout = Literal["padded", "jagged"]
 
+from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -232,6 +233,9 @@ class TQWorkerMixin:
                 src=leader,
                 group=replica_group,
             )
+            # Reconstruct message_log after broadcast so the views alias
+            # the per-rank local ``input_ids`` rather than the leader's.
+            attach_message_log_view(data)
             if preprocess is not None:
                 data = preprocess(self, data)
             return data
@@ -248,6 +252,7 @@ class TQWorkerMixin:
             pad_to_multiple=pad_to_multiple,
             object_fields=obj_fields,
         )
+        attach_message_log_view(data)
         if preprocess is not None:
             data = preprocess(self, data)
         return data

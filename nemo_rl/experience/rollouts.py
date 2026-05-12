@@ -96,7 +96,10 @@ def generate_responses(
 
     generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
-    # Append to message log
+    # Per-row slices alias the vllm output arena; safe in the data-plane
+    # path because `sync_rollout_actor.rollout_to_tq` calls
+    # `decompose_message_log` before the wire, so no tensor reaches
+    # per-row pickle.
     for i, (text, input_length, total_length) in enumerate(
         zip(generated_texts, input_lengths, unpadded_sequence_lengths)
     ):
@@ -198,7 +201,7 @@ async def generate_responses_async(
 
     generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
-    # Append to message log
+    # Slice aliasing safe; see sync version above.
     for i, (text, input_length, total_length) in enumerate(
         zip(generated_texts, input_lengths, unpadded_sequence_lengths)
     ):
