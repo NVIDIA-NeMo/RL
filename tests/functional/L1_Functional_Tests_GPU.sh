@@ -46,7 +46,7 @@ run_test      uv run --no-sync bash ./tests/functional/dpo_automodel_lora.sh
 run_test fast uv run --no-sync bash ./tests/functional/dpo_megatron_lora.sh
 run_test      uv run --no-sync bash ./tests/functional/dpo_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/eval.sh
-run_test      uv run --no-sync bash ./tests/functional/eval_random_dataset.sh
+run_test fast uv run --no-sync bash ./tests/functional/eval_random_dataset.sh
 run_test      uv run --no-sync bash ./tests/functional/eval_async.sh
 run_test fast uv run --no-sync bash ./tests/functional/eval_audio.sh
 run_test fast uv run --no-sync bash ./tests/functional/gdpo.sh
