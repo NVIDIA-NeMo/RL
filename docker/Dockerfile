@@ -44,6 +44,17 @@ apt-get install -y --no-install-recommends \
     wget \
     less \
     vim \
+    libfuse3-3 \
+    uidmap \
+    squashfs-tools \
+    fakeroot \
+
+# Apptainer (for SWE-bench singularity sandbox)
+cd /tmp \
+    && wget --no-check-certificate -q https://github.com/apptainer/apptainer/releases/download/v1.3.1/apptainer_1.3.1_amd64.deb \
+    && apt install -y ./apptainer_1.3.1_amd64.deb \
+    && ln -sf /usr/bin/apptainer /usr/bin/singularity \
+    && rm -f /tmp/apptainer_1.3.1_amd64.deb
 
 # Nsight
 apt install -y --no-install-recommends gnupg
