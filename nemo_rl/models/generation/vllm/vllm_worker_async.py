@@ -312,6 +312,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         from vllm.entrypoints.openai.engine.protocol import ErrorResponse
         from vllm.entrypoints.openai.models.protocol import BaseModelPath
         from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+        from vllm.entrypoints.serve.render.serving import OpenAIServingRender
         from vllm.entrypoints.serve.tokenize.protocol import (
             TokenizeChatRequest,
             TokenizeCompletionRequest,
@@ -481,10 +482,21 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
+        openai_serving_render = OpenAIServingRender(
+            model_config=engine_client.model_config,
+            renderer=engine_client.renderer,
+            model_registry=openai_serving_models.registry,
+            request_logger=serving_chat_kwargs["request_logger"],
+            chat_template=serving_chat_kwargs["chat_template"],
+            chat_template_content_format=serving_chat_kwargs[
+                "chat_template_content_format"
+            ],
+        )
         serving_chat_kwargs.update(
             dict(
                 engine_client=engine_client,
                 models=openai_serving_models,
+                openai_serving_render=openai_serving_render,
                 return_tokens_as_token_ids=True,
             )
         )
@@ -551,6 +563,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             ],
             engine_client=serving_chat_kwargs["engine_client"],
             models=serving_chat_kwargs["models"],
+            openai_serving_render=openai_serving_render,
         )
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
             **serving_tokenization_kwargs
