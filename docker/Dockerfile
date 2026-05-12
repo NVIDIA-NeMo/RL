@@ -105,8 +105,10 @@ ARG BUILD_CUSTOM_FLASHINFER_REF
 # Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
-# Re-declared so the RUN block can invalidate the uv cache when the base image changes
+# Re-declared so the RUN block can invalidate the uv cache when the base image
+# or uv version changes (compiled wheels may be incompatible across either).
 ARG BASE_IMAGE
+ARG UV_VERSION
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
@@ -128,20 +130,21 @@ COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh --mount=type=cache,target=/tmp/uv-warm-cache <<"EOF" bash -exu
-# Invalidate persistent cache when base image changes (compiled CUDA kernels
-# are ABI-incompatible across CUDA toolkit versions).
-BASE_IMAGE_HASH=$(echo "${BASE_IMAGE}" | md5sum | cut -c1-12)
-if [ -f /tmp/uv-warm-cache/.base-image-hash ]; then
-    if [ "$(cat /tmp/uv-warm-cache/.base-image-hash)" != "${BASE_IMAGE_HASH}" ]; then
-        echo "Base image changed (${BASE_IMAGE}) — clearing stale uv cache"
-        rm -rf /tmp/uv-warm-cache/*
+# Invalidate persistent cache when base image or uv version changes (compiled
+# CUDA kernels are ABI-incompatible across toolkit versions, and uv cache
+# format may change across uv versions).
+CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}" | md5sum | cut -c1-12)
+if [ -f /tmp/uv-warm-cache/.cache-key ]; then
+    if [ "$(cat /tmp/uv-warm-cache/.cache-key)" != "${CACHE_KEY}" ]; then
+        echo "Cache key changed (base=${BASE_IMAGE}, uv=${UV_VERSION}) — clearing stale uv cache"
+        find /tmp/uv-warm-cache -mindepth 1 -delete
     fi
 fi
 
 # Seed uv cache from persistent BuildKit cache to avoid recompiling CUDA kernels
 # (e.g. sglang-kernel ~90 min) when only unrelated deps changed in pyproject.toml.
 mkdir -p /root/.cache/uv
-rsync -a /tmp/uv-warm-cache/ /root/.cache/uv/ 2>/dev/null || true
+rsync -a --exclude='.cache-key' /tmp/uv-warm-cache/ /root/.cache/uv/ 2>/dev/null || true
 
 uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
@@ -177,7 +180,7 @@ find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_f
 # Persist the uv cache back to the BuildKit cache mount for future builds.
 # --delete ensures stale entries (e.g. CVE-cleaned aiohttp) don't re-seed.
 rsync -a --delete /root/.cache/uv/ /tmp/uv-warm-cache/ || true
-echo "${BASE_IMAGE_HASH}" > /tmp/uv-warm-cache/.base-image-hash
+echo "${CACHE_KEY}" > /tmp/uv-warm-cache/.cache-key || true
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
