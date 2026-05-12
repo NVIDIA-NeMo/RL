@@ -6,7 +6,7 @@ when_to_use: auto research; run experiments; test these hypotheses; find a bette
 
 # Auto Research
 
-Run iterative NeMo RL experiments in this repository with accuracy as the objective and git as the ledger.
+Run iterative NeMo RL experiments in this repository against the user's stated objective, such as accuracy, reward, throughput, latency, stability, or another recipe-specific metric, with git as the research ledger.
 
 Treat dependencies as ready, but choose the runtime deliberately. Use the recipe's authoritative metric as the source of truth. Keep changes small, reproducible, and simple. Preserve unrelated user work.
 
