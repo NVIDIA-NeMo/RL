@@ -16,7 +16,7 @@
 
 import json
 import logging
-from typing import Any, Dict, cast
+from typing import Any, Dict, Optional, cast
 
 import torch
 from transformers import AutoProcessor, PreTrainedTokenizerBase
@@ -32,6 +32,132 @@ from nemo_rl.data.interfaces import (
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+def _normalize_nemo_gym_message_content(
+    content: str | list[dict[str, Any]] | None,
+) -> str | list[dict[str, Any]] | None:
+    """Convert NeMo-Gym Responses-style content into NeMo-RL VLM content.
+
+    NeMo-Gym uses OpenAI Responses-style content parts such as `input_text` and
+    `input_image`. NeMo-RL's processor-backed VLM path expects `text` and
+    `image` items instead.
+    """
+    if not isinstance(content, list):
+        return content
+
+    normalized_content = []
+    for part in content:
+        part_type = part["type"]
+        if part_type == "input_text":
+            normalized_content.append({"type": "text", "text": part["text"]})
+        elif part_type == "input_image":
+            normalized_content.append({"type": "image", "image": part["image_url"]})
+        elif part_type in {"text", "image", "audio", "video"}:
+            normalized_content.append(part)
+        else:
+            raise NotImplementedError(
+                f"Unsupported NeMo-Gym VLM content type: {part_type}"
+            )
+
+    return normalized_content
+
+
+def _nemo_gym_prompt_contains_media(input_messages: list[dict[str, Any]]) -> bool:
+    """Return whether the Responses input contains multimodal content."""
+    for message in input_messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if part["type"] in {"input_image", "image", "audio", "video"}:
+                return True
+    return False
+
+
+def build_nemo_gym_vlm_prompt_message(
+    input_messages: list[dict[str, Any]],
+    processor: AutoProcessor,
+    prompt_token_ids: list[int | str],
+    *,
+    tools: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Build a processor-backed NeMo-RL prompt message from NeMo-Gym input.
+
+    This helper bridges NeMo-Gym's Responses-style prompt schema to NeMo-RL's
+    VLM training representation. It also validates that the reconstructed
+    processor prompt matches NeMo-Gym's canonical `prompt_token_ids`.
+    """
+    from nemo_rl.data.multimodal_utils import (
+        PackedTensor,
+        get_dim_to_pack_along,
+        get_multimodal_keys_from_processor,
+    )
+
+    normalized_messages = []
+    for message in input_messages:
+        message_type = message.get("type")
+        if message_type not in (None, "message"):
+            raise NotImplementedError(
+                f"Unsupported NeMo-Gym prompt item type for VLM reconstruction: {message_type}"
+            )
+        normalized_messages.append(
+            {
+                "role": message["role"],
+                "content": _normalize_nemo_gym_message_content(message.get("content")),
+            }
+        )
+
+    prompt_kwargs = dict(
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+    )
+    if tools is not None:
+        prompt_kwargs["tools"] = tools
+
+    processed_prompt: dict[str, Any] = processor.apply_chat_template(
+        normalized_messages, **prompt_kwargs
+    )
+
+    expected_prompt_token_ids = torch.tensor(
+        [int(token_id) for token_id in prompt_token_ids], dtype=torch.long
+    )
+    actual_prompt_token_ids = processed_prompt["input_ids"][0].to(torch.long)
+    if not torch.equal(actual_prompt_token_ids.cpu(), expected_prompt_token_ids):
+        raise ValueError(
+            "NeMo-Gym VLM prompt reconstruction does not match Gym prompt_token_ids. "
+            f"Expected {len(expected_prompt_token_ids)} prompt tokens but reconstructed "
+            f"{len(actual_prompt_token_ids)} tokens."
+        )
+
+    prompt_message = {
+        "role": "user",
+        "content": "",
+        "token_ids": actual_prompt_token_ids,
+    }
+    multimodal_keys = get_multimodal_keys_from_processor(processor)
+    for key in multimodal_keys:
+        if key in processed_prompt:
+            prompt_message[key] = PackedTensor(
+                processed_prompt[key],
+                dim_to_pack=get_dim_to_pack_along(processor, key),
+            )
+
+    if "token_type_ids" in processed_prompt:
+        prompt_message["token_type_ids"] = processed_prompt["token_type_ids"][0]
+    if "mm_token_type_ids" in processed_prompt:
+        prompt_message["mm_token_type_ids"] = processed_prompt["mm_token_type_ids"][0]
+
+    if _nemo_gym_prompt_contains_media(input_messages) and not any(
+        key in prompt_message for key in multimodal_keys
+    ):
+        raise ValueError(
+            "NeMo-Gym VLM prompt reconstruction dropped multimodal processor outputs."
+        )
+
+    return prompt_message
 
 
 def helpsteer3_data_processor(

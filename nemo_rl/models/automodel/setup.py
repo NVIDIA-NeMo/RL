@@ -188,16 +188,18 @@ def get_tokenizer(
     else:
         print("No chat template provided, using tokenizer's default")
 
-    if (
-        "chat_template_kwargs" in tokenizer_config
-        and tokenizer_config["chat_template_kwargs"] is not None
-    ):
-        assert isinstance(tokenizer_config["chat_template_kwargs"], dict), (
+    chat_template_kwargs = tokenizer_config.get("chat_template_kwargs")
+    if chat_template_kwargs is not None:
+        assert isinstance(chat_template_kwargs, dict), (
             "chat_template_kwargs should be a dictionary"
         )
         tokenizer.apply_chat_template = partial(
-            tokenizer.apply_chat_template, **tokenizer_config["chat_template_kwargs"]
+            tokenizer.apply_chat_template, **chat_template_kwargs
         )
+        if processor is not None and hasattr(processor, "apply_chat_template"):
+            processor.apply_chat_template = partial(
+                processor.apply_chat_template, **chat_template_kwargs
+            )
 
     if processor is not None:
         processor.pad_token = tokenizer.pad_token
