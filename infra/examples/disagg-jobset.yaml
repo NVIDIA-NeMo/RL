@@ -38,7 +38,7 @@ kind: JobSet
 metadata:
   name: disagg-job
   labels:
-    kai.scheduler/queue: high-prio
+    kai.scheduler/queue: rl
 spec:
   network:
     enableDNSHostnames: true

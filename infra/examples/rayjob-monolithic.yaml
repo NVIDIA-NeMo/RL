@@ -15,7 +15,7 @@ kind: RayJob
 metadata:
   name: sft-job
   labels:
-    kai.scheduler/queue: high-prio
+    kai.scheduler/queue: rl
 spec:
   entrypoint: "bash tests/functional/sft.sh"
   submissionMode: HTTPMode     # K8sJobMode breaks KAI gang scheduling
