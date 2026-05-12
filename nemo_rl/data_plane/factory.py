@@ -21,17 +21,22 @@ from nemo_rl.data_plane.interfaces import DataPlaneClient, DataPlaneConfig
 def build_data_plane_client(
     cfg: DataPlaneConfig | None, *, bootstrap: bool = True
 ) -> DataPlaneClient:
-    """Construct a TransferQueue-backed client.
+    """Construct the configured data-plane client.
 
-    Callers should reach this function only when the TQ-mediated trainer
+    Dispatches on ``cfg["impl"]``. ``impl == "transfer_queue"`` is the
+    only implementation today; other adapters can be added behind this
+    factory without touching call sites.
+
+    Callers should reach this function only when the sync trainer
     (``grpo_sync``) is in use — the legacy trainer never touches the
     data plane and therefore should not call the factory at all. There
     is intentionally no NoOp fallback here: a NoOp client running inside
     ``grpo_sync`` would silently divorce the per-step lifecycle from the
     storage backend the trainer is meant to exercise.
 
-    ``bootstrap`` is honored by the TransferQueue adapter:
-      * True (driver, default): bootstraps the TQ controller from ``cfg``.
+    ``bootstrap`` is honored by adapters that distinguish a controller
+    process from worker processes (the ``transfer_queue`` adapter does):
+      * True (driver, default): bootstraps the controller from ``cfg``.
       * False (worker process): connects this process to the existing
         controller — workers must use this so they don't try to create a
         second named actor in the Ray cluster.
