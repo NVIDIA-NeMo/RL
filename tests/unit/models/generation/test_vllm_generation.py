@@ -23,7 +23,6 @@ import ray
 import requests
 import torch
 
-from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -34,12 +33,27 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
+from nemo_rl.weight_sync import create_weight_synchronizer
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
     _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+
+
+def sync_weights(policy, generation, colocated, refit_buffer_size_gb=None):
+    """Create a weight synchronizer and sync weights from policy to generation."""
+    ws = create_weight_synchronizer(
+        policy=policy,
+        generation=generation,
+        generation_backend="vllm",
+        colocated=colocated,
+        refit_buffer_size_gb=refit_buffer_size_gb,
+    )
+    ws.init_communicator()
+    ws.sync_weights()
+
 
 model_name = "Qwen/Qwen3-0.6B"
 # Define basic vLLM test config
@@ -605,7 +619,7 @@ async def test_vllm_policy_generation_async(
         async_policy.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
-        refit_policy_generation(
+        sync_weights(
             lm_policy, async_policy, vllm_config["colocated"]["enabled"]
         )
 
@@ -706,7 +720,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
     policy.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
-    refit_policy_generation(lm_policy, policy, vllm_config["colocated"]["enabled"])
+    sync_weights(lm_policy, policy, vllm_config["colocated"]["enabled"])
 
     try:
         # Generate with duplicated prompts
@@ -845,7 +859,7 @@ async def run_hf_train_process(
         )
 
         print("refitting vllm policy...")
-        refit_policy_generation(lm_policy, vllm_policy, colocated)
+        sync_weights(lm_policy, vllm_policy, colocated)
 
         # Step 1: Use vLLM for generation
         print("Using vLLM policy for fast generation...")
@@ -956,7 +970,7 @@ async def run_hf_train_process(
         print(f"Training loss: {results['loss']}")
 
         lm_policy.finish_training()
-        refit_policy_generation(lm_policy, vllm_policy, colocated)
+        sync_weights(lm_policy, vllm_policy, colocated)
 
         # Step 4: Use vLLM for generation again to complete the workflow
         print("Using vLLM for generation again...")
@@ -1889,11 +1903,11 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     # reset peak memory stats before refit
     workers = lm_policy.worker_group.workers
     ray.get([w.reset_peak_memory_stats.remote() for w in workers])
-    refit_policy_generation(
+    sync_weights(
         lm_policy,
         vllm_policy,
         vllm_config["colocated"]["enabled"],
-        _refit_buffer_size_gb=1.5,
+        refit_buffer_size_gb=1.5,
     )
     gpu_infos = ray.get([w.get_gpu_info.remote() for w in workers])
 
@@ -1958,7 +1972,7 @@ def test_vllm_generation_with_stop(cluster, test_input_data, tokenizer, is_eval)
         vllm_generation.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
-        refit_policy_generation(
+        sync_weights(
             lm_policy, vllm_generation, vllm_config["colocated"]["enabled"]
         )
 
@@ -2097,7 +2111,7 @@ async def test_vllm_refit_non_colocated_update_weights(
     vllm_generation.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
-    refit_policy_generation(lm_policy, vllm_generation, False)
+    sync_weights(lm_policy, vllm_generation, False)
 
     # test generate
     if async_engine:
@@ -2231,7 +2245,7 @@ def test_vllm_generation_with_megatron_training(
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM policy with Megatron weights...")
-        refit_policy_generation(
+        sync_weights(
             megatron_policy, vllm_policy, vllm_config["colocated"]["enabled"]
         )
 
@@ -2403,7 +2417,7 @@ def test_vllm_generation_with_megatron_training_moe_model(
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM policy with Megatron weights...")
-        refit_policy_generation(
+        sync_weights(
             megatron_policy, vllm_policy, vllm_config["colocated"]["enabled"]
         )
 
@@ -2536,11 +2550,11 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     workers = megatron_policy.worker_group.workers
     ray.get([w.reset_peak_memory_stats.remote() for w in workers])
 
-    refit_policy_generation(
+    sync_weights(
         megatron_policy,
         vllm_policy,
         vllm_config["colocated"]["enabled"],
-        _refit_buffer_size_gb=1.5,
+        refit_buffer_size_gb=1.5,
     )
 
     gpu_infos = ray.get([w.get_gpu_info.remote() for w in workers])
@@ -2638,7 +2652,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM with Megatron PP=2 weights...")
-        refit_policy_generation(
+        sync_weights(
             megatron_policy, vllm_policy, vllm_config["colocated"]["enabled"]
         )
 
@@ -2704,7 +2718,7 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
         vllm_generation.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
-        refit_policy_generation(
+        sync_weights(
             megatron_policy, vllm_generation, vllm_config["colocated"]["enabled"]
         )
 

@@ -321,8 +321,8 @@ def test_sglang_worker_seed_behavior(cluster, tokenizer):
     Key: Use gpus_per_server=1 to create 2 independent SGLang servers (each with its own seed),
     rather than 1 server with TP=2.
     """
-    from nemo_rl.algorithms.grpo import refit_policy_generation
     from nemo_rl.models.policy.lm_policy import Policy
+    from nemo_rl.weight_sync import create_weight_synchronizer
 
     unique_prompts = [
         "Hello, my name is",
@@ -371,7 +371,14 @@ def test_sglang_worker_seed_behavior(cluster, tokenizer):
     policy.prepare_refit_info(state_dict_info)
 
     print("Refitting SGLang policy...")
-    refit_policy_generation(lm_policy, policy, sglang_config["colocated"]["enabled"])
+    ws = create_weight_synchronizer(
+        policy=lm_policy,
+        generation=policy,
+        generation_backend="sglang",
+        colocated=sglang_config["colocated"]["enabled"],
+    )
+    ws.init_communicator()
+    ws.sync_weights()
 
     try:
         # Generate with duplicated prompts
@@ -689,8 +696,8 @@ def test_sglang_non_divisible_batch_handling(policy):
 @pytest.mark.timeout(300)
 def test_sglang_generation_with_hf_training_colocated(cluster, tokenizer):
     """Test that DTensor policy can work together with colocated SGLang policy."""
-    from nemo_rl.algorithms.grpo import refit_policy_generation
     from nemo_rl.models.policy.lm_policy import Policy
+    from nemo_rl.weight_sync import create_weight_synchronizer
 
     sglang_config = deepcopy(basic_sglang_test_config)
     sglang_config = configure_sglang_config(sglang_config, tokenizer)
@@ -712,14 +719,15 @@ def test_sglang_generation_with_hf_training_colocated(cluster, tokenizer):
         print("Creating DTensor policy...")
         lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
-        print("Preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info()
-        sglang_policy.prepare_refit_info(state_dict_info)
-
-        print("Refitting SGLang policy...")
-        refit_policy_generation(
-            lm_policy, sglang_policy, sglang_config["colocated"]["enabled"]
+        print("Syncing SGLang policy...")
+        ws = create_weight_synchronizer(
+            policy=lm_policy,
+            generation=sglang_policy,
+            generation_backend="sglang",
+            colocated=sglang_config["colocated"]["enabled"],
         )
+        ws.init_communicator()
+        ws.sync_weights()
 
         # Test generation
         test_prompts = ["Hello, my name is", "The capital of France is"]
@@ -760,8 +768,8 @@ def test_sglang_generation_with_hf_training_non_colocated(
     policy_cluster_separate, tokenizer
 ):
     """Test that DTensor policy can work together with non-colocated SGLang policy."""
-    from nemo_rl.algorithms.grpo import refit_policy_generation
     from nemo_rl.models.policy.lm_policy import Policy
+    from nemo_rl.weight_sync import create_weight_synchronizer
 
     generation_cluster_separate = get_generation_cluster_separate(2)
 
@@ -787,26 +795,17 @@ def test_sglang_generation_with_hf_training_non_colocated(
         print("Creating DTensor policy...")
         lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
 
-        # Initialize collective communication
-        ip, port = policy_cluster_separate.get_master_address_and_port()
-        train_world_size = policy_cluster_separate.world_size()
-        inference_world_size = generation_cluster_separate.world_size()
-        world_size = train_world_size + inference_world_size
-
-        futures_train = lm_policy.init_collective(
-            ip, port, world_size=world_size, train_world_size=train_world_size
+        print("Syncing SGLang policy...")
+        ws = create_weight_synchronizer(
+            policy=lm_policy,
+            generation=sglang_policy,
+            generation_backend="sglang",
+            colocated=False,
+            train_cluster=policy_cluster_separate,
+            inference_cluster=generation_cluster_separate,
         )
-        futures_inference = sglang_policy.init_collective(
-            ip, port, world_size=world_size, train_world_size=train_world_size
-        )
-        ray.get(futures_train + futures_inference)
-
-        # Prepare refit info
-        state_dict_info = lm_policy.prepare_refit_info()
-        sglang_policy.prepare_refit_info(state_dict_info)
-
-        print("Refitting SGLang policy...")
-        refit_policy_generation(lm_policy, sglang_policy, False)
+        ws.init_communicator()
+        ws.sync_weights()
 
         # Test generation
         test_prompts = ["Hello, my name is", "The capital of France is"]

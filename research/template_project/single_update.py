@@ -35,21 +35,15 @@ from omegaconf import OmegaConf
 from rich.pretty import pprint
 from template_project.data_utils import create_batch_from
 
-from nemo_rl.algorithms.grpo import MasterConfig, refit_policy_generation
+from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.ray_actor_environment_registry import (
-    ACTOR_ENVIRONMENT_REGISTRY,
-)
-from nemo_rl.distributed.virtual_cluster import (
-    PY_EXECUTABLES,
-    RayVirtualCluster,
-    init_ray,
-)
-from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, init_ray
+from nemo_rl.models.generation import configure_generation_config, create_generation
+from nemo_rl.models.generation.constants import MEGATRON_BACKEND
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.weight_sync import create_weight_synchronizer
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -80,20 +74,19 @@ def main(config: MasterConfig) -> None:
         use_gpus=True,
         num_gpus_per_node=config.cluster["gpus_per_node"],
         max_colocated_worker_groups=1
-        if policy_config["generation"]["backend"] == "megatron"
+        if policy_config["generation"]["backend"] == MEGATRON_BACKEND
         else 2,
     )
 
-    # 2) Initialize vLLM generation first for a clean GPU environment
-    print("\n▶ Initializing vLLM generation...")
-    # Initialize vLLM directly from config
+    # 2) Initialize generation backend first for a clean GPU environment
+    backend = policy_config["generation"]["backend"]
+    print(f"\n▶ Initializing {backend} generation...")
     policy_config["generation"]["model_name"] = policy_config["model_name"]
-    policy_generation = VllmGeneration(
-        cluster=cluster, config=policy_config["generation"]
+    policy_generation = create_generation(
+        backend=backend, cluster=cluster, config=policy_config["generation"]
     )
-    # Pre-initialize workers to avoid contention later
     policy_generation.finish_generation()
-    print("  ✓ vLLM generation ready")
+    print(f"  ✓ {backend} generation ready")
 
     # 3) Initialize policy (LM)
     print("\n▶ Initializing LM Policy...")
@@ -106,22 +99,15 @@ def main(config: MasterConfig) -> None:
     )
     print("  ✓ Policy created")
 
-    # 4) Executes custom methods on all workers
-    # 4.1) Run a method on all workers in parallel with the same data
-    print("\n▶ Running a method on all workers in parallel with the same data...")
-    results = policy.run_all_workers_single_data("get_worker_rank")
-    print(f"  ✓ Results for get_worker_rank: {results}")
-
-    # 4.2) Run a method on all workers in parallel with different data
-    print("\n▶ Running a method on all workers in parallel with different data...")
-    worker_nums = config.cluster["gpus_per_node"] * config.cluster["num_nodes"]
-    input_list = [i for i in range(worker_nums)]
-    results = policy.run_all_workers_multiple_data("return_input", input=input_list)
-    print(f"  ✓ Results for return_input: {results}")
-
-    # Prepare refit info once before first refit
-    state_dict_info = policy.prepare_refit_info()
-    policy_generation.prepare_refit_info(state_dict_info or {})
+    # Set up weight synchronizer for transferring policy weights to generation
+    colocated = policy_config["generation"]["colocated"]["enabled"]
+    weight_sync = create_weight_synchronizer(
+        policy=policy,
+        generation=policy_generation,
+        generation_backend=backend,
+        colocated=colocated,
+    )
+    weight_sync.init_communicator()
 
     # Create tiny numeric batch and train with NLLLossFn
     print("\n▶ Creating tiny numeric batch and training with NLLLossFn...")
@@ -160,14 +146,9 @@ def main(config: MasterConfig) -> None:
             }
         )
 
-        # 5) Refits the generation engine with the latest policy weights
-        print("  • Refit generation with latest policy weights...")
-        refit_policy_generation(
-            policy=policy,
-            policy_generation=policy_generation,
-            colocated_inference=policy_config["generation"]["colocated"]["enabled"],
-        )
-        print("  ✓ Refit complete")
+        print("  • Syncing generation with latest policy weights...")
+        weight_sync.sync_weights()
+        print("  ✓ Sync complete")
 
         policy_generation.prepare_for_generation()
         gen_outputs = policy_generation.generate(

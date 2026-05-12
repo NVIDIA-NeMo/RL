@@ -34,9 +34,9 @@ from nemo_rl.algorithms.grpo import (
     TokenizerType,
     _should_use_nemo_gym,
     grpo_train,
-    refit_policy_generation,
     setup,
 )
+from nemo_rl.weight_sync import WeightSynchronizer
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -77,11 +77,13 @@ def collect_trajectories(
     val_task_to_env: dict[str, EnvironmentInterface],
     logger: Logger,
     master_config: MasterConfig,
+    weight_sync: WeightSynchronizer | None = None,
 ) -> None:
     """Run trajectory collection."""
-    # common config/state items
-    colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
-    refit_policy_generation(policy, policy_generation, colocated_inference)
+    if weight_sync is not None:
+        weight_sync.sync_weights()
+    else:
+        policy_generation.prepare_for_generation()
 
     log_filename = "trajectory_collection.jsonl"
 
@@ -231,6 +233,7 @@ The validation set you pass in will directly be used for validation with no addi
             val_task_to_env=val_task_to_env,
             logger=logger,
             master_config=master_config,
+            weight_sync=weight_sync,
         )
     # Check if async mode is enabled
     elif "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:

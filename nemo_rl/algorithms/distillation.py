@@ -50,10 +50,9 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
 )
-from nemo_rl.models.generation.interfaces import (
-    GenerationInterface,
-)
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation import create_generation
+from nemo_rl.models.generation.constants import MEGATRON_BACKEND, VLLM_BACKEND
+from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import OffloadMode, PolicyTrainerInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -298,7 +297,7 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=cluster_config["gpus_per_node"],
             max_colocated_worker_groups=1
-            if generation_config["backend"] == "megatron"
+            if generation_config["backend"] == MEGATRON_BACKEND
             else 3,
         )
         train_cluster = cluster
@@ -308,7 +307,7 @@ def setup(
             flush=True,
         )
     else:
-        assert generation_config["backend"] != "megatron", (
+        assert generation_config["backend"] != MEGATRON_BACKEND, (
             "Non-colocated inference is not supported for Megatron generation backends. "
             "Please use vLLM backend for generation."
         )
@@ -412,21 +411,22 @@ def setup(
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
-    if backend == "megatron":
+    if backend == MEGATRON_BACKEND:
         student_generation = None
-    elif backend == "vllm":
-        generation_config = cast(VllmConfig, generation_config)
-        if "vllm_cfg" in generation_config:
-            ## make vllm hf overrides match the training policy
-            generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
+    else:
+        if backend == VLLM_BACKEND and "vllm_cfg" in generation_config:
+            generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
                 "hf_config_overrides", {}
             )
-        student_generation = VllmGeneration(
-            cluster=inference_cluster, config=generation_config
+
+        student_generation = create_generation(
+            backend=backend,
+            cluster=inference_cluster,
+            config=generation_config,
         )
         student_generation.finish_generation()
         print(
-            f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
+            f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
             flush=True,
         )
 

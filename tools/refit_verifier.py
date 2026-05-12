@@ -72,12 +72,11 @@ import ray
 import torch
 from transformers import AutoTokenizer
 
-from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.models.generation import configure_generation_config, create_generation
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.weight_sync import create_weight_synchronizer
 
 
 def parse_args():
@@ -344,8 +343,10 @@ def setup_clusters_and_policies(args, megatron_config, vllm_config, tokenizer):
     )
 
     # Create vLLM policy for inference-only logprobs
-    vllm_inference_policy = VllmGeneration(
-        cluster=megatron_cluster, config=vllm_inference_config
+    vllm_inference_policy = create_generation(
+        backend=vllm_inference_config["backend"],
+        cluster=megatron_cluster,
+        config=vllm_inference_config,
     )
 
     return megatron_cluster, policy, vllm_inference_policy
@@ -397,14 +398,15 @@ def run_model_refitting(policy, vllm_inference_policy, refit_buffer_size_gb):
     """
     print("\n--- Performing Model Refitting ---")
 
-    # Perform the refitting between policies using GRPO's refit function
-    # Note: colocated_inference=True since we're using the same cluster
-    refit_policy_generation(
-        policy,
-        vllm_inference_policy,
-        colocated_inference=True,
-        _refit_buffer_size_gb=refit_buffer_size_gb,
+    weight_sync = create_weight_synchronizer(
+        policy=policy,
+        generation=vllm_inference_policy,
+        generation_backend="vllm",
+        colocated=True,
+        refit_buffer_size_gb=refit_buffer_size_gb,
     )
+    weight_sync.init_communicator()
+    weight_sync.sync_weights()
     print("Model refitting completed")
 
 

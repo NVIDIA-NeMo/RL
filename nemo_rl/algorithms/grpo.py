@@ -17,6 +17,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -69,9 +70,13 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.models.generation import create_generation
+from nemo_rl.models.generation.constants import (
+    MEGATRON_BACKEND,
+    SGLANG_BACKEND,
+    VLLM_BACKEND,
+)
 from nemo_rl.models.generation.interfaces import GenerationInterface
-from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import OffloadMode, PolicyTrainerInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -452,7 +457,7 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=policy_gpus_per_node,
             max_colocated_worker_groups=1
-            if generation_config["backend"] == "megatron"
+            if generation_config["backend"] == MEGATRON_BACKEND
             else 2,
         )
         train_cluster = cluster
@@ -463,7 +468,7 @@ def setup(
         )
 
     else:
-        assert generation_config["backend"] != "megatron", (
+        assert generation_config["backend"] != MEGATRON_BACKEND, (
             "Non-colocated inference is not supported for Megatron generation backends. "
             "Please use vLLM backend for generation."
         )
@@ -606,17 +611,14 @@ def setup(
         )
         return p, time.perf_counter() - t0
 
-    def init_vllm():
-        """Initialize vLLM generation workers."""
+    def init_generation():
+        """Initialize generation backend workers via the registry."""
         t0 = time.perf_counter()
-        pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
-        pg.finish_generation()
-        return pg, time.perf_counter() - t0
-
-    def init_sglang():
-        """Initialize SGLang generation workers."""
-        t0 = time.perf_counter()
-        pg = SGLangGeneration(cluster=inference_cluster, config=generation_config)
+        pg = create_generation(
+            backend=backend,
+            cluster=inference_cluster,
+            config=generation_config,
+        )
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
@@ -682,7 +684,7 @@ def setup(
         return policy_generation, policy
 
     # Handle generation-specific setup
-    if backend == "megatron":
+    if backend == MEGATRON_BACKEND:
         # Megatron generation: policy_generation is None, only initialize policy
         policy_generation = None
         print(
@@ -693,65 +695,46 @@ def setup(
         policy, policy_time = init_policy()
         worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
-    elif backend == "vllm":
-        # vLLM generation: setup config, then initialize with policy
-        generation_config = cast(VllmConfig, generation_config)
-        if generation_config["vllm_cfg"]["precision"] == "fp8":
-            assert loss_config.use_importance_sampling_correction, (
-                "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
-            )
-        if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
-            # FP8 KV cache requires FP8 model precision
-            assert generation_config["vllm_cfg"]["precision"] == "fp8", (
-                f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
-                "FP8 KV cache can only be used together with FP8 model weights."
-            )
-            # FP8 KV cache compatibility checks
-            assert policy_config["dtensor_cfg"]["enabled"] == False, (
-                "DTensor backend is not supported with kv cache fp8 enabled."
-            )
-            assert not _should_use_async_rollouts(master_config), (
-                "Async rollouts is not supported with kv cache fp8 enabled."
-            )
-            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
+    else:
+        # Backend-specific config validation / defaults
+        if backend == VLLM_BACKEND:
+            if generation_config["vllm_cfg"]["precision"] == "fp8":
+                assert loss_config["use_importance_sampling_correction"] is True, (
+                    "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
+                )
+            if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
+                assert generation_config["vllm_cfg"]["precision"] == "fp8", (
+                    f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
+                    "FP8 KV cache can only be used together with FP8 model weights."
+                )
+                assert policy_config["dtensor_cfg"]["enabled"] == False, (
+                    "DTensor backend is not supported with kv cache fp8 enabled."
+                )
+                assert not _should_use_async_rollouts(master_config), (
+                    "Async rollouts is not supported with kv cache fp8 enabled."
+                )
+                assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
+                    "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
+                )
+
+            generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
+                "hf_config_overrides", {}
             )
 
-        ## make vllm hf overrides match the training policy
-        generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
-            "hf_config_overrides", {}
-        )
+        elif backend == SGLANG_BACKEND:
+            if "model_path" not in generation_config["sglang_cfg"]:
+                generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
 
         policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_vllm,
-            generation_name="vLLM",
-            init_time_key="vllm_init_time_s",
+            init_generation_fn=init_generation,
+            generation_name=backend,
+            init_time_key=f"{backend}_init_time_s",
             colocated_inference=colocated_inference,
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
 
         print(
-            f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
-            flush=True,
-        )
-
-    elif backend == "sglang":
-        generation_config = cast(SGLangConfig, generation_config)
-
-        # Set model_path if not already set
-        if "model_path" not in generation_config["sglang_cfg"]:
-            generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
-
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_sglang,
-            generation_name="SGLang",
-            init_time_key="sglang_init_time_s",
-            colocated_inference=colocated_inference,
-            worker_init_timing_metrics=worker_init_timing_metrics,
-        )
-
-        print(
-            f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
+            f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
             flush=True,
         )
 
@@ -787,12 +770,13 @@ def setup(
     if worker_init_timing_metrics:
         print("\n▶ Worker Initialization Timing:")
 
-        vllm_time = worker_init_timing_metrics.get("vllm_init_time_s", 0)
+        gen_time_key = f"{backend}_init_time_s"
+        gen_time = worker_init_timing_metrics.get(gen_time_key, 0)
         policy_time = worker_init_timing_metrics.get("policy_init_time_s", 0)
         total_setup = worker_init_timing_metrics.get("total_setup_time_s", 0)
 
-        if vllm_time:
-            print(f"  vLLM init: {vllm_time:.1f}s")
+        if gen_time:
+            print(f"  {backend} init: {gen_time:.1f}s")
 
         if policy_time:
             print(f"  Policy init: {policy_time:.1f}s")
@@ -1017,7 +1001,7 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
         return False
 
     backend = generation_config.get("backend", "")
-    if backend != "vllm":
+    if backend != VLLM_BACKEND:
         return False
 
     vllm_cfg = generation_config.get("vllm_cfg", {})
@@ -1124,101 +1108,6 @@ def _extract_prompt_only_messages(message_logs: list) -> list:
         prompt_only_message_logs.append(prompt_only_log)
     return prompt_only_message_logs
 
-
-def refit_policy_generation(
-    policy: PolicyTrainerInterface,
-    policy_generation: GenerationInterface,
-    colocated_inference: bool,
-    _refit_buffer_size_gb: Optional[int] = None,
-    timer: Optional[Timer] = None,
-    kv_scales: Optional[dict[str, float]] = None,
-) -> None:
-    """Refit the policy generation interface with the latest policy weights.
-
-    .. deprecated::
-        Use :class:`~nemo_rl.weight_sync.WeightSynchronizer` and call
-        ``sync_weights()`` instead.
-
-    Args:
-        policy: The policy to provide weights to the inference engine.
-        policy_generation: The inference engine to refit.
-        _refit_buffer_size_gb: The size of the buffer to use for refitting.
-            If it is None, the buffer size will be computed by the remaining memory.
-            This parameter is primarily used for testing.
-        timer: Optional Timer used to time the prepare/transfer/update phase
-        kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
-    """
-    warnings.warn(
-        "refit_policy_generation() is deprecated. "
-        "Use WeightSynchronizer.sync_weights() instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    from nemo_rl.models.policy.interfaces import OffloadMode
-
-    if colocated_inference:
-        policy.finish_training(offload_mode=OffloadMode.OPTIMIZER_ONLY)
-        policy_generation.prepare_for_generation(tags=["weights"])
-
-    timer_context = (
-        timer.time("prepare_for_generation/transfer_and_update_weights")
-        if timer is not None
-        else nullcontext()
-    )
-    with timer_context:
-        update_success = False
-        if colocated_inference:
-            if _refit_buffer_size_gb is not None:
-                buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
-            else:
-                memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
-                buffer_size_bytes = int(
-                    policy.get_free_memory_bytes() * float(memory_ratio)
-                )
-
-            if isinstance(policy_generation, SGLangGeneration):
-                sglang_url_to_gpu_uuids = (
-                    policy_generation.get_sglang_url_to_gpu_uuids()
-                )
-                flush_success = policy_generation.invalidate_kv_cache()
-                if not flush_success:
-                    print("SGLang KV cache invalidation failed before weight update. ")
-                futures_train = policy.stream_weights_via_http(
-                    sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
-                )
-                ray.get(futures_train)
-                update_success = True
-            else:
-                futures_train = policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes
-                )
-                futures_inference = policy_generation.update_weights_via_ipc_zmq()
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
-                update_success = all(result for result in results if result is not None)
-        else:
-            if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
-                )
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
-
-        if not update_success:
-            error_tag = "cuda-ipc" if colocated_inference else "nccl"
-            error_message = (
-                "❌ Error: Updating weights for the generation policy failed during refit.\n"
-                f"This often indicates an issue with {error_tag} or "
-                "a problem within the generation backend (e.g., vLLM worker).\n"
-            )
-            raise RuntimeError(error_message)
-
-    if colocated_inference:
-        policy.finish_training(offload_mode=OffloadMode.FULL)
-        policy_generation.prepare_for_generation(tags=["kv_cache"])
 
 
 def _log_mixed_rewards_and_advantages_information(
