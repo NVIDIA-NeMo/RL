@@ -9,6 +9,7 @@ grpo:
 
 checkpointing:
   checkpoint_dir: "results/gdpo"
+  resume_if_exists: true
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"

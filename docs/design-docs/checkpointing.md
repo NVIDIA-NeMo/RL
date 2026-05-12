@@ -1,4 +1,39 @@
-# Exporting Checkpoints to Hugging Face Format
+# Checkpointing
+
+## Resume Behavior
+
+Training uses the root `checkpointing.checkpoint_dir` as the active checkpoint namespace.
+By default, if root `step_<N>` checkpoints already exist, NeMo RL resumes from the latest one:
+
+```yaml
+checkpointing:
+  enabled: true
+  resume_if_exists: true
+  checkpoint_dir: results/sft
+```
+
+If you want to reuse the same `checkpoint_dir` for a fresh run instead, set:
+
+```yaml
+checkpointing:
+  enabled: true
+  resume_if_exists: false
+  checkpoint_dir: results/sft
+```
+
+In that mode, existing root checkpoints are archived under `run_<N>/` and the new run starts from scratch:
+
+```text
+results/sft/
+  run_0/
+    step_1/
+    step_2/
+  step_1/
+```
+
+Archived checkpoints are still valid if you want to inspect or convert them later by path.
+
+## Exporting Checkpoints to Hugging Face Format
 
 NeMo RL provides two checkpoint formats for Hugging Face models: Torch distributed and Hugging Face format. Torch distributed is used by default for efficiency, and Hugging Face format is provided for compatibility with Hugging Face's `AutoModel.from_pretrained` API. Note that Hugging Face format checkpoints save only the model weights, ignoring the optimizer states. It is recommended to use Torch distributed format to save intermediate checkpoints and to save a Hugging Face checkpoint only at the end of training. 
 

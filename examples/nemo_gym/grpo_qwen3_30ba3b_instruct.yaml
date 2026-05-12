@@ -151,5 +151,6 @@ checkpointing:
   #     1. For this config Qwen 3 30BA3B on math with 32k context length, the validation could take up to 10 mins.
   # 3. The step time for this config on 32 nodes takes around 30 mins.
   # 4. The checkpoint time for this model is around 10 mins.
+  resume_if_exists: true
   checkpoint_must_save_by: "00:03:30:00"
   save_period: 1

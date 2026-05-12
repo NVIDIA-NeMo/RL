@@ -788,7 +788,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
         ),
     ):
         # Configure mocks to skip checkpoint loading
-        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        mock_checkpointer.return_value.resolve_training_start_checkpoint.return_value = (
+            None
+        )
         setup(master_config, tokenizer, dataset, None)
 
 
@@ -870,7 +872,9 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
         ),
     ):
         # Configure mocks to skip checkpoint loading
-        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        mock_checkpointer.return_value.resolve_training_start_checkpoint.return_value = (
+            None
+        )
         setup(master_config, tokenizer, dataset, None)
 
 
@@ -893,7 +897,7 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
             logged["metrics"] = metrics
 
     class DummyCheckpointer:
-        def get_latest_checkpoint_path(self):
+        def resolve_training_start_checkpoint(self):
             return None
 
         def load_training_info(self, _path):
@@ -1023,7 +1027,7 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
             "use_multiple_dataloader": False,
         },
         "logger": {"num_val_samples_to_print": 0},
-        "checkpointing": {"enabled": False},
+        "checkpointing": {"enabled": False, "resume_if_exists": True},
         "cluster": {"num_nodes": 1, "gpus_per_node": 4},
     }
 
@@ -1364,6 +1368,7 @@ def mock_grpo_components():
         },
         "checkpointing": {
             "enabled": False,
+            "resume_if_exists": True,
             "checkpoint_must_save_by": None,
             "save_period": 10,
         },

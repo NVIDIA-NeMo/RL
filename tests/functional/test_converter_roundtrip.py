@@ -73,6 +73,7 @@ def create_test_config() -> Dict[str, Any]:
         },
         "checkpointing": {
             "enabled": True,
+            "resume_if_exists": True,
             "checkpoint_dir": "/tmp/test_converter_checkpoints",
             "metric_name": "val_loss",
             "higher_is_better": False,

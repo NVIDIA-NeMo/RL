@@ -9,6 +9,7 @@ grpo:
 
 checkpointing:
   checkpoint_dir: results/clevr_grpo_${policy.model_name}
+  resume_if_exists: true
 
 policy:
   model_name: Qwen/Qwen2.5-VL-3B-Instruct

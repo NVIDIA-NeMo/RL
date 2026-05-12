@@ -15,6 +15,7 @@ sft:
 
 checkpointing:
   enabled: true
+  resume_if_exists: true
   checkpoint_dir: "results/sft"
   metric_name: "val:val_loss" # one of "val:" or "train:" followed by the metric name
   higher_is_better: false
