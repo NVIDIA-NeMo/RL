@@ -255,10 +255,10 @@ The validation set you pass in will directly be used for validation with no addi
                         f"{feature} is not supported with async GRPO"
                     )
 
-        # Async GRPO does not support multiple dataloaders
+        # Async NeMo-Gym rollouts keep task selection inside the gym bridge.
         if config["data"]["use_multiple_dataloader"]:
             raise NotImplementedError(
-                "use_multiple_dataloader is not supported with async GRPO"
+                "use_multiple_dataloader is not supported with async NeMo-Gym GRPO"
             )
 
         from nemo_rl.algorithms.grpo import async_grpo_train

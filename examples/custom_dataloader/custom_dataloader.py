@@ -19,6 +19,18 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
+def _next_from_task(
+    task_name: str,
+    data_iterators: dict[str, Iterator],
+    dataloaders: dict[str, StatefulDataLoader],
+) -> BatchedDataDict:
+    try:
+        return next(data_iterators[task_name])
+    except StopIteration:
+        data_iterators[task_name] = iter(dataloaders[task_name])
+        return next(data_iterators[task_name])
+
+
 def example_custom_dataloader(
     data_iterators: dict[str, Iterator],
     dataloaders: dict[str, StatefulDataLoader],
@@ -43,12 +55,8 @@ def example_custom_dataloader(
     """
     # sample data from each dataloader
     result = []
-    for task_name, data_iterator in data_iterators.items():
-        try:
-            result.append(next(data_iterator))
-        except StopIteration:
-            data_iterators[task_name] = iter(dataloaders[task_name])
-            result.append(next(data_iterators[task_name]))
+    for task_name in data_iterators:
+        result.append(_next_from_task(task_name, data_iterators, dataloaders))
 
     # merge results
     result = BatchedDataDict.from_batches(result)
@@ -89,16 +97,62 @@ def example_custom_dataloader_with_chosen_task(
     current_num_prompts = 0
     while current_num_prompts < expected_num_prompts:
         task_name = chosen_task[current_task_idx]
-        try:
-            data = next(data_iterators[task_name])
-        except StopIteration:
-            data_iterators[task_name] = iter(dataloaders[task_name])
-            data = next(data_iterators[task_name])
+        data = _next_from_task(task_name, data_iterators, dataloaders)
 
         result.append(data)
         current_num_prompts += len(data["message_log"])
         current_task_idx = (current_task_idx + 1) % len(chosen_task)
 
     # merge results
+    result = BatchedDataDict.from_batches(result)
+    return result, data_iterators
+
+
+def example_async_target_ratio_dataloader(
+    data_iterators: dict[str, Iterator],
+    dataloaders: dict[str, StatefulDataLoader],
+    target_weight_version: int,
+    expected_num_prompts: int,
+    **kwargs,
+) -> tuple[BatchedDataDict, dict[str, Iterator]]:
+    """Sample from multiple dataloaders using async target-version metadata.
+
+    This is a small reference implementation for async GRPO. The collector calls
+    `wrapped_dataloader.set_records()` before every batch with the target weight
+    version and expected prompt count. Users can replace this ratio logic with a
+    curriculum or per-target routing policy while keeping the same wrapper API.
+
+    Args:
+        data_iterators: A dictionary of data iterators.
+        dataloaders: A dictionary of dataloaders.
+        target_weight_version: Target training step for the generated batch.
+        expected_num_prompts: The expected number of prompts to sample.
+        **kwargs: Additional records from the async collector.
+
+    Returns:
+        Data from the dataloaders.
+        Updated data iterators.
+    """
+    task_names = list(dataloaders)
+    if not task_names:
+        raise ValueError("At least one dataloader is required.")
+
+    if len(task_names) == 1:
+        sampling_plan = [task_names[0]]
+    elif target_weight_version % 2 == 0:
+        sampling_plan = task_names
+    else:
+        sampling_plan = task_names + task_names[1:]
+
+    result = []
+    current_task_idx = 0
+    current_num_prompts = 0
+    while current_num_prompts < expected_num_prompts:
+        task_name = sampling_plan[current_task_idx]
+        data = _next_from_task(task_name, data_iterators, dataloaders)
+        result.append(data)
+        current_num_prompts += len(data["message_log"])
+        current_task_idx = (current_task_idx + 1) % len(sampling_plan)
+
     result = BatchedDataDict.from_batches(result)
     return result, data_iterators

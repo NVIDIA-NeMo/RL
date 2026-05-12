@@ -2421,7 +2421,7 @@ def validate(
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
-    dataloader: StatefulDataLoader,
+    dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer: TokenizerType,
     loss_fn: LossFunction,
@@ -2597,6 +2597,11 @@ def async_grpo_train(
     # Ensure collector knows initial weight version
     trajectory_collector.set_weight_version.remote(weight_version)
 
+    def raise_if_collector_failed() -> None:
+        collector_error = ray.get(trajectory_collector.get_error.remote())
+        if collector_error is not None:
+            raise RuntimeError(f"Async trajectory collection failed: {collector_error}")
+
     print("📦 Started continuous background trajectory collection")
 
     print(
@@ -2671,6 +2676,7 @@ def async_grpo_train(
     )
     wait_iterations = 0
     while True:
+        raise_if_collector_failed()
         buffer_size_current = ray.get(replay_buffer.size.remote())
 
         print(
@@ -2687,6 +2693,7 @@ def async_grpo_train(
     # Main training loop
     try:
         while step < master_config["grpo"]["max_num_steps"]:
+            raise_if_collector_failed()
             print(
                 f"\n{'=' * 25} Step {step + 1}/{master_config['grpo']['max_num_steps']} {'=' * 25}"
             )
@@ -2738,6 +2745,7 @@ def async_grpo_train(
                                 f"   Trajectory versions in buffer: {buffer_debug['trajectory_versions']}"
                             )
 
+                        raise_if_collector_failed()
                         time.sleep(0.5)
                         continue
 
@@ -3160,10 +3168,23 @@ def async_grpo_train(
                         actual_dataloader_state = ray.get(
                             trajectory_collector.get_dataloader_state.remote()
                         )
-                        torch.save(
-                            actual_dataloader_state,
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
+                        if master_config["data"]["use_multiple_dataloader"]:
+                            for (
+                                task_name,
+                                task_dataloader_state,
+                            ) in actual_dataloader_state["dataloaders"].items():
+                                torch.save(
+                                    task_dataloader_state,
+                                    os.path.join(
+                                        checkpoint_path,
+                                        f"train_dataloader_{task_name}.pt",
+                                    ),
+                                )
+                        else:
+                            torch.save(
+                                actual_dataloader_state,
+                                os.path.join(checkpoint_path, "train_dataloader.pt"),
+                            )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
             # Logging

@@ -21,6 +21,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig
+from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -290,6 +291,8 @@ class AsyncTrajectoryCollector:
         self._generation_check_lock: _threading.Lock = _threading.Lock()
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
+        self._dataloader_lock: _threading.Lock = _threading.Lock()
+        self._worker_error: str | None = None
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
@@ -320,10 +323,18 @@ class AsyncTrajectoryCollector:
 
         return [generation_weight_version + i for i in range(1, max_trajectory_age + 1)]
 
-    def _get_next_target_for_generation(
+    def _target_needs_generation(
+        self, target_weight: int, last_target_weight_already_generated: int
+    ) -> bool:
+        return (
+            target_weight > last_target_weight_already_generated
+            and target_weight not in self._generating_targets
+        )
+
+    def _reserve_next_target_for_generation(
         self, generation_weight_version: int
     ) -> Optional[int]:
-        """Get the next target weight that needs generation (if any)."""
+        """Reserve the next target weight that needs generation, if any."""
         target_weights = self._calculate_target_weights(generation_weight_version)
         last_target_weight_already_generated = ray.get(
             self.replay_buffer.get_last_target_weight_already_generated.remote()
@@ -331,15 +342,38 @@ class AsyncTrajectoryCollector:
 
         with self._generation_check_lock:
             for target_weight in target_weights:
-                if (
-                    target_weight > last_target_weight_already_generated
-                    and target_weight not in self._generating_targets
+                if self._target_needs_generation(
+                    target_weight, last_target_weight_already_generated
                 ):
                     self._generating_targets.add(target_weight)
                     print(f"🎯 Reserved target weight {target_weight} for generation")
                     return target_weight
 
         return None
+
+    def _get_next_target_for_generation(
+        self, generation_weight_version: int
+    ) -> Optional[int]:
+        """Backward-compatible alias for target reservation."""
+        return self._reserve_next_target_for_generation(generation_weight_version)
+
+    def _release_target_generation_reservation(
+        self, target_weight_version: int, reason: str
+    ) -> None:
+        with self._generation_check_lock:
+            if target_weight_version in self._generating_targets:
+                self._generating_targets.discard(target_weight_version)
+                print(
+                    f"🧹 Released reservation for target weight {target_weight_version} ({reason})"
+                )
+
+    def _record_worker_error(self, context: str, error: BaseException) -> None:
+        if self._worker_error is None:
+            self._worker_error = f"{context}: {error}"
+        self.running = False
+        self._manual_pause_cleared.set()
+        self._refit_pause_cleared.set()
+        self._generation_limit_cleared.set()
 
     def set_weight_version(self, version: int) -> None:
         self.current_weight_version = version
@@ -363,9 +397,8 @@ class AsyncTrajectoryCollector:
             # Check if any target weight in our range needs generation
             with self._generation_check_lock:
                 for target_weight in target_weights:
-                    if (
-                        target_weight > last_target_weight_already_generated
-                        and target_weight not in self._generating_targets
+                    if self._target_needs_generation(
+                        target_weight, last_target_weight_already_generated
                     ):
                         return False  # Found a target that needs generation
 
@@ -376,9 +409,12 @@ class AsyncTrajectoryCollector:
         except Exception:
             return False
 
-    def start_collection(self, dataloader: StatefulDataLoader) -> None:
+    def start_collection(
+        self, dataloader: StatefulDataLoader | MultipleDataloaderWrapper
+    ) -> None:
         """Start collecting trajectories from dataloader."""
         self.running = True
+        self._worker_error = None
         self.dataloader = dataloader
 
         print("Started continuous trajectory collection")
@@ -392,7 +428,8 @@ class AsyncTrajectoryCollector:
     def _collection_loop(self):
         """Run the collection loop in background thread."""
         try:
-            for batch in self.dataloader:
+            dataloader_iter = iter(self.dataloader)
+            while self.running:
                 if not self.running:
                     break
 
@@ -406,41 +443,65 @@ class AsyncTrajectoryCollector:
                     self._refit_pause_cleared.wait()
                     print("▶️ Refit completed, resuming collection")
 
-                # Check if generation limits require pausing collection
-                if self._should_pause_for_generation_limits() and self.running:
-                    # Only log warning once per weight version
-                    if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.get("grpo", {}).get(
-                            "async_grpo", {}
-                        )
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
-
-                        print(
-                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
-                        )
-                        self._last_limit_warning_version = self.current_weight_version
-
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
-
-                    # Efficiently wait for generation limits to be cleared (no polling!)
-                    self._generation_limit_cleared.wait()
-
-                    # Double-check we're still running after being woken up
-                    if not self.running:
-                        break
-
                 if not self.running:
                     break
 
-                self._process_batch(batch)
+                generation_weight_version = self.current_weight_version
+                target_weight = self._reserve_next_target_for_generation(
+                    generation_weight_version
+                )
+
+                if target_weight is None:
+                    paused_weight_version = generation_weight_version
+                    # Only log warning once per weight version
+                    if self._last_limit_warning_version != paused_weight_version:
+                        target_weights = self._calculate_target_weights(
+                            paused_weight_version
+                        )
+
+                        print(
+                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {paused_weight_version} "
+                            f"already exist in buffer. Waiting for weight update..."
+                        )
+                        self._last_limit_warning_version = paused_weight_version
+
+                    self._generation_limit_cleared.clear()
+                    if self.current_weight_version == paused_weight_version:
+                        self._generation_limit_cleared.wait()
+                    else:
+                        self._generation_limit_cleared.set()
+                    continue
+
+                try:
+                    with self._dataloader_lock:
+                        self._set_dataloader_records_for_target(
+                            generation_weight_version, target_weight
+                        )
+                        batch = next(dataloader_iter)
+                except StopIteration:
+                    self._release_target_generation_reservation(
+                        target_weight, "dataloader exhausted"
+                    )
+                    break
+                except Exception:
+                    self._release_target_generation_reservation(
+                        target_weight, "dataloader error"
+                    )
+                    raise
+
+                if not self.running:
+                    self._release_target_generation_reservation(
+                        target_weight, "collector stopped before scheduling"
+                    )
+                    break
+
+                self._process_batch_for_target(
+                    batch, generation_weight_version, target_weight
+                )
 
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
+            self._record_worker_error("trajectory collection", e)
             import traceback
 
             traceback.print_exc()
@@ -448,23 +509,33 @@ class AsyncTrajectoryCollector:
             self.running = False
             print("🛑 Trajectory collection stopped")
 
-    def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
-        """Process a single batch and generate for one target weight."""
+    def _set_dataloader_records_for_target(
+        self, generation_weight_version: int, target_weight_version: int
+    ) -> None:
+        if not isinstance(self.dataloader, MultipleDataloaderWrapper):
+            return
+
+        self.dataloader.set_records(
+            {
+                "generation_weight_version": generation_weight_version,
+                "target_weight_version": target_weight_version,
+                "current_weight_version": self.current_weight_version,
+                "expected_num_prompts": self.master_config["grpo"][
+                    "num_prompts_per_step"
+                ],
+            }
+        )
+
+    def _process_batch_for_target(
+        self,
+        batch: BatchedDataDict[DatumSpec],
+        generation_weight_version: int,
+        target_weight: int,
+    ) -> None:
+        """Process a single batch for an already-reserved target weight."""
         try:
-            generation_weight_version = self.current_weight_version
             num_generations = self.master_config["grpo"]["num_generations_per_prompt"]
             num_prompts = batch.size
-
-            # Get the next target weight that needs generation
-            target_weight = self._get_next_target_for_generation(
-                generation_weight_version
-            )
-
-            if target_weight is None:
-                print(
-                    f"🔄 No targets need generation for weight {generation_weight_version}"
-                )
-                return
 
             print(
                 f"🎯 Generating for target weight {target_weight} from generation_weight_version {generation_weight_version}"
@@ -509,9 +580,28 @@ class AsyncTrajectoryCollector:
 
         except Exception as e:
             print(f"❌ Error processing batch: {e}")
+            self._release_target_generation_reservation(
+                target_weight, "batch processing error"
+            )
+            self._record_worker_error("batch processing", e)
             import traceback
 
             traceback.print_exc()
+
+    def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
+        """Process a single batch by reserving a target weight first."""
+        generation_weight_version = self.current_weight_version
+        target_weight = self._reserve_next_target_for_generation(
+            generation_weight_version
+        )
+
+        if target_weight is None:
+            print(
+                f"🔄 No targets need generation for weight {generation_weight_version}"
+            )
+            return
+
+        self._process_batch_for_target(batch, generation_weight_version, target_weight)
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
@@ -624,9 +714,14 @@ class AsyncTrajectoryCollector:
 
     def get_dataloader_state(self) -> dict:
         """Get the current dataloader state for checkpointing."""
-        if hasattr(self, "dataloader") and hasattr(self.dataloader, "state_dict"):
-            return self.dataloader.state_dict()
+        with self._dataloader_lock:
+            if hasattr(self, "dataloader") and hasattr(self.dataloader, "state_dict"):
+                return self.dataloader.state_dict()
         return {}
+
+    def get_error(self) -> str | None:
+        """Return the first background collection error, if any."""
+        return self._worker_error
 
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
@@ -707,14 +802,9 @@ class AsyncTrajectoryCollector:
 
                         # Release reservation when FIRST prompt group for this target is successfully buffered
                         if prompt_idx == 0:
-                            with self._generation_check_lock:
-                                if target_weight_version in self._generating_targets:
-                                    self._generating_targets.discard(
-                                        target_weight_version
-                                    )
-                                    print(
-                                        f"🧹 Released reservation for target weight {target_weight_version} (first prompt buffered)"
-                                    )
+                            self._release_target_generation_reservation(
+                                target_weight_version, "first prompt buffered"
+                            )
                         break
                     elif status == "full":
                         # Exponential backoff up to 0.5 second
@@ -725,22 +815,21 @@ class AsyncTrajectoryCollector:
                         time.sleep(0.01)
             except Exception as e:
                 print(f"❌ Failed to enqueue per-prompt group to buffer: {e}")
+                self._record_worker_error("buffer enqueue", e)
                 import traceback
 
                 traceback.print_exc()
         except Exception as e:
             print(f"❌ Error in prompt group worker: {e}")
+            self._record_worker_error("prompt group worker", e)
             import traceback
 
             traceback.print_exc()
         finally:
             # Clean up reservation in case of error (if not already cleaned up)
-            with self._generation_check_lock:
-                if target_weight_version in self._generating_targets:
-                    self._generating_targets.discard(target_weight_version)
-                    print(
-                        f"🧹 Emergency cleanup: Released reservation for target weight {target_weight_version}"
-                    )
+            self._release_target_generation_reservation(
+                target_weight_version, "worker finished"
+            )
 
             # Detach thread record when finished
             with self._threads_lock:
