@@ -10,6 +10,8 @@ Run iterative NeMo RL experiments in this repository against the user's stated o
 
 Treat dependencies as ready, but choose the runtime deliberately. Use the recipe's authoritative metric as the source of truth. Keep changes small, reproducible, and simple. Preserve unrelated user work.
 
+Use `session-memory` for every auto-research campaign. Start or resume a session record before branching, then checkpoint after forming the plan, before and after meaningful edits or long-running launches, when the user changes direction, and before handing off or summarizing results.
+
 ## Workflow
 
 1. Inspect the current git state and identify unrelated user changes before branching.
