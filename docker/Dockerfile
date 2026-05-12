@@ -128,7 +128,8 @@ COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 RUN --mount=type=ssh --mount=type=cache,target=/tmp/uv-warm-cache <<"EOF" bash -exu
 # Seed uv cache from persistent BuildKit cache to avoid recompiling CUDA kernels
 # (e.g. sglang-kernel ~90 min) when only unrelated deps changed in pyproject.toml.
-cp -a /tmp/uv-warm-cache/. /root/.cache/uv/ 2>/dev/null || true
+mkdir -p /root/.cache/uv
+rsync -a /tmp/uv-warm-cache/ /root/.cache/uv/ 2>/dev/null || true
 
 uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
@@ -161,8 +162,9 @@ uv sync --link-mode symlink --locked --all-groups --no-install-project
 # The ray install will include the older aiohttp version in its cache
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 
-# Persist the uv cache back to the BuildKit cache mount for future builds
-cp -a /root/.cache/uv/. /tmp/uv-warm-cache/
+# Persist the uv cache back to the BuildKit cache mount for future builds.
+# --delete ensures stale entries (e.g. CVE-cleaned aiohttp) don't re-seed.
+rsync -a --delete /root/.cache/uv/ /tmp/uv-warm-cache/ || true
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
