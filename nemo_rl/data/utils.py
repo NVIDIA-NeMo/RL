@@ -317,3 +317,82 @@ def setup_preference_data(
         )
 
     return dataset, val_dataset
+
+
+def setup_random_data(
+    tokenizer: AutoTokenizer, data_config: DataConfig
+) -> tuple[
+    AllTaskProcessedDataset,
+    Optional[AllTaskProcessedDataset],
+    dict[str, EnvironmentInterface],
+    dict[str, EnvironmentInterface],
+]:
+    """Setup random dataset.
+
+    This function is used to setup the random dataset and corresponding environment for the training and validation datasets.
+
+    Args:
+        tokenizer: Tokenizer.
+        data_config: Data config for random dataset.
+    """
+    print("\n▶ Setting up data (random dataset)...")
+    if data_config.get("input_len_or_input_len_generator") is None:
+        raise ValueError(
+            "data.input_len_or_input_len_generator must be provided when "
+            "data.dataset_name == 'random'"
+        )
+    if "num_samples" not in data_config:
+        raise ValueError(
+            "data.num_samples must be provided when data.dataset_name == 'random'"
+        )
+
+    if isinstance(data_config["input_len_or_input_len_generator"], dict):
+        from nemo_rl.utils.sequence_length_generator import (
+            get_sequence_length_generator,
+        )
+
+        data_config["input_len_or_input_len_generator"] = get_sequence_length_generator(
+            data_config["input_len_or_input_len_generator"]
+        )
+
+    random_task_spec = TaskDataSpec(
+        task_name="random",
+        input_len_or_input_len_generator=data_config[
+            "input_len_or_input_len_generator"
+        ],
+    )
+
+    base_dataset: Any = RandomDataset(
+        data_config["input_len_or_input_len_generator"],
+        num_samples=data_config["num_samples"],
+    )
+
+    # data processor — defaultdict so any task name in the synthetic data falls
+    # back to the random processor
+    task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
+        defaultdict(lambda: (random_task_spec, random_input_len_processor))
+    )
+    task_data_processors["random"] = (random_task_spec, random_input_len_processor)
+
+    dummy_env = DummyEnvironment.options(  # type: ignore # wrapped with ray.remote
+        runtime_env={
+            "py_executable": get_actor_python_env(
+                "nemo_rl.environments.math_environment.MathEnvironment"
+            ),
+            "env_vars": dict(os.environ),  # pass through user env
+        }
+    ).remote()
+
+    dataset = AllTaskProcessedDataset(
+        base_dataset.formatted_ds["train"],
+        tokenizer,
+        random_task_spec,
+        task_data_processors,
+        max_seq_length=data_config["max_input_seq_length"],
+    )
+
+    val_dataset: Optional[AllTaskProcessedDataset] = None
+
+    task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: dummy_env)
+    task_to_env["random"] = dummy_env
+    return dataset, val_dataset, task_to_env, task_to_env

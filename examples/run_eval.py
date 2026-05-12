@@ -24,10 +24,10 @@ from omegaconf import OmegaConf
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import (
     AllTaskProcessedDataset,
-    RandomDataset,
     load_eval_dataset,
 )
 from nemo_rl.data.datasets.eval_datasets import _is_multimodal_dataset
+from nemo_rl.data.utils import setup_random_data
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.dummy_environment import DummyEnvironment
@@ -54,47 +54,13 @@ def parse_args():
     return args, overrides
 
 
-def _setup_random_data(tokenizer, data_config):
-    """Build a RandomDataset + DummyEnvironment for synthetic benchmarking."""
-    if data_config.get("input_len_or_input_len_generator") is None:
-        raise ValueError(
-            "data.input_len_or_input_len_generator must be provided when "
-            "data.dataset_name == 'random'"
-        )
-    if "num_samples" not in data_config:
-        raise ValueError(
-            "data.num_samples must be provided when data.dataset_name == 'random'"
-        )
-
-    base_dataset = RandomDataset(
-        data_config["input_len_or_input_len_generator"],
-        num_samples=data_config["num_samples"],
-    )
-
-    env = DummyEnvironment.options(  # type: ignore # wrapped with ray.remote
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.math_environment.MathEnvironment"
-            )
-        }
-    ).remote()
-
-    dataset = AllTaskProcessedDataset(
-        dataset=base_dataset.formatted_ds["train"],
-        tokenizer=tokenizer,
-        default_task_data_spec=base_dataset.task_spec,
-        task_data_processors=base_dataset.processor,
-        max_seq_length=data_config["max_input_seq_length"],
-    )
-    return dataset, env
-
-
 def setup_data(tokenizer, data_config, env_configs):
     print("Setting up data...")
 
     # Synthetic random-data path for benchmarking (no real dataset / env).
     if data_config.get("dataset_name") == "random":
-        dataset, env = _setup_random_data(tokenizer, data_config)
+        dataset, _, task_to_env, _ = setup_random_data(tokenizer, data_config)
+        env = task_to_env["random"]
         return dataset, env, tokenizer
 
     # load dataset
