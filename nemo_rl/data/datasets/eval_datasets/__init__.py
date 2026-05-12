@@ -14,6 +14,7 @@
 
 from nemo_rl.data.datasets.eval_datasets.aime import AIMEDataset
 from nemo_rl.data.datasets.eval_datasets.gpqa import GPQADataset
+from nemo_rl.data.datasets.eval_datasets.hmmt import HmmtDataset
 from nemo_rl.data.datasets.eval_datasets.local_math_dataset import LocalMathDataset
 from nemo_rl.data.datasets.eval_datasets.math import MathDataset
 from nemo_rl.data.datasets.eval_datasets.mmau import MMAUDataset
@@ -78,6 +79,24 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
+    elif dataset_name == "hmmt2025_feb":
+        base_dataset = HmmtDataset(
+            variant="2025_feb",
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+        )
+    elif dataset_name == "hmmt2025_nov":
+        base_dataset = HmmtDataset(
+            variant="2025_nov",
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+        )
+    elif dataset_name == "hmmt2026_feb":
+        base_dataset = HmmtDataset(
+            variant="2026_feb",
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+        )
     # math
     elif dataset_name == "math":
         base_dataset = MathDataset(
@@ -117,6 +136,7 @@ def load_eval_dataset(data_config):
 __all__ = [
     "AIMEDataset",
     "GPQADataset",
+    "HmmtDataset",
     "LocalMathDataset",
     "MathDataset",
     "MMAUDataset",
