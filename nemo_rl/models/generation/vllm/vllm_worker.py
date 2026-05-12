@@ -623,6 +623,18 @@ class BaseVllmGenerationWorker:
     def _resolve_max_tokens(
         self, max_new_tokens: Optional[int] = None, sample_idx: int | None = None
     ) -> int:
+        """Resolve the maximum number of tokens to generate. 
+        When max_new_tokens is provided, max_new_tokens is used as the maximum number of tokens to generate.
+        Otherwise, the output_len_or_output_len_generator is used as the maximum number of tokens to generate.
+        In the latter case, it is only used in benchmarking scenarios when we want to fix the output length.
+
+        Args:
+            max_new_tokens: The maximum number of tokens to generate.
+            sample_idx: The index of the sample.
+
+        Returns:
+            The maximum number of tokens to generate.
+        """
         max_tokens = (
             max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
         )
