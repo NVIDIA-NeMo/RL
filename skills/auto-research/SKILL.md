@@ -82,6 +82,11 @@ Prefer ideas with high expected objective gain and low complexity cost:
 
 All else equal, prefer simpler wins and avoid brittle hardware-specific hacks.
 
+## Avoid
+
+- Do not conclude a training idea failed from an underpowered smoke run. If a run uses tiny batch sizes, very few optimizer steps, or otherwise non-representative settings, treat it as plumbing validation only; scale to a meaningful batch size and train long enough to test the hypothesis before marking it `discard`.
+- Do not repeatedly pay batch-scheduler setup costs for tight edit-run-debug loops. If Slurm batch jobs have a large startup tax and failures require quick iteration, use the documented interactive Slurm pattern or ask the user before resubmitting more batch jobs.
+
 ## Stop
 
 If the user gives explicit stopping conditions, they override the generic rule. Do not stop because the search feels sufficient; stop only when the requested count, deadline, budget, or target condition has been clearly met.
