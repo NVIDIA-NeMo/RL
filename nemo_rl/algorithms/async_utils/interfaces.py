@@ -12,14 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 
-class ReplayBufferProtocol(ABC):
+class ReplayBufferProtocol(Protocol):
     """Interface for the replay buffer used in async RL training."""
 
-    @abstractmethod
     def add(
         self,
         trajectory: dict[str, Any],
@@ -33,8 +31,8 @@ class ReplayBufferProtocol(ABC):
             weight_version: version of the model weights used for generation
             target_weight_version: version of the model weights this trajectory is intended for training
         """
+        ...
 
-    @abstractmethod
     def sample(
         self,
         num_prompt_groups: int,
@@ -51,19 +49,16 @@ class ReplayBufferProtocol(ABC):
         Returns:
             Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
         """
-        pass
+        ...
 
-    @abstractmethod
     def evict(self) -> None:
         """Evict old trajectories."""
-        pass
+        ...
 
-    @abstractmethod
     def size(self) -> int:
         """Return current buffer size."""
-        pass
+        ...
 
-    @abstractmethod
     def clear(self) -> None:
         """Clear the buffer."""
-        pass
+        ...
