@@ -568,7 +568,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
         def prepare_refit_info(self):
             return {}
 
-        def offload_after_refit(self):
+        def finish_training(self, **kwargs):
             return None
 
         def init_collective(self, *args, **kwargs):

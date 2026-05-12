@@ -12,15 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Any, Optional, TypedDict
 
-import ray
 import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.utils.timer import Timer
+
+
+class OffloadMode(Enum):
+    """Controls how aggressively to offload during finish_training().
+
+    EVAL_ONLY: keep model on GPU in eval mode, optionally offload optimizer
+        based on worker config (offload_optimizer_for_logprob). Used by
+        algorithm code before logprob / KV-scale inference.
+    OPTIMIZER_ONLY: offload optimizer, keep model on GPU in its current mode.
+        Used by colocated weight synchronizers before weight transfer (model
+        must stay on GPU for CUDA IPC / HTTP streaming).
+    FULL: offload everything appropriate for the deployment topology. In
+        colocated mode this offloads model + optimizer; in non-colocated mode
+        this sets eval mode, keeps model on GPU, and optionally offloads
+        optimizer.
+    """
+
+    EVAL_ONLY = "eval_only"
+    OPTIMIZER_ONLY = "optimizer_only"
+    FULL = "full"
 
 
 class LogprobOutputSpec(TypedDict):
@@ -48,8 +68,8 @@ class TopkLogitsOutputSpec(TypedDict):
     topk_indices: torch.Tensor
 
 
-class PolicyInterface(ABC):
-    """Abstract base class defining the interface for RL policies."""
+class PolicyTrainerInterface(ABC):
+    """Abstract base class defining the interface for RL policy training."""
 
     @abstractmethod
     def get_logprobs(
@@ -148,10 +168,18 @@ class PolicyInterface(ABC):
 
     @abstractmethod
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
+        """Transition to training phase. Load model and optimizer to GPU, set train mode."""
         pass
 
     @abstractmethod
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
+        """Transition out of training phase. Free GPU resources.
+
+        Accepts an optional ``offload_mode`` kwarg (OffloadMode enum):
+          - EVAL_ONLY: model on GPU in eval mode (for logprob inference).
+          - OPTIMIZER_ONLY: offload optimizer only (for weight staging).
+          - FULL (default): full offload based on deployment topology.
+        """
         pass
 
     @abstractmethod
@@ -163,49 +191,5 @@ class PolicyInterface(ABC):
         pass
 
 
-class ColocatablePolicyInterface(PolicyInterface):
-    @abstractmethod
-    def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
-    ) -> list[ray.ObjectRef]:
-        pass
-
-    @abstractmethod
-    def offload_before_refit(self) -> None:
-        pass
-
-    @abstractmethod
-    def offload_after_refit(self) -> None:
-        pass
-
-    @abstractmethod
-    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
-        pass
-
-    @abstractmethod
-    def stream_weights_via_ipc_zmq(
-        self, *args: Any, **kwargs: Any
-    ) -> list[ray.ObjectRef]:
-        pass
-
-    def stream_weights_via_http(
-        self, sglang_url_to_gpu_uuids: dict[str, list[str]]
-    ) -> list[ray.ObjectRef]:
-        """Stream model weights to SGLang servers via HTTP API.
-
-        Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
-        """
-        raise NotImplementedError(
-            "stream_weights_via_http is not implemented for this policy worker"
-        )
-
-    @abstractmethod
-    def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
-    ) -> list[ray.ObjectRef]:
-        pass
-
-    @abstractmethod
-    def prepare_for_lp_inference(self) -> None:
-        pass
+# Backward compatibility
+PolicyInterface = PolicyTrainerInterface

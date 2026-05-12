@@ -440,7 +440,9 @@ def generate_and_compare_logprobs(policy, vllm_inference_policy, generation_data
     ]
 
     # Get logprobs from Megatron
-    policy.prepare_for_lp_inference()
+    from nemo_rl.models.policy.interfaces import OffloadMode
+
+    policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
     megatron_generation_data = policy.get_logprobs(megatron_input_data)
     print(f"Megatron Generation shape: {megatron_generation_data['logprobs'].shape}")
     print(

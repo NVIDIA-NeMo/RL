@@ -19,12 +19,12 @@ backend using HTTP streaming. SGLang exposes an HTTP endpoint for weight
 updates, so the policy streams weights directly to SGLang servers.
 
 Lifecycle per sync:
-  1. policy.offload_before_refit()       -- free GPU for weight staging
-  2. generation.prepare_for_generation(tags=["weights"])  -- allocate buffers
-  3. generation.invalidate_kv_cache()    -- clear stale KV cache
-  4. policy.stream_weights_via_http()    -- push weights via HTTP
-  5. policy.offload_after_refit()        -- restore optimizer state
-  6. generation.prepare_for_generation(tags=["kv_cache"]) -- rebuild KV cache
+  1. policy.finish_training(OPTIMIZER_ONLY)  -- free optimizer for weight staging
+  2. generation.prepare_for_generation()     -- allocate weight buffers
+  3. generation.invalidate_kv_cache()        -- clear stale KV cache
+  4. policy.stream_weights_via_http()        -- push weights via HTTP
+  5. policy.finish_training(FULL)            -- exit training phase (offload model)
+  6. generation.prepare_for_generation()     -- rebuild KV cache
 """
 
 from contextlib import nullcontext
@@ -32,6 +32,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.models.policy.interfaces import OffloadMode
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -43,7 +44,7 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
     are streamed to SGLang servers via their HTTP weight-update API.
 
     Args:
-        policy: Policy object implementing ColocatablePolicyInterface.
+        policy: Policy object implementing PolicyTrainerInterface.
         generation: SGLangGeneration instance exposing get_sglang_url_to_gpu_uuids().
     """
 
@@ -58,7 +59,7 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
-        self._policy.offload_before_refit()
+        self._policy.finish_training(offload_mode=OffloadMode.OPTIMIZER_ONLY)
         self._generation.prepare_for_generation(tags=["weights"])
 
         sync_succeeded = False
@@ -81,7 +82,7 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
                 ray.get(futures_train)
             sync_succeeded = True
         finally:
-            self._policy.offload_after_refit()
+            self._policy.finish_training(offload_mode=OffloadMode.FULL)
             self._generation.prepare_for_generation(tags=["kv_cache"])
 
         self._stale = not sync_succeeded

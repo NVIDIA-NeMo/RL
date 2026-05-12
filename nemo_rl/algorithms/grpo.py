@@ -73,7 +73,7 @@ from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
+from nemo_rl.models.policy.interfaces import OffloadMode, PolicyTrainerInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
@@ -225,7 +225,7 @@ def setup(
     processor: Optional[AutoProcessor] = None,
     policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
 ) -> tuple[
-    ColocatablePolicyInterface,
+    PolicyTrainerInterface,
     Optional[GenerationInterface],
     tuple[RayVirtualCluster, RayVirtualCluster],
     Optional[WeightSynchronizer],
@@ -1126,7 +1126,7 @@ def _extract_prompt_only_messages(message_logs: list) -> list:
 
 
 def refit_policy_generation(
-    policy: ColocatablePolicyInterface,
+    policy: PolicyTrainerInterface,
     policy_generation: GenerationInterface,
     colocated_inference: bool,
     _refit_buffer_size_gb: Optional[int] = None,
@@ -1154,26 +1154,23 @@ def refit_policy_generation(
         DeprecationWarning,
         stacklevel=2,
     )
+    from nemo_rl.models.policy.interfaces import OffloadMode
+
     if colocated_inference:
-        policy.offload_before_refit()
+        policy.finish_training(offload_mode=OffloadMode.OPTIMIZER_ONLY)
         policy_generation.prepare_for_generation(tags=["weights"])
 
-    # Create a context manager that does nothing when timer is None
     timer_context = (
         timer.time("prepare_for_generation/transfer_and_update_weights")
         if timer is not None
         else nullcontext()
     )
     with timer_context:
-        # update weights
         update_success = False
         if colocated_inference:
-            # get model param keys, which is grouped by size
             if _refit_buffer_size_gb is not None:
                 buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
             else:
-                # Empirically sets ratio as 30% to maximize efficiency.
-                # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
                 memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
                 buffer_size_bytes = int(
                     policy.get_free_memory_bytes() * float(memory_ratio)
@@ -1183,41 +1180,33 @@ def refit_policy_generation(
                 sglang_url_to_gpu_uuids = (
                     policy_generation.get_sglang_url_to_gpu_uuids()
                 )
-                # Stream weights via HTTP
                 flush_success = policy_generation.invalidate_kv_cache()
                 if not flush_success:
                     print("SGLang KV cache invalidation failed before weight update. ")
                 futures_train = policy.stream_weights_via_http(
                     sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
                 )
-                # Wait for all workers to complete
                 ray.get(futures_train)
                 update_success = True
             else:
-                # Original ZMQ IPC path for vLLM
                 futures_train = policy.stream_weights_via_ipc_zmq(
                     buffer_size_bytes=buffer_size_bytes
                 )
                 futures_inference = policy_generation.update_weights_via_ipc_zmq()
-                # wait for all futures to complete
                 ray.get(futures_train)
                 results = ray.get(futures_inference)
                 update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl
-            # SGLang haven't implemented non-colocated inference mode.
             if isinstance(policy_generation, SGLangGeneration):
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
             futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
             futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
 
-        # check if update is successful
         if not update_success:
             error_tag = "cuda-ipc" if colocated_inference else "nccl"
             error_message = (
@@ -1228,7 +1217,7 @@ def refit_policy_generation(
             raise RuntimeError(error_message)
 
     if colocated_inference:
-        policy.offload_after_refit()
+        policy.finish_training(offload_mode=OffloadMode.FULL)
         policy_generation.prepare_for_generation(tags=["kv_cache"])
 
 
@@ -1345,7 +1334,7 @@ def compute_and_apply_seq_logprob_error_masking(
 
 
 def grpo_train(
-    policy: ColocatablePolicyInterface,
+    policy: PolicyTrainerInterface,
     policy_generation: Optional[GenerationInterface],
     wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
     val_dataloader: Optional[StatefulDataLoader],
@@ -1491,7 +1480,7 @@ def grpo_train(
                         # Compute KV scales if needed for FP8 quantization
                         if sync_kv_scales and kv_scales_cache is None:
                             print("▶ Computing KV cache scales...", flush=True)
-                            policy.prepare_for_lp_inference()
+                            policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
                             # Align with training data processing to ensure parallel training compatibility
                             calib_flat, calib_input_lengths = (
                                 batched_message_log_to_flat_message(
@@ -1525,7 +1514,7 @@ def grpo_train(
                         )
                     else:
                         if colocated_inference:
-                            policy.offload_after_refit()  # unload optimizer to make space for generation
+                            policy.finish_training()
                         policy_generation.prepare_for_generation()
 
                 dynamic_sampling_num_gen_batches += 1
@@ -1785,7 +1774,7 @@ def grpo_train(
                 else:
                     print("▶ Preparing for logprob inference...", flush=True)
                     with timer.time("logprob_inference_prep"):
-                        policy.prepare_for_lp_inference()
+                        policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
@@ -1924,7 +1913,7 @@ def grpo_train(
                         )
                     else:
                         if colocated_inference:
-                            policy.offload_after_refit()  # unload optimizer to make space for generation
+                            policy.finish_training()
                         policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(
                         policy_generation,
@@ -2473,7 +2462,7 @@ def aggregate_rollout_metrics(
 
 
 def async_grpo_train(
-    policy: ColocatablePolicyInterface,
+    policy: PolicyTrainerInterface,
     policy_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
@@ -2902,7 +2891,7 @@ def async_grpo_train(
                 else:
                     print("▶ Preparing for logprob inference...")
                     with timer.time("logprob_inference_prep"):
-                        policy.prepare_for_lp_inference()
+                        policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
@@ -3204,6 +3193,7 @@ def async_grpo_train(
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
+                    policy.finish_training()
 
             # Logging
             # Log training data (match sync GRPO logging payload for parity)

@@ -55,7 +55,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
+from nemo_rl.models.policy.interfaces import OffloadMode, PolicyTrainerInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
@@ -163,8 +163,8 @@ def setup(
     train_dataset: AllTaskProcessedDataset,
     val_dataset: Optional[AllTaskProcessedDataset],
 ) -> tuple[
-    ColocatablePolicyInterface,  # student_policy
-    ColocatablePolicyInterface,  # teacher_policy
+    PolicyTrainerInterface,  # student_policy
+    PolicyTrainerInterface,  # teacher_policy
     Optional[GenerationInterface],  # student_generation
     Optional[WeightSynchronizer],  # weight_sync
     StatefulDataLoader,
@@ -404,7 +404,7 @@ def setup(
         init_optimizer=False,
         init_reference_model=False,
     )
-    teacher_policy.offload_after_refit()
+    teacher_policy.finish_training()
 
     # ==========================
     #    Student Generation Interface
@@ -497,8 +497,8 @@ def setup(
 
 
 def distillation_train(
-    student_policy: ColocatablePolicyInterface,
-    teacher_policy: ColocatablePolicyInterface,
+    student_policy: PolicyTrainerInterface,
+    teacher_policy: PolicyTrainerInterface,
     student_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
@@ -680,7 +680,7 @@ def distillation_train(
 
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
-                    teacher_policy.prepare_for_lp_inference()
+                    teacher_policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
 
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
@@ -694,7 +694,7 @@ def distillation_train(
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
-                    teacher_policy.offload_after_refit()
+                    teacher_policy.finish_training()
                     student_policy.prepare_for_training()  # set model train and reload optim to GPU
                     if weight_sync is not None:
                         weight_sync.mark_stale()

@@ -41,7 +41,7 @@ def create_weight_synchronizer(
     """Create the appropriate WeightSynchronizer for the given deployment.
 
     Args:
-        policy: Policy object (ColocatablePolicyInterface).
+        policy: Policy object (PolicyTrainerInterface).
         generation: Generation object (GenerationInterface).
         generation_backend: Name of the generation backend ("vllm", "sglang", "megatron").
         colocated: Whether policy and generation share the same GPUs.

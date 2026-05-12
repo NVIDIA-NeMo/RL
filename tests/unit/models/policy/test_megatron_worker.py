@@ -753,7 +753,9 @@ def test_megatron_policy_logprobs(logprob_setup):
 
     # Generate logprobs
     print("\nGenerating logprobs...")
-    policy.prepare_for_lp_inference()
+    from nemo_rl.models.policy.interfaces import OffloadMode
+
+    policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
     policy_logprobs = policy.get_logprobs(data)["logprobs"]
 
     # Basic validation
@@ -1013,7 +1015,9 @@ def test_megatron_reference_policy_functionality(tiny_llama_model_path):
     )
 
     # Get initial logprobs from policy
-    policy.prepare_for_lp_inference()
+    from nemo_rl.models.policy.interfaces import OffloadMode
+
+    policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
     initial_logprobs = policy.get_logprobs(data)["logprobs"]
 
     # Get logprobs from reference policy
@@ -1057,7 +1061,7 @@ def test_megatron_reference_policy_functionality(tiny_llama_model_path):
     )
 
     # Get logprobs after training
-    policy.prepare_for_lp_inference()
+    policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
     post_train_logprobs = policy.get_logprobs(data)["logprobs"]
     post_train_reference_logprobs = policy.get_reference_policy_logprobs(data)[
         "reference_logprobs"
@@ -1175,7 +1179,9 @@ def test_megatron_checkpoint_save_kill_and_restore(
 
             # Get parameters from the worker - need to call the remote method properly
             # We'll use the logprob computation to extract parameters indirectly
-            policy1.prepare_for_lp_inference()
+            from nemo_rl.models.policy.interfaces import OffloadMode
+
+            policy1.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
 
             # Get a sample of the model state by running inference and observing outputs
             # This is a proxy for parameter values since we can't directly access the distributed model
@@ -1239,7 +1245,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
             policy2 = Policy(cluster=cluster2, config=fresh_config, tokenizer=tokenizer)
 
             # Get logprobs from fresh policy (should be different from saved)
-            policy2.prepare_for_lp_inference()
+            policy2.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
             logprobs_fresh = policy2.get_logprobs(sample_data)["logprobs"]
             print(f"Logprobs from fresh policy: {logprobs_fresh[0, :5]}")
 
@@ -1282,7 +1288,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
 
             # Get logprobs from restored policy (should match the saved state)
             print("Getting logprobs from restored policy...")
-            policy3.prepare_for_lp_inference()
+            policy3.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
             logprobs_restored = policy3.get_logprobs(sample_data)["logprobs"]
             print(f"Logprobs from restored policy: {logprobs_restored[0, :5]}")
 
@@ -1607,7 +1613,7 @@ def test_megatron_policy_topk_logits(topk_setup):
 
     # Generate top-k logits
     print("\nGenerating top-k logits...")
-    policy.prepare_for_lp_inference()
+    policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
     k = 5
     outputs = policy.get_topk_logits(data, k=k)
 
@@ -1720,7 +1726,7 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
     )
 
     # Get top-k from non-CP model with sequence packing
-    policy_no_cp.prepare_for_lp_inference()
+    policy_no_cp.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
     out_no_cp = policy_no_cp.get_topk_logits(data, k=k)
     logits_no_cp = out_no_cp["topk_logits"] * attention_mask.unsqueeze(-1)
     indices_no_cp = out_no_cp["topk_indices"]
@@ -1737,7 +1743,7 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
         name_prefix="lm_policy_nocp_nopack",
         init_reference_model=False,
     )
-    policy_no_cp_no_packing.prepare_for_lp_inference()
+    policy_no_cp_no_packing.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
     out_no_cp_np = policy_no_cp_no_packing.get_topk_logits(data, k=k)
     logits_no_cp_np = out_no_cp_np["topk_logits"] * attention_mask.unsqueeze(-1)
     indices_no_cp_np = out_no_cp_np["topk_indices"]
@@ -1800,7 +1806,7 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
         name_prefix="lm_policy_cp",
         init_reference_model=False,
     )
-    policy_cp.prepare_for_lp_inference()
+    policy_cp.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
     out_cp = policy_cp.get_topk_logits(data, k=k)
     logits_cp = out_cp["topk_logits"] * attention_mask.unsqueeze(-1)
     indices_cp = out_cp["topk_indices"]
@@ -2178,7 +2184,9 @@ def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
     )
 
     # Get logprobs from non-CP model with sequence packing
-    policy_no_cp.prepare_for_lp_inference()
+    from nemo_rl.models.policy.interfaces import OffloadMode
+
+    policy_no_cp.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
     logprobs_no_cp = policy_no_cp.get_logprobs(data)["logprobs"]
     logprobs_no_cp = logprobs_no_cp * attention_mask
     print(f"Non-CP logprobs shape: {logprobs_no_cp.shape}")
@@ -2199,7 +2207,7 @@ def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
         init_reference_model=False,
     )
     # Get logprobs from non-CP model with sequence packing
-    policy_no_cp_no_packing.prepare_for_lp_inference()
+    policy_no_cp_no_packing.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
     logprobs_no_cp_no_packing = policy_no_cp_no_packing.get_logprobs(data)["logprobs"]
     logprobs_no_cp_no_packing = logprobs_no_cp_no_packing * attention_mask
     print(f"Non-CP logprobs no packing shape: {logprobs_no_cp_no_packing.shape}")
@@ -2262,7 +2270,7 @@ def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
     )
 
     # Get logprobs from CP model with sequence packing
-    policy_cp.prepare_for_lp_inference()
+    policy_cp.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
     logprobs_cp = policy_cp.get_logprobs(data)["logprobs"]
     print(f"CP logprobs shape: {logprobs_cp.shape}")
     print(f"CP logprobs sample: {logprobs_cp[0, :5]}")

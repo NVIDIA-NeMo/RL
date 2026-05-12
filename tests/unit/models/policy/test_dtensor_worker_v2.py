@@ -466,7 +466,9 @@ def test_dtensor_v2_mixed_precision_training_and_logprobs(
         # --- Test Logprobs ---
         logprob_data = create_test_batch(mode="logprob")
 
-        policy.prepare_for_lp_inference()
+        from nemo_rl.models.policy.interfaces import OffloadMode
+
+        policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
         logprobs = policy.get_logprobs(logprob_data)
 
         # Verify logprobs were computed successfully

@@ -26,7 +26,6 @@ from omegaconf import OmegaConf
 from wandb import Table
 
 from nemo_rl.algorithms.grpo import (
-    ColocatablePolicyInterface,
     EnvironmentInterface,
     GenerationInterface,
     Logger,
@@ -71,7 +70,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 # These types are directly imported from grpo_train since if something about the architecture changes we want to immediately fail.
 def collect_trajectories(
-    policy: ColocatablePolicyInterface,
+    policy,
     policy_generation: GenerationInterface,
     val_dataloader: StatefulDataLoader,
     tokenizer: TokenizerType,

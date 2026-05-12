@@ -1345,12 +1345,13 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
 def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
     from nemo_rl.algorithms import grpo as grpo_mod
 
+    from nemo_rl.models.policy.interfaces import OffloadMode
+
     calls = {
         "prepare_for_generation_tags": [],
         "invalidate_kv_cache": 0,
         "stream_weights_via_http": [],
-        "offload_before_refit": 0,
-        "offload_after_refit": 0,
+        "finish_training_modes": [],
     }
 
     class DummySGLangGeneration:
@@ -1365,11 +1366,10 @@ def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
             return True
 
     class DummyPolicy:
-        def offload_before_refit(self):
-            calls["offload_before_refit"] += 1
-
-        def offload_after_refit(self):
-            calls["offload_after_refit"] += 1
+        def finish_training(self, **kwargs):
+            calls["finish_training_modes"].append(
+                kwargs.get("offload_mode", OffloadMode.FULL)
+            )
 
         def get_free_memory_bytes(self):
             return 1024 * 1024 * 1024
@@ -1387,8 +1387,10 @@ def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
         colocated_inference=True,
     )
 
-    assert calls["offload_before_refit"] == 1
-    assert calls["offload_after_refit"] == 1
+    assert calls["finish_training_modes"] == [
+        OffloadMode.OPTIMIZER_ONLY,
+        OffloadMode.FULL,
+    ]
     assert calls["invalidate_kv_cache"] == 1
     assert calls["stream_weights_via_http"] == [
         {"http://localhost:12345": ["gpu-uuid-0"]}
