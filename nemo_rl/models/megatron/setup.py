@@ -1249,6 +1249,11 @@ def finalize_megatron_setup(
         ]
     )
 
+    # if flextron is enabled, we should not disable the forward pre hook
+    # actually we dont need this since it is used only during reference logprob calculation which
+    # is the base model (KL loss will be computed on the base model which aligns the smaller model to the base model)
+    # should_disable_forward_pre_hook = should_disable_forward_pre_hook and not bool(config["megatron_cfg"]["flex_routers"])
+
     return megatron_tokenizer, megatron_bridge, should_disable_forward_pre_hook, dp_size
 
 

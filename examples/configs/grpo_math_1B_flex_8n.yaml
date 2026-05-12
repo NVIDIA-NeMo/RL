@@ -11,8 +11,8 @@ checkpointing:
 policy:
   train_global_batch_size: 16
   train_micro_batch_size: 1
-  logprob_batch_size: 1
-  max_total_sequence_length: 4096
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  max_total_sequence_length: 2048
 
 logger:
   wandb_enabled: true

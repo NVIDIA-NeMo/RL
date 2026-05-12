@@ -45,14 +45,10 @@ class FrozenFlextronRouter:
     ) -> None:
         self.model = model
         self.model_cfg = model_cfg
-        self.flex_routers = list(getattr(model_cfg, "flex_routers", None))
+        self.flex_routers = list(getattr(model_cfg, "flex_routers", []))
         self.flextron_sampling_rates = list(
-            getattr(model_cfg, "flextron_sampling_rates", None)
+            getattr(model_cfg, "flextron_sampling_rates", [])
         )
-        if self.flex_routers == []:
-            self.flex_routers = None
-        if self.flextron_sampling_rates == []:
-            self.flextron_sampling_rates = None
 
         self.active_router_id: int | None = None
         self._handles: list[RemovableHandle] = []
@@ -70,7 +66,7 @@ class FrozenFlextronRouter:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.flex_routers and self.flextron_sampling_rates)
+        return bool(self.flex_routers)
 
     def sample_router_ids(
         self, *, batch_size: int, device: torch.device | str | None = None
