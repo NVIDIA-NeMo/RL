@@ -1,7 +1,7 @@
 ---
 name: auto-research
-description: Autonomous NeMo RL experiment driver for accuracy-focused recipe search in this repository. Use when coding agents should inspect recipe inheritance and backend code paths, run repeatable experiments, and record each hypothesis on its own git branch under a shared prefix with a TSV experiment log.
-when_to_use: Running autonomous experiment campaigns; iterating on recipe accuracy; investigating NeMo-RL built-in environment or Nemo-gym recipes; 'auto research', 'experiment loop', 'hypothesis testing', 'accuracy search'.
+description: "Autonomous NeMo RL research agent workflow for directed hypothesis testing and open-ended discovery. Guides agents through the full experiment lifecycle: understanding recipes and environments, wiring RL or Nemo-gym runs, launching reproducible baselines and iterations, analyzing results, preserving human oversight, and using git plus TSV logs as the research ledger."
+when_to_use: auto research; run experiments; test these hypotheses; find a better recipe; improve accuracy; long-running NeMo-RL or Nemo-gym research campaigns; autonomous discovery; directed execution.
 ---
 
 # Auto Research
