@@ -315,7 +315,18 @@ class BaseVllmGenerationWorker:
             - https://github.com/huggingface/tokenizers/issues/537
             - https://github.com/PrimeIntellect-ai/prime-rl/pull/1837
             """
-            file_to_patch = _get_vllm_file("tool_parsers/hermes_tool_parser.py")
+            try:
+                file_to_patch = _get_vllm_file("tool_parsers/hermes_tool_parser.py")
+            except RuntimeError:
+                try:
+                    file_to_patch = _get_vllm_file(
+                        "entrypoints/openai/tool_parsers/hermes_tool_parser.py"
+                    )
+                except RuntimeError as e:
+                    logger.warning(
+                        "Skipping hermes tool parser thread-safety patch: %s", e
+                    )
+                    return
 
             with open(file_to_patch, "r") as f:
                 content = f.read()

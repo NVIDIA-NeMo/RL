@@ -1277,6 +1277,7 @@ def run_async_nemo_gym_rollout(
             # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
             # Extra information not in the DatumSpec used by the GRPO algorithm
             "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
+            "full_result": [r["full_result"] for r in results],
             # Add truncated field to match other rollout paths (reusing hit_max_tokens logic)
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
