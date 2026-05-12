@@ -1,17 +1,15 @@
 """OpenAI-compatible HTTP server wrapping a ``tensorrt_llm.LLM`` instance.
 
-Designed to be started inside a ``TrtllmGenerationWorker`` Ray actor so that
-NeMo Gym's harbor agent can call ``/v1/chat/completions`` for multi-turn
-rollout generation.  The response includes the custom fields that
-``NemoGymLLM`` expects (``prompt_token_ids``, ``generation_token_ids``,
-``generation_log_probs``).
+Started inside a ``TrtllmGenerationWorker`` Ray actor so NeMo Gym's harbor
+agent can call ``/v1/chat/completions`` for multi-turn rollout generation.
+The response includes the custom fields ``NemoGymLLM`` expects
+(``prompt_token_ids``, ``generation_token_ids``, ``generation_log_probs``).
 
 Supports OpenAI-format tool calling: accepts ``tools`` in the request,
-passes them to ``apply_chat_template``, parses ``<tool_call>`` tags from
-the generated text, and returns structured ``tool_calls`` in the response.
+passes them through ``apply_chat_template``, parses ``<tool_call>`` tags
+from the generated text, and returns structured ``tool_calls``.
 
-The server runs **uvicorn** in a daemon thread — identical to how vLLM's
-async worker exposes its HTTP server in NeMo RL.
+Runs uvicorn in a daemon thread.
 """
 
 import asyncio
@@ -259,10 +257,7 @@ def start_server(
     host: str = "0.0.0.0",
     port: int = 0,
 ) -> "tuple[threading.Thread, str, Any]":
-    """Start the HTTP server in a daemon thread and return (thread, base_url, server).
-
-    Mirrors the pattern from ``VllmAsyncGenerationWorker._setup_vllm_server``.
-    """
+    """Start the HTTP server in a daemon thread and return (thread, base_url, server)."""
     import uvicorn
     from nemo_rl.distributed.virtual_cluster import (
         _get_free_port_local,

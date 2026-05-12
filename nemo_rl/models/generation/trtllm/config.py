@@ -30,6 +30,13 @@ class TrtllmSpecificArgs(TypedDict):
     # prompt) and exposes llm.release()/llm.resume()/llm.update_weights() for
     # the upcoming colocated mode. Defaults to false (sync LLM, current behavior).
     async_engine: NotRequired[bool]
+    # MoE expert parallelism. TRT-LLM splits the TP dimension on MoE layers
+    # into moe_tp × moe_ep, so the constraint is
+    #     moe_tensor_parallel_size * moe_expert_parallel_size == tensor_parallel_size
+    # The outer worker count is unchanged (still TP × PP × DP) — these only
+    # affect how MoE expert weights are partitioned inside each TP rank.
+    moe_tensor_parallel_size: NotRequired[int]
+    moe_expert_parallel_size: NotRequired[int]
 
 
 class TrtllmConfig(GenerationConfig):

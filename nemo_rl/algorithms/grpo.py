@@ -757,26 +757,13 @@ def setup(
             pg.finish_generation()
             return pg, time.perf_counter() - t0
 
-        assert not colocated_inference, (
-            "TRT-LLM backend only supports non-colocated inference for now."
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_trtllm,
+            generation_name="TRT-LLM",
+            init_time_key="trtllm_init_time_s",
+            colocated_inference=colocated_inference,
+            worker_init_timing_metrics=worker_init_timing_metrics,
         )
-
-        print(
-            "  ⚡ Using parallel worker initialization (non-colocated mode)",
-            flush=True,
-        )
-        parallel_start_time = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            trtllm_future = executor.submit(init_trtllm)
-            policy_future = executor.submit(init_policy)
-            policy_generation, trtllm_time = trtllm_future.result()
-            policy, policy_time = policy_future.result()
-        parallel_wall_time = time.perf_counter() - parallel_start_time
-
-        worker_init_timing_metrics["trtllm_init_time_s"] = trtllm_time
-        worker_init_timing_metrics["policy_init_time_s"] = policy_time
-        worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
-        worker_init_timing_metrics["parallel_init_enabled"] = True
 
         print(
             f"  ✓ Using TRT-LLM backend for generation with {policy_config['model_name']}",
@@ -1229,7 +1216,10 @@ def refit_policy_generation(
                 ray.get(futures_train)
                 update_success = True
             else:
-                # Original ZMQ IPC path for vLLM
+                # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
+                # streams CUDA IPC handles in chunks; receiver reconstructs
+                # tensors in-place and feeds them into the inference engine's
+                # loader.
                 futures_train = policy.stream_weights_via_ipc_zmq(
                     buffer_size_bytes=buffer_size_bytes
                 )

@@ -14,8 +14,9 @@
 
 """``GenerationInterface`` implementation backed by TRT-LLM.
 
-Mirrors the non-colocated path of ``VllmGeneration`` — separate train /
-inference GPU sets, NCCL broadcast for weight synchronisation.
+Non-colocated: separate train / inference GPU sets, NCCL broadcast for
+weight sync. Colocated: shares GPUs with the policy and uses sleep/wakeup
+to time-multiplex GPU memory between training and inference phases.
 """
 
 from typing import Any, Optional, Union
@@ -36,7 +37,7 @@ from nemo_rl.models.generation.trtllm.config import TrtllmConfig
 
 
 class TrtllmGeneration(GenerationInterface):
-    """TRT-LLM generation backend (non-colocated only)."""
+    """TRT-LLM generation backend (colocated requires async_engine=true)."""
 
     def __init__(
         self,
@@ -55,6 +56,20 @@ class TrtllmGeneration(GenerationInterface):
         )
         self.dp_size = cluster.world_size() // self.model_parallel_size
 
+        # MoE: TRT-LLM partitions TP on MoE layers into moe_tp × moe_ep, so
+        # the product must equal the main tensor_parallel_size. Validate here
+        # to fail fast — the LLM constructor would otherwise raise a less
+        # actionable error deep inside the engine.
+        moe_tp = self.cfg["trtllm_cfg"].get("moe_tensor_parallel_size")
+        moe_ep = self.cfg["trtllm_cfg"].get("moe_expert_parallel_size")
+        if moe_tp is not None or moe_ep is not None:
+            moe_tp_v = moe_tp if moe_tp is not None else 1
+            moe_ep_v = moe_ep if moe_ep is not None else 1
+            assert moe_tp_v * moe_ep_v == self.tp_size, (
+                f"moe_tensor_parallel_size ({moe_tp_v}) * moe_expert_parallel_size "
+                f"({moe_ep_v}) must equal tensor_parallel_size ({self.tp_size})."
+            )
+
         missing_keys = [k for k in TrtllmConfig.__required_keys__ if k not in self.cfg]
         if "model_name" not in self.cfg:
             missing_keys.append("model_name")
@@ -69,17 +84,42 @@ class TrtllmGeneration(GenerationInterface):
             names=["data_parallel", "tensor_parallel"],
         )
 
-        strategy = "PACK"  # non-colocated
-        cluster._init_placement_groups(strategy=strategy, use_unified_pg=False)
-
+        self.colocated_enabled = bool(
+            self.cfg.get("colocated", {}).get("enabled", False)
+        )
         self.async_engine = self.cfg["trtllm_cfg"].get("async_engine", False)
+        if self.colocated_enabled and not self.async_engine:
+            raise NotImplementedError(
+                "TRT-LLM colocated mode requires trtllm_cfg.async_engine=true "
+                "(sleep/wakeup is only wired through the async worker)."
+            )
+
+        # Colocated reuses the policy's placement group → no PACK rearrangement.
+        # Non-colocated uses PACK so inference workers cluster together rather
+        # than interleaving with training bundles (SPREAD would emit something
+        # like [[0,3,6],[1,4,7],[2,5]] across nodes, breaking TP placement).
+        strategy = None if self.colocated_enabled else "PACK"
+        # Cross-node TP needs a single unified placement group so workers can
+        # land on bundles spanning node boundaries (e.g. TP=8 on 2x4 GPUs).
+        needs_cross_node_parallelism = (
+            self.model_parallel_size > cluster.num_gpus_per_node
+        )
+        cluster._init_placement_groups(
+            strategy=strategy,
+            use_unified_pg=needs_cross_node_parallelism,
+        )
+
         if self.async_engine:
             worker_cls = "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker"
         else:
             worker_cls = "nemo_rl.models.generation.trtllm.trtllm_worker.TrtllmGenerationWorker"
         worker_builder = RayWorkerBuilder(worker_cls, config)
 
-        env_vars: dict[str, str] = {"NCCL_CUMEM_ENABLE": "1"}
+        # NCCL_CUMEM_ENABLE=1 is needed for the non-colocated NCCL collective
+        # broadcast; colocated shares the policy's NCCL group so don't touch it.
+        env_vars: dict[str, str] = {}
+        if not self.colocated_enabled:
+            env_vars["NCCL_CUMEM_ENABLE"] = "1"
 
         if self.model_parallel_size > 1:
             node_bundle_indices = self._get_tied_worker_bundle_indices(cluster)
@@ -216,12 +256,33 @@ class TrtllmGeneration(GenerationInterface):
         return combined
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
-        return True
-
-    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+        """Wake inference workers up. No-op for non-colocated."""
+        if not self.colocated_enabled:
+            return True
         try:
             futures = self.worker_group.run_all_workers_single_data(
-                "reset_prefix_cache_async" if self.async_engine else "reset_prefix_cache",
+                "wake_up_async",
+                run_rank_0_only_axes=["tensor_parallel"],
+                **kwargs,
+            )
+            results = ray.get(futures)
+            return all(r for r in results if r is not None)
+        except Exception as e:
+            print(f"Error in prepare_for_generation: {e}")
+            return False
+
+    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+        """Sleep workers (colocated) or reset prefix cache (non-colocated)."""
+        try:
+            if self.colocated_enabled:
+                method_name = "sleep_async"
+            else:
+                method_name = (
+                    "reset_prefix_cache_async" if self.async_engine
+                    else "reset_prefix_cache"
+                )
+            futures = self.worker_group.run_all_workers_single_data(
+                method_name,
                 run_rank_0_only_axes=["tensor_parallel"],
             )
             results = ray.get(futures)
@@ -244,6 +305,16 @@ class TrtllmGeneration(GenerationInterface):
         return self.worker_group.run_all_workers_single_data(
             "update_weights_from_collective_async" if self.async_engine
             else "update_weights_from_collective",
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+
+    def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
+        """Receive weights via CUDA-IPC + ZMQ (colocated mode)."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group not initialised")
+        return self.worker_group.run_all_workers_single_data(
+            "update_weights_via_ipc_zmq_async" if self.async_engine
+            else "update_weights_via_ipc_zmq",
             run_rank_0_only_axes=["tensor_parallel"],
         )
 

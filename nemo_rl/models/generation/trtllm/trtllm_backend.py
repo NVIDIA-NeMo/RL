@@ -12,26 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TRT-LLM WorkerExtension for NCCL-based weight synchronisation.
+"""TRT-LLM WorkerExtension for NCCL / IPC weight synchronisation.
 
-This extension is injected into TRT-LLM's RayGPUWorker via the
-``ray_worker_extension_cls`` parameter on ``tensorrt_llm.LLM``.  It follows
-the same pattern as ``VllmInternalWorkerExtension`` (NCCL broadcast via
-nemo_rl's ``packed_broadcast_consumer``) but targets the TRT-LLM internal
-model / model_loader API.
+Injected into TRT-LLM's RayGPUWorker via ``ray_worker_extension_cls``.
 
-TRT-LLM's built-in ``WorkerExtension.update_weights()`` uses CUDA IPC
-handles.  This custom extension uses NCCL instead, matching the nemo-rl
-non-colocated weight-update path.
+- ``update_weights_from_collective`` — NCCL broadcast via
+  ``packed_broadcast_consumer``, used in non-colocated mode.
+- ``update_weights_via_ipc_zmq`` — CUDA IPC handles streamed over a
+  per-GPU ZMQ socket, used in colocated mode (NCCL can't form a group
+  when train and inference processes share the same physical GPU).
 """
 
+import gc
+import traceback
 from typing import Any
 
 import torch
+import zmq
 
 from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
+from nemo_rl.models.policy.utils import (
+    IPCProtocol,
+    calculate_aligned_size,
+    rebuild_cuda_tensor_from_ipc,
+)
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
 
@@ -55,11 +61,6 @@ class NcclExtension(WorkerExtension):
         world_size: int,
         train_world_size: int,
     ) -> None:
-        # Use nemo-rl's own StatelessProcessGroup (backed by nccl4py) instead
-        # of vllm.distributed.* — TrtllmGenerationWorker runs under the
-        # container's system python where vllm isn't installed, but nccl4py
-        # is in nemo-rl core deps. The exposed `.broadcast(tensor, src=...)`
-        # method matches what packed_broadcast_consumer calls.
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -84,16 +85,7 @@ class NcclExtension(WorkerExtension):
 
     @control_action_decorator
     def update_weights_from_collective(self) -> bool:
-        """Receive weights via NCCL broadcast, then update model parameters.
-
-        packed_broadcast_consumer uses double-buffered NCCL transfer across
-        multiple CUDA streams. A full device sync is required before reading
-        the received tensors on the default stream to avoid a data race.
-
-        post_unpack_func is called with List[Tuple[str, Tensor]] per chunk;
-        TRT-LLM's model_loader.reload expects a dict-like (weight_mapper
-        does weights.items() / weights[name]), so we convert per chunk.
-        """
+        """Receive weights via NCCL broadcast and update model parameters."""
         assert hasattr(self, "state_dict_info") and self.state_dict_info is not None, (
             "state_dict_info not set — call prepare_refit_info first"
         )
@@ -102,12 +94,9 @@ class NcclExtension(WorkerExtension):
 
         def load_model_weight_func(weight_list):
             # packed_broadcast_consumer runs NCCL broadcast on a non-default
-            # stream (streams[buffer_idx]); model_loader.reload internally
-            # spawns a ThreadPoolExecutor whose worker threads each use their
-            # own per-thread default stream and won't see the broadcast's
-            # writes without an explicit sync. Without this sync, worker
-            # threads read partially-written tensors → corrupted refit →
-            # KL divergence blow-up between generation and policy.
+            # stream; model_loader.reload spawns a ThreadPoolExecutor whose
+            # worker threads use per-thread default streams. Without this
+            # sync those threads would read partially-written tensors.
             torch.cuda.current_stream().synchronize()
             model_engine.model_loader.reload(
                 model, dict(weight_list), allow_partial_loading=True,
@@ -131,7 +120,6 @@ class NcclExtension(WorkerExtension):
                 if hasattr(module, "post_load_weights") and not getattr(module, "_weights_removed", False):
                     module.post_load_weights()
             torch.cuda.current_stream().synchronize()
-            self.engine.reset_prefix_cache()
         except Exception as e:
             print(
                 f"Error in NcclExtension.update_weights_from_collective: {e}"
@@ -141,6 +129,119 @@ class NcclExtension(WorkerExtension):
             return False
 
         return True
+
+    # ------------------------------------------------------------------ #
+    #  IPC weight receive + reload (colocated mode)
+    # ------------------------------------------------------------------ #
+
+    def get_zmq_address(self) -> str:
+        # Trainer side binds the same path (per-GPU UUID) so workers sharing
+        # the same physical GPU meet on one socket.
+        return f"ipc:///tmp/{self.report_device_id()}.sock"
+
+    def maybe_init_zmq(self) -> None:
+        if hasattr(self, "zmq_socket"):
+            return
+        self.zmq_context = zmq.Context()
+        self.zmq_socket = self.zmq_context.socket(zmq.REP)
+        self.zmq_socket.setsockopt(zmq.SNDTIMEO, 120000)
+        self.zmq_socket.setsockopt(zmq.RCVTIMEO, 120000)
+        self.zmq_socket.setsockopt(zmq.LINGER, 0)
+        self.zmq_socket.connect(self.get_zmq_address())
+
+    @control_action_decorator
+    def update_weights_via_ipc_zmq(self) -> bool:
+        """Receive weights via CUDA-IPC + ZMQ, reload model.
+
+        Trainer sends ``(ipc_handle, list_keys, used_bytes)`` chunks; end of
+        refit is signalled by ``IPCProtocol.COMPLETE``.
+        """
+        assert hasattr(self, "state_dict_info") and self.state_dict_info is not None, (
+            "state_dict_info not set — call prepare_refit_info first"
+        )
+        model_engine = self.engine.model_engine
+        model = model_engine.model
+
+        buffer = None
+        weights = None
+        try:
+            self.maybe_init_zmq()
+            for module in model.modules():
+                if hasattr(module, "pre_reload_weights") and not getattr(
+                    module, "_weights_removed", False
+                ):
+                    module.pre_reload_weights()
+
+            while True:
+                payload = self.zmq_socket.recv_pyobj()
+
+                if payload == IPCProtocol.COMPLETE:
+                    self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+                    break
+
+                ipc_handle, list_keys, used_bytes = payload
+                buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device_id)
+
+                weights = {}
+                offset = 0
+                for key in list_keys:
+                    shape, dtype = self.state_dict_info[key]
+                    if isinstance(shape, list):
+                        shape = torch.Size(shape)
+                    size_in_bytes = dtype.itemsize * shape.numel()
+                    weights[key] = (
+                        buffer[offset : offset + size_in_bytes]
+                        .view(dtype=dtype)
+                        .view(shape)
+                    )
+                    offset += calculate_aligned_size(size_in_bytes)
+
+                assert offset == used_bytes, (
+                    f"IPC payload offset mismatch: computed={offset}, sent={used_bytes}. "
+                    "Likely stale state_dict_info (wrong shape/dtype for some key)."
+                )
+
+                # Trainer writes the IPC buffer on its own stream; sync
+                # before reload so loader threads see the data.
+                torch.cuda.current_stream().synchronize()
+                model_engine.model_loader.reload(
+                    model, weights, allow_partial_loading=True,
+                )
+                torch.cuda.current_stream().synchronize()
+
+                # Drop views before ACK — trainer reuses the buffer on the
+                # next chunk, lingering views would read corrupted data.
+                del weights, buffer
+                weights = None
+                buffer = None
+                self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+
+            for module in model.modules():
+                if hasattr(module, "process_weights_after_loading") and not getattr(
+                    module, "_weights_removed", False
+                ):
+                    module.process_weights_after_loading()
+                if hasattr(module, "post_load_weights") and not getattr(module, "_weights_removed", False):
+                    module.post_load_weights()
+            torch.cuda.current_stream().synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+            return True
+        except Exception as e:
+            print(
+                f"Error in NcclExtension.update_weights_via_ipc_zmq: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            return False
+
+    def cleanup_zmq(self) -> None:
+        """Close ZMQ socket if open — called from worker shutdown."""
+        if hasattr(self, "zmq_socket"):
+            self.zmq_socket.close()
+            del self.zmq_socket
+        if hasattr(self, "zmq_context"):
+            self.zmq_context.destroy()
+            del self.zmq_context
 
     # ------------------------------------------------------------------ #
     #  Utilities

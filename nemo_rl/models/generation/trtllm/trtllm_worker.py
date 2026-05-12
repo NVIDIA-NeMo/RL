@@ -104,7 +104,7 @@ class TrtllmGenerationWorkerImpl:
 
         import tensorrt_llm
         from tensorrt_llm import SamplingParams as TrtSamplingParams
-        from tensorrt_llm.llmapi.llm_args import RayPlacementConfig
+        from tensorrt_llm.llmapi.llm_args import KvCacheConfig, RayPlacementConfig
         from ray.util.placement_group import get_current_placement_group
 
         self.TrtSamplingParams = TrtSamplingParams
@@ -148,6 +148,21 @@ class TrtllmGenerationWorkerImpl:
             ray_placement_config=ray_placement_config,
             trust_remote_code=True,
         )
+
+        gpu_mem_util = trtllm_cfg.get("gpu_memory_utilization")
+        if gpu_mem_util is not None:
+            llm_kwargs["kv_cache_config"] = KvCacheConfig(
+                free_gpu_memory_fraction=gpu_mem_util,
+            )
+
+        # MoE expert parallelism. TRT-LLM splits TP into moe_tp × moe_ep on
+        # MoE layers (non-MoE layers still use the main TP).
+        moe_tp = trtllm_cfg.get("moe_tensor_parallel_size")
+        moe_ep = trtllm_cfg.get("moe_expert_parallel_size")
+        if moe_tp is not None:
+            llm_kwargs["moe_tensor_parallel_size"] = moe_tp
+        if moe_ep is not None:
+            llm_kwargs["moe_expert_parallel_size"] = moe_ep
 
         self.llm = tensorrt_llm.LLM(**llm_kwargs)
 
@@ -226,6 +241,20 @@ class TrtllmGenerationWorkerImpl:
             return True
         except Exception as e:
             print(f"Exception during TRT-LLM collective weight update: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def update_weights_via_ipc_zmq(self) -> bool:
+        try:
+            results = self._collective_rpc("update_weights_via_ipc_zmq")
+            worker_result = results[0] if results else True
+            if not worker_result:
+                print(f"Error: TRT-LLM worker failed to update weights via IPC. Result: {worker_result}")
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during TRT-LLM IPC weight update: {e}")
             import traceback
             traceback.print_exc()
             return False

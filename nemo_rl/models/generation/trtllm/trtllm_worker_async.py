@@ -14,16 +14,13 @@
 
 """Ray actor wrapping ``tensorrt_llm._torch.async_llm.AsyncLLM``.
 
-Sibling of :class:`TrtllmGenerationWorker` that drives the async TRT-LLM
-engine. Follows vLLM's ``VllmAsyncGenerationWorker`` pattern: every method
-that needs to call into ``AsyncLLM`` is exposed as an ``async def`` with
-the ``_async`` suffix. Ray's actor runtime runs those coroutines directly
-on the actor's own asyncio event loop, so we don't need an external
-``AsyncLoopThread`` (which would deadlock against Ray's loop).
-
-Sync entrypoints inherited from :class:`TrtllmGenerationWorkerImpl` (e.g.
-``shutdown``) stay sync. :meth:`TrtllmGeneration` dispatches to the
-``_async`` variants when ``trtllm_cfg.async_engine`` is set.
+Sibling of :class:`TrtllmGenerationWorker` for the async TRT-LLM engine.
+Every method that calls into ``AsyncLLM`` is exposed as ``async def`` with
+the ``_async`` suffix, so Ray's actor runtime runs them on the actor's own
+asyncio loop. Sync entrypoints inherited from
+:class:`TrtllmGenerationWorkerImpl` (e.g. ``shutdown``) stay sync.
+:class:`TrtllmGeneration` dispatches to the ``_async`` variants when
+``trtllm_cfg.async_engine`` is set.
 """
 
 import asyncio
@@ -70,12 +67,14 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
             return
 
         from tensorrt_llm import AsyncLLM, SamplingParams as TrtSamplingParams
+        from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SleepConfig
         from ray.util.placement_group import get_current_placement_group
 
         self.TrtSamplingParams = TrtSamplingParams
 
         trtllm_cfg = self.cfg["trtllm_cfg"]
         tp_size = trtllm_cfg["tensor_parallel_size"]
+        self._colocated = bool(self.cfg.get("colocated", {}).get("enabled", False))
 
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
@@ -84,13 +83,10 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
             "TrtllmAsyncGenerationWorker must be scheduled inside a Ray placement "
             "group; got None from get_current_placement_group()."
         )
-        # NB: AsyncLLM.__init__ has its OWN placement_groups /
-        # placement_bundle_indices / per_worker_gpu_share named parameters,
-        # and it unconditionally overwrites any ``ray_placement_config`` we
-        # might pass in **kwargs with a fresh one built from those top-level
-        # args (see tensorrt_llm/_torch/async_llm.py). So passing
-        # ``ray_placement_config`` directly is a no-op (silently dropped).
-        # The right way is verl's pattern: top-level keyword args.
+        # AsyncLLM.__init__ has its own placement_groups /
+        # placement_bundle_indices / per_worker_gpu_share named params that
+        # unconditionally overwrite kwargs["ray_placement_config"] — so we
+        # must pass these as top-level kwargs, not via ray_placement_config.
         print(
             f"[TrtllmAsyncWorker] bundle_indices={self._bundle_indices}, "
             f"pg={pg}, bundle_specs={pg.bundle_specs}",
@@ -101,17 +97,10 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
         max_batch_size = trtllm_cfg.get("max_batch_size", 64)
         max_num_tokens = trtllm_cfg.get("max_num_tokens", 8192)
 
-        # Verl-style top-level placement kwargs: AsyncLLM.__init__ takes
-        # placement_groups / placement_bundle_indices as named parameters and
-        # builds the RayPlacementConfig itself with defer_workers_init=True.
-        # Passing ray_placement_config in **kwargs is a no-op (silently
-        # overwritten inside AsyncLLM.__init__).
-        #
-        # Use the "one entry per worker" expansion form
-        # (placement_groups=[pg, pg, ..., pg], placement_bundle_indices=[[i0],
-        # [i1], ...]) — matches the docstring example and trivially
-        # generalizes to multi-PG (multi-node TP) once we extend
-        # configure_worker to surface per-rank PGs.
+        # One PG entry per worker (placement_groups=[pg]*N,
+        # placement_bundle_indices=[[i0], [i1], ...]) so the expansion
+        # generalises to multi-PG layouts (cross-node TP) when
+        # configure_worker surfaces per-rank PGs.
         n_workers = len(self._bundle_indices)
         placement_groups_list = [pg] * n_workers
         placement_bundle_indices_list = [[i] for i in self._bundle_indices]
@@ -131,8 +120,27 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
             trust_remote_code=True,
         )
 
-        # Sync construction only — defer __await__ (which fires setup_async)
-        # to post_init_async on the Ray actor's asyncio loop.
+        gpu_mem_util = trtllm_cfg.get("gpu_memory_utilization")
+        if gpu_mem_util is not None:
+            llm_kwargs["kv_cache_config"] = KvCacheConfig(
+                free_gpu_memory_fraction=gpu_mem_util,
+            )
+
+        moe_tp = trtllm_cfg.get("moe_tensor_parallel_size")
+        moe_ep = trtllm_cfg.get("moe_expert_parallel_size")
+        if moe_tp is not None:
+            llm_kwargs["moe_tensor_parallel_size"] = moe_tp
+        if moe_ep is not None:
+            llm_kwargs["moe_expert_parallel_size"] = moe_ep
+
+        # Colocated: share each bundle's GPU 0.5/0.5 with the policy actor.
+        # RayWorkerWrapper does ray.get_gpu_ids()[0], so num_gpus must be > 0.
+        if self._colocated:
+            llm_kwargs["sleep_config"] = SleepConfig()
+            llm_kwargs["per_worker_gpu_share"] = 0.5
+
+        # Defer __await__ (which fires setup_async) to post_init_async so
+        # AsyncLLM setup runs on the Ray actor's asyncio loop.
         self.llm = AsyncLLM(**llm_kwargs)
 
     # ------------------------------------------------------------------ #
@@ -232,9 +240,76 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
             traceback.print_exc()
             return False
 
+    async def update_weights_via_ipc_zmq_async(self) -> bool:
+        assert self.llm is not None
+        try:
+            results = await self.llm.collective_rpc("update_weights_via_ipc_zmq")
+            worker_result = results[0] if results else True
+            if not worker_result:
+                print(
+                    f"Error: TRT-LLM worker failed to update weights via IPC. Result: {worker_result}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during TRT-LLM async IPC weight update: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
     async def report_device_id_async(self) -> list[str]:
         assert self.llm is not None
         return await self.llm.collective_rpc("report_device_id")
+
+    @classmethod
+    def _weights_tags(cls) -> list[str]:
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        return [
+            t.value for t in ExecutorMemoryType
+            if t is not ExecutorMemoryType.KV_CACHE and not t.value.startswith("_")
+        ]
+
+    @classmethod
+    def _all_sleep_tags(cls) -> list[str]:
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        return cls._weights_tags() + [ExecutorMemoryType.KV_CACHE.value]
+
+    def _resolve_wake_tags(self, tags: Optional[list[str]]) -> list[str]:
+        if not tags:
+            return self._all_sleep_tags()
+        out: list[str] = []
+        for t in tags:
+            if t == "weights":
+                out.extend(self._weights_tags())
+            elif t == "kv_cache":
+                from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+                out.append(ExecutorMemoryType.KV_CACHE.value)
+            else:
+                out.append(t)
+        return out
+
+    async def sleep_async(self, **kwargs: Any) -> bool:
+        # reset_prefix_cache before release: TRT-LLM's release() frees
+        # kv_cache memory but doesn't invalidate the prefix-reuse index, so
+        # the next wake-up would point at stale entries.
+        if self.llm is None:
+            return True
+        await self.llm.collective_rpc("reset_prefix_cache")
+        await self.llm.release(self._all_sleep_tags())
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        return True
+
+    async def wake_up_async(self, **kwargs: Any) -> bool:
+        if self.llm is None:
+            return True
+        tags = self._resolve_wake_tags(kwargs.get("tags"))
+        await self.llm.resume(tags)
+        return True
 
     async def reset_prefix_cache_async(self) -> bool:
         if self.llm is not None:
