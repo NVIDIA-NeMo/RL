@@ -389,6 +389,16 @@ def setup(
         os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
         print("  ✓ force_on_policy_ratio enabled")
 
+    # Validate skip_reference_policy_logprobs_calculation
+    if grpo_config.get("skip_reference_policy_logprobs_calculation"):
+        assert loss_config["reference_policy_kl_penalty"] == 0, (
+            "grpo.skip_reference_policy_logprobs_calculation=True requires "
+            "loss_fn.reference_policy_kl_penalty == 0"
+        )
+        print(
+            "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
+        )
+
     # ==========================
     #          Cluster
     # ==========================
@@ -554,6 +564,19 @@ def setup(
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Define initialization functions that will be used in all paths
+    init_reference_model = master_config["loss_fn"]["reference_policy_kl_penalty"] > 0
+
+    # Auto-enable skip_reference_policy_logprobs_calculation when the reference model is not loaded.
+    if not init_reference_model and not master_config["grpo"].get(
+        "skip_reference_policy_logprobs_calculation"
+    ):
+        master_config["grpo"]["skip_reference_policy_logprobs_calculation"] = True
+        print(
+            "Auto-enabling `grpo.skip_reference_policy_logprobs_calculation=True` "
+            "because `loss_fn.reference_policy_kl_penalty == 0` "
+            "(reference model is not loaded)."
+        )
+
     def init_policy():
         """Initialize policy training workers."""
         t0 = time.perf_counter()
@@ -565,6 +588,7 @@ def setup(
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_optimizer=True,
+            init_reference_model=init_reference_model,
         )
         return p, time.perf_counter() - t0
 
@@ -1336,12 +1360,6 @@ def grpo_train(
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
 
-    if master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
-        assert master_config["loss_fn"]["reference_policy_kl_penalty"] == 0
-        print(
-            "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
-        )
-
     # Check if we need to sync KV cache scales
     # When fallback to policy as the policy_generation, we use getattr to check.
     sync_kv_scales = getattr(policy_generation, "requires_kv_scale_sync", False)
@@ -1728,9 +1746,19 @@ def grpo_train(
                     metrics_logging_data["content"] = flat_messages["content"]
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
-                print("▶ Preparing for logprob inference...", flush=True)
-                with timer.time("logprob_inference_prep"):
-                    policy.prepare_for_lp_inference()
+                # Skip prev_logprobs computation when force_on_policy_ratio=True
+                skip_prev_logprobs = master_config["loss_fn"].get(
+                    "force_on_policy_ratio", False
+                )
+                if skip_prev_logprobs:
+                    print(
+                        "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
+                        flush=True,
+                    )
+                else:
+                    print("▶ Preparing for logprob inference...", flush=True)
+                    with timer.time("logprob_inference_prep"):
+                        policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
@@ -1744,9 +1772,14 @@ def grpo_train(
                             **extra_multimodal_data,
                         }
                     )
-                    train_data["prev_logprobs"] = policy.get_logprobs(
-                        logprob_data, timer=timer
-                    )["logprobs"]
+                    if not skip_prev_logprobs:
+                        train_data["prev_logprobs"] = policy.get_logprobs(
+                            logprob_data, timer=timer
+                        )["logprobs"]
+                    else:
+                        train_data["prev_logprobs"] = torch.zeros_like(
+                            train_data["generation_logprobs"]
+                        )
 
                     if not master_config["grpo"].get(
                         "skip_reference_policy_logprobs_calculation"
@@ -1757,10 +1790,28 @@ def grpo_train(
                                 timer=timer,
                             )["reference_logprobs"]
                         )
+                    else:
+                        train_data["reference_policy_logprobs"] = torch.zeros_like(
+                            train_data["prev_logprobs"]
+                        )
 
                     del logprob_data
                     del extra_multimodal_data
 
+                # Seq-level logprob error metrics/masking require real prev_logprobs
+                seq_logprob_error_threshold = master_config["grpo"].get(
+                    "seq_logprob_error_threshold", None
+                )
+                if skip_prev_logprobs:
+                    # Cannot compute seq-level metrics with placeholder prev_logprobs
+                    assert seq_logprob_error_threshold is None, (
+                        "seq_logprob_error_threshold requires prev_logprobs computation; "
+                        "cannot use with force_on_policy_ratio=True"
+                    )
+                    max_seq_mult_prob_error = 0.0
+                    num_masked_seqs = 0
+                    masked_correct_pct = 0.0
+                else:
                     (
                         max_seq_mult_prob_error,
                         num_masked_seqs,
@@ -1768,9 +1819,7 @@ def grpo_train(
                     ) = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
                         rewards=rewards,
-                        seq_logprob_error_threshold=master_config["grpo"][
-                            "seq_logprob_error_threshold"
-                        ],
+                        seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
@@ -2781,23 +2830,56 @@ def async_grpo_train(
                     train_data.to("cpu")
 
                 # Training phase (same as sync version)
-                print("▶ Preparing for logprob inference...")
-                with timer.time("logprob_inference_prep"):
-                    policy.prepare_for_lp_inference()
+                # Skip prev_logprobs computation when force_on_policy_ratio=True
+                skip_prev_logprobs = master_config["loss_fn"].get(
+                    "force_on_policy_ratio", False
+                )
+                if skip_prev_logprobs:
+                    print(
+                        "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
+                        flush=True,
+                    )
+                    fprop_logprobs = torch.zeros_like(train_data["generation_logprobs"])
+                else:
+                    print("▶ Preparing for logprob inference...")
+                    with timer.time("logprob_inference_prep"):
+                        policy.prepare_for_lp_inference()
 
-                print("▶ Computing logprobs...")
+                print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
-                    fprop_logprobs = policy.get_logprobs(
-                        train_data,
-                        timer=timer,
-                    )["logprobs"]
-                    reference_logprobs = policy.get_reference_policy_logprobs(
-                        train_data,
-                        timer=timer,
-                    )["reference_logprobs"]
+                    if not skip_prev_logprobs:
+                        fprop_logprobs = policy.get_logprobs(
+                            train_data,
+                            timer=timer,
+                        )["logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
-                    train_data["reference_policy_logprobs"] = reference_logprobs
 
+                    if not master_config["grpo"].get(
+                        "skip_reference_policy_logprobs_calculation"
+                    ):
+                        reference_logprobs = policy.get_reference_policy_logprobs(
+                            train_data,
+                            timer=timer,
+                        )["reference_logprobs"]
+                        train_data["reference_policy_logprobs"] = reference_logprobs
+                    else:
+                        train_data["reference_policy_logprobs"] = torch.zeros_like(
+                            fprop_logprobs
+                        )
+
+                # Seq-level logprob error metrics/masking require real prev_logprobs
+                seq_logprob_error_threshold = master_config["grpo"].get(
+                    "seq_logprob_error_threshold", None
+                )
+                if skip_prev_logprobs:
+                    assert seq_logprob_error_threshold is None, (
+                        "seq_logprob_error_threshold requires prev_logprobs computation; "
+                        "cannot use with force_on_policy_ratio=True"
+                    )
+                    max_seq_mult_prob_error = 0.0
+                    num_masked_seqs = 0
+                    masked_correct_pct = 0.0
+                else:
                     (
                         max_seq_mult_prob_error,
                         num_masked_seqs,
@@ -2805,9 +2887,7 @@ def async_grpo_train(
                     ) = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
                         rewards=rewards,
-                        seq_logprob_error_threshold=master_config["grpo"][
-                            "seq_logprob_error_threshold"
-                        ],
+                        seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
