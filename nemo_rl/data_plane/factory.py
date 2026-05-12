@@ -36,7 +36,7 @@ def build_data_plane_client(
         controller — workers must use this so they don't try to create a
         second named actor in the Ray cluster.
     """
-    if cfg is None or not cfg.get("enabled", False):
+    if cfg is None or not cfg["enabled"]:
         raise ValueError(
             "build_data_plane_client called with data_plane disabled. "
             "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer "

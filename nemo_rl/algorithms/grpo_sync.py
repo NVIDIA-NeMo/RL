@@ -234,7 +234,7 @@ def grpo_train_sync(
     # entry-guard so users running this trainer with the legacy policy
     # see a clear error rather than an opaque AttributeError.
     dp_cfg = master_config.get("data_plane")
-    if not dp_cfg or not dp_cfg.get("enabled", False):
+    if not dp_cfg or not dp_cfg["enabled"]:
         raise ValueError(
             "grpo_train_sync requires master_config['data_plane']['enabled']=True. "
             "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer if you don't "
