@@ -11,12 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Stable boundary between NeMo-RL and any data-plane implementation.
+"""Stable boundary between NeMo-RL and any data-plane implementation
+that supports the NeMo-RL columnar batch contract.
+
+Wire shape adapters must support:
+  * ``fields``: tensor-only ``TensorDict`` (no Python objects on the bus).
+    :func:`nemo_rl.data_plane.codec.pack_object_array` encodes
+    ``np.ndarray(dtype=object)`` fields into uint8 jagged tensors
+    *before* they reach the adapter, so adapters never see arbitrary
+    Python objects.
+  * ``tags``: ``list[dict[str, Any]]`` per-sample primitives (kept
+    separate from ``fields`` so non-tensor metadata like
+    ``input_lengths`` doesn't pollute the tensor bus).
+  * ``keys``: per-sample string uids.
+  * ``partition_id``: string-named address spaces with declared
+    ``consumer_tasks`` and ``fields`` schemas.
 
 All call sites in ``nemo_rl/algorithms``, ``nemo_rl/experience`` and
 ``nemo_rl/models`` go through :class:`DataPlaneClient` — never
-``import transfer_queue`` directly. This is what makes the implementation
-swappable.
+``import transfer_queue`` directly. This is what makes the
+implementation swappable.
 
 See ``nemo_rl/data_plane/README.md`` for the full design.
 """
