@@ -113,6 +113,17 @@ class TQPolicy(Policy):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
+        # Validate the topology the data plane fan-out (`shard_meta_for_dp`)
+        # depends on. Failing here surfaces a clear error at policy
+        # construction; the same condition is re-checked inside
+        # `shard_meta_for_dp` as a defensive invariant.
+        dp_world = self.sharding_annotations.get_axis_size("data_parallel")
+        if dp_world <= 0:
+            raise ValueError(
+                f"TQPolicy requires data_parallel axis size > 0, got {dp_world}. "
+                f"Check cluster config (gpus_per_node * num_nodes) vs. "
+                f"TP/PP/CP/EP sizes."
+            )
         self.dp_cfg = dp_cfg
         self._dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
         self._tq_partition_id = tq_partition_id
