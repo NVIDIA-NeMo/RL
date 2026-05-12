@@ -129,7 +129,7 @@ COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashi
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
-RUN --mount=type=ssh --mount=type=cache,target=/tmp/uv-warm-cache <<"EOF" bash -exu
+RUN --mount=type=ssh --mount=type=cache,target=/tmp/uv-warm-cache,sharing=locked <<"EOF" bash -exu
 # Invalidate persistent cache when base image or uv version changes (compiled
 # CUDA kernels are ABI-incompatible across toolkit versions, and uv cache
 # format may change across uv versions).
