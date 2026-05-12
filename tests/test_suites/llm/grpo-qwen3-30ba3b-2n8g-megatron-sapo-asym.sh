@@ -4,12 +4,10 @@ source $SCRIPT_DIR/common.env
 # ignore tensor parallel accuracy check
 export NRL_IGNORE_TP_ACCURACY_CHECK=1
 
-# Arm 2/3 of the SAPO vs GRPO reproduction: SAPO with ASYMMETRIC tau
-# (tau_pos=1.0, tau_neg=1.05). Replaces the hard PPO clip with a smooth
-# temperature-controlled sigmoid gate. This is the recommended SAPO
-# setting per arXiv:2511.20347 (Eq. 5-6 + Fig. 5 asymmetric-tau ablation).
-# See examples/configs/recipes/llm/grpo-qwen3-30ba3b-2n8g-megatron-sapo-repro-base.yaml
-# for the shared base config the three arms inherit from.
+# SAPO (Soft Adaptive Policy Optimization, arXiv:2511.20347) on
+# Qwen3-30B-A3B with Megatron policy + colocated vLLM rollouts, using
+# the paper's recommended ASYMMETRIC tau (tau_pos=1.0, tau_neg=1.05).
+# See examples/configs/recipes/llm/grpo-qwen3-30ba3b-2n8g-megatron-sapo-asym.yaml.
 
 # Megatron backend requires TORCH_CUDA_ARCH_LIST. In local SSH environments
 # this may be unset, so infer from nvidia-smi when possible.
