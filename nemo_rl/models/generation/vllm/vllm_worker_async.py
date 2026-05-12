@@ -975,9 +975,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 top_p=self.cfg["top_p"],
                 top_k=top_k if not greedy else 1,
                 max_tokens=self.cfg["max_new_tokens"],
-                stop_token_ids=self.cfg["stop_token_ids"]
-                if not self.cfg["ignore_eos"]
-                else [],
+                stop_token_ids=self.cfg["stop_token_ids"],
                 ignore_eos=self.cfg["ignore_eos"],
                 stop=final_stop_strings,
                 include_stop_str_in_output=True,  # returning stop strings like hf
