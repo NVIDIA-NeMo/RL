@@ -22,7 +22,7 @@ Treat dependencies as ready, but choose the runtime deliberately. Use the recipe
 
 For GPU, CPU-heavy, distributed, or long-running work, choose the execution environment deliberately. Run locally when the current machine has suitable GPUs and capacity; otherwise follow the user's requested environment, use `launch-nemo-rl` for nrl-k8s/Kubernetes, use the environment's native launcher for Slurm, or clarify with the user before launching. Use CPU-only local runs only for light inspection, dry runs, and short non-GPU checks.
 
-If the machine appears to be a Brev instance, use `brev-etiquette` before creating experiment directories, caches, logs, checkpoints, or authenticated runtime state.
+If `/home/ubuntu/RL` exists and `/ephemeral` is available as a volume, treat the machine as a Brev instance and use `brev-etiquette` before creating experiment directories, caches, logs, checkpoints, or authenticated runtime state.
 
 ## Branching
 
