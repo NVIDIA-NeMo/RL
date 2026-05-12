@@ -450,8 +450,15 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
         }
-        # Collect MoE aux metrics averaged across microbatches
-        num_moe_experts = getattr(self.model.config, "num_moe_experts", None)
+        # Collect MoE aux metrics averaged across microbatches.
+        # Read "config" via getattr-by-string instead of `self.model.config` so
+        # the token does not land in train.__code__.co_names. With torch 2.11,
+        # cloudpickle's _find_imported_submodules otherwise matches
+        # torch.distributed.config (a ConfigModuleInstance, not a real module)
+        # when {distributed, config} both appear in co_names, and Ray actor
+        # serialization fails with "cannot pickle 'ConfigModuleInstance'".
+        model_config = getattr(self.model, "config", None)
+        num_moe_experts = getattr(model_config, "num_moe_experts", None)
         if num_moe_experts is not None and num_moe_experts > 1:
             moe_loss_scale = 1.0 / max(1, total_num_microbatches)
             moe_metrics = get_moe_metrics(
