@@ -234,8 +234,12 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
         _master = os.path.join(_moon_pkg, "mooncake_master")
         try:
             os.chmod(_master, 0o755)
-        except OSError:
-            pass
+        except OSError as e:
+            if not os.access(_master, os.X_OK):
+                raise RuntimeError(
+                    f"Failed to make {_master} executable: {e}. "
+                    f"Mooncake bootstrap requires this binary."
+                ) from e
         _existing_path = os.environ.get("PATH", "")
         if _moon_pkg not in _existing_path.split(os.pathsep):
             os.environ["PATH"] = _moon_pkg + os.pathsep + _existing_path
