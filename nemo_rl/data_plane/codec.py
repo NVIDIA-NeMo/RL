@@ -364,6 +364,10 @@ def materialize(
     """
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
+    if pad_to_multiple < 1:
+        raise ValueError(
+            f"pad_to_multiple must be >= 1, got {pad_to_multiple}"
+        )
     pads = pad_value_dict or {}
     obj_set = set(object_fields or ())
     out: dict[str, Any] = {}
