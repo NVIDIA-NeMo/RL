@@ -166,6 +166,7 @@ def pack_object_array(arr: "np.ndarray | list[Any]") -> torch.Tensor:
 
     rows: list[torch.Tensor] = []
     for item in items:
+        # Trusted serialization — producer-registered `object_fields` only.
         b = pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL)
         # np.frombuffer + .copy() avoids the "non-writable buffer" warning
         # and severs the lifetime tie to the bytes object.
