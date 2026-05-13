@@ -11,7 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared string-key constants for the data-plane meta contract."""
+"""Shared constants and type aliases for the data-plane meta contract."""
+
+from typing import Literal
+
+# Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
+Layout = Literal["padded", "jagged"]
 
 # Per-shard packing metadata keys in `KVBatchMeta.extra_info`.
 META_MICRO_BATCH_INDICES = "micro_batch_indices"
