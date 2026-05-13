@@ -30,9 +30,18 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, dataclass
 from time import monotonic
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, TypedDict
 
 EventStatus = Literal["ok", "error", "timeout"]
+
+
+class DataPlaneEvent(TypedDict):
+    op: str
+    partition_id: str
+    n_keys: int
+    n_bytes: int
+    wall_ms: float
+    status: EventStatus
 
 import torch
 from tensordict import TensorDict
@@ -55,7 +64,7 @@ def _td_bytes(td: TensorDict | None) -> int:
     return total
 
 
-def log_event(event: dict[str, Any]) -> None:
+def log_event(event: DataPlaneEvent) -> None:
     logger.info("data_plane_event: %s", event)
 
 
@@ -79,7 +88,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
     def __init__(
         self,
         inner: DataPlaneClient,
-        on_event: Callable[[dict[str, Any]], None] | None = None,
+        on_event: Callable[[DataPlaneEvent], None] | None = None,
     ) -> None:
         self._inner = inner
         self._on_event = on_event or (lambda _: None)
@@ -173,7 +182,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         t0: float,
         status: EventStatus,
     ) -> None:
-        event = {
+        event: DataPlaneEvent = {
             "op": op,
             "partition_id": partition_id,
             "n_keys": int(n_keys),
