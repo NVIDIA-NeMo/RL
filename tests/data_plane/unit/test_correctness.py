@@ -28,7 +28,8 @@ from tensordict import TensorDict
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import read_columns, write_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.preshard import DP_SEED_FIELDS, shard_meta_for_dp
+from nemo_rl.data_plane.preshard import shard_meta_for_dp
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.sync_rollout_actor import kv_first_write
 
@@ -52,7 +53,7 @@ def _final_batch(n: int = 4, *, with_image: bool = False) -> BatchedDataDict:
 def _setup(client: NoOpDataPlaneClient, n: int, *, fields=None) -> None:
     client.register_partition(
         partition_id="train",
-        fields=list(fields if fields is not None else DP_SEED_FIELDS),
+        fields=list(fields if fields is not None else DP_TRAIN_FIELDS),
         num_samples=n,
         consumer_tasks=["train"],
     )
@@ -270,7 +271,7 @@ def test_kv_first_write_carries_multimodal_extras_through_tq() -> None:
     """End-to-end flow for VLM: image features must round-trip via TQ
     with original shape + dtype, not be silently dropped or coerced."""
     client = NoOpDataPlaneClient()
-    fields = list(DP_SEED_FIELDS) + ["image_features"]
+    fields = list(DP_TRAIN_FIELDS) + ["image_features"]
     client.register_partition(
         partition_id="train",
         fields=fields,

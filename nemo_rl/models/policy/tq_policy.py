@@ -39,11 +39,8 @@ import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
-from nemo_rl.data_plane.preshard import (
-    DP_SEED_FIELDS,
-    LP_SEED_FIELDS,
-    shard_meta_for_dp,
-)
+from nemo_rl.data_plane.preshard import shard_meta_for_dp
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, LP_SEED_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
@@ -101,7 +98,7 @@ class TQPolicy(Policy):
     The partition lifecycle (``register_partition`` / ``kv_clear``) is
     the trainer's responsibility — this class assumes the partition
     named ``self._tq_partition_id`` (default ``"train"``) is open with a
-    schema covering ``DP_SEED_FIELDS`` (the bulk schema written by the
+    schema covering ``DP_TRAIN_FIELDS`` (the bulk schema written by the
     rollout actor at first put + driver-/worker-written deltas).
     """
 
@@ -163,7 +160,7 @@ class TQPolicy(Policy):
         """
         self._dp_client.register_partition(
             partition_id=self._tq_partition_id,
-            fields=list(DP_SEED_FIELDS),
+            fields=list(DP_TRAIN_FIELDS),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
             grpo_group_size=group_size,
@@ -300,13 +297,13 @@ class TQPolicy(Policy):
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
 
         spa, dba = self._packing_args("train_mb_tokens")
-        # Train workers fetch the full DP_SEED_FIELDS schema (rollout +
+        # Train workers fetch the full DP_TRAIN_FIELDS schema (rollout +
         # logprob deltas + advantages + sample_mask). Caller is responsible
         # for ensuring those columns have been written to TQ before this
         # call (workers + driver delta-writes).
         train_meta = replace(
             meta,
-            fields=list(DP_SEED_FIELDS),
+            fields=list(DP_TRAIN_FIELDS),
             task_name="train",
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
