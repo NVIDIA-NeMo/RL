@@ -85,7 +85,10 @@ def to_nested_by_length(
         raise ValueError(
             f"lengths shape {tuple(lengths.shape)} != ({n},) (rows of padded)"
         )
-    rows = [padded[i, : int(lengths[i].item())] for i in range(n)]
+    # Single sync — without this, the per-row ``.item()`` below would
+    # GPU-sync N times if ``lengths`` lives on CUDA.
+    lens = lengths.cpu().tolist() if lengths.is_cuda else lengths.tolist()
+    rows = [padded[i, : lens[i]] for i in range(n)]
     return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
 
