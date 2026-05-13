@@ -15,7 +15,7 @@ grpo:
   num_val_generations_per_prompt: 1
   max_rollout_turns: 1
   max_num_epochs: 1
-  max_num_steps: 10
+  max_num_steps: 20
   normalize_rewards: true
   use_leave_one_out_baseline: true
   advantage_clip_low: -100
@@ -299,16 +299,13 @@ logger:
   log_dir: logs/grpo-nemotron-nano-16n8g-async-1off-swe
   num_val_samples_to_print: 0
   wandb_enabled: True
-  wandb:
-    project: "nemo-rl"
-    name: "grpo-nemotron-nano-16n8g-async-1off-swe"
   tensorboard_enabled: false
   mlflow_enabled: false
   monitor_gpus: true
   swanlab_enabled: false
   wandb:
-    project: "grpo-dev"
-    name: "grpo-dev-logger"
+    project: "nemo-rl"
+    name: "grpo-nemotron-nano-16n8g-async-1off-swe"
   tensorboard: {}
   mlflow:
     experiment_name: "grpo-dev"

@@ -127,7 +127,7 @@ if [[ -n "$SIF_DIR" ]]; then
 fi
 
 if [[ -n "$CONTAINER_FORMATTER" ]]; then
-    COMMAND="$COMMAND container_formatter=${CONTAINER_FORMATTER}"
+    COMMAND="$COMMAND env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter=${CONTAINER_FORMATTER}"
 fi
 
 export CONTAINER
