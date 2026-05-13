@@ -23,6 +23,11 @@ META_MICRO_BATCH_INDICES = "micro_batch_indices"
 META_MICRO_BATCH_LENGTHS = "micro_batch_lengths"
 META_ELEM_COUNTS_PER_GB = "elem_counts_per_gb"
 
+# Preshard-internal column that rides through
+# `BatchedDataDict.shard_by_batch_size` so each rank can recover its
+# meta-index mapping.
+META_IDX = "meta_idx"
+
 # Tensor fields in the train partition. Rollout writes the input
 # subset on first put; later stages add prev_logprobs /
 # reference_policy_logprobs (workers) and advantages (driver).

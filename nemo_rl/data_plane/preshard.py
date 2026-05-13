@@ -30,6 +30,7 @@ import torch
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     META_ELEM_COUNTS_PER_GB,
+    META_IDX,
     META_MICRO_BATCH_INDICES,
     META_MICRO_BATCH_LENGTHS,
 )
@@ -96,14 +97,14 @@ def shard_meta_for_dp(
     seq_lens = list(meta.sequence_lengths)
     # Skeleton BatchedDataDict — `shard_by_batch_size` only needs
     # input_ids (placeholder), input_lengths (real), sample_mask (ones).
-    # ``_meta_idx`` lets us recover which original meta index each shard row
+    # ``meta_idx`` lets us recover which original meta index each shard row
     # corresponds to, so we can slice ``meta.keys`` per rank.
     skeleton = BatchedDataDict(
         {
             "input_ids": torch.zeros(n, 1, dtype=torch.int64),
             "input_lengths": torch.tensor(seq_lens, dtype=torch.int64),
             "sample_mask": torch.ones(n, dtype=torch.float32),
-            "_meta_idx": torch.arange(n, dtype=torch.int64),
+            META_IDX: torch.arange(n, dtype=torch.int64),
         }
     )
 
@@ -129,7 +130,7 @@ def shard_meta_for_dp(
     flat_idx: list[int] = []
     for shard in sharded:
         # pyrefly: ignore  # no-matching-overload
-        idx_list: list[int] = shard["_meta_idx"].tolist()
+        idx_list: list[int] = shard[META_IDX].tolist()
         flat_idx.extend(idx_list)
         rank_keys = [meta.keys[i] for i in idx_list]
         rank_seqlens = [seq_lens[i] for i in idx_list]
