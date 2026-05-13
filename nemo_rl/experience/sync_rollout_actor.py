@@ -74,23 +74,25 @@ def kv_first_write(
 ) -> KVBatchMeta:
     """Single flat ``kv_batch_put`` of every tensor field in ``final_batch_cpu``.
 
-    Keys ``f"{uid}_g{i}"``, no DP awareness, no fan-out. Bulk lives in
-    TQ from here on; the caller never re-handles it on the driver.
+    Keys ``f"{uid}_g{i}"``; no DP awareness, no fan-out. Bulk lives in
+    TQ from here on. Variable-length tensor fields are jagged-packed via
+    :func:`to_nested_by_length`; non-tensor leaves ride as
+    ``NonTensorStack`` (TQ handles non-tensor encoding per backend).
+    Padding is paid only at consumer side via :func:`materialize`.
 
-    Wire format: variable-length tensor fields are converted to
-    ``torch.jagged`` nested tensors via :func:`to_nested_by_length`
-    before the put. A field qualifies as variable-length when its shape
-    is ``(N, S, ...)`` with ``S == max(input_lengths)`` and
-    ``N == len(uids) * n_gen`` — catches ``input_ids``, ``token_mask``,
-    ``generation_logprobs``. Rectangular fields (``input_lengths``,
-    ``sample_mask``, image embeddings) pass through as regular tensors.
-    The padding tax is paid only when a consumer calls
-    :func:`materialize(layout='padded', pad_value_dict=...)`.
+    Args:
+        final_batch_cpu: Rollout output already on CPU.
+        uids: Per-prompt UIDs; each row gets ``f"{uid}_g{i}"``.
+        dp_client: Data-plane client used for the put.
+        partition_id: TQ partition to write into.
+        extra_info: Optional extra fields to attach to the returned meta.
+        task_name: Consumer task tag stamped on the returned meta.
+        pad_to_multiple: Seq-dim alignment recorded in ``extra_info`` so
+            readers pad to a multiple compatible with downstream backends
+            (mcore SP, PyTorch CP).
 
-    Non-tensor object fields (``np.ndarray(dtype=object)`` — verl-style)
-    ride the wire as ``NonTensorStack`` leaves. TQ handles the encoding
-    per backend (simple keeps Python objects; mooncake_client pickles
-    internally) — no codec-level pickle here.
+    Returns:
+        ``KVBatchMeta`` covering the written keys.
     """
     from tensordict import NonTensorStack
 
@@ -181,24 +183,23 @@ class SyncRolloutActor:
     ]:
         """Rollout → flatten + mask + prompt extraction → flat ``kv_batch_put``.
 
-        Returns ``(meta, slice, rollout_metrics, generation_logger_metrics)``.
         ``slice`` carries only the small per-sample tensors the driver
-        needs to do its own per-sample compute (scale_rewards,
+        needs for its own per-sample compute (scale_rewards,
         reward_shaping, overlong filtering, baseline/std,
-        dynamic_sampling, advantage). The actor handles only the
-        bulk-touching ops — flatten / mask / prompt extraction — that
-        require ``message_log`` and would otherwise force bulk onto the
-        driver.
+        dynamic_sampling, advantage). The actor handles the bulk-touching
+        ops (flatten / mask / prompt extraction) that require
+        ``message_log`` and would otherwise force bulk onto the driver.
 
         Args:
             input_batch: Per-step prompt batch (already repeat-interleaved).
             uids: One uid per prompt; bulk keys are ``f"{uid}_g{i}"``.
             partition_id: TQ partition target.
-            first_iter: True on the first DS iteration of a step. Drives
+            first_iter: True on the first DS iteration of a step; drives
                 ``policy_generation.snapshot_step_metrics()`` so per-step
-                generation metrics align with the legacy
-                ``grpo.grpo_train`` path. Driver passes
-                ``dynamic_sampling_num_gen_batches == 1``.
+                metrics align with the legacy ``grpo.grpo_train`` path.
+
+        Returns:
+            ``(meta, slice, rollout_metrics, generation_logger_metrics)``.
         """
         # Lazy imports — avoid pulling grpo into this module at load.
         from nemo_rl.algorithms.grpo import (
