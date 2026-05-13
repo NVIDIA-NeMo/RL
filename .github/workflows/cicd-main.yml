@@ -332,6 +332,9 @@ jobs:
           docker build -t "${DST}" -f /tmp/Dockerfile.uv-cache /tmp
           docker push "${DST}"
 
+          docker rmi "${SRC}" "${DST}" 2>/dev/null || true
+          rm -rf /tmp/uv-cache /tmp/Dockerfile.uv-cache
+
   cicd-doc-tests:
     strategy:
       fail-fast: false
