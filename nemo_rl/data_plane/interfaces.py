@@ -205,10 +205,13 @@ class DataPlaneClient(ABC):
     ) -> None:
         """Declare the partition schema and consumer tasks.
 
-        ``fields`` is the superset of fields any producer may write to
-        this partition (multimodal-tolerant). ``enums`` ships fixed-vocab
-        string codecs to the controller once at register time rather
-        than per-sample.
+        Args:
+            partition_id: Partition name.
+            fields: Superset of fields any producer may write here.
+            num_samples: Expected total samples; sizes controller arrays.
+            consumer_tasks: Named tasks; each gets its own consumption cursor.
+            grpo_group_size: Group size for GRPO balanced sampling.
+            enums: Per-field fixed-vocab string codec, shipped once at register.
         """
 
     @abstractmethod
@@ -222,17 +225,23 @@ class DataPlaneClient(ABC):
         blocking: bool = True,
         timeout_s: float = 60.0,
     ) -> KVBatchMeta:
-        """Discover and **claim** up to ``batch_size`` ready samples for ``task_name``.
+        """Discover and **claim** up to ``batch_size`` ready samples.
 
-        Side effect: advances ``task_name``'s per-sample consumption cursor
-        for the returned uids (TQ's ``mode='fetch'``). Subsequent
-        :meth:`claim_meta` calls for the same task will not return these
-        uids again. Does NOT delete samples — they remain readable via
-        :meth:`kv_batch_get` until :meth:`kv_clear`.
+        Advances ``task_name``'s per-sample consumption cursor (TQ's
+        ``mode='fetch'``); claimed uids won't be returned again. Samples
+        stay readable via :meth:`kv_batch_get` until :meth:`kv_clear`.
 
-        ``dp_rank`` is preserved on the ABC for forward compatibility but
-        the current path uses driver-side balancing via
-        :func:`shard_meta_for_dp` instead of TQ's ``RankAwareSampler``.
+        Args:
+            partition_id: Partition to claim from.
+            task_name: Consumer task whose cursor is advanced.
+            required_fields: Fields that must be produced for a sample to be claimable.
+            batch_size: Max samples to claim.
+            dp_rank: Reserved; driver-side balancing via :func:`shard_meta_for_dp` is used today.
+            blocking: Block until the batch can be claimed.
+            timeout_s: Max blocking time before raising.
+
+        Returns:
+            ``KVBatchMeta`` for the claimed batch; pass to :meth:`get_data`.
         """
 
     @abstractmethod
@@ -243,20 +252,33 @@ class DataPlaneClient(ABC):
     ) -> TensorDict:
         """Resolve a meta to tensor data.
 
-        Resolution order for the field set:
-          1. Explicit ``select_fields`` argument.
-          2. ``meta.fields`` if non-None.
-          3. *Fail loudly* — never silently fetch all fields.
+        Field-set resolution: (1) explicit ``select_fields``; (2)
+        ``meta.fields`` if non-None; (3) *fail loudly* — never silently
+        fetch all fields.
+
+        Args:
+            meta: From :meth:`claim_meta` or hand-built with explicit keys.
+            select_fields: Subset of fields to fetch.
+
+        Returns:
+            ``TensorDict`` keyed by field name, batched along ``meta.keys``.
         """
 
     @abstractmethod
     def check_consumption_status(
         self, partition_id: str, task_names: list[str]
     ) -> bool:
-        """True iff every task in ``task_names`` has consumed all samples.
+        """True iff every task has consumed all samples in the partition.
 
         Authoritative across workers — uses TQ's controller-side counter,
         not the per-process client cache.
+
+        Args:
+            partition_id: Partition to check.
+            task_names: Tasks whose consumption cursors are inspected.
+
+        Returns:
+            ``True`` iff every task in ``task_names`` has consumed all samples.
         """
 
     # ── (B) direct-by-key (TQ-aligned signatures) ──────────────────────
@@ -269,15 +291,21 @@ class DataPlaneClient(ABC):
         fields: TensorDict | None = None,
         tags: list[dict[str, Any]] | None = None,
     ) -> KVBatchMeta:
-        """Producer entrypoint.
+        """Write fields for ``keys`` — the producer entrypoint.
 
         Writing a field flips the controller's ``production_status`` bit
-        for ``(sample, field)`` — that flip *is* the "stage finished for
-        these keys" signal that downstream consumers wait on. Returns the
-        meta downstream consumers can use for direct :meth:`kv_batch_get`.
+        for ``(sample, field)``; that flip is the "stage finished" signal
+        downstream consumers wait on. Tensor and ``NonTensorStack`` leaves
+        both pass through to TQ; non-tensor encoding is per-backend.
 
-        The adapter MUST reject non-tensor leaves in ``fields`` — no
-        pickle on the bus.
+        Args:
+            keys: Per-sample uids being written.
+            partition_id: Partition these keys belong to.
+            fields: Tensor / ``NonTensorStack`` leaves to write.
+            tags: Optional per-sample primitive metadata.
+
+        Returns:
+            ``KVBatchMeta`` covering ``keys`` — usable for direct :meth:`kv_batch_get`.
         """
 
     @abstractmethod
@@ -291,6 +319,14 @@ class DataPlaneClient(ABC):
 
         Used by per-DP-rank slice fetches. Does NOT advance any per-task
         consumption cursor — that only happens via :meth:`claim_meta`.
+
+        Args:
+            keys: Uids to fetch.
+            partition_id: Partition the keys live in.
+            select_fields: Subset of fields; ``None`` fetches every registered field.
+
+        Returns:
+            ``TensorDict`` keyed by field name, batched along ``keys``.
         """
 
     @abstractmethod
@@ -299,7 +335,12 @@ class DataPlaneClient(ABC):
         keys: list[str] | None,
         partition_id: str,
     ) -> None:
-        """Drop key-value pairs. ``keys=None`` clears the whole partition."""
+        """Drop key-value pairs.
+
+        Args:
+            keys: Uids to drop; ``None`` clears the whole partition.
+            partition_id: Partition the keys live in.
+        """
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
 
