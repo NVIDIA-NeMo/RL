@@ -258,7 +258,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
 
     def check_consumption_status(self, partition_id, task_names):
-        return self._inner.check_consumption_status(partition_id, task_names)
+        return self._run(
+            "check_consumption_status",
+            partition_id,
+            lambda: self._inner.check_consumption_status(partition_id, task_names),
+        )
 
     def kv_batch_put(self, keys, partition_id, fields=None, tags=None):
         n_bytes = _td_bytes(fields)
