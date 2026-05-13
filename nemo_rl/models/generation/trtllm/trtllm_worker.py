@@ -31,6 +31,8 @@ import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -57,13 +59,11 @@ class TrtllmGenerationWorkerImpl:
         # gives up its GPU reservation.
         resources: dict[str, Any] = {"num_gpus": 0, "num_cpus": 0}
         # TRT-LLM's CudaRunner derives NVRTC -I include paths via
-        # `popen("pip show tensorrt_llm")`. With /opt/nemo_rl_venv/bin ahead of
-        # /usr/bin on PATH (uv run prepends the venv), pip resolves to the venv
-        # pip which has no tensorrt_llm installed, breaking fmha JIT
-        # ("cuda.h: no directories in search list"). Force /usr/bin first so
-        # `pip` is the system pip that can locate tensorrt_llm in
-        # /usr/local/lib/python3.12/dist-packages.
-        worker_path = "/usr/bin:" + os.environ.get("PATH", "")
+        # `popen("pip show tensorrt_llm")`. Pin the worker's actor python's
+        # bin dir to the front of PATH so `pip` resolves to the interpreter
+        # whose site-packages contain tensorrt_llm.
+        worker_py_bin_dir = os.path.dirname(PY_EXECUTABLES.TRTLLM)
+        worker_path = f"{worker_py_bin_dir}:" + os.environ.get("PATH", "")
         env_vars: dict[str, str] = {
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
             "NCCL_CUMEM_ENABLE": "1",
@@ -76,12 +76,6 @@ class TrtllmGenerationWorkerImpl:
             # parent placement group via get_current_placement_group() and hands both
             # to TRT-LLM as ray_placement_config (instead of TRTLLM_RAY_BUNDLE_INDICES).
             init_kwargs["bundle_indices"] = bundle_indices[1]
-            node_idx = bundle_indices[0]
-            if len(bundle_indices[1]) == 1:
-                seed = node_idx * 1024 + bundle_indices[1][0]
-            else:
-                seed = node_idx * 1024 + bundle_indices[1][0] // len(bundle_indices[1])
-            init_kwargs["seed"] = seed
 
         return resources, env_vars, init_kwargs
 
@@ -163,6 +157,10 @@ class TrtllmGenerationWorkerImpl:
             llm_kwargs["moe_tensor_parallel_size"] = moe_tp
         if moe_ep is not None:
             llm_kwargs["moe_expert_parallel_size"] = moe_ep
+
+        # Escape hatch: spread user-provided TRT-LLM kwargs last so they can
+        # override anything above for advanced tuning.
+        llm_kwargs.update(self.cfg.get("trtllm_kwargs") or {})
 
         self.llm = tensorrt_llm.LLM(**llm_kwargs)
 
@@ -379,7 +377,10 @@ class TrtllmGenerationWorkerImpl:
         )
 
 
-@ray.remote(num_cpus=0)
+@ray.remote(
+    num_cpus=0,
+    runtime_env={**get_nsight_config_if_pattern_matches("trtllm_generation_worker")},
+)  # pragma: no cover
 class TrtllmGenerationWorker(TrtllmGenerationWorkerImpl):
     """Ray actor wrapper around :class:`TrtllmGenerationWorkerImpl`."""
 

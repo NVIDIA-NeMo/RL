@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
@@ -41,3 +41,7 @@ class TrtllmSpecificArgs(TypedDict):
 
 class TrtllmConfig(GenerationConfig):
     trtllm_cfg: TrtllmSpecificArgs
+    # Escape hatch for arbitrary TRT-LLM LLM/AsyncLLM constructor kwargs not
+    # covered by TrtllmSpecificArgs (e.g. sampler_type, enable_attention_dp).
+    # Spread into the engine constructor as `**trtllm_kwargs`.
+    trtllm_kwargs: NotRequired[dict[str, Any]]

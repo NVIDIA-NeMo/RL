@@ -31,6 +31,7 @@ import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -67,7 +68,12 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
             return
 
         from tensorrt_llm import AsyncLLM, SamplingParams as TrtSamplingParams
-        from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SleepConfig
+        from tensorrt_llm.llmapi.llm_args import (
+            CapacitySchedulerPolicy,
+            KvCacheConfig,
+            SchedulerConfig,
+            SleepConfig,
+        )
         from ray.util.placement_group import get_current_placement_group
 
         self.TrtSamplingParams = TrtSamplingParams
@@ -94,8 +100,6 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
         )
 
         precision = trtllm_cfg.get("precision", "bfloat16")
-        max_batch_size = trtllm_cfg.get("max_batch_size", 64)
-        max_num_tokens = trtllm_cfg.get("max_num_tokens", 8192)
 
         # One PG entry per worker (placement_groups=[pg]*N,
         # placement_bundle_indices=[[i0], [i1], ...]) so the expansion
@@ -110,15 +114,20 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
             backend="pytorch",
             tensor_parallel_size=tp_size,
             dtype=precision,
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens,
             max_seq_len=trtllm_cfg["max_model_len"],
             orchestrator_type="ray",
             ray_worker_extension_cls="nemo_rl.models.generation.trtllm.trtllm_backend.NcclExtension",
             placement_groups=placement_groups_list,
             placement_bundle_indices=placement_bundle_indices_list,
             trust_remote_code=True,
+            scheduler_config=SchedulerConfig(
+                capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+            ),
         )
+        if "max_batch_size" in trtllm_cfg:
+            llm_kwargs["max_batch_size"] = trtllm_cfg["max_batch_size"]
+        if "max_num_tokens" in trtllm_cfg:
+            llm_kwargs["max_num_tokens"] = trtllm_cfg["max_num_tokens"]
 
         gpu_mem_util = trtllm_cfg.get("gpu_memory_utilization")
         if gpu_mem_util is not None:
@@ -138,6 +147,10 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
         if self._colocated:
             llm_kwargs["sleep_config"] = SleepConfig()
             llm_kwargs["per_worker_gpu_share"] = 0.5
+
+        # Escape hatch: spread user-provided TRT-LLM kwargs last so they can
+        # override anything above for advanced tuning.
+        llm_kwargs.update(self.cfg.get("trtllm_kwargs") or {})
 
         # Defer __await__ (which fires setup_async) to post_init_async so
         # AsyncLLM setup runs on the Ray actor's asyncio loop.
@@ -411,7 +424,10 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
         })
 
 
-@ray.remote(num_cpus=0)
+@ray.remote(
+    num_cpus=0,
+    runtime_env={**get_nsight_config_if_pattern_matches("trtllm_async_generation_worker")},
+)  # pragma: no cover
 class TrtllmAsyncGenerationWorker(TrtllmAsyncGenerationWorkerImpl):
     """Ray actor wrapper around :class:`TrtllmAsyncGenerationWorkerImpl`."""
 

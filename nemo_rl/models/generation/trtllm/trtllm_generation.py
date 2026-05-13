@@ -21,6 +21,7 @@ to time-multiplex GPU memory between training and inference phases.
 
 import asyncio
 import os
+from collections import defaultdict
 from typing import Any, AsyncGenerator, Optional, Union
 
 import numpy as np
@@ -50,6 +51,11 @@ class TrtllmGeneration(GenerationInterface):
     ):
         self.cfg = config
         self.tp_size = self.cfg["trtllm_cfg"]["tensor_parallel_size"]
+        pp_size = self.cfg["trtllm_cfg"].get("pipeline_parallel_size", 1)
+        assert pp_size == 1, (
+            f"TRT-LLM backend does not support pipeline parallelism yet "
+            f"(pipeline_parallel_size={pp_size}, must be 1)."
+        )
         self.model_parallel_size = self.tp_size
 
         assert cluster.world_size() % self.model_parallel_size == 0, (
@@ -105,6 +111,10 @@ class TrtllmGeneration(GenerationInterface):
         # land on bundles spanning node boundaries (e.g. TP=8 on 2x4 GPUs).
         needs_cross_node_parallelism = (
             self.model_parallel_size > cluster.num_gpus_per_node
+        )
+        assert not needs_cross_node_parallelism, (
+            f"TRT-LLM backend does not support cross-node tensor parallelism yet "
+            f"(model_parallel_size={self.model_parallel_size} > GPUs/node={cluster.num_gpus_per_node})."
         )
         cluster._init_placement_groups(
             strategy=strategy,
@@ -170,21 +180,84 @@ class TrtllmGeneration(GenerationInterface):
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster,
     ) -> list[tuple[int, list[int]]]:
+        """Calculate bundle indices for tensor-parallel worker groups.
+
+        Handles both unified placement groups (cross-node model parallelism) and
+        per-node placement groups (node-local model parallelism). For unified
+        PGs, bundles are reordered by physical node before slicing so each TP
+        group stays as node-local as possible.
+        """
         placement_groups = cluster.get_placement_groups()
         if not placement_groups:
-            raise ValueError("No placement groups in cluster")
+            raise ValueError("No placement groups available in the cluster")
 
-        tied_groups: list[tuple[int, list[int]]] = []
-        for pg_idx, pg in enumerate(placement_groups):
-            if pg.bundle_count == 0:
-                continue
-            n_groups = pg.bundle_count // self.model_parallel_size
-            for g in range(n_groups):
-                start = g * self.model_parallel_size
-                tied_groups.append((pg_idx, list(range(start, start + self.model_parallel_size))))
+        model_parallel_size = self.model_parallel_size
+
+        if len(placement_groups) == 1:
+            # Single unified PG: TP > GPUs/node, so model parallelism may span
+            # nodes. Reorder bundles by physical node so consecutive indices in
+            # `flat` belong to the same node — keeps TP siblings co-located
+            # when TP <= GPUs/node and only crosses node boundaries when forced.
+            unified_pg = placement_groups[0]
+            try:
+                pg_table = ray.util.placement_group_table(unified_pg)
+                bundle_to_node = pg_table["bundles_to_node_id"]
+            except Exception as e:
+                raise RuntimeError(
+                    "Failed to retrieve bundle/node mapping from placement group"
+                ) from e
+
+            node_bundles: dict[str, list[int]] = defaultdict(list)
+            for bundle_idx, node_id in bundle_to_node.items():
+                node_bundles[node_id].append(bundle_idx)
+            for bundles in node_bundles.values():
+                bundles.sort()
+
+            if not node_bundles:
+                raise ValueError("Placement group contains no bundles")
+
+            counts = [len(b) for b in node_bundles.values()]
+            assert len(set(counts)) == 1, (
+                "All nodes must have identical bundle counts"
+            )
+
+            total = sum(counts)
+            num_groups = total // model_parallel_size
+            if num_groups == 0:
+                raise ValueError(
+                    "Unable to allocate any worker groups with the available resources."
+                )
+
+            sorted_nodes = sorted(node_bundles)
+            node_idx = {nid: idx for idx, nid in enumerate(sorted_nodes)}
+
+            flat: list[int] = []
+            for nid in sorted_nodes:
+                flat.extend(node_bundles[nid])
+
+            tied_groups: list[tuple[int, list[int]]] = []
+            for i in range(num_groups):
+                slice_ = flat[
+                    i * model_parallel_size : (i + 1) * model_parallel_size
+                ]
+                first_node = bundle_to_node[slice_[0]]
+                tied_groups.append((node_idx[first_node], slice_))
+        else:
+            tied_groups = []
+            for pg_idx, pg in enumerate(placement_groups):
+                if pg.bundle_count == 0:
+                    continue
+                num_groups_in_pg = pg.bundle_count // model_parallel_size
+                for group_idx in range(num_groups_in_pg):
+                    start_idx = group_idx * model_parallel_size
+                    end_idx = start_idx + model_parallel_size
+                    bundle_indices = list(range(start_idx, end_idx))
+                    tied_groups.append((pg_idx, bundle_indices))
 
         if not tied_groups:
-            raise ValueError("Cannot allocate worker groups with available resources")
+            raise ValueError(
+                "Unable to allocate any worker groups with the available resources."
+            )
         return tied_groups
 
     def _report_device_id(self) -> list[list[str]]:
