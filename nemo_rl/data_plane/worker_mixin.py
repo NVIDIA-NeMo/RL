@@ -181,17 +181,19 @@ class TQWorkerMixin:
     ) -> BatchedDataDict[Any]:
         """Fetch this rank's slice from TQ and return a BatchedDataDict.
 
-        ``fetch_policy``:
-          * ``"auto"`` (default) — leader-fetch + NCCL broadcast when
-            ``_get_replica_group()`` returns a group, else every rank
-            fetches independently from TQ (the cheapest path for
-            TP=CP=PP=1).
-          * ``"independent"`` — force every sibling to fetch.
-          * ``"leader_broadcast"`` — force the broadcast path; asserts a
-            replica group exists.
+        Args:
+            meta: Per-rank ``KVBatchMeta`` from :func:`shard_meta_for_dp`.
+            layout: Materialization layout (``"padded"`` or ``"jagged"``).
+            fetch_policy: ``"auto"`` uses leader-fetch + NCCL broadcast when
+                :meth:`_get_replica_group` returns a group, else independent
+                fetch (cheapest for TP=CP=PP=1). ``"independent"`` forces
+                every sibling to fetch. ``"leader_broadcast"`` forces the
+                broadcast path and asserts a replica group exists.
+            preprocess: Optional ``(worker, td) -> td`` applied between
+                materialize and return.
 
-        ``preprocess``: optional ``(worker, td) -> td`` applied between
-        materialize and return.
+        Returns:
+            ``BatchedDataDict`` of this rank's slice.
         """
         if fetch_policy not in {"auto", "independent", "leader_broadcast"}:
             raise ValueError(f"unknown fetch_policy: {fetch_policy!r}")
@@ -350,6 +352,10 @@ class TQWorkerMixin:
         so they land with the same row lengths as the initial put;
         without this a worker write-back (rectangular ``[N, S]``) would
         mismatch the jagged ``input_ids`` on the next read.
+
+        Args:
+            meta: Per-rank ``KVBatchMeta`` for this slice.
+            fields: Map of field name to tensor to write back.
         """
         if not self._is_replica_leader() or not fields:
             return
@@ -383,6 +389,12 @@ class TQWorkerMixin:
 
         ``result`` is checked via the ``Mapping`` ABC because
         ``BatchedDataDict`` is a ``UserDict`` (not ``dict``).
+
+        Args:
+            meta: Per-rank ``KVBatchMeta`` for this slice.
+            result: Worker output containing ``result_key``.
+            result_key: Key into ``result`` for the tensor to write back.
+            tq_field: Field name on the TQ side.
         """
         if self._dp_client is None:
             return
