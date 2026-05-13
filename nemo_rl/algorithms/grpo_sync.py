@@ -104,11 +104,28 @@ def _apply_dynamic_sampling(
     dict[str, Any],
     Optional[torch.Tensor],
 ]:
-    """One iteration.
+    """Process one dynamic-sampling iteration.
 
-    Returns (pending_meta, pending_slice, pending_rewards,
-    is_complete, ds_metrics, unfiltered_for_log). When complete, the returned
-    pending_* IS the training batch.
+    Drops zero-std (filtered) keys, merges survivors into the running
+    pending cache, and reports whether the cache has reached
+    ``train_prompts_size``. When complete, the returned ``pending_*`` IS
+    the training batch.
+
+    Args:
+        meta: This iteration's ``KVBatchMeta``.
+        slice_data: Per-sample driver-side slice for this iteration.
+        pending_meta: Survivors accumulated from prior iterations.
+        pending_slice: Slice data for ``pending_meta``.
+        pending_unfiltered_rewards: All iterations' rewards pre-filter,
+            for legacy reward metric parity.
+        train_prompts_size: Target batch size.
+        num_gen_batches: Iteration counter (1-based).
+        max_gen_batches: Upper bound on iterations before raising.
+        dp_client: Data-plane client used to clear filtered keys.
+
+    Returns:
+        ``(pending_meta, pending_slice, pending_rewards, is_complete,
+        ds_metrics, unfiltered_for_log)``.
     """
     # Cumulative unfiltered total_reward for legacy metrics["reward"]
     # parity. Reference-only append (no copy) — slice tensors are
