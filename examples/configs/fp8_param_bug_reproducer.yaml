@@ -66,17 +66,17 @@ policy:
 
   megatron_cfg:
     enabled: true
-    tensor_model_parallel_size: 8
+    tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 1
     context_parallel_size: 1
     # SP is off so individual sequence divisibility is just make_sequence_length_divisible_by
     sequence_parallel: false
-    activation_checkpointing: false
+    activation_checkpointing: true
 
     empty_unused_memory_level: 0
     apply_rope_fusion: true
-    bias_activation_fusion: true
-    defer_fp32_logits: false
+    bias_activation_fusion: false
+    defer_fp32_logits: true #false
     gradient_accumulation_fusion: false
     # Use flash attention. When FP8 is enabled TE would otherwise select its
     # cuDNN fused-attention path (requires cuDNN >= 9 with FP8 flash support).
@@ -136,10 +136,14 @@ policy:
       adam_eps: 1e-5
       sgd_momentum: 0.9
       use_distributed_optimizer: true
-      use_precision_aware_optimizer: false #true
+      use_precision_aware_optimizer: true
       clip_grad: ${policy.max_grad_norm}
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+
+      ## mxfp8-specific
+      fp8_recipe: "mxfp8"
+      overlap_param_gather: true
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -168,7 +172,8 @@ policy:
       # reuse_grad_buf_for_mxfp8_param_ag=True (required by Megatron-Bridge).
       fp8_param: false
 
-  make_sequence_length_divisible_by: 1
+  # MXFP8 uses block size 32 and requires every tensor dim to be 32-divisible.
+  make_sequence_length_divisible_by: 32
   max_grad_norm: 1.0
   dynamic_batching:
     enabled: false
@@ -207,5 +212,5 @@ logger:
     log_dir: "tb_logs-fp8_param-bug"
 
 cluster:
-  gpus_per_node: 8
+  gpus_per_node: 4
   num_nodes: 1

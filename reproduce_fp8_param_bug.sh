@@ -16,10 +16,13 @@
 # Reproducer for the fp8_param convergence bug in mcore with MXFP8:
 #   https://github.com/NVIDIA-NeMo/RL/issues/1164
 #
-# Runs a single SFT experiment with fp8_param configurable via --fp8-param.
 # With deterministic_mode=true every source of non-determinism is eliminated,
-# so two runs that differ only in fp8_param should produce identical loss curves
-# — the bug causes them to diverge.
+# so the three modes below should be directly comparable across runs.
+#
+# Modes:
+#   mxfp8-fp8param   MXFP8 recipe with fp8_param=true   (buggy — diverges)
+#   mxfp8-noparam    MXFP8 recipe with fp8_param=false  (baseline)
+#   bf16             FP8 disabled entirely              (pure bf16 reference)
 #
 # Prerequisites:
 #   - Single node with 8 B100/B200 GPUs (Blackwell, CUDA >= 12.9)
@@ -27,11 +30,9 @@
 #   - Run from the root of the NeMo-RL repo inside the nemo-rl container
 #
 # Usage:
-#   # Baseline — expected good convergence:
-#   bash reproduce_fp8_param_bug.sh --fp8-param false
-#
-#   # Buggy run — expected to diverge:
-#   bash reproduce_fp8_param_bug.sh --fp8-param true
+#   bash reproduce_fp8_param_bug.sh --mode mxfp8-fp8param
+#   bash reproduce_fp8_param_bug.sh --mode mxfp8-noparam
+#   bash reproduce_fp8_param_bug.sh --mode bf16
 
 set -euo pipefail
 
@@ -39,28 +40,47 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFG="${SCRIPT_DIR}/examples/configs/fp8_param_bug_reproducer.yaml"
 
 # ---------- defaults ----------
-FP8_PARAM="false"
+MODE="mxfp8-noparam"
 
 # ---------- arg parsing ----------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --fp8-param) FP8_PARAM="$2"; shift 2 ;;
+        --mode) MODE="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
 
-if [[ "${FP8_PARAM}" != "true" && "${FP8_PARAM}" != "false" ]]; then
-    echo "Error: --fp8-param must be 'true' or 'false'" >&2
-    exit 1
-fi
+# ---------- mode → config overrides ----------
+case "${MODE}" in
+    mxfp8-fp8param)
+        FP8_ENABLED="true"
+        FP8_PARAM="true"
+        ;;
+    mxfp8-noparam)
+        FP8_ENABLED="true"
+        FP8_PARAM="false"
+        ;;
+    bf16)
+        # fp8_param value is irrelevant when fp8_cfg.enabled=false, but pass
+        # something valid so the override doesn't trip type checks downstream.
+        FP8_ENABLED="false"
+        FP8_PARAM="false"
+        ;;
+    *)
+        echo "Error: --mode must be one of: mxfp8-fp8param, mxfp8-noparam, bf16" >&2
+        exit 1
+        ;;
+esac
 
 WANDB_PROJECT="nrl_fp8_param_debug"
-WANDB_RUN="fp8_param_${FP8_PARAM}"
-TB_DIR="tb_logs-fp8_param_${FP8_PARAM}"
-LOG_DIR="logs/fp8_param_bug/run_fp8_param_${FP8_PARAM}"
+WANDB_RUN="${MODE}"
+TB_DIR="tb_logs-${MODE}"
+LOG_DIR="logs/fp8_param_bug/run_${MODE}"
 
 echo "================================================================"
 echo "  FP8 param bug reproducer"
+echo "  mode           : ${MODE}"
+echo "  fp8_cfg.enabled: ${FP8_ENABLED}"
 echo "  fp8_param      : ${FP8_PARAM}"
 echo "  wandb project  : ${WANDB_PROJECT}"
 echo "  wandb run name : ${WANDB_RUN}"
@@ -70,6 +90,7 @@ echo "================================================================"
 
 uv run "${SCRIPT_DIR}/examples/run_sft.py" \
     --config "${CFG}" \
+    "policy.megatron_cfg.fp8_cfg.enabled=${FP8_ENABLED}" \
     "policy.megatron_cfg.fp8_cfg.fp8_param=${FP8_PARAM}" \
     "logger.tensorboard.log_dir=${TB_DIR}" \
     "logger.log_dir=${LOG_DIR}" \

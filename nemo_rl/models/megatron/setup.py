@@ -676,11 +676,6 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. "
                 "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
             )
-            if model_cfg.fp8_recipe == "mxfp8":
-                # Megatron-Bridge requires reuse_grad_buf_for_mxfp8_param_ag=True when
-                # fp8_param=True and fp8_recipe="mxfp8". Set it automatically here so
-                # callers don't need to configure this derived flag manually.
-                model_cfg.reuse_grad_buf_for_mxfp8_param_ag = True
 
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
@@ -793,6 +788,23 @@ def _create_megatron_config(
     dtype: torch.dtype,
 ) -> ConfigContainer:
     """Create the final Megatron configuration container."""
+    # fp8_param_gather and reuse_grad_buf_for_mxfp8_param_ag are derived: both are
+    # only valid when fp8 is enabled, fp8_param=True, and recipe is mxfp8. Mcore's
+    # DDP __post_init__ asserts they remain in sync, so we centralize the derivation
+    # rather than exposing two redundant YAML knobs that can disagree.
+    fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+    fp8_param_enabled = bool(
+        fp8_cfg
+        and fp8_cfg.get("enabled", False)
+        and fp8_cfg.get("fp8_param", False)
+    )
+    reuse_grad_buf_for_mxfp8_param_ag = (
+        fp8_param_enabled and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    )
+    optimizer_kwargs = {
+        **config["megatron_cfg"]["optimizer"],
+        "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
+    }
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
@@ -802,7 +814,7 @@ def _create_megatron_config(
             global_batch_size=config["train_global_batch_size"],  # ignored
             train_iters=config["megatron_cfg"]["train_iters"],
         ),
-        optimizer=OptimizerConfig(**config["megatron_cfg"]["optimizer"]),
+        optimizer=OptimizerConfig(**optimizer_kwargs),
         ddp=DistributedDataParallelConfig(
             check_for_nan_in_grad=True,
             grad_reduce_in_fp32=config["megatron_cfg"][
@@ -823,6 +835,8 @@ def _create_megatron_config(
             data_parallel_sharding_strategy=config["megatron_cfg"][
                 "distributed_data_parallel_config"
             ]["data_parallel_sharding_strategy"],
+            reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf_for_mxfp8_param_ag,
+            fp8_param_gather=fp8_param_enabled,
         ),
         scheduler=SchedulerConfig(**config["megatron_cfg"]["scheduler"]),
         dataset=None,
