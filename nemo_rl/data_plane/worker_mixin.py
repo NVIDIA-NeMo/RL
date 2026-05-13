@@ -35,6 +35,11 @@ FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 Layout = Literal["padded", "jagged"]
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
+from nemo_rl.data_plane.schema import (
+    META_ELEM_COUNTS_PER_GB,
+    META_MICRO_BATCH_INDICES,
+    META_MICRO_BATCH_LENGTHS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -320,11 +325,11 @@ class TQWorkerMixin:
         when it provided the metadata.
         """
         extra = meta.extra_info or {}
-        if "micro_batch_indices" in extra and "micro_batch_lengths" in extra:
-            data.micro_batch_indices = extra["micro_batch_indices"]
-            data.micro_batch_lengths = extra["micro_batch_lengths"]
-            if "elem_counts_per_gb" in extra:
-                data.elem_counts_per_gb = extra["elem_counts_per_gb"]
+        if META_MICRO_BATCH_INDICES in extra and META_MICRO_BATCH_LENGTHS in extra:
+            data.micro_batch_indices = extra[META_MICRO_BATCH_INDICES]
+            data.micro_batch_lengths = extra[META_MICRO_BATCH_LENGTHS]
+            if META_ELEM_COUNTS_PER_GB in extra:
+                data.elem_counts_per_gb = extra[META_ELEM_COUNTS_PER_GB]
             return data
         return self._apply_packing_prep(data)
 

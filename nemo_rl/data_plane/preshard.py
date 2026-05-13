@@ -28,6 +28,11 @@ from typing import Any, Optional
 import torch
 
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.schema import (
+    META_ELEM_COUNTS_PER_GB,
+    META_MICRO_BATCH_INDICES,
+    META_MICRO_BATCH_LENGTHS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 # Tensor fields the ``train`` partition schema declares. The rollout
@@ -167,9 +172,9 @@ def shard_meta_for_dp(
         # sequence_packing/dynamic_batching is enabled. Workers' *_presharded
         # paths look these up off ``meta.extra_info``.
         for attr in (
-            "micro_batch_indices",
-            "micro_batch_lengths",
-            "elem_counts_per_gb",
+            META_MICRO_BATCH_INDICES,
+            META_MICRO_BATCH_LENGTHS,
+            META_ELEM_COUNTS_PER_GB,
         ):
             val = getattr(shard, attr, None)
             if val is not None:
