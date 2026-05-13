@@ -25,7 +25,6 @@
 #   - Single node with 8 B100/B200 GPUs (Blackwell, CUDA >= 12.9)
 #     MXFP8 is only supported on Blackwell architecture (compute capability >= 10.0)
 #   - Run from the root of the NeMo-RL repo inside the nemo-rl container
-#   - HuggingFace cache with "meta-llama/Llama-3.2-1B" already downloaded
 #
 # Usage:
 #   # Baseline — expected good convergence:
