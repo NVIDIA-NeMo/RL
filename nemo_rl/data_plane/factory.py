@@ -60,9 +60,9 @@ def build_data_plane_client(
     if obs.get("enabled", False):
         from nemo_rl.data_plane.observability import (
             MetricsDataPlaneClient,
-            print_event,
+            log_event,
         )
 
-        on_event = obs.get("callback") or print_event
+        on_event = obs.get("callback") or log_event
         client = MetricsDataPlaneClient(client, on_event=on_event)
     return client
