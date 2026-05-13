@@ -157,6 +157,10 @@ class TQPolicy(Policy):
         partition id ``"train"`` is cleared and reused across steps. The
         schema is the union of all consumer fields — producers write
         only the subset they have, consumers fetch via ``select_fields``.
+
+        Args:
+            num_samples: Expected total samples this step.
+            group_size: GRPO group size for balanced sampling; ``None`` disables grouping.
         """
         self._dp_client.register_partition(
             partition_id=self._tq_partition_id,
@@ -286,12 +290,18 @@ class TQPolicy(Policy):
         ``meta`` names per-sample keys; columns written by the rollout
         actor + worker logprob deltas + driver-side advantage delta have
         all landed under the same keys at this point. Workers fetch the
-        union via ``train_presharded`` → ``self._fetch(meta)``.
+        union via ``train_presharded`` → ``self._fetch(meta)``. No
+        partition drain here — sync 1-hop's trainer calls ``kv_clear``
+        once at end of step.
 
-        **No partition drain.** Sync 1-hop's trainer calls ``kv_clear`` once
-        at end of step. The drain in :meth:`train` (which clears after
-        every call) is needed only for the legacy fan-out path that mints
-        fresh keys per call.
+        Args:
+            meta: Full-step ``KVBatchMeta`` (consumed by all DP ranks).
+            gbs: Global batch size; defaults to ``cfg["train_global_batch_size"]``.
+            mbs: Micro batch size; defaults to ``cfg["train_micro_batch_size"]``.
+            timer: Optional timer for nested ``policy_training/*`` measurements.
+
+        Returns:
+            Aggregated training-step output dict.
         """
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
