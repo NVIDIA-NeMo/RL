@@ -15,7 +15,7 @@ grpo:
   num_val_generations_per_prompt: 1
   max_rollout_turns: 1
   max_num_epochs: 1
-  max_num_steps: 10
+  max_num_steps: 20
   normalize_rewards: true
   use_leave_one_out_baseline: true
   advantage_clip_low: -100
@@ -88,7 +88,7 @@ policy:
   train_micro_batch_size: 1
   generation_batch_size: 64
   logprob_batch_size: 1
-  max_total_sequence_length: 131072
+  max_total_sequence_length: 49152
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
@@ -284,7 +284,10 @@ env:
           swebench_agent_timeout: 3600
           run_with_mixed_prompts: true
           dataset_path: ${data.train.data_path}
-          container_formatter: null
+          container_formatter:
+          - "${sif_dir}/swebench_sweb.eval.x86_64.{instance_id}.sif"
+          - "${sif_dir}/swegym_sweb.eval.x86_64.{instance_id}.sif"
+          - "${sif_dir}/r2egym_{instance_id}.sif"
     swe_agents_val:
       responses_api_agents:
         swe_agents:
@@ -306,9 +309,6 @@ logger:
   mlflow_enabled: false
   monitor_gpus: true
   swanlab_enabled: false
-  wandb:
-    project: "grpo-dev"
-    name: "grpo-dev-logger"
   tensorboard: {}
   mlflow:
     experiment_name: "grpo-dev"

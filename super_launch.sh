@@ -15,7 +15,7 @@ set -euo pipefail
 
 # ---- Optional vars with defaults ----
 WANDB_PROJ="${WANDB_PROJ:-super-v3-posttraining}"
-SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT:-4:0:0}"
+SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT:-4:00:0}"
 DRY_RUN="${DRY_RUN:-false}"
 # Comma-separated host:container mount pairs for shared filesystems (e.g. "/scratch:/scratch,/lustre:/lustre").
 EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
@@ -78,13 +78,15 @@ RET=1
 while [ $RET -ne 0 ]; do
   cd /tmp && \
   wget --no-check-certificate https://github.com/apptainer/apptainer/releases/download/v1.3.1/apptainer_1.3.1_amd64.deb && \
-  apt install -y ./apptainer_1.3.1_amd64.deb && \
+  apt install -y --allow-downgrades ./apptainer_1.3.1_amd64.deb && \
   ln -sf /usr/bin/apptainer /usr/bin/singularity
-  if command -v apptainer >/dev/null 2>&1; then
-    echo "apptainer installed successfully."
+  installed_ver=$(apptainer --version 2>/dev/null | awk '{print $NF}')
+  echo "Installed apptainer version: ${installed_ver}"
+  if [[ "${installed_ver}" == 1.3.1* ]]; then
+    echo "apptainer 1.3.1 installed successfully."
     RET=0
   else
-    echo "apptainer NOT installed. Retrying in 10 seconds..."
+    echo "apptainer 1.3.1 NOT installed (got '${installed_ver:-none}'). Retrying in 10 seconds..."
     sleep 10
     RET=1
   fi
@@ -127,7 +129,7 @@ if [[ -n "$SIF_DIR" ]]; then
 fi
 
 if [[ -n "$CONTAINER_FORMATTER" ]]; then
-    COMMAND="$COMMAND container_formatter=${CONTAINER_FORMATTER}"
+    COMMAND="$COMMAND env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter=${CONTAINER_FORMATTER}"
 fi
 
 export CONTAINER
@@ -135,6 +137,9 @@ export CONTAINER
 # ---- Container mounts ----
 BASE_MOUNTS="${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
 BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Megatron-LM-workspace/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"
+# Bind the Gym source from the snapshot over /opt/nemo-rl/... so user edits to
+# run_openhands.py (and other agent code) actually take effect at runtime.
+BASE_MOUNTS+=",${SNAPSHOT_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 
 export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 
@@ -155,8 +160,13 @@ SBATCH_CMD=(
     --gres=gpu:8
     --exclusive
     --dependency=singleton
-    ray.sub
 )
+
+if [[ -n "${EXCLUDE_NODES:-}" ]]; then
+    SBATCH_CMD+=(--exclude="${EXCLUDE_NODES}")
+fi
+
+SBATCH_CMD+=(ray.sub)
 
 if [[ "$DRY_RUN" == true ]]; then
     echo ""
