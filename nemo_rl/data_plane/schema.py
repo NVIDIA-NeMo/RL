@@ -19,13 +19,14 @@ from typing import Literal
 Layout = Literal["padded", "jagged"]
 
 # Per-shard packing metadata keys in `KVBatchMeta.extra_info`.
-META_MICRO_BATCH_INDICES = "micro_batch_indices"
-META_MICRO_BATCH_LENGTHS = "micro_batch_lengths"
-META_ELEM_COUNTS_PER_GB = "elem_counts_per_gb"
+MICRO_BATCH_INDICES = "micro_batch_indices"
+MICRO_BATCH_LENGTHS = "micro_batch_lengths"
+ELEM_COUNTS_PER_GB = "elem_counts_per_gb"
 
-# Preshard-internal column that rides through
-# `BatchedDataDict.shard_by_batch_size` so each rank can recover its
-# meta-index mapping.
+# Skeleton field names from `shard_meta_for_dp`.
+INPUT_IDS = "input_ids"
+INPUT_LENGTHS = "input_lengths"
+SAMPLE_MASK = "sample_mask"
 META_IDX = "meta_idx"
 
 # Tensor fields in the train partition. Rollout writes the input
