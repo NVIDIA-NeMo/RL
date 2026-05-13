@@ -21,6 +21,9 @@ FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
 
+# Empty default; CI overrides with --build-context to inject pre-compiled wheels
+FROM scratch AS uv-cache-seed
+
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
 ENV NRL_CONTAINER=1
@@ -125,7 +128,11 @@ COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashi
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
-RUN --mount=type=ssh <<"EOF" bash -exu
+RUN --mount=type=ssh \
+    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
+mkdir -p /root/.cache/uv
+rsync -a /tmp/uv-cache-seed/ /root/.cache/uv/ 2>/dev/null || true
+
 uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
