@@ -38,7 +38,7 @@ from tensordict import TensorDict
 
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 
-_logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def _td_bytes(td: TensorDict | None) -> int:
@@ -55,7 +55,7 @@ def _td_bytes(td: TensorDict | None) -> int:
 
 
 def log_event(event: dict[str, Any]) -> None:
-    _logger.info("data_plane_event: %s", event)
+    logger.info("data_plane_event: %s", event)
 
 
 class MetricsDataPlaneClient(DataPlaneClient):
