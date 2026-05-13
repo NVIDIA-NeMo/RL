@@ -1659,14 +1659,25 @@ class TestLogger:
         mock_wandb_instance = mock_wandb_logger.return_value
         mock_tb_instance = mock_tb_logger.return_value
 
-        # Create sample data
+        # Create sample data where the largest raw mismatch belongs to a masked
+        # sequence. The plot should select the valid sequence instead.
         data = {
-            "token_mask": torch.ones((1, 10)),
-            "sample_mask": torch.ones(1),
-            "generation_logprobs": torch.randn((1, 10)),
-            "prev_logprobs": torch.randn((1, 10)),
-            "prompt_lengths": torch.tensor([2]),
-            "full_lengths": torch.tensor([8]),
+            "token_mask": torch.ones((2, 6)),
+            "sample_mask": torch.tensor([0.0, 1.0]),
+            "generation_logprobs": torch.tensor(
+                [
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [0.0, -0.1, -0.2, -0.3, -0.4, -0.5],
+                ]
+            ),
+            "prev_logprobs": torch.tensor(
+                [
+                    [0.0, -10.0, -10.0, -10.0, -10.0, -10.0],
+                    [0.0, -0.1, -0.2, -0.1, -0.4, -0.5],
+                ]
+            ),
+            "prompt_lengths": torch.tensor([1, 2]),
+            "full_lengths": torch.tensor([6, 5]),
         }
         step = 10
         name = "test_plot"
@@ -1691,6 +1702,10 @@ class TestLogger:
 
         # Verify the legend labels
         legend_texts = [text.get_text() for text in ax.get_legend().get_texts()]
+        assert "logprob (training policy recompute)" in legend_texts
+        assert "logprob (reference policy)" not in legend_texts
+        assert all("token_mult_prob_error=nan" not in text for text in legend_texts)
+        assert list(ax.lines[0].get_ydata()) == pytest.approx([-0.2, -0.3, -0.4])
         assert any("Max abs error" in text for text in legend_texts)
         assert any("Max rel error (prob)" in text for text in legend_texts)
 

@@ -1147,20 +1147,38 @@ class Logger(LoggerInterface):
             step: Global step value
             name: Name of the plot
         """
-        # find the sample with the highest log probability error
+        # Find the unmasked sample with the highest log probability error.
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         generation_logprobs = data["generation_logprobs"][:, 1:]
         prev_logprobs = data["prev_logprobs"][:, 1:]
-        mask = token_mask * sample_mask.unsqueeze(-1)
 
         diff = (generation_logprobs - prev_logprobs).abs() * token_mask
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        mult_prob_error = (torch.exp(diff) * mask).sum(dim=-1) / mask.sum(dim=-1)
+        valid_token_counts = mask.sum(dim=-1)
+        valid_sample_mask = valid_token_counts > 0
+        if not valid_sample_mask.any():
+            print(
+                "Skipping token_mult_prob_error plot because no unmasked samples contain valid tokens."
+            )
+            return
 
-        sample_idx = torch.argmax(mult_prob_error)
-        sample_error = mult_prob_error[sample_idx]
+        # Masked samples have zero denominator after sequence-level logprob
+        # masking. Exclude them so the plot does not select a masked sample
+        # and report token_mult_prob_error=nan.
+        mult_prob_error = torch.full(
+            (mask.shape[0],),
+            float("-inf"),
+            dtype=generation_logprobs.dtype,
+            device=generation_logprobs.device,
+        )
+        mult_prob_error[valid_sample_mask] = (torch.exp(diff) * mask).sum(dim=-1)[
+            valid_sample_mask
+        ] / valid_token_counts[valid_sample_mask]
+
+        sample_idx = torch.argmax(mult_prob_error).item()
+        sample_error = mult_prob_error[sample_idx].item()
 
         # plot the sample with the highest log probability error
         # offset by 1 token for next token prediction
@@ -1178,12 +1196,9 @@ class Logger(LoggerInterface):
         generation_logprob = generation_logprobs[
             sample_idx, int(generation_start_idx) : int(generation_end_idx)
         ]
-        prev_logprob = (
-            prev_logprobs[
-                sample_idx, int(generation_start_idx) : int(generation_end_idx)
-            ]
-            * mask[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
-        )
+        prev_logprob = prev_logprobs[
+            sample_idx, int(generation_start_idx) : int(generation_end_idx)
+        ]
         diff_i = diff[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
 
         # Find max absolute error token
@@ -1201,7 +1216,7 @@ class Logger(LoggerInterface):
         step_idx = torch.arange(int(generation_start_idx), int(generation_end_idx))
 
         plt.plot(step_idx, generation_logprob, label="logprob (inference engine)")
-        plt.plot(step_idx, prev_logprob, label="logprob (reference policy)")
+        plt.plot(step_idx, prev_logprob, label="logprob (training policy recompute)")
         plt.plot(
             step_idx,
             diff_i,
