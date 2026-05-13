@@ -89,6 +89,9 @@ def _make_worker(
     worker._judge_base_url = judge_base_url
     worker._judge_api_key = judge_api_key
     worker._active_envs = {}
+    worker._mock_user = False
+    worker._mock_judge = False
+    worker._mock_judge_latency_s = 0.0
     return worker
 
 
@@ -203,74 +206,57 @@ class TestCallJudge:
         )
 
     def _make_response(self, score):
+        """Return a mock matching litellm.completion's return type."""
         resp = mock.MagicMock()
-        resp.json.return_value = {
-            "choices": [
-                {"message": {"content": json.dumps({"score": score, "reasoning": "good"})}}
-            ]
-        }
-        resp.raise_for_status = mock.MagicMock()
+        resp.choices[0].message.content = json.dumps(
+            {"score": score, "reasoning": "good"}
+        )
         return resp
 
     def test_successful_judge_call_returns_score(self, worker):
-        with mock.patch("requests.post", return_value=self._make_response(0.9)) as mock_post:
+        with mock.patch("litellm.completion", return_value=self._make_response(0.9)) as mock_completion:
             score = worker._call_judge(
                 [{"role": "user", "content": "hello"}],
                 domain_rules="Be helpful.",
                 task_instruction="Cancel my order.",
             )
         assert score == pytest.approx(0.9)
-        mock_post.assert_called_once()
+        mock_completion.assert_called_once()
 
-    def test_judge_uses_correct_url(self, worker):
-        with mock.patch("requests.post", return_value=self._make_response(0.5)) as mock_post:
+    def test_judge_passes_correct_api_base(self, worker):
+        with mock.patch("litellm.completion", return_value=self._make_response(0.5)) as mock_completion:
             worker._call_judge([], domain_rules="", task_instruction="")
-        url = mock_post.call_args[0][0]
-        assert url == "https://api.example.com/v1/chat/completions"
+        assert mock_completion.call_args.kwargs["api_base"] == "https://api.example.com"
 
-    def test_judge_default_url_when_no_base_url(self):
+    def test_judge_passes_none_api_base_when_not_configured(self):
         worker = _make_worker(judge_model="gpt-4o", judge_base_url=None)
-        with mock.patch("requests.post", return_value=self._make_response(0.7)) as mock_post:
+        with mock.patch("litellm.completion", return_value=self._make_response(0.7)) as mock_completion:
             score = worker._call_judge([], domain_rules="", task_instruction="")
-        url = mock_post.call_args[0][0]
-        assert "api.openai.com" in url
+        assert mock_completion.call_args.kwargs["api_base"] is None
         assert score == pytest.approx(0.7)
 
-    def test_http_error_returns_zero(self, worker):
-        resp = mock.MagicMock()
-        resp.raise_for_status.side_effect = Exception("HTTP 500")
-        with mock.patch("requests.post", return_value=resp):
-            score = worker._call_judge([], domain_rules="", task_instruction="")
-        assert score == 0.0
-
-    def test_network_exception_returns_zero(self, worker):
-        with mock.patch("requests.post", side_effect=ConnectionError("timeout")):
+    def test_litellm_exception_returns_zero(self, worker):
+        with mock.patch("litellm.completion", side_effect=Exception("API error")):
             score = worker._call_judge([], domain_rules="", task_instruction="")
         assert score == 0.0
 
     def test_invalid_json_in_response_returns_zero(self, worker):
         resp = mock.MagicMock()
-        resp.raise_for_status = mock.MagicMock()
-        resp.json.return_value = {
-            "choices": [{"message": {"content": "not json at all"}}]
-        }
-        with mock.patch("requests.post", return_value=resp):
+        resp.choices[0].message.content = "not json at all"
+        with mock.patch("litellm.completion", return_value=resp):
             score = worker._call_judge([], domain_rules="", task_instruction="")
         assert score == 0.0
 
     def test_missing_score_key_returns_zero(self, worker):
         resp = mock.MagicMock()
-        resp.raise_for_status = mock.MagicMock()
-        resp.json.return_value = {
-            "choices": [{"message": {"content": json.dumps({"reasoning": "looks good"})}}]
-        }
-        with mock.patch("requests.post", return_value=resp):
+        resp.choices[0].message.content = json.dumps({"reasoning": "looks good"})
+        with mock.patch("litellm.completion", return_value=resp):
             score = worker._call_judge([], domain_rules="", task_instruction="")
         assert score == 0.0
 
     def test_score_boundary_values(self, worker):
         for expected in (0.0, 1.0):
-            with mock.patch("requests.post", return_value=self._make_response(expected)):
+            with mock.patch("litellm.completion", return_value=self._make_response(expected)):
                 score = worker._call_judge([], domain_rules="", task_instruction="")
             assert score == pytest.approx(expected)
 
@@ -279,10 +265,10 @@ class TestCallJudge:
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi there"},
         ]
-        with mock.patch("requests.post", return_value=self._make_response(0.8)) as mock_post:
+        with mock.patch("litellm.completion", return_value=self._make_response(0.8)) as mock_completion:
             worker._call_judge(convo, domain_rules="Rules.", task_instruction="Task.")
-        body = mock_post.call_args[1]["json"]
-        user_prompt = body["messages"][1]["content"]
+        messages = mock_completion.call_args.kwargs["messages"]
+        user_prompt = messages[1]["content"]
         assert "USER: Hello" in user_prompt
         assert "ASSISTANT: Hi there" in user_prompt
         assert "Rules." in user_prompt

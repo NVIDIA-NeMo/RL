@@ -86,3 +86,13 @@ class EnvironmentInterface(abc.ABC, Generic[MetadataT]):
         self, batch: BatchedDataDict
     ) -> tuple[BatchedDataDict, dict]:
         """Post processing function after all rollouts are done for the batch and returns metrics."""
+
+    def obs_use_chat_template(self) -> bool:
+        """Whether environment observations should be tokenized via apply_chat_template.
+
+        Override to return True for environments whose observations carry standard
+        chat roles (e.g. "user", "tool") that apply_chat_template understands.
+        The default returns False, preserving the existing raw-tokenization behaviour
+        for all environments that use the non-standard "environment" role.
+        """
+        return False

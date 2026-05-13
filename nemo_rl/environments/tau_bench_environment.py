@@ -67,9 +67,10 @@ class TauBenchEnvConfig(TypedDict):
             Ignored when user_strategy is "mock".
         judge_api_key: API key for the judge model server. Ignored when user_strategy is "mock".
         judge_weight: Blend weight: 0.0 = pure tau-bench reward, 1.0 = pure judge score.
-        mock_latency_s: Seconds to sleep per simulated LLM call in mock mode (default 0.0).
+        mock_user_latency_s: Seconds to sleep per mock user simulator call.
+        mock_judge_latency_s: Seconds to sleep per mock judge call.
         mock_stop_prob: Probability that the mock user simulator ends the conversation on
-            any given turn by emitting ###STOP### (default 0.2).
+            any given turn by emitting ###STOP###.
     """
 
     num_workers: int
@@ -78,14 +79,15 @@ class TauBenchEnvConfig(TypedDict):
     user_strategy: str
     user_model: str
     user_base_url: NotRequired[str | None]
-    user_api_key: NotRequired[str]
-    max_steps: NotRequired[int]
+    user_api_key: NotRequired[str | None]
+    max_steps: int
     judge_model: NotRequired[str | None]
     judge_base_url: NotRequired[str | None]
-    judge_api_key: NotRequired[str]
-    judge_weight: NotRequired[float]
-    mock_latency_s: NotRequired[float]
-    mock_stop_prob: NotRequired[float]
+    judge_api_key: NotRequired[str | None]
+    judge_weight: float
+    mock_user_latency_s: NotRequired[float | None]
+    mock_judge_latency_s: NotRequired[float | None]
+    mock_stop_prob: NotRequired[float | None]
 
 
 class TauBenchEnvMetadata(TypedDict):
@@ -126,8 +128,9 @@ class TauBenchWorker:
         judge_model: Optional[str],
         judge_base_url: Optional[str],
         judge_api_key: str,
-        mock_latency_s: float = 0.0,
-        mock_stop_prob: float = 0.2,
+        mock_user_latency_s: Optional[float] = None,
+        mock_judge_latency_s: Optional[float] = None,
+        mock_stop_prob: Optional[float] = None,
     ) -> None:
         self._env_name = env_name
         self._task_split = task_split
@@ -137,18 +140,22 @@ class TauBenchWorker:
         self._judge_model = judge_model
         self._judge_base_url = judge_base_url
         self._judge_api_key = judge_api_key
-        self._mock_mode = user_strategy == "mock"
-        self._mock_latency_s = mock_latency_s
+        self._mock_user = user_strategy == "mock"
+        self._mock_judge = judge_model == "mock"
         self._active_envs: Dict[str, Any] = {}
 
-        if self._mock_mode:
-            # Patch litellm.completion with a fake that returns random customer-like
-            # text after sleeping mock_latency_s seconds.  This intercepts all LLM
-            # calls made by tau-bench's user simulator so no real API endpoint or
-            # credentials are needed.  user_base_url and judge_base_url are ignored.
-            import litellm as _litellm
+        if self._mock_user:
+            assert mock_user_latency_s is not None, "mock_user_latency_s must be set when user_strategy='mock'"
+            assert mock_stop_prob is not None, "mock_stop_prob must be set when user_strategy='mock'"
+        if self._mock_judge:
+            assert mock_judge_latency_s is not None, "mock_judge_latency_s must be set when judge_model='mock'"
+        self._mock_judge_latency_s = mock_judge_latency_s
 
-            _latency = mock_latency_s
+        if self._mock_user:
+            # Build a mock litellm.completion that returns random customer-like text.
+            # Applied as a scoped patch only around tau-bench's reset/step calls so
+            # other litellm users in the same worker process are not affected.
+            _latency = mock_user_latency_s
             _stop_prob = mock_stop_prob
             _responses = [
                 "I need help with a recent order.",
@@ -180,12 +187,15 @@ class TauBenchWorker:
                 content = "###STOP###" if random.random() < _stop_prob else random.choice(_responses)
                 return _Resp(content)
 
-            _litellm.completion = _mock_completion  # type: ignore[method-assign]
+            self._mock_completion = _mock_completion
         else:
             # Configure LiteLLM (used by tau-bench's user simulator) once at startup.
             if user_base_url:
                 os.environ["OPENAI_BASE_URL"] = user_base_url
-            os.environ["OPENAI_API_KEY"] = user_api_key
+            if user_api_key:
+                os.environ["OPENAI_API_KEY"] = user_api_key
+            elif "OPENAI_API_KEY" not in os.environ:
+                os.environ["OPENAI_API_KEY"] = "dummy"
 
     def _make_env(self, task_index: int) -> tuple:
         """Create and reset a tau-bench Env for a specific task index.
@@ -206,9 +216,9 @@ class TauBenchWorker:
         # tau-bench does not know about the "mock" strategy; translate it to "llm"
         # so it instantiates an LLMUserSimulationEnv whose litellm.completion calls
         # are intercepted by the mock installed in __init__.
-        tau_user_strategy = "llm" if self._mock_mode else self._user_strategy
+        tau_user_strategy = "llm" if self._mock_user else self._user_strategy
         # llm strategy requires a provider; default to "openai" in mock mode.
-        if self._mock_mode:
+        if self._mock_user:
             user_provider = user_provider or "openai"
 
         env = get_env(
@@ -219,7 +229,12 @@ class TauBenchWorker:
             user_provider=user_provider,
             task_index=task_index,
         )
-        reset_response = env.reset(task_index=task_index)
+        if self._mock_user:
+            from unittest.mock import patch
+            with patch("litellm.completion", self._mock_completion):
+                reset_response = env.reset(task_index=task_index)
+        else:
+            reset_response = env.reset(task_index=task_index)
         initial_obs = str(reset_response.observation)
         return env, initial_obs
 
@@ -263,8 +278,8 @@ class TauBenchWorker:
         Returns a float in [0, 1].  Returns 0.0 on any error so that a judge
         misconfiguration degrades gracefully rather than crashing training.
         """
-        if self._mock_mode:
-            time.sleep(self._mock_latency_s)
+        if self._mock_judge:
+            time.sleep(self._mock_judge_latency_s)
             return random.random()
 
         import litellm
@@ -356,11 +371,12 @@ class TauBenchWorker:
                 continue
 
             action = self._parse_action(agent_text)
-            # Snapshot before step(): when done=True, step() calls calculate_reward()
-            # internally which replays gold actions via self.step(), appending them to
-            # tau_env.actions and corrupting any snapshot taken afterwards.
-            actions_snapshot = list(tau_env.actions) + [action]
-            env_response = tau_env.step(action)
+            if self._mock_user:
+                from unittest.mock import patch
+                with patch("litellm.completion", self._mock_completion):
+                    env_response = tau_env.step(action)
+            else:
+                env_response = tau_env.step(action)
             step_count += 1
 
             done = bool(env_response.done) or step_count >= self._max_steps
@@ -448,7 +464,7 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
     def __init__(self, cfg: TauBenchEnvConfig) -> None:
         self.cfg = cfg
         self._num_workers = cfg["num_workers"]
-        self._judge_weight = float(cfg.get("judge_weight", 0.0))
+        self._judge_weight = float(cfg["judge_weight"])
 
         self._workers = [
             TauBenchWorker.options(
@@ -459,16 +475,20 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
                 user_strategy=cfg["user_strategy"],
                 user_model=cfg["user_model"],
                 user_base_url=cfg.get("user_base_url"),
-                user_api_key=cfg.get("user_api_key", "dummy"),
-                max_steps=cfg.get("max_steps", 30),
+                user_api_key=cfg.get("user_api_key") or "dummy",
+                max_steps=cfg["max_steps"],
                 judge_model=cfg.get("judge_model"),
                 judge_base_url=cfg.get("judge_base_url"),
-                judge_api_key=cfg.get("judge_api_key", "dummy"),
-                mock_latency_s=cfg.get("mock_latency_s", 0.0),
-                mock_stop_prob=cfg.get("mock_stop_prob", 0.2),
+                judge_api_key=cfg.get("judge_api_key") or "dummy",
+                mock_user_latency_s=cfg.get("mock_user_latency_s"),
+                mock_judge_latency_s=cfg.get("mock_judge_latency_s"),
+                mock_stop_prob=cfg.get("mock_stop_prob"),
             )
             for _ in range(self._num_workers)
         ]
+
+    def obs_use_chat_template(self) -> bool:
+        return True
 
     def step(
         self,

@@ -58,18 +58,22 @@ def _tokenize_env_observation(
     tokenizer: TokenizerType,
     obs_role: str,
     obs_content: str,
+    use_chat_template: bool = False,
 ) -> torch.Tensor:
-    """Tokenize an environment observation using the chat template.
+    """Tokenize an environment observation.
 
-    Uses apply_chat_template to produce properly structured tokens including
-    role markers (e.g. <|im_start|>tool) and a generation prompt
-    (<|im_start|>assistant), so the model knows to respond as an assistant
-    after seeing the observation.  Raw tokenization lacks these markers and
-    causes the model to echo the observation rather than respond to it.
+    By default uses raw tokenization (no role markers), preserving the
+    existing behaviour for all environments.
 
-    Falls back to raw tokenization if apply_chat_template is unavailable.
+    When use_chat_template=True, uses apply_chat_template to produce properly
+    structured tokens including role markers (e.g. <|im_start|>tool) and a
+    generation prompt (<|im_start|>assistant), so the model knows to respond
+    as an assistant after seeing the observation.  This should only be enabled
+    for environments whose observations carry standard chat roles ("user",
+    "tool") — currently only tau_bench.  Passing a non-standard role (e.g.
+    "environment") to apply_chat_template would produce incorrect output.
     """
-    if not hasattr(tokenizer, "apply_chat_template"):
+    if not use_chat_template or getattr(tokenizer, "chat_template", None) is None:
         return tokenizer(
             obs_content, return_tensors="pt", add_special_tokens=False
         ).input_ids[0]
@@ -105,6 +109,12 @@ def _tokenize_env_observation(
         tokenize=False,
         add_generation_prompt=False,
         add_special_tokens=False,
+    )
+    assert _with_obs.startswith(_without_obs), (
+        f"apply_chat_template prefix assumption violated for obs_role={obs_role!r}. "
+        "The tokenizer's chat template likely uses loop.last logic that changes the "
+        "trailing separator of a non-final message, so _without_obs is not a strict "
+        "prefix of _with_obs and the slice would produce incorrect tokens."
     )
     obs_chunk = _with_obs[len(_without_obs):]
     return tokenizer(
@@ -438,6 +448,12 @@ def run_multi_turn_rollout(
     active_indices = torch.arange(batch_size)
     total_rewards = torch.zeros(batch_size, dtype=torch.float32)
 
+    # Build per-task lookup for chat-template tokenization once, before the loop.
+    task_obs_use_chat_template: dict[str, bool] = {
+        task_name: ray.get(env.obs_use_chat_template.remote())  # type: ignore[attr-defined]
+        for task_name, env in task_to_env.items()
+    }
+
     # Multi_rewards: number of components inferred from first env_output (1 for single-reward envs)
     number_of_rewards: int | None = None
     multi_rewards: torch.Tensor | None = None
@@ -555,7 +571,14 @@ def run_multi_turn_rollout(
         for i, global_idx in enumerate(active_indices.tolist()):
             env_obs_content = env_output.observations[i]["content"]
             obs_role = env_output.observations[i]["role"]
-            tokenized_obs = _tokenize_env_observation(tokenizer, obs_role, env_obs_content)
+            tokenized_obs = _tokenize_env_observation(
+                tokenizer,
+                obs_role,
+                env_obs_content,
+                use_chat_template=task_obs_use_chat_template.get(
+                    active_batch["task_name"][i], False
+                ),
+            )
             # tokenizer returns torch.float32 when env_obs_content is empty
             tokenized_obs = tokenized_obs.to(dtype=torch.int64)
 
@@ -754,6 +777,12 @@ async def run_sample_multi_turn_rollout(
     current_stop_strings = initial_sample_state.get("stop_strings", None)
     task_name = initial_sample_state["task_name"]
 
+    # Build per-task lookup for chat-template tokenization once, before the loop.
+    task_obs_use_chat_template: dict[str, bool] = {
+        tn: ray.get(env.obs_use_chat_template.remote())  # type: ignore[attr-defined]
+        for tn, env in task_to_env.items()
+    }
+
     # Sample-level metrics
     total_reward = 0.0
     reward_acc_list: list[
@@ -847,7 +876,12 @@ async def run_sample_multi_turn_rollout(
         terminated = env_output.terminateds[0].item()
         env_obs_content = env_output.observations[0]["content"]
         obs_role = env_output.observations[0]["role"]
-        tokenized_obs = _tokenize_env_observation(tokenizer, obs_role, env_obs_content)
+        tokenized_obs = _tokenize_env_observation(
+            tokenizer,
+            obs_role,
+            env_obs_content,
+            use_chat_template=task_obs_use_chat_template.get(task_name, False),
+        )
 
         # Check for sequence length overflow
         if input_lengths + gen_token_count + len(tokenized_obs) >= max_seq_len:

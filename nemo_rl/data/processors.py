@@ -716,7 +716,7 @@ def tau_bench_data_processor(
 ) -> DatumSpec:
     """Process a tau-bench datum into a DatumSpec for multi-turn GRPO training.
 
-    Expects datum_dict produced by ``examples/prepare_tau_bench_data.py``:
+    Expects datum_dict produced by ``TauBenchDataset`` at runtime:
       - messages: [system_message, initial_user_message]
       - extra_env_info: {task_index, episode_id, step_count}
       - task_name: "tau_bench"

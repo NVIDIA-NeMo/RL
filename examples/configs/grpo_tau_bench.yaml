@@ -4,10 +4,9 @@
 # tools across multiple turns.  Rewards blend tau-bench's deterministic task-completion
 # check with an optional LLM judge score for policy compliance.
 #
-# Data preparation: run scripts/prepare_tau_bench_data.py to generate the JSONL files
-# before starting training.  The script calls tau-bench's env.reset() for each task
-# so that the prompts (tool definitions, domain wiki, initial user message) are
-# exactly consistent with the environment state.
+# No offline data preparation is required.  TauBenchDataset builds each record at
+# runtime by calling tau-bench's env.reset(), so prompts (tool definitions, domain
+# wiki, initial user message) are always consistent with the environment state.
 #
 # Tool call format expected from the policy:
 #   <tool_call>{"name": "tool_name", "arguments": {"key": "value"}}</tool_call>
@@ -91,7 +90,8 @@ env:
     judge_base_url: null # unused when judge_model="mock"
     judge_api_key: null # unused when judge_model="mock"
     judge_weight: 0.3   # 70% task-completion + 30% judge score
-    mock_latency_s: 0.1 # how much time to wait before returning mock user/judge generations
+    mock_user_latency_s: 0.1  # seconds to sleep per mock user simulator call
+    mock_judge_latency_s: 0.1  # seconds to sleep per mock judge call
     mock_stop_prob: 0.4
 
 logger:

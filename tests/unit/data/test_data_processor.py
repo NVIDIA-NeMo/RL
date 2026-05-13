@@ -41,6 +41,7 @@ from nemo_rl.data.processors import (
     helpsteer3_data_processor,
     math_data_processor,
     math_hf_data_processor,
+    tau_bench_data_processor,
 )
 from nemo_rl.models.policy import TokenizerConfig
 
@@ -348,3 +349,66 @@ def test_helpsteer3_data_processor():
 
     # Length equals sum of token lengths
     assert out["length"] == sum(int(m["token_ids"].numel()) for m in msg_log)
+
+
+_TAU_BENCH_TASK_SPEC = TaskDataSpec(
+    task_name="tau_bench",
+    prompt_file=None,
+    system_prompt_file=None,
+)
+
+_TAU_BENCH_DATUM = {
+    "messages": [
+        {"role": "system", "content": "You are a retail assistant."},
+        {"role": "user", "content": "Cancel my order O123."},
+    ],
+    "extra_env_info": {"task_index": 7, "episode_id": None, "step_count": 0},
+    "task_name": "tau_bench",
+}
+
+
+def test_tau_bench_data_processor_returns_valid_datum_spec():
+    result = tau_bench_data_processor(
+        datum_dict=_TAU_BENCH_DATUM,
+        task_data_spec=_TAU_BENCH_TASK_SPEC,
+        tokenizer=DummyTokenizer(),
+        max_seq_length=4096,
+        idx=3,
+    )
+
+    assert result["idx"] == 3
+    assert result["task_name"] == "tau_bench"
+    assert result["loss_multiplier"] == 1.0
+    assert isinstance(result["length"], int) and result["length"] > 0
+    assert len(result["message_log"]) == 1
+    msg = result["message_log"][0]
+    assert msg["role"] == "user"
+    assert "Cancel my order O123." in msg["content"]
+    assert isinstance(msg["token_ids"], torch.Tensor)
+    assert msg["token_ids"].dtype == torch.long
+
+
+def test_tau_bench_data_processor_passes_through_extra_env_info():
+    extra = {"task_index": 42, "episode_id": None, "step_count": 0}
+    datum = {**_TAU_BENCH_DATUM, "extra_env_info": extra}
+    result = tau_bench_data_processor(
+        datum_dict=datum,
+        task_data_spec=_TAU_BENCH_TASK_SPEC,
+        tokenizer=DummyTokenizer(),
+        max_seq_length=4096,
+        idx=0,
+    )
+    assert result["extra_env_info"] is extra
+
+
+def test_tau_bench_data_processor_truncation_path():
+    result = tau_bench_data_processor(
+        datum_dict=_TAU_BENCH_DATUM,
+        task_data_spec=_TAU_BENCH_TASK_SPEC,
+        tokenizer=DummyTokenizer(),
+        max_seq_length=1,  # shorter than any real input → triggers truncation
+        idx=0,
+    )
+
+    assert result["loss_multiplier"] == 0.0
+    assert len(result["message_log"][0]["token_ids"]) <= 4
