@@ -302,7 +302,7 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _to_wire(td: TensorDict) -> TensorDict:
+def _to_wire(td: TensorDict, *, promote_1d: bool = False) -> TensorDict:
     # Walk via keys() + get() rather than items() — see noop adapter for
     # the rationale (NonTensorData entries can slip past items()).
     bad = []
@@ -318,21 +318,8 @@ def _to_wire(td: TensorDict) -> TensorDict:
         )
     # pyrefly: ignore  # missing-argument
     out = td.detach().contiguous()
-    # KV-path round-trip preservation. TQ's extract_field_schema
-    # silently unsqueezes 1D fields to (N, 1) when recording per-row
-    # shape into metadata (transfer_queue/metadata.py:171-173), but
-    # _generate_values row-iterates the original 1D tensor — producing
-    # 0-dim per-row tensors. The KV storage backend (mooncake_cpu)
-    # stores them under the metadata shape (1,) and on get returns
-    # (1,)-shaped tensors which stack back to (N, 1). The simple
-    # backend doesn't go through this kv path so the bug doesn't
-    # surface there. Fix here at the wire layer: unsqueeze 1D → 2D so
-    # per-row tensors are 1D (1,) and writer-stored shape matches
-    # metadata-recorded shape. materialize squeezes the trailing 1
-    # back on read so consumers see (N,).
-    from nemo_rl.data_plane.codec import _KV_PROMOTE_1D as _promote_1d
-
-    if _promote_1d:
+    if promote_1d:
+        # Mooncake-cpu workaround — see `TQDataPlaneClient._promote_1d`.
         new_dict: dict[str, torch.Tensor] = {}
         changed = False
         for k in out.keys(include_nested=True, leaves_only=True):
@@ -347,6 +334,28 @@ def _to_wire(td: TensorDict) -> TensorDict:
             out = TensorDict(new_dict, batch_size=out.batch_size)
     # pyrefly: ignore  # bad-return
     return out
+
+
+def _from_wire(td: TensorDict) -> TensorDict:
+    """Inverse of `_to_wire`'s 1D promotion: squeeze trailing 1 back to (N,)."""
+    new_dict: dict[str, torch.Tensor] = {}
+    changed = False
+    for k in td.keys(include_nested=True, leaves_only=True):
+        v = td.get(k)
+        if (
+            isinstance(v, torch.Tensor)
+            and not v.is_nested
+            and v.dim() >= 2
+            and v.shape[-1] == 1
+        ):
+            new_dict[str(k)] = v.squeeze(-1).contiguous()
+            changed = True
+        else:
+            # pyrefly: ignore  # bad-argument-type
+            new_dict[str(k)] = v
+    if not changed:
+        return td
+    return TensorDict(new_dict, batch_size=td.batch_size)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -407,9 +416,13 @@ class TQDataPlaneClient(DataPlaneClient):
                 # IP — peers fail with "connection refused".
                 os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
             os.environ.setdefault("MC_STORE_MEMCPY", "0")
-            from nemo_rl.data_plane.codec import set_kv_promote_1d
 
-            set_kv_promote_1d(True)
+        # Workaround for TQ KVStorageManager's 1D-field schema/data
+        # mismatch (only `mooncake_cpu` goes through that path; `simple`
+        # is unaffected). Writer unsqueezes 1D → (N, 1) on put; reader
+        # squeezes the trailing 1 back on get. Drop when upstream TQ
+        # unifies the schema/data shapes for 1D fields.
+        self._promote_1d = cfg["backend"] == "mooncake_cpu"
 
         if bootstrap:
             _init_tq(cfg)
@@ -551,7 +564,7 @@ class TQDataPlaneClient(DataPlaneClient):
         wire_fields: TensorDict | None = None
         field_names: list[str] | None = None
         if fields is not None:
-            wire_fields = _to_wire(fields)
+            wire_fields = _to_wire(fields, promote_1d=self._promote_1d)
             field_names = list(wire_fields.keys())
 
         self._tq.kv_batch_put(
@@ -580,11 +593,14 @@ class TQDataPlaneClient(DataPlaneClient):
     ) -> TensorDict:
         if not keys:
             return TensorDict({}, batch_size=(0,))
-        return self._tq.kv_batch_get(
+        td = self._tq.kv_batch_get(
             keys=list(keys),
             partition_id=partition_id,
             select_fields=list(select_fields) if select_fields else None,
         )
+        if self._promote_1d:
+            td = _from_wire(td)
+        return td
 
     def kv_clear(self, keys: list[str] | None, partition_id: str) -> None:
         if keys is None:

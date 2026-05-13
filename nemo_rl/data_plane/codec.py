@@ -99,33 +99,6 @@ def to_nested_by_length(
     return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
 
-# 1D field round-trip kill-switch for the KV-path. TQ's
-# KVStorageManager silently unsqueezes 1D fields in metadata while
-# row-iterating them in data (transfer_queue/metadata.py:171 vs
-# storage/managers/base.py:_generate_values). Backends that go through
-# that path (mooncake_cpu) need the writer to unsqueeze 1D fields to
-# (N, 1) so per-row tensors match the metadata shape; the reader then
-# squeezes the trailing 1 back. Default off — only the affected
-# adapter flips it.
-_KV_PROMOTE_1D = False
-
-
-def set_kv_promote_1d(enabled: bool) -> None:
-    """Adapter hook: enable/disable 1D→(N,1) promotion for bulk fields.
-
-    When True, writer unsqueezes 1D bulk fields to (N, 1) and reader
-    squeezes the trailing 1 in :func:`materialize`. Required by backends
-    that go through TQ's KVStorageManager path (mooncake_cpu) — see
-    ``_KV_PROMOTE_1D`` above for the schema/data mismatch.
-
-    Args:
-        enabled: When True, the writer/reader pair apply the
-            (N,) ↔ (N, 1) shape transform.
-    """
-    global _KV_PROMOTE_1D
-    _KV_PROMOTE_1D = bool(enabled)
-
-
 def maybe_pack_jagged(
     val: torch.Tensor,
     lengths: torch.Tensor,
@@ -398,17 +371,4 @@ def materialize(
             out[key] = padded
         else:
             out[key] = val
-        # KV-path round-trip: writer side unsqueezed 1D fields to (N, 1)
-        # so per-row tensors match TQ's extract_field_schema implicit
-        # unsqueeze (transfer_queue/metadata.py:171-173). Squeeze the
-        # trailing 1 back so consumers see the original (N,) shape.
-        # Safe to apply unconditionally on the _KV_PROMOTE_1D path: none
-        # of the bulk fields naturally carry shape[-1] == 1.
-        if (
-            _KV_PROMOTE_1D
-            and isinstance(out[key], torch.Tensor)
-            and out[key].dim() >= 2
-            and out[key].shape[-1] == 1
-        ):
-            out[key] = out[key].squeeze(-1)
     return BatchedDataDict(out)
