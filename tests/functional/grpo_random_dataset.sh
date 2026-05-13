@@ -28,7 +28,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.generation.vllm_cfg.max_model_len=64 \
     policy.generation.vllm_cfg.gpu_memory_utilization=0.45 \
     policy.generation.ignore_eos=true \
-    ++policy.generation.output_len_or_output_len_generator=8 \
+    ++policy.generation.output_len_or_output_distribution=8 \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=2 \
     grpo.max_num_steps=2 \
@@ -39,7 +39,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     cluster.gpus_per_node=1 \
     +data.dataset_name=random \
     data.max_input_seq_length=32 \
-    +data.input_len_or_input_len_generator=16 \
+    +data.input_len_or_input_distribution=16 \
     +data.num_samples=4 \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \

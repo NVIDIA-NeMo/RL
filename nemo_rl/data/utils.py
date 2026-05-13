@@ -28,6 +28,7 @@ from nemo_rl.data.datasets import (
 from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
+from nemo_rl.utils.sequence_length_generator import get_sequence_length_generator
 
 
 # TODO: @yukih: unify to setup_data after dataset refactored
@@ -336,9 +337,9 @@ def setup_random_data(
         data_config: Data config for random dataset.
     """
     print("\n▶ Setting up data (random dataset)...")
-    if data_config.get("input_len_or_input_len_generator") is None:
+    if data_config.get("input_len_or_input_distribution") is None:
         raise ValueError(
-            "data.input_len_or_input_len_generator must be provided when "
+            "data.input_len_or_input_distribution must be provided when "
             "data.dataset_name == 'random'"
         )
     if "num_samples" not in data_config:
@@ -346,24 +347,17 @@ def setup_random_data(
             "data.num_samples must be provided when data.dataset_name == 'random'"
         )
 
-    if isinstance(data_config["input_len_or_input_len_generator"], dict):
-        from nemo_rl.utils.sequence_length_generator import (
-            get_sequence_length_generator,
-        )
-
-        data_config["input_len_or_input_len_generator"] = get_sequence_length_generator(
-            data_config["input_len_or_input_len_generator"]
-        )
+    input_len_generator = get_sequence_length_generator(
+        data_config["input_len_or_input_distribution"]
+    )
 
     random_task_spec = TaskDataSpec(
         task_name="random",
-        input_len_or_input_len_generator=data_config[
-            "input_len_or_input_len_generator"
-        ],
+        input_len_generator=input_len_generator,
     )
 
     base_dataset: Any = RandomDataset(
-        data_config["input_len_or_input_len_generator"],
+        input_len_generator,
         num_samples=data_config["num_samples"],
     )
 

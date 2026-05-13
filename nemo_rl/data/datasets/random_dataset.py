@@ -42,7 +42,7 @@ class RandomDataset:
     This dataset is used for benchmarking purposes. It is not meant to be used for training or evaluation.
 
     Args:
-        input_len_or_input_len_generator: Fixed input length, a callable input
+        input_len_generator: Fixed input length, a callable input
             length generator, or a dict with 'mean' and 'std' for normal sampling.
         num_samples: Number of synthetic raw samples to expose.
 
@@ -52,18 +52,14 @@ class RandomDataset:
 
     def __init__(
         self,
-        input_len_or_input_len_generator: Callable | dict[str, Any] | int,
+        input_len_generator: Callable[[int | None], int | None],
         num_samples: int,
     ):
-        if isinstance(input_len_or_input_len_generator, dict):
-            input_len_or_input_len_generator = get_sequence_length_generator(
-                input_len_or_input_len_generator
-            )
-        self.input_len_or_input_len_generator = input_len_or_input_len_generator
+        self.input_len_generator = input_len_generator
 
         self.formatted_ds = {"train": _SyntheticRandomRawDataset(num_samples)}
         self.task_spec = TaskDataSpec(
             task_name="random",
-            input_len_or_input_len_generator=self.input_len_or_input_len_generator,
+            input_len_generator=self.input_len_generator,
         )
         self.processor = processors.random_input_len_processor

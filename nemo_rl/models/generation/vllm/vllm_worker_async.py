@@ -739,15 +739,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             )
             allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
 
-            output_len_or_output_len_generator = self.cfg[
-                "output_len_or_output_len_generator"
-            ]
-            if output_len_or_output_len_generator is not None:
-                if callable(output_len_or_output_len_generator):
-                    output_len = output_len_or_output_len_generator(sample_idx)
-                else:
-                    output_len = output_len_or_output_len_generator
-                allowed_new_tokens = min(allowed_new_tokens, output_len)
+            allowed_new_tokens = self._resolve_max_tokens(allowed_new_tokens, sample_idx)
 
             # Handle case where no tokens can be generated due to length constraints
             if allowed_new_tokens == 0:

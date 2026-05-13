@@ -114,7 +114,7 @@ def test_random_input_len_processor_uses_fixed_length():
     tokenizer = RandomTokenizer()
     task_spec = TaskDataSpec(
         task_name="random",
-        input_len_or_input_len_generator=7,
+        input_len_generator=lambda _: 7,
     )
 
     datum = random_input_len_processor(
@@ -145,7 +145,7 @@ def test_random_input_len_processor_passes_idx_to_generator():
 
     task_spec = TaskDataSpec(
         task_name="random",
-        input_len_or_input_len_generator=input_len_generator,
+        input_len_generator=input_len_generator,
     )
 
     datum = random_input_len_processor(
@@ -165,7 +165,7 @@ def test_random_input_len_processor_rejects_overlength_input():
     tokenizer = RandomTokenizer()
     task_spec = TaskDataSpec(
         task_name="random",
-        input_len_or_input_len_generator=17,
+        input_len_generator=lambda _: 17,
     )
 
     with pytest.raises(AssertionError):
@@ -180,8 +180,13 @@ def test_random_input_len_processor_rejects_overlength_input():
 
 def test_random_dataset_processes_synthetic_samples():
     tokenizer = RandomTokenizer()
+    
+    from nemo_rl.utils.sequence_length_generator import (
+        get_sequence_length_generator,
+    )
+    input_len_generator = get_sequence_length_generator({"mean": 4, "std": 0})
     random_dataset = RandomDataset(
-        input_len_or_input_len_generator={"mean": 4, "std": 0},
+        input_len_generator=input_len_generator,
         num_samples=3,
     )
 

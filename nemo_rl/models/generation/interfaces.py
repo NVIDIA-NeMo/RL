@@ -128,7 +128,7 @@ class GenerationConfig(TypedDict):
         stop_token_ids: The list of token IDs to stop generation.
         stop_strings: The list of strings to stop generation.
         ignore_eos: Whether to ignore the EOS token. This is only used for performance benchmarking purposes.
-        output_len_or_output_len_generator: An integer or a dictionary with keys 'mean' and 'std' for the normal distribution that samples the output length. This is only used for performance benchmarking purposes.
+        output_len_or_output_len_distribution: An integer or a dictionary with keys 'mean' and 'std' for the normal distribution that samples the output length. This is only used for performance benchmarking purposes.
         colocated: The configuration for colocated generation.
         _pad_token_id: The padding token ID.
     """
@@ -142,7 +142,7 @@ class GenerationConfig(TypedDict):
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
     ignore_eos: bool
-    output_len_or_output_len_generator: NotRequired[Dict[str, Any] | int]
+    output_len_or_output_distribution: NotRequired[Dict[str, Any] | int]
     colocated: NotRequired[ColocationConfig]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]

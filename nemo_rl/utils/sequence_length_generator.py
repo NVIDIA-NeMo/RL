@@ -11,25 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Callable
+from typing import Callable, Any, Optional
 
 import numpy as np
 
 
-def get_sequence_length_generator(sequence_length_generator_cfg: dict) -> Callable:
+def get_sequence_length_generator(constant_length_or_length_distribution: Optional[int | dict[str, Any]]) -> Callable:
     """Returns a callable that samples sequence lengths from a normal distribution.
 
     Args:
-        sequence_length_generator_cfg: Dict with keys 'mean' and 'std' for the normal distribution.
+        constant_length_or_length_distribution: A constant length or a dict with keys 'mean' and 'std' for the normal distribution.
 
     Returns:
         A callable that when invoked returns a sampled sequence length (int >= 1).
     """
-    mean = sequence_length_generator_cfg["mean"]
-    std = sequence_length_generator_cfg["std"]
-
-    def sample_length(idx: int | None = None) -> int:
-        length = int(np.round(np.random.normal(mean, std)))
-        return max(1, length)
-
-    return sample_length
+    if constant_length_or_length_distribution is None:
+        return lambda _: None
+    if isinstance(constant_length_or_length_distribution, int):
+        return lambda _: max(1, constant_length_or_length_distribution)
+    if isinstance(constant_length_or_length_distribution, dict):
+        mean = constant_length_or_length_distribution["mean"]
+        std = constant_length_or_length_distribution["std"]
+        def sample_length(sample_idx: int | None = None) -> int:
+            length = int(np.round(np.random.normal(mean, std)))
+            return max(1, length)
+        return sample_length
+    if callable(constant_length_or_length_distribution):
+        return constant_length_or_length_distribution
+    raise ValueError(f"Invalid constant_length_or_length_distribution: {constant_length_or_length_distribution}")

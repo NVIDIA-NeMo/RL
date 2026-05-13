@@ -715,20 +715,11 @@ def random_input_len_processor(
     idx: int,
 ) -> DatumSpec:
     """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for random input length."""
-    input_len_or_input_len_generator = task_data_spec.input_len_or_input_len_generator
-    if input_len_or_input_len_generator is None:
-        raise ValueError("input_len_or_input_len_generator must be provided")
+    input_len_generator = task_data_spec.input_len_generator
+    if input_len_generator is None:
+        raise ValueError("input_len_generator must be provided if you are using random_input_len_processor")
 
-    if callable(input_len_or_input_len_generator):
-        input_len = input_len_or_input_len_generator(idx)
-    elif isinstance(input_len_or_input_len_generator, int):
-        input_len = input_len_or_input_len_generator
-    else:
-        raise ValueError(
-            f"Invalid input_len_or_input_len_generator: {input_len_or_input_len_generator}"
-        )
-
-    input_len = int(input_len)
+    input_len = input_len_generator(idx)
     if max_seq_length is not None:
         assert input_len <= max_seq_length
 

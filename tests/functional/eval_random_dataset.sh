@@ -24,13 +24,13 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     generation.model_name=Qwen/Qwen3-0.6B \
     tokenizer.name=Qwen/Qwen3-0.6B \
     generation.max_new_tokens=4 \
-    ++generation.output_len_or_output_len_generator=4 \
+    ++generation.output_len_or_output_distribution=4 \
     generation.ignore_eos=true \
     generation.num_prompts_per_step=2 \
     generation.vllm_cfg.max_model_len=32 \
     generation.vllm_cfg.gpu_memory_utilization=0.45 \
     data.max_input_seq_length=16 \
-    ++data.input_len_or_input_len_generator=8 \
+    ++data.input_len_or_input_distribution=8 \
     ++data.num_samples=2 \
     cluster.gpus_per_node=1 \
     $@ \

@@ -149,27 +149,11 @@ class BaseVllmGenerationWorker:
             get_sequence_length_generator,
         )
 
-        output_len_or_output_len_generator = self.cfg.get(
-            "output_len_or_output_len_generator", None
+        output_len_or_output_distribution = self.cfg.get(
+            "output_len_or_output_distribution", None
         )
-        if output_len_or_output_len_generator is not None:
-            if isinstance(output_len_or_output_len_generator, dict):
-                output_len_or_output_len_generator = get_sequence_length_generator(
-                    output_len_or_output_len_generator
-                )
-            elif isinstance(output_len_or_output_len_generator, int):
-                pass
-            elif callable(output_len_or_output_len_generator):
-                pass
-            else:
-                raise ValueError(
-                    f"Invalid output_len_or_output_len_generator: {output_len_or_output_len_generator}"
-                )
-            self.cfg["output_len_or_output_len_generator"] = (
-                output_len_or_output_len_generator
-            )
-        else:
-            self.cfg["output_len_or_output_len_generator"] = None
+        output_len_generator = get_sequence_length_generator(output_len_or_output_distribution)
+        self.cfg["output_len_generator"] = output_len_generator
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
@@ -625,7 +609,7 @@ class BaseVllmGenerationWorker:
     ) -> int:
         """Resolve the maximum number of tokens to generate. 
         When max_new_tokens is provided, max_new_tokens is used as the maximum number of tokens to generate.
-        Otherwise, the output_len_or_output_len_generator is used as the maximum number of tokens to generate.
+        Otherwise, the output_len_generator is used as the maximum number of tokens to generate.
         In the latter case, it is only used in benchmarking scenarios when we want to fix the output length.
 
         Args:
@@ -638,19 +622,21 @@ class BaseVllmGenerationWorker:
         max_tokens = (
             max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
         )
-        output_len_or_output_len_generator = self.cfg[
-            "output_len_or_output_len_generator"
+        output_len_generator = self.cfg[
+            "output_len_generator"
         ]
-        if output_len_or_output_len_generator is None:
+        output_len = output_len_generator(sample_idx)
+        if output_len is None:
             return max_tokens
-
-        if callable(output_len_or_output_len_generator):
-            output_len = output_len_or_output_len_generator(
-                sample_idx if sample_idx is not None else 0
+        if output_len > max_tokens:
+            print(
+                f"the output length derived by output_len_generator={output_len}, which is greater than max_new_tokens={max_tokens}. max_new_tokens overrides output_len_generator."
             )
-        else:
-            output_len = output_len_or_output_len_generator
-        return min(max_tokens, int(output_len))
+        elif output_len < max_tokens:
+            print(
+                f"the output length derived by output_len_generator={output_len}, which is less than max_new_tokens={max_tokens}. output_len_generator overrides max_new_tokens."
+            )
+        return min(max_tokens, output_len)
 
     def _build_sampling_params(
         self,

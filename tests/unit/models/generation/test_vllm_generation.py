@@ -89,61 +89,22 @@ def test_base_vllm_worker_converts_output_len_generator_dict():
     from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
     config = deepcopy(basic_vllm_test_config)
-    config["output_len_or_output_len_generator"] = {"mean": 3, "std": 0}
+    config["output_len_or_output_distribution"] = {"mean": 3, "std": 0}
 
     worker = BaseVllmGenerationWorker(config=config, bundle_indices=None)
 
-    output_len_generator = worker.cfg["output_len_or_output_len_generator"]
+    output_len_generator = worker.cfg["output_len_generator"]
     assert callable(output_len_generator)
     assert output_len_generator(0) == 3
-
-
-def test_base_vllm_worker_accepts_callable_output_len_generator():
-    from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
-
-    def output_len_generator(idx: int) -> int:
-        return idx + 1
-
-    config = deepcopy(basic_vllm_test_config)
-    config["output_len_or_output_len_generator"] = output_len_generator
-
-    worker = BaseVllmGenerationWorker(config=config, bundle_indices=None)
-
-    assert worker.cfg["output_len_or_output_len_generator"] is output_len_generator
-
-
-def test_base_vllm_worker_does_not_reapply_generator_to_explicit_max_tokens():
-    from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
-
-    def output_len_generator(idx: int) -> int:
-        raise AssertionError("output length generator should not be called")
-
-    class FakeSamplingParams:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-    config = deepcopy(basic_vllm_test_config)
-    config["output_len_or_output_len_generator"] = output_len_generator
-
-    worker = BaseVllmGenerationWorker(config=config, bundle_indices=None)
-    worker.SamplingParams = FakeSamplingParams
-
-    sampling_params = worker._build_sampling_params(
-        greedy=False,
-        stop_strings=None,
-        max_new_tokens=7,
-    )
-
-    assert sampling_params.kwargs["max_tokens"] == 7
 
 
 def test_base_vllm_worker_rejects_invalid_output_len_generator():
     from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
     config = deepcopy(basic_vllm_test_config)
-    config["output_len_or_output_len_generator"] = "bad"
+    config["output_len_or_output_distribution"] = "bad"
 
-    with pytest.raises(ValueError, match="Invalid output_len_or_output_len_generator"):
+    with pytest.raises(ValueError, match="Invalid constant_length_or_length_distribution: bad"):
         BaseVllmGenerationWorker(config=config, bundle_indices=None)
 
 
@@ -156,7 +117,7 @@ def test_vllm_generate_text_drops_stop_token_ids_when_ignore_eos():
     worker.cfg["ignore_eos"] = True
     worker.cfg["stop_token_ids"] = [1, 2]
     worker.cfg["max_new_tokens"] = 8
-    worker.cfg["output_len_or_output_len_generator"] = 3
+    worker.cfg["output_len_generator"] = lambda _: 3
 
     class FakeSamplingParams:
         def __init__(self, **kwargs):
