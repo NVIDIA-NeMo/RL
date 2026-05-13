@@ -282,6 +282,7 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv]
+environments = ["python_version == '3.13'"]
 preview = true # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
   "transformer-engine-torch",
