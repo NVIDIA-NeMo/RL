@@ -308,7 +308,6 @@ jobs:
     needs: [build-container, org-member-pre-flight]
     if: >-
       ${{
-        github.ref == 'refs/heads/main' &&
         needs.build-container.result == 'success'
       }}
     runs-on: ${{ contains(needs.org-member-pre-flight.outputs.runner_prefix, 'azure') && format('{0}-gpu-x2', needs.org-member-pre-flight.outputs.runner_prefix) || format('{0}-gpu-x2', needs.org-member-pre-flight.outputs.runner_prefix) }}
