@@ -21,60 +21,10 @@ the trainer.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 import torch
 from tensordict import NonTensorStack, TensorDict
 
-from nemo_rl.data_plane.codec import (
-    materialize,
-    pack_object_array,
-    to_nested_by_length,
-    unpack_object_array,
-)
-
-
-def test_pack_unpack_roundtrip_strings() -> None:
-    arr = np.array(["alpha", "beta", "gamma"], dtype=object)
-    packed = pack_object_array(arr)
-    assert packed.is_nested and packed.dtype == torch.uint8
-    out = unpack_object_array(packed)
-    assert isinstance(out, np.ndarray) and out.dtype == object
-    assert list(out) == ["alpha", "beta", "gamma"]
-
-
-def test_pack_unpack_roundtrip_message_log_shape() -> None:
-    """The actual message_log shape: list[list[dict[str, str|Tensor]]]."""
-    sample_a = [
-        {"role": "user", "content": "hi", "token_ids": torch.tensor([1, 2, 3])},
-        {"role": "assistant", "content": "hello", "token_ids": torch.tensor([4, 5])},
-    ]
-    sample_b = [
-        {"role": "user", "content": "what's up?", "token_ids": torch.tensor([6])},
-    ]
-    arr = np.array([sample_a, sample_b], dtype=object)
-    packed = pack_object_array(arr)
-    out = unpack_object_array(packed)
-    assert len(out) == 2
-    assert out[0][0]["role"] == "user"
-    assert out[0][1]["content"] == "hello"
-    assert torch.equal(out[1][0]["token_ids"], torch.tensor([6]))
-
-
-def test_pack_accepts_python_list() -> None:
-    """list passes through the same path as np.ndarray(object)."""
-    packed = pack_object_array([{"a": 1}, {"a": 2}, {"a": 3}])
-    out = unpack_object_array(packed)
-    assert [d["a"] for d in out] == [1, 2, 3]
-
-
-def test_pack_rejects_non_object_ndarray() -> None:
-    with pytest.raises(TypeError, match=r"dtype=object"):
-        pack_object_array(np.array([1, 2, 3], dtype=np.int64))
-
-
-def test_unpack_rejects_rectangular_tensor() -> None:
-    with pytest.raises(ValueError, match=r"nested"):
-        unpack_object_array(torch.zeros(3, dtype=torch.uint8))
+from nemo_rl.data_plane.codec import materialize, to_nested_by_length
 
 
 def test_materialize_decodes_nontensor_stack() -> None:
