@@ -25,7 +25,7 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneConfig,
     KVBatchMeta,
 )
-from nemo_rl.data_plane.observability import MetricsDataPlaneClient, print_event
+from nemo_rl.data_plane.observability import MetricsDataPlaneClient, log_event
 
 __all__ = [
     "DataPlaneClient",
@@ -33,6 +33,6 @@ __all__ = [
     "KVBatchMeta",
     "MetricsDataPlaneClient",
     "build_data_plane_client",
+    "log_event",
     "materialize",
-    "print_event",
 ]

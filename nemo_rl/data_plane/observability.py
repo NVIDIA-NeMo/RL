@@ -27,6 +27,7 @@ bytes currently held in TQ, i.e. put minus cleared) and
 
 from __future__ import annotations
 
+import logging
 from time import monotonic
 from typing import Any, Callable, Literal
 
@@ -36,6 +37,8 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
+
+_logger = logging.getLogger(__name__)
 
 
 def _td_bytes(td: TensorDict | None) -> int:
@@ -51,12 +54,8 @@ def _td_bytes(td: TensorDict | None) -> int:
     return total
 
 
-def print_event(event: dict[str, Any]) -> None:
-    print(
-        f"[data_plane] op={event['op']} partition={event['partition_id']} "
-        f"keys={event['n_keys']} bytes={event['n_bytes']} "
-        f"ms={event['wall_ms']:.2f} status={event['status']}"
-    )
+def log_event(event: dict[str, Any]) -> None:
+    _logger.info("data_plane_event: %s", event)
 
 
 class MetricsDataPlaneClient(DataPlaneClient):
