@@ -676,6 +676,11 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. "
                 "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
             )
+            if model_cfg.fp8_recipe == "mxfp8":
+                # Megatron-Bridge requires reuse_grad_buf_for_mxfp8_param_ag=True when
+                # fp8_param=True and fp8_recipe="mxfp8". Set it automatically here so
+                # callers don't need to configure this derived flag manually.
+                model_cfg.reuse_grad_buf_for_mxfp8_param_ag = True
 
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:

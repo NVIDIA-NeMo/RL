@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Reproducer for the fp8_param convergence bug in mcore:
+# Reproducer for the fp8_param convergence bug in mcore with MXFP8:
 #   https://github.com/NVIDIA-NeMo/RL/issues/1164
 #
 # Runs a single SFT experiment with fp8_param configurable via --fp8-param.
@@ -22,7 +22,8 @@
 # — the bug causes them to diverge.
 #
 # Prerequisites:
-#   - Single node with 8 H100/H200/B100/B200 GPUs (Hopper+, CUDA >= 12.9)
+#   - Single node with 8 B100/B200 GPUs (Blackwell, CUDA >= 12.9)
+#     MXFP8 is only supported on Blackwell architecture (compute capability >= 10.0)
 #   - Run from the root of the NeMo-RL repo inside the nemo-rl container
 #   - HuggingFace cache with "meta-llama/Llama-3.2-1B" already downloaded
 #

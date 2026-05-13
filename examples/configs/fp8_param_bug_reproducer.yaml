@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Reproducer for the fp8_param convergence bug in mcore:
+# Reproducer for the fp8_param convergence bug in mcore with MXFP8:
 #   https://github.com/NVIDIA-NeMo/RL/issues/1164
 #
 # This config is intentionally minimal for a single node (8 GPUs, TP=8).
@@ -54,8 +54,6 @@ policy:
 
   train_global_batch_size: 8
   train_micro_batch_size: 1
-  # blockwise FP8 requires sequence length divisible by 128.
-  # With TP=8 and SP=false there is no additional TP constraint on individual seqs.
   max_total_sequence_length: 512
   precision: "bfloat16"
 
@@ -110,9 +108,7 @@ policy:
     # initialization (to avoid CUDNN_STATUS_NOT_INITIALIZED at import time).
     deterministic_mode: true
 
-    env_vars:
-      # Required for blockwise FP8 to use fp32 scales (avoids scale drift)
-      NVTE_FP8_BLOCK_SCALING_FP32_SCALES: "1"
+    env_vars: {}
 
     peft:
       enabled: false
@@ -164,15 +160,15 @@ policy:
     fp8_cfg:
       enabled: true
       fp8: "e4m3"
-      fp8_recipe: "blockwise"
+      fp8_recipe: "mxfp8"
       # Toggle this flag to reproduce the bug:
       #   fp8_param: false  ->  baseline (expected convergence)
       #   fp8_param: true   ->  buggy    (diverged / different convergence)
+      # Note: when fp8_param=true + fp8_recipe="mxfp8", setup.py automatically sets
+      # reuse_grad_buf_for_mxfp8_param_ag=True (required by Megatron-Bridge).
       fp8_param: false
 
-  # blockwise FP8 requires packed seq divisible by 128.
-  # With TP=8, SP=false: minimum_pad_factor=1, so 128 is sufficient.
-  make_sequence_length_divisible_by: 128
+  make_sequence_length_divisible_by: 1
   max_grad_norm: 1.0
   dynamic_batching:
     enabled: false
