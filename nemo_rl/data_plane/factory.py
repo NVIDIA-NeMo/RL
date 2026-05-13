@@ -23,23 +23,21 @@ def build_data_plane_client(
 ) -> DataPlaneClient:
     """Construct the configured data-plane client.
 
-    Dispatches on ``cfg["impl"]``. ``impl == "transfer_queue"`` is the
-    only implementation today; other adapters can be added behind this
-    factory without touching call sites.
+    Dispatches on ``cfg["impl"]``. Only ``"transfer_queue"`` ships today;
+    other adapters can be added behind this factory without touching
+    call sites. Raises if data_plane is disabled — the legacy trainer
+    (``nemo_rl.algorithms.grpo.grpo_train``) should be used in that case
+    rather than a NoOp fallback here.
 
-    Callers should reach this function only when the sync trainer
-    (``grpo_sync``) is in use — the legacy trainer never touches the
-    data plane and therefore should not call the factory at all. There
-    is intentionally no NoOp fallback here: a NoOp client running inside
-    ``grpo_sync`` would silently divorce the per-step lifecycle from the
-    storage backend the trainer is meant to exercise.
+    Args:
+        cfg: Data-plane config; must have ``enabled=True``.
+        bootstrap: ``True`` on the driver — bootstraps the TQ
+            controller. ``False`` on worker processes — connects to the
+            existing controller (avoids creating a second named actor).
 
-    ``bootstrap`` is honored by adapters that distinguish a controller
-    process from worker processes (the ``transfer_queue`` adapter does):
-      * True (driver, default): bootstraps the controller from ``cfg``.
-      * False (worker process): connects this process to the existing
-        controller — workers must use this so they don't try to create a
-        second named actor in the Ray cluster.
+    Returns:
+        A configured ``DataPlaneClient``; wrapped in
+        :class:`MetricsDataPlaneClient` when observability is enabled.
     """
     if cfg is None or not cfg["enabled"]:
         raise ValueError(
