@@ -87,18 +87,14 @@ def kv_first_write(
     The padding tax is paid only when a consumer calls
     :func:`materialize(layout='padded', pad_value_dict=...)`.
 
-    Non-tensor object fields (``np.ndarray(dtype=object)``) are pickled
-    per-row and packed into a jagged uint8 nested tensor via
-    :func:`pack_object_array`. Their names are recorded in
-    ``meta.extra_info['object_fields']`` so consumers (read_columns /
-    materialize) decode them back to object arrays. Backends only ever
-    see tensors — both simple and mooncake_cpu carry the same wire.
+    Non-tensor object fields (``np.ndarray(dtype=object)`` — verl-style)
+    ride the wire as ``NonTensorStack`` leaves. TQ handles the encoding
+    per backend (simple keeps Python objects; mooncake_client pickles
+    internally) — no codec-level pickle here.
     """
-    from nemo_rl.data_plane.codec import (
-        META_OBJECT_FIELDS,
-        maybe_pack_jagged,
-        pack_object_array,
-    )
+    from tensordict import NonTensorStack
+
+    from nemo_rl.data_plane.codec import maybe_pack_jagged
 
     n = int(final_batch_cpu["sample_mask"].shape[0])
     if n == 0 or len(uids) == 0 or n % len(uids) != 0:
@@ -109,14 +105,12 @@ def kv_first_write(
     keys = [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]
     lengths = final_batch_cpu["input_lengths"]
 
-    wire: dict[str, torch.Tensor] = {}
-    object_field_names: list[str] = []
+    wire: dict[str, Any] = {}
     for k, v in final_batch_cpu.items():
         if isinstance(v, torch.Tensor):
             wire[k] = maybe_pack_jagged(v, lengths)
         elif isinstance(v, np.ndarray) and v.dtype == object:
-            wire[k] = pack_object_array(v)
-            object_field_names.append(k)
+            wire[k] = NonTensorStack(*v.tolist())
 
     bulk = TensorDict(wire, batch_size=[n])
     dp_client.kv_batch_put(
@@ -131,8 +125,6 @@ def kv_first_write(
         # backends (mcore SP, PyTorch CP) get sequence dims that satisfy
         # their own divisibility asserts.
         extras["pad_to_multiple"] = int(pad_to_multiple)
-    if object_field_names:
-        extras[META_OBJECT_FIELDS] = object_field_names
     return KVBatchMeta(
         partition_id=partition_id,
         task_name=task_name,
@@ -301,9 +293,9 @@ class SyncRolloutActor:
         for k, v in flat.get_multimodal_dict(as_tensors=False).items():
             if isinstance(v, torch.Tensor):
                 bulk_batch[k] = v
-        # ``content`` (raw assistant text per sample) — rides TQ as an
-        # object array so the driver can fetch it back at jsonl time
-        # (kv_first_write packs it via pack_object_array).
+        # ``content`` (raw assistant text per sample) — rides TQ as a
+        # NonTensorStack so the driver can fetch it back at jsonl time
+        # (kv_first_write wraps it via NonTensorStack).
         if "content" in flat:
             bulk_batch["content"] = np.asarray(flat["content"], dtype=object)
 

@@ -303,19 +303,9 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
 
 
 def _to_wire(td: TensorDict, *, promote_1d: bool = False) -> TensorDict:
-    # Walk via keys() + get() rather than items() — see noop adapter for
-    # the rationale (NonTensorData entries can slip past items()).
-    bad = []
-    for k in td.keys(include_nested=True, leaves_only=True):
-        v = td.get(k)
-        if not isinstance(v, torch.Tensor):
-            bad.append(k)
-    if bad:
-        raise TypeError(
-            f"kv_batch_put received non-tensor leaves: {bad}. "
-            "Tensorize via codec helpers, use `tags=` for primitives, "
-            "or use the Ray object store for arbitrary Python objects."
-        )
+    # `NonTensorStack` / `NonTensorData` leaves pass through — TQ supports
+    # non-tensor data natively (simple backend keeps them as Python objects;
+    # mooncake_client pickles internally). No need to pre-encode on our side.
     # pyrefly: ignore  # missing-argument
     out = td.detach().contiguous()
     if promote_1d:

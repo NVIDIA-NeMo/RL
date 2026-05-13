@@ -297,12 +297,11 @@ def materialize(
     layout: Layout = "padded",
     pad_value_dict: dict[str, int | float] | None = None,
     pad_to_multiple: int = 1,
-    object_fields: Iterable[str] | None = None,
 ) -> "BatchedDataDict[Any]":
     """Convert a wire TensorDict to a BatchedDataDict.
 
     Trainer/worker code expects rectangular tensors — this is the
-    bridge from the on-wire nested/uint8-packed format.
+    bridge from the on-wire nested format.
 
     The lazy ``BatchedDataDict`` import keeps
     ``import nemo_rl.data_plane`` cheap for unit tests that don't
@@ -323,19 +322,14 @@ def materialize(
             impose alignment (mcore SP needs ``seq_len % TP == 0``;
             PyTorch CP needs ``seq_len % (CP * 2) == 0``). Default 1
             disables extra alignment.
-        object_fields: Names of fields written via
-            :func:`pack_object_array`. Each is decoded via
-            :func:`unpack_object_array` and emitted as
-            ``np.ndarray(dtype=object)``; tensor padding/alignment do
-            not apply. Typically read from
-            ``meta.extra_info["object_fields"]`` by the driver / worker
-            fetch helpers.
 
     Returns:
         ``BatchedDataDict`` with rectangular tensors for padded layout,
-        nested tensors for jagged layout, and object arrays for fields
-        listed in ``object_fields``.
+        nested tensors for jagged layout, and ``np.ndarray(dtype=object)``
+        for ``NonTensorStack`` leaves (TQ-native non-tensor passthrough).
     """
+    from tensordict import NonTensorData, NonTensorStack
+
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
     if pad_to_multiple < 1:
@@ -343,21 +337,18 @@ def materialize(
             f"pad_to_multiple must be >= 1, got {pad_to_multiple}"
         )
     pads = pad_value_dict or {}
-    obj_set = set(object_fields or ())
     out: dict[str, Any] = {}
     for key, val in td.items(include_nested=False):
-        if key in obj_set:
-            if not isinstance(val, torch.Tensor):
-                raise TypeError(
-                    f"materialize() object field {key!r} is not a tensor: "
-                    f"{type(val)}; wire encoding broken."
-                )
-            out[key] = unpack_object_array(val)
+        if isinstance(val, NonTensorStack):
+            out[key] = np.asarray(val.tolist(), dtype=object)
+            continue
+        if isinstance(val, NonTensorData):
+            out[key] = np.asarray([val.data], dtype=object)
             continue
         if not isinstance(val, torch.Tensor):
             raise TypeError(
-                f"materialize() received non-tensor leaf {key!r}: {type(val)}. "
-                "Wire format must be tensor-only."
+                f"materialize() received unexpected leaf type for {key!r}: "
+                f"{type(val)}. Expected Tensor or NonTensorStack."
             )
         if val.is_nested and layout == "padded":
             pad = pads.get(key, 0)

@@ -32,13 +32,12 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
+from tensordict import NonTensorStack
+
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data_plane.codec import (
-    META_OBJECT_FIELDS,
     materialize,
     maybe_pack_jagged,
-    pack_object_array,
-    select_object_fields,
 )
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import Layout
@@ -65,10 +64,9 @@ def read_columns(
     matches the alignment required by downstream backends (mcore SP /
     PyTorch CP).
 
-    Object-encoded fields (registered at write time in
-    ``meta.extra_info['object_fields']``) bypass tensor padding and
-    are unpickled back to ``np.ndarray(dtype=object)`` — see
-    :func:`nemo_rl.data_plane.codec.pack_object_array`.
+    Non-tensor object fields ride the wire as ``NonTensorStack`` leaves
+    (TQ-native); :func:`materialize` unwraps them to
+    ``np.ndarray(dtype=object)`` for trainer consumption.
     """
     td = dp_client.kv_batch_get(
         keys=meta.keys,
@@ -81,7 +79,6 @@ def read_columns(
         layout=layout,
         pad_value_dict=pad_value_dict,
         pad_to_multiple=pad_mult,
-        object_fields=select_object_fields(meta, select_fields),
     )
     attach_message_log_view(data)
     return data
@@ -99,29 +96,19 @@ def write_columns(
     so they land in TQ with the same row lengths as the initial put — keeps
     mixed jagged/rectangular shape mismatches out of subsequent reads.
 
-    Object-array fields (``np.ndarray(dtype=object)``) must already be
-    registered in ``meta.extra_info[META_OBJECT_FIELDS]`` (typically by
-    :func:`kv_first_write`); writing an unregistered object field raises
-    so subsequent reads can't silently corrupt by treating uint8 wire
-    bytes as a regular tensor.
+    Non-tensor object fields (``np.ndarray(dtype=object)``) are wrapped
+    in ``NonTensorStack``; TQ handles the encoding per backend.
     """
     if not fields:
         return
 
     seq_lens = meta.sequence_lengths
     lengths = torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
-    registered_objects = set((meta.extra_info or {}).get(META_OBJECT_FIELDS, ()))
 
-    packed: dict[str, torch.Tensor] = {}
+    packed: dict[str, Any] = {}
     for k, v in fields.items():
         if isinstance(v, np.ndarray) and v.dtype == object:
-            if k not in registered_objects:
-                raise ValueError(
-                    f"write_columns: object field {k!r} not registered in "
-                    f"meta.extra_info[{META_OBJECT_FIELDS!r}]; register it "
-                    f"at first put (kv_first_write) so readers decode it."
-                )
-            packed[k] = pack_object_array(v)
+            packed[k] = NonTensorStack(*v.tolist())
         elif isinstance(v, torch.Tensor):
             packed[k] = (
                 maybe_pack_jagged(v, lengths)
