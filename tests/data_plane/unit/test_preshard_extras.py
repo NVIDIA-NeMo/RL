@@ -31,10 +31,8 @@ import torch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
-from nemo_rl.data_plane.preshard import (
-    DP_SEED_FIELDS,
-    shard_meta_for_dp,
-)
+from nemo_rl.data_plane.preshard import shard_meta_for_dp
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.sync_rollout_actor import kv_first_write
 
@@ -54,7 +52,7 @@ def _final_batch(n_samples: int = 4, *, with_extras: bool = False) -> BatchedDat
 def _setup_partition(client: NoOpDataPlaneClient, *, num_samples: int):
     client.register_partition(
         partition_id="train",
-        fields=list(DP_SEED_FIELDS),
+        fields=list(DP_TRAIN_FIELDS),
         num_samples=num_samples,
         consumer_tasks=["train"],
     )
@@ -113,7 +111,7 @@ def _meta(n: int) -> KVBatchMeta:
         partition_id="train",
         task_name="train",
         keys=[f"k{i}" for i in range(n)],
-        fields=list(DP_SEED_FIELDS),
+        fields=list(DP_TRAIN_FIELDS),
         sequence_lengths=[10 + i for i in range(n)],
         extra_info={},
     )

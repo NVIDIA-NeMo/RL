@@ -288,7 +288,7 @@ class SyncRolloutActor:
             **pad,
         )
 
-        # TQ bulk payload — DP_SEED_FIELDS + multimodal extras.
+        # TQ bulk payload — DP_TRAIN_FIELDS + multimodal extras.
         bulk_batch = BatchedDataDict[Any](
             {
                 "input_ids": flat["token_ids"],

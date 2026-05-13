@@ -13,6 +13,29 @@
 # limitations under the License.
 """Shared string-key constants for the data-plane meta contract."""
 
+# Per-shard packing metadata keys in `KVBatchMeta.extra_info`.
 META_MICRO_BATCH_INDICES = "micro_batch_indices"
 META_MICRO_BATCH_LENGTHS = "micro_batch_lengths"
 META_ELEM_COUNTS_PER_GB = "elem_counts_per_gb"
+
+# Tensor fields in the train partition. Rollout writes the input
+# subset on first put; later stages add prev_logprobs /
+# reference_policy_logprobs (workers) and advantages (driver).
+DP_TRAIN_FIELDS = (
+    "input_ids",
+    "input_lengths",
+    "generation_logprobs",
+    "prev_logprobs",
+    "reference_policy_logprobs",
+    "advantages",
+    "token_mask",
+    "sample_mask",
+)
+
+# Subset fetched by logprob / ref-logprob workers.
+LP_SEED_FIELDS = (
+    "input_ids",
+    "input_lengths",
+    "token_mask",
+    "sample_mask",
+)

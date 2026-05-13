@@ -35,35 +35,6 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-# Tensor fields the ``train`` partition schema declares. The rollout
-# actor's first ``kv_batch_put`` writes the input-side subset
-# (input_ids, input_lengths, generation_logprobs, token_mask,
-# sample_mask) plus any multimodal extras present in the rollout
-# output; later stages add ``prev_logprobs`` /
-# ``reference_policy_logprobs`` (worker write-back) and ``advantages``
-# (driver delta-write). Consumers (``train_presharded`` workers) fetch
-# the union via ``select_fields``.
-DP_SEED_FIELDS = (
-    "input_ids",
-    "input_lengths",
-    "generation_logprobs",
-    "prev_logprobs",
-    "reference_policy_logprobs",
-    "advantages",
-    "token_mask",
-    "sample_mask",
-)
-
-# Subset used by ``get_logprobs_from_meta`` / ``get_reference_policy_logprobs_from_meta``
-# — logprob workers only need the input + masks, not the full train fields.
-LP_SEED_FIELDS = (
-    "input_ids",
-    "input_lengths",
-    "token_mask",
-    "sample_mask",
-)
-
-
 def shard_meta_for_dp(
     meta: KVBatchMeta,
     *,
