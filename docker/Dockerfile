@@ -85,6 +85,64 @@ ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 
+# ---------------------------------------------------------------------------
+# Pre-build stages for expensive CUDA packages.
+# These stages compile sglang-kernel (~90 min) and transformer-engine (~15 min)
+# in isolation from pyproject.toml. Their Docker layers are cached in the
+# container registry (requires mode=max, i.e. use-inline-cache: false in CI)
+# and only rebuild when the git ref ARGs change — not when unrelated deps in
+# pyproject.toml are bumped.
+# The uv cache produced here is seeded into the hermetic stage so that
+# `uv sync --locked` finds the pre-built wheels and skips recompilation.
+# ---------------------------------------------------------------------------
+
+FROM base AS sglang-kernel-builder
+ARG SKIP_SGLANG_BUILD
+ARG SGLANG_GIT_REF=v0.5.10
+ARG TORCH_VERSION=2.10.0
+ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
+RUN <<"EOF" bash -exu
+if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
+    echo "SKIP_SGLANG_BUILD is set — skipping sglang-kernel pre-build"
+    mkdir -p /root/.cache/uv
+    exit 0
+fi
+uv venv /tmp/build-venv --seed
+uv pip install --python /tmp/build-venv/bin/python \
+    torch==${TORCH_VERSION} --torch-backend=cu130
+uv pip install --python /tmp/build-venv/bin/python \
+    setuptools packaging
+FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a" \
+CMAKE_BUILD_PARALLEL_LEVEL=8 \
+CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
+uv pip install --python /tmp/build-venv/bin/python --no-build-isolation \
+    "sglang-kernel @ git+https://github.com/sgl-project/sglang.git@${SGLANG_GIT_REF}#subdirectory=sgl-kernel"
+rm -rf /tmp/build-venv /root/.cache/uv/git-v0
+EOF
+
+FROM base AS te-builder
+ARG TE_GIT_REF=v2.14.1
+ARG TORCH_VERSION=2.10.0
+ARG CUDNN_VERSION=9.20.0.48
+ARG MAX_JOBS
+ARG NVTE_BUILD_THREADS_PER_JOB
+ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
+RUN <<"EOF" bash -exu
+uv venv /tmp/build-venv --seed
+uv pip install --python /tmp/build-venv/bin/python \
+    torch==${TORCH_VERSION} --torch-backend=cu130
+uv pip install --python /tmp/build-venv/bin/python \
+    setuptools packaging pybind11 \
+    "nvidia-cudnn-cu13==${CUDNN_VERSION}"
+CUDNN_HOME=/tmp/build-venv/lib/python3.13/site-packages/nvidia/cudnn \
+uv pip install --python /tmp/build-venv/bin/python --no-build-isolation \
+    "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@${TE_GIT_REF}"
+rm -rf /tmp/build-venv /root/.cache/uv/git-v0
+EOF
+
+
 FROM base AS hermetic
 
 WORKDIR /opt/nemo-rl
@@ -115,6 +173,14 @@ ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 ## CUDA 13 moved standard library headers under include/cccl; expose that path so
 ## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
+
+# Seed the uv cache with pre-built wheels from the builder stages above.
+# These COPY layers are cached independently of pyproject.toml — they only
+# change when a builder stage's git ref ARG changes. When pyproject.toml is
+# modified for unrelated deps, these layers remain cached and the subsequent
+# `uv sync` finds the expensive wheels already built.
+COPY --from=sglang-kernel-builder /root/.cache/uv/ /root/.cache/uv/
+COPY --from=te-builder /root/.cache/uv/ /root/.cache/uv/
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
