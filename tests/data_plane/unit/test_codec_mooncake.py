@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the mooncake_cpu-specific codec flags.
+"""Unit tests for the mooncake_cpu-specific wire workarounds.
 
 Covers:
-  P1 — _KV_PROMOTE_1D flag: writer unsqueezes 1D → (N,1), reader squeezes back.
+  P1 — `promote_1d` round-trip: writer unsqueezes 1D → (N,1), reader squeezes back.
   P2 — pack_per_token_field: tolerates SP padding wider than max(lengths).
 
 No Ray, no GPU, no transfer_queue required.
@@ -22,104 +22,62 @@ No Ray, no GPU, no transfer_queue required.
 
 from __future__ import annotations
 
-import pytest
 import torch
 
-# ── Module-level state restoration fixture ───────────────────────────────────
+# ── P1: promote_1d — writer unsqueezes, reader squeezes ──────────────────────
 
 
-@pytest.fixture
-def codec_flags():
-    """Save and restore module-level flags after each test.
+def test_promote_1d_unsqueezes_on_write() -> None:
+    """`_to_wire(..., promote_1d=True)` turns (N,) into (N, 1).
 
-    Tests that mutate _KV_PROMOTE_1D must use this fixture so they
-    cannot pollute other tests in the session.
+    Guards the mooncake_cpu path where TQ's extract_field_schema silently
+    unsqueezes 1D fields in metadata; the wire layer pre-unsqueezes so the
+    per-row data shape matches the metadata-recorded shape.
     """
-    from nemo_rl.data_plane import codec
-
-    saved = codec._KV_PROMOTE_1D
-    yield codec
-    codec._KV_PROMOTE_1D = saved
-
-
-# ── P1: _KV_PROMOTE_1D — writer unsqueezes, reader squeezes ──────────────────
-
-
-def test_promote_1d_unsqueezes_on_write(codec_flags) -> None:
-    """When _KV_PROMOTE_1D is True, writing a (N,) tensor through _to_wire
-    produces an (N, 1) tensor on the wire.
-
-    This guards the mooncake_cpu path where TQ's extract_field_schema silently
-    unsqueezes 1D fields in metadata (metadata.py:171-173). The fix is to
-    pre-unsqueeze at the wire layer so per-row shape matches the metadata shape.
-    """
-    # Import the adapter's _to_wire directly so this test stays unit-level.
     from tensordict import TensorDict
 
     from nemo_rl.data_plane.adapters.transfer_queue import _to_wire
-
-    codec_flags.set_kv_promote_1d(True)
 
     n = 8
     t = torch.arange(n, dtype=torch.float32)
     td = TensorDict({"reward": t}, batch_size=[n])
 
-    out = _to_wire(td)
+    out = _to_wire(td, promote_1d=True)
     assert out["reward"].shape == (n, 1), (
-        f"Expected wire shape ({n}, 1) but got {tuple(out['reward'].shape)}. "
-        "1D→2D promotion must happen when _KV_PROMOTE_1D is True."
+        f"Expected wire shape ({n}, 1) but got {tuple(out['reward'].shape)}."
     )
 
 
-def test_promote_1d_squeezes_on_read_roundtrip(codec_flags) -> None:
-    """After a write-unsqueeze, the reader squeezes back so consumers see (N,).
-
-    Simulates the full write → read round-trip through materialize().
-    """
+def test_promote_1d_roundtrip_via_from_wire() -> None:
+    """`_to_wire` then `_from_wire` restores the original (N,) shape and values."""
     from tensordict import TensorDict
 
-    codec_flags.set_kv_promote_1d(True)
+    from nemo_rl.data_plane.adapters.transfer_queue import _from_wire, _to_wire
 
     n = 6
     original = torch.arange(n, dtype=torch.float32)
+    td = TensorDict({"reward": original}, batch_size=[n])
 
-    # Simulate what _to_wire does on the mooncake_cpu path.
-    wire_tensor = original.unsqueeze(-1).contiguous()  # (N, 1)
-    td = TensorDict({"reward": wire_tensor}, batch_size=[n])
+    wire = _to_wire(td, promote_1d=True)
+    assert wire["reward"].shape == (n, 1)
 
-    # materialize squeezes (N, 1) back to (N,) when _KV_PROMOTE_1D is True.
-    from nemo_rl.data_plane.codec import _KV_PROMOTE_1D as flag_before  # noqa: F401
-
-    # The flag is now True (set above). Directly call the squeeze logic.
-    from nemo_rl.data_plane.codec import materialize
-
-    bdd = materialize(td, layout="padded")
-
-    assert bdd["reward"].shape == (n,), (
-        f"Expected shape ({n},) after read squeeze but got {tuple(bdd['reward'].shape)}."
-    )
-    assert torch.equal(bdd["reward"], original), (
-        "Values changed during 1D round-trip unsqueeze→squeeze."
-    )
+    back = _from_wire(wire)
+    assert back["reward"].shape == (n,)
+    assert torch.equal(back["reward"], original)
 
 
-def test_promote_1d_off_leaves_shape_unchanged(codec_flags) -> None:
-    """When _KV_PROMOTE_1D is False (the default), 1D tensors pass through
-    the wire layer without modification."""
+def test_promote_1d_off_leaves_shape_unchanged() -> None:
+    """With `promote_1d=False` (the default), `_to_wire` is a pass-through for 1D."""
     from tensordict import TensorDict
 
     from nemo_rl.data_plane.adapters.transfer_queue import _to_wire
-
-    codec_flags.set_kv_promote_1d(False)
 
     n = 5
     t = torch.arange(n, dtype=torch.long)
     td = TensorDict({"idx": t}, batch_size=[n])
 
-    out = _to_wire(td)
-    assert out["idx"].shape == (n,), (
-        f"Expected shape ({n},) when _KV_PROMOTE_1D=False but got {tuple(out['idx'].shape)}."
-    )
+    out = _to_wire(td, promote_1d=False)
+    assert out["idx"].shape == (n,)
 
 
 # ── P2: pack_per_token_field — tolerates SP padding ──────────────────────────

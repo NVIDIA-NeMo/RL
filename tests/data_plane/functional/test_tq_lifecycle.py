@@ -182,7 +182,7 @@ def test_smoke_round_trip_1d_fields(tq_client) -> None:
     """A 1D (N,) tensor put into TQ must come back as (N,), not (N,1).
 
     Regression guard for R-C2: TQ's KVStorageManager path silently unsqueezes
-    1D fields. The codec's _KV_PROMOTE_1D flag and materialize squeeze fix
+    1D fields. The adapter's `_to_wire(promote_1d=True)` + `_from_wire` pair fix
     this for the mooncake_cpu backend; this test verifies simple backend does
     not introduce the regression.
     """
