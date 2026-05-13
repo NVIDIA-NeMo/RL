@@ -428,6 +428,9 @@ class TQDataPlaneClient(DataPlaneClient):
             _init_tq(cfg)
         else:
             _connect_existing()
+        # `self._tq` is the transfer_queue module: KV ops (`kv_batch_*`,
+        # `kv_clear`) are module-level helpers; metadata ops (`claim_meta`,
+        # `check_consumption_status`) go through `self._tq.get_client()`.
         self._tq = _tq()
         self._poll_interval_s = cfg.get("claim_meta_poll_interval_s", 0.5)
         self._partitions: dict[str, _PartitionRecord] = {}
