@@ -29,10 +29,13 @@ import torch
 
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import (
-    META_ELEM_COUNTS_PER_GB,
+    ELEM_COUNTS_PER_GB,
+    INPUT_IDS,
+    INPUT_LENGTHS,
     META_IDX,
-    META_MICRO_BATCH_INDICES,
-    META_MICRO_BATCH_LENGTHS,
+    MICRO_BATCH_INDICES,
+    MICRO_BATCH_LENGTHS,
+    SAMPLE_MASK,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -101,9 +104,9 @@ def shard_meta_for_dp(
     # corresponds to, so we can slice ``meta.keys`` per rank.
     skeleton = BatchedDataDict(
         {
-            "input_ids": torch.zeros(n, 1, dtype=torch.int64),
-            "input_lengths": torch.tensor(seq_lens, dtype=torch.int64),
-            "sample_mask": torch.ones(n, dtype=torch.float32),
+            INPUT_IDS: torch.zeros(n, 1, dtype=torch.int64),
+            INPUT_LENGTHS: torch.tensor(seq_lens, dtype=torch.int64),
+            SAMPLE_MASK: torch.ones(n, dtype=torch.float32),
             META_IDX: torch.arange(n, dtype=torch.int64),
         }
     )
@@ -139,9 +142,9 @@ def shard_meta_for_dp(
         # sequence_packing/dynamic_batching is enabled. Workers' *_presharded
         # paths look these up off ``meta.extra_info``.
         for attr in (
-            META_MICRO_BATCH_INDICES,
-            META_MICRO_BATCH_LENGTHS,
-            META_ELEM_COUNTS_PER_GB,
+            MICRO_BATCH_INDICES,
+            MICRO_BATCH_LENGTHS,
+            ELEM_COUNTS_PER_GB,
         ):
             val = getattr(shard, attr, None)
             if val is not None:
