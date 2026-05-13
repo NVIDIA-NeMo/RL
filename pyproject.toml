@@ -210,9 +210,9 @@ causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
-# Official sglang v0.5.10 with transformers v5 support
-sglang = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "python" }
-sglang-kernel = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "sgl-kernel" }
+# Official sglang v0.5.11 with CUDA 13 support
+sglang = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.11", subdirectory = "python" }
+sglang-kernel = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.11", subdirectory = "sgl-kernel" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "905018803414702e414a86716484ed4115b37ba6" }
 
 [tool.uv.workspace]
@@ -278,12 +278,12 @@ override-dependencies = [
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  # Note: flashinfer versions are pinned per-extra (vllm uses 0.6.4, sglang uses 0.6.7.post2)
+  # Note: flashinfer versions are pinned per-extra (vllm uses 0.6.4, sglang uses 0.6.8.post1)
   # since vllm and sglang extras are mutually exclusive and have different requirements.
-  # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm (0.6.4) and sglang (0.6.7.post2)
+  # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm (0.6.4) and sglang (0.6.8.post1)
   "flashinfer-python>=0.5.0",
   "flashinfer-cubin>=0.5.0",
-  # sglang 0.5.10 requires nvidia-cutlass-dsl>=4.4.1 (via flashinfer 0.6.7.post2 which uses CUTLASS 4.4.2).
+  # sglang 0.5.11 requires nvidia-cutlass-dsl==4.4.2 (via flashinfer 0.6.8.post1).
   # Override to >=4.4.1 so uv can resolve to a version satisfying both vllm and sglang.
   "nvidia-cutlass-dsl>=4.4.1",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
@@ -291,8 +291,6 @@ override-dependencies = [
   # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
   # Override until vllm officially relaxes the constraint (https://github.com/vllm-project/vllm/issues/30466).
   "transformers==5.3.0",
-  #Override till we can upgrade sglang version to address CVE GHSA-7rgv-gqhr-fxg3
-  "xgrammar==0.1.33",
   # Override dependencies to address CVEs
   "mlflow>=3.11.1",
   # Override outlines for Python 3.13 support
@@ -416,16 +414,16 @@ requires-dist = ["setuptools", "wheel", "torch", "numpy"]
 [[tool.uv.dependency-metadata]]
 name = "sglang-kernel"
 # This version has to match the version in the commit/rev/tag used
-version = "0.4.1"
+version = "0.4.2"
 requires-dist = ["torch", "scikit-build-core", "wheel"]
 
 [[tool.uv.dependency-metadata]]
 name = "sglang"
-# VCS install from official sgl-project/sglang v0.5.10
+# VCS install from official sgl-project/sglang v0.5.11
 # Version is dynamic (setuptools-scm), so uv cannot resolve deps from the VCS source automatically.
 # This requires-dist list must be kept in sync with the official python/pyproject.toml [project].dependencies.
-# Source: https://github.com/sgl-project/sglang/blob/v0.5.10/python/pyproject.toml
-version = "0.5.10"
+# Source: https://github.com/sgl-project/sglang/blob/v0.5.11/python/pyproject.toml
+version = "0.5.11"
 requires-dist = [
   "IPython",
   "aiohttp",
@@ -434,21 +432,23 @@ requires-dist = [
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
-  "cuda-python==13.0",
+  "cuda-python>=13.0",
   "decord2",
   "datasets",
+  "easydict",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.7.post2",
-  "flashinfer_cubin==0.6.7.post2",
+  "flashinfer_python==0.6.8.post1",
+  "flashinfer_cubin==0.6.8.post1",
   "gguf",
   "interegular",
+  "kernels",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
   "msgspec",
   "ninja",
   "numpy",
-  "nvidia-cutlass-dsl>=4.4.1",
+  "nvidia-cutlass-dsl==4.4.2",
   "nvidia-ml-py",
   "openai-harmony==0.0.4",
   "openai==2.6.1",
@@ -469,20 +469,20 @@ requires-dist = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "flash-attn-4>=4.0.0b4",
-  "sglang-kernel==0.4.1",
+  "flash-attn-4>=4.0.0b9",
+  "sglang-kernel==0.4.2",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
-  "torch_memory_saver==0.0.9",
-  "torch==2.9.1",
-  "torchao==0.9.0",
-  "torchaudio==2.9.1",
-  "torchcodec==0.9.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')",
+  "torch_memory_saver>=0.0.9.post1",
+  "torch==2.11.0",
+  "torchao==0.17.0",
+  "torchaudio==2.11.0",
+  "torchcodec==0.11.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')",
   "torchvision",
   "tqdm",
-  "mistral_common>=1.9.0",
-  "transformers==5.3.0",
+  "mistral_common>=1.11.0",
+  "transformers==5.6.0",
   "uvicorn",
   "uvloop",
   "watchfiles",
