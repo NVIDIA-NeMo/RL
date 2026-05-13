@@ -27,7 +27,7 @@ policy:
   generation:
     backend: megatron
     mcore_generation_config:
-    enable_chunked_prefill: true
+      enable_chunked_prefill: true
       buffer_size_gb: 4
     vllm_cfg:
       enabled: false

@@ -72,6 +72,8 @@ def generate_responses(
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
     if "flex_router_ids" in batch:
         generation_input_data["flex_router_ids"] = batch["flex_router_ids"]
+    if "flex_router_probs" in batch:
+        generation_input_data["flex_router_probs"] = batch["flex_router_probs"]
 
     # Always use synchronous generation
     generation_outputs = policy_generation.generate(
@@ -89,6 +91,7 @@ def generate_responses(
     if flex_router_ids is not None:
         flex_router_ids = flex_router_ids.cpu()
         batch["flex_router_ids"] = flex_router_ids
+    flex_router_probs = batch.get("flex_router_probs")
 
     # Extract generated parts
     generated_ids = []
@@ -117,6 +120,8 @@ def generate_responses(
             ]
         if flex_router_ids is not None:
             assistant_message["flex_router_id"] = int(flex_router_ids[i].item())
+        if flex_router_probs is not None:
+            assistant_message["flex_router_prob"] = float(flex_router_probs[i].item())
 
         batch["message_log"][i].append(assistant_message)
 

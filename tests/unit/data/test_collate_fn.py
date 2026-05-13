@@ -12,13 +12,54 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
 from unittest.mock import MagicMock
 
 import torch
 
-from nemo_rl.data.collate_fn import preference_collate_fn
+from nemo_rl.data.collate_fn import preference_collate_fn, rl_collate_fn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def _minimal_rl_datum(idx: int, **overrides) -> DatumSpec:
+    datum = DatumSpec(
+        message_log=[
+            {"role": "user", "content": "x", "token_ids": torch.tensor([1, 2])},
+        ],
+        length=2,
+        extra_env_info={"ground_truth": "y"},
+        loss_multiplier=1.0,
+        idx=idx,
+    )
+    datum.update(overrides)
+    return datum
+
+
+def test_rl_collate_fn_samples_flex_router_probs_when_missing():
+    random.seed(0)
+    data_batch = [_minimal_rl_datum(i) for i in range(8)]
+
+    output = rl_collate_fn(data_batch)
+
+    probs = output["flex_router_probs"]
+    assert probs.dtype == torch.float32
+    assert probs.shape == (8,)
+    assert torch.all(probs >= 0.0)
+    assert torch.all(probs < 1.0)
+
+
+def test_rl_collate_fn_passes_through_explicit_flex_router_prob():
+    explicit = [0.05, 0.55, 0.95]
+    data_batch = [
+        _minimal_rl_datum(i, flex_router_prob=p) for i, p in enumerate(explicit)
+    ]
+
+    output = rl_collate_fn(data_batch)
+
+    torch.testing.assert_close(
+        output["flex_router_probs"], torch.tensor(explicit, dtype=torch.float32)
+    )
 
 
 def test_preference_collate_fn():

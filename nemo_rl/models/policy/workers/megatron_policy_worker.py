@@ -205,6 +205,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
+
+        # setup frozen flextron router if enabled
         self.frozen_flextron_router = FrozenFlextronRouter(
             model=self.model, model_cfg=runtime_config.model_cfg
         )

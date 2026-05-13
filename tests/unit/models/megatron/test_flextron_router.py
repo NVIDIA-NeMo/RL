@@ -372,12 +372,9 @@ def test_inference_mode_mask_does_not_break_grad_enabled_forward():
     assert router.active_router_id is None
 
 
-def test_router_ids_can_be_sampled_or_read_from_batch():
+def test_router_ids_read_from_batch_and_default_to_base():
     model = _DummyModel()
     router = FrozenFlextronRouter(model=model, model_cfg=_router_config())
-
-    sampled = router.sample_router_ids(batch_size=4)
-    assert sampled.tolist() == [1, 1, 1, 1]
 
     data = BatchedDataDict(
         {
@@ -388,21 +385,66 @@ def test_router_ids_can_be_sampled_or_read_from_batch():
     assert router.get_router_ids(data).tolist() == [0, 1]
     assert router.grouped_indices(torch.tensor([1, 0, 1])) == {1: [0, 2], 0: [1]}
 
+    # No probs and no ids -> default to base route (id 0) for every sample.
+    default_data = BatchedDataDict({"input_ids": torch.ones(3, 2, dtype=torch.long)})
+    assert router.get_router_ids(default_data).tolist() == [0, 0, 0]
 
-def test_router_sampling_uses_one_route_for_whole_batch(monkeypatch):
+
+def _three_route_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        hybrid_layer_pattern="E*",
+        hidden_size=4,
+        ffn_hidden_size=6,
+        layernorm_epsilon=1.0e-5,
+        flex_routers=[
+            {"emb_int_list": [2, 3], "mlp_int_list": [4]},
+            {"emb_int_list": [3, 4], "mlp_int_list": [5]},
+            {"emb_int_list": [4, 4], "mlp_int_list": [6]},
+        ],
+        # base=0.3, route0=0.5, route1=0.15, route2=0.05 -> cdf [0.3, 0.8, 0.95, 1.0]
+        flextron_sampling_rates=[0.3, 0.5, 0.15, 0.05],
+    )
+
+
+def test_resolve_router_ids_partitions_unit_interval_by_cdf():
     model = _DummyModel()
-    router = FrozenFlextronRouter(model=model, model_cfg=_router_config())
-    sampled_num_samples = []
+    router = FrozenFlextronRouter(model=model, model_cfg=_three_route_config())
 
-    def fake_multinomial(
-        probs: torch.Tensor, num_samples: int, replacement: bool = False
-    ) -> torch.Tensor:
-        sampled_num_samples.append(num_samples)
-        return torch.tensor([1], dtype=torch.long, device=probs.device)
+    # cdf: [0.3, 0.8, 0.95, 1.0]; pick probs strictly interior to each partition
+    # to avoid float32 rounding at the cumulative-sum boundaries.
+    probs = torch.tensor([0.0, 0.2, 0.4, 0.7, 0.85, 0.9, 0.97, 0.99])
+    ids = router.resolve_router_ids(probs)
 
-    monkeypatch.setattr(torch, "multinomial", fake_multinomial)
+    assert ids.tolist() == [0, 0, 1, 1, 2, 2, 3, 3]
 
-    sampled = router.sample_router_ids(batch_size=4)
 
-    assert sampled.tolist() == [1, 1, 1, 1]
-    assert sampled_num_samples == [1]
+def test_resolve_router_ids_via_get_router_ids_prefers_probs():
+    model = _DummyModel()
+    router = FrozenFlextronRouter(model=model, model_cfg=_three_route_config())
+
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.ones(3, 2, dtype=torch.long),
+            "flex_router_probs": torch.tensor([0.1, 0.5, 0.97]),
+            # If probs took precedence, ids below must be ignored.
+            "flex_router_ids": torch.tensor([7, 7, 7]),
+        }
+    )
+
+    assert router.get_router_ids(data).tolist() == [0, 1, 3]
+
+
+def test_resolve_router_ids_matches_sampling_distribution():
+    model = _DummyModel()
+    router = FrozenFlextronRouter(model=model, model_cfg=_three_route_config())
+
+    torch.manual_seed(0)
+    n = 200_000
+    probs = torch.rand(n)
+    ids = router.resolve_router_ids(probs)
+
+    expected = torch.tensor([0.3, 0.5, 0.15, 0.05])
+    empirical = torch.bincount(ids, minlength=4).float() / n
+    torch.testing.assert_close(empirical, expected, atol=0.01, rtol=0.0)
+
+

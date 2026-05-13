@@ -138,6 +138,8 @@ class GenerationDatumSpec(TypedDict):
     - input_lengths: Tensor containing the actual length of each sequence (without padding)
     - stop_strings: Optional list of strings to stop generation (per sample)
     - flex_router_ids: Optional tensor of deterministic Flextron route ids
+    - flex_router_probs: Optional tensor of per-sample uniform probabilities in
+      [0, 1) used to derive route ids via inverse-CDF inside the Flextron router
     - __extra__: Additional model-specific data fields
 
     Example of a batch with 4 entries with different sequence lengths:
@@ -164,6 +166,7 @@ class GenerationDatumSpec(TypedDict):
     input_lengths: torch.Tensor
     stop_strings: NotRequired[list[str]]
     flex_router_ids: NotRequired[torch.Tensor]
+    flex_router_probs: NotRequired[torch.Tensor]
     __extra__: Any
 
 

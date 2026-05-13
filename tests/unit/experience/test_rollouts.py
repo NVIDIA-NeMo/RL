@@ -105,6 +105,7 @@ def test_generate_responses_attaches_flex_router_metadata():
                     }
                 ],
             ],
+            "flex_router_probs": torch.tensor([0.42, 0.83]),
         }
     )
 
@@ -119,6 +120,15 @@ def test_generate_responses_attaches_flex_router_metadata():
     assert updated_batch["flex_router_ids"].tolist() == [1, 0]
     assert updated_batch["message_log"][0][-1]["flex_router_id"] == 1
     assert updated_batch["message_log"][1][-1]["flex_router_id"] == 0
+    assert updated_batch["message_log"][0][-1]["flex_router_prob"] == pytest.approx(
+        0.42, abs=1e-6
+    )
+    assert updated_batch["message_log"][1][-1]["flex_router_prob"] == pytest.approx(
+        0.83, abs=1e-6
+    )
+    assert generation_input_data["flex_router_probs"].tolist() == pytest.approx(
+        [0.42, 0.83], abs=1e-6
+    )
 
 
 class TestCalculateSingleMetric:

@@ -40,6 +40,11 @@ class DatumSpec(TypedDict):
     idx: int
     task_name: NotRequired[str]
     stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
+    # Uniform random sample in [0, 1) used to select a Flextron route via
+    # inverse-CDF over the configured `flextron_sampling_rates`. Sampled in
+    # `rl_collate_fn` when absent so every trajectory carries one. Unused when
+    # Flextron routing is disabled.
+    flex_router_prob: NotRequired[float]
     __extra__: NotRequired[Any]  # This allows additional fields of any type
 
 

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import random
 from typing import Any, Union
 
 import torch
@@ -45,6 +46,18 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     # Extract stop_strings if present
     stop_strings = [datum.get("stop_strings", None) for datum in data_batch]
 
+    # Sample a uniform Flextron router probability per sample if absent so every
+    # trajectory carries a deterministic seed for route selection. The float is
+    # resolved to an integer route id inside FrozenFlextronRouter via inverse-CDF
+    # over `flextron_sampling_rates`; collation stays agnostic of those rates.
+    flex_router_probs_list: list[float] = []
+    for datum_spec in data_batch:
+        if "flex_router_prob" in datum_spec:
+            flex_router_probs_list.append(float(datum_spec["flex_router_prob"]))
+        else:
+            flex_router_probs_list.append(random.random())
+    flex_router_probs = torch.tensor(flex_router_probs_list, dtype=torch.float32)
+
     # check if any of the data batch has vllm content and images
     extra_args = {}
     if any(
@@ -70,6 +83,7 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         idx=idx,
         batch_max_length=batch_max_length,
         stop_strings=stop_strings,
+        flex_router_probs=flex_router_probs,
         **extra_args,
     )
     return output

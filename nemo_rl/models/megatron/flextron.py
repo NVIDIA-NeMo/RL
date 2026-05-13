@@ -49,6 +49,8 @@ class FrozenFlextronRouter:
         self.flextron_sampling_rates = list(
             getattr(model_cfg, "flextron_sampling_rates", [])
         )
+        # normalize
+        self.flextron_sampling_rates = self._normalize_sampling_rates(self.flextron_sampling_rates)
 
         self.active_router_id: int | None = None
         self._handles: list[RemovableHandle] = []
@@ -64,79 +66,59 @@ class FrozenFlextronRouter:
         if self.enabled:
             self._attach_hooks()
 
+    def _normalize_sampling_rates(self, sampling_rates: list[float]) -> list[float]:
+        """Normalize sampling rates to sum to 1."""
+        if not sampling_rates:
+            return []
+        total = sum(sampling_rates)
+        return [rate / total for rate in sampling_rates]
+
     @property
     def enabled(self) -> bool:
         return bool(self.flex_routers)
 
-    def sample_router_ids(
-        self, *, batch_size: int, device: torch.device | str | None = None
+    def resolve_router_ids(
+        self,
+        probs: torch.Tensor,
+        *,
+        device: torch.device | str | None = None,
     ) -> torch.Tensor:
-        """Sample one route id from configured `[base, *routers]` probabilities.
+        """Map per-sample probabilities in [0, 1) to deterministic route ids.
 
-        Sampling is performed only on global rank 0 and the result is broadcast
-        across the default process group, so every DP/TP/PP/CP/EP rank routes
-        the current batch through the same Flextron submodel. Independent
-        sampling would mismatch per-rank route choices and hang the
-        model-parallel NCCL collectives that follow.
+        Performs inverse-CDF lookup over `flextron_sampling_rates` so collation
+        can attach a route-agnostic uniform sample to every datum while this
+        router owns the partitioning. Because the probabilities flow through the
+        batch identically on every rank, no cross-rank broadcast is required.
         """
         if not self.enabled:
-            return torch.zeros(batch_size, dtype=torch.long, device=device)
+            return torch.zeros(probs.numel(), dtype=torch.long, device=device)
 
-        src_rank = 0
-        distributed_initialized = self._distributed_is_initialized()
-        # NCCL broadcast requires the buffer to live on the current CUDA device;
-        # the caller's `device` (e.g. the input_ids tensor) may still be CPU, so
-        # sample/broadcast on CUDA and move to `device` only at the end.
-        backend = (
-            str(torch.distributed.get_backend()).lower()
-            if distributed_initialized
-            else ""
-        )
-        if backend == "nccl":
-            broadcast_device: torch.device | str = torch.device(
-                "cuda", torch.cuda.current_device()
-            )
-        else:
-            broadcast_device = device if device is not None else "cpu"
-
-        is_src = (
-            not distributed_initialized or torch.distributed.get_rank() == src_rank
-        )
-        if is_src:
-            rates = torch.tensor(
+        cdf = torch.cumsum(
+            torch.tensor(
                 self.flextron_sampling_rates,
                 dtype=torch.float32,
-                device=broadcast_device,
-            )
-            probs = rates / rates.sum()
-            router_id = torch.multinomial(
-                probs, num_samples=1, replacement=True
-            ).to(dtype=torch.long)
-        else:
-            router_id = torch.empty(1, dtype=torch.long, device=broadcast_device)
-
-        if distributed_initialized:
-            torch.distributed.broadcast(router_id, src=src_rank)
-
-        router_ids = router_id.expand(batch_size).clone()
+                device=probs.device,
+            ),
+            dim=0,
+        )
+        router_ids = torch.searchsorted(
+            cdf, probs.to(dtype=torch.float32), right=True
+        )
+        router_ids = router_ids.clamp(max=len(self.flex_routers)).to(dtype=torch.long)
         if device is not None and router_ids.device != torch.device(device):
             router_ids = router_ids.to(device=device)
         return router_ids
 
-    @staticmethod
-    def _distributed_is_initialized() -> bool:
-        """Return whether torch.distributed can be used for router broadcast."""
-        return bool(
-            torch.distributed.is_available() and torch.distributed.is_initialized()
-        )
-
     def get_router_ids(
-        self, data: BatchedDataDict[Any], *, device: torch.device | str | None = None
+        self, data: BatchedDataDict[Any], *, device: torch.device | str | None = None, offset_router_id: int = 0
     ) -> torch.Tensor:
-        """Return explicit route ids from data or sample new route ids."""
+        """Return per-sample route ids from `flex_router_probs`, `flex_router_ids`, or default to base route (id 0) if neither is present."""
+        if "flex_router_probs" in data:
+            return self.resolve_router_ids(data["flex_router_probs"], device=device)
         if "flex_router_ids" in data:
             return data["flex_router_ids"].to(device=device, dtype=torch.long)
-        return self.sample_router_ids(batch_size=data.size, device=device)
+        # default to route (id offset_router_id) if neither is present (during evals?)
+        return torch.zeros(data.size, dtype=torch.long, device=device) + offset_router_id
 
     def grouped_indices(self, router_ids: torch.Tensor) -> dict[int, list[int]]:
         """Group batch indices by route id."""
