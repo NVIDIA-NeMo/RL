@@ -80,6 +80,8 @@ def shard_meta_for_dp(
         unpacked path interleaves via ``shard_by_batch_size``).
     """
     n = len(meta.keys)
+    if n == 0:
+        raise ValueError("shard_meta_for_dp: empty meta — nothing to shard")
     if meta.sequence_lengths is None or len(meta.sequence_lengths) != n:
         raise ValueError(
             "shard_meta_for_dp requires meta.sequence_lengths populated and "
