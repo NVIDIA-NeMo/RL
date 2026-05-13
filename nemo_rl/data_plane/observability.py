@@ -28,6 +28,7 @@ bytes currently held in TQ, i.e. put minus cleared) and
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict, dataclass
 from time import monotonic
 from typing import Any, Callable, Literal
 
@@ -58,6 +59,20 @@ def log_event(event: dict[str, Any]) -> None:
     logger.info("data_plane_event: %s", event)
 
 
+@dataclass
+class DataPlaneStats:
+    total_bytes: int = 0
+    total_keys: int = 0
+    total_ops: int = 0
+    bytes_outstanding: int = 0
+    peak_bytes_outstanding: int = 0
+    # Anomaly trackers — a wire-format regression that bloats bytes per
+    # row (cf. message_log view-aliasing pickle bug) shows up as a
+    # sudden spike in ``max_bytes_per_key_seen``.
+    max_bytes_per_key_seen: int = 0
+    last_put_bytes_per_key: int = 0
+
+
 class MetricsDataPlaneClient(DataPlaneClient):
     """Wrap a ``DataPlaneClient`` with a per-op callback hook."""
 
@@ -68,18 +83,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
     ) -> None:
         self._inner = inner
         self._on_event = on_event or (lambda _: None)
-        self._stats: dict[str, int | float] = {
-            "total_bytes": 0,
-            "total_keys": 0,
-            "total_ops": 0,
-            "bytes_outstanding": 0,
-            "peak_bytes_outstanding": 0,
-            # Anomaly trackers — a wire-format regression that bloats
-            # bytes per row (cf. message_log view-aliasing pickle bug)
-            # shows up as a sudden spike in ``max_bytes_per_key_seen``.
-            "max_bytes_per_key_seen": 0,
-            "last_put_bytes_per_key": 0,
-        }
+        self._stats = DataPlaneStats()
         # Nested per-partition / per-key live byte counts. Populated on
         # successful ``kv_batch_put``; popped on successful ``kv_clear``.
         # Bounded by the live key population, not cumulative traffic.
@@ -87,7 +91,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
 
     def snapshot(self) -> dict[str, Any]:
         """Cumulative totals plus live ``bytes_outstanding`` / ``peak_bytes_outstanding``."""
-        out = dict(self._stats)
+        out = asdict(self._stats)
         out["n_keys_outstanding"] = sum(
             len(d) for d in self._bytes_by_partition.values()
         )
@@ -110,9 +114,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
         for i, key in enumerate(keys):
             share = per_key + (1 if i < remainder else 0)
             partition_dict[key] = partition_dict.get(key, 0) + share
-        self._stats["bytes_outstanding"] += n_bytes
-        if self._stats["bytes_outstanding"] > self._stats["peak_bytes_outstanding"]:
-            self._stats["peak_bytes_outstanding"] = self._stats["bytes_outstanding"]
+        self._stats.bytes_outstanding += n_bytes
+        if self._stats.bytes_outstanding > self._stats.peak_bytes_outstanding:
+            self._stats.peak_bytes_outstanding = self._stats.bytes_outstanding
 
     def _record_clear(self, partition_id: str, keys: list[str] | None) -> None:
         """Reverse the put accounting for ``keys`` (``None`` clears the partition).
@@ -132,7 +136,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 freed += partition_dict.pop(key, 0)
             if not partition_dict:
                 del self._bytes_by_partition[partition_id]
-        self._stats["bytes_outstanding"] -= freed
+        self._stats.bytes_outstanding -= freed
 
     def _run(
         self,
@@ -179,14 +183,14 @@ class MetricsDataPlaneClient(DataPlaneClient):
         }
         self._on_event(event)
         if status == "ok":
-            self._stats["total_bytes"] += n_bytes
-            self._stats["total_keys"] += n_keys
-            self._stats["total_ops"] += 1
+            self._stats.total_bytes += n_bytes
+            self._stats.total_keys += n_keys
+            self._stats.total_ops += 1
             if op == "put" and n_keys:
                 per_key = n_bytes // n_keys
-                self._stats["last_put_bytes_per_key"] = per_key
-                if per_key > self._stats["max_bytes_per_key_seen"]:
-                    self._stats["max_bytes_per_key_seen"] = per_key
+                self._stats.last_put_bytes_per_key = per_key
+                if per_key > self._stats.max_bytes_per_key_seen:
+                    self._stats.max_bytes_per_key_seen = per_key
 
     def register_partition(
         self,
