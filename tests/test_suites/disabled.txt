@@ -6,11 +6,5 @@ tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.sh
 # Disable this due to know vLLM bug with Qwen3.5: https://github.com/vllm-project/vllm/issues/37856
 tests/test_suites/llm/grpo-qwen3.5-397ba17b-32n8g-megatron.v2.sh
 
-# Keep the old GLM 5.1 32-node recipe out of nightly while validating the 64-node topology.
-tests/test_suites/llm/grpo-glm5.1-32n8g-megatron.sh
-tests/test_suites/llm/grpo-glm5.1-32n8g-megatron-noncolocated.sh
-tests/test_suites/llm/grpo-glm5.1-32n8g-new-megatron.sh
-tests/test_suites/llm/grpo-glm5.1-8n8g-megatron.sh
-
 # 64-node GLM validation is manual-only because it exceeds the nightly GPU-hour budget.
 tests/test_suites/llm/grpo-glm5.1-64n8g-megatron.sh
