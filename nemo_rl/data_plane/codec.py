@@ -40,11 +40,13 @@ no per-backend non-tensor support required.
 from __future__ import annotations
 
 import pickle
-from typing import TYPE_CHECKING, Any, Iterable, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
 import numpy as np
 import torch
 from tensordict import TensorDict
+
+from nemo_rl.data_plane.schema import Layout
 
 if TYPE_CHECKING:
     # Type-only import. At runtime, BatchedDataDict is loaded lazily
@@ -318,7 +320,7 @@ def response_from_nested(
 
 def materialize(
     td: TensorDict,
-    layout: Literal["padded", "jagged"] = "padded",
+    layout: Layout = "padded",
     pad_value_dict: dict[str, int | float] | None = None,
     pad_to_multiple: int = 1,
     object_fields: Iterable[str] | None = None,

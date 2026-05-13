@@ -26,7 +26,7 @@ equivalents on ``AbstractPolicyWorker`` (``self._fetch(meta)`` /
     ``kv_batch_put`` the result.
 """
 
-from typing import Any, Literal, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -41,6 +41,7 @@ from nemo_rl.data_plane.codec import (
     select_object_fields,
 )
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
+from nemo_rl.data_plane.schema import Layout
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -49,7 +50,7 @@ def read_columns(
     meta: KVBatchMeta,
     select_fields: Sequence[str],
     *,
-    layout: Literal["jagged", "padded"] = "padded",
+    layout: Layout = "padded",
     pad_value_dict: dict[str, Any] | None = None,
 ) -> BatchedDataDict[Any]:
     """``kv_batch_get(meta.keys, select_fields=...) → materialize``.

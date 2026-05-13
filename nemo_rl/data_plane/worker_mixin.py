@@ -32,13 +32,13 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 import torch
 
 FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
-Layout = Literal["padded", "jagged"]
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data_plane.schema import (
     META_ELEM_COUNTS_PER_GB,
     META_MICRO_BATCH_INDICES,
     META_MICRO_BATCH_LENGTHS,
+    Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
