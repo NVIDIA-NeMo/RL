@@ -244,6 +244,11 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
         # including this driver). _init_tq only needs local_ip below
         # for the metadata/master server URLs (driver-bound).
         local_ip = _get_local_node_ip()
+        if not local_ip:
+            raise RuntimeError(
+                "Mooncake backend requires a local node IP; "
+                "_get_local_node_ip() returned empty."
+            )
         # Mooncake virtual segment / local buffer sizing. Defaults sized
         # for production-scale rollouts (multi-iter DAPO, large
         # message_log object payloads); under-sized values cause
