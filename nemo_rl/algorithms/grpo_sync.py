@@ -738,8 +738,8 @@ def grpo_train_sync(
                 # late log_data jsonl block can use them. The clear below
                 # removes meta.keys from TQ, so any post-clear
                 # read_columns on this meta would fail. ``content`` is a
-                # decoded object array (list[str]); read_columns handles
-                # decoding via meta.extra_info[META_OBJECT_FIELDS].
+                # decoded object array (list[str]); read_columns decodes
+                # the NonTensorStack wire field via materialize.
                 _log_input_ids: Optional[torch.Tensor] = None
                 _log_content: Optional[np.ndarray] = None
                 if not _should_log_nemo_gym_responses(master_config):

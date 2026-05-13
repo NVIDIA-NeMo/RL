@@ -15,14 +15,13 @@
 that supports the NeMo-RL columnar batch contract.
 
 Wire shape adapters must support:
-  * ``fields``: tensor-only ``TensorDict`` (no Python objects on the bus).
-    :func:`nemo_rl.data_plane.codec.pack_object_array` encodes
-    ``np.ndarray(dtype=object)`` fields into uint8 jagged tensors
-    *before* they reach the adapter, so adapters never see arbitrary
-    Python objects.
+  * ``fields``: ``TensorDict`` with tensor leaves AND optional
+    ``NonTensorStack`` / ``NonTensorData`` leaves (TQ-native non-tensor
+    passthrough). TQ's storage backends handle encoding per backend
+    (simple keeps Python objects; mooncake_client pickles internally).
   * ``tags``: ``list[dict[str, Any]]`` per-sample primitives (kept
     separate from ``fields`` so non-tensor metadata like
-    ``input_lengths`` doesn't pollute the tensor bus).
+    ``input_lengths`` doesn't pollute the leaf-level schema).
   * ``keys``: per-sample string uids.
   * ``partition_id``: string-named address spaces with declared
     ``consumer_tasks`` and ``fields`` schemas.

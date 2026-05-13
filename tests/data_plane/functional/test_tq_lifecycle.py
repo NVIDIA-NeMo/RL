@@ -32,7 +32,7 @@ from tensordict import TensorDict
 transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
 from nemo_rl.data_plane import build_data_plane_client
-from nemo_rl.data_plane.codec import META_OBJECT_FIELDS, pack_object_array
+from tensordict import NonTensorStack
 from nemo_rl.data_plane.column_io import read_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 
@@ -248,11 +248,10 @@ def test_object_round_trip_backends(tq_client_backends) -> None:
     """np.ndarray(dtype=object) put → get → decode equality, both backends.
 
     Mirrors the wire used by ``SyncRolloutActor.kv_first_write`` for
-    ``message_log`` / ``content``: object fields are packed via
-    :func:`pack_object_array` into a jagged uint8 nested tensor on the
-    wire, recorded in ``meta.extra_info[META_OBJECT_FIELDS]``, then
-    decoded by :func:`read_columns` via materialize's
-    ``object_fields=`` kwarg.
+    ``message_log`` / ``content``: object fields ride as
+    ``NonTensorStack`` leaves (TQ-native non-tensor passthrough);
+    :func:`read_columns` → :func:`materialize` decodes them back to
+    ``np.ndarray(dtype=object)``.
     """
     client = tq_client_backends
     n = 8
@@ -269,7 +268,7 @@ def test_object_round_trip_backends(tq_client_backends) -> None:
         keys=keys,
         partition_id="obj-backend",
         fields=TensorDict(
-            {field_name: pack_object_array(_object_payload(n))},
+            {field_name: NonTensorStack(*_object_payload(n).tolist())},
             batch_size=[n],
         ),
     )
@@ -278,7 +277,6 @@ def test_object_round_trip_backends(tq_client_backends) -> None:
         task_name="read",
         keys=keys,
         fields=[field_name],
-        extra_info={META_OBJECT_FIELDS: [field_name]},
     )
 
     bdd = read_columns(client, meta, select_fields=[field_name])
@@ -297,12 +295,11 @@ def test_object_round_trip_backends(tq_client_backends) -> None:
 
 def test_object_and_tensor_mixed_round_trip_backends(tq_client_backends) -> None:
     """Mixed tensor + object fields in one put — exercises the actor's
-    real schema (tensors + object data side-by-side) and the
-    ``select_object_fields`` filter on read.
+    real schema (tensors + object data side-by-side).
 
     Regression guard: object writes coexisting with tensor writes must
-    not corrupt either side. Co-fetch by `read_columns` decodes the
-    tensor via padding and the object field via unpickle in one call.
+    not corrupt either side. Co-fetch decodes the tensor via padding
+    and the ``NonTensorStack`` leaf via :func:`materialize` in one call.
     """
     client = tq_client_backends
     n = 6
@@ -316,13 +313,13 @@ def test_object_and_tensor_mixed_round_trip_backends(tq_client_backends) -> None
     )
     ids = torch.arange(n * 4, dtype=torch.long).reshape(n, 4)
     lens = torch.full((n,), 4, dtype=torch.long)
-    msg_packed = pack_object_array(_object_payload(n))
+    msg = NonTensorStack(*_object_payload(n).tolist())
 
     client.kv_batch_put(
         keys=keys,
         partition_id="mix-backend",
         fields=TensorDict(
-            {"ids": ids, "lens": lens, "msg": msg_packed},
+            {"ids": ids, "lens": lens, "msg": msg},
             batch_size=[n],
         ),
     )
@@ -333,11 +330,10 @@ def test_object_and_tensor_mixed_round_trip_backends(tq_client_backends) -> None
         keys=keys,
         fields=["ids", "lens", "msg"],
         sequence_lengths=[4] * n,
-        extra_info={META_OBJECT_FIELDS: ["msg"]},
     )
 
     # Read all three together — tensor fields decode via padding,
-    # object field decodes via unpickle.
+    # object field decodes via NonTensorStack passthrough.
     bdd = read_columns(client, meta, select_fields=["ids", "lens", "msg"])
     assert torch.equal(bdd["ids"], ids)
     assert torch.equal(bdd["lens"], lens)
@@ -345,12 +341,12 @@ def test_object_and_tensor_mixed_round_trip_backends(tq_client_backends) -> None
     for i in range(n):
         assert bdd["msg"][i] == expected[i]
 
-    # Read just the tensor — object_fields filter should not engage.
+    # Read just the tensor.
     only_ids = read_columns(client, meta, select_fields=["ids"])
     assert torch.equal(only_ids["ids"], ids)
     assert "msg" not in only_ids
 
-    # Read just the object — tensor decode path should not engage.
+    # Read just the object.
     only_msg = read_columns(client, meta, select_fields=["msg"])
     assert isinstance(only_msg["msg"], np.ndarray)
     assert "ids" not in only_msg

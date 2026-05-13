@@ -11,14 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for object-array codec (non-tensor passthrough on the wire)."""
+"""Unit tests for non-tensor passthrough on the wire.
+
+Object fields ride the wire as ``NonTensorStack`` leaves (TQ-native);
+``materialize`` decodes them back to ``np.ndarray(dtype=object)`` for
+the trainer.
+"""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 import torch
-from tensordict import TensorDict
+from tensordict import NonTensorStack, TensorDict
 
 from nemo_rl.data_plane.codec import (
     materialize,
@@ -72,8 +77,8 @@ def test_unpack_rejects_rectangular_tensor() -> None:
         unpack_object_array(torch.zeros(3, dtype=torch.uint8))
 
 
-def test_materialize_decodes_object_field() -> None:
-    """object_fields names are decoded back to np.ndarray(object).
+def test_materialize_decodes_nontensor_stack() -> None:
+    """``NonTensorStack`` leaves are decoded back to ``np.ndarray(object)``.
 
     Tensor fields in the same TensorDict are still padded as before —
     object support is per-field, not all-or-nothing.
@@ -83,12 +88,10 @@ def test_materialize_decodes_object_field() -> None:
     )
     lens = torch.tensor([3, 2, 4], dtype=torch.long)
     ids_nested = to_nested_by_length(ids_padded, lens)
-    msg_packed = pack_object_array(
-        np.array([{"id": 0}, {"id": 1}, {"id": 2}], dtype=object)
-    )
+    msg = NonTensorStack({"id": 0}, {"id": 1}, {"id": 2})
 
     td = TensorDict(
-        {"input_ids": ids_nested, "message_log": msg_packed},
+        {"input_ids": ids_nested, "message_log": msg},
         batch_size=[3],
     )
 
@@ -96,7 +99,6 @@ def test_materialize_decodes_object_field() -> None:
         td,
         layout="padded",
         pad_value_dict={"input_ids": 999},
-        object_fields=["message_log"],
     )
 
     # Tensor field padded with 999 as usual.
@@ -105,17 +107,3 @@ def test_materialize_decodes_object_field() -> None:
     assert isinstance(bdd["message_log"], np.ndarray)
     assert bdd["message_log"].dtype == object
     assert [d["id"] for d in bdd["message_log"]] == [0, 1, 2]
-
-
-def test_materialize_padding_corrupts_object_field_when_object_fields_omitted() -> None:
-    """Sanity: forgetting to pass object_fields silently mangles the
-    pickle bytes by padding with zeros. This is why read_columns reads
-    ``meta.extra_info['object_fields']`` and forwards it to materialize.
-    """
-    msg_packed = pack_object_array(np.array([{"x": "long"}, {"x": "s"}], dtype=object))
-    td = TensorDict({"message_log": msg_packed}, batch_size=[2])
-    bdd = materialize(td, layout="padded")  # no object_fields → padded
-    assert isinstance(bdd["message_log"], torch.Tensor)
-    # Padded with 0; row 1 had a shorter pickle blob so trailing bytes
-    # are zeros that don't match valid pickle data.
-    assert bdd["message_log"].dtype == torch.uint8
