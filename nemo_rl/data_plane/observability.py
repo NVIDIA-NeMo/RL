@@ -99,7 +99,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._bytes_by_partition: dict[str, dict[str, int]] = {}
 
     def snapshot(self) -> dict[str, Any]:
-        """Cumulative totals plus live ``bytes_outstanding`` / ``peak_bytes_outstanding``."""
+        """Return cumulative totals plus live byte / key outstanding counts."""
         out = asdict(self._stats)
         out["n_keys_outstanding"] = sum(
             len(d) for d in self._bytes_by_partition.values()
@@ -113,8 +113,13 @@ class MetricsDataPlaneClient(DataPlaneClient):
     def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:
         """Attribute put bytes per key so a later ``kv_clear`` can subtract.
 
-        Called *after* the underlying RPC succeeds so a failed put never
+        Called after the underlying RPC succeeds so a failed put never
         leaves the accounting inflated.
+
+        Args:
+            partition_id: Partition the keys were written to.
+            keys: Per-sample uids that were written.
+            n_bytes: Total bytes written; distributed evenly across keys.
         """
         if not keys or n_bytes <= 0:
             return
@@ -128,10 +133,14 @@ class MetricsDataPlaneClient(DataPlaneClient):
             self._stats.peak_bytes_outstanding = self._stats.bytes_outstanding
 
     def _record_clear(self, partition_id: str, keys: list[str] | None) -> None:
-        """Reverse the put accounting for ``keys`` (``None`` clears the partition).
+        """Reverse the put accounting for ``keys``.
 
-        Called *after* the underlying RPC succeeds so a failed clear
-        keeps the accounting consistent with TQ's actual state.
+        Called after the underlying RPC succeeds so a failed clear keeps
+        the accounting consistent with TQ's actual state.
+
+        Args:
+            partition_id: Partition the keys were dropped from.
+            keys: Uids dropped; ``None`` means the whole partition was cleared.
         """
         partition_dict = self._bytes_by_partition.get(partition_id)
         if partition_dict is None:
@@ -156,6 +165,20 @@ class MetricsDataPlaneClient(DataPlaneClient):
         n_keys: int = 0,
         n_bytes: int = 0,
     ) -> Any:
+        """Run ``fn`` and emit one observability event with wall-time and status.
+
+        Args:
+            op: Operation tag (``"put"``, ``"get"``, ``"clear"``, etc.).
+            partition_id: Partition the op targets.
+            fn: Zero-arg callable that invokes the inner client.
+            n_keys: Key count if known up front; otherwise inferred from
+                the return value (``KVBatchMeta.keys``).
+            n_bytes: Byte estimate; overridden by ``_td_bytes`` when the
+                return is a ``TensorDict``.
+
+        Returns:
+            Whatever ``fn`` returned.
+        """
         t0 = monotonic()
         try:
             out = fn()
