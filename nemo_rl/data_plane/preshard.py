@@ -49,39 +49,29 @@ def shard_meta_for_dp(
 ) -> tuple[list[KVBatchMeta], Optional[list[int]]]:
     """Pure key-list split: assign ``meta.keys`` to ``dp_world`` ranks.
 
-    Seq-len-aware on top of ``shard_by_batch_size``. **No I/O, no key
-    minting.** Returned per-rank metas reference subsets of the input
-    ``meta.keys`` under the same ``partition_id``; workers fetch their
-    slice via the existing ``*_presharded`` flow.
-
-    Use this for every dispatch *after* rollout (logprob, ref-logprob, train).
-    The rollout actor's first write is a flat ``kv_batch_put`` via
-    :func:`nemo_rl.experience.sync_rollout_actor.kv_first_write` — no fan-out.
+    Seq-len-aware on top of ``shard_by_batch_size``. No I/O, no key
+    minting. Used for every dispatch after rollout (logprob, ref-logprob,
+    train); the rollout actor's first write goes through
+    :func:`nemo_rl.experience.sync_rollout_actor.kv_first_write` directly.
 
     Per-rank packing metadata (``micro_batch_indices`` /
-    ``micro_batch_lengths`` / ``elem_counts_per_gb``) lands in each shard's
-    ``extra_info`` so the ``*_presharded`` worker can reattach packing exactly
-    as it does today via the legacy fan-out path.
+    ``micro_batch_lengths`` / ``elem_counts_per_gb``) is set in each
+    shard's ``extra_info`` so the ``*_presharded`` worker can reattach
+    packing as it does on the legacy fan-out path.
 
     Args:
-        meta: input KVBatchMeta covering the full step batch. Must have
-            ``sequence_lengths`` populated (per-key seq lens).
-        dp_world: number of data-parallel ranks.
-        batch_size: total samples — passed to ``shard_by_batch_size``.
-            Use ``None`` for the logprob path (matches ``_shard_for_logprob``);
-            use the GBS for the train path (matches ``_shard_for_train``).
-        sequence_packing_args / dynamic_batching_args: packing config —
-            same dicts passed to ``BatchedDataDict.shard_by_batch_size``.
-            Mutually exclusive. Both ``None`` → unpacked interleave-split.
+        meta: Full-batch ``KVBatchMeta`` with ``sequence_lengths`` populated.
+        dp_world: Number of DP ranks.
+        batch_size: Total samples; ``None`` for the logprob path, GBS for train.
+        sequence_packing_args: Packing config dict for ``shard_by_batch_size``.
+        dynamic_batching_args: Dynamic-batching config dict; mutually exclusive with the above.
 
     Returns:
-        ``(per_rank_metas, unsorted_indices)``. ``per_rank_metas`` is the
-        list of ``dp_world`` ``KVBatchMeta`` slices. ``unsorted_indices``
-        is the inverse permutation that maps aggregated DP-rank-order
-        outputs back to original ``meta.keys`` order — pass it to
-        ``BatchedDataDict.reorder_data`` after worker results are
-        aggregated. ``None`` when no reorder occurred (rare; even the
-        unpacked path interleaves via ``shard_by_batch_size``).
+        ``(per_rank_metas, unsorted_indices)``. ``unsorted_indices`` is
+        the inverse permutation that maps DP-rank-order outputs back to
+        original ``meta.keys`` order (feed to
+        ``BatchedDataDict.reorder_data`` post-aggregation); ``None`` if
+        no reorder occurred.
     """
     n = len(meta.keys)
     if n == 0:
