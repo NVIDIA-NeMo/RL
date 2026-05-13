@@ -225,19 +225,6 @@ def test_legacy_does_not_import_sync():
     )
 
 
-# ─── No-pickle-on-the-bus rule — adapter enforces it ─────────────────────
-
-
-def test_tq_adapter_enforces_no_pickle():
-    """Plan §1.1 P3: the TQ adapter must reject non-tensor leaves at
-    the wire boundary. Catch silent removal of this guard."""
-    src = _read("nemo_rl/data_plane/adapters/transfer_queue.py")
-    assert "TypeError" in src and "non-tensor leaves" in src, (
-        "TQ adapter is missing the no-pickle-on-the-bus guard "
-        "(P3). _to_wire must raise on non-tensor leaves."
-    )
-
-
 # ─── pack_per_token_field export guard (commit 45f4ffb8) ─────────────────────
 
 

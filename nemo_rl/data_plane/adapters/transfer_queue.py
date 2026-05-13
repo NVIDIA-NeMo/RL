@@ -288,45 +288,38 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _to_wire(td: TensorDict, *, promote_1d: bool = False) -> TensorDict:
-    """Detach + contiguous-ify; optionally unsqueeze 1D leaves for the mooncake_cpu KV path.
+def _promote_1d_leaves(td: TensorDict) -> TensorDict:
+    """Unsqueeze 1D tensor leaves to ``(N, 1)`` — mooncake_cpu KV-path workaround.
 
-    ``NonTensorStack`` / ``NonTensorData`` leaves pass through — TQ
-    supports non-tensor data natively (simple backend keeps them as
-    Python objects; mooncake_client pickles internally).
+    Works around TQ's ``KVStorageManager`` 1D schema/data mismatch;
+    :func:`_from_wire` squeezes the trailing 1 back on read. Symmetric
+    with `_from_wire` — callers gate on ``self._promote_1d``.
+    ``NonTensorStack`` / ``NonTensorData`` leaves pass through.
 
     Args:
-        td: Wire ``TensorDict`` to prepare for put.
-        promote_1d: When ``True``, unsqueeze 1D tensor leaves to ``(N, 1)`` —
-            works around TQ's ``KVStorageManager`` 1D schema/data mismatch
-            on the mooncake_cpu backend; ``_from_wire`` squeezes them back
-            on read.
+        td: ``TensorDict`` whose 1D tensor leaves should be promoted.
 
     Returns:
-        ``TensorDict`` ready for ``kv_batch_put``.
+        ``TensorDict`` with 1D tensor leaves unsqueezed to ``(N, 1)``;
+        all other leaves pass through unchanged.
     """
-    # pyrefly: ignore  # missing-argument
-    out = td.detach().contiguous()
-    if promote_1d:
-        # Mooncake-cpu workaround — see `TQDataPlaneClient._promote_1d`.
-        new_dict: dict[str, torch.Tensor] = {}
-        changed = False
-        for k in out.keys(include_nested=True, leaves_only=True):
-            v = out.get(k)
-            if isinstance(v, torch.Tensor) and not v.is_nested and v.dim() == 1:
-                new_dict[str(k)] = v.unsqueeze(-1).contiguous()
-                changed = True
-            else:
-                # pyrefly: ignore  # bad-argument-type
-                new_dict[str(k)] = v
-        if changed:
-            out = TensorDict(new_dict, batch_size=out.batch_size)
-    # pyrefly: ignore  # bad-return
-    return out
+    new_dict: dict[str, torch.Tensor] = {}
+    changed = False
+    for k in td.keys(include_nested=True, leaves_only=True):
+        v = td.get(k)
+        if isinstance(v, torch.Tensor) and not v.is_nested and v.dim() == 1:
+            new_dict[str(k)] = v.unsqueeze(-1).contiguous()
+            changed = True
+        else:
+            # pyrefly: ignore  # bad-argument-type
+            new_dict[str(k)] = v
+    if not changed:
+        return td
+    return TensorDict(new_dict, batch_size=td.batch_size)
 
 
 def _from_wire(td: TensorDict) -> TensorDict:
-    """Inverse of `_to_wire`'s 1D promotion: squeeze trailing 1 back to (N,)."""
+    """Inverse of `_promote_1d_leaves`: squeeze trailing 1 back to (N,)."""
     new_dict: dict[str, torch.Tensor] = {}
     changed = False
     for k in td.keys(include_nested=True, leaves_only=True):
@@ -556,7 +549,9 @@ class TQDataPlaneClient(DataPlaneClient):
         wire_fields: TensorDict | None = None
         field_names: list[str] | None = None
         if fields is not None:
-            wire_fields = _to_wire(fields, promote_1d=self._promote_1d)
+            wire_fields = fields.detach().contiguous()
+            if self._promote_1d:
+                wire_fields = _promote_1d_leaves(wire_fields)
             field_names = list(wire_fields.keys())
 
         self._tq.kv_batch_put(

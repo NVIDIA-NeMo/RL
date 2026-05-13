@@ -27,8 +27,8 @@ import torch
 # ── P1: promote_1d — writer unsqueezes, reader squeezes ──────────────────────
 
 
-def test_promote_1d_unsqueezes_on_write() -> None:
-    """`_to_wire(..., promote_1d=True)` turns (N,) into (N, 1).
+def test_promote_1d_leaves_unsqueezes_1d() -> None:
+    """`_promote_1d_leaves` turns 1D ``(N,)`` leaves into ``(N, 1)``.
 
     Guards the mooncake_cpu path where TQ's extract_field_schema silently
     unsqueezes 1D fields in metadata; the wire layer pre-unsqueezes so the
@@ -36,48 +36,37 @@ def test_promote_1d_unsqueezes_on_write() -> None:
     """
     from tensordict import TensorDict
 
-    from nemo_rl.data_plane.adapters.transfer_queue import _to_wire
+    from nemo_rl.data_plane.adapters.transfer_queue import _promote_1d_leaves
 
     n = 8
     t = torch.arange(n, dtype=torch.float32)
     td = TensorDict({"reward": t}, batch_size=[n])
 
-    out = _to_wire(td, promote_1d=True)
+    out = _promote_1d_leaves(td)
     assert out["reward"].shape == (n, 1), (
         f"Expected wire shape ({n}, 1) but got {tuple(out['reward'].shape)}."
     )
 
 
 def test_promote_1d_roundtrip_via_from_wire() -> None:
-    """`_to_wire` then `_from_wire` restores the original (N,) shape and values."""
+    """`_promote_1d_leaves` then `_from_wire` restores the original ``(N,)`` shape and values."""
     from tensordict import TensorDict
 
-    from nemo_rl.data_plane.adapters.transfer_queue import _from_wire, _to_wire
+    from nemo_rl.data_plane.adapters.transfer_queue import (
+        _from_wire,
+        _promote_1d_leaves,
+    )
 
     n = 6
     original = torch.arange(n, dtype=torch.float32)
     td = TensorDict({"reward": original}, batch_size=[n])
 
-    wire = _to_wire(td, promote_1d=True)
+    wire = _promote_1d_leaves(td)
     assert wire["reward"].shape == (n, 1)
 
     back = _from_wire(wire)
     assert back["reward"].shape == (n,)
     assert torch.equal(back["reward"], original)
-
-
-def test_promote_1d_off_leaves_shape_unchanged() -> None:
-    """With `promote_1d=False` (the default), `_to_wire` is a pass-through for 1D."""
-    from tensordict import TensorDict
-
-    from nemo_rl.data_plane.adapters.transfer_queue import _to_wire
-
-    n = 5
-    t = torch.arange(n, dtype=torch.long)
-    td = TensorDict({"idx": t}, batch_size=[n])
-
-    out = _to_wire(td, promote_1d=False)
-    assert out["idx"].shape == (n,)
 
 
 # ── P2: pack_per_token_field — tolerates SP padding ──────────────────────────
