@@ -109,13 +109,6 @@ def shard_meta_for_dp(
         unpacked path interleaves via ``shard_by_batch_size``).
     """
     n = len(meta.keys)
-    # Defensive invariant — user-facing check lives in `TQPolicy.__init__`
-    # so a malformed topology fails at policy construction, not deep
-    # inside a per-step helper.
-    assert dp_world > 0, (
-        f"dp_world must be positive, got {dp_world} "
-        f"(should be caught at TQPolicy config time)"
-    )
     if meta.sequence_lengths is None or len(meta.sequence_lengths) != n:
         raise ValueError(
             "shard_meta_for_dp requires meta.sequence_lengths populated and "
