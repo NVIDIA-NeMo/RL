@@ -151,9 +151,10 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self,
         op: str,
         partition_id: str,
-        n_keys: int,
-        n_bytes: int,
         fn: Callable[[], Any],
+        *,
+        n_keys: int = 0,
+        n_bytes: int = 0,
     ) -> Any:
         t0 = monotonic()
         try:
@@ -213,8 +214,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._run(
             "register",
             partition_id,
-            int(num_samples),
-            0,
             lambda: self._inner.register_partition(
                 partition_id,
                 fields,
@@ -223,6 +222,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 grpo_group_size=grpo_group_size,
                 enums=enums,
             ),
+            n_keys=int(num_samples),
         )
 
     def claim_meta(
@@ -238,8 +238,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
         return self._run(
             "claim_meta",
             partition_id,
-            0,
-            0,
             lambda: self._inner.claim_meta(
                 partition_id,
                 task_name,
@@ -255,9 +253,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
         return self._run(
             "get_data",
             meta.partition_id,
-            len(meta.keys),
-            0,
             lambda: self._inner.get_data(meta, select_fields=select_fields),
+            n_keys=len(meta.keys),
         )
 
     def check_consumption_status(self, partition_id, task_names):
@@ -271,14 +268,14 @@ class MetricsDataPlaneClient(DataPlaneClient):
         out = self._run(
             "put",
             partition_id,
-            len(keys_list),
-            n_bytes,
             lambda: self._inner.kv_batch_put(
                 keys_list,
                 partition_id,
                 fields=fields,
                 tags=tags,
             ),
+            n_keys=len(keys_list),
+            n_bytes=n_bytes,
         )
         self._record_put(partition_id, keys_list, n_bytes)
         return out
@@ -287,13 +284,12 @@ class MetricsDataPlaneClient(DataPlaneClient):
         return self._run(
             "get",
             partition_id,
-            len(keys),
-            0,
             lambda: self._inner.kv_batch_get(
                 keys,
                 partition_id,
                 select_fields=select_fields,
             ),
+            n_keys=len(keys),
         )
 
     def kv_clear(self, keys, partition_id):
@@ -304,9 +300,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._run(
             "clear",
             partition_id,
-            n_keys,
-            0,
             lambda: self._inner.kv_clear(keys_list, partition_id),
+            n_keys=n_keys,
         )
         self._record_clear(partition_id, keys_list)
 
