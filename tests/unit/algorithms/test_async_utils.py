@@ -31,8 +31,8 @@ os.environ["TMPDIR"] = _temp_dir  # System temp dir
 from nemo_rl.algorithms.async_utils import (
     AsyncTrajectoryCollector,
     ReplayBuffer,
-    ReplayBufferNew,
 )
+from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferNew
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict

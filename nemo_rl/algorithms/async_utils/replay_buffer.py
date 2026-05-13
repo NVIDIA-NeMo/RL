@@ -228,10 +228,14 @@ class ReplayBuffer(ReplayBufferImpl):
     pass
 
 
-# TEMPORARY — will be replaced by TQReplayBuffer once TQ is ready.
+# WIP: DO NOT USE - This class is WIP and may be changed without notice, please DO NOT USE it.
+# Will be replaced by TQReplayBuffer once TQ is ready.
 @ray.remote  # pragma: no cover
 class ReplayBufferNew(ReplayBufferImpl):
     """Staleness-window replay buffer.
+
+    -- WIP: DO NOT USE --
+    This class is WIP and may be changed without notice, please DO NOT USE it.
 
     Differences from ReplayBuffer:
     - _evict(): Stale rows (trainer_version - weight_version > max_staleness) are evicted
@@ -245,6 +249,7 @@ class ReplayBufferNew(ReplayBufferImpl):
     - self.target_weight_versions won't be used in ReplayBufferNew and will be removed
       when cleaning up. target_weight_versions gates generation on specific trainer steps,
       which causes generation pauses; ReplayBufferNew intentionally avoids this.
+    - add this class to nemo_rl/algorithms/async_utils/__init__.py
     """
 
     def __init__(
