@@ -26,8 +26,8 @@ policy:
 
   megatron_cfg:
     enabled: true
+    pretrained_checkpoint_path: /data/flextron-nano-models/30b-patched
       # force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
-      # pretrained_checkpoint_path: /data/flextron-nano-models/30b
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false
     converter_type: "NemotronHForCausalLM"
