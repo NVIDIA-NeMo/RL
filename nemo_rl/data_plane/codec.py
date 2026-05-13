@@ -68,13 +68,18 @@ def to_nested_by_length(
 ) -> torch.Tensor:
     """Strip right-padding off a rectangular tensor using per-row lengths.
 
-    ``padded`` has shape ``(N, S, ...)``; ``lengths`` has shape ``(N,)``.
-    Returns a ``torch.jagged`` nested tensor whose i-th row is
-    ``padded[i, :lengths[i], ...]``.
-
     Used by the producer side: convert
     :func:`batched_message_log_to_flat_message` output (already padded)
     into the wire format before ``kv_batch_put``.
+
+    Args:
+        padded: Rectangular tensor of shape ``(N, S, ...)``.
+        lengths: Per-row valid lengths, shape ``(N,)``. CUDA tensors are
+            moved to CPU once to avoid per-row syncs.
+
+    Returns:
+        A ``torch.jagged`` nested tensor whose i-th row is
+        ``padded[i, :lengths[i], ...]``.
     """
     if padded.dim() < 2:
         raise ValueError(
@@ -107,11 +112,13 @@ def set_kv_promote_1d(enabled: bool) -> None:
     """Adapter hook: enable/disable 1D→(N,1) promotion for bulk fields.
 
     When True, writer unsqueezes 1D bulk fields to (N, 1) and reader
-    squeezes the trailing 1 in :func:`materialize`.
+    squeezes the trailing 1 in :func:`materialize`. Required by backends
+    that go through TQ's KVStorageManager path (mooncake_cpu) — see
+    ``_KV_PROMOTE_1D`` above for the schema/data mismatch.
 
-    Required by backends that go through TQ's KVStorageManager path
-    (mooncake_cpu) — see ``_KV_PROMOTE_1D`` above for the schema/data
-    mismatch.
+    Args:
+        enabled: When True, the writer/reader pair apply the
+            (N,) ↔ (N, 1) shape transform.
     """
     global _KV_PROMOTE_1D
     _KV_PROMOTE_1D = bool(enabled)
@@ -123,13 +130,21 @@ def maybe_pack_jagged(
 ) -> torch.Tensor:
     """Convert ``val`` to jagged iff it looks like a per-token field.
 
-    Heuristic: ``val`` qualifies when ``val.shape == (N, max(lengths), ...)``
-    where ``N == lengths.shape[0]``. Other shapes pass through as
-    rectangular tensors. Used by every write site (initial put,
-    driver delta-write, worker write-back) so all per-token fields
-    land in TQ as jagged with the same row lengths — read-time
-    materialization then pads them all to the same target shape,
-    avoiding shape-mismatch crashes between mixed wire formats.
+    Used by every write site (initial put, driver delta-write, worker
+    write-back) so all per-token fields land in TQ as jagged with the
+    same row lengths — read-time materialization then pads them all to
+    the same target shape, avoiding shape-mismatch crashes between
+    mixed wire formats.
+
+    Args:
+        val: Tensor to consider. Qualifies for jagged conversion only
+            when ``val.shape == (N, max(lengths), ...)`` where
+            ``N == lengths.shape[0]``.
+        lengths: Per-row valid lengths, shape ``(N,)``.
+
+    Returns:
+        A ``torch.jagged`` nested tensor when the shape heuristic matches;
+        otherwise ``val`` passed through as a rectangular tensor.
     """
     n = lengths.shape[0]
     if n == 0:
@@ -152,13 +167,16 @@ def pack_object_array(arr: "np.ndarray | list[Any]") -> torch.Tensor:
     tensors (simple, mooncake_cpu) carry object payloads transparently;
     no per-backend non-tensor codepath is required.
 
-    ``arr`` may be a Python list or a numpy object array; the result is
-    a 2D jagged ``(N, *)`` uint8 tensor. Recover via
-    :func:`unpack_object_array`.
+    Pickle is used unconditionally — the wire stays inside one Ray
+    cluster where producer / consumer share the venv, so format
+    compatibility is implicit.
 
-    Pickle is used unconditionally — the wire stays inside one Ray cluster
-    where producer / consumer share the venv, so format compatibility is
-    implicit.
+    Args:
+        arr: Python list or numpy object array of items to pickle.
+
+    Returns:
+        2D jagged ``(N, *)`` uint8 nested tensor. Recover via
+        :func:`unpack_object_array`.
     """
     if isinstance(arr, np.ndarray):
         if arr.dtype != object:
@@ -183,8 +201,13 @@ def pack_object_array(arr: "np.ndarray | list[Any]") -> torch.Tensor:
 def unpack_object_array(t: torch.Tensor) -> "np.ndarray":
     """Inverse of :func:`pack_object_array`.
 
-    Accepts a jagged uint8 nested tensor; returns
-    ``np.ndarray(dtype=object)``. Each row is unpickled in isolation.
+    Each row is unpickled in isolation.
+
+    Args:
+        t: Jagged uint8 nested tensor produced by :func:`pack_object_array`.
+
+    Returns:
+        ``np.ndarray(dtype=object)`` of the decoded items.
     """
     if not t.is_nested:
         raise ValueError(
@@ -206,7 +229,17 @@ def select_object_fields(
 
     Single chokepoint for the read-side filter so :func:`materialize`
     decodes the right keys regardless of caller (column_io,
-    worker_mixin). ``requested=None`` returns the full registered set.
+    worker_mixin).
+
+    Args:
+        meta: ``KVBatchMeta`` whose ``extra_info`` carries the registered
+            object-field names.
+        requested: Subset of names to keep; ``None`` returns the full
+            registered set.
+
+    Returns:
+        Ordered list of object-field names that appear in both the
+        registered set and ``requested``.
     """
     extras = meta.extra_info or {}
     fields = extras.get(META_OBJECT_FIELDS, ())
@@ -224,13 +257,20 @@ def pack_per_token_field(val: torch.Tensor, lengths: torch.Tensor) -> torch.Tens
     invoked at write-back sites where the caller already knows the
     field is per-token (e.g. ``prev_logprobs``,
     ``reference_policy_logprobs``). mcore SP rounds the forward
-    output's seq dim up to a multiple of TP, so the value can be
-    1+ tokens wider than ``max(lengths)``; :func:`to_nested_by_length`
+    output's seq dim up to a multiple of TP, so the value can be 1+
+    tokens wider than ``max(lengths)``; :func:`to_nested_by_length`
     slices each row to its own length and drops the trailing SP
     padding cleanly.
 
-    Falls back to rectangular when ``val`` cannot be jaggedized
-    (wrong batch dim, < 2D, or seq dim shorter than ``max(lengths)``).
+    Args:
+        val: Per-token tensor. Falls back to rectangular when it cannot
+            be jaggedized (wrong batch dim, < 2D, or seq dim shorter
+            than ``max(lengths)``).
+        lengths: Per-row valid lengths, shape ``(N,)``.
+
+    Returns:
+        A ``torch.jagged`` nested tensor when the shape allows;
+        otherwise ``val`` passed through as a rectangular tensor.
     """
     n = lengths.shape[0]
     if n == 0:
@@ -248,15 +288,20 @@ def response_from_nested(
     """Extract the response slice from a (prompt+response) nested tensor.
 
     Used on the worker side for logprob / ref-logprob write-back where
-    only the response-token slice is interesting downstream.
+    only the response-token slice is interesting downstream. The
+    "left-shift by one token" convention is applied (so logprobs at
+    output position i correspond to the prediction of input token i+1).
 
-    ``full``: jagged nested tensor of shape ``(N, prompt_len + response_len)``.
-    ``response_mask``: jagged nested tensor of shape ``(N, response_len)``;
-    its ``offsets().diff()`` gives the per-row response length.
+    Args:
+        full: Jagged nested tensor of shape
+            ``(N, prompt_len + response_len)``.
+        response_mask: Jagged nested tensor of shape
+            ``(N, response_len)``; its ``offsets().diff()`` gives the
+            per-row response length.
 
-    Output: jagged nested tensor of shape ``(N, response_len)`` with the
-    "left-shift by one token" convention applied (so logprobs at output
-    position i correspond to the prediction of input token i+1).
+    Returns:
+        Jagged nested tensor of shape ``(N, response_len)`` containing
+        the left-shifted response slice.
     """
     values = full.values()
     offsets = full.offsets()
@@ -280,30 +325,40 @@ def materialize(
 ) -> "BatchedDataDict[Any]":
     """Convert a wire TensorDict to a BatchedDataDict.
 
-    ``layout='padded'`` (default): any nested-tensor leaves are padded
-    via :func:`torch.nested.to_padded_tensor` using ``pad_value_dict[k]``
-    (or 0 if not specified). Regular tensor leaves pass through.
-    Trainer/worker code expects rectangular tensors — this is the bridge.
+    Trainer/worker code expects rectangular tensors — this is the
+    bridge from the on-wire nested/uint8-packed format.
 
-    ``pad_to_multiple`` rounds the seq dim up to the next multiple after
-    ``to_padded_tensor``. Required when downstream backends impose
-    alignment (mcore SP needs ``seq_len % TP == 0``; PyTorch CP needs
-    ``seq_len % (CP * 2) == 0``). Default 1 = no extra alignment.
+    The lazy ``BatchedDataDict`` import keeps
+    ``import nemo_rl.data_plane`` cheap for unit tests that don't
+    actually call this function (``BatchedDataDict`` transitively
+    pulls multimodal deps like decord / torchvision).
 
-    ``layout='jagged'``: nested leaves pass through; rectangular leaves
-    pass through. Use only when the caller knows how to consume nested.
+    Args:
+        td: Wire TensorDict to materialize.
+        layout: ``"padded"`` (default) pads nested-tensor leaves via
+            :func:`torch.nested.to_padded_tensor` using
+            ``pad_value_dict[k]`` (or 0 if unspecified); rectangular
+            leaves pass through. ``"jagged"`` passes nested leaves
+            through — use only when the caller knows how to consume
+            them.
+        pad_value_dict: Per-field pad value used when ``layout='padded'``.
+        pad_to_multiple: Round the seq dim up to the next multiple after
+            ``to_padded_tensor``. Required when downstream backends
+            impose alignment (mcore SP needs ``seq_len % TP == 0``;
+            PyTorch CP needs ``seq_len % (CP * 2) == 0``). Default 1
+            disables extra alignment.
+        object_fields: Names of fields written via
+            :func:`pack_object_array`. Each is decoded via
+            :func:`unpack_object_array` and emitted as
+            ``np.ndarray(dtype=object)``; tensor padding/alignment do
+            not apply. Typically read from
+            ``meta.extra_info["object_fields"]`` by the driver / worker
+            fetch helpers.
 
-    ``object_fields``: names of fields written via
-    :func:`pack_object_array`. Each is decoded via
-    :func:`unpack_object_array` and emitted as ``np.ndarray(dtype=object)``
-    in the result; tensor padding/alignment do not apply. The set is
-    typically read from ``meta.extra_info["object_fields"]`` by the
-    driver / worker fetch helpers.
-
-    The lazy ``BatchedDataDict`` import keeps ``import
-    nemo_rl.data_plane`` cheap for unit tests that don't actually call
-    this function (``BatchedDataDict`` transitively pulls multimodal
-    deps like decord / torchvision).
+    Returns:
+        ``BatchedDataDict`` with rectangular tensors for padded layout,
+        nested tensors for jagged layout, and object arrays for fields
+        listed in ``object_fields``.
     """
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
