@@ -121,32 +121,18 @@ _TQ_RUNTIME_ENV_PATCHED = False
 
 
 def _patch_tq_actor_runtime_env() -> None:
-    """Inject Ray ``runtime_env`` into TQ's internal actor class ``.options()`` calls.
+    """Inject ``{"pip": ["TransferQueue==0.1.6"]}`` into TQ's actor ``.options()``.
 
-    Injects ``{"pip": ["TransferQueue==0.1.6"]}`` into ``.options()`` for
-    ``SimpleStorageUnit`` and ``TransferQueueController``.
-
-    **Why**: TQ spawns these actors via ``Cls.options(...).remote(...)`` with
-    no runtime_env. They inherit the *job-level* runtime_env that the driver
-    set when calling ``ray.init``. In a multi-node container deployment where
-    each node has its own ``/opt/nemo_rl_venv`` (per-container filesystem),
-    ``uv sync`` on the driver only updates ray-head's venv — ray-worker-N's
-    venv is stale and lacks ``transfer_queue``. The TQ storage actor on a
-    worker node then dies with ``ModuleNotFoundError: No module named
-    'transfer_queue'``.
-
-    This monkey-patch makes Ray pip-install ``TransferQueue==0.1.6`` into a
-    per-actor runtime_env on first spawn (cached per-node by Ray after that),
-    sidestepping the per-node venv divergence entirely. Idempotent — only
-    patches once per process.
-
-    Trade-offs:
-      * Requires PyPI access from each Ray worker node. The user's cluster
-        has it (we resolved TQ via PyPI when building the driver venv).
-      * Couples our adapter to TQ's *internal* class layout. If TQ renames or
-        restructures these classes in a future release, the patch becomes a
-        no-op (with a logged warning) and we fall back to the
-        per-node-uv-sync workaround.
+    TQ spawns ``SimpleStorageUnit`` and ``TransferQueueController`` via
+    ``Cls.options(...).remote(...)`` without a runtime_env, so they
+    inherit the job-level env. In a multi-node container deployment
+    where each node has its own ``/opt/nemo_rl_venv``, the driver's
+    ``uv sync`` only updates ray-head's venv and a worker-node actor
+    fails with ``ModuleNotFoundError``. This monkey-patch makes Ray
+    pip-install TQ into a per-actor runtime_env on first spawn (cached
+    per-node by Ray afterwards). Idempotent. Couples us to TQ's internal
+    class layout — if TQ restructures, this becomes a no-op with a
+    logged warning and we fall back to per-node ``uv sync``.
     """
     global _TQ_RUNTIME_ENV_PATCHED
     if _TQ_RUNTIME_ENV_PATCHED:
@@ -303,9 +289,22 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
 
 
 def _to_wire(td: TensorDict, *, promote_1d: bool = False) -> TensorDict:
-    # `NonTensorStack` / `NonTensorData` leaves pass through — TQ supports
-    # non-tensor data natively (simple backend keeps them as Python objects;
-    # mooncake_client pickles internally). No need to pre-encode on our side.
+    """Detach + contiguous-ify; optionally unsqueeze 1D leaves for the mooncake_cpu KV path.
+
+    ``NonTensorStack`` / ``NonTensorData`` leaves pass through — TQ
+    supports non-tensor data natively (simple backend keeps them as
+    Python objects; mooncake_client pickles internally).
+
+    Args:
+        td: Wire ``TensorDict`` to prepare for put.
+        promote_1d: When ``True``, unsqueeze 1D tensor leaves to ``(N, 1)`` —
+            works around TQ's ``KVStorageManager`` 1D schema/data mismatch
+            on the mooncake_cpu backend; ``_from_wire`` squeezes them back
+            on read.
+
+    Returns:
+        ``TensorDict`` ready for ``kv_batch_put``.
+    """
     # pyrefly: ignore  # missing-argument
     out = td.detach().contiguous()
     if promote_1d:
