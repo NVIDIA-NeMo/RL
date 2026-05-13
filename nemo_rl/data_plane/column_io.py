@@ -54,19 +54,22 @@ def read_columns(
 ) -> BatchedDataDict[Any]:
     """``kv_batch_get(meta.keys, select_fields=...) → materialize``.
 
-    ``pad_value_dict`` is forwarded to :func:`materialize` so jagged
-    fields are padded with the right value per field
-    (``input_ids → pad_token_id``, masks → 0, logprobs → 0.0). When
-    omitted, jagged fields pad with 0.
+    ``pad_to_multiple`` is read from ``meta.extra_info`` so the
+    materialized seq dim matches the alignment downstream backends
+    require (mcore SP / PyTorch CP). Non-tensor object fields ride as
+    ``NonTensorStack`` leaves; :func:`materialize` unwraps them to
+    ``np.ndarray(dtype=object)``.
 
-    ``pad_to_multiple`` is read from ``meta.extra_info`` (writer-side
-    alignment recorded at first put) so the materialized seq dim
-    matches the alignment required by downstream backends (mcore SP /
-    PyTorch CP).
+    Args:
+        dp_client: Data-plane client used for the underlying fetch.
+        meta: ``KVBatchMeta`` describing the keys to fetch.
+        select_fields: Fields to fetch.
+        layout: Materialization layout (``"padded"`` or ``"jagged"``).
+        pad_value_dict: Per-field pad value for jagged tensors (e.g.
+            ``input_ids → pad_token_id``); defaults to 0.
 
-    Non-tensor object fields ride the wire as ``NonTensorStack`` leaves
-    (TQ-native); :func:`materialize` unwraps them to
-    ``np.ndarray(dtype=object)`` for trainer consumption.
+    Returns:
+        ``BatchedDataDict`` with the requested fields, materialized.
     """
     td = dp_client.kv_batch_get(
         keys=meta.keys,
@@ -91,13 +94,16 @@ def write_columns(
 ) -> None:
     """``kv_batch_put(meta.keys, fields=...)``.
 
-    Per-token fields (whose seq dim matches ``max(meta.sequence_lengths)``)
-    are converted to jagged before the put via :func:`maybe_pack_jagged`,
-    so they land in TQ with the same row lengths as the initial put — keeps
-    mixed jagged/rectangular shape mismatches out of subsequent reads.
+    Per-token tensor fields are converted to jagged via
+    :func:`maybe_pack_jagged` so they land in TQ with the same row
+    lengths as the initial put. ``np.ndarray(dtype=object)`` leaves are
+    wrapped in ``NonTensorStack`` — TQ handles non-tensor encoding per
+    backend.
 
-    Non-tensor object fields (``np.ndarray(dtype=object)``) are wrapped
-    in ``NonTensorStack``; TQ handles the encoding per backend.
+    Args:
+        dp_client: Data-plane client used for the underlying put.
+        meta: ``KVBatchMeta`` describing the keys being written.
+        fields: Map of field name to tensor or object array.
     """
     if not fields:
         return
