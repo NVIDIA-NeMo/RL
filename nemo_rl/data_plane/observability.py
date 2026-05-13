@@ -310,4 +310,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._record_clear(partition_id, keys_list)
 
     def close(self) -> None:
-        self._inner.close()
+        self._run(
+            "close",
+            "",
+            lambda: self._inner.close(),
+        )
