@@ -216,6 +216,12 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
         # FileNotFoundError unless we put the package dir on PATH first.
         import mooncake  # type: ignore[import-not-found]
 
+        # TQ's mooncake_client masks any underlying ImportError as
+        # "Please install via pip install mooncake-transfer-engine".
+        # Force the real cause (e.g. ``libcudart.so.X: cannot open
+        # shared object file``) to surface by importing here.
+        import mooncake.store  # type: ignore[import-not-found]  # noqa: F401
+
         _moon_pkg = os.path.dirname(mooncake.__file__)
         _master = os.path.join(_moon_pkg, "mooncake_master")
         try:

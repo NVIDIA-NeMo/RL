@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
-from tensordict import TensorDict
+from tensordict import TensorDict, TensorDictBase
 
 from nemo_rl.data_plane.schema import Layout
 
@@ -85,6 +85,49 @@ def to_nested_by_length(
     lens = lengths.cpu().tolist() if lengths.is_cuda else lengths.tolist()
     rows = [padded[i, : lens[i]] for i in range(n)]
     return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+
+def stack_or_nest(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Stack equal-shape rows; reconstruct as jagged nested when ragged.
+
+    Args:
+        tensors: Per-row tensors; assumed to share leading dims modulo
+            an optional ragged seq dim. Empty list returns ``torch.empty(0)``.
+
+    Returns:
+        A regular tensor when all rows share shape; otherwise a
+        ``torch.jagged`` nested tensor.
+    """
+    if not tensors:
+        return torch.empty(0)
+    first_shape = tensors[0].shape
+    if all(t.shape == first_shape for t in tensors):
+        return torch.stack(tensors, dim=0)
+    return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+
+
+def unwrap_wire_stripped_payload(item: Any) -> Any:
+    """Recover the payload of a possibly wire-stripped ``NonTensorData``.
+
+    TQ's ``MsgpackEncoder._encode_tensordict`` serializes any
+    ``TensorDictBase`` via ``dict(obj.items())`` — only the tensor
+    backing dict. ``NonTensorData`` stores its payload in
+    ``_non_tensordict["data"]``, so it round-trips through ZMQ as an
+    empty ``TensorDict({}, batch_size=[])``. We map only that exact
+    signature to ``None``; any other ``TensorDictBase`` (with tensor
+    fields, non-scalar batch, or a salvageable ``_non_tensordict``
+    payload) passes through unchanged so we never drop real data.
+    """
+    nt = getattr(item, "_non_tensordict", None)
+    if isinstance(nt, dict) and "data" in nt:
+        return nt["data"]
+    if (
+        isinstance(item, TensorDictBase)
+        and item.batch_dims == 0
+        and len(item.keys()) == 0
+    ):
+        return None
+    return item
 
 
 def maybe_pack_jagged(
@@ -233,7 +276,18 @@ def materialize(
     out: dict[str, Any] = {}
     for key, val in td.items(include_nested=False):
         if isinstance(val, NonTensorStack):
-            out[key] = np.asarray(val.tolist(), dtype=object)
+            # ``np.asarray(list, dtype=object)`` would probe each item's
+            # ``__iter__`` to detect a nested array. A wire-stripped TD
+            # has ``batch_dims=0`` → its ``__iter__`` raises
+            # ``StopIteration`` → ``RuntimeError: generator raised
+            # StopIteration``. ``np.empty + assignment`` skips that
+            # probe; ``unwrap_wire_stripped_payload`` normalizes both
+            # live ``NonTensorData`` and stripped TDs.
+            items = val.tolist()
+            arr = np.empty(len(items), dtype=object)
+            for i, item in enumerate(items):
+                arr[i] = unwrap_wire_stripped_payload(item)
+            out[key] = arr
             continue
         if isinstance(val, NonTensorData):
             out[key] = np.asarray([val.data], dtype=object)
