@@ -1,10 +1,17 @@
 # Evaluation Configuration
 eval:
-  metric: "pass@k" # pass@k and cons@k are supported
+  # single_turn uses one env step; nemo_gym delegates multi-turn rollout to NeMo-Gym
+  rollout_mode: "single_turn"
+  # maximum turns for native eval rollouts; set null for rollout_mode=nemo_gym
+  max_rollout_turns: 1
+  # single_turn supports pass@k and cons@k; nemo_gym supports mean_reward and pass@k
+  metric: "pass@k"
   num_tests_per_prompt: 1 # every prompt will be tested num_tests_per_prompt times and use the average score as the final score
   seed: 42
   k_value: 1
   save_path: null # Path to save evaluation results and configuration of the evaluation. Set to null to disable saving. Example: "results/eval_output" or "/path/to/evaluation_results"
+  # when rollout_mode=nemo_gym, include the full NeMo-Gym result payload in saved JSON
+  save_full_gym_result: false
 
 generation:
   backend: "vllm" # only vllm is supported for evaluation

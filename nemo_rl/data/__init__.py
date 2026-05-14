@@ -177,6 +177,24 @@ class MMAUEvalDataConfig(TypedDict):
     env_name: NotRequired[str]
 
 
+class NemoGymEvalDataConfig(TypedDict):
+    """Config for NeMo-Gym JSONL datasets used by eval rollout_mode=nemo_gym.
+
+    Each JSONL row must be a NeMo-Gym example containing responses_create_params
+    and agent_ref. The dataset is processed with nemo_gym_data_processor and
+    scored by the NeMo-Gym environment instead of a single-turn eval env.
+    """
+
+    max_input_seq_length: None
+    dataset_name: Literal["NemoGymDataset"]
+    data_path: str
+    processor: Literal["nemo_gym_data_processor"]
+    env_name: Literal["nemo_gym"]
+    repeat: NotRequired[int]
+    prompt_file: NotRequired[str | None]
+    system_prompt_file: NotRequired[str | None]
+
+
 # Union type for all eval dataset configs
 EvalDataConfigType = Union[
     MMLUEvalDataConfig,
@@ -185,5 +203,6 @@ EvalDataConfigType = Union[
     GPQAEvalDataConfig,
     MathEvalDataConfig,
     MMAUEvalDataConfig,
+    NemoGymEvalDataConfig,
     LocalMathEvalDataConfig,
 ]
