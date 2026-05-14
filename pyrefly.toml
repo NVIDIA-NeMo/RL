@@ -96,7 +96,7 @@ project-includes = [
   "nemo_rl/data_plane/adapters/noop.py",
   "nemo_rl/data_plane/adapters/transfer_queue.py",
   "nemo_rl/data_plane/codec.py",
-  "nemo_rl/data_plane/driver_io.py",
+  "nemo_rl/data_plane/column_io.py",
   "nemo_rl/data_plane/factory.py",
   "nemo_rl/data_plane/interfaces.py",
   "nemo_rl/data_plane/observability.py",
