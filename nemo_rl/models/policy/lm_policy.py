@@ -601,89 +601,35 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return stacked
 
-    def get_global_topk_logits(
+    def get_full_logits_ipc(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
-        k: int,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
-    ) -> BatchedDataDict[Any]:
-        """Dispatch get_global_topk_logits to workers.
+    ) -> list[dict[str, Any]]:
+        """Ship the teacher's full-vocab logits to the student via CUDA IPC.
 
-        Returns a BatchedDataDict with:
-          - ``topk_logits``: ``[B, S, k]``
-          - ``topk_indices``: ``[B, k]`` per-sample global vocab subset.
-
-        Used by cross-tokenizer distillation; intentionally doesn't support
-        dynamic batching or sequence packing in v0.
-        """
-        if self.use_dynamic_batches or self.use_sequence_packing:
-            raise NotImplementedError(
-                "get_global_topk_logits does not support dynamic batching or "
-                "sequence packing in v0."
-            )
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        with timer.time("get_global_topk_logits/shard_data") if timer else nullcontext():
-            sharded_data = data.shard_by_batch_size(  # type: ignore
-                dp_size,
-                batch_size=None,
-            )
-        with (
-            timer.time("get_global_topk_logits/submit")
-            if timer
-            else nullcontext()
-        ):
-            futures = self.worker_group.run_all_workers_sharded_data(
-                "get_global_topk_logits",
-                data=sharded_data,
-                in_sharded_axes=["data_parallel"],
-                replicate_on_axes=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
-            )
-        worker_batches = self.worker_group.get_all_worker_results(futures)
-        all_vals = [wb["topk_logits"] for wb in worker_batches]
-        all_idx = [wb["topk_indices"] for wb in worker_batches]
-        stacked: BatchedDataDict[Any] = BatchedDataDict()
-        stacked["topk_logits"] = torch.cat(all_vals, dim=0)
-        stacked["topk_indices"] = torch.cat(all_idx, dim=0)
-        return stacked
-
-    def get_global_topk_logits_ipc(
-        self,
-        data: BatchedDataDict[GenerationDatumSpec],
-        k: int,
-        micro_batch_size: Optional[int] = None,
-        timer: Optional[Timer] = None,
-    ) -> tuple[list[dict[str, Any]], torch.Tensor]:
-        """Like get_global_topk_logits but ships the logits via CUDA IPC.
-
-        Logits are returned as a flat ``list[B]`` of per-sample IPC handle
-        dicts. Each entry's ``logits_ipc`` reconstructs a ``[T_t, k]``
-        CUDA tensor on the consumer device. Top-k *indices* are tiny (a
-        few MB at k=8192) so they're shipped via the standard CPU/Ray
-        path as a single ``[B, k]`` tensor.
+        Used by cross-tokenizer distillation. Returns a flat ``list[B]`` of
+        per-sample IPC handle dicts; each entry's ``logits_ipc``
+        reconstructs a ``[T_t, V_t]`` CUDA tensor on the consumer device.
+        The loss fn then either (a) derives a microbatch-global top-k
+        subset internally to match the PT non-gold path, or (b) uses the
+        full vocab end-to-end to match the PT gold path.
 
         Caller must invoke :meth:`release_ipc_buffer` after the student
         finishes consuming the handles — otherwise the producer-side
         CUDA tensors leak.
+
+        v0 limitation: no dynamic batching, no sequence packing.
         """
         if self.use_dynamic_batches or self.use_sequence_packing:
             raise NotImplementedError(
-                "get_global_topk_logits_ipc does not support dynamic batching "
+                "get_full_logits_ipc does not support dynamic batching "
                 "or sequence packing in v0."
             )
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         with (
-            timer.time("get_global_topk_logits_ipc/shard_data")
+            timer.time("get_full_logits_ipc/shard_data")
             if timer
             else nullcontext()
         ):
@@ -692,12 +638,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 batch_size=None,
             )
         with (
-            timer.time("get_global_topk_logits_ipc/submit")
+            timer.time("get_full_logits_ipc/submit")
             if timer
             else nullcontext()
         ):
             futures = self.worker_group.run_all_workers_sharded_data(
-                "get_global_topk_logits_ipc",
+                "get_full_logits_ipc",
                 data=sharded_data,
                 in_sharded_axes=["data_parallel"],
                 replicate_on_axes=[
@@ -710,21 +656,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+                common_kwargs={"micro_batch_size": micro_batch_size},
             )
         worker_results = self.worker_group.get_all_worker_results(futures)
         all_handles: list[dict[str, Any]] = []
-        all_idx: list[torch.Tensor] = []
         for wr in worker_results:
             all_handles.extend(wr["per_sample_handles"])
-            all_idx.append(wr["topk_indices"])
-        indices = torch.cat(all_idx, dim=0)
-        assert len(all_handles) == indices.shape[0], (
-            f"IPC handle list length ({len(all_handles)}) must match the "
-            f"top-k indices batch dim ({indices.shape[0]}). One of the two "
-            f"transports lost a sample — sharding pairing is broken."
-        )
-        return all_handles, indices
+        return all_handles
 
     def release_ipc_buffer(self) -> None:
         """Tell all workers to drop their stashed IPC tensors."""

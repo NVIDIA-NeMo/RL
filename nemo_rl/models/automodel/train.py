@@ -58,7 +58,7 @@ PostProcessingFunction = Union[
     "LossPostProcessor",
     "LogprobsPostProcessor",
     "TopkLogitsPostProcessor",
-    "GlobalTopkLogitsPostProcessor",
+    "FullLogitsPostProcessor",
     "ScorePostProcessor",
 ]
 
@@ -328,7 +328,7 @@ def forward_with_post_processing_fn(
             LossPostProcessor,
             LogprobsPostProcessor,
             TopkLogitsPostProcessor,
-            GlobalTopkLogitsPostProcessor,
+            FullLogitsPostProcessor,
         ),
     ):
         # Temperature scaling is element-wise, directly applying it here.
@@ -348,7 +348,7 @@ def forward_with_post_processing_fn(
         )
     elif isinstance(
         post_processing_fn,
-        (LogprobsPostProcessor, TopkLogitsPostProcessor, GlobalTopkLogitsPostProcessor),
+        (LogprobsPostProcessor, TopkLogitsPostProcessor),
     ):
         result = post_processing_fn(
             logits=logits,
@@ -363,6 +363,16 @@ def forward_with_post_processing_fn(
         else:
             vals, idx = result
             metrics = {"topk_logits": vals, "topk_indices": idx}
+    elif isinstance(post_processing_fn, FullLogitsPostProcessor):
+        result = post_processing_fn(
+            logits=logits,
+            data_dict=data_dict,
+            processed_inputs=processed_inputs,
+            original_batch_size=processed_mb.original_batch_size,
+            original_seq_len=processed_mb.original_seq_len,
+            sequence_dim=sequence_dim,
+        )
+        metrics = {"full_logits": result}
     elif isinstance(post_processing_fn, ScorePostProcessor):
         result = post_processing_fn(logits=logits)
         metrics = {"scores": result}
@@ -936,23 +946,23 @@ class TopkLogitsPostProcessor:
         return vals, idx
 
 
-class GlobalTopkLogitsPostProcessor:
-    """Post-processor for global top-k logits (single vocab subset per sample).
+class FullLogitsPostProcessor:
+    """Post-processor that returns the full teacher vocab logits unchanged.
 
-    Used by cross-tokenizer distillation: the teacher's vocab axis is reduced
-    to one ``vocab_topk`` subset *per sample* (max over positions, then top-k
-    over vocab) so the same vocab columns are kept across every position.
-    This makes chunk-averaged KL well-defined when student and teacher chunks
-    span multiple positions — every position carries the same vocab axis.
+    Used by cross-tokenizer distillation: the loss fn needs the entire
+    ``[B, S, V_t]`` teacher logits tensor — no vocab reduction is done at
+    the worker. The loss fn either (a) derives a microbatch-global top-k
+    subset internally (``gold_loss=False`` path, matching PT
+    ``global_top_indices`` math) or (b) operates on full vocab directly
+    (``gold_loss=True`` path, matching PT gold). Doing the reduction in
+    the loss fn (not here) keeps transport faithful to the PT reference.
 
     Output:
-        vals: ``[B, S, k]`` teacher logits at the selected ``k`` columns.
-        idx:  ``[B, k]`` teacher vocab ids selected per sample.
+        logits: ``[B, S, V_t]`` raw teacher logits cast to ``float32``.
 
-    v0 limitation: only the no-TP, no-CP, no-seq-packing path is implemented.
-    The post-processor asserts on the unsupported configurations because
-    distributed global top-k requires TP-aware reduction that isn't on the
-    smoke-test path.
+    v0 limitation: only the no-TP, no-CP, no-seq-packing path is
+    implemented. Asserts on the unsupported configurations — distributed
+    full-vocab gather requires TP-aware reduction not on the smoke path.
     """
 
     def __init__(
@@ -962,7 +972,6 @@ class GlobalTopkLogitsPostProcessor:
         cp_mesh: Any,
         tp_mesh: Any,
         cp_size: int,
-        k: int,
         enable_seq_packing: bool = False,
     ):
         self.cfg = cfg
@@ -970,7 +979,6 @@ class GlobalTopkLogitsPostProcessor:
         self.cp_mesh = cp_mesh
         self.tp_mesh = tp_mesh
         self.cp_size = cp_size
-        self.k = k
         self.enable_seq_packing = enable_seq_packing
 
     def __call__(
@@ -981,15 +989,15 @@ class GlobalTopkLogitsPostProcessor:
         original_batch_size: int,
         original_seq_len: int,
         sequence_dim: int = 1,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         if self.cp_size > 1:
             raise NotImplementedError(
-                "GlobalTopkLogitsPostProcessor: context_parallel_size > 1 is "
+                "FullLogitsPostProcessor: context_parallel_size > 1 is "
                 "not supported in v0."
             )
         if self.enable_seq_packing:
             raise NotImplementedError(
-                "GlobalTopkLogitsPostProcessor: sequence packing is not "
+                "FullLogitsPostProcessor: sequence packing is not "
                 "supported in v0."
             )
         if isinstance(logits, DTensor):
@@ -1001,21 +1009,12 @@ class GlobalTopkLogitsPostProcessor:
             )
             if tp_size > 1:
                 raise NotImplementedError(
-                    "GlobalTopkLogitsPostProcessor: tensor_parallel_size > 1 "
+                    "FullLogitsPostProcessor: tensor_parallel_size > 1 "
                     "is not supported in v0."
                 )
             logits = logits.to_local()
 
-        full_logits = logits.to(torch.float32)  # [B, S, V]
-        # Per-sample max over positions, then top-k over vocab.
-        per_vocab_max = full_logits.max(dim=1).values  # [B, V]
-        _, idx = torch.topk(per_vocab_max, k=self.k, dim=-1)  # [B, k]
-        # Gather the selected k columns at every position for each sample.
-        # full_logits: [B, S, V], idx: [B, k] -> vals: [B, S, k].
-        b, s, _ = full_logits.shape
-        idx_expanded = idx.unsqueeze(1).expand(-1, s, -1)  # [B, S, k]
-        vals = torch.gather(full_logits, dim=-1, index=idx_expanded)
-        return vals, idx
+        return logits.to(torch.float32)  # [B, S, V_t]
 
 
 class ScorePostProcessor:

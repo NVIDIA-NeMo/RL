@@ -63,17 +63,17 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 # fn can index them per-microbatch, but the worker's `check_sequence_dim`
 # pre-flight (which assumes [B, student_seq, ...] for every 2+D tensor) must
 # skip them. Sources:
-#   - teacher_topk_*: produced by GlobalTopkLogitsPostProcessor in
-#     dtensor_policy_worker_v2.get_global_topk_logits.
+#   - teacher_full_logits_ipc: list[B] of CUDA IPC handle dicts produced by
+#     FullLogitsPostProcessor in dtensor_policy_worker_v2.get_full_logits_ipc.
+#     Not a tensor at all — list of dicts — but listed here so the worker's
+#     dict-level dim check skips it.
 #   - teacher_input_ids/teacher_token_mask + alignment_*: produced by
 #     CrossTokenizerCollator (in DataLoader workers).
 # alignment_student_chunk_id and alignment_student_exact_partition_mask are
 # [B, T_s] and DO follow the student-seq invariant, so they are NOT listed.
 XTOKEN_NON_STUDENT_SEQ_KEYS: frozenset[str] = frozenset(
     {
-        "teacher_topk_logits",
-        "teacher_topk_logits_ipc",
-        "teacher_topk_indices",
+        "teacher_full_logits_ipc",
         "teacher_input_ids",
         "teacher_token_mask",
         "alignment_student_spans",
@@ -97,8 +97,6 @@ class XTokenDistillationConfig(TypedDict):
         num_prompts_per_step: Global batch size at the dataloader level.
         max_num_steps: Max training steps before early stop.
         max_num_epochs: Max passes over the training dataset.
-        topk_logits_k: ``k`` passed to ``teacher_policy.get_topk_logits``.
-            Should equal ``loss_fn.vocab_topk``.
         seed: RNG seed.
         val_period: Validation cadence in steps. ``0`` disables validation.
         val_at_start: Run validation before training begins.
@@ -108,7 +106,6 @@ class XTokenDistillationConfig(TypedDict):
     num_prompts_per_step: int
     max_num_steps: int
     max_num_epochs: int
-    topk_logits_k: int
     seed: int
     val_period: int
     val_at_start: bool
@@ -175,14 +172,6 @@ def setup(
     data_config = master_config["data"]
     logger_config = master_config["logger"]
     cluster_config = master_config["cluster"]
-
-    # Parity check that catches misconfigured topk values early.
-    assert loss_config["vocab_topk"] == distill_config["topk_logits_k"], (
-        f"loss_fn.vocab_topk ({loss_config['vocab_topk']}) must equal "
-        f"distillation.topk_logits_k ({distill_config['topk_logits_k']}) — "
-        f"the teacher returns top-k in teacher vocab and the loss fn must "
-        f"use the same k."
-    )
 
     # Backend gate: this code path is DTensor V2 only by design.
     assert policy_config["dtensor_cfg"]["enabled"] and policy_config["dtensor_cfg"].get(
@@ -321,8 +310,9 @@ def setup(
     #         Loss
     # ==========================
     # Inject the teacher's full vocab size so the projection matrix's V_t
-    # axis covers every teacher id GlobalTopkLogitsPostProcessor can pick.
-    # `len(tokenizer)` is what HF treats as the embedding/lm_head dim.
+    # axis covers every teacher id the loss fn's exact-token map / P-KL
+    # global top-k can pick. `len(tokenizer)` is what HF treats as the
+    # embedding/lm_head dim.
     loss_config = {**loss_config, "teacher_vocab_size": len(teacher_tokenizer)}
     loss_fn = CrossTokenizerDistillationLossFn(loss_config)
 
@@ -378,7 +368,6 @@ def xtoken_distillation_train(
     val_at_end = distill_cfg["val_at_end"]
     max_epochs = distill_cfg["max_num_epochs"]
     max_steps = distill_cfg["max_num_steps"]
-    topk_logits_k = distill_cfg["topk_logits_k"]
 
     if val_at_start and total_steps == 0 and val_dataloader is not None:
         val_metrics, val_timings = validate(
@@ -416,29 +405,27 @@ def xtoken_distillation_train(
                         token_mask=batch["teacher_token_mask"],
                         sample_mask=batch["sample_mask"],
                     )
-                    # IPC transport: per-sample [T_t, k] logit views are
-                    # exported as CUDA IPC handles and consumed by the
-                    # student in-process. Indices are tiny and go through
-                    # the standard CPU/Ray path.
-                    teacher_handles, teacher_indices = (
-                        teacher_policy.get_global_topk_logits_ipc(
-                            teacher_data, k=topk_logits_k, timer=timer
-                        )
+                    # IPC transport: per-sample [T_t, V_t] full-vocab logit
+                    # views are exported as CUDA IPC handles and consumed
+                    # by the student in-process. The loss fn either uses
+                    # full vocab (gold path) or derives a microbatch-global
+                    # top-k from this inline (P-KL path).
+                    teacher_handles = teacher_policy.get_full_logits_ipc(
+                        teacher_data, timer=timer
                     )
                     # Model offload frees the teacher's PARAMS to CPU; the
                     # IPC-stashed logit tensors live in worker Python state
                     # and survive this call.
                     teacher_policy.offload_after_refit()
 
-                # Pack student-side training data with teacher topk and the
-                # alignment payload the loss fn will index into.
+                # Pack student-side training data with teacher logits and
+                # the alignment payload the loss fn will index into.
                 train_data: BatchedDataDict[Any] = BatchedDataDict(
                     input_ids=batch["input_ids"],
                     input_lengths=batch["input_lengths"],
                     token_mask=batch["token_mask"],
                     sample_mask=batch["sample_mask"],
-                    teacher_topk_logits_ipc=teacher_handles,
-                    teacher_topk_indices=teacher_indices,
+                    teacher_full_logits_ipc=teacher_handles,
                     alignment_student_spans=batch["alignment_student_spans"],
                     alignment_teacher_spans=batch["alignment_teacher_spans"],
                     alignment_pair_valid=batch["alignment_pair_valid"],
@@ -454,7 +441,7 @@ def xtoken_distillation_train(
                     alignment_num_chunks=batch["alignment_num_chunks"],
                 )
                 # `.to("cpu")` is a no-op on the IPC handle list (lists are
-                # not tensors) and on the CPU indices tensor.
+                # not tensors).
                 train_data.to("cpu")
 
                 with timer.time("training_prep"):
@@ -502,7 +489,10 @@ def xtoken_distillation_train(
 
                 metrics: dict[str, Any] = {}
                 metrics.update(train_results["all_mb_metrics"])
-                # Reduce per-microbatch metrics to per-step scalars.
+                # Reduce per-microbatch metrics to per-step scalars. The
+                # P-KL path emits kl_loss/ce_loss/kl_loss_scale/proj_accuracy;
+                # the gold-loss path emits kl_common/l1_uncommon. Either set
+                # may be present — reduce both via the same rules.
                 for k, v in metrics.items():
                     if k in {
                         "lr",
@@ -512,6 +502,8 @@ def xtoken_distillation_train(
                         "accuracy",
                         "proj_accuracy",
                         "kl_loss_scale",
+                        "kl_common",
+                        "l1_uncommon",
                     }:
                         metrics[k] = float(np.mean(v))
                     else:
@@ -581,32 +573,47 @@ def xtoken_distillation_train(
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
             )  # type: ignore
-            # `metrics["loss"]/kl_loss/ce_loss` are SUM across all DP ranks
-            # AND microbatches (= dp_size * local_mbs values summed). PT
-            # logs rank-0 per-microbatch raw, so to compare apples-to-apples
-            # to PT, also print per-MB-mean. n_mb = len of the flat list of
-            # per-MB metrics across all ranks.
+            # `metrics["loss"]` and the SUM-reduced terms (kl_loss, ce_loss
+            # for the P-KL path) are SUM across all DP ranks AND microbatches
+            # (= dp_size * local_mbs values summed). PT logs rank-0
+            # per-microbatch raw, so for apples-to-apples we also print
+            # per-MB-mean. n_mb = len of the flat list of per-MB metrics.
             n_mb = max(len(train_results["all_mb_metrics"].get("loss", [])), 1)
             print(
                 f"  • Loss: {metrics['loss']:.4f} "
                 f"(per-MB-mean: {metrics['loss'] / n_mb:.4f})",
                 flush=True,
             )
-            kl_sum = float(metrics.get("kl_loss", 0.0))
-            ce_sum = float(metrics.get("ce_loss", 0.0))
-            print(
-                f"  • KL:   {kl_sum:.4f} "
-                f"(per-MB-mean: {kl_sum / n_mb:.4f})",
-                flush=True,
-            )
-            print(
-                f"  • CE:   {ce_sum:.4f} "
-                f"(per-MB-mean: {ce_sum / n_mb:.4f})",
-                flush=True,
-            )
-            # Next-token accuracy is already a mean-across-MB-ranks (we
-            # put it in the np.mean branch above), directly comparable to
-            # PT's `Acc:` log column.
+            # P-KL path metrics — only printed when they're present.
+            if "kl_loss" in metrics:
+                kl_sum = float(metrics["kl_loss"])
+                print(
+                    f"  • KL:   {kl_sum:.4f} "
+                    f"(per-MB-mean: {kl_sum / n_mb:.4f})",
+                    flush=True,
+                )
+            if "ce_loss" in metrics:
+                ce_sum = float(metrics["ce_loss"])
+                print(
+                    f"  • CE:   {ce_sum:.4f} "
+                    f"(per-MB-mean: {ce_sum / n_mb:.4f})",
+                    flush=True,
+                )
+            # Gold-loss path metrics — kl_common/l1_uncommon are already
+            # per-MB means (np.mean branch above), so no /n_mb division.
+            if "kl_common" in metrics:
+                print(
+                    f"  • KL(common):  {metrics['kl_common']:.4f}",
+                    flush=True,
+                )
+            if "l1_uncommon" in metrics:
+                print(
+                    f"  • L1(uncommon): {metrics['l1_uncommon']:.4f}",
+                    flush=True,
+                )
+            # Accuracy: P-KL emits next-token student accuracy + projection
+            # top-1; gold emits top-1 common-vocab accuracy. Both arrive
+            # under "accuracy" so the same line works.
             if "accuracy" in metrics:
                 print(
                     f"  • Acc:  {metrics['accuracy'] * 100:.2f}%",
@@ -661,12 +668,16 @@ def validate(
     backward / optimizer step runs. Returns mean train-style metrics.
     """
     distill_cfg = master_config["distillation"]
-    topk_logits_k = distill_cfg["topk_logits_k"]
     timer = timer if timer is not None else Timer()
 
     losses: list[float] = []
+    # The P-KL path emits kl_loss/ce_loss; the gold path emits
+    # kl_common/l1_uncommon. Track both, only the ones the active loss
+    # populates will end up in the returned metrics.
     kl_losses: list[float] = []
     ce_losses: list[float] = []
+    kl_common_losses: list[float] = []
+    l1_uncommon_losses: list[float] = []
 
     with timer.time("validation_total"):
         teacher_policy.prepare_for_lp_inference()
@@ -677,19 +688,14 @@ def validate(
                 token_mask=batch["teacher_token_mask"],
                 sample_mask=batch["sample_mask"],
             )
-            teacher_handles, teacher_indices = (
-                teacher_policy.get_global_topk_logits_ipc(
-                    teacher_data, k=topk_logits_k
-                )
-            )
+            teacher_handles = teacher_policy.get_full_logits_ipc(teacher_data)
 
             train_data: BatchedDataDict[Any] = BatchedDataDict(
                 input_ids=batch["input_ids"],
                 input_lengths=batch["input_lengths"],
                 token_mask=batch["token_mask"],
                 sample_mask=batch["sample_mask"],
-                teacher_topk_logits_ipc=teacher_handles,
-                teacher_topk_indices=teacher_indices,
+                teacher_full_logits_ipc=teacher_handles,
                 alignment_student_spans=batch["alignment_student_spans"],
                 alignment_teacher_spans=batch["alignment_teacher_spans"],
                 alignment_pair_valid=batch["alignment_pair_valid"],
@@ -721,6 +727,12 @@ def validate(
                 kl_losses.append(float(np.mean(mb_metrics["kl_loss"])))
             if "ce_loss" in mb_metrics:
                 ce_losses.append(float(np.mean(mb_metrics["ce_loss"])))
+            if "kl_common" in mb_metrics:
+                kl_common_losses.append(float(np.mean(mb_metrics["kl_common"])))
+            if "l1_uncommon" in mb_metrics:
+                l1_uncommon_losses.append(
+                    float(np.mean(mb_metrics["l1_uncommon"]))
+                )
         teacher_policy.offload_after_refit()
 
     metrics: dict[str, Any] = {
@@ -730,5 +742,9 @@ def validate(
         metrics["kl_loss"] = float(np.mean(kl_losses))
     if ce_losses:
         metrics["ce_loss"] = float(np.mean(ce_losses))
+    if kl_common_losses:
+        metrics["kl_common"] = float(np.mean(kl_common_losses))
+    if l1_uncommon_losses:
+        metrics["l1_uncommon"] = float(np.mean(l1_uncommon_losses))
 
     return metrics, timer.get_timing_metrics(reduction_op="sum")  # type: ignore

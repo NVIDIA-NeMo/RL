@@ -8,7 +8,6 @@ distillation:
   num_prompts_per_step: 64
   max_num_steps: 5000
   max_num_epochs: 1
-  topk_logits_k: 8192         # must equal loss_fn.vocab_topk
   seed: 42
   val_period: 0               # validation disabled by default
   val_at_start: false
@@ -16,20 +15,32 @@ distillation:
 
 loss_fn:
   projection_matrix_path: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/avenkateshha/nemo_rl/RL/cross_tokenizer_data/llama_qwen_best_special_exact_map_remapped.pt"
-  # Loss-mode selection (mutually exclusive):
-  #   gold_loss=false, xtoken_loss=false  -> P-KL (full-vocab projection KL)
-  #   gold_loss=true,  xtoken_loss=false  -> gold-loss (NotImplementedError in v0)
-  #   gold_loss=false, xtoken_loss=true   -> xtoken-loss (NotImplementedError in v0)
+  # Loss-mode selection:
+  #   gold_loss=false                    -> P-KL: full-vocab teacher logits
+  #     transported via IPC; the loss derives a microbatch-global top-k
+  #     (size `vocab_topk`) inside, projects student to teacher vocab via
+  #     M, and chunk-averages KL on the [k] subset. CE term is added.
+  #   gold_loss=true, xtoken_loss=false  -> gold-loss (PT-faithful):
+  #     KL on the exact-mapped common vocab (top-1 weight == 1.0) + L1
+  #     on the uncommon vocab tail (sorted, capped at `uncommon_topk`).
+  #   gold_loss=true, xtoken_loss=true   -> relaxed gold: same partition
+  #     math but exact-map threshold is >= 0.6 and collisions are resolved
+  #     by keeping the higher-weight student. Matches the PT canonical CT
+  #     run.
+  # `xtoken_loss=true` requires `gold_loss=true`.
   gold_loss: false
   xtoken_loss: false
   temperature: 1.0
-  vocab_topk: 8192
+  vocab_topk: 8192            # P-KL only; size of the microbatch-global
+                              # top-k derived inside the loss
+  uncommon_topk: 8192         # gold-loss only; caps the L1 uncommon tail
+                              # (matches PT default at tokenalign.py:3727)
   reverse_kl: false
   exact_token_match_only: false
   project_teacher_to_student: false
-  kl_loss_weight: 1.0
-  ce_loss_scale: 0.1
-  dynamic_loss_scaling: true
+  kl_loss_weight: 1.0         # P-KL only
+  ce_loss_scale: 0.1          # P-KL only
+  dynamic_loss_scaling: true  # P-KL only
 
 checkpointing:
   enabled: false
