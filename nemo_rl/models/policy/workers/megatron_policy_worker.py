@@ -114,8 +114,9 @@ class MegatronPolicyWorkerImpl(
             return f"{self.__class__.__qualname__}"
 
     def _is_writeback_leader(self) -> bool:
-        """``(tp_rank, cp_rank, pp_rank) == (0, 0, 0)``. See
-        :meth:`TQWorkerMixin._is_writeback_leader` for the rationale.
+        """``(tp_rank, cp_rank, pp_rank) == (0, 0, 0)``.
+
+        See :meth:`TQWorkerMixin._is_writeback_leader` for the rationale.
         """
         if not torch.distributed.is_initialized():
             return True

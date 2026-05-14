@@ -213,8 +213,9 @@ class DTensorPolicyWorkerV2Impl(
         return self.device_mesh[("cp", "tp")]._flatten().get_group()
 
     def _is_writeback_leader(self) -> bool:
-        """``(cp_local_rank, tp_local_rank) == (0, 0)``. See
-        :meth:`TQWorkerMixin._is_writeback_leader` for the rationale.
+        """``(cp_local_rank, tp_local_rank) == (0, 0)``.
+
+        See :meth:`TQWorkerMixin._is_writeback_leader` for the rationale.
         """
         if not hasattr(self, "device_mesh") or self.device_mesh is None:
             return True
