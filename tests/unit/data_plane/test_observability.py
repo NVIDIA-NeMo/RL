@@ -89,6 +89,30 @@ def test_register_and_clear_recorded(wrapped_client):
     assert ops.count("clear") == 1
 
 
+def test_recovery_ops_recorded(wrapped_client):
+    client, events = wrapped_client
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["r"]
+    )
+    client.put_samples(
+        sample_ids=["a"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.ones(1)}, batch_size=[1]),
+        tags=[{"group_id": "g", "committed": True}],
+    )
+
+    client.ping()
+    assert client.depth("p") == 1
+    groups = client.list_metadata("p")
+    client.pop(keys=groups[0].keys, partition_id="p")
+
+    ops = [e["op"] for e in events]
+    assert "ping" in ops
+    assert "depth" in ops
+    assert "list_metadata" in ops
+    assert "pop" in ops
+
+
 def test_error_status_recorded_and_reraised(wrapped_client):
     """Decorator does NOT swallow errors — re-raise after recording."""
     client, events = wrapped_client

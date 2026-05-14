@@ -58,6 +58,12 @@ def test_run_grpo_dispatches_both_trainers():
         "get_samples",
         "clear_samples",
         "check_consumption_status",
+        "ping",
+        "list_metadata",
+        "depth",
+        "pop",
+        "evict",
+        "get_capabilities",
         "close",
     ],
 )

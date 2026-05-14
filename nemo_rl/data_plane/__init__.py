@@ -21,15 +21,35 @@ detail of a specific adapter.
 from nemo_rl.data_plane.codec import materialize
 from nemo_rl.data_plane.factory import build_data_plane_client
 from nemo_rl.data_plane.interfaces import (
+    DataPlaneBadRequest,
+    DataPlaneCapabilities,
     DataPlaneClient,
     DataPlaneConfig,
+    DataPlaneError,
+    DataPlaneGroupMeta,
+    DataPlaneNotReady,
+    DataPlaneReadError,
+    DataPlaneTimeout,
+    DataPlaneUnavailable,
+    DataPlaneWriteError,
+    DataPlaneClearError,
     KVBatchMeta,
 )
 from nemo_rl.data_plane.observability import MetricsDataPlaneClient, log_event
 
 __all__ = [
+    "DataPlaneBadRequest",
+    "DataPlaneCapabilities",
+    "DataPlaneClearError",
     "DataPlaneClient",
     "DataPlaneConfig",
+    "DataPlaneError",
+    "DataPlaneGroupMeta",
+    "DataPlaneNotReady",
+    "DataPlaneReadError",
+    "DataPlaneTimeout",
+    "DataPlaneUnavailable",
+    "DataPlaneWriteError",
     "KVBatchMeta",
     "MetricsDataPlaneClient",
     "build_data_plane_client",

@@ -220,6 +220,75 @@ class KVBatchMeta:
         )
 
 
+@dataclass(frozen=True)
+class DataPlaneCapabilities:
+    """Recovery-relevant behavior promised by a data-plane backend."""
+
+    supports_persistent_recovery: bool = False
+    supports_server_side_filtering: bool = False
+    supports_atomic_batch_put: bool = False
+    supports_verified_clear: bool = False
+
+
+@dataclass(frozen=True)
+class DataPlaneGroupMeta:
+    """Non-consuming metadata record used by SingleController recovery.
+
+    A rollout group may span multiple transfer-queue keys. The fields here
+    are intentionally control-plane only: SC can reconstruct capacity and
+    select trainable groups without fetching tensor payloads.
+    """
+
+    partition_id: str
+    group_id: str
+    keys: list[str]
+    weight_version: int | None
+    created_at: float | None
+    committed: bool
+    expected_num_keys: int | None = None
+    size_bytes: int | None = None
+    tags: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_complete(self) -> bool:
+        """Whether the listed keys match the producer-declared group size."""
+        if self.expected_num_keys is None:
+            return True
+        return len(self.keys) == self.expected_num_keys
+
+
+class DataPlaneError(RuntimeError):
+    """Base class for data-plane failures surfaced to controllers."""
+
+
+class DataPlaneUnavailable(DataPlaneError):
+    """The data-plane controller or storage path is unavailable."""
+
+
+class DataPlaneTimeout(DataPlaneError, TimeoutError):
+    """A data-plane operation exceeded its caller-visible timeout."""
+
+
+class DataPlaneReadError(DataPlaneError):
+    """A data-plane read or metadata-list operation failed."""
+
+
+class DataPlaneWriteError(DataPlaneError):
+    """A data-plane write operation failed."""
+
+
+class DataPlaneClearError(DataPlaneError):
+    """A data-plane clear/pop/evict operation failed."""
+
+
+class DataPlaneNotReady(DataPlaneError):
+    """Requested data exists but is not ready for consumption."""
+
+
+class DataPlaneBadRequest(DataPlaneError):
+    """The caller supplied invalid keys, fields, partition, or arguments."""
+
+
 class DataPlaneClient(ABC):
     """Stable, swappable data-plane boundary.
 
@@ -415,7 +484,37 @@ class DataPlaneClient(ABC):
             partition_id: Partition the samples live in.
         """
 
-    # ── (C) lifecycle ──────────────────────────────────────────────────
+    # ── (C) recovery/control-plane ─────────────────────────────────────
+
+    @abstractmethod
+    def ping(self, timeout_s: float | None = None) -> None:
+        """Raise if the data-plane request path is not healthy."""
+
+    @abstractmethod
+    def list_metadata(self, partition_id: str) -> list[DataPlaneGroupMeta]:
+        """Return non-consuming rollout-group metadata for ``partition_id``."""
+
+    def depth(self, partition_id: str) -> int:
+        """Count committed, complete groups visible to recovery."""
+        return sum(
+            1
+            for group in self.list_metadata(partition_id)
+            if group.committed and group.is_complete
+        )
+
+    def pop(self, keys: list[str], partition_id: str) -> None:
+        """Remove successfully trained keys from the data plane."""
+        self.clear_samples(sample_ids=keys, partition_id=partition_id)
+
+    def evict(self, keys: list[str], partition_id: str) -> None:
+        """Remove stale or abandoned keys from the data plane."""
+        self.clear_samples(sample_ids=keys, partition_id=partition_id)
+
+    @abstractmethod
+    def get_capabilities(self) -> DataPlaneCapabilities:
+        """Describe backend guarantees relevant to recovery."""
+
+    # ── (D) lifecycle ──────────────────────────────────────────────────
 
     @abstractmethod
     def close(self) -> None:
