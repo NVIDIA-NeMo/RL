@@ -968,6 +968,32 @@ def test_rollout_writer_resume_requires_explicit_output_path():
         )
 
 
+def test_rollout_writer_generation_config_loads_real_teacher_weights():
+    writer = _load_rollout_writer_module()
+
+    class _Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+
+    generation_config = {
+        "backend": "vllm",
+        "stop_token_ids": None,
+        "stop_strings": None,
+        "vllm_cfg": {
+            "expose_http_server": True,
+        },
+    }
+
+    configured = writer._configure_teacher_rollout_generation(
+        generation_config,
+        _Tokenizer(),
+    )
+
+    assert configured["vllm_cfg"]["load_format"] == "auto"
+    assert configured["vllm_cfg"]["skip_tokenizer_init"] is False
+    assert configured["stop_token_ids"] == [2]
+
+
 def test_rollout_writer_resume_done_sentinel_exits_without_rewrite(tmp_path: Path):
     writer = _load_rollout_writer_module()
     output_path = tmp_path / "teacher-rollouts.jsonl"

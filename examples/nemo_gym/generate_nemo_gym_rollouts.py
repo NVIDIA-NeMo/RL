@@ -131,6 +131,17 @@ def _disable_validation(config: MasterConfig) -> None:
     config["distillation"]["max_val_samples"] = 0
 
 
+def _configure_teacher_rollout_generation(
+    generation_config: dict[str, Any],
+    tokenizer: Any,
+) -> dict[str, Any]:
+    return configure_generation_config(
+        generation_config,
+        tokenizer,
+        is_eval=True,
+    )
+
+
 def _resolve_generation_count(
     config: MasterConfig, requested_count: int | None
 ) -> int:
@@ -527,8 +538,9 @@ def main() -> None:
         raise ValueError(
             "A vLLM generation config is required for NeMo-Gym teacher rollout generation"
         )
-    config["policy"]["generation"] = configure_generation_config(
-        config["policy"]["generation"], tokenizer
+    config["policy"]["generation"] = _configure_teacher_rollout_generation(
+        config["policy"]["generation"],
+        tokenizer,
     )
 
     setup_nemo_gym_config(config, tokenizer)
