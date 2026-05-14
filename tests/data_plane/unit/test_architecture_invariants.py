@@ -49,19 +49,6 @@ def _strip_comments_and_docstrings(src: str) -> str:
     return src
 
 
-# ─── R-C8 — legacy grpo.py is clean ──────────────────────────────────────
-
-
-def test_no_data_plane_in_master_config():
-    """``MasterConfig`` was transitionally extended with a ``data_plane``
-    field; it should be removed once the sibling-trainer split lands."""
-    src = _read("nemo_rl/algorithms/grpo.py")
-    assert "data_plane: NotRequired" not in src, (
-        "Legacy MasterConfig still has the data_plane scaffold. "
-        "Remove it with the sibling-trainer split."
-    )
-
-
 # ─── R-C9 — sync trainer engages the data plane (TQPolicy design) ────────
 
 

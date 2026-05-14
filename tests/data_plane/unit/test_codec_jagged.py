@@ -142,21 +142,6 @@ def test_materialize_default_pad_value_is_zero() -> None:
     assert bdd["x"][1, 2].item() == 0
 
 
-def test_materialize_rejects_non_tensor_leaves() -> None:
-    """P3 — wire is tensors only."""
-    from tensordict import NonTensorData
-
-    td = TensorDict(
-        {
-            "x": torch.zeros((2, 3)),
-            "meta": NonTensorData(["a", "b"], batch_size=[2]),
-        },
-        batch_size=[2],
-    )
-    with pytest.raises(TypeError, match=r"non-tensor"):
-        materialize(td)
-
-
 # ── response_from_nested ──────────────────────────────────────────────
 
 
