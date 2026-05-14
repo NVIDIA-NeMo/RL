@@ -341,6 +341,21 @@ class TQWorkerMixin:
         leader = torch.distributed.get_global_rank(replica_group, 0)
         return torch.distributed.get_rank() == leader
 
+    def _is_writeback_leader(self) -> bool:
+        """True iff this rank is the TP×CP×PP leader for write-back to TQ.
+
+        Distinct from :meth:`_is_replica_leader` because that one piggybacks
+        on :meth:`_get_replica_group`, which subclasses gate on ``CP > 1``
+        (a fetch-path optimization). Under TP-only configs (e.g. TP=2,
+        CP=1) the replica group is ``None`` → every rank passes the
+        leader check → every TP rank writes the same keys, which crashes
+        the mooncake_cpu backend with ``-601 ILLEGAL_CLIENT`` (concurrent
+        UpsertStart from different Mooncake clients on the same key).
+        Subclasses with TP/CP/PP siblings must override to gate on the
+        true (TP, CP, PP) coordinates regardless of CP.
+        """
+        return self._is_replica_leader()
+
     def _write_back(
         self,
         meta: "KVBatchMeta",
@@ -357,7 +372,7 @@ class TQWorkerMixin:
             meta: Per-rank ``KVBatchMeta`` for this slice.
             fields: Map of field name to tensor to write back.
         """
-        if not self._is_replica_leader() or not fields:
+        if not self._is_writeback_leader() or not fields:
             return
         from tensordict import TensorDict
 
