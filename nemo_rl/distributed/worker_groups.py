@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import math
 import os
 import time
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import ray
 from ray.util.placement_group import PlacementGroup
@@ -791,6 +792,8 @@ class RayWorkerGroup:
             "See https://github.com/NVIDIA-NeMo/RL/issues/582 for more details."
         )
 
+        kwargs = {key: ray.put(value) for key, value in kwargs.items()}
+
         futures = []
 
         if run_rank_0_only_axes is None:
@@ -874,6 +877,31 @@ class RayWorkerGroup:
             replicate_on_axes = []
         if output_is_replicated is None:
             output_is_replicated = []
+
+        replicate_degrees = math.prod(
+            [self.sharding_annotations.get_axis_size(ax) for ax in replicate_on_axes]
+        )
+        if replicate_degrees > 1:
+            # Use ray.put to serialize all the arguments. This can reduce the cost
+            # of repeated serialization when we send same arguments to multiple workers.
+            def _map_nested_value_list(
+                nested_value_list: Any, depth: int, map_fn: Callable[[Any], Any]
+            ) -> list[Any]:
+                if depth < 0:
+                    raise ValueError(f"Depth is less than 0: {depth}")
+                if depth == 0:
+                    return map_fn(nested_value_list)
+                return [
+                    _map_nested_value_list(v, depth - 1, map_fn)
+                    for v in nested_value_list
+                ]
+
+            kwargs_after_ray_put = dict()
+            for key, nested_value_list in kwargs.items():
+                kwargs_after_ray_put[key] = _map_nested_value_list(
+                    nested_value_list, len(in_sharded_axes), ray.put
+                )
+            kwargs = kwargs_after_ray_put
 
         futures = []
 

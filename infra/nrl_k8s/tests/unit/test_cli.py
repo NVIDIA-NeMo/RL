@@ -100,7 +100,7 @@ class TestCheck:
                 "infra": {
                     "namespace": "ns-a",
                     "image": "img:new",
-                    "clusters": {"training": {"name": "rc-t", "spec": spec}},
+                    "kuberay": {"training": {"name": "rc-t", "spec": spec}},
                 }
             },
         )
@@ -122,7 +122,7 @@ class TestCheck:
                 "infra": {
                     "namespace": "ns-a",
                     "image": "img:new",
-                    "clusters": {"training": {"name": "rc-t", "spec": spec}},
+                    "kuberay": {"training": {"name": "rc-t", "spec": spec}},
                 }
             },
         )
@@ -132,11 +132,9 @@ class TestCheck:
         assert result.exit_code == 0, result.output
         parsed = json.loads(out.read_text())
         assert parsed["infra"]["image"] == "img:new"
-        assert parsed["manifests"]["training"]["metadata"]["name"] == "rc-t"
-        # Image is patched through into the rendered manifest.
-        containers = parsed["manifests"]["training"]["spec"]["headGroupSpec"][
-            "template"
-        ]["spec"]["containers"]
+        [rc] = [m for m in parsed["manifests"] if m["kind"] == "RayCluster"]
+        assert rc["metadata"]["name"] == "rc-t"
+        containers = rc["spec"]["headGroupSpec"]["template"]["spec"]["containers"]
         assert containers[0]["image"] == "img:new"
 
     def test_reports_validation_error_cleanly(self, tmp_path) -> None:
@@ -301,7 +299,7 @@ class TestRayJob:
         infra = {
             "namespace": "ns",
             "image": "img:new",
-            "clusters": {"training": {"name": "rc-train", "spec": spec}},
+            "kuberay": {"training": {"name": "rc-train", "spec": spec}},
         }
         if entrypoint is not None:
             infra["launch"] = {"entrypoint": entrypoint}
@@ -414,7 +412,7 @@ class TestRunCommand:
                     "namespace": "ns",
                     "image": "img:new",
                     "launch": {"entrypoint": "python run.py"},
-                    "clusters": {"training": {"name": "rc-train", "spec": spec}},
+                    "kuberay": {"training": {"name": "rc-train", "spec": spec}},
                 }
             },
         )
@@ -475,14 +473,14 @@ class TestRunCommand:
 
 
 class TestClusterDown:
-    def test_errors_without_role_or_name(self, tmp_path, monkeypatch) -> None:
+    def test_errors_without_resources(self, tmp_path, monkeypatch) -> None:
         recipe = _write_recipe(
             tmp_path, {"infra": {"namespace": "ns-a", "image": "img:1"}}
         )
         runner = CliRunner()
         result = runner.invoke(cli.main, ["cluster", "down", str(recipe)])
-        assert result.exit_code == 2
-        assert "--role" in result.output or "--name" in result.output
+        assert result.exit_code != 0
+        assert "no resources" in result.output
 
 
 # =============================================================================

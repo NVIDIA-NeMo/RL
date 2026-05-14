@@ -16,8 +16,13 @@
 
 from __future__ import annotations
 
-from nrl_k8s.manifest import build_raycluster_manifest
-from nrl_k8s.schema import ClusterSpec, InfraConfig
+import pytest
+from nrl_k8s.manifest import (
+    build_deployment_manifest,
+    build_raycluster_manifest,
+    build_service_for_deployment,
+)
+from nrl_k8s.schema import ClusterSpec, DeploymentSpec, InfraConfig
 
 # =============================================================================
 # Fixtures
@@ -218,3 +223,267 @@ class TestServiceAccountOverride:
         worker = got["spec"]["workerGroupSpecs"][0]["template"]["spec"]
         assert head["serviceAccountName"] == "new-sa"
         assert worker["serviceAccountName"] == "new-sa"
+
+
+# =============================================================================
+# Segment splitting
+# =============================================================================
+
+
+class TestSegmentSplitting:
+    def test_no_split_when_segment_size_is_none(self) -> None:
+        got = build_raycluster_manifest(_make_cluster(), _make_infra())
+        assert len(got["spec"]["workerGroupSpecs"]) == 1
+        assert got["spec"]["workerGroupSpecs"][0]["groupName"] == "gpu-workers"
+
+    def test_split_64_into_4_segments_of_16(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 64
+        spec["workerGroupSpecs"][0]["minReplicas"] = 64
+        spec["workerGroupSpecs"][0]["maxReplicas"] = 64
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        got = build_raycluster_manifest(cluster, _make_infra())
+        workers = got["spec"]["workerGroupSpecs"]
+        assert len(workers) == 4
+        for i, wg in enumerate(workers):
+            assert wg["groupName"] == f"gpu-workers-segment-{i}"
+            assert wg["replicas"] == 16
+            assert wg["minReplicas"] == 16
+            assert wg["maxReplicas"] == 16
+
+    def test_no_split_when_replicas_leq_segment_size(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 8
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        got = build_raycluster_manifest(cluster, _make_infra())
+        workers = got["spec"]["workerGroupSpecs"]
+        assert len(workers) == 1
+        assert workers[0]["groupName"] == "gpu-workers"
+
+    def test_indivisible_replicas_raises(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 65
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        with pytest.raises(ValueError, match="not evenly divisible"):
+            build_raycluster_manifest(cluster, _make_infra())
+
+    def test_preserves_pod_template(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 32
+        spec["workerGroupSpecs"][0]["template"]["metadata"] = {
+            "annotations": {"kai.scheduler/topology": "gb300-topology"}
+        }
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        got = build_raycluster_manifest(cluster, _make_infra())
+        workers = got["spec"]["workerGroupSpecs"]
+        assert len(workers) == 2
+        for wg in workers:
+            ann = wg["template"]["metadata"]["annotations"]
+            assert ann["kai.scheduler/topology"] == "gb300-topology"
+
+    def test_does_not_mutate_input(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 32
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        build_raycluster_manifest(cluster, _make_infra())
+        assert len(spec["workerGroupSpecs"]) == 1
+        assert spec["workerGroupSpecs"][0]["replicas"] == 32
+
+    def test_images_patched_on_all_segments(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 32
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        got = build_raycluster_manifest(cluster, _make_infra())
+        for wg in got["spec"]["workerGroupSpecs"]:
+            img = wg["template"]["spec"]["containers"][0]["image"]
+            assert img == "registry/img:new"
+
+    def test_dra_rewriting_on_all_segments(self) -> None:
+        spec = _base_spec()
+        spec["workerGroupSpecs"][0]["replicas"] = 32
+        spec["workerGroupSpecs"][0]["template"]["spec"]["resourceClaims"] = [
+            {
+                "name": "compute-domain-channel",
+                "resourceClaimTemplateName": "placeholder",
+            },
+        ]
+        cluster = _make_cluster(spec=spec, segmentSize=16)
+        got = build_raycluster_manifest(cluster, _make_infra(), role="training")
+        for wg in got["spec"]["workerGroupSpecs"]:
+            claims = wg["template"]["spec"]["resourceClaims"]
+            assert (
+                claims[0]["resourceClaimTemplateName"]
+                == "compute-domain-rc-test-training"
+            )
+
+
+# =============================================================================
+# Deployment manifest builder
+# =============================================================================
+
+_MANAGED_BY = {"app.kubernetes.io/managed-by": "nrl-k8s"}
+
+
+def _base_deployment_spec() -> dict:
+    return {
+        "selector": {"matchLabels": {"app": "sidecar"}},
+        "template": {
+            "spec": {
+                "containers": [
+                    {
+                        "name": "server",
+                        "ports": [{"containerPort": 8080}],
+                    }
+                ],
+            }
+        },
+    }
+
+
+def _make_deployment(**overrides) -> DeploymentSpec:
+    payload = {"name": "my-sidecar", "spec": _base_deployment_spec()} | overrides
+    return DeploymentSpec.model_validate(payload)
+
+
+class TestBuildDeploymentManifest:
+    def test_basic_structure(self) -> None:
+        dep = _make_deployment()
+        got = build_deployment_manifest(dep, _make_infra())
+        assert got["apiVersion"] == "apps/v1"
+        assert got["kind"] == "Deployment"
+        assert got["metadata"]["name"] == "my-sidecar"
+        assert got["metadata"]["namespace"] == "ns-patched"
+
+    def test_image_default_patched_onto_container(self) -> None:
+        dep = _make_deployment()
+        got = build_deployment_manifest(dep, _make_infra())
+        container = got["spec"]["template"]["spec"]["containers"][0]
+        assert container["image"] == "registry/img:new"
+
+    def test_explicit_image_not_overwritten(self) -> None:
+        spec = _base_deployment_spec()
+        spec["template"]["spec"]["containers"][0]["image"] = "custom:v1"
+        dep = _make_deployment(spec=spec)
+        got = build_deployment_manifest(dep, _make_infra())
+        container = got["spec"]["template"]["spec"]["containers"][0]
+        assert container["image"] == "custom:v1"
+
+    def test_image_pull_secrets_patched(self) -> None:
+        dep = _make_deployment()
+        infra = _make_infra(imagePullSecrets=["secret-a", "secret-b"])
+        got = build_deployment_manifest(dep, infra)
+        pod_spec = got["spec"]["template"]["spec"]
+        assert pod_spec["imagePullSecrets"] == [
+            {"name": "secret-a"},
+            {"name": "secret-b"},
+        ]
+
+    def test_service_account_patched(self) -> None:
+        dep = _make_deployment()
+        infra = _make_infra(serviceAccount="my-sa")
+        got = build_deployment_manifest(dep, infra)
+        pod_spec = got["spec"]["template"]["spec"]
+        assert pod_spec["serviceAccountName"] == "my-sa"
+
+    def test_service_account_not_patched_when_none(self) -> None:
+        dep = _make_deployment()
+        got = build_deployment_manifest(dep, _make_infra())
+        pod_spec = got["spec"]["template"]["spec"]
+        assert "serviceAccountName" not in pod_spec
+
+    def test_labels_merged(self) -> None:
+        dep = _make_deployment(labels={"team": "infra"})
+        infra = _make_infra(labels={"env": "test"})
+        got = build_deployment_manifest(dep, infra)
+        meta_labels = got["metadata"]["labels"]
+        assert meta_labels["app.kubernetes.io/managed-by"] == "nrl-k8s"
+        assert meta_labels["env"] == "test"
+        assert meta_labels["team"] == "infra"
+
+    def test_pod_template_labels_merged(self) -> None:
+        spec = _base_deployment_spec()
+        spec["template"]["metadata"] = {"labels": {"existing": "keep"}}
+        dep = _make_deployment(spec=spec, labels={"dep": "v1"})
+        infra = _make_infra(labels={"infra": "v2"})
+        got = build_deployment_manifest(dep, infra)
+        tmpl_labels = got["spec"]["template"]["metadata"]["labels"]
+        assert tmpl_labels["existing"] == "keep"
+        assert tmpl_labels["dep"] == "v1"
+        assert tmpl_labels["infra"] == "v2"
+        assert tmpl_labels["app.kubernetes.io/managed-by"] == "nrl-k8s"
+
+    def test_existing_pod_label_wins_over_infra(self) -> None:
+        spec = _base_deployment_spec()
+        spec["template"]["metadata"] = {"labels": {"env": "original"}}
+        dep = _make_deployment(spec=spec)
+        infra = _make_infra(labels={"env": "overridden"})
+        got = build_deployment_manifest(dep, infra)
+        assert got["spec"]["template"]["metadata"]["labels"]["env"] == "original"
+
+    def test_annotations_merged(self) -> None:
+        dep = _make_deployment(annotations={"note": "hi"})
+        infra = _make_infra(annotations={"global": "yes"})
+        got = build_deployment_manifest(dep, infra)
+        assert got["metadata"]["annotations"]["note"] == "hi"
+        assert got["metadata"]["annotations"]["global"] == "yes"
+
+    def test_does_not_mutate_original_spec(self) -> None:
+        dep = _make_deployment()
+        original_image = dep.spec["template"]["spec"]["containers"][0].get("image")
+        build_deployment_manifest(dep, _make_infra())
+        assert (
+            dep.spec["template"]["spec"]["containers"][0].get("image") == original_image
+        )
+
+
+class TestBuildServiceForDeployment:
+    def test_returns_none_when_no_selector(self) -> None:
+        spec = _base_deployment_spec()
+        del spec["selector"]
+        dep = _make_deployment(spec=spec)
+        assert build_service_for_deployment(dep, _make_infra()) is None
+
+    def test_returns_none_when_no_ports(self) -> None:
+        spec = _base_deployment_spec()
+        del spec["template"]["spec"]["containers"][0]["ports"]
+        dep = _make_deployment(spec=spec)
+        assert build_service_for_deployment(dep, _make_infra()) is None
+
+    def test_basic_service(self) -> None:
+        dep = _make_deployment()
+        got = build_service_for_deployment(dep, _make_infra())
+        assert got is not None
+        assert got["apiVersion"] == "v1"
+        assert got["kind"] == "Service"
+        assert got["spec"]["type"] == "ClusterIP"
+        assert got["spec"]["selector"] == {"app": "sidecar"}
+        assert got["metadata"]["name"] == "my-sidecar"
+        assert got["metadata"]["namespace"] == "ns-patched"
+
+    def test_ports_extracted_from_containers(self) -> None:
+        spec = _base_deployment_spec()
+        spec["template"]["spec"]["containers"][0]["ports"] = [
+            {"containerPort": 8080, "name": "http"},
+            {"containerPort": 9090},
+        ]
+        dep = _make_deployment(spec=spec)
+        got = build_service_for_deployment(dep, _make_infra())
+        ports = got["spec"]["ports"]
+        assert len(ports) == 2
+        assert ports[0] == {
+            "port": 8080,
+            "targetPort": 8080,
+            "protocol": "TCP",
+            "name": "http",
+        }
+        assert ports[1] == {
+            "port": 9090,
+            "targetPort": 9090,
+            "protocol": "TCP",
+            "name": "port-1",
+        }
+
+    def test_service_has_managed_by_label(self) -> None:
+        dep = _make_deployment()
+        got = build_service_for_deployment(dep, _make_infra())
+        assert got["metadata"]["labels"] == _MANAGED_BY

@@ -557,27 +557,158 @@ def secret_exists(name: str, namespace: str) -> bool:
         raise
 
 
+# =============================================================================
+# Deployment lifecycle (apps/v1)
+# =============================================================================
+
+
+def _apps_api() -> client.AppsV1Api:
+    load_kubeconfig()
+    return client.AppsV1Api()
+
+
+def apply_deployment(manifest: dict[str, Any], namespace: str) -> Any:
+    """Create-or-patch a Deployment. Returns the server-side object."""
+    name = manifest["metadata"]["name"]
+    apps = _apps_api()
+    try:
+        return with_retries(
+            lambda: apps.create_namespaced_deployment(
+                namespace=namespace, body=manifest
+            )
+        )
+    except ApiException as exc:
+        if exc.status == 409:
+            return with_retries(
+                lambda: apps.patch_namespaced_deployment(
+                    name=name, namespace=namespace, body=manifest
+                )
+            )
+        raise
+
+
+def get_deployment(name: str, namespace: str) -> Any | None:
+    apps = _apps_api()
+    try:
+        return with_retries(
+            lambda: apps.read_namespaced_deployment(name=name, namespace=namespace)
+        )
+    except ApiException as exc:
+        if exc.status == 404:
+            return None
+        raise
+
+
+def delete_deployment(
+    name: str, namespace: str, *, ignore_missing: bool = True
+) -> None:
+    apps = _apps_api()
+    try:
+        with_retries(
+            lambda: apps.delete_namespaced_deployment(name=name, namespace=namespace)
+        )
+    except ApiException as exc:
+        if exc.status == 404 and ignore_missing:
+            return
+        raise
+
+
+def wait_for_deployment_ready(
+    name: str, namespace: str, *, timeout_s: int = 300, poll_s: int = 5
+) -> None:
+    """Block until all Deployment replicas are available."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        dep = get_deployment(name, namespace)
+        if dep is not None and dep.status:
+            spec_replicas = dep.spec.replicas or 1
+            ready = dep.status.ready_replicas or 0
+            if ready >= spec_replicas:
+                return
+        time.sleep(poll_s)
+    raise TimeoutError(
+        f"Deployment {name} in {namespace} did not become ready after {timeout_s}s"
+    )
+
+
+# =============================================================================
+# Service lifecycle (v1)
+# =============================================================================
+
+
+def apply_service(manifest: dict[str, Any], namespace: str) -> Any:
+    """Create-or-patch a Service. Returns the server-side object."""
+    name = manifest["metadata"]["name"]
+    load_kubeconfig()
+    core = client.CoreV1Api()
+    try:
+        return with_retries(
+            lambda: core.create_namespaced_service(namespace=namespace, body=manifest)
+        )
+    except ApiException as exc:
+        if exc.status == 409:
+            return with_retries(
+                lambda: core.patch_namespaced_service(
+                    name=name, namespace=namespace, body=manifest
+                )
+            )
+        raise
+
+
+def get_service(name: str, namespace: str) -> Any | None:
+    load_kubeconfig()
+    core = client.CoreV1Api()
+    try:
+        return with_retries(
+            lambda: core.read_namespaced_service(name=name, namespace=namespace)
+        )
+    except ApiException as exc:
+        if exc.status == 404:
+            return None
+        raise
+
+
+def delete_service(name: str, namespace: str, *, ignore_missing: bool = True) -> None:
+    load_kubeconfig()
+    core = client.CoreV1Api()
+    try:
+        with_retries(
+            lambda: core.delete_namespaced_service(name=name, namespace=namespace)
+        )
+    except ApiException as exc:
+        if exc.status == 404 and ignore_missing:
+            return
+        raise
+
+
 __all__ = [
     "apply_compute_domain",
+    "apply_deployment",
     "apply_raycluster",
     "apply_rayjob",
     "apply_resource_claim_template",
+    "apply_service",
     "create_or_update_secret",
     "create_pod",
     "custom_objects_api",
     "delete_compute_domain",
     "delete_configmap",
+    "delete_deployment",
     "delete_pod",
     "delete_raycluster",
     "delete_rayjob",
     "delete_resource_claim_template",
+    "delete_service",
+    "get_deployment",
     "get_head_pod",
     "get_pod_phase",
     "get_raycluster",
     "get_rayjob",
+    "get_service",
     "list_rayclusters",
     "load_kubeconfig",
     "secret_exists",
+    "wait_for_deployment_ready",
     "wait_for_raycluster_gone",
     "wait_for_raycluster_ready",
     "wait_for_rayjob_terminal",

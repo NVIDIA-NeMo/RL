@@ -1,6 +1,7 @@
 ---
 name: testing
-description: Testing conventions for NeMo-RL. Covers Ray actor coverage pragmas, nightly test requirements, and recipe naming rules. Auto-invoked during code review.
+description: Testing conventions for NeMo-RL. Covers Ray actor coverage pragmas, nightly test requirements, and recipe naming rules.
+when_to_use: Writing or reviewing tests; adding a nightly test; naming a recipe; 'coverage pragma', 'Ray actor test', 'nightly test requirement', 'how to name recipes', during code review of test files.
 ---
 
 # Testing Conventions
@@ -38,7 +39,7 @@ Create a shell script in the matching domain (`tests/test_suites/llm/` or `tests
 
 ### 3. Add to nightly list
 
-Append the driver script path (relative to `tests/test_suites/`) to `tests/test_suites/nightly.txt`.
+Append the driver script path (relative to `tests/test_suites/`) to @tests/test_suites/nightly.txt.
 
 ## Recipe Naming Rules
 

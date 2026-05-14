@@ -47,7 +47,7 @@ def _infra_payload(
         "namespace": "ns-a",
         "image": "img:1",
         "launch": {"entrypoint": training_entrypoint},
-        "clusters": {
+        "kuberay": {
             "training": {
                 "name": "rc-train",
                 "spec": {
@@ -59,7 +59,7 @@ def _infra_payload(
         },
     }
     if gym_entrypoint is not None:
-        base["clusters"]["gym"] = {
+        base["kuberay"]["gym"] = {
             "name": "rc-gym",
             "spec": {
                 "headGroupSpec": {
@@ -295,7 +295,7 @@ class TestEnsureCluster:
         log_fn, lines = log
         loaded = _loaded()
         rendered = orchestrate.build_raycluster_manifest(
-            loaded.infra.clusters.training, loaded.infra
+            loaded.infra.kuberay.training, loaded.infra
         )
         live = {
             "metadata": {
@@ -325,7 +325,7 @@ class TestEnsureCluster:
         loaded = _loaded()
         # Start from the rendered spec, mutate one field to simulate drift.
         rendered = orchestrate.build_raycluster_manifest(
-            loaded.infra.clusters.training, loaded.infra
+            loaded.infra.kuberay.training, loaded.infra
         )
         drifted = {"metadata": {"name": "rc-train"}, "spec": dict(rendered["spec"])}
         drifted["spec"]["rayVersion"] = "drifted"
@@ -348,7 +348,7 @@ class TestEnsureCluster:
         log_fn, lines = log
         loaded = _loaded()
         rendered = orchestrate.build_raycluster_manifest(
-            loaded.infra.clusters.training, loaded.infra
+            loaded.infra.kuberay.training, loaded.infra
         )
         drifted = {"metadata": {"name": "rc-train"}, "spec": dict(rendered["spec"])}
         drifted["spec"]["rayVersion"] = "drifted"
@@ -463,3 +463,193 @@ class TestResetEndpointRegistry:
 
         orchestrate._reset_endpoint_registry(loaded, log=log_fn)
         delete_cm.assert_not_called()
+
+
+# =============================================================================
+# Recipe path translation + entrypoint --config rewrite
+# =============================================================================
+
+
+class TestRecipePathInPod:
+    def test_upload_returns_staged_filename(self, tmp_path: Path) -> None:
+        loaded = _loaded()
+        loaded.source_path = tmp_path / "subdir" / "recipe.yaml"
+        # repo_root irrelevant in upload mode — recipe is staged into
+        # the working_dir as a fixed filename.
+        assert (
+            orchestrate._recipe_path_in_pod(loaded, tmp_path, upload=True)
+            == "nrl_k8s_run.yaml"
+        )
+
+    def test_image_lustre_returns_repo_relative_path(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        recipe = repo / "infra" / "nrl_k8s" / "examples" / "x.yaml"
+        recipe.parent.mkdir(parents=True)
+        recipe.write_text("policy: {}")
+        loaded = _loaded()
+        loaded.source_path = recipe
+
+        result = orchestrate._recipe_path_in_pod(loaded, repo, upload=False)
+        assert result == "infra/nrl_k8s/examples/x.yaml"
+
+    def test_image_lustre_recipe_outside_repo_returns_none(
+        self, tmp_path: Path
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        outside = tmp_path / "elsewhere" / "recipe.yaml"
+        outside.parent.mkdir()
+        outside.write_text("policy: {}")
+        loaded = _loaded()
+        loaded.source_path = outside
+
+        # None makes the rewriter leave the entrypoint alone rather
+        # than invent a path the pod can't resolve.
+        assert orchestrate._recipe_path_in_pod(loaded, repo, upload=False) is None
+
+
+class TestRewriteEntrypointRecipe:
+    @staticmethod
+    def _loaded_for(repo: Path, recipe_relpath: str) -> LoadedConfig:
+        recipe = repo / recipe_relpath
+        recipe.parent.mkdir(parents=True, exist_ok=True)
+        recipe.write_text("policy: {}")
+        loaded = _loaded()
+        loaded.source_path = recipe
+        return loaded
+
+    def test_rewrites_hardcoded_config_to_cli_recipe(self, tmp_path: Path, log) -> None:
+        log_fn, lines = log
+        repo = tmp_path / "repo"
+        loaded = self._loaded_for(repo, "infra/recipes/x.yaml")
+        ep = "cd /opt/nemo-rl && python train.py --config a/b.yaml --foo"
+
+        result = orchestrate._rewrite_entrypoint_recipe(
+            ep, loaded, repo, upload=False, log=log_fn
+        )
+
+        assert "--config infra/recipes/x.yaml" in result
+        assert "a/b.yaml" not in result
+        # Substitution is logged so it shows up in the submission log.
+        assert any("rewrote" in ln and "a/b.yaml" in ln for ln in lines)
+
+    def test_no_op_when_paths_already_match(self, tmp_path: Path, log) -> None:
+        log_fn, lines = log
+        repo = tmp_path / "repo"
+        loaded = self._loaded_for(repo, "infra/recipes/x.yaml")
+        ep = "python train.py --config infra/recipes/x.yaml"
+
+        result = orchestrate._rewrite_entrypoint_recipe(
+            ep, loaded, repo, upload=False, log=log_fn
+        )
+
+        assert result == ep
+        # No log noise when nothing was actually rewritten.
+        assert lines == []
+
+    def test_handles_equals_separator(self, tmp_path: Path, log) -> None:
+        # Some shells / hydra invocations write ``--config=path`` with
+        # no space. Keep the same separator the user used.
+        log_fn, _ = log
+        repo = tmp_path / "repo"
+        loaded = self._loaded_for(repo, "x.yaml")
+        ep = "python train.py --config=a/b.yaml"
+
+        result = orchestrate._rewrite_entrypoint_recipe(
+            ep, loaded, repo, upload=False, log=log_fn
+        )
+
+        assert "--config=x.yaml" in result
+
+    def test_preserves_quoting(self, tmp_path: Path, log) -> None:
+        log_fn, _ = log
+        repo = tmp_path / "repo"
+        loaded = self._loaded_for(repo, "x.yaml")
+
+        for ep, expected in (
+            ('python t.py --config "a/b.yaml"', '--config "x.yaml"'),
+            ("python t.py --config 'a/b.yaml'", "--config 'x.yaml'"),
+        ):
+            result = orchestrate._rewrite_entrypoint_recipe(
+                ep, loaded, repo, upload=False, log=log_fn
+            )
+            assert expected in result
+
+    def test_does_not_touch_config_name_or_config_dir(
+        self, tmp_path: Path, log
+    ) -> None:
+        # Hydra's ``--config-name`` / ``--config-dir`` / ``--config-path``
+        # look superficially similar but aren't recipe paths.
+        log_fn, lines = log
+        repo = tmp_path / "repo"
+        loaded = self._loaded_for(repo, "x.yaml")
+        ep = "python train.py --config-name=foo --config-dir=bar --config-path conf"
+
+        result = orchestrate._rewrite_entrypoint_recipe(
+            ep, loaded, repo, upload=False, log=log_fn
+        )
+
+        assert result == ep
+        assert lines == []
+
+    def test_no_op_when_no_config_flag_present(self, tmp_path: Path, log) -> None:
+        log_fn, lines = log
+        repo = tmp_path / "repo"
+        loaded = self._loaded_for(repo, "x.yaml")
+        ep = "python train.py --some-other-flag"
+
+        result = orchestrate._rewrite_entrypoint_recipe(
+            ep, loaded, repo, upload=False, log=log_fn
+        )
+
+        assert result == ep
+        assert lines == []
+
+    def test_no_op_when_recipe_outside_repo(self, tmp_path: Path, log) -> None:
+        log_fn, lines = log
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        outside = tmp_path / "elsewhere.yaml"
+        outside.write_text("policy: {}")
+        loaded = _loaded()
+        loaded.source_path = outside
+        ep = "python train.py --config a/b.yaml"
+
+        result = orchestrate._rewrite_entrypoint_recipe(
+            ep, loaded, repo, upload=False, log=log_fn
+        )
+
+        # Cannot translate path; leave entrypoint alone rather than
+        # invent something.
+        assert result == ep
+
+    def test_upload_mode_uses_staged_filename(self, tmp_path: Path, log) -> None:
+        log_fn, _ = log
+        loaded = _loaded()
+        loaded.source_path = tmp_path / "anywhere.yaml"
+        ep = "python train.py --config a/b.yaml"
+
+        result = orchestrate._rewrite_entrypoint_recipe(
+            ep, loaded, tmp_path, upload=True, log=log_fn
+        )
+
+        assert "--config nrl_k8s_run.yaml" in result
+
+    def test_rewrites_multiple_config_flags(self, tmp_path: Path, log) -> None:
+        # Defensive: if an entrypoint somehow has multiple ``--config``
+        # flags (e.g. an experimental harness chaining), all get the
+        # same recipe substitution. Single log line per distinct
+        # original path.
+        log_fn, lines = log
+        repo = tmp_path / "repo"
+        loaded = self._loaded_for(repo, "x.yaml")
+        ep = "python train.py --config a.yaml ; python verify.py --config a.yaml"
+
+        result = orchestrate._rewrite_entrypoint_recipe(
+            ep, loaded, repo, upload=False, log=log_fn
+        )
+
+        assert result.count("--config x.yaml") == 2
+        assert "a.yaml" not in result
+        # De-duplicated: same original path → one log line.
+        assert sum("rewrote" in ln for ln in lines) == 1
