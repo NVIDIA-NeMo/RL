@@ -34,8 +34,8 @@ policy:
       tensor_parallel_size: 4
       precision: ${policy.precision}
       max_model_len: ${policy.max_total_sequence_length}
-      max_batch_size: 16
-      max_num_tokens: 16384
+      max_batch_size: 256
+      max_num_tokens: 65536
       async_engine: true
       gpu_memory_utilization: 0.6
     trtllm_kwargs:

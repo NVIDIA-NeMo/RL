@@ -70,6 +70,7 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
         from tensorrt_llm import AsyncLLM, SamplingParams as TrtSamplingParams
         from tensorrt_llm.llmapi.llm_args import (
             CapacitySchedulerPolicy,
+            CudaGraphConfig,
             KvCacheConfig,
             SchedulerConfig,
             SleepConfig,
@@ -122,6 +123,10 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
             trust_remote_code=True,
             scheduler_config=SchedulerConfig(
                 capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+            ),
+            cuda_graph_config=CudaGraphConfig(
+                enable_padding=True,
+                max_batch_size=trtllm_cfg["max_batch_size"] if "max_batch_size" in trtllm_cfg else 0,
             ),
         )
         if "max_batch_size" in trtllm_cfg:
