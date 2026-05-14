@@ -16,7 +16,7 @@
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 
-ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.05-cuda12.9-devel-ubuntu24.04
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -115,6 +115,9 @@ ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 # Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
 ENV CUDA_HOME=/usr/local/cuda
 
+## CUDA 13 moved standard library headers under include/cccl; expose that path so
+## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
+ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
