@@ -93,7 +93,7 @@ def test_base_vllm_worker_converts_output_len_generator_dict():
 
     worker = BaseVllmGenerationWorker(config=config, bundle_indices=None)
 
-    output_len_generator = worker.cfg["output_len_generator"]
+    output_len_generator = worker.output_len_generator
     assert callable(output_len_generator)
     assert output_len_generator(0) == 3
 
@@ -104,7 +104,9 @@ def test_base_vllm_worker_rejects_invalid_output_len_generator():
     config = deepcopy(basic_vllm_test_config)
     config["output_len_or_output_distribution"] = "bad"
 
-    with pytest.raises(ValueError, match="Invalid constant_length_or_length_distribution: bad"):
+    with pytest.raises(
+        ValueError, match="Invalid constant_length_or_length_distribution: bad"
+    ):
         BaseVllmGenerationWorker(config=config, bundle_indices=None)
 
 
@@ -117,7 +119,7 @@ def test_vllm_generate_text_drops_stop_token_ids_when_ignore_eos():
     worker.cfg["ignore_eos"] = True
     worker.cfg["stop_token_ids"] = [1, 2]
     worker.cfg["max_new_tokens"] = 8
-    worker.cfg["output_len_generator"] = lambda _: 3
+    worker.output_len_generator = lambda _: 3
 
     class FakeSamplingParams:
         def __init__(self, **kwargs):

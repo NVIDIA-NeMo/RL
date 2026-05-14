@@ -28,9 +28,7 @@ from nemo_rl.data.datasets import (
 )
 from nemo_rl.data.datasets.eval_datasets import _is_multimodal_dataset
 from nemo_rl.data.utils import setup_random_data
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.dummy_environment import DummyEnvironment
 from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
@@ -56,12 +54,6 @@ def parse_args():
 
 def setup_data(tokenizer, data_config, env_configs):
     print("Setting up data...")
-
-    # Synthetic random-data path for benchmarking (no real dataset / env).
-    if data_config.get("dataset_name") == "random":
-        dataset, _, task_to_env, _ = setup_random_data(tokenizer, data_config)
-        env = task_to_env["random"]
-        return dataset, env, tokenizer
 
     # load dataset
     base_dataset = load_eval_dataset(data_config)
@@ -122,18 +114,22 @@ def main():
         config["generation"], tokenizer, is_eval=True
     )
 
-    # configure_generation_config sets load_format to 'auto' based on is_eval. 
+    # configure_generation_config sets load_format to 'auto' based on is_eval.
     # But for the random dataset case, we don't need real model weights — vLLM can use dummy
     # weights since outputs are not validated against any ground truth.
     if is_random_dataset:
         config["generation"]["vllm_cfg"]["load_format"] = "dummy"
 
     # Setup data
-    (
-        dataset,
-        env,
-        tokenizer,
-    ) = setup_data(tokenizer, config["data"], config["env"])
+    if config["data"].get("dataset_name") == "random":
+        (dataset, _, task_to_env, _) = setup_random_data(tokenizer, config["data"])
+        env = task_to_env["random"]
+    else:
+        (
+            dataset,
+            env,
+            tokenizer,
+        ) = setup_data(tokenizer, config["data"], config["env"])
 
     # Setup
     (
