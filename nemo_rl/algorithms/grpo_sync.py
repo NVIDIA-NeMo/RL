@@ -460,7 +460,7 @@ def grpo_train_sync(
                         rollout_actor.rollout_to_tq.remote(
                             repeated_batch,
                             uids=uids,
-                            partition_id=policy._tq_partition_id,
+                            partition_id=policy.tq_partition_id,
                             first_iter=(dynamic_sampling_num_gen_batches == 1),
                         )
                     )
@@ -538,7 +538,7 @@ def grpo_train_sync(
                             max_gen_batches=master_config["grpo"][
                                 "dynamic_sampling_max_gen_batches"
                             ],
-                            dp_client=policy._dp_client,
+                            dp_client=policy.dp_client,
                         )
                         if not is_complete:
                             current_size = (
@@ -611,7 +611,7 @@ def grpo_train_sync(
                     # output_ids, attention_mask, position_ids) stays in
                     # TQ — workers will fetch it via ``train_presharded``.
                     extras_bdd = read_columns(
-                        policy._dp_client,
+                        policy.dp_client,
                         meta,
                         select_fields=["generation_logprobs", "token_mask"],
                         pad_value_dict=_pad_dict,
@@ -688,7 +688,7 @@ def grpo_train_sync(
                 # sample_mask under the same meta.keys so workers fetch
                 # the union via train_presharded.
                 write_columns(
-                    policy._dp_client,
+                    policy.dp_client,
                     meta,
                     fields={
                         "advantages": advantages,
@@ -740,7 +740,7 @@ def grpo_train_sync(
                             )
                         ]
                         calibration_data = read_columns(
-                            policy._dp_client,
+                            policy.dp_client,
                             meta,
                             select_fields=_calib_fields,
                             pad_value_dict=_pad_dict,
@@ -764,7 +764,7 @@ def grpo_train_sync(
                     if "content" in (meta.fields or []):
                         _log_select.append("content")
                     _log_extras = read_columns(
-                        policy._dp_client,
+                        policy.dp_client,
                         meta,
                         select_fields=_log_select,
                         pad_value_dict=_pad_dict,
@@ -773,7 +773,7 @@ def grpo_train_sync(
                     _log_content = _log_extras.get("content")
 
                 # ── Step-end TQ cleanup ────────────────────────────────
-                policy._dp_client.kv_clear(
+                policy.dp_client.kv_clear(
                     keys=meta.keys,
                     partition_id=meta.partition_id,
                 )
@@ -1121,7 +1121,6 @@ def grpo_train_sync(
                 step_finished=True,
             )
 
-            batch_cache = None
             dynamic_sampling_num_gen_batches = 0
 
             memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())

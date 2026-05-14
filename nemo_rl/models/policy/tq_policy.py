@@ -97,7 +97,7 @@ class TQPolicy(Policy):
 
     The partition lifecycle (``register_partition`` / ``kv_clear``) is
     the trainer's responsibility — this class assumes the partition
-    named ``self._tq_partition_id`` (default ``"train"``) is open with a
+    named ``self.tq_partition_id`` (default ``"train"``) is open with a
     schema covering ``DP_TRAIN_FIELDS`` (the bulk schema written by the
     rollout actor at first put + driver-/worker-written deltas).
     """
@@ -122,8 +122,8 @@ class TQPolicy(Policy):
                 f"TP/PP/CP/EP sizes."
             )
         self.dp_cfg = dp_cfg
-        self._dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
-        self._tq_partition_id = tq_partition_id
+        self.dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
+        self.tq_partition_id = tq_partition_id
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -141,7 +141,7 @@ class TQPolicy(Policy):
     def shutdown(self) -> bool:  # type: ignore[override]
         """Close the TQ client before shutting down the worker group."""
         try:
-            self._dp_client.close()
+            self.dp_client.close()
         except Exception as e:
             warnings.warn(f"Error closing data-plane client: {e}")
         return super().shutdown()
@@ -162,8 +162,8 @@ class TQPolicy(Policy):
             num_samples: Expected total samples this step.
             group_size: GRPO group size for balanced sampling; ``None`` disables grouping.
         """
-        self._dp_client.register_partition(
-            partition_id=self._tq_partition_id,
+        self.dp_client.register_partition(
+            partition_id=self.tq_partition_id,
             fields=list(DP_TRAIN_FIELDS),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],

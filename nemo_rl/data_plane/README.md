@@ -228,7 +228,7 @@ no-I/O). 24 of those are the per-DP fetch fan-out (3 phases × 8 ranks).
 meta = kv_first_write(
     final_batch_cpu=batch,
     uids=[f"step{step}_p{i}" for i in range(num_prompts)],
-    dp_client=policy._dp_client,
+    dp_client=policy.dp_client,
     partition_id=f"grpo_step_{step}",
 )
 # meta.keys = ["step17_p0_g0", "step17_p0_g1", ..., "step17_p7_g3"]
