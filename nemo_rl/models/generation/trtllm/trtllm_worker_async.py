@@ -74,6 +74,7 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
             KvCacheConfig,
             SchedulerConfig,
             SleepConfig,
+            ExecutorMemoryType,
         )
         from ray.util.placement_group import get_current_placement_group
 
@@ -128,6 +129,12 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
                 enable_padding=True,
                 max_batch_size=trtllm_cfg["max_batch_size"] if "max_batch_size" in trtllm_cfg else 0,
             ),
+            sleep_config=SleepConfig(
+                restore_modes={
+                    ExecutorMemoryType.MODEL_WEIGHTS_MAIN: "NONE",
+                    ExecutorMemoryType.KV_CACHE: "NONE",
+                }
+            )
         )
         if "max_batch_size" in trtllm_cfg:
             llm_kwargs["max_batch_size"] = trtllm_cfg["max_batch_size"]
