@@ -269,9 +269,7 @@ def materialize(
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
     if pad_to_multiple < 1:
-        raise ValueError(
-            f"pad_to_multiple must be >= 1, got {pad_to_multiple}"
-        )
+        raise ValueError(f"pad_to_multiple must be >= 1, got {pad_to_multiple}")
     pads = pad_value_dict or {}
     out: dict[str, Any] = {}
     for key, val in td.items(include_nested=False):

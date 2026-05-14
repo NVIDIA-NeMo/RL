@@ -43,6 +43,7 @@ class DataPlaneEvent(TypedDict):
     wall_ms: float
     status: EventStatus
 
+
 import torch
 from tensordict import TensorDict
 
@@ -320,9 +321,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
 
     def kv_clear(self, keys, partition_id):
-        keys_list = (
-            keys if (keys is None or isinstance(keys, list)) else list(keys)
-        )
+        keys_list = keys if (keys is None or isinstance(keys, list)) else list(keys)
         n_keys = len(keys_list) if keys_list is not None else 0
         self._run(
             "clear",
