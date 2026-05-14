@@ -291,7 +291,7 @@ jobs:
       build-ref: ${{ needs.pre-flight.outputs.test_sha }}
       image-name: ${{ vars.CI_CONTAINER_NAME }}
       dockerfile: docker/Dockerfile
-      runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+      runner: ${{ contains(needs.org-member-pre-flight.outputs.runner_prefix, 'azure') && format('{0}-gpu-x2', needs.org-member-pre-flight.outputs.runner_prefix) || contains(needs.org-member-pre-flight.outputs.runner_prefix, 'gcp') && format('{0}-gpu-x4', needs.org-member-pre-flight.outputs.runner_prefix) }}
       image-label: ${{ vars.CI_CONTAINER_NAME }}
       target: release
       registry: ${{ needs.org-member-pre-flight.outputs.registry }}

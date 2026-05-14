@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -256,6 +257,45 @@ def mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
     )
 
     return stack
+
+
+@contextmanager
+def _patched_logprob_phase(policy):
+    """Provide real tensors for the logprob phase of ``grpo_train``.
+
+    Both PRs #2174 / #2178 (``skip_reference_policy_logprobs_calculation=True``)
+    and PR #2177 (``force_on_policy_ratio=True``) use ``torch.zeros_like(...)``
+    placeholders inside ``grpo_train``. Those calls fail with
+    ``TypeError: zeros_like(): argument 'input' must be Tensor, not MagicMock``
+    when the surrounding inputs come straight from the bare ``mock_grpo_components``
+    fixture. This helper swaps in real tensors for the duration of the test and
+    restores the original mock return values afterwards.
+    """
+    fake_flat = BatchedDataDict(
+        {
+            "token_ids": torch.tensor([[1, 2]]),
+            "advantages": torch.tensor([[0.5, 0.5]]),
+            "generation_logprobs": torch.tensor([[0.0, 0.0]]),
+            "token_loss_mask": torch.tensor([[1, 1]]),
+            "content": ["ok"],
+        }
+    )
+    fake_lengths = torch.tensor([2])
+    saved_lp = policy.get_logprobs.return_value
+    saved_rlp = policy.get_reference_policy_logprobs.return_value
+    policy.get_logprobs.return_value = {"logprobs": torch.zeros(1, 2)}
+    policy.get_reference_policy_logprobs.return_value = {
+        "reference_logprobs": torch.zeros(1, 2)
+    }
+    with patch(
+        "nemo_rl.algorithms.grpo.batched_message_log_to_flat_message",
+        return_value=(fake_flat, fake_lengths),
+    ):
+        try:
+            yield
+        finally:
+            policy.get_logprobs.return_value = saved_lp
+            policy.get_reference_policy_logprobs.return_value = saved_rlp
 
 
 @ray.remote(num_cpus=0)
@@ -995,6 +1035,7 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
         "loss_fn": {
             "force_on_policy_ratio": False,
             "use_importance_sampling_correction": False,
+            "reference_policy_kl_penalty": 0.0,
         },
         "env": {},
         "grpo": {
@@ -1203,6 +1244,184 @@ def test_grpo_train_collects_generation_logger_metrics(
     assert any(
         "generation_logger_metrics" in call.args[0]
         for call in mock_grpo_components["logger"].log_metrics.call_args_list
+    )
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_train_skips_reference_policy_logprobs_when_configured(
+    mock_grpo_components, train_func
+):
+    """Regression test for issue #1968 (Bug 1) and PRs #2174 / #2178.
+
+    When ``grpo.skip_reference_policy_logprobs_calculation=True`` and
+    ``loss_fn.reference_policy_kl_penalty=0``, both ``grpo_train`` and
+    ``async_grpo_train`` MUST NOT call ``policy.get_reference_policy_logprobs``.
+    Without the skip guards in ``grpo.py``, training would crash inside
+    ``use_reference_model()`` because the reference model state was never loaded.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config["grpo"]["skip_reference_policy_logprobs_calculation"] = True
+    master_config["loss_fn"]["reference_policy_kl_penalty"] = 0
+    master_config["grpo"]["max_num_steps"] = 1
+    master_config["grpo"]["max_num_epochs"] = 1
+    master_config["grpo"]["val_period"] = 0
+    master_config["grpo"]["val_at_start"] = False
+    master_config["grpo"]["use_dynamic_sampling"] = False
+
+    if train_func == async_grpo_train:
+        master_config["policy"]["generation"]["colocated"]["enabled"] = False
+
+    grpo_save_state = _default_grpo_save_state()
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    policy = mock_grpo_components["policy"]
+
+    if train_func == async_grpo_train:
+        with (
+            mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+            _patched_logprob_phase(policy),
+        ):
+            train_func(
+                policy,
+                None,
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                mock_grpo_components["checkpointer"],
+                grpo_save_state,
+                master_config,
+            )
+    else:
+        with (
+            _patched_logprob_phase(policy),
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                return_value=(mock_batch, mock_rollout_metrics),
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+                return_value=(mock_batch, mock_rollout_metrics),
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                return_value=(0.0, 0, 0.0),
+            ),
+        ):
+            train_func(
+                policy,
+                None,
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                mock_grpo_components["checkpointer"],
+                grpo_save_state,
+                master_config,
+            )
+
+    assert not policy.get_reference_policy_logprobs.called, (
+        "policy.get_reference_policy_logprobs was called even though "
+        "skip_reference_policy_logprobs_calculation=True. "
+        "This indicates a regression of issue #1968 / PRs #2174, #2178."
+    )
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
+    mock_grpo_components, train_func
+):
+    """Regression test for PR #2177.
+
+    When ``loss_fn.force_on_policy_ratio=True``, both ``grpo_train`` and
+    ``async_grpo_train`` MUST NOT call ``policy.get_logprobs`` to compute
+    ``prev_logprobs`` -- the importance-sampling ratio is forced to 1.0 so
+    the prev-policy forward pass would be wasted compute.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config["loss_fn"]["force_on_policy_ratio"] = True
+    master_config["grpo"]["seq_logprob_error_threshold"] = None
+    master_config["grpo"]["max_num_steps"] = 1
+    master_config["grpo"]["max_num_epochs"] = 1
+    master_config["grpo"]["val_period"] = 0
+    master_config["grpo"]["val_at_start"] = False
+    master_config["grpo"]["use_dynamic_sampling"] = False
+
+    if train_func == async_grpo_train:
+        master_config["policy"]["generation"]["colocated"]["enabled"] = False
+
+    grpo_save_state = _default_grpo_save_state()
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    policy = mock_grpo_components["policy"]
+
+    if train_func == async_grpo_train:
+        with (
+            mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+            _patched_logprob_phase(policy),
+        ):
+            train_func(
+                policy,
+                None,
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                mock_grpo_components["checkpointer"],
+                grpo_save_state,
+                master_config,
+            )
+    else:
+        with (
+            _patched_logprob_phase(policy),
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                return_value=(mock_batch, mock_rollout_metrics),
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+                return_value=(mock_batch, mock_rollout_metrics),
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                return_value=(0.0, 0, 0.0),
+            ),
+        ):
+            train_func(
+                policy,
+                None,
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                mock_grpo_components["checkpointer"],
+                grpo_save_state,
+                master_config,
+            )
+
+    assert not policy.get_logprobs.called, (
+        "policy.get_logprobs was called even though force_on_policy_ratio=True. "
+        "This indicates a regression of PR #2177."
     )
 
 

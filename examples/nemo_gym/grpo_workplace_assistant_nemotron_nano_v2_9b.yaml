@@ -208,7 +208,7 @@ policy:
 
   generation:
     backend: "vllm"
-    max_new_tokens: ${policy.max_total_sequence_length}
+    max_new_tokens: 8192
     temperature: 1.0
     top_p: 1.0
     top_k: null
