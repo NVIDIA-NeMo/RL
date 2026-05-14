@@ -94,7 +94,6 @@ def kv_first_write(
     Returns:
         ``KVBatchMeta`` covering the written keys.
     """
-    from tensordict import NonTensorStack
 
     from nemo_rl.data_plane.codec import maybe_pack_jagged
 
@@ -112,7 +111,12 @@ def kv_first_write(
         if isinstance(v, torch.Tensor):
             wire[k] = maybe_pack_jagged(v, lengths)
         elif isinstance(v, np.ndarray) and v.dtype == object:
-            wire[k] = NonTensorStack(*v.tolist())
+            # Pass object arrays as ndarray, not NonTensorStack: under
+            # tensordict==0.12.2, a NonTensorStack stored as a TensorDict
+            # leaf is returned as an internal LinkedList on parent
+            # __getitem__, which loses identity in TQ's wire path.
+            # ndarray(dtype=object) round-trips through TensorDict intact.
+            wire[k] = v
 
     bulk = TensorDict(wire, batch_size=[n])
     dp_client.kv_batch_put(
