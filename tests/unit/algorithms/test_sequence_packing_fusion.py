@@ -28,6 +28,7 @@ import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
+    ClippedPGLossConfig,
     ClippedPGLossFn,
     SequencePackingFusionLossWrapper,
     SequencePackingLossWrapper,
@@ -171,28 +172,12 @@ def _build_test_case(cp_size, tp_size, my_tp_rank, cp_group):
 
         return logits_local, packed_logits
 
-    loss_cfg = {
-        "reference_policy_kl_penalty": 0.01,
-        "ratio_clip_min": 0.2,
-        "ratio_clip_max": 0.2,
-        "use_on_policy_kl_approximation": False,
-        "use_importance_sampling_correction": False,
-        "token_level_loss": True,
-        "ratio_clip_c": None,
-        "reference_policy_kl_type": "k3",
-        "kl_input_clamp_value": 20.0,
-        "kl_output_clamp_value": 10.0,
-        "truncated_importance_sampling_ratio": None,
-        "sequence_level_importance_ratios": False,
-        "force_on_policy_ratio": False,
-    }
-
     valid_toks = int(torch.clamp(seq_lengths - 1, min=0).sum().item())
     global_valid_toks = torch.tensor(valid_toks, dtype=torch.float32, device=device)
     global_valid_seqs = torch.tensor(batch_size, dtype=torch.float32, device=device)
 
     return {
-        "loss_cfg": loss_cfg,
+        "loss_cfg": ClippedPGLossConfig(),
         "cu_seqlens": cu_seqlens,
         "cu_seqlens_padded": cu_seqlens_padded,
         "data_dict": data_dict,

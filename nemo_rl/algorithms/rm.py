@@ -19,6 +19,7 @@ from typing import Optional, TypedDict
 
 import numpy as np
 import torch
+from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
@@ -70,7 +71,7 @@ class RMConfig(TypedDict):
     seed: int
 
 
-class MasterConfig(TypedDict):
+class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     data: DataConfig
     rm: RMConfig
@@ -111,30 +112,30 @@ def setup(
     Returns:
         Tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, master_config, logger
     """
-    set_seed(master_config["rm"]["seed"])
+    set_seed(master_config.rm["seed"])
 
     # Extract individual configs for easier access
-    policy_config = master_config["policy"]
-    checkpointing_pretrained = master_config.get("checkpointing", {}).get(
-        "pretrained_checkpoint"
-    )
+    policy_config = master_config.policy
+    data_config = master_config.data
+    rm_config = master_config.rm
+    logger_config = master_config.logger
+    cluster_config = master_config.cluster
+    checkpointing_config = master_config.checkpointing
+
+    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
-    data_config = master_config["data"]
-    logger_config = master_config["logger"]
-    cluster_config = master_config["cluster"]
-    rm_config = master_config["rm"]
 
     # ==========================
     #         Logger
     # ==========================
     logger = Logger(logger_config)
-    logger.log_hyperparams(master_config)
+    logger.log_hyperparams(master_config.model_dump())
 
     # ==========================
     #      Checkpointing
     # ==========================
-    checkpointer = CheckpointManager(master_config["checkpointing"])
+    checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     rm_save_state: Optional[RMSaveState] = checkpointer.load_training_info(
         last_checkpoint_path
@@ -314,8 +315,8 @@ def validate_one_dataset(
 ):
     """Run validation on one validation dataset."""
     if val_dataloader is None:
-        assert val_dataloader is not None or master_config["dpo"]["val_period"] == 0, (
-            "val_dataloader is None, so dpo.val_period must be 0"
+        assert val_dataloader is not None or master_config.rm["val_period"] == 0, (
+            "val_dataloader is None, so rm.val_period must be 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation")
         return
@@ -439,7 +440,7 @@ def rm_train(
     # Run basic rm training
     timer = Timer()
     timeout = TimeoutChecker(
-        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -457,7 +458,7 @@ def rm_train(
             "total_valid_tokens", 0
         )  # Default to 0 for backward compatibility with older checkpoints
 
-    rm_config = master_config["rm"]
+    rm_config = master_config.rm
     # Validation configuration
     val_period = rm_config["val_period"]
     val_at_start = rm_config["val_at_start"]
@@ -483,14 +484,14 @@ def rm_train(
     policy.prepare_for_training()
 
     while current_epoch < max_num_epochs and (
-        master_config["rm"]["max_num_steps"] == -1
-        or total_steps < master_config["rm"]["max_num_steps"]
+        master_config.rm["max_num_steps"] == -1
+        or total_steps < master_config.rm["max_num_steps"]
     ):
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
         for batch in train_dataloader:
             print(
-                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['rm']['max_num_steps'] if master_config['rm']['max_num_steps'] != -1 else len(train_dataloader))} {'=' * 25}"
+                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config.rm['max_num_steps'] if master_config.rm['max_num_steps'] != -1 else len(train_dataloader))} {'=' * 25}"
             )
             maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
@@ -505,14 +506,14 @@ def rm_train(
                     eval_mode=False,
                     ## NOTE: we double the batch size here because each preference example corresponds to a pair of
                     ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
-                    gbs=master_config["policy"]["train_global_batch_size"] * 2,
-                    mbs=master_config["policy"]["train_micro_batch_size"] * 2,
+                    gbs=master_config.policy["train_global_batch_size"] * 2,
+                    mbs=master_config.policy["train_micro_batch_size"] * 2,
                     timer=timer,
                 )
 
                 is_last_step = (
-                    master_config["rm"]["max_num_steps"] != -1
-                    and total_steps + 1 >= master_config["rm"]["max_num_steps"]
+                    master_config.rm["max_num_steps"] != -1
+                    and total_steps + 1 >= master_config.rm["max_num_steps"]
                 ) or (
                     current_epoch + 1 == max_num_epochs
                     and current_step + 1 == len(train_dataloader)
@@ -549,18 +550,18 @@ def rm_train(
                 ## Checkpointing
                 timeout.mark_iteration()
 
-                rm_save_state["consumed_samples"] += master_config["policy"][
+                rm_save_state["consumed_samples"] += master_config.policy[
                     "train_global_batch_size"
                 ]
 
                 should_save_by_step = (
                     is_last_step
-                    or (total_steps + 1) % master_config["checkpointing"]["save_period"]
+                    or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
                 )
                 should_save_by_timeout = timeout.check_save()
 
-                if master_config["checkpointing"]["enabled"] and (
+                if master_config.checkpointing["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     ## +1 because step is 0-indexed
@@ -585,7 +586,7 @@ def rm_train(
                     if val_metrics is not None:
                         rm_save_state.update(val_metrics)
 
-                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
                         assert full_metric_name.startswith(
                             "train:"
@@ -631,7 +632,7 @@ def rm_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config["checkpointing"],
+                            checkpointing_cfg=master_config.checkpointing,
                         )
                         torch.save(
                             train_dataloader.state_dict(),
@@ -662,8 +663,8 @@ def rm_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             total_num_gpus = (
-                master_config["cluster"]["num_nodes"]
-                * master_config["cluster"]["gpus_per_node"]
+                master_config.cluster["num_nodes"]
+                * master_config.cluster["gpus_per_node"]
             )
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
@@ -679,8 +680,8 @@ def rm_train(
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if (
-                master_config["rm"]["max_num_steps"] != -1
-                and total_steps >= master_config["rm"]["max_num_steps"]
+                master_config.rm["max_num_steps"] != -1
+                and total_steps >= master_config.rm["max_num_steps"]
             ):
                 print(
                     "Max number of steps has been reached, stopping training early",

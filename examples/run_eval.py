@@ -95,7 +95,8 @@ def main():
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Print config
@@ -108,10 +109,10 @@ def main():
     is_random_dataset = config["data"].get("dataset_name") == "random"
 
     # Setup tokenizer — get_tokenizer handles both text-only and multimodal
-    is_multimodal = _is_multimodal_dataset(config["data"]["dataset_name"])
-    tokenizer = get_tokenizer(config["tokenizer"], get_processor=is_multimodal)
-    config["generation"] = configure_generation_config(
-        config["generation"], tokenizer, is_eval=True
+    is_multimodal = _is_multimodal_dataset(config.data["dataset_name"])
+    tokenizer = get_tokenizer(config.tokenizer, get_processor=is_multimodal)
+    config.generation = configure_generation_config(
+        config.generation, tokenizer, is_eval=True
     )
 
     # configure_generation_config sets load_format to 'auto' based on is_eval.
@@ -122,14 +123,14 @@ def main():
 
     # Setup data
     if config["data"].get("dataset_name") == "random":
-        (dataset, _, task_to_env, _) = setup_random_data(tokenizer, config["data"])
+        (dataset, _, task_to_env, _) = setup_random_data(tokenizer, config.data)
         env = task_to_env["random"]
     else:
         (
             dataset,
             env,
             tokenizer,
-        ) = setup_data(tokenizer, config["data"], config["env"])
+        ) = setup_data(tokenizer, config.data, config.env)
 
     # Setup
     (

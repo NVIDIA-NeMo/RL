@@ -32,6 +32,7 @@ import argparse
 import os
 
 from omegaconf import OmegaConf
+from rich.pretty import pprint
 from template_project.data_utils import create_batch_from
 
 from nemo_rl.algorithms.grpo import MasterConfig, refit_policy_generation
@@ -63,7 +64,7 @@ ACTOR_ENVIRONMENT_REGISTRY[
 
 def main(config: MasterConfig) -> None:
     # 0) Config
-    policy_config = config["policy"]
+    policy_config = config.policy
     tokenizer = get_tokenizer(policy_config["tokenizer"])
     policy_config["generation"] = configure_generation_config(
         policy_config["generation"], tokenizer
@@ -74,10 +75,10 @@ def main(config: MasterConfig) -> None:
     init_ray()
     cluster = RayVirtualCluster(
         name="single_update_cluster",
-        bundle_ct_per_node_list=[config["cluster"]["gpus_per_node"]]
-        * config["cluster"]["num_nodes"],
+        bundle_ct_per_node_list=[config.cluster["gpus_per_node"]]
+        * config.cluster["num_nodes"],
         use_gpus=True,
-        num_gpus_per_node=config["cluster"]["gpus_per_node"],
+        num_gpus_per_node=config.cluster["gpus_per_node"],
         max_colocated_worker_groups=1
         if policy_config["generation"]["backend"] == "megatron"
         else 2,
@@ -113,7 +114,7 @@ def main(config: MasterConfig) -> None:
 
     # 4.2) Run a method on all workers in parallel with different data
     print("\n▶ Running a method on all workers in parallel with different data...")
-    worker_nums = config["cluster"]["gpus_per_node"] * config["cluster"]["num_nodes"]
+    worker_nums = config.cluster["gpus_per_node"] * config.cluster["num_nodes"]
     input_list = [i for i in range(worker_nums)]
     results = policy.run_all_workers_multiple_data("return_input", input=input_list)
     print(f"  ✓ Results for return_input: {results}")
@@ -124,7 +125,7 @@ def main(config: MasterConfig) -> None:
 
     # Create tiny numeric batch and train with NLLLossFn
     print("\n▶ Creating tiny numeric batch and training with NLLLossFn...")
-    train_sentences = ["a b c d e hello", "a d f world"] * config["policy"][
+    train_sentences = ["a b c d e hello", "a d f world"] * config.policy[
         "train_global_batch_size"
     ]
     generation_prompts = [
@@ -225,9 +226,9 @@ if __name__ == "__main__":
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
-    from rich.pretty import pprint
 
     pprint(config)
 
