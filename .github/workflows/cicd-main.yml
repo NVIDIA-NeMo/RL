@@ -300,7 +300,6 @@ jobs:
         ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}-uv-cache:latest', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       build-args: |
         MAX_JOBS=4
-        SKIP_SGLANG_BUILD=1
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
 
   update-uv-cache:
