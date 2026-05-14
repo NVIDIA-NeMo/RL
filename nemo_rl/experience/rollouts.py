@@ -143,16 +143,20 @@ async def generate_responses_async(
         # Ensure the key exists even if it's None, matching GenerationDatumSpec
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
 
-    # Check if this is vLLM with async_engine enabled
+    # Async generation requires a backend that supports per-sample streaming
+    # (vLLM async_engine or TRT-LLM async_engine).
+    cfg = getattr(policy_generation, "cfg", None)
     use_async_generation = (
-        hasattr(policy_generation, "cfg")
-        and "vllm_cfg" in policy_generation.cfg
-        and policy_generation.cfg["vllm_cfg"]["async_engine"]
+        cfg is not None
         and hasattr(policy_generation, "generate_async")
+        and (
+            ("vllm_cfg" in cfg and cfg["vllm_cfg"].get("async_engine", False))
+            or ("trtllm_cfg" in cfg and cfg["trtllm_cfg"].get("async_engine", False))
+        )
     )
 
     assert use_async_generation, (
-        "Async generation is not enabled. Please enable async generation by setting async_engine=True in the vllm_cfg section of the policy config."
+        "Async generation is not enabled. Set async_engine=True in vllm_cfg or trtllm_cfg."
     )
 
     # Use async generation with per-sample streaming
@@ -1175,7 +1179,12 @@ def run_async_nemo_gym_rollout(
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
-        max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+        if "vllm_cfg" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+        elif "trtllm_cfg" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg["trtllm_cfg"]["max_model_len"]
+        else:
+            max_total_tokens_per_sample = policy_generation.cfg.get("max_total_sequence_length", 4096)
         all_sample_metrics = [
             {
                 "total_reward": r["full_result"]["reward"],
