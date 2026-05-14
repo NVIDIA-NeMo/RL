@@ -555,9 +555,11 @@ class TQDataPlaneClient(DataPlaneClient):
         wire_fields: TensorDict | None = None
         field_names: list[str] | None = None
         if fields is not None:
-            wire_fields = fields.detach().contiguous()
+            # pyrefly mis-infers ``TensorDict.contiguous()`` (functools.wraps-decorated)
+            # as ``Tensor | Unknown`` and emits a spurious ``_self`` missing-argument.
+            wire_fields = fields.detach().contiguous()  # type: ignore[bad-assignment,missing-argument]
             if self._promote_1d:
-                wire_fields = _promote_1d_leaves(wire_fields)
+                wire_fields = _promote_1d_leaves(wire_fields)  # type: ignore[bad-argument-type]
             field_names = list(wire_fields.keys())
 
         self._tq.kv_batch_put(
