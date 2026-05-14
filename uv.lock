@@ -4490,7 +4490,7 @@ requires-dist = [
     { name = "soundfile", specifier = ">=0.13.1" },
     { name = "swanlab" },
     { name = "sympy", specifier = ">=1.14.0" },
-    { name = "tau-bench", marker = "extra == 'tau-bench'", git = "https://github.com/sierra-research/tau-bench" },
+    { name = "tau-bench", marker = "extra == 'tau-bench'", git = "https://github.com/sierra-research/tau-bench?rev=59a200c6d575d595120f1cb70fea53cef0632f6b" },
     { name = "tensorboard" },
     { name = "tiktoken" },
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "==2.10.0", index = "https://download.pytorch.org/whl/cu129" },
@@ -7715,7 +7715,7 @@ wheels = [
 [[package]]
 name = "tau-bench"
 version = "0.1.0"
-source = { git = "https://github.com/sierra-research/tau-bench#59a200c6d575d595120f1cb70fea53cef0632f6b" }
+source = { git = "https://github.com/sierra-research/tau-bench?rev=59a200c6d575d595120f1cb70fea53cef0632f6b#59a200c6d575d595120f1cb70fea53cef0632f6b" }
 dependencies = [
     { name = "anthropic" },
     { name = "litellm" },

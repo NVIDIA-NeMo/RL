@@ -73,10 +73,13 @@ def _tokenize_env_observation(
     "tool") — currently only tau_bench.  Passing a non-standard role (e.g.
     "environment") to apply_chat_template would produce incorrect output.
     """
-    if not use_chat_template or getattr(tokenizer, "chat_template", None) is None:
+    if not use_chat_template:
         return tokenizer(
             obs_content, return_tensors="pt", add_special_tokens=False
         ).input_ids[0]
+
+
+    assert getattr(tokenizer, "chat_template", None) is not None
 
     # Use a minimal two-message sequence to extract the incremental tokens for
     # this observation.  The dummy prior message makes the template generate
