@@ -374,23 +374,9 @@ class TQWorkerMixin:
         """
         if not self._is_writeback_leader() or not fields:
             return
-        from tensordict import TensorDict
+        from nemo_rl.data_plane.column_io import write_columns
 
-        from nemo_rl.data_plane.codec import maybe_pack_jagged
-
-        seq_lens = meta.sequence_lengths
-        if seq_lens is not None:
-            lengths = torch.tensor(seq_lens, dtype=torch.long)
-            packed = {k: maybe_pack_jagged(v, lengths) for k, v in fields.items()}
-        else:
-            packed = {k: v.detach().contiguous() for k, v in fields.items()}
-
-        td = TensorDict(packed, batch_size=[len(meta.keys)])
-        self._require_dp_client().kv_batch_put(
-            keys=meta.keys,
-            partition_id=meta.partition_id,
-            fields=td,
-        )
+        write_columns(self._require_dp_client(), meta, fields)
 
     def _write_back_result_field(
         self,

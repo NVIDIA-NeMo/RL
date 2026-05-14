@@ -161,6 +161,57 @@ def maybe_pack_jagged(
     return to_nested_by_length(val.detach(), lengths)
 
 
+def pack_jagged_fields(
+    fields: "dict[str, torch.Tensor | np.ndarray]",
+    *,
+    lengths: torch.Tensor | None,
+) -> TensorDict:
+    """Pack a column dict into the wire layout expected by ``kv_batch_put``.
+
+    Zero-copy where possible: per-token tensors that match
+    ``(N, max(lengths), ...)`` become ``torch.jagged`` views via
+    :func:`maybe_pack_jagged`; non-conforming tensors pass through
+    rectangular; ``np.ndarray(dtype=object)`` is forwarded as-is. This
+    is a **layout transform**, not serialization — the on-wire bytes are
+    produced later by the TQ backend's msgpack encoder. Centralizing
+    the transform here makes it the single source of truth for both
+    :func:`kv_first_write` and :func:`write_columns`.
+
+    Args:
+        fields: Column name → tensor or object array. Other value types
+            raise ``TypeError``.
+        lengths: Per-row valid lengths used by :func:`maybe_pack_jagged`
+            to decide whether a tensor qualifies for jagged conversion.
+            ``None`` disables jagged conversion entirely (every tensor
+            passes through rectangular).
+
+    Returns:
+        ``TensorDict`` with ``batch_size=[N]`` (N from ``lengths`` if
+        given, else 0) ready for ``kv_batch_put``.
+    """
+    n = int(lengths.shape[0]) if lengths is not None else 0
+    packed: dict[str, Any] = {}
+    for k, v in fields.items():
+        if isinstance(v, np.ndarray) and v.dtype == object:
+            # tensordict==0.12.2 wire bug: a NonTensorStack stored as a
+            # TensorDict leaf returns as a LinkedList on parent
+            # __getitem__, losing identity. ndarray(dtype=object)
+            # round-trips intact.
+            packed[k] = v
+        elif isinstance(v, torch.Tensor):
+            packed[k] = (
+                maybe_pack_jagged(v, lengths)
+                if lengths is not None
+                else v.detach().contiguous()
+            )
+        else:
+            raise TypeError(
+                f"pack_jagged_fields: unsupported value type for {k!r}: {type(v)}. "
+                "Use torch.Tensor or np.ndarray(dtype=object)."
+            )
+    return TensorDict(packed, batch_size=[n])
+
+
 def pack_per_token_field(val: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     """Force-jaggedize a known per-token field, tolerating SP padding.
 

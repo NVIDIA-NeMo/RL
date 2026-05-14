@@ -11,24 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sync GRPO data-plane helpers — sibling of ``async_utils``.
+"""Sync GRPO rollout actor — sibling of ``async_utils``.
 
-Houses the sync 1-hop counterparts to ``async_utils.AsyncTrajectoryCollector``
-and ``async_utils.ReplayBuffer``:
-
-* :func:`kv_first_write` — the flat first-write primitive: a single
-  ``kv_batch_put`` of every tensor field under per-sample keys
-  ``f"{uid}_g{i}"``.
-
-* :class:`SyncRolloutActor` — the Ray actor that owns the
-  multi-turn rollout loop AND the post-rollout flatten / mask /
-  prompt extraction / reward shaping / baseline-std for a sync GRPO
-  step. The driver dispatches a per-step prompt batch + uids; the
-  actor runs ``run_multi_turn_rollout`` (or async / nemo_gym variants),
-  then writes the bulk schema to TQ via :func:`kv_first_write`. Only a
-  ``KVBatchMeta`` and a small per-sample slice (rewards, masks,
-  lengths, baseline/std, prompt_ids_for_adv) cross back to the driver
-  via Ray.
+Houses :class:`SyncRolloutActor`, the Ray actor that owns the multi-turn
+rollout loop AND the post-rollout flatten / mask / prompt extraction /
+reward shaping / baseline-std for a sync GRPO step. The driver dispatches
+a per-step prompt batch + uids; the actor runs ``run_multi_turn_rollout``
+(or async / nemo_gym variants), then writes the bulk schema to TQ via
+:func:`nemo_rl.data_plane.column_io.kv_first_write`. Only a ``KVBatchMeta``
+and a small per-sample slice (rewards, masks, lengths, baseline/std,
+prompt_ids_for_adv) cross back to the driver via Ray.
 
 **Goal — rollout 1-hop put**: bulk tensors (input_ids, output_ids,
 attention_mask, position_ids, multi_modal_inputs, generation_logprobs,
@@ -36,7 +28,7 @@ token_mask) stay actor-side until ``kv_batch_put``, then live only in
 TQ. Driver never holds these bytes between rollout finish and train
 fan-out.
 
-The collector is the sync counterpart to
+The actor is the sync counterpart to
 :class:`nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector`. It
 intentionally does not buffer or stream — sync GRPO consumes the whole
 step batch in one call.
@@ -44,14 +36,13 @@ step batch in one call.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 import numpy as np
 import ray
-import torch
-from tensordict import TensorDict
 
-from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
+from nemo_rl.data_plane.column_io import kv_first_write
+from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
@@ -60,84 +51,6 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
-
-
-def kv_first_write(
-    final_batch_cpu: BatchedDataDict[Any],
-    *,
-    uids: Sequence[str],
-    dp_client: DataPlaneClient,
-    partition_id: str,
-    extra_info: Optional[dict[str, Any]] = None,
-    task_name: str = "train",
-    pad_to_multiple: int = 1,
-) -> KVBatchMeta:
-    """Single flat ``kv_batch_put`` of every tensor field in ``final_batch_cpu``.
-
-    Keys ``f"{uid}_g{i}"``; no DP awareness, no fan-out. Bulk lives in
-    TQ from here on. Variable-length tensor fields are jagged-packed via
-    :func:`to_nested_by_length`; non-tensor leaves ride as
-    ``NonTensorStack`` (TQ handles non-tensor encoding per backend).
-    Padding is paid only at consumer side via :func:`materialize`.
-
-    Args:
-        final_batch_cpu: Rollout output already on CPU.
-        uids: Per-prompt UIDs; each row gets ``f"{uid}_g{i}"``.
-        dp_client: Data-plane client used for the put.
-        partition_id: TQ partition to write into.
-        extra_info: Optional extra fields to attach to the returned meta.
-        task_name: Consumer task tag stamped on the returned meta.
-        pad_to_multiple: Seq-dim alignment recorded in ``extra_info`` so
-            readers pad to a multiple compatible with downstream backends
-            (mcore SP, PyTorch CP).
-
-    Returns:
-        ``KVBatchMeta`` covering the written keys.
-    """
-    from nemo_rl.data_plane.codec import maybe_pack_jagged
-
-    n = int(final_batch_cpu["sample_mask"].shape[0])
-    if n == 0 or len(uids) == 0 or n % len(uids) != 0:
-        raise ValueError(
-            f"final_batch_cpu has {n} samples; not divisible by len(uids)={len(uids)}"
-        )
-    n_gen = n // len(uids)
-    keys = [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]
-    lengths = final_batch_cpu["input_lengths"]
-
-    wire: dict[str, Any] = {}
-    for k, v in final_batch_cpu.items():
-        if isinstance(v, torch.Tensor):
-            wire[k] = maybe_pack_jagged(v, lengths)
-        elif isinstance(v, np.ndarray) and v.dtype == object:
-            # Pass object arrays as ndarray, not NonTensorStack: under
-            # tensordict==0.12.2, a NonTensorStack stored as a TensorDict
-            # leaf is returned as an internal LinkedList on parent
-            # __getitem__, which loses identity in TQ's wire path.
-            # ndarray(dtype=object) round-trips through TensorDict intact.
-            wire[k] = v
-
-    bulk = TensorDict(wire, batch_size=[n])
-    dp_client.kv_batch_put(
-        keys=keys,
-        partition_id=partition_id,
-        fields=bulk,
-    )
-
-    extras = dict(extra_info or {})
-    if pad_to_multiple > 1:
-        # Reader pads jagged fields up to this multiple so downstream
-        # backends (mcore SP, PyTorch CP) get sequence dims that satisfy
-        # their own divisibility asserts.
-        extras["pad_to_multiple"] = int(pad_to_multiple)
-    return KVBatchMeta(
-        partition_id=partition_id,
-        task_name=task_name,
-        keys=keys,
-        fields=list(wire.keys()),
-        sequence_lengths=[int(s) for s in lengths.tolist()],
-        extra_info=extras,
-    )
 
 
 @ray.remote  # pragma: no cover
@@ -351,13 +264,20 @@ class SyncRolloutActor:
         for k in get_gdpo_reward_component_keys(fb):
             slice_extras[k] = fb[k]
 
+        n_samples = int(bulk_batch["sample_mask"].shape[0])
+        if len(uids) == 0 or n_samples % len(uids) != 0:
+            raise ValueError(
+                f"bulk_batch has {n_samples} samples; not divisible by len(uids)={len(uids)}"
+            )
+        n_gen = n_samples // len(uids)
+        keys = [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]
         meta = kv_first_write(
             bulk_batch,
-            uids=uids,
+            keys=keys,
             dp_client=self._dp_client,
             partition_id=partition_id,
             extra_info={"rollout_metrics": rollout_metrics},
-            task_name="train" if partition_id == "train" else partition_id,
+            task_name=partition_id,
             pad_to_multiple=int(
                 cfg["policy"].get("make_sequence_length_divisible_by") or 1
             ),

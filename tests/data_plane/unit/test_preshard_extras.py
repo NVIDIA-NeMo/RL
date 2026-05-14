@@ -31,10 +31,14 @@ import torch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.sync_rollout_actor import kv_first_write
+
+
+def _keys_from_uids(uids: list[str], n_gen: int = 1) -> list[str]:
+    return [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]
 
 
 def _final_batch(n_samples: int = 4, *, with_extras: bool = False) -> BatchedDataDict:
@@ -66,7 +70,9 @@ def test_kv_first_write_writes_seed_fields():
     _setup_partition(client, num_samples=4)
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
-    meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
+    meta = kv_first_write(
+        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+    )
     # Every tensor field in the input lands in TQ under f"{uid}_g0".
     assert meta.keys == [f"u{i}_g0" for i in range(4)]
     fetched = client.kv_batch_get(
@@ -83,7 +89,9 @@ def test_kv_first_write_carries_multimodal_extras():
     _setup_partition(client, num_samples=4)
     fb = _final_batch(4, with_extras=True)
     uids = [f"u{i}" for i in range(4)]
-    meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
+    meta = kv_first_write(
+        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+    )
     assert "pixel_values" in (meta.fields or [])
     fetched = client.kv_batch_get(
         keys=meta.keys,
@@ -94,12 +102,14 @@ def test_kv_first_write_carries_multimodal_extras():
 
 
 def test_kv_first_write_keys_match_uids_x_ngen():
-    """Keys are f"{uid}_g{i}"; n_gen inferred from sample_mask shape vs uids."""
+    """Keys round-trip: caller mints ``f"{uid}_g{i}"``, helper preserves them
+    in ``meta.keys`` byte-for-byte."""
     client = NoOpDataPlaneClient()
     _setup_partition(client, num_samples=6)
     fb = _final_batch(6)  # 3 prompts × 2 generations
     uids = ["a", "b", "c"]
-    meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
+    keys = _keys_from_uids(uids, n_gen=2)
+    meta = kv_first_write(fb, keys=keys, dp_client=client, partition_id="train")
     assert meta.keys == ["a_g0", "a_g1", "b_g0", "b_g1", "c_g0", "c_g1"]
 
 

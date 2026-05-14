@@ -22,21 +22,20 @@ equivalents on ``AbstractPolicyWorker`` (``self._fetch(meta)`` /
 
   * :func:`read_columns` — ``kv_batch_get + materialize`` (decode jagged
     + object-array fields into a :class:`BatchedDataDict`).
-  * :func:`write_columns` — encode jagged / object-array fields and
-    ``kv_batch_put`` the result.
+  * :func:`write_columns` — pack-to-wire + ``kv_batch_put`` for deltas
+    against an existing :class:`KVBatchMeta`.
+  * :func:`kv_first_write` — pack-to-wire + ``kv_batch_put`` for the
+    rollout-actor's first put of a partition. Returns a new
+    :class:`KVBatchMeta`.
 """
 
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
-from tensordict import TensorDict
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
-from nemo_rl.data_plane.codec import (
-    materialize,
-    maybe_pack_jagged,
-)
+from nemo_rl.data_plane.codec import materialize, pack_jagged_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import Layout
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -93,10 +92,9 @@ def write_columns(
     """``kv_batch_put(meta.keys, fields=...)``.
 
     Per-token tensor fields are converted to jagged via
-    :func:`maybe_pack_jagged` so they land in TQ with the same row
-    lengths as the initial put. ``np.ndarray(dtype=object)`` leaves are
-    wrapped in ``NonTensorStack`` — TQ handles non-tensor encoding per
-    backend.
+    :func:`pack_jagged_fields` so they land in TQ with the same row
+    lengths as the initial put. ``np.ndarray(dtype=object)`` leaves
+    pass through as-is.
 
     Args:
         dp_client: Data-plane client used for the underlying put.
@@ -108,28 +106,76 @@ def write_columns(
 
     seq_lens = meta.sequence_lengths
     lengths = torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
-
-    packed: dict[str, Any] = {}
-    for k, v in fields.items():
-        if isinstance(v, np.ndarray) and v.dtype == object:
-            # Pass through as ndarray; see kv_first_write for the
-            # tensordict==0.12.2 NonTensorStack→LinkedList rationale.
-            packed[k] = v
-        elif isinstance(v, torch.Tensor):
-            packed[k] = (
-                maybe_pack_jagged(v, lengths)
-                if lengths is not None
-                else v.detach().contiguous()
-            )
-        else:
-            raise TypeError(
-                f"write_columns: unsupported value type for {k!r}: {type(v)}. "
-                "Use torch.Tensor or np.ndarray(dtype=object)."
-            )
-
-    td = TensorDict(packed, batch_size=[len(meta.keys)])
+    td = pack_jagged_fields(fields, lengths=lengths)
     dp_client.kv_batch_put(
         keys=meta.keys,
         partition_id=meta.partition_id,
         fields=td,
+    )
+
+
+def kv_first_write(
+    final_batch_cpu: BatchedDataDict[Any],
+    *,
+    keys: Sequence[str],
+    dp_client: DataPlaneClient,
+    partition_id: str,
+    extra_info: dict[str, Any] | None = None,
+    task_name: str = "train",
+    pad_to_multiple: int = 1,
+) -> KVBatchMeta:
+    """Single flat ``kv_batch_put`` of every tensor field in ``final_batch_cpu``.
+
+    The rollout actor's first put of a partition. Caller mints
+    ``keys`` (verl-style) — the helper is rollout-shape-agnostic.
+
+    Args:
+        final_batch_cpu: Rollout output already on CPU. Must contain
+            ``"sample_mask"`` (used as batch-size oracle: ``shape[0] == N``)
+            and ``"input_lengths"`` (per-row valid lengths for the jagged
+            pack). Tensor fields are packed jagged via
+            :func:`pack_jagged_fields`; ``np.ndarray(dtype=object)``
+            leaves pass through.
+        keys: Pre-minted per-sample keys, one per row of
+            ``final_batch_cpu``.
+        dp_client: Data-plane client used for the put.
+        partition_id: TQ partition to write into.
+        extra_info: Optional extra fields to attach to the returned meta.
+        task_name: Consumer task tag stamped on the returned meta.
+        pad_to_multiple: Seq-dim alignment recorded in ``extra_info`` so
+            readers pad to a multiple compatible with downstream backends
+            (mcore SP, PyTorch CP).
+
+    Returns:
+        ``KVBatchMeta`` covering the written keys.
+    """
+    n = int(final_batch_cpu["sample_mask"].shape[0])
+    if n == 0 or len(keys) != n:
+        raise ValueError(
+            f"kv_first_write: keys ({len(keys)}) must match batch size ({n})"
+        )
+    lengths = final_batch_cpu["input_lengths"]
+    fields: Mapping[str, torch.Tensor | np.ndarray] = {
+        k: v
+        for k, v in final_batch_cpu.items()
+        if isinstance(v, torch.Tensor)
+        or (isinstance(v, np.ndarray) and v.dtype == object)
+    }
+    td = pack_jagged_fields(fields, lengths=lengths)
+    dp_client.kv_batch_put(
+        keys=list(keys),
+        partition_id=partition_id,
+        fields=td,
+    )
+
+    extras = dict(extra_info or {})
+    if pad_to_multiple > 1:
+        extras["pad_to_multiple"] = int(pad_to_multiple)
+    return KVBatchMeta(
+        partition_id=partition_id,
+        task_name=task_name,
+        keys=list(keys),
+        fields=list(td.keys()),
+        sequence_lengths=[int(s) for s in lengths.tolist()],
+        extra_info=extras,
     )

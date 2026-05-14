@@ -30,11 +30,14 @@ import torch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
-from nemo_rl.data_plane.column_io import read_columns, write_columns
+from nemo_rl.data_plane.column_io import kv_first_write, read_columns, write_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.sync_rollout_actor import kv_first_write
+
+
+def _keys_from_uids(uids: list[str], n_gen: int = 1) -> list[str]:
+    return [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]
 
 
 def _final_batch(n: int = 4) -> BatchedDataDict:
@@ -69,7 +72,9 @@ def test_write_columns_lands_in_tq():
     _setup(client, n=4)
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
-    meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
+    meta = kv_first_write(
+        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+    )
 
     # Driver delta-write: simulates advantage compute on the trainer.
     delta = {"advantages": torch.full((4,), 7.5)}
@@ -88,7 +93,9 @@ def test_read_columns_returns_only_requested_fields():
     _setup(client, n=4)
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
-    meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
+    meta = kv_first_write(
+        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+    )
 
     bdd = read_columns(client, meta, ["input_ids", "input_lengths"])
     assert "input_ids" in bdd
@@ -103,7 +110,9 @@ def test_write_then_read_roundtrip_after_train_window():
     _setup(client, n=4)
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
-    meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
+    meta = kv_first_write(
+        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+    )
 
     # Simulate the full sync 1-hop trainer-step writes:
     write_columns(
@@ -143,7 +152,9 @@ def test_meta_keys_identity_across_dp_shards():
     _setup(client, n=8)
     fb = _final_batch(8)
     uids = [f"u{i}" for i in range(8)]
-    meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
+    meta = kv_first_write(
+        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+    )
 
     rank_metas, _ = shard_meta_for_dp(meta, dp_world=4, batch_size=8)
     flat = {k for m in rank_metas for k in m.keys}
@@ -162,7 +173,9 @@ def test_kv_clear_uses_meta_keys_minted_at_rollout():
     _setup(client, n=4)
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
-    meta = kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
+    meta = kv_first_write(
+        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+    )
     rollout_keys = list(meta.keys)
 
     # Workers / driver write deltas — keys still meta.keys.
@@ -213,7 +226,9 @@ def _seed_meta(client: NoOpDataPlaneClient, prefix: str, n: int) -> KVBatchMeta:
     _setup(client, n=n)
     fb = _final_batch(n)
     uids = [f"{prefix}{i}" for i in range(n)]
-    return kv_first_write(fb, uids=uids, dp_client=client, partition_id="train")
+    return kv_first_write(
+        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+    )
 
 
 def test_apply_dynamic_sampling_filters_zero_std():

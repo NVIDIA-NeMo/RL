@@ -31,7 +31,11 @@ from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.sync_rollout_actor import kv_first_write
+from nemo_rl.data_plane.column_io import kv_first_write
+
+
+def _keys_from_uids(uids: list[str], n_gen: int = 1) -> list[str]:
+    return [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]
 
 # ── helpers ────────────────────────────────────────────────────────────
 
@@ -70,7 +74,9 @@ def test_kv_batch_get_after_clear_raises() -> None:
     client = NoOpDataPlaneClient()
     _setup(client, n=2)
     fb = _final_batch(2)
-    meta = kv_first_write(fb, uids=["a", "b"], dp_client=client, partition_id="train")
+    meta = kv_first_write(
+        fb, keys=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+    )
 
     client.kv_clear(keys=meta.keys, partition_id="train")
 
@@ -89,7 +95,9 @@ def test_kv_batch_get_unproduced_field_raises() -> None:
     client = NoOpDataPlaneClient()
     _setup(client, n=2)
     fb = _final_batch(2)
-    meta = kv_first_write(fb, uids=["a", "b"], dp_client=client, partition_id="train")
+    meta = kv_first_write(
+        fb, keys=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+    )
 
     # ``advantages`` has not been written yet (driver delta-write).
     with pytest.raises(KeyError):
@@ -105,7 +113,9 @@ def test_get_data_without_select_fields_raises() -> None:
     client = NoOpDataPlaneClient()
     _setup(client, n=2)
     fb = _final_batch(2)
-    kv_first_write(fb, uids=["a", "b"], dp_client=client, partition_id="train")
+    kv_first_write(
+        fb, keys=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+    )
 
     bare_meta = KVBatchMeta(
         partition_id="train",
@@ -169,7 +179,9 @@ def test_kv_clear_with_none_drops_partition() -> None:
     client = NoOpDataPlaneClient()
     _setup(client, n=2)
     fb = _final_batch(2)
-    meta = kv_first_write(fb, uids=["a", "b"], dp_client=client, partition_id="train")
+    meta = kv_first_write(
+        fb, keys=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+    )
 
     client.kv_clear(keys=None, partition_id="train")
 
@@ -204,7 +216,9 @@ def test_check_consumption_status_only_true_when_all_consumed() -> None:
     client = NoOpDataPlaneClient()
     _setup(client, n=2)
     fb = _final_batch(2)
-    meta = kv_first_write(fb, uids=["a", "b"], dp_client=client, partition_id="train")
+    meta = kv_first_write(
+        fb, keys=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+    )
     # No consumer has fetched yet.
     assert not client.check_consumption_status("train", ["train"])
 
@@ -232,7 +246,7 @@ def test_shard_meta_for_dp_partitions_keys_disjointly() -> None:
     fb = _final_batch(8)
     meta = kv_first_write(
         fb,
-        uids=[f"u{i}" for i in range(8)],
+        keys=_keys_from_uids([f"u{i}" for i in range(8)]),
         dp_client=client,
         partition_id="train",
     )
@@ -254,7 +268,7 @@ def test_shard_meta_for_dp_keeps_partition_id() -> None:
     fb = _final_batch(4)
     meta = kv_first_write(
         fb,
-        uids=[f"u{i}" for i in range(4)],
+        keys=_keys_from_uids([f"u{i}" for i in range(4)]),
         dp_client=client,
         partition_id="train",
     )
@@ -283,7 +297,7 @@ def test_kv_first_write_carries_multimodal_extras_through_tq() -> None:
 
     meta = kv_first_write(
         fb,
-        uids=[f"u{i}" for i in range(4)],
+        keys=_keys_from_uids([f"u{i}" for i in range(4)]),
         dp_client=client,
         partition_id="train",
     )
@@ -354,7 +368,9 @@ def test_write_columns_accepts_batched_data_dict_input() -> None:
     client = NoOpDataPlaneClient()
     _setup(client, n=2)
     fb = _final_batch(2)
-    meta = kv_first_write(fb, uids=["a", "b"], dp_client=client, partition_id="train")
+    meta = kv_first_write(
+        fb, keys=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+    )
 
     bdd = BatchedDataDict()
     bdd["advantages"] = torch.full((2,), 3.0)
@@ -370,17 +386,17 @@ def test_write_columns_accepts_batched_data_dict_input() -> None:
 # ── kv_first_write key-mint contract ────────────────────────────────────
 
 
-def test_kv_first_write_rejects_indivisible_batch() -> None:
-    """If the flattened batch isn't divisible by len(uids), keys would
-    silently mis-align. Must fail loud."""
+def test_kv_first_write_rejects_key_count_mismatch() -> None:
+    """If ``len(keys) != n_samples``, keys would silently mis-align.
+    Must fail loud. (Caller-side ``n % len(uids) == 0`` is now enforced
+    at the rollout actor — see ``SyncRolloutActor.rollout_and_first_put``.)"""
     client = NoOpDataPlaneClient()
     _setup(client, n=5)
-    # 5 samples, 2 uids → not divisible by num_generations.
     fb = _final_batch(5)
-    with pytest.raises(ValueError, match=r"divisible"):
+    with pytest.raises(ValueError, match=r"must match batch size"):
         kv_first_write(
             fb,
-            uids=["a", "b"],
+            keys=["a_g0", "b_g0"],  # 2 keys for a 5-sample batch
             dp_client=client,
             partition_id="train",
         )
@@ -396,7 +412,7 @@ def test_kv_first_write_meta_sequence_lengths_match_input_lengths() -> None:
 
     meta = kv_first_write(
         fb,
-        uids=[f"u{i}" for i in range(4)],
+        keys=_keys_from_uids([f"u{i}" for i in range(4)]),
         dp_client=client,
         partition_id="train",
     )
