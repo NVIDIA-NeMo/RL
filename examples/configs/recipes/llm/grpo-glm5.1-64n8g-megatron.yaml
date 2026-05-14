@@ -3,9 +3,6 @@ grpo:
   max_num_steps: 30
   num_prompts_per_step: 8
   num_generations_per_prompt: 8
-  val_period: 8
-  val_batch_size: 8
-  max_val_samples: 8
 loss_fn:
   use_importance_sampling_correction: true
 checkpointing:
@@ -48,18 +45,11 @@ policy:
       lr_warmup_iters: 2
       lr_warmup_init: 5.0e-08
   generation:
-    max_new_tokens: 512
     vllm_cfg:
       tensor_parallel_size: 32
       expert_parallel_size: 128
       gpu_memory_utilization: 0.5
-      max_model_len: 2048
       enforce_eager: true
-    vllm_kwargs:
-      max_num_batched_tokens: 2048
-      max_num_seqs: 4
-data:
-  max_input_seq_length: 512
 logger:
   log_dir: logs/grpo-glm5.1-64n8g-megatron
   wandb_enabled: true
