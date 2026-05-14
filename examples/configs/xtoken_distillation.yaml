@@ -14,7 +14,11 @@ distillation:
   val_at_end: false
 
 loss_fn:
-  projection_matrix_path: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/avenkateshha/nemo_rl/RL/cross_tokenizer_data/llama_qwen_best_special_exact_map_remapped.pt"
+  # Path to the (student, teacher) projection matrix .pt file. Override via
+  # Hydra CLI per run, e.g.
+  #   loss_fn.projection_matrix_path=/path/to/projection_matrix.pt
+  # See docs/guides/xtoken-distillation.md for how to produce this file.
+  projection_matrix_path: null
   # Loss-mode selection:
   #   gold_loss=false                    -> P-KL: full-vocab teacher logits
   #     transported via IPC; the loss derives a microbatch-global top-k
