@@ -42,7 +42,7 @@ dependencies = [
   "plotly",
   "sympy>=1.14.0",
   "pillow>=12.1.1",
-  "torchvision==0.25.0",
+  "torchvision==0.26.0",
   "transformers==5.3.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
   "mlflow>=3.11.1",
@@ -88,11 +88,11 @@ vllm = [
   # +cu130 wheels from GitHub match torch (pytorch-cu130). PyPI can resolve to +cu12
   # binaries on Linux (e.g. libcudart.so.12 vs torch cu13). See v0.17.1 release assets:
   # https://github.com/vllm-project/vllm/releases/tag/v0.17.1
-  "vllm==0.17.1",
+  "vllm==0.20.1",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.4",
-  "flashinfer-cubin==0.6.4",
-  "nvidia-cutlass-dsl>=4.4.0.dev1",
+  "flashinfer-python==0.6.9",
+  "flashinfer-cubin==0.6.9",
+  "nvidia-cutlass-dsl>=4.5.0",
 ]
 sglang = [
   "sglang",
