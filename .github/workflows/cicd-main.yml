@@ -311,7 +311,7 @@ jobs:
         github.ref == 'refs/heads/main' &&
         needs.build-container.result == 'success'
       }}
-    runs-on: ${{ contains(needs.org-member-pre-flight.outputs.runner_prefix, 'azure') && format('{0}-gpu-x2', needs.org-member-pre-flight.outputs.runner_prefix) || format('{0}-gpu-x2', needs.org-member-pre-flight.outputs.runner_prefix) }}
+    runs-on: ${{ format('{0}-gpu-x2', needs.org-member-pre-flight.outputs.runner_prefix) }}
     environment: nemo-ci
     env:
       REGISTRY: ${{ needs.org-member-pre-flight.outputs.registry }}
