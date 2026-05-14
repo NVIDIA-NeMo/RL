@@ -272,7 +272,8 @@ def materialize(
         raise ValueError(f"pad_to_multiple must be >= 1, got {pad_to_multiple}")
     pads = pad_value_dict or {}
     out: dict[str, Any] = {}
-    for key, val in td.items(include_nested=False):
+    # pyrefly: inference cycle on tensordict.items() loop var.
+    for key, val in td.items(include_nested=False):  # type: ignore[bad-assignment]
         if isinstance(val, NonTensorStack):
             # ``np.asarray(list, dtype=object)`` would probe each item's
             # ``__iter__`` to detect a nested array. A wire-stripped TD

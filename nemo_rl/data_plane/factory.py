@@ -62,5 +62,6 @@ def build_data_plane_client(
         )
 
         on_event = obs.get("callback") or log_event
-        client = MetricsDataPlaneClient(client, on_event=on_event)
+        # pyrefly: obs.get returns Any, can't narrow to the expected callback type.
+        client = MetricsDataPlaneClient(client, on_event=on_event)  # type: ignore[bad-argument-type]
     return client
