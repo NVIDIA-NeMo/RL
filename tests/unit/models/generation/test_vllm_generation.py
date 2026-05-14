@@ -110,42 +110,6 @@ def test_base_vllm_worker_rejects_invalid_output_len_generator():
         BaseVllmGenerationWorker(config=config, bundle_indices=None)
 
 
-def test_vllm_generate_text_drops_stop_token_ids_when_ignore_eos():
-    from nemo_rl.models.generation.vllm import VllmGenerationWorker
-
-    worker_cls = VllmGenerationWorker.__ray_metadata__.modified_class
-    worker = worker_cls.__new__(worker_cls)
-    worker.cfg = deepcopy(basic_vllm_test_config)
-    worker.cfg["ignore_eos"] = True
-    worker.cfg["stop_token_ids"] = [1, 2]
-    worker.cfg["max_new_tokens"] = 8
-    worker.output_len_generator = lambda _: 3
-
-    class FakeSamplingParams:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-    class FakeLLM:
-        def __init__(self):
-            self.sampling_params = None
-
-        def generate(self, prompts, sampling_params):
-            self.sampling_params = sampling_params
-            output = MagicMock()
-            output.outputs = [MagicMock(text="synthetic")]
-            return [output for _ in prompts]
-
-    worker.SamplingParams = FakeSamplingParams
-    worker.llm = FakeLLM()
-
-    result = worker.generate_text(BatchedDataDict({"prompts": ["prompt"]}))
-
-    assert result["texts"] == ["synthetic"]
-    assert worker.llm.sampling_params.kwargs["ignore_eos"] is True
-    assert worker.llm.sampling_params.kwargs["stop_token_ids"] == []
-    assert worker.llm.sampling_params.kwargs["max_tokens"] == 3
-
-
 basic_dtensor_test_config: PolicyConfig = {
     "model_name": basic_vllm_test_config["model_name"],
     "tokenizer": {
@@ -250,6 +214,15 @@ def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refi
     )
 
     assert configured["vllm_cfg"]["load_format"] == "dummy"
+
+
+def test_configure_generation_config_sets_stop_token_ids_to_empty_list_if_ignore_eos_is_true():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["ignore_eos"] = True
+    tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+
+    configured = configure_generation_config(vllm_config, tokenizer)
+    assert configured["stop_token_ids"] == []
 
 
 def get_basic_megatron_test_config(
