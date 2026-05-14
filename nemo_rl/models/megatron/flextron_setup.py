@@ -22,10 +22,17 @@ _FLEXTRON_EMB_LAYER_TYPES = frozenset(("M", "E", "*"))
 
 
 def _validate_flextron_config(config: PolicyConfig, model_cfg: Any) -> None:
-    """Validate and resolve deterministic Flextron route config."""
-    megatron_cfg = config["megatron_cfg"]
-    flex_routers = megatron_cfg.get("flex_routers", None)
-    sampling_rates = megatron_cfg.get("flextron_sampling_rates", None)
+    """Validate and resolve deterministic Flextron route config.
+
+    Reads from the top-level ``policy.flextron`` block. When the block is
+    missing or ``flex_routers`` is empty, leaves ``model_cfg`` unchanged.
+    """
+    flextron_cfg = config.get("flextron")
+    if flextron_cfg is None:
+        return
+
+    flex_routers = flextron_cfg.get("flex_routers")
+    sampling_rates = flextron_cfg.get("flextron_sampling_rates")
     if flex_routers == []:
         flex_routers = None
     if sampling_rates == []:
@@ -35,16 +42,25 @@ def _validate_flextron_config(config: PolicyConfig, model_cfg: Any) -> None:
         return
     if flex_routers is None:
         raise ValueError(
-            "policy.megatron_cfg.flextron_sampling_rates requires "
-            "policy.megatron_cfg.flex_routers."
+            "policy.flextron.flextron_sampling_rates requires "
+            "policy.flextron.flex_routers."
         )
     if sampling_rates is None:
         raise ValueError(
-            "policy.megatron_cfg.flex_routers requires "
-            "policy.megatron_cfg.flextron_sampling_rates."
+            "policy.flextron.flex_routers requires "
+            "policy.flextron.flextron_sampling_rates."
         )
     if not isinstance(flex_routers, list):
-        raise TypeError("policy.megatron_cfg.flex_routers must be a list.")
+        raise TypeError("policy.flextron.flex_routers must be a list.")
+
+    if "on_policy" not in flextron_cfg:
+        raise ValueError(
+            "policy.flextron.on_policy is required when "
+            "policy.flextron.flex_routers is set."
+        )
+    on_policy = flextron_cfg["on_policy"]
+    if not isinstance(on_policy, bool):
+        raise TypeError("policy.flextron.on_policy must be a bool.")
 
     resolved_sampling_rates = _validate_flextron_sampling_rates(
         sampling_rates, expected_len=1 + len(flex_routers)
@@ -53,6 +69,7 @@ def _validate_flextron_config(config: PolicyConfig, model_cfg: Any) -> None:
     if not flex_routers:
         model_cfg.flex_routers = []
         model_cfg.flextron_sampling_rates = resolved_sampling_rates
+        model_cfg.flextron_on_policy = on_policy
         return
 
     main_layer_pattern = _get_flextron_main_layer_pattern(model_cfg)
@@ -63,25 +80,25 @@ def _validate_flextron_config(config: PolicyConfig, model_cfg: Any) -> None:
     for router_idx, router in enumerate(flex_routers):
         if not isinstance(router, dict):
             raise TypeError(
-                f"policy.megatron_cfg.flex_routers[{router_idx}] must be a dict."
+                f"policy.flextron.flex_routers[{router_idx}] must be a dict."
             )
         if "mlp_int_list" not in router or "emb_int_list" not in router:
             raise ValueError(
-                f"policy.megatron_cfg.flex_routers[{router_idx}] must define "
+                f"policy.flextron.flex_routers[{router_idx}] must define "
                 "mlp_int_list and emb_int_list."
             )
         resolved_routers.append(
             {
                 "mlp_int_list": _resolve_flextron_int_list(
                     router["mlp_int_list"],
-                    field_path=f"policy.megatron_cfg.flex_routers[{router_idx}].mlp_int_list",
+                    field_path=f"policy.flextron.flex_routers[{router_idx}].mlp_int_list",
                     max_value=ffn_hidden_size,
                     main_layer_pattern=main_layer_pattern,
                     eligible_layer_types=_FLEXTRON_MLP_LAYER_TYPES,
                 ),
                 "emb_int_list": _resolve_flextron_int_list(
                     router["emb_int_list"],
-                    field_path=f"policy.megatron_cfg.flex_routers[{router_idx}].emb_int_list",
+                    field_path=f"policy.flextron.flex_routers[{router_idx}].emb_int_list",
                     max_value=hidden_size,
                     main_layer_pattern=main_layer_pattern,
                     eligible_layer_types=_FLEXTRON_EMB_LAYER_TYPES,
@@ -91,6 +108,7 @@ def _validate_flextron_config(config: PolicyConfig, model_cfg: Any) -> None:
 
     model_cfg.flex_routers = resolved_routers
     model_cfg.flextron_sampling_rates = resolved_sampling_rates
+    model_cfg.flextron_on_policy = on_policy
 
 
 def _validate_flextron_generation_backend(
@@ -106,7 +124,7 @@ def _validate_flextron_generation_backend(
         warnings.warn(
             "policy.generation.backend='vllm' cannot be used with nonzero "
             "nested Flextron sampling rates. Use backend='megatron' or set all "
-            "policy.megatron_cfg.flextron_sampling_rates[1:] values to 0."
+            "policy.flextron.flextron_sampling_rates[1:] values to 0."
         )
 
 
@@ -115,11 +133,11 @@ def _validate_flextron_sampling_rates(
 ) -> list[float]:
     """Validate Flextron sampling rates and return them as floats."""
     if not isinstance(sampling_rates, list):
-        raise TypeError("policy.megatron_cfg.flextron_sampling_rates must be a list.")
+        raise TypeError("policy.flextron.flextron_sampling_rates must be a list.")
     if len(sampling_rates) != expected_len:
         raise ValueError(
-            "policy.megatron_cfg.flextron_sampling_rates must have length "
-            f"{expected_len} (1 + len(policy.megatron_cfg.flex_routers)); got "
+            "policy.flextron.flextron_sampling_rates must have length "
+            f"{expected_len} (1 + len(policy.flextron.flex_routers)); got "
             f"{len(sampling_rates)}."
         )
 
@@ -127,19 +145,19 @@ def _validate_flextron_sampling_rates(
     for rate_idx, rate in enumerate(sampling_rates):
         if isinstance(rate, bool) or not isinstance(rate, (float, int)):
             raise TypeError(
-                "policy.megatron_cfg.flextron_sampling_rates"
+                "policy.flextron.flextron_sampling_rates"
                 f"[{rate_idx}] must be a number."
             )
         if rate < 0:
             raise ValueError(
-                "policy.megatron_cfg.flextron_sampling_rates"
+                "policy.flextron.flextron_sampling_rates"
                 f"[{rate_idx}] must be non-negative."
             )
         resolved_rates.append(float(rate))
 
     if sum(resolved_rates) <= 0.0:
         raise ValueError(
-            "policy.megatron_cfg.flextron_sampling_rates must sum to a value > 0."
+            "policy.flextron.flextron_sampling_rates must sum to a value > 0."
         )
     return resolved_rates
 
@@ -149,13 +167,13 @@ def _get_flextron_main_layer_pattern(model_cfg: Any) -> str:
     hybrid_layer_pattern = getattr(model_cfg, "hybrid_layer_pattern", None)
     if not hybrid_layer_pattern:
         raise ValueError(
-            "policy.megatron_cfg.flex_routers requires model_cfg.hybrid_layer_pattern."
+            "policy.flextron.flex_routers requires model_cfg.hybrid_layer_pattern."
         )
 
     main_pattern = hybrid_layer_pattern.split("/", maxsplit=1)[0].replace("|", "")
     if not main_pattern:
         raise ValueError(
-            "policy.megatron_cfg.flex_routers requires a non-empty main "
+            "policy.flextron.flex_routers requires a non-empty main "
             "hybrid layer pattern."
         )
     return main_pattern
@@ -166,7 +184,7 @@ def _get_flextron_model_dimension(model_cfg: Any, attr_name: str) -> int:
     value = getattr(model_cfg, attr_name, None)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(
-            f"policy.megatron_cfg.flex_routers requires model_cfg.{attr_name} "
+            f"policy.flextron.flex_routers requires model_cfg.{attr_name} "
             "to be a positive integer."
         )
     return value

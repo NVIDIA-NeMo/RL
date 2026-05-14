@@ -51,6 +51,10 @@ class FrozenFlextronRouter:
         )
         # normalize
         self.flextron_sampling_rates = self._normalize_sampling_rates(self.flextron_sampling_rates)
+        # `flextron_on_policy` is set by _validate_flextron_config whenever
+        # Flextron is enabled; the True fallback only applies when Flextron is
+        # off, in which case this flag is never consulted.
+        self.on_policy: bool = getattr(model_cfg, "flextron_on_policy", True)
 
         self.active_router_id: int | None = None
         self._handles: list[RemovableHandle] = []

@@ -600,9 +600,10 @@ class TestValidateFlextronConfig:
 
         model_cfg = self._model_cfg()
         config = {
-            "megatron_cfg": {
+            "flextron": {
                 "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
                 "flextron_sampling_rates": [0.25, 0.75],
+                "on_policy": True,
             }
         }
 
@@ -626,7 +627,7 @@ class TestValidateFlextronConfig:
             hidden_size=16,
         )
         config = {
-            "megatron_cfg": {
+            "flextron": {
                 "flex_routers": [
                     {
                         "mlp_int_list": [4, 20, 28, 30, 24],
@@ -634,6 +635,7 @@ class TestValidateFlextronConfig:
                     }
                 ],
                 "flextron_sampling_rates": [1, 2],
+                "on_policy": True,
             }
         }
 
@@ -653,9 +655,10 @@ class TestValidateFlextronConfig:
 
         model_cfg = SimpleNamespace()
         config = {
-            "megatron_cfg": {
+            "flextron": {
                 "flex_routers": [],
                 "flextron_sampling_rates": [1.0],
+                "on_policy": True,
             }
         }
 
@@ -669,9 +672,10 @@ class TestValidateFlextronConfig:
         from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
 
         config = {
-            "megatron_cfg": {
+            "flextron": {
                 "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
                 "flextron_sampling_rates": [1.0],
+                "on_policy": True,
             }
         }
 
@@ -683,9 +687,10 @@ class TestValidateFlextronConfig:
         from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
 
         config = {
-            "megatron_cfg": {
+            "flextron": {
                 "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
                 "flextron_sampling_rates": [1.0, -0.5],
+                "on_policy": True,
             }
         }
 
@@ -697,9 +702,10 @@ class TestValidateFlextronConfig:
         from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
 
         config = {
-            "megatron_cfg": {
+            "flextron": {
                 "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
                 "flextron_sampling_rates": [0.0, 0.0],
+                "on_policy": True,
             }
         }
 
@@ -711,7 +717,7 @@ class TestValidateFlextronConfig:
         from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
 
         config = {
-            "megatron_cfg": {
+            "flextron": {
                 "flex_routers": [
                     {
                         "mlp_int_list": [4, 20],
@@ -719,6 +725,7 @@ class TestValidateFlextronConfig:
                     }
                 ],
                 "flextron_sampling_rates": [0.5, 0.5],
+                "on_policy": True,
             }
         }
 
@@ -730,7 +737,7 @@ class TestValidateFlextronConfig:
         from nemo_rl.models.megatron.flextron_setup import _validate_flextron_config
 
         config = {
-            "megatron_cfg": {
+            "flextron": {
                 "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
             }
         }
@@ -744,9 +751,10 @@ class TestValidateFlextronConfig:
 
         config = {
             "generation": {"backend": "vllm"},
-            "megatron_cfg": {
+            "flextron": {
                 "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
                 "flextron_sampling_rates": [0.5, 0.5],
+                "on_policy": True,
             },
         }
 
@@ -760,9 +768,10 @@ class TestValidateFlextronConfig:
         model_cfg = self._model_cfg()
         config = {
             "generation": {"backend": "vllm"},
-            "megatron_cfg": {
+            "flextron": {
                 "flex_routers": [{"mlp_int_list": 24, "emb_int_list": 12}],
                 "flextron_sampling_rates": [1.0, 0.0],
+                "on_policy": True,
             },
         }
 

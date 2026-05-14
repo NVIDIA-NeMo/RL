@@ -14,6 +14,7 @@
 
 from typing import Any, Literal, NotRequired, TypedDict
 
+from nemo_rl.models.flextron_config import FlextronConfig
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
@@ -191,21 +192,6 @@ class MegatronDDPConfig(TypedDict):
     data_parallel_sharding_strategy: str
 
 
-class FlexRouterConfig(TypedDict):
-    """Configuration for one deterministic Flextron submodel route."""
-
-    # MLP/MoE intermediate dimension for this submodel route.
-    # Set an int to apply the same dimension to all eligible layers, or a
-    # list[int] with one value per main hybrid layer before setup projects it
-    # to the layer types handled by the Flextron MLP hooks.
-    mlp_int_list: int | list[int]
-    # Hidden-state dimension for this submodel route.
-    # Set an int to apply the same dimension to all eligible layers, or a
-    # list[int] with one value per main hybrid layer before setup projects it
-    # to the layer types handled by the Flextron hidden-state hooks.
-    emb_int_list: int | list[int]
-
-
 # Type exists to be lax if not specified
 class MegatronConfigDisabled(TypedDict):
     enabled: Literal[False]
@@ -254,14 +240,6 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
-    # Optional deterministic Flextron submodel routes. Each item specifies the
-    # MLP/MoE intermediate and hidden-state dimensions to force for a nested
-    # route. Omit or set to [] to disable nested Flextron routing.
-    flex_routers: NotRequired[list[FlexRouterConfig]]
-    # Sampling rates for Flextron routes. Must have length 1 + len(flex_routers):
-    # index 0 is the unmasked base model, and later entries map to flex_routers.
-    # Recommended default when disabled is [1.0].
-    flextron_sampling_rates: NotRequired[list[float]]
     peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
@@ -358,6 +336,10 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
+    # Optional deterministic Flextron routing. When present with a non-empty
+    # flex_routers list, the Megatron policy honors the routes via hook-based
+    # masking. Omit or set flex_routers=[] to disable Flextron entirely.
+    flextron: NotRequired[FlextronConfig]
     draft: NotRequired[DraftConfig | DraftConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled

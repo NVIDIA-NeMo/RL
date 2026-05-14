@@ -716,7 +716,7 @@ def test_flextron_reward_metrics_carry_forward_missing_groups():
     """Test Flextron reward metrics include every configured route."""
     master_config = {
         "policy": {
-            "megatron_cfg": {
+            "flextron": {
                 "flex_routers": [
                     {"mlp_int_list": 1856, "emb_int_list": 2688},
                     {"mlp_int_list": 960, "emb_int_list": 1920},
@@ -766,7 +766,7 @@ def test_flextron_reward_metrics_skip_when_flextron_is_disabled():
         metrics,
         rewards=torch.tensor([1.0]),
         router_ids=torch.tensor([0]),
-        master_config={"policy": {"megatron_cfg": {}}},
+        master_config={"policy": {}},
         previous_rewards={0: 2.0},
     )
 
@@ -778,7 +778,7 @@ def test_flextron_router_selection_metrics_log_selected_route():
     """Test Flextron router selection metrics identify the selected route."""
     master_config = {
         "policy": {
-            "megatron_cfg": {
+            "flextron": {
                 "flex_routers": [
                     {"mlp_int_list": 1856, "emb_int_list": 2688},
                     {"mlp_int_list": 960, "emb_int_list": 1920},
@@ -811,7 +811,7 @@ def test_flextron_router_selection_metrics_log_mixed_routes():
     """Test Flextron router selection metrics summarize mixed route batches."""
     master_config = {
         "policy": {
-            "megatron_cfg": {
+            "flextron": {
                 "flex_routers": [
                     {"mlp_int_list": 1856, "emb_int_list": 2688},
                     {"mlp_int_list": 960, "emb_int_list": 1920},
@@ -846,7 +846,7 @@ def test_flextron_router_selection_metrics_skip_when_flextron_is_disabled():
     _update_flextron_router_selection_metrics(
         metrics,
         router_ids=torch.tensor([0]),
-        master_config={"policy": {"megatron_cfg": {}}},
+        master_config={"policy": {}},
     )
 
     assert metrics == {}

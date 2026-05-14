@@ -9,17 +9,18 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 512
-  megatron_cfg:
-    bias_activation_fusion: false
-    tensor_model_parallel_size: 4
-    expert_model_parallel_size: 1
-    pipeline_model_parallel_size: 1
+  flextron:
     flex_routers:
       - mlp_int_list: 96
         emb_int_list: 96
       - mlp_int_list: 64
         emb_int_list: 64
     flextron_sampling_rates: [0.5, 0.3, 0.2]
+  megatron_cfg:
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 4
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
     peft:
       enabled: false
   sequence_packing:

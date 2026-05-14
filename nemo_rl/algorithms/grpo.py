@@ -1074,9 +1074,9 @@ def _create_advantage_estimator(master_config: MasterConfig):
 
 def _get_flextron_reward_metric_keys(master_config: MasterConfig) -> dict[int, str]:
     """Return reward metric keys for configured Flextron routes."""
-    megatron_cfg = master_config["policy"].get("megatron_cfg") or {}
-    flex_routers = megatron_cfg.get("flex_routers")
-    sampling_rates = megatron_cfg.get("flextron_sampling_rates")
+    flextron_cfg = master_config["policy"].get("flextron") or {}
+    flex_routers = flextron_cfg.get("flex_routers")
+    sampling_rates = flextron_cfg.get("flextron_sampling_rates")
     if (
         not isinstance(flex_routers, list)
         or not flex_routers
@@ -1092,9 +1092,9 @@ def _get_flextron_reward_metric_keys(master_config: MasterConfig) -> dict[int, s
 
 def _get_flextron_router_metric_keys(master_config: MasterConfig) -> dict[int, str]:
     """Return router-selection metric prefixes for configured Flextron routes."""
-    megatron_cfg = master_config["policy"].get("megatron_cfg") or {}
-    flex_routers = megatron_cfg.get("flex_routers")
-    sampling_rates = megatron_cfg.get("flextron_sampling_rates")
+    flextron_cfg = master_config["policy"].get("flextron") or {}
+    flex_routers = flextron_cfg.get("flex_routers")
+    sampling_rates = flextron_cfg.get("flextron_sampling_rates")
     if (
         not isinstance(flex_routers, list)
         or not flex_routers

@@ -878,6 +878,16 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         router_ids = self.frozen_flextron_router.get_router_ids(
             data, device=data["input_ids"].device
         )
+
+        # Off-policy: every sample is generated under router 0 (base model) but
+        # the sampled router ids still flow downstream so logprobs/training use
+        # the assigned routers.
+        if not self.frozen_flextron_router.on_policy:
+            with self.frozen_flextron_router.use_router(0):
+                output = self._generate_unrouted(data=data, greedy=greedy)
+            output["flex_router_ids"] = router_ids.cpu()
+            return output
+
         router_groups = self.frozen_flextron_router.grouped_indices(router_ids)
 
         if len(router_groups) == 1:

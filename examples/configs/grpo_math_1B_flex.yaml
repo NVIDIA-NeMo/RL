@@ -24,6 +24,27 @@ policy:
   dtensor_cfg:
     enabled: false
 
+  # Top-level deterministic Flextron routing. Consumed by the Megatron policy
+  # (hook-based masking on a single model). Each route can set scalar dims for
+  # all eligible layers or one value per main hybrid layer. Setup expands and
+  # projects these lists to the layer types supported by Flextron hooks.
+  # Set flex_routers: [] (or omit the block) to disable Flextron entirely.
+  flextron:
+    flex_routers:
+      # 23B nested Flextron route
+      - mlp_int_list: 1856
+        emb_int_list: 2688
+      # 12B nested Flextron route
+      - mlp_int_list: 960
+        emb_int_list: 1920
+    # Sampling rates for [base_model, 23B nested route, 12B nested route].
+    # Length must equal 1 + len(flex_routers).
+    flextron_sampling_rates: [0.5, 0.3, 0.2]
+    # When true, each sample is generated under its assigned router. When
+    # false, every sample is generated under router 0 (base model) while
+    # logprobs/training keep the assigned routers (off-policy regime).
+    on_policy: true
+
   megatron_cfg:
     enabled: true
     pretrained_checkpoint_path: /data/flextron-nano-models/30b-patched
@@ -41,19 +62,6 @@ policy:
     pipeline_dtype: ${policy.precision}
     sequence_parallel: true
     freeze_moe_router: true
-    # Deterministic Flextron submodel routes. Each route can set scalar dims
-    # for all eligible layers or one value per main hybrid layer. Setup expands
-    # and projects these lists to the layer types supported by Flextron hooks.
-    flex_routers:
-      # 23B nested Flextron route
-      - mlp_int_list: 1856
-        emb_int_list: 2688
-      # 12B nested Flextron route
-      - mlp_int_list: 960
-        emb_int_list: 1920
-    # Sampling rates for [base_model, 23B nested route, 12B nested route].
-    flextron_sampling_rates: [0.5, 0.3, 0.2]
-    # flextron_sampling_rates: [1.0, 0.0, 0.0]
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
