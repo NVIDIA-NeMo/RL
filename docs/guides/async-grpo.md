@@ -88,14 +88,14 @@ The async GRPO implementation consists of three main components:
 - Handles validation and checkpointing
 - Manages weight synchronization between training and generation
 
-#### 2. Async Trajectory Collector (`AsyncTrajectoryCollector` in `async_utils.py`)
+#### 2. Async Trajectory Collector (`AsyncTrajectoryCollector` in `async_utils/trajectory_collector.py`)
 - Runs in background Ray actor
 - Continuously generates trajectories using current policy weights
 - Manages generation scheduling and weight version tracking
 - Handles pause/resume for weight updates and validation
 - Coordinates with replay buffer for trajectory storage
 
-#### 3. Replay Buffer (`ReplayBuffer` in `async_utils.py`)
+#### 3. Replay Buffer (`ReplayBuffer` in `async_utils/replay_buffer.py`)
 - Stores generated trajectories with metadata
 - Tracks weight versions for both generation and intended training use
 - Implements age-based filtering to prevent stale trajectories

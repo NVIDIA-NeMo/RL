@@ -62,7 +62,8 @@ def main() -> None:
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Print config
@@ -70,23 +71,23 @@ def main() -> None:
     pprint.pprint(config)
 
     # Get the next experiment directory with incremented ID
-    config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
-    print(f"📊 Using log directory: {config['logger']['log_dir']}")
-    if config["checkpointing"]["enabled"]:
+    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    if config.checkpointing["enabled"]:
         print(
-            f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
+            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
     init_ray()
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-    assert config["policy"]["generation"] is not None, (
+    tokenizer = get_tokenizer(config.policy["tokenizer"])
+    assert config.policy["generation"] is not None, (
         "A generation config is required for GRPO"
     )
-    has_refit_draft_weights = bool(config["policy"]["draft"]["enabled"])
-    config["policy"]["generation"] = configure_generation_config(
-        config["policy"]["generation"],
+    has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
+    config.policy["generation"] = configure_generation_config(
+        config.policy["generation"],
         tokenizer,
         has_refit_draft_weights=has_refit_draft_weights,
     )
@@ -97,7 +98,7 @@ def main() -> None:
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_response_data(tokenizer, config["data"], config["env"])
+    ) = setup_response_data(tokenizer, config.data, config.env)
 
     (
         policy,
@@ -113,7 +114,7 @@ def main() -> None:
     ) = setup(config, tokenizer, dataset, val_dataset)
 
     # Check if async mode is enabled
-    if "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:
+    if "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
         # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
         unsupported_features = [
             "use_dynamic_sampling",
@@ -122,22 +123,22 @@ def main() -> None:
         ]
 
         for feature in unsupported_features:
-            if feature not in config["grpo"]:
+            if feature not in config.grpo:
                 continue
 
             if feature == "use_dynamic_sampling":
-                if config["grpo"][feature]:
+                if config.grpo[feature]:
                     raise NotImplementedError(
                         f"{feature} is not supported with async GRPO"
                     )
             else:
-                if config["grpo"][feature]["enabled"]:
+                if config.grpo[feature]["enabled"]:
                     raise NotImplementedError(
                         f"{feature} is not supported with async GRPO"
                     )
 
         # Async GRPO does not support multiple dataloaders
-        if config["data"]["use_multiple_dataloader"]:
+        if config.data["use_multiple_dataloader"]:
             raise NotImplementedError(
                 "use_multiple_dataloader is not supported with async GRPO"
             )
@@ -146,7 +147,7 @@ def main() -> None:
 
         print("🚀 Running async GRPO training")
 
-        async_config = config["grpo"]["async_grpo"]
+        async_config = config.grpo["async_grpo"]
         # Run async GRPO training
         async_grpo_train(
             policy=policy,
