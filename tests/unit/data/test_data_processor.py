@@ -180,10 +180,11 @@ def test_random_input_len_processor_rejects_overlength_input():
 
 def test_random_dataset_processes_synthetic_samples():
     tokenizer = RandomTokenizer()
-    
+
     from nemo_rl.utils.sequence_length_generator import (
         get_sequence_length_generator,
     )
+
     input_len_generator = get_sequence_length_generator({"mean": 4, "std": 0})
     random_dataset = RandomDataset(
         input_len_generator=input_len_generator,
