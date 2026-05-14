@@ -1,7 +1,7 @@
 # GRPO Algorithm Configuration
 defaults: ./grpo_math_1B_flex.yaml
 grpo:
-  num_prompts_per_step: 4
+  num_prompts_per_step: 8
   num_generations_per_prompt: 16
 
 checkpointing:
