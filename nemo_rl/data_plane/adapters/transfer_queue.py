@@ -555,9 +555,12 @@ class TQDataPlaneClient(DataPlaneClient):
         wire_fields: TensorDict | None = None
         field_names: list[str] | None = None
         if fields is not None:
-            # pyrefly mis-infers ``TensorDict.contiguous()`` (functools.wraps-decorated)
-            # as ``Tensor | Unknown`` and emits a spurious ``_self`` missing-argument.
-            wire_fields = fields.detach().contiguous()  # type: ignore[bad-assignment,missing-argument]
+            # No ``.contiguous()``: under tensordict==0.12.2 it strips
+            # non-tensor leaves (NonTensorStack stored as LinkedList) to empty
+            # TDs. TQ's encoder forces ``.contiguous()`` per tensor leaf
+            # itself, so the call here was redundant for tensors and
+            # destructive for non-tensors.
+            wire_fields = fields.detach()  # type: ignore[bad-assignment,missing-argument]
             if self._promote_1d:
                 wire_fields = _promote_1d_leaves(wire_fields)  # type: ignore[bad-argument-type]
             field_names = list(wire_fields.keys())

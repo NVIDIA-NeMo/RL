@@ -112,7 +112,9 @@ def write_columns(
     packed: dict[str, Any] = {}
     for k, v in fields.items():
         if isinstance(v, np.ndarray) and v.dtype == object:
-            packed[k] = NonTensorStack(*v.tolist())
+            # Pass through as ndarray; see kv_first_write for the
+            # tensordict==0.12.2 NonTensorStack→LinkedList rationale.
+            packed[k] = v
         elif isinstance(v, torch.Tensor):
             packed[k] = (
                 maybe_pack_jagged(v, lengths)
