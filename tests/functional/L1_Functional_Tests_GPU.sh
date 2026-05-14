@@ -38,6 +38,7 @@ run_test() {
 run_test      bash ./tests/functional/grpo_frozen_env.sh
 run_test      bash ./tests/functional/test_frozen_env.sh
 
+run_test fast uv run --no-sync bash ./tests/functional/audio_grpo_megatron.sh
 run_test fast uv run --no-sync bash ./tests/functional/distillation.sh
 run_test      uv run --no-sync bash ./tests/functional/distillation_megatron.sh
 run_test fast uv run --no-sync bash ./tests/functional/dpo.sh
@@ -46,6 +47,7 @@ run_test fast uv run --no-sync bash ./tests/functional/dpo_megatron_lora.sh
 run_test      uv run --no-sync bash ./tests/functional/dpo_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/eval.sh
 run_test      uv run --no-sync bash ./tests/functional/eval_async.sh
+run_test fast uv run --no-sync bash ./tests/functional/eval_audio.sh
 run_test fast uv run --no-sync bash ./tests/functional/gdpo.sh
 run_test fast uv run --no-sync bash ./tests/functional/gdpo_async_grpo.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo.sh
@@ -55,6 +57,7 @@ run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora_async
 run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora_non_colocated.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_fsdp2.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_megatron.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_mbridge_restore.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_eagle3_online.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_lora.sh
@@ -66,6 +69,7 @@ run_test      uv run --no-sync bash ./tests/functional/grpo_rm_env.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_sglang.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_topp_topk.sh
 run_test      uv run --no-sync bash ./tests/functional/prorlv2.sh
+run_test      uv run --no-sync bash ./tests/functional/qa_distillation_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/rm.sh
 run_test fast uv run --no-sync bash ./tests/functional/sft.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_automodel_lora.sh

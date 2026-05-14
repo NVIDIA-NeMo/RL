@@ -37,11 +37,20 @@ uv run --extra mcore examples/converters/convert_megatron_to_hf.py \
   --hf-ckpt-path=<path_to_save_hf_ckpt>
 ```
 
-## Merging Megatron LoRA Adapter Checkpoints to Hugging Face Format
+## Converting Megatron LoRA Adapter Checkpoints to Hugging Face Format
 
-When training with [LoRA (Low-Rank Adaptation)](../guides/sft.md#lora-configuration) on the Megatron backend, the resulting checkpoint contains only the adapter weights alongside the base model configuration. To produce a standalone Hugging Face checkpoint suitable for inference or evaluation, use the LoRA merger script. It loads the base model, applies the LoRA adapter weights on top, and saves the merged result in Hugging Face format.
+When training with [LoRA (Low-Rank Adaptation)](../guides/sft.md#lora-configuration) on the Megatron backend, the resulting checkpoint contains only the adapter weights alongside the base model configuration. The `convert_lora_to_hf.py` script supports two export modes:
 
-This script requires Megatron-Core, so make sure to launch with the `mcore` extra:
+- **Merged**: fold the LoRA adapter into the base model and export a single standalone HuggingFace checkpoint.
+- **Adapter-only**: export only the LoRA adapter weights in [HuggingFace PEFT](https://huggingface.co/docs/peft) format, keeping the base model separate.
+
+This script requires Megatron-Core, so make sure to launch with the `mcore` extra.
+
+### Option A — Merged checkpoint
+
+Loads the base model, applies the LoRA adapter weights on top, and saves the merged result in HuggingFace format. The output can be used directly with `AutoModelForCausalLM.from_pretrained` or passed to the [evaluation pipeline](../guides/eval.md).
+
+**Example:**
 
 ```sh
 uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
@@ -51,24 +60,29 @@ uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
     --hf-ckpt-path <output_path_for_merged_hf_model>
 ```
 
+### Option B — Adapter-only (PEFT format)
+
+Exports only the LoRA adapter weights in HuggingFace PEFT format without merging into the base model. This is useful when you want to serve the base model and adapter separately (e.g. with vLLM's LoRA support).
+
+Although the output is adapter-only, the converter still needs `--base-ckpt` to reconstruct the Megatron model, apply the LoRA modules, and load the adapter weights before exporting them to PEFT format.
+
+**Example:**
+
+```sh
+uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
+    --base-ckpt <path_to_base_megatron_checkpoint>/iter_0000000 \
+    --adapter-only \
+    --adapter-ckpt <path_to_lora_adapter_checkpoint>/iter_0000000 \
+    --hf-model-name <huggingface_model_name> \
+    --hf-ckpt-path <output_path_for_hf_adapter>
+```
+
 ### Arguments
 
 | Argument | Description |
 |---|---|
-| `--base-ckpt` | Path to the base model's Megatron checkpoint directory (the `iter_XXXXXXX` folder). |
+| `--base-ckpt` | Path to the base model's Megatron checkpoint directory (the `iter_XXXXXXX` folder). Required for both merged and adapter-only export. |
 | `--adapter-ckpt` | Path to the LoRA adapter's Megatron checkpoint directory (must contain a `run_config.yaml` with a `peft` section). |
 | `--hf-model-name` | HuggingFace model identifier used to resolve the model architecture and tokenizer (e.g. `Qwen/Qwen2.5-7B`). |
-| `--hf-ckpt-path` | Output directory for the merged HuggingFace checkpoint. Must not already exist. |
-
-### Example
-
-```sh
-# Merge a LoRA adapter trained on Qwen2.5-7B back into a full HF checkpoint
-uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
-    --base-ckpt ~/.cache/huggingface/nemo_rl/Qwen/Qwen2.5-7B/iter_0000000 \
-    --adapter-ckpt results/sft_lora/step_100/policy/weights/iter_0000000 \
-    --hf-model-name Qwen/Qwen2.5-7B \
-    --hf-ckpt-path results/sft_lora/merged_hf
-```
-
-The merged checkpoint can then be used directly with `AutoModelForCausalLM.from_pretrained` or passed to the [evaluation pipeline](../guides/eval.md).
+| `--hf-ckpt-path` | Output directory for the exported HuggingFace checkpoint or adapter. Must not already exist. |
+| `--adapter-only` | Export only the LoRA adapter in HuggingFace PEFT format without merging into the base model. |

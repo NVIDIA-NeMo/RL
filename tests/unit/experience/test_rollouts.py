@@ -47,7 +47,6 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 
 # These are all fixtures
 from tests.unit.environments.test_nemo_gym import (
-    NEMO_GYM_INSTALLED,
     cluster,  # noqa: F401
     nemo_gym,  # noqa: F401
     nemo_gym_sanity_test_data,  # noqa: F401
@@ -787,10 +786,26 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
     print("\nSliding Puzzle VLLM Test assertions passed.")
 
 
-@pytest.mark.skipif(
-    not NEMO_GYM_INSTALLED,
-    reason="Skipping NeMo-Gym test since NeMo-Gym is not installed!",
-)
+def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
+    class _FakePolicyGeneration:
+        cfg = {"vllm_cfg": {"max_model_len": 100}}
+
+    # stop_strings is truthy so the function hits the next assert and exits
+    # right after emitting the warning — keeps this test free of any rollout work.
+    with pytest.warns(UserWarning, match="greater than the"):
+        with pytest.raises(AssertionError, match="Stop strings"):
+            run_async_nemo_gym_rollout(
+                policy_generation=_FakePolicyGeneration(),
+                input_batch={"extra_env_info": []},
+                tokenizer=None,
+                task_to_env={},
+                generation_config={"stop_strings": "x", "max_new_tokens": 50},
+                max_seq_len=200,
+                max_rollout_turns=None,
+            )
+
+
+@pytest.mark.nemo_gym
 def test_run_async_nemo_gym_rollout(
     nemo_gym,  # noqa: F811
     nemo_gym_vllm_generation,  # noqa: F811
@@ -813,23 +828,45 @@ def test_run_async_nemo_gym_rollout(
     ]
 
     input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(nemo_rl_compatible_examples)
+    rows = input_batch["extra_env_info"]
+    assert len(rows) >= 2, "test expects the fixture to provide at least two rows"
+
+    max_new_tokens = nemo_gym_vllm_generation.cfg["max_new_tokens"]
+    # Row 0: per-agent override looser than the configured cap — min() should clamp down to max_new_tokens.
+    # Row 1: no per-agent override — should fall back to max_new_tokens.
+    rows[0]["responses_create_params"]["max_output_tokens"] = max_new_tokens + 1
+    assert "max_output_tokens" not in rows[1]["responses_create_params"]
+
     actual_result = run_async_nemo_gym_rollout(
         policy_generation=nemo_gym_vllm_generation,
         input_batch=input_batch,
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
-        max_seq_len=None,
+        max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         generation_config=nemo_gym_vllm_generation.cfg,
         max_rollout_turns=None,
     )
+    for row in rows:
+        assert row["responses_create_params"]["max_output_tokens"] == max_new_tokens
     actual_result = asdict(actual_result)
     actual_result["final_batch"] = actual_result["final_batch"].get_dict()
 
     expected_result = {
         "final_batch": {
-            "length": torch.tensor([3088, 3056]),
+            "agent_ref": [
+                {
+                    "name": "example_multi_step_simple_agent",
+                    "type": "responses_api_agents",
+                },
+                {
+                    "name": "example_multi_step_simple_agent",
+                    "type": "responses_api_agents",
+                },
+            ],
+            "length": torch.tensor([3080, 3048]),
             "loss_multiplier": torch.tensor([1.0, 1.0]),
             "total_reward": torch.tensor([0.0, 0.0]),
+            "truncated": torch.tensor([False, False]),
         },
         "rollout_metrics": {
             # core metrics
@@ -909,6 +946,7 @@ def test_run_async_nemo_gym_rollout(
         final_batch["total_reward"] = final_batch["total_reward"].tolist()
         final_batch["loss_multiplier"] = final_batch["loss_multiplier"].tolist()
         final_batch["length"] = final_batch["length"].tolist()
+        final_batch["truncated"] = final_batch["truncated"].tolist()
 
         for key in d["rollout_metrics"]:
             # We remove these fields from comparison since we cannot guarantee exact generation reproducibility

@@ -119,6 +119,12 @@ linkcheck_ignore = [
     ".*githubusercontent\\.com.*",
 ]
 
+# PyTorch docs anchor IDs change between stable versions; verify the page
+# loads but skip anchor validation to avoid spurious failures on redirects.
+linkcheck_anchors_ignore_for_url = [
+    "https://docs.pytorch.org/.*",
+]
+
 
 def _convert_gh_admonitions_inplace(contents: list[str]) -> None:
     """Mutate contents to convert GitHub blockquote admonitions to MyST.

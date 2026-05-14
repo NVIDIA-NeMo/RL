@@ -18,8 +18,10 @@ from pathlib import Path
 
 import pytest
 import ray
+import torch
 from yaml import safe_load
 
+from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
@@ -35,20 +37,11 @@ from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
 
-try:
-    from nemo_gym import config_types  # noqa: F401
 
-    NEMO_GYM_INSTALLED = True
-except ImportError:
-    nemo_gym = None
-    NEMO_GYM_INSTALLED = False
-
-
-@pytest.mark.skipif(
-    not NEMO_GYM_INSTALLED,
-    reason="Skipping NeMo-Gym test since NeMo-Gym is not installed!",
-)
+@pytest.mark.nemo_gym
 def test_nemo_gym_stub_module():
+    from nemo_gym import config_types
+
     print(
         f"NeMo-Gym test successfully run! NeMo-Gym config_types module: {config_types}"
     )
@@ -57,11 +50,9 @@ def test_nemo_gym_stub_module():
 @pytest.fixture(scope="function")
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
-    master_config = {
-        "policy": {
-            "generation": generation_config,
-        },
-    }
+    master_config = MasterConfig.model_construct(
+        policy={"generation": generation_config}
+    )
     setup_nemo_gym_config(master_config, nemo_gym_tokenizer)
 
     generation_config["vllm_cfg"]["max_model_len"] = 16_384
@@ -141,10 +132,43 @@ def nemo_gym_sanity_test_data():
     return data
 
 
-@pytest.mark.skipif(
-    not NEMO_GYM_INSTALLED,
-    reason="Skipping NeMo-Gym test since NeMo-Gym is not installed!",
-)
+def _write_actual_test_data(original_input: list, actual_result: list):
+    """Write actual rollout results to actual_test_nemo_gym_sanity.json.
+
+    This makes it easy to update the expected output after a Gym commit bump:
+        cp nemo_gym_test_data/actual_test_nemo_gym_sanity.json nemo_gym_test_data/test_nemo_gym_sanity.json
+    """
+
+    def _convert(obj):
+        """Recursively convert torch tensors to Python lists for JSON serialization."""
+        if isinstance(obj, torch.Tensor):
+            return obj.tolist()
+        if isinstance(obj, dict):
+            return {k: _convert(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_convert(v) for v in obj]
+        return obj
+
+    cleaned = deepcopy(actual_result)
+    for r in cleaned:
+        r.pop("full_result", None)
+        for msg in r.get("message_log", [])[1:]:
+            if "token_ids" in msg:
+                msg["token_ids"] = []
+            if "generation_logprobs" in msg:
+                msg["generation_logprobs"] = []
+
+    output_path = (
+        Path(__file__).parent / "nemo_gym_test_data/actual_test_nemo_gym_sanity.json"
+    )
+    data = _convert({"input": original_input, "expected_output": cleaned})
+    with open(output_path, "w") as f:
+        json.dump(data, f)
+        f.write("\n")
+    print(f"Wrote updated test data to {output_path}")
+
+
+@pytest.mark.nemo_gym
 def test_nemo_gym_sanity(
     nemo_gym,
     nemo_gym_sanity_test_data,
@@ -152,6 +176,9 @@ def test_nemo_gym_sanity(
     nemo_gym_tokenizer,  # noqa: F811
 ):
     """Test basic functionality of MathEnvironment step with simple messages."""
+
+    # Save original input before mutation for writing the actual test data file
+    original_input = deepcopy(nemo_gym_sanity_test_data["input"])
 
     # We need to match NeMo RL generation config params before sending to NeMo-Gym
     generation_config = nemo_gym_vllm_generation.cfg
@@ -177,6 +204,10 @@ def test_nemo_gym_sanity(
         # Right now, we don't need to swap the token ids in the message log since they pointto the same underlying dictionary as above.
         # for message in d["message_log"][:1]:
         #     message["token_ids"] = message["token_ids"].tolist()
+
+    # Write the actual result to a file so it can be used to update the expected output.
+    # To update: cp actual_test_nemo_gym_sanity.json test_nemo_gym_sanity.json
+    _write_actual_test_data(original_input, actual_result)
 
     def _standardize_single_result(d: dict):
         d = deepcopy(d)

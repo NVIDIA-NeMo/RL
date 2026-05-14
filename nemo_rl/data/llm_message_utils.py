@@ -623,10 +623,17 @@ def get_formatted_message_log(
             # add all vlm keys to the message
             for key in multimodal_keys:
                 if key in processed_chunk:
-                    new_message[key] = PackedTensor(
-                        processed_chunk[key],
-                        dim_to_pack=get_dim_to_pack_along(tokenizer, key),
-                    )
+                    # token_type_ids and mm_token_type_ids are sequence-length tensors
+                    # (one label per token), not visual patch tensors. They must be
+                    # stored as plain tensors and padded like input_ids rather than
+                    # packed as multimodal data. This mirrors processors.py behavior.
+                    if key in ("token_type_ids", "mm_token_type_ids"):
+                        new_message[key] = processed_chunk[key][0]
+                    else:
+                        new_message[key] = PackedTensor(
+                            processed_chunk[key],
+                            dim_to_pack=get_dim_to_pack_along(tokenizer, key),
+                        )
 
         if len(new_message["token_ids"]) == 0:
             # if there is an empty message, the empty `token_ids` tensor ends up being in fp32,

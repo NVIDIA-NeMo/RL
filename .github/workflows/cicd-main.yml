@@ -39,7 +39,7 @@ on:
         default: ""
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -291,15 +291,49 @@ jobs:
       build-ref: ${{ needs.pre-flight.outputs.test_sha }}
       image-name: ${{ vars.CI_CONTAINER_NAME }}
       dockerfile: docker/Dockerfile
-      runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+      runner: ${{ contains(needs.org-member-pre-flight.outputs.runner_prefix, 'azure') && format('{0}-gpu-x2', needs.org-member-pre-flight.outputs.runner_prefix) || contains(needs.org-member-pre-flight.outputs.runner_prefix, 'gcp') && format('{0}-gpu-x4', needs.org-member-pre-flight.outputs.runner_prefix) }}
       image-label: ${{ vars.CI_CONTAINER_NAME }}
       target: release
       registry: ${{ needs.org-member-pre-flight.outputs.registry }}
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
+        ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}-uv-cache:latest', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       build-args: |
         MAX_JOBS=4
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
+
+  update-uv-cache:
+    name: Update uv build cache
+    needs: [build-container, org-member-pre-flight]
+    if: >-
+      ${{
+        github.ref == 'refs/heads/main' &&
+        needs.build-container.result == 'success'
+      }}
+    runs-on: ${{ format('{0}-gpu-x2', needs.org-member-pre-flight.outputs.runner_prefix) }}
+    environment: nemo-ci
+    env:
+      REGISTRY: ${{ needs.org-member-pre-flight.outputs.registry }}
+      IMAGE_NAME: ${{ vars.CI_CONTAINER_NAME }}
+    steps:
+      - name: Extract and push uv cache image
+        run: |
+          set -euo pipefail
+          SRC="${REGISTRY}/${IMAGE_NAME}:${{ github.run_id }}"
+          DST="${REGISTRY}/${IMAGE_NAME}-uv-cache:latest"
+
+          docker pull "${SRC}"
+          CID=$(docker create "${SRC}" true)
+          mkdir -p /tmp/uv-cache
+          docker cp "${CID}:/root/.cache/uv/." /tmp/uv-cache/
+          docker rm "${CID}"
+
+          printf 'FROM scratch\nCOPY uv-cache/ /\n' > /tmp/Dockerfile.uv-cache
+          docker build -t "${DST}" -f /tmp/Dockerfile.uv-cache /tmp
+          docker push "${DST}"
+
+          docker rmi "${SRC}" "${DST}" 2>/dev/null || true
+          rm -rf /tmp/uv-cache /tmp/Dockerfile.uv-cache
 
   cicd-doc-tests:
     strategy:
@@ -480,6 +514,24 @@ jobs:
           SUMMARY=$(echo $JOB_RESULTS | jq 'to_entries[] | .key + ": " + .value.result' | tr -d '"')
           echo '🤖: CICD Result for test level: ${{ needs.pre-flight.outputs.test_level }}' >> $GITHUB_STEP_SUMMARY
           echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$TEST_LEVEL" == "none" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **No tests were run.** This PR does not have a CI label." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "To trigger tests, add one of the following labels to your PR:" >> $GITHUB_STEP_SUMMARY
+            echo "| Label | What it runs |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------|-------------|" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:docs\` | Doc tests only |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:Lfast\` | Fast subset (reuses main container) |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:L0\` | Unit tests + docs + lint |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:L1\` | L0 + functional tests |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:L2\` | L1 + convergence tests |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "This check will remain failed until a CI label is added." >> $GITHUB_STEP_SUMMARY
+          fi
+
           test "$ALL_SUCCESS" = "true" || test "$CI_SKIP" = "true"
 
   notify-nightly-failure:
@@ -519,6 +571,11 @@ jobs:
       matrix:
         flag: [doc-test, unit-test, e2e]
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -526,12 +583,13 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           pattern: coverage-${{ matrix.flag }}-*
+          path: coverage-downloads
 
       - name: Check if artifacts were downloaded
         id: check-artifacts
         run: |
-          # Check if any coverage directories were downloaded
-          if ls coverage-* 1> /dev/null 2>&1; then
+          # Check if any .coverage files were downloaded
+          if find coverage-downloads -name ".coverage" -type f 2>/dev/null | grep -q .; then
             echo "artifacts-found=true" >> $GITHUB_OUTPUT
             echo "Found coverage artifacts for ${{ matrix.flag }}"
           else
@@ -545,12 +603,10 @@ jobs:
         run: |
           pip install coverage
 
-          ls -al .
-          ls -al coverage-*/
-          coverage combine --keep $(ls coverage-*/.coverage)
+          find coverage-downloads -name ".coverage" -type f
+          coverage combine --keep $(find coverage-downloads -name ".coverage" -type f)
           coverage report -i --show-missing
-          rm -rf coverage-*
-          ls -al
+          rm -rf coverage-downloads
 
       - name: Skip coverage processing
         if: ${{ steps.check-artifacts.outputs.artifacts-found == 'false' }}
@@ -564,6 +620,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
+          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
         if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}
