@@ -29,6 +29,67 @@ class NemoGymConfig(TypedDict):
     initial_global_config_dict: Dict[str, Any]
 
 
+def _summarize_rollout_row(row: dict[str, Any]) -> dict[str, Any]:
+    responses_create_params = row.get("responses_create_params") or {}
+    input_messages = responses_create_params.get("input")
+    return {
+        "agent_ref": row.get("agent_ref"),
+        "input_messages": len(input_messages) if isinstance(input_messages, list) else None,
+    }
+
+
+def _validate_and_order_rollout_results(
+    nemo_gym_examples: list[dict],
+    nemo_rl_rowidxs: list[int],
+    nemo_rl_results: list[dict],
+) -> list[dict]:
+    if len(nemo_rl_rowidxs) != len(nemo_rl_results):
+        raise ValueError(
+            "NeMo-Gym rollout row mapping has mismatched row/result counts: "
+            f"rowidxs={len(nemo_rl_rowidxs)}, results={len(nemo_rl_results)}"
+        )
+
+    ordered_results: list[dict | None] = [None] * len(nemo_gym_examples)
+    filled = [False] * len(nemo_gym_examples)
+    duplicate_rowidxs: list[int] = []
+    invalid_rowidxs: list[Any] = []
+
+    for result_position, (rowidx, result) in enumerate(
+        zip(nemo_rl_rowidxs, nemo_rl_results)
+    ):
+        if not isinstance(rowidx, int) or not 0 <= rowidx < len(nemo_gym_examples):
+            invalid_rowidxs.append(
+                {"result_position": result_position, "rowidx": rowidx}
+            )
+            continue
+        if filled[rowidx]:
+            duplicate_rowidxs.append(rowidx)
+        filled[rowidx] = True
+        ordered_results[rowidx] = result
+
+    missing_rowidxs = [idx for idx, is_filled in enumerate(filled) if not is_filled]
+    none_result_rowidxs = [
+        idx for idx, result in enumerate(ordered_results) if filled[idx] and result is None
+    ]
+    if missing_rowidxs or duplicate_rowidxs or invalid_rowidxs or none_result_rowidxs:
+        missing_rows = {
+            idx: _summarize_rollout_row(nemo_gym_examples[idx])
+            for idx in missing_rowidxs
+        }
+        raise ValueError(
+            "NeMo-Gym rollout row mapping is incomplete after sorting by `_rowidx`. "
+            f"missing_rowidxs={missing_rowidxs}, "
+            f"duplicate_rowidxs={sorted(set(duplicate_rowidxs))}, "
+            f"invalid_rowidxs={invalid_rowidxs}, "
+            f"none_result_rowidxs={none_result_rowidxs}, "
+            f"missing_rows={missing_rows}. "
+            "This usually means repeated rollout rows shared mutable metadata "
+            "and `_rowidx` was overwritten before collection."
+        )
+
+    return [result for result in ordered_results if result is not None]
+
+
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
@@ -160,10 +221,11 @@ Depending on your data shape, you may want to change these values."""
             else:
                 break
 
-        nemo_rl_sort_results = [None] * nemo_gym_num_rows
-        for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
-            nemo_rl_sort_results[rowidx] = result
-        nemo_rl_results = nemo_rl_sort_results
+        nemo_rl_results = _validate_and_order_rollout_results(
+            nemo_gym_examples,
+            nemo_rl_rowidxs,
+            nemo_rl_results,
+        )
 
         timer.stop("_run_rollouts_total")
         timing_metrics = timer.get_timing_metrics("sum")

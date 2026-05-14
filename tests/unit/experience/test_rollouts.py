@@ -934,3 +934,86 @@ def test_run_async_nemo_gym_rollout(
     1. In nemo_rl/experience/rollouts.py::run_async_nemo_gym_rollout, the sampling params are passed appropriately
     2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """
+
+
+def test_run_async_nemo_gym_rollout_copies_repeated_extra_env_info(monkeypatch):
+    shared_extra_env_info = {
+        "responses_create_params": {"input": [{"role": "user", "content": "p0"}]},
+        "agent_ref": {"type": "responses_api_agents", "name": "agent"},
+    }
+    input_batch = BatchedDataDict[DatumSpec](
+        {
+            "extra_env_info": [shared_extra_env_info, shared_extra_env_info],
+            "loss_multiplier": torch.ones(2, dtype=torch.float32),
+        }
+    )
+    captured_rows = []
+
+    class FakeRemoteMethod:
+        def remote(self, rows, tokenizer, timer_prefix):
+            captured_rows.extend(rows)
+            return "fake-ref"
+
+    class FakeEnv:
+        run_rollouts = FakeRemoteMethod()
+
+    class FakeTokenizer:
+        pad_token_id = 0
+
+    class FakeGeneration:
+        cfg = {"vllm_cfg": {"max_model_len": 128}}
+
+    def fake_ray_get(ref):
+        assert ref == "fake-ref"
+        results = []
+        for row in captured_rows:
+            rowidx = row["_rowidx"]
+            results.append(
+                {
+                    "input_message_log": [
+                        {
+                            "role": "user",
+                            "content": "",
+                            "token_ids": [rowidx + 1],
+                        }
+                    ],
+                    "message_log": [
+                        {
+                            "role": "user",
+                            "content": "",
+                            "token_ids": [rowidx + 1],
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "token_ids": [rowidx + 10],
+                            "generation_logprobs": [-0.1],
+                        },
+                    ],
+                    "full_result": {"reward": float(rowidx)},
+                }
+            )
+        return results, {}
+
+    monkeypatch.setattr(ray, "get", fake_ray_get)
+
+    result = run_async_nemo_gym_rollout(
+        policy_generation=FakeGeneration(),
+        input_batch=input_batch,
+        tokenizer=FakeTokenizer(),
+        task_to_env={"nemo_gym": FakeEnv()},
+        generation_config={
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": None,
+            "stop_strings": None,
+            "stop_token_ids": None,
+        },
+        max_seq_len=None,
+        max_rollout_turns=None,
+    )
+
+    assert [row["_rowidx"] for row in captured_rows] == [0, 1]
+    assert len({id(row) for row in captured_rows}) == 2
+    assert "_rowidx" not in shared_extra_env_info
+    assert result.final_batch["total_reward"].tolist() == [0.0, 1.0]

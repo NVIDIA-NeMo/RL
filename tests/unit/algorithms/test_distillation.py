@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -553,6 +554,697 @@ def test_distillation_train_stream_rollout_allows_nemo_gym_metadata_restore(
 
     assert train_metrics is not None
     assert "agent/full_result" not in train_metrics
+
+
+def _configure_mixed_generation_test(
+    mock_components,
+    *,
+    student_generations_per_prompt: int,
+    teacher_generations_per_prompt: int,
+) -> None:
+    mock_components["master_config"]["distillation"]["max_num_steps"] = 1
+    mock_components["master_config"]["distillation"]["max_num_epochs"] = 1
+    mock_components["master_config"]["distillation"]["val_period"] = 0
+    mock_components["master_config"]["distillation"]["val_at_end"] = False
+    mock_components["master_config"]["distillation"]["num_generations_per_prompt"] = (
+        student_generations_per_prompt + teacher_generations_per_prompt
+    )
+    mock_components["master_config"]["distillation"]["data_pipeline"] = {
+        "mode": "stream_rollout",
+        "max_chunk_tokens": 128,
+    }
+    mixed_generation = {
+        "enabled": True,
+        "student_generations_per_prompt": student_generations_per_prompt,
+        "teacher_generations_per_prompt": teacher_generations_per_prompt,
+    }
+    if teacher_generations_per_prompt > 0:
+        mixed_generation["teacher_rollout_path"] = "/tmp/teacher-rollouts.jsonl"
+    mock_components["master_config"]["distillation"]["mixed_generation"] = (
+        mixed_generation
+    )
+    mock_components["master_config"]["policy"]["train_global_batch_size"] = (
+        student_generations_per_prompt + teacher_generations_per_prompt
+    )
+    mock_components["master_config"]["policy"]["generation"]["backend"] = "vllm"
+    mock_components["master_config"]["policy"]["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+    mock_components["master_config"]["env"] = {"should_use_nemo_gym": True}
+
+    layout = MagicMock()
+    layout.dp = 1
+    mock_components["teacher_policy"].stage_layout.return_value = layout
+    mock_components["teacher_policy"].annotate_topk_stream.return_value = "annotated"
+    mock_components["student_policy"].train_distillation_stream_from_refs.return_value = {
+        "loss": torch.tensor(0.25),
+        "grad_norm": torch.tensor(0.75),
+        "all_mb_metrics": {"global_valid_toks": [3]},
+    }
+
+
+def _student_rollout_final_batch(
+    row_count: int,
+    *,
+    prompt_token_ids: list[int] | None = None,
+) -> BatchedDataDict:
+    if prompt_token_ids is None:
+        prompt_token_ids = [1] * row_count
+    return BatchedDataDict[DatumSpec](
+        {
+            "agent_ref": [
+                {"type": "student", "name": f"student-{idx}"}
+                for idx in range(row_count)
+            ],
+            "message_log": [
+                [
+                    {"token_ids": torch.tensor([prompt_token_ids[idx]]), "role": "user"},
+                    {
+                        "token_ids": torch.tensor([10 + idx]),
+                        "generation_logprobs": torch.tensor([-0.2]),
+                        "role": "assistant",
+                    },
+                ]
+                for idx in range(row_count)
+            ],
+            "loss_multiplier": torch.ones(row_count),
+            "length": torch.ones(row_count, dtype=torch.int32),
+            "total_reward": torch.arange(1, row_count + 1, dtype=torch.float32),
+            "truncated": torch.zeros(row_count, dtype=torch.bool),
+        }
+    )
+
+
+def _teacher_rollout_record(
+    generation_id: int,
+    *,
+    prompt_uid: str = "train:test_dataset:0",
+    dataset_index: int = 0,
+    prompt_token_id: int = 1,
+    assistant_token_id: int | None = None,
+) -> dict:
+    if assistant_token_id is None:
+        assistant_token_id = 99 + generation_id
+    return {
+        "schema_version": 1,
+        "source": "teacher",
+        "prompt_uid": prompt_uid,
+        "dataset_index": dataset_index,
+        "teacher_generation_id": generation_id,
+        "agent_ref": {"type": "teacher", "name": f"teacher-{generation_id}"},
+        "message_log": [
+            {"token_ids": [prompt_token_id], "role": "user", "content": ""},
+            {
+                "token_ids": [assistant_token_id],
+                "generation_logprobs": [-0.1],
+                "role": "assistant",
+                "content": "",
+            },
+        ],
+        "length": 1,
+        "loss_multiplier": 1.0,
+        "total_reward": 4.0 + generation_id,
+        "truncated": False,
+        "sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": None},
+        "model": {"name_or_path": "test-teacher", "tokenizer": "test-teacher"},
+    }
+
+
+def _train_metrics_from_logger(logger: MagicMock) -> dict | None:
+    for call in logger.log_metrics.call_args_list:
+        if call.kwargs.get("prefix") == "train":
+            return call.args[0]
+    return None
+
+
+def test_distillation_train_mixed_generation_uses_student_subset_and_full_metadata(
+    mock_components,
+):
+    _configure_mixed_generation_test(
+        mock_components,
+        student_generations_per_prompt=3,
+        teacher_generations_per_prompt=1,
+    )
+
+    student_final_batch = _student_rollout_final_batch(3)
+    teacher_record = _teacher_rollout_record(0)
+    teacher_store = MagicMock()
+    teacher_store.select_for_step.return_value = [teacher_record]
+    fake_manifest = SimpleNamespace(
+        input_lengths=torch.tensor([2, 2, 2, 2]),
+        batch_size=4,
+        loss_spans=object(),
+    )
+    fake_token_stream = SimpleNamespace(shard_streams=[["chunk"]])
+
+    def fake_rollout_normalizer(**kwargs):
+        rollout_batch = kwargs["rollout_batch"]
+        assert rollout_batch["rollout_source"] == [
+            "student",
+            "student",
+            "student",
+            "teacher",
+        ]
+        assert rollout_batch["sample_ids"].tolist() == [0, 1, 2, 3]
+        assert rollout_batch["generation_ids"].tolist() == [0, 1, 2, 3]
+        return fake_manifest, fake_token_stream
+
+    with (
+        patch.object(
+            distil_mod,
+            "TeacherRolloutStore",
+            return_value=teacher_store,
+        ) as mock_store_cls,
+        patch.object(
+            distil_mod,
+            "run_async_nemo_gym_rollout",
+            return_value=SimpleNamespace(
+                final_batch=student_final_batch,
+                rollout_metrics={"mean_gen_tokens_per_sample": 1.0},
+            ),
+        ) as mock_nemo_gym_rollout,
+        patch.object(
+            distil_mod,
+            "build_token_stream_from_rollout_batch",
+            side_effect=fake_rollout_normalizer,
+        ),
+        patch.object(distil_mod, "estimate_chunk_bytes", return_value=1),
+        patch.object(distil_mod, "estimate_active_loss_positions", return_value=3),
+        patch.object(
+            distil_mod,
+            "drain_annotated_stream",
+            return_value="drained",
+        ),
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            mock_components["master_config"],
+        )
+
+    mock_store_cls.assert_called_once()
+    _, store_kwargs = mock_store_cls.call_args
+    assert store_kwargs["dataset_namespace"] == "train:test_dataset"
+    assert store_kwargs["expected_model_name"] == "test-teacher"
+    assert store_kwargs["expected_tokenizer_name_or_path"] == "test-teacher"
+    assert store_kwargs["require_done"] is True
+    teacher_store.select_for_step.assert_called_once_with(
+        ["train:test_dataset:0"],
+        teacher_generations_per_prompt=1,
+        step=0,
+        seed=42,
+    )
+    rollout_input = mock_nemo_gym_rollout.call_args.kwargs["input_batch"]
+    assert rollout_input.size == 3
+    for key in distil_mod.STREAM_METADATA_KEYS:
+        assert key not in rollout_input
+    train_metrics = _train_metrics_from_logger(mock_components["logger"])
+    assert train_metrics is not None
+    assert train_metrics["rollout/source/student/count"] == 3.0
+    assert train_metrics["rollout/source/teacher/count"] == 1.0
+    assert train_metrics["rollout/source/teacher/reward_mean"] == 4.0
+
+
+def test_distillation_train_mixed_generation_uses_real_store_and_preserves_alignment(
+    mock_components,
+    tmp_path,
+):
+    _configure_mixed_generation_test(
+        mock_components,
+        student_generations_per_prompt=3,
+        teacher_generations_per_prompt=1,
+    )
+    teacher_rollout_path = tmp_path / "teacher-rollouts.jsonl"
+    teacher_records = [
+        _teacher_rollout_record(
+            0,
+            prompt_uid="train:test_dataset:0",
+            dataset_index=0,
+            prompt_token_id=101,
+            assistant_token_id=900,
+        ),
+        _teacher_rollout_record(
+            0,
+            prompt_uid="train:test_dataset:1",
+            dataset_index=1,
+            prompt_token_id=102,
+            assistant_token_id=901,
+        ),
+    ]
+    with teacher_rollout_path.open("w", encoding="utf-8") as handle:
+        for record in teacher_records:
+            handle.write(json.dumps(record) + "\n")
+    teacher_rollout_path.with_name(f"{teacher_rollout_path.name}.done").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    mock_components["master_config"]["distillation"]["mixed_generation"][
+        "teacher_rollout_path"
+    ] = str(teacher_rollout_path)
+    mock_components["master_config"]["distillation"]["num_prompts_per_step"] = 2
+    mock_components["master_config"]["policy"]["train_global_batch_size"] = 8
+
+    prompt_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {"token_ids": torch.tensor([101]), "role": "user", "content": "p0"},
+                    {
+                        "token_ids": torch.tensor([201]),
+                        "role": "assistant",
+                        "content": "a0",
+                    },
+                ],
+                [
+                    {"token_ids": torch.tensor([102]), "role": "user", "content": "p1"},
+                    {
+                        "token_ids": torch.tensor([202]),
+                        "role": "assistant",
+                        "content": "a1",
+                    },
+                ],
+            ],
+            "loss_multiplier": torch.ones(2),
+            "task_name": ["math", "math"],
+            "extra_env_info": [{}, {}],
+            "length": torch.tensor([1, 1]),
+            "idx": torch.tensor([0, 1]),
+        }
+    )
+
+    def train_iter(self):
+        return iter([prompt_batch])
+
+    mock_components["train_dataloader"].__iter__ = train_iter
+    mock_components["train_dataloader"].__len__ = MagicMock(return_value=1)
+
+    fake_manifest = SimpleNamespace(
+        input_lengths=torch.full((8,), 2),
+        batch_size=8,
+        loss_spans=object(),
+    )
+    fake_token_stream = SimpleNamespace(shard_streams=[["chunk"]])
+
+    def fake_nemo_gym_rollout(**kwargs):
+        rollout_input = kwargs["input_batch"]
+        prompt_tokens = [
+            int(message_log[0]["token_ids"].item())
+            for message_log in rollout_input["message_log"]
+        ]
+        assert prompt_tokens == [101, 101, 101, 102, 102, 102]
+        return SimpleNamespace(
+            final_batch=_student_rollout_final_batch(
+                6,
+                prompt_token_ids=[101, 101, 101, 102, 102, 102],
+            ),
+            rollout_metrics={"mean_gen_tokens_per_sample": 1.0},
+        )
+
+    def fake_rollout_normalizer(**kwargs):
+        rollout_batch = kwargs["rollout_batch"]
+        assert rollout_batch["rollout_source"] == [
+            "student",
+            "student",
+            "student",
+            "teacher",
+            "student",
+            "student",
+            "student",
+            "teacher",
+        ]
+        assert rollout_batch["prompt_ids"].tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
+        assert rollout_batch["generation_ids"].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
+        prompt_tokens = [
+            int(message_log[0]["token_ids"].item())
+            for message_log in rollout_batch["message_log"]
+        ]
+        assistant_tokens = [
+            int(message_log[1]["token_ids"].item())
+            for message_log in rollout_batch["message_log"]
+        ]
+        assert prompt_tokens == [101, 101, 101, 101, 102, 102, 102, 102]
+        assert assistant_tokens == [10, 11, 12, 900, 13, 14, 15, 901]
+        return fake_manifest, fake_token_stream
+
+    with (
+        patch.object(
+            distil_mod,
+            "run_async_nemo_gym_rollout",
+            side_effect=fake_nemo_gym_rollout,
+        ),
+        patch.object(
+            distil_mod,
+            "build_token_stream_from_rollout_batch",
+            side_effect=fake_rollout_normalizer,
+        ),
+        patch.object(distil_mod, "estimate_chunk_bytes", return_value=1),
+        patch.object(distil_mod, "estimate_active_loss_positions", return_value=8),
+        patch.object(
+            distil_mod,
+            "drain_annotated_stream",
+            return_value="drained",
+        ),
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            mock_components["master_config"],
+        )
+
+    train_metrics = _train_metrics_from_logger(mock_components["logger"])
+    assert train_metrics is not None
+    assert train_metrics["rollout/source/student/count"] == 6.0
+    assert train_metrics["rollout/source/teacher/count"] == 2.0
+
+
+def test_distillation_train_mixed_generation_supports_student_only_layout(
+    mock_components,
+):
+    _configure_mixed_generation_test(
+        mock_components,
+        student_generations_per_prompt=4,
+        teacher_generations_per_prompt=0,
+    )
+    student_final_batch = _student_rollout_final_batch(4)
+    fake_manifest = SimpleNamespace(
+        input_lengths=torch.tensor([2, 2, 2, 2]),
+        batch_size=4,
+        loss_spans=object(),
+    )
+    fake_token_stream = SimpleNamespace(shard_streams=[["chunk"]])
+
+    def fake_rollout_normalizer(**kwargs):
+        rollout_batch = kwargs["rollout_batch"]
+        assert rollout_batch["rollout_source"] == [
+            "student",
+            "student",
+            "student",
+            "student",
+        ]
+        assert rollout_batch["generation_ids"].tolist() == [0, 1, 2, 3]
+        return fake_manifest, fake_token_stream
+
+    with (
+        patch.object(distil_mod, "TeacherRolloutStore") as mock_store_cls,
+        patch.object(
+            distil_mod,
+            "run_async_nemo_gym_rollout",
+            return_value=SimpleNamespace(
+                final_batch=student_final_batch,
+                rollout_metrics={"mean_gen_tokens_per_sample": 1.0},
+            ),
+        ) as mock_nemo_gym_rollout,
+        patch.object(
+            distil_mod,
+            "build_token_stream_from_rollout_batch",
+            side_effect=fake_rollout_normalizer,
+        ),
+        patch.object(distil_mod, "estimate_chunk_bytes", return_value=1),
+        patch.object(distil_mod, "estimate_active_loss_positions", return_value=3),
+        patch.object(
+            distil_mod,
+            "drain_annotated_stream",
+            return_value="drained",
+        ),
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            mock_components["master_config"],
+        )
+
+    mock_store_cls.assert_not_called()
+    assert mock_nemo_gym_rollout.call_args.kwargs["input_batch"].size == 4
+    train_metrics = _train_metrics_from_logger(mock_components["logger"])
+    assert train_metrics is not None
+    assert train_metrics["rollout/source/student/count"] == 4.0
+    assert train_metrics["rollout/source/teacher/count"] == 0.0
+
+
+def test_distillation_train_mixed_generation_supports_teacher_only_layout(
+    mock_components,
+):
+    _configure_mixed_generation_test(
+        mock_components,
+        student_generations_per_prompt=0,
+        teacher_generations_per_prompt=4,
+    )
+    teacher_store = MagicMock()
+    teacher_store.select_for_step.return_value = [
+        _teacher_rollout_record(generation_id) for generation_id in range(4)
+    ]
+    fake_manifest = SimpleNamespace(
+        input_lengths=torch.tensor([2, 2, 2, 2]),
+        batch_size=4,
+        loss_spans=object(),
+    )
+    fake_token_stream = SimpleNamespace(shard_streams=[["chunk"]])
+
+    def fake_rollout_normalizer(**kwargs):
+        rollout_batch = kwargs["rollout_batch"]
+        assert rollout_batch["rollout_source"] == [
+            "teacher",
+            "teacher",
+            "teacher",
+            "teacher",
+        ]
+        assert rollout_batch["generation_ids"].tolist() == [0, 1, 2, 3]
+        return fake_manifest, fake_token_stream
+
+    with (
+        patch.object(
+            distil_mod,
+            "TeacherRolloutStore",
+            return_value=teacher_store,
+        ) as mock_store_cls,
+        patch.object(
+            distil_mod,
+            "run_async_nemo_gym_rollout",
+            side_effect=AssertionError("teacher-only layout should skip student rollout"),
+        ) as mock_nemo_gym_rollout,
+        patch.object(
+            distil_mod,
+            "build_token_stream_from_rollout_batch",
+            side_effect=fake_rollout_normalizer,
+        ),
+        patch.object(distil_mod, "estimate_chunk_bytes", return_value=1),
+        patch.object(distil_mod, "estimate_active_loss_positions", return_value=3),
+        patch.object(
+            distil_mod,
+            "drain_annotated_stream",
+            return_value="drained",
+        ),
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            mock_components["master_config"],
+        )
+
+    mock_store_cls.assert_called_once()
+    mock_nemo_gym_rollout.assert_not_called()
+    teacher_store.select_for_step.assert_called_once_with(
+        ["train:test_dataset:0"],
+        teacher_generations_per_prompt=4,
+        step=0,
+        seed=42,
+    )
+    train_metrics = _train_metrics_from_logger(mock_components["logger"])
+    assert train_metrics is not None
+    assert train_metrics["rollout/source/student/count"] == 0.0
+    assert train_metrics["rollout/source/teacher/count"] == 4.0
+
+
+def test_distillation_train_mixed_generation_rejects_non_nemo_gym_rollouts(
+    mock_components,
+):
+    mock_components["master_config"]["distillation"]["num_generations_per_prompt"] = 1
+    mock_components["master_config"]["distillation"]["mixed_generation"] = {
+        "enabled": True,
+        "student_generations_per_prompt": 1,
+        "teacher_generations_per_prompt": 0,
+    }
+
+    with pytest.raises(AssertionError, match="NeMo-Gym"):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            mock_components["master_config"],
+        )
+
+
+def test_distillation_train_mixed_generation_sparse_loss_uses_sparse_stream_consumer(
+    mock_components,
+):
+    _configure_mixed_generation_test(
+        mock_components,
+        student_generations_per_prompt=3,
+        teacher_generations_per_prompt=1,
+    )
+    mock_components["master_config"]["distillation"]["data_pipeline"] = {
+        "mode": "sparse_loss",
+        "max_chunk_tokens": 128,
+    }
+    mock_components["student_policy"].train_distillation_sparse_stream.return_value = {
+        "loss": torch.tensor(0.25),
+        "grad_norm": torch.tensor(0.75),
+        "all_mb_metrics": {"global_valid_toks": [3]},
+    }
+    teacher_store = MagicMock()
+    teacher_store.select_for_step.return_value = [_teacher_rollout_record(0)]
+
+    with (
+        patch.object(
+            distil_mod,
+            "TeacherRolloutStore",
+            return_value=teacher_store,
+        ),
+        patch.object(
+            distil_mod,
+            "run_async_nemo_gym_rollout",
+            return_value=SimpleNamespace(
+                final_batch=_student_rollout_final_batch(3),
+                rollout_metrics={"mean_gen_tokens_per_sample": 1.0},
+            ),
+        ),
+        patch.object(
+            distil_mod,
+            "drain_annotated_stream",
+            return_value="drained",
+        ),
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            mock_components["master_config"],
+        )
+
+    mock_components["teacher_policy"].get_topk_logits.assert_not_called()
+    mock_components[
+        "student_policy"
+    ].train_distillation_sparse_stream.assert_called_once()
+    sparse_call = mock_components[
+        "student_policy"
+    ].train_distillation_sparse_stream.call_args
+    assert sparse_call.args[1:] == ("drained", mock_components["loss_fn"])
+    assert sparse_call.args[0]["sample_ids"].tolist() == [0, 1, 2, 3]
+    assert sparse_call.args[0]["generation_ids"].tolist() == [0, 1, 2, 3]
+
+
+def test_distillation_train_mixed_generation_dense_path_calls_get_topk_logits(
+    mock_components,
+):
+    _configure_mixed_generation_test(
+        mock_components,
+        student_generations_per_prompt=3,
+        teacher_generations_per_prompt=1,
+    )
+    mock_components["master_config"]["distillation"].pop("data_pipeline")
+    mock_components["teacher_policy"].get_topk_logits.return_value = {
+        "topk_logits": torch.randn(4, 2, 64),
+        "topk_indices": torch.randint(0, 8, (4, 2, 64)),
+    }
+    teacher_store = MagicMock()
+    teacher_store.select_for_step.return_value = [_teacher_rollout_record(0)]
+
+    with (
+        patch.object(
+            distil_mod,
+            "TeacherRolloutStore",
+            return_value=teacher_store,
+        ),
+        patch.object(
+            distil_mod,
+            "run_async_nemo_gym_rollout",
+            return_value=SimpleNamespace(
+                final_batch=_student_rollout_final_batch(3),
+                rollout_metrics={"mean_gen_tokens_per_sample": 1.0},
+            ),
+        ),
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            mock_components["master_config"],
+        )
+
+    mock_components["teacher_policy"].get_topk_logits.assert_called_once()
+    mock_components["student_policy"].train.assert_called_once()
+    train_payload = mock_components["student_policy"].train.call_args.args[0]
+    assert train_payload["sample_ids"].tolist() == [0, 1, 2, 3]
+    assert train_payload["generation_ids"].tolist() == [0, 1, 2, 3]
+    assert train_payload["teacher_topk_logits"].shape[0] == 4
 
 
 def test_distillation_train_sparse_loss_uses_sparse_stream_consumer(mock_components):

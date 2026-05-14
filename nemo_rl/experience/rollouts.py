@@ -1095,7 +1095,11 @@ def run_async_nemo_gym_rollout(
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
-    nemo_gym_rows = input_batch["extra_env_info"]
+    # The rollout path mutates each row with per-request generation settings and
+    # `_rowidx`.  `BatchedDataDict.select_indices` can intentionally reuse list
+    # objects when duplicate prompt indices are selected, so copy row objects
+    # before mutation to keep repeated samples independent.
+    nemo_gym_rows = [copy.deepcopy(row) for row in input_batch["extra_env_info"]]
 
     # Handle generation parameters up front so we don't hide anything inside here to avoid being unintuitive to the user.
     # NeMo-Gym policy is "What you see is what you get".

@@ -34,6 +34,17 @@ from nemo_rl.algorithms.loss import (
     DistillationLossDataDict,
     DistillationLossFn,
 )
+from nemo_rl.algorithms.distillation_mixed_generation import (
+    TeacherRolloutStore,
+    build_prompt_identities_from_batch,
+    build_source_plan,
+    build_student_rollout_input,
+    dataset_namespace_from_config,
+    mix_rollout_batches,
+    parse_mixed_generation_config,
+    records_to_final_batch,
+    source_metrics,
+)
 from nemo_rl.algorithms.distillation_streaming import (
     attach_step_metadata,
     build_batch_manifest_from_train_data,
@@ -108,6 +119,7 @@ class DistillationConfig(TypedDict):
     topk_logits_k: int
     seed: int
     data_pipeline: NotRequired[dict[str, Any]]
+    mixed_generation: NotRequired[dict[str, Any]]
 
 
 class DistillationSaveState(TypedDict):
@@ -654,6 +666,42 @@ def distillation_train(
         raise AssertionError("stream_rollout v1 does not support async rollouts")
     tokenizer_name_or_path = _get_tokenizer_name_or_path(tokenizer, master_config)
     tokenizer_config = _get_tokenizer_config(tokenizer)
+    mixed_generation_config = parse_mixed_generation_config(
+        master_config["distillation"].get("mixed_generation"),
+        num_generations_per_prompt=master_config["distillation"][
+            "num_generations_per_prompt"
+        ],
+    )
+    mixed_teacher_store = None
+    mixed_dataset_namespace = None
+    if mixed_generation_config.enabled:
+        if not use_nemo_gym:
+            raise AssertionError(
+                "distillation.mixed_generation currently supports NeMo-Gym rollouts only"
+            )
+        mixed_dataset_namespace = dataset_namespace_from_config(
+            master_config["data"],
+            split="train",
+        )
+        teacher_generations_per_prompt = (
+            mixed_generation_config.teacher_generations_per_prompt or 0
+        )
+        if teacher_generations_per_prompt > 0:
+            mixed_teacher_store = TeacherRolloutStore(
+                mixed_generation_config.teacher_rollout_path,
+                dataset_namespace=mixed_dataset_namespace,
+                sampling_config=master_config["policy"].get("generation"),
+                require_sampling_match=mixed_generation_config.require_sampling_match,
+                expected_model_name=master_config["teacher"]["model_name"],
+                expected_tokenizer_name_or_path=tokenizer_name_or_path,
+                require_done=True,
+            )
+        print(
+            "▶ Using mixed generation for distillation: "
+            f"student={mixed_generation_config.student_generations_per_prompt}, "
+            f"teacher={mixed_generation_config.teacher_generations_per_prompt}",
+            flush=True,
+        )
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -721,90 +769,144 @@ def distillation_train(
                             "num_prompts_per_step"
                         ],
                     )
-                    # Repeat batch items
-                    repeated_batch: BatchedDataDict[DatumSpec] = (
-                        batch.repeat_interleave(
+                    source_plan = None
+                    if mixed_generation_config.enabled:
+                        source_plan = build_source_plan(
+                            prompt_count=batch.size,
+                            num_generations_per_prompt=master_config["distillation"][
+                                "num_generations_per_prompt"
+                            ],
+                            config=mixed_generation_config,
+                        )
+                        student_rollout_batch, _ = build_student_rollout_input(
+                            batch,
+                            source_plan,
+                        )
+                        repeated_batch = student_rollout_batch
+                    else:
+                        # Repeat batch items
+                        repeated_batch = batch.repeat_interleave(
                             master_config["distillation"]["num_generations_per_prompt"]
                         )
-                    )
-                    attach_step_metadata(repeated_batch, step_manifest)
+                        student_rollout_batch = repeated_batch
+                        attach_step_metadata(repeated_batch, step_manifest)
 
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 print(
-                    f"▶ Generating responses for batch of size {repeated_batch.size}...",
+                    "▶ Generating responses for batch of size "
+                    f"{student_rollout_batch.size}...",
                     flush=True,
                 )
-                with timer.time("prepare_for_generation"):
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            student_policy,
-                            student_generation,
-                            colocated_inference,
-                            timer=timer,
-                        )
-                        POLICY_GENERATION_STALE = False
-                    else:
-                        student_generation.prepare_for_generation()
+                if student_rollout_batch.size > 0:
+                    with timer.time("prepare_for_generation"):
+                        if NEED_REFIT and POLICY_GENERATION_STALE:
+                            refit_policy_generation(
+                                student_policy,
+                                student_generation,
+                                colocated_inference,
+                                timer=timer,
+                            )
+                            POLICY_GENERATION_STALE = False
+                        else:
+                            student_generation.prepare_for_generation()
 
-                with timer.time("generation"):
-                    # NeMo-Gym uses the async OpenAI-compatible rollout path.
-                    if use_nemo_gym:
-                        rollout_metadata = {
-                            key: repeated_batch[key] for key in STREAM_METADATA_KEYS
-                        }
-                        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
-                            policy_generation=student_generation,
-                            input_batch=repeated_batch,
-                            tokenizer=tokenizer,
-                            task_to_env=task_to_env,
-                            generation_config=master_config["policy"]["generation"],
-                            max_seq_len=None,
-                            max_rollout_turns=None,
-                            greedy=False,
-                        )
-                        repeated_batch = nemo_gym_rollout_result.final_batch
-                        for key, value in rollout_metadata.items():
-                            repeated_batch[key] = value
-                        rollout_metrics = nemo_gym_rollout_result.rollout_metrics
-                        del nemo_gym_rollout_result
+                    with timer.time("generation"):
+                        # NeMo-Gym uses the async OpenAI-compatible rollout path.
+                        if use_nemo_gym:
+                            rollout_metadata = (
+                                {
+                                    key: repeated_batch[key]
+                                    for key in STREAM_METADATA_KEYS
+                                }
+                                if not mixed_generation_config.enabled
+                                else {}
+                            )
+                            nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                                policy_generation=student_generation,
+                                input_batch=student_rollout_batch,
+                                tokenizer=tokenizer,
+                                task_to_env=task_to_env,
+                                generation_config=master_config["policy"][
+                                    "generation"
+                                ],
+                                max_seq_len=None,
+                                max_rollout_turns=None,
+                                greedy=False,
+                            )
+                            repeated_batch = nemo_gym_rollout_result.final_batch
+                            for key, value in rollout_metadata.items():
+                                repeated_batch[key] = value
+                            rollout_metrics = nemo_gym_rollout_result.rollout_metrics
+                            del nemo_gym_rollout_result
 
-                        if not _should_log_nemo_gym_responses(master_config):
-                            for key in list(rollout_metrics):
-                                if "full_result" in key:
-                                    rollout_metrics.pop(key)
-                    # Use async rollouts if vLLM async engine is enabled
-                    elif _should_use_async_rollouts(master_config):
-                        (
-                            repeated_batch,
-                            rollout_metrics,
-                        ) = run_async_multi_turn_rollout(
-                            policy_generation=student_generation,
-                            input_batch=repeated_batch,
-                            tokenizer=tokenizer,
-                            task_to_env=task_to_env,
-                            max_seq_len=master_config["policy"][
-                                "max_total_sequence_length"
-                            ],
-                            max_rollout_turns=master_config["distillation"][
-                                "max_rollout_turns"
-                            ],
-                            greedy=False,
+                            if not _should_log_nemo_gym_responses(master_config):
+                                for key in list(rollout_metrics):
+                                    if "full_result" in key:
+                                        rollout_metrics.pop(key)
+                        # Use async rollouts if vLLM async engine is enabled
+                        elif _should_use_async_rollouts(master_config):
+                            (
+                                repeated_batch,
+                                rollout_metrics,
+                            ) = run_async_multi_turn_rollout(
+                                policy_generation=student_generation,
+                                input_batch=student_rollout_batch,
+                                tokenizer=tokenizer,
+                                task_to_env=task_to_env,
+                                max_seq_len=master_config["policy"][
+                                    "max_total_sequence_length"
+                                ],
+                                max_rollout_turns=master_config["distillation"][
+                                    "max_rollout_turns"
+                                ],
+                                greedy=False,
+                            )
+                        else:
+                            repeated_batch, rollout_metrics = run_multi_turn_rollout(
+                                policy_generation=student_generation,
+                                input_batch=student_rollout_batch,
+                                tokenizer=tokenizer,
+                                task_to_env=task_to_env,
+                                max_seq_len=master_config["policy"][
+                                    "max_total_sequence_length"
+                                ],
+                                max_rollout_turns=master_config["distillation"][
+                                    "max_rollout_turns"
+                                ],
+                                greedy=False,
+                            )
+                        student_generation.finish_generation()
+                else:
+                    rollout_metrics = {}
+                    repeated_batch = records_to_final_batch([])
+
+                if mixed_generation_config.enabled:
+                    assert source_plan is not None
+                    teacher_generations_per_prompt = (
+                        mixed_generation_config.teacher_generations_per_prompt or 0
+                    )
+                    if teacher_generations_per_prompt > 0:
+                        assert mixed_teacher_store is not None
+                        teacher_records = mixed_teacher_store.select_for_step(
+                            build_prompt_identities_from_batch(
+                                batch,
+                                dataset_namespace=mixed_dataset_namespace,
+                            ),
+                            teacher_generations_per_prompt=teacher_generations_per_prompt,
+                            step=total_steps,
+                            seed=master_config["distillation"]["seed"],
                         )
+                        teacher_batch = records_to_final_batch(teacher_records)
                     else:
-                        repeated_batch, rollout_metrics = run_multi_turn_rollout(
-                            policy_generation=student_generation,
-                            input_batch=repeated_batch,
-                            tokenizer=tokenizer,
-                            task_to_env=task_to_env,
-                            max_seq_len=master_config["policy"][
-                                "max_total_sequence_length"
-                            ],
-                            max_rollout_turns=master_config["distillation"][
-                                "max_rollout_turns"
-                            ],
-                            greedy=False,
-                        )
-                    student_generation.finish_generation()
+                        teacher_batch = records_to_final_batch([])
+                    repeated_batch = mix_rollout_batches(
+                        repeated_batch,
+                        teacher_batch,
+                        source_plan,
+                        step_manifest,
+                    )
+                    if mixed_generation_config.log_source_metrics:
+                        rollout_metrics.update(source_metrics(repeated_batch))
 
                 with timer.time("data_processing"):
                     stream_rollout_mode = (

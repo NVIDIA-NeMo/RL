@@ -24,7 +24,12 @@ from yaml import safe_load
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
-from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig, setup_nemo_gym_config
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    NemoGymConfig,
+    _validate_and_order_rollout_results,
+    setup_nemo_gym_config,
+)
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -167,6 +172,82 @@ def _write_actual_test_data(original_input: list, actual_result: list):
         json.dump(data, f)
         f.write("\n")
     print(f"Wrote updated test data to {output_path}")
+
+
+def test_validate_and_order_rollout_results_rejects_sparse_row_mapping():
+    examples = [
+        {
+            "agent_ref": {"type": "responses_api_agents", "name": "agent"},
+            "responses_create_params": {
+                "input": [{"role": "user", "content": f"p{idx}"}]
+            },
+        }
+        for idx in range(3)
+    ]
+
+    with pytest.raises(ValueError) as exc_info:
+        _validate_and_order_rollout_results(
+            examples,
+            nemo_rl_rowidxs=[0, 2, 2],
+            nemo_rl_results=[
+                {"full_result": {"reward": 0.0}},
+                {"full_result": {"reward": 2.0}},
+                {"full_result": {"reward": 2.0}},
+            ],
+        )
+    message = str(exc_info.value)
+    assert "missing_rowidxs=[1]" in message
+    assert "duplicate_rowidxs=[2]" in message
+    assert "invalid_rowidxs=[]" in message
+
+
+def test_validate_and_order_rollout_results_rejects_invalid_row_mapping():
+    examples = [
+        {
+            "agent_ref": {"type": "responses_api_agents", "name": "agent"},
+            "responses_create_params": {
+                "input": [{"role": "user", "content": f"p{idx}"}]
+            },
+        }
+        for idx in range(2)
+    ]
+
+    with pytest.raises(ValueError) as exc_info:
+        _validate_and_order_rollout_results(
+            examples,
+            nemo_rl_rowidxs=[0, 4],
+            nemo_rl_results=[
+                {"full_result": {"reward": 0.0}},
+                {"full_result": {"reward": 4.0}},
+            ],
+        )
+    message = str(exc_info.value)
+    assert "missing_rowidxs=[1]" in message
+    assert "invalid_rowidxs=[{'result_position': 1, 'rowidx': 4}]" in message
+
+
+def test_validate_and_order_rollout_results_reorders_out_of_order_rows():
+    examples = [
+        {
+            "agent_ref": {"type": "responses_api_agents", "name": "agent"},
+            "responses_create_params": {
+                "input": [{"role": "user", "content": f"p{idx}"}]
+            },
+        }
+        for idx in range(3)
+    ]
+
+    ordered = _validate_and_order_rollout_results(
+        examples,
+        nemo_rl_rowidxs=[2, 0, 1],
+        nemo_rl_results=[
+            {"full_result": {"reward": 2.0}},
+            {"full_result": {"reward": 0.0}},
+            {"full_result": {"reward": 1.0}},
+        ],
+    )
+
+    assert [result["full_result"]["reward"] for result in ordered] == [0.0, 1.0, 2.0]
 
 
 @pytest.mark.nemo_gym
