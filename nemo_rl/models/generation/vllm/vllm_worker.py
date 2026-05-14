@@ -703,10 +703,10 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
-                - output_ids: input + generated token IDs with proper padding
-                - logprobs: Log probabilities for tokens
-                - generation_lengths: Lengths of each response
-                - unpadded_sequence_lengths: Lengths of each input + generated sequence
+                - ``output_ids``: input + generated token IDs with proper padding
+                - ``logprobs``: Log probabilities for tokens
+                - ``generation_lengths``: Lengths of each response
+                - ``unpadded_sequence_lengths``: Lengths of each input + generated sequence
         """
         # Handle empty input case
         if len(data["input_ids"]) == 0:
