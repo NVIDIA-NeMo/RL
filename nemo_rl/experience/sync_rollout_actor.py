@@ -94,7 +94,6 @@ def kv_first_write(
     Returns:
         ``KVBatchMeta`` covering the written keys.
     """
-
     from nemo_rl.data_plane.codec import maybe_pack_jagged
 
     n = int(final_batch_cpu["sample_mask"].shape[0])
