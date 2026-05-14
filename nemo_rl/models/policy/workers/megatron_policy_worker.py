@@ -95,6 +95,46 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+@contextmanager
+def _meta_metadata_context():
+    """Skip real GPU work during metadata enumeration.
+
+    Bridge's ``export_hf_weights`` does PP/TP/EP gathers to materialize
+    full unsharded tensors, but the refit-info builders only need shape+dtype.
+    Patch the allocators to redirect to ``meta`` and turn the collectives into
+    no-ops.  Subsequent shape-only ops on meta tensors propagate correctly,
+    while peak memory stays at zero extra GiB.
+    """
+    real_all_gather = torch.distributed.all_gather
+    real_broadcast = torch.distributed.broadcast
+    real_empty_like = torch.empty_like
+    real_zeros_like = torch.zeros_like
+
+    def _meta_empty_like(t, *a, **k):
+        return torch.empty(t.shape, dtype=t.dtype, device="meta")
+
+    def _meta_zeros_like(t, *a, **k):
+        return torch.zeros(t.shape, dtype=t.dtype, device="meta")
+
+    def _noop_all_gather(tensor_list, tensor, *a, **k):
+        return None
+
+    def _noop_broadcast(tensor, src, *a, **k):
+        return None
+
+    torch.distributed.all_gather = _noop_all_gather
+    torch.distributed.broadcast = _noop_broadcast
+    torch.empty_like = _meta_empty_like
+    torch.zeros_like = _meta_zeros_like
+    try:
+        yield
+    finally:
+        torch.distributed.all_gather = real_all_gather
+        torch.distributed.broadcast = real_broadcast
+        torch.empty_like = real_empty_like
+        torch.zeros_like = real_zeros_like
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
@@ -968,10 +1008,45 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
         # Reuse shared iterator that appends FP8 KV/Q scales when enabled
-        for name, tensor in self._iter_params_with_optional_kv_scales():
-            refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
+        with _meta_metadata_context():
+            for name, tensor in self._iter_params_with_optional_kv_scales():
+                refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
         return refit_param_info_hf
+
+    def _is_fp8_export(self) -> bool:
+        """Return True iff the train side stores weights as TE blockwise FP8.
+
+        Only ``fp8_param=True`` together with ``fp8_recipe="blockwise"`` produces
+        ``Float8BlockwiseQTensor`` weights that Megatron-Bridge can export via
+        ``build_export_fp8_tasks``.  The common ``fp8_param=False`` recipe runs
+        FP8 GEMMs internally but stores BF16 weights, so the standard task list
+        is correct for that case.
+        """
+        if self.fp8_cfg is None:
+            return False
+        return bool(
+            self.fp8_cfg.get("fp8_param", False)
+            and self.fp8_cfg.get("fp8_recipe") == "blockwise"
+        )
+
+    def _build_refit_conversion_tasks(self) -> list:
+        """Build the conversion-task list driving refit (BF16 or FP8 export).
+
+        For BF16 / FP8-but-fp8_param=False training: standard ``get_conversion_tasks``.
+        For FP8-with-fp8_param=True: Bridge's ``build_export_fp8_tasks``, which
+        emits a *pair* of tasks per FP8 weight (the FP8 data and a ``*_scale_inv``
+        scale tensor).
+        """
+        if self._is_fp8_export():
+            return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
+                self.megatron_bridge.hf_pretrained, [self.model]
+            )
+        return [
+            task
+            for task in self.megatron_bridge.get_conversion_tasks([self.model])
+            if task is not None
+        ]
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
@@ -987,11 +1062,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         Returns:
             List of (parameter_name, size_in_bytes) tuples.
         """
-        self.refit_conversion_tasks = [
-            task
-            for task in self.megatron_bridge.get_conversion_tasks([self.model])
-            if task is not None
-        ]
+        self.refit_conversion_tasks = self._build_refit_conversion_tasks()
         param_info = []
 
         def calculate_size_in_bytes(param, tp_size, ep_size):
@@ -1004,6 +1075,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     torch.bfloat16: 2,
                     torch.float16: 2,
                     torch.float32: 4,
+                    torch.float8_e4m3fn: 1,
+                    torch.float8_e5m2: 1,
+                    torch.uint8: 1,
                 }
                 scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
                 size_in_bytes = (
@@ -1092,6 +1166,108 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             ).reshape(1)
             yield param_name, scale_tensor
 
+    def _iter_local_hf_params(self) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield (hf_name, local_tp_shard) for locally owned params.
+
+        Unlike ``_iter_params_with_optional_kv_scales`` which does PP broadcast
+        + TP gather via ``export_hf_weights``, this method yields TP-local
+        shards directly from Megatron parameters — no collectives needed.
+
+        Compound mappings (QKV, GatedMLP) are split into individual HF params
+        on the TP-local shard.  The returned tensors are views of the model
+        parameters and must not be modified in-place.
+        """
+        from types import SimpleNamespace
+
+        from megatron.bridge.models.conversion.param_mapping import (
+            GatedMLPMapping,
+            QKVMapping,
+            split_qkv_weights,
+        )
+
+        config = self.megatron_bridge.transformer_config
+
+        for task in self.refit_conversion_tasks:
+            if task.param_weight is None:
+                continue  # Non-local PP rank
+
+            local_tensor = task.param_weight
+
+            # FP8 blockwise scale_inv tasks ship as siblings of their weight
+            # tasks. Bridge wraps the base mapping in `_HFNameSuffixMapping`
+            # which delegates `.hf_param` to the base — for compound mappings
+            # the scale tensor must be split the same way the weight is, then
+            # each piece gets the `_scale_inv` suffix on the HF name.
+            if task.global_param_name.endswith("_scale_inv"):
+                hf_param = task.mapping.hf_param
+                if isinstance(hf_param, dict):
+                    base = task.mapping._base_mapping
+                    if isinstance(base, QKVMapping):
+                        # QKV scale: split along dim 0 by head structure.
+                        # split_qkv_weights auto-detects FP8 scale tensors via
+                        # the trailing-dim block divisor (see Bridge code).
+                        tp_size = base.tp_size
+                        local_config = SimpleNamespace(
+                            num_attention_heads=config.num_attention_heads // tp_size,
+                            num_query_groups=config.num_query_groups // tp_size,
+                            kv_channels=config.kv_channels,
+                            hidden_size=config.hidden_size,
+                            attention_output_gate=getattr(
+                                config, "attention_output_gate", False
+                            ),
+                        )
+                        q_s, k_s, v_s = split_qkv_weights(local_config, local_tensor)
+                        yield hf_param["q"] + "_scale_inv", q_s
+                        yield hf_param["k"] + "_scale_inv", k_s
+                        yield hf_param["v"] + "_scale_inv", v_s
+                    elif isinstance(base, GatedMLPMapping):
+                        # linear_fc1 scale: rows are [gate_scale; up_scale]
+                        gate_s, up_s = torch.chunk(local_tensor, 2, dim=0)
+                        yield hf_param["gate"] + "_scale_inv", gate_s
+                        yield hf_param["up"] + "_scale_inv", up_s
+                    else:
+                        raise NotImplementedError(
+                            f"FP8 scale_inv not yet supported for compound "
+                            f"mapping: {type(base).__name__}"
+                        )
+                else:
+                    yield str(hf_param) + "_scale_inv", local_tensor
+                continue
+
+            hf_param = task.mapping.hf_param
+
+            if isinstance(hf_param, dict):
+                if isinstance(task.mapping, QKVMapping):
+                    # Split interleaved QKV into separate Q, K, V on TP-local shard.
+                    # split_qkv_weights works on local shards with adjusted head counts
+                    # since heads_per_group = num_heads/num_query_groups stays constant.
+                    tp_size = task.mapping.tp_size
+                    local_config = SimpleNamespace(
+                        num_attention_heads=config.num_attention_heads // tp_size,
+                        num_query_groups=config.num_query_groups // tp_size,
+                        kv_channels=config.kv_channels,
+                        hidden_size=config.hidden_size,
+                        attention_output_gate=getattr(
+                            config, "attention_output_gate", False
+                        ),
+                    )
+                    q, k, v = split_qkv_weights(local_config, local_tensor)
+                    yield hf_param["q"], q
+                    yield hf_param["k"], k
+                    yield hf_param["v"], v
+                elif isinstance(task.mapping, GatedMLPMapping):
+                    # Each TP shard of linear_fc1 is [gate_shard; up_shard] along dim 0
+                    gate, up = torch.chunk(local_tensor, 2, dim=0)
+                    yield hf_param["gate"], gate
+                    yield hf_param["up"], up
+                else:
+                    raise ValueError(
+                        f"Unsupported compound mapping: {type(task.mapping).__name__}"
+                    )
+            else:
+                # Simple 1→1 mapping (Direct, ColumnParallel, RowParallel, Replicated)
+                yield str(hf_param), local_tensor
+
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(
@@ -1125,6 +1301,275 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             src=0,
             post_iter_func=lambda x: x[1],
         )
+
+    def _build_layer_to_pp_stage(self, pp_size: int) -> dict[str, int]:
+        """Build mapping from layer group name to PP stage index.
+
+        Mirrors Megatron-LM's ``get_num_layers_to_build``
+        (``transformer_block.py``) for the standard (non-VP, non-custom-layout)
+        path: middle stages share ``num_layers - first - last`` evenly, while
+        the first/last stages get their explicit counts when set.
+
+        Cases not yet supported are asserted out so failures are loud rather
+        than silently producing wrong layer→stage mappings:
+          - ``pipeline_model_parallel_layout`` (e.g. DeepSeek-V3)
+          - ``virtual_pipeline_model_parallel_size`` (interleaved PP)
+          - ``account_for_embedding_in_pipeline_split``
+          - ``account_for_loss_in_pipeline_split``
+        """
+        # Read from the runtime model's config rather than the bridge's
+        # default — the user's per-stage layout overrides
+        # (num_layers_in_first/last_pipeline_stage) are applied to the model
+        # in setup but never make it into bridge.transformer_config.
+        config = self.model.config
+
+        assert getattr(config, "pipeline_model_parallel_layout", None) is None, (
+            "nccl_reshard_refit does not support custom pipeline_model_parallel_layout yet"
+        )
+        assert getattr(config, "virtual_pipeline_model_parallel_size", None) in (
+            None,
+            1,
+        ), (
+            "nccl_reshard_refit does not support virtual_pipeline_model_parallel_size > 1 yet"
+        )
+        assert not getattr(config, "account_for_embedding_in_pipeline_split", False), (
+            "nccl_reshard_refit does not support account_for_embedding_in_pipeline_split yet"
+        )
+        assert not getattr(config, "account_for_loss_in_pipeline_split", False), (
+            "nccl_reshard_refit does not support account_for_loss_in_pipeline_split yet"
+        )
+
+        num_layers = config.num_layers
+        n_first = getattr(config, "num_layers_in_first_pipeline_stage", None)
+        n_last = getattr(config, "num_layers_in_last_pipeline_stage", None)
+
+        layers_to_distribute = num_layers
+        stages_left = pp_size
+        if n_first is not None:
+            layers_to_distribute -= n_first
+            stages_left -= 1
+        if n_last is not None:
+            layers_to_distribute -= n_last
+            stages_left -= 1
+
+        if stages_left > 0:
+            assert layers_to_distribute % stages_left == 0, (
+                f"With uneven pipelining the leftover layers ({layers_to_distribute}) "
+                f"must be divisible by leftover stages ({stages_left})"
+            )
+            middle_per_stage = layers_to_distribute // stages_left
+        else:
+            middle_per_stage = 0
+
+        layer_to_pp_stage: dict[str, int] = {}
+        layer_idx = 0
+        for stage in range(pp_size):
+            if stage == 0 and n_first is not None:
+                count = n_first
+            elif stage == pp_size - 1 and n_last is not None:
+                count = n_last
+            else:
+                count = middle_per_stage
+            for _ in range(count):
+                layer_to_pp_stage[f"model.layers.{layer_idx}"] = stage
+                layer_idx += 1
+
+        assert layer_idx == num_layers, (
+            f"Layer assignment incomplete: assigned {layer_idx} of {num_layers}"
+        )
+
+        layer_to_pp_stage["model.embed_tokens"] = 0
+        layer_to_pp_stage["model.norm"] = pp_size - 1
+        layer_to_pp_stage["lm_head"] = pp_size - 1
+        return layer_to_pp_stage
+
+    @torch.no_grad()
+    def prepare_nccl_reshard_refit_info(
+        self, train_parallelism, gen_parallelism, train_world_size, gen_world_size
+    ):
+        """Prepare per-layer parameter metadata for nccl_reshard-based refit."""
+        from nemo_rl.distributed.nccl_reshard_utils import build_nccl_reshard_refit_info
+
+        # Ensure refit_param_info_mcore is computed (needed by _iter_params_with_optional_kv_scales)
+        if self.refit_conversion_tasks is None:
+            self.refit_param_info_mcore = self._calculate_refit_param_info()
+
+        state_dict_metadata = {}
+        with _meta_metadata_context():
+            for name, tensor in self._iter_params_with_optional_kv_scales():
+                state_dict_metadata[name] = {
+                    "shape": list(tensor.shape),
+                    "dtype": str(self.dtype),
+                }
+
+        pp_size = train_parallelism.get("pp_size", 1)
+        layer_to_pp_stage = (
+            self._build_layer_to_pp_stage(pp_size) if pp_size > 1 else None
+        )
+
+        self.nccl_reshard_refit_info = build_nccl_reshard_refit_info(
+            state_dict_metadata,
+            train_parallelism,
+            gen_parallelism,
+            train_world_size,
+            gen_world_size,
+            layer_to_pp_stage=layer_to_pp_stage,
+        )
+
+        # Cache the param map + expert grouping now (depends only on model
+        # topology, not weight values, so it can be computed once at setup
+        # and reused for every refit).
+        self._param_map = {
+            name: tensor for name, tensor in self._iter_local_hf_params()
+        }
+        self._expert_groups = self._build_expert_groups()
+
+        return self.nccl_reshard_refit_info
+
+    def _get_src_local_tensor(self, param_info, expert_groups, gen_tp_size):
+        """Get the TP/EP-local source tensor for one param.
+
+        For fused MoE entries (``_moe_kind`` set), build the fused tensor on
+        demand from ``_param_map``.  For everything else, return the existing
+        ``_param_map`` view directly.  Returns ``None`` if not on this rank
+        (e.g. layer owned by a different PP stage and PP filtering didn't
+        already skip the param).
+        """
+        name = param_info["name"]
+        kind = param_info.get("_moe_kind")
+        if kind:
+            return self._fuse_one_moe_param(kind, name, expert_groups, gen_tp_size)
+        return self._param_map.get(name)
+
+    def _build_expert_groups(self):
+        """Group individual expert params from ``_param_map`` by (prefix, proj_type).
+
+        Pure regex grouping — no tensor allocations.  Returns
+        ``{(prefix, proj): [(expert_idx, param_name), ...]}`` sorted by
+        expert index.  Used by ``_fuse_one_moe_param`` to look up the
+        constituent gate/up/down tensors for a fused w13/w2 entry.
+        """
+        from nemo_rl.distributed.nccl_reshard_utils import _INDIVIDUAL_EXPERT_RE
+
+        groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
+        for name in self._param_map:
+            m = _INDIVIDUAL_EXPERT_RE.match(name)
+            if m:
+                groups.setdefault((m.group(1), m.group(3)), []).append(
+                    (int(m.group(2)), name)
+                )
+        for key in groups:
+            groups[key].sort()
+        return groups
+
+    def _fuse_one_moe_param(self, kind, fused_name, expert_groups, gen_tp_size):
+        """Build a single fused MoE tensor (w13 or w2) on demand.
+
+        Returns the local (TP/EP) shard of the fused tensor, or ``None`` if
+        no local experts contribute to this fused entry (e.g. the layer is
+        not on this PP rank).  Caller is responsible for releasing the
+        returned tensor after the per-param transfer completes — this lets
+        peak memory stay at ~one fused tensor instead of the full
+        ``_fused_expert_map``.
+        """
+        if kind == "w13":
+            # vLLM expects per-rank w13[:, :P] = gate[r*P:(r+1)*P] and
+            # w13[:, P:2P] = up[r*P:(r+1)*P] (P = intermediate / gen_tp_size).
+            # Build the global tensor so that contiguous Shard(1) slicing
+            # by gen TP yields that layout: dim 1 must be
+            # [gate[0:P], up[0:P], gate[P:2P], up[P:2P], ...].
+            prefix = fused_name.rsplit(".w13_weight", 1)[0]
+            gate_group = expert_groups.get((prefix, "gate_proj"), [])
+            up_group = expert_groups.get((prefix, "up_proj"), [])
+            expert_tensors = []
+            for (_, gn), (_, un) in zip(gate_group, up_group):
+                gate = self._param_map[gn]
+                up = self._param_map[un]
+                if gen_tp_size > 1:
+                    inter, hidden = gate.shape
+                    assert inter % gen_tp_size == 0, (
+                        f"intermediate {inter} not divisible by gen_tp_size {gen_tp_size}"
+                    )
+                    P = inter // gen_tp_size
+                    stacked = torch.cat(
+                        [
+                            gate.view(gen_tp_size, P, hidden),
+                            up.view(gen_tp_size, P, hidden),
+                        ],
+                        dim=1,
+                    )  # [gen_tp_size, 2P, hidden]
+                    expert_tensors.append(
+                        stacked.reshape(2 * inter, hidden).contiguous()
+                    )
+                else:
+                    expert_tensors.append(torch.cat([gate, up], dim=0))
+            return torch.stack(expert_tensors) if expert_tensors else None
+
+        if kind == "w2":
+            prefix = fused_name.rsplit(".w2_weight", 1)[0]
+            down_group = expert_groups.get((prefix, "down_proj"), [])
+            expert_tensors = [self._param_map[n] for _, n in down_group]
+            return torch.stack(expert_tensors) if expert_tensors else None
+
+        raise ValueError(f"Unknown _moe_kind: {kind!r}")
+
+    @torch.no_grad()
+    def nccl_reshard_refit(self, kv_scales=None):
+        """Transfer weights to generation workers via xferdtensor_golden.
+
+        Uses TP-local shards directly from Megatron parameters, bypassing
+        the Bridge's PP broadcast + TP gather.  The modified xferdtensor_golden
+        reconstructs the full tensor from per-rank shards internally.
+        """
+        from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
+
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for nccl_reshard refit path."
+            )
+
+        from nemo_rl.distributed.nccl_reshard_utils import DTensorRef
+
+        # _param_map and _expert_groups are built once in
+        # prepare_nccl_reshard_refit_info; weight values change but the
+        # name → view mapping is stable across refits.
+        gen_tp_size = self.nccl_reshard_refit_info.get("gen_tp_size", 1)
+        use_per_stage = hasattr(self, "pp_comm_group")
+
+        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
+            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
+                layer_name
+            ]:
+                if use_per_stage:
+                    if param_info.get("pp_stage", 0) != self.my_pp_stage:
+                        continue
+                    group = self.pp_comm_group
+                else:
+                    group = self.model_update_group
+
+                local = self._get_src_local_tensor(
+                    param_info, self._expert_groups, gen_tp_size
+                )
+                src_tensor = (
+                    DTensorRef(
+                        local_tensor=local, global_shape=param_info["global_shape"]
+                    )
+                    if local is not None
+                    else None
+                )
+                xferdtensor_golden(
+                    src_tensor,
+                    param_info["src_mesh_info"],
+                    param_info["src_placements"],
+                    None,
+                    param_info["dst_mesh_info"],
+                    param_info["dst_placements"],
+                    group,
+                )
+                # Drop refs to the per-iteration fused MoE tensor so its CUDA
+                # memory returns to the caching allocator before the next
+                # iteration's fusion allocates.
+                del local, src_tensor
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)

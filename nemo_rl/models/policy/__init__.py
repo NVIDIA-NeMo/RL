@@ -356,3 +356,6 @@ class PolicyConfig(TypedDict):
     quant_calib_size: NotRequired[int | None]
     quant_batch_size: NotRequired[int | None]
     quant_sequence_length: NotRequired[int | None]
+
+    # shard-to-shard refit for large models (experimental)
+    nccl_reshard_refit: NotRequired[bool]

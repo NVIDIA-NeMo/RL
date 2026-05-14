@@ -987,6 +987,102 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         if self.cpu_offload:
             self.model = self.move_to_cpu(self.model)
 
+    @torch.no_grad()
+    def prepare_nccl_reshard_refit_info(
+        self, train_parallelism, gen_parallelism, train_world_size, gen_world_size
+    ):
+        """Prepare per-layer parameter metadata for nccl_reshard-based refit."""
+        from nemo_rl.distributed.nccl_reshard_utils import build_nccl_reshard_refit_info
+
+        state_dict_metadata = {}
+        for name, tensor in self.model.state_dict().items():
+            if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+                continue
+            if isinstance(tensor, DTensor):
+                global_shape = list(tensor.shape)  # DTensor.shape returns global shape
+            else:
+                global_shape = list(tensor.shape)
+            state_dict_metadata[name] = {
+                "shape": global_shape,
+                "dtype": str(self.dtype),
+            }
+
+        self.nccl_reshard_refit_info = build_nccl_reshard_refit_info(
+            state_dict_metadata,
+            train_parallelism,
+            gen_parallelism,
+            train_world_size,
+            gen_world_size,
+        )
+        return self.nccl_reshard_refit_info
+
+    def get_src_dtensor(self, param_name):
+        """Get a DTensorRef for a source parameter to use with xferdtensor_golden.
+
+        Handles DTensor state_dict quirks: DTensor.state_dict() returns float32
+        params even when model dtype is bfloat16, so this converts to the
+        correct dtype before wrapping.
+        """
+        from nemo_rl.distributed.nccl_reshard_utils import DTensorRef
+
+        src_tensor = self._param_map.get(param_name)
+        if src_tensor is None:
+            return None
+
+        # DTensor state_dict returns float32 — convert to model dtype
+        if isinstance(src_tensor, DTensor):
+            src_tensor = src_tensor.full_tensor()
+            torch.cuda.synchronize()
+        src_tensor = src_tensor.to(self.dtype).contiguous()
+
+        return DTensorRef(local_tensor=src_tensor, global_shape=src_tensor.shape)
+
+    @torch.no_grad()
+    def nccl_reshard_refit(self, kv_scales=None):
+        """Transfer weights to generation workers via xferdtensor_golden."""
+        from torch.distributed.tensor.placement_types import Replicate
+
+        from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
+
+        if self.model_update_group.rank == 0:
+            print("[DTensor nccl_reshard_refit] started", flush=True)
+
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for nccl_reshard refit path."
+            )
+
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
+        self._param_map = dict(self.model.state_dict())
+
+        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
+            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
+                layer_name
+            ]:
+                src_tensor = self.get_src_dtensor(param_info["name"])
+                # DTensor path: get_src_dtensor calls .full_tensor(), so every
+                # src rank holds the complete tensor.  Use all-Replicate for src
+                # so xferdtensor_golden does a single broadcast.
+                src_placements = [Replicate() for _ in param_info["src_placements"]]
+                xferdtensor_golden(
+                    src_tensor,
+                    param_info["src_mesh_info"],
+                    src_placements,
+                    None,
+                    param_info["dst_mesh_info"],
+                    param_info["dst_placements"],
+                    self.model_update_group,
+                )
+
+        del self._param_map
+
+        # Manually move model to cpu for cpu offload case
+        if self.cpu_offload:
+            self.model = self.move_to_cpu(self.model)
+
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:
         # onload model to cuda

@@ -206,6 +206,12 @@ class ColocatablePolicyInterface(PolicyInterface):
     ) -> list[ray.ObjectRef]:
         pass
 
+    def prepare_nccl_reshard_refit_info(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def nccl_reshard_refit(self, kv_scales=None) -> list[ray.ObjectRef]:
+        raise NotImplementedError
+
     @abstractmethod
     def prepare_for_lp_inference(self) -> None:
         pass
