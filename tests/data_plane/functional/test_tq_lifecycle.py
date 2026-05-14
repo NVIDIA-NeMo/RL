@@ -31,8 +31,9 @@ from tensordict import TensorDict
 
 transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
-from nemo_rl.data_plane import build_data_plane_client
 from tensordict import NonTensorStack
+
+from nemo_rl.data_plane import build_data_plane_client
 from nemo_rl.data_plane.column_io import read_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 

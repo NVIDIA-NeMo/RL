@@ -43,7 +43,11 @@ def _build_message_log_batch() -> list[LLMMessageLogType]:
         ],
         [
             {"role": "user", "content": "Q2", "token_ids": torch.tensor([6, 7])},
-            {"role": "assistant", "content": "A2", "token_ids": torch.tensor([8, 9, 10, 11])},
+            {
+                "role": "assistant",
+                "content": "A2",
+                "token_ids": torch.tensor([8, 9, 10, 11]),
+            },
         ],
     ]
 
@@ -71,9 +75,17 @@ def test_decompose_message_log_picks_first_assistant() -> None:
         [
             [
                 {"role": "user", "content": "U", "token_ids": torch.tensor([1])},
-                {"role": "assistant", "content": "A1", "token_ids": torch.tensor([2, 3])},
+                {
+                    "role": "assistant",
+                    "content": "A1",
+                    "token_ids": torch.tensor([2, 3]),
+                },
                 {"role": "user", "content": "U2", "token_ids": torch.tensor([4])},
-                {"role": "assistant", "content": "A2", "token_ids": torch.tensor([5, 6, 7, 8])},
+                {
+                    "role": "assistant",
+                    "content": "A2",
+                    "token_ids": torch.tensor([5, 6, 7, 8]),
+                },
             ]
         ]
     )

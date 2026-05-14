@@ -30,9 +30,7 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
-from tensordict import TensorDict
-
-from tensordict import NonTensorStack
+from tensordict import NonTensorStack, TensorDict
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data_plane.codec import (
