@@ -29,6 +29,7 @@ from typing import Any, Literal, Mapping, NotRequired, Optional, TypedDict, Unio
 import numpy as np
 import torch
 import yaml
+from pydantic import BaseModel
 
 PathLike = Union[str, "os.PathLike[Any]"]
 
@@ -190,7 +191,7 @@ class CheckpointManager:
         self,
         step: int,
         training_info: Mapping[str, Any],
-        run_config: Optional[Mapping[str, Any]] = None,
+        run_config: Optional[BaseModel] = None,
     ) -> PathLike:
         """Initialize a temporary checkpoint directory.
 
@@ -203,7 +204,7 @@ class CheckpointManager:
         Args:
             step (int): The training step number.
             training_info (dict[str, Any]): Dictionary containing training metrics and info.
-            run_config (Optional[dict[str, Any]]): Optional configuration for the training run.
+            run_config (Optional[BaseModel]): Optional configuration for the training run.
 
         Returns:
             PathLike: Path to the temporary checkpoint directory.
@@ -224,7 +225,7 @@ class CheckpointManager:
         # save config
         if run_config is not None:
             with open(save_dir / "config.yaml", "w") as f:
-                yaml.safe_dump(run_config, f)
+                yaml.safe_dump(run_config.model_dump(), f)
 
         return Path(os.path.abspath(save_dir))
 

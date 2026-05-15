@@ -21,6 +21,9 @@ FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
 
+# Empty default; CI overrides with --build-context to inject pre-compiled wheels
+FROM scratch AS uv-cache-seed
+
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
 ENV NRL_CONTAINER=1
@@ -105,6 +108,8 @@ ARG BUILD_CUSTOM_FLASHINFER_REF
 # Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
+ARG BASE_IMAGE
+ARG UV_VERSION
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
@@ -125,7 +130,18 @@ COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashi
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
-RUN --mount=type=ssh <<"EOF" bash -exu
+RUN --mount=type=ssh \
+    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
+CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}" | md5sum | cut -c1-12)
+SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
+if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
+    echo "Cache key mismatch (base image or uv version changed) — skipping stale seed"
+elif [ -n "$SEED_KEY" ]; then
+    echo "Seeding uv cache (key=${CACHE_KEY})"
+    mkdir -p /root/.cache/uv
+    rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ /root/.cache/uv/ 2>/dev/null || true
+fi
+
 uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
@@ -156,6 +172,8 @@ uv sync --link-mode symlink --locked --all-groups --no-install-project
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+
+echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
