@@ -117,6 +117,7 @@ html_extra_path = ["project.json", "versions1.json"]
 linkcheck_ignore = [
     ".*github\\.com.*",
     ".*githubusercontent\\.com.*",
+    "https://docs\\.nvidia\\.com/nemo/gym/.*",
 ]
 
 # PyTorch docs anchor IDs change between stable versions; verify the page
