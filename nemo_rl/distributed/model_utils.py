@@ -943,6 +943,7 @@ def from_parallel_logits_to_logprobs(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    cu_seqlens_padded: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Get log probabilities from TP+CP sharded vocab logits.
 
@@ -958,6 +959,9 @@ def from_parallel_logits_to_logprobs(
         cp_group (torch.distributed.ProcessGroup, optional): Context parallelism process group. Defaults to None.
         chunk_size (int, optional): Sequence dimension chunk size for computing the log probabilities.
         sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
+        cu_seqlens_padded (torch.Tensor, optional): Packed THD cumulative sequence lengths. When provided,
+            CP target sharding and logprob reconstruction use the same TransformerEngine THD partitioning
+            as Megatron's packed forward path.
 
     Returns:
         torch.Tensor: Log probabilities tensor with shape [batch_size, seq_len-1].
@@ -976,7 +980,17 @@ def from_parallel_logits_to_logprobs(
 
     # Shard the targets by context parallelism
     cp_rank = torch.distributed.get_rank(cp_group)
-    target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
+    if cu_seqlens_padded is not None and cp_size > 1:
+        if int(cu_seqlens_padded[-1].item()) != target.shape[1]:
+            raise ValueError(
+                "Packed THD cu_seqlens_padded must end at the padded target length; "
+                f"got {int(cu_seqlens_padded[-1].item())} vs {target.shape[1]}"
+            )
+        target = _get_packed_thd_tokens_on_this_cp_rank(
+            target, cu_seqlens_padded, cp_rank, cp_size, seq_dim=1
+        )
+    else:
+        target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
 
     if need_top_k_or_top_p_filtering(sampling_params):
         if chunk_size is not None:
@@ -1021,9 +1035,14 @@ def from_parallel_logits_to_logprobs(
 
     if cp_size > 1:
         # we need to gather the logits by context parallelism
-        logprobs = allgather_cp_sharded_tensor(
-            logprobs, cp_group, seq_dim=1
-        )  # , unpadded_seqlen=target.shape[1])
+        if cu_seqlens_padded is not None:
+            logprobs = allgather_packed_thd_cp_sharded_tensor(
+                logprobs, cu_seqlens_padded, cp_group, seq_dim=1
+            )
+        else:
+            logprobs = allgather_cp_sharded_tensor(
+                logprobs, cp_group, seq_dim=1
+            )  # , unpadded_seqlen=target.shape[1])
 
     if pad_len > 0:
         logprobs = logprobs[:, :-pad_len]
@@ -1081,22 +1100,27 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         target = target.squeeze(0)
         cp_rank = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
 
-        rolled_targets = torch.zeros(
-            target.shape[0] // cp_size, dtype=target.dtype, device=target.device
-        )
+        rolled_targets = torch.zeros_like(target)
         for i in range(batch_size):
             start_idx = cu_seqlens_padded[i].item()
             end_idx = cu_seqlens_padded[i + 1].item()
 
             seq_targets = target[start_idx:end_idx]
             rolled_seq_targets = seq_targets.roll(shifts=-1, dims=0)
-            rolled_targets[start_idx // cp_size : end_idx // cp_size] = (
-                _get_tokens_on_this_cp_rank(
-                    rolled_seq_targets, cp_rank, cp_size, seq_dim=0
-                )
-            )
+            rolled_targets[start_idx:end_idx] = rolled_seq_targets
 
-        target = rolled_targets.unsqueeze(0)
+        if cp_size > 1:
+            rolled_targets = _get_packed_thd_tokens_on_this_cp_rank(
+                rolled_targets.unsqueeze(0),
+                cu_seqlens_padded,
+                cp_rank,
+                cp_size,
+                seq_dim=1,
+            )
+        else:
+            rolled_targets = rolled_targets.unsqueeze(0)
+
+        target = rolled_targets
         vocab_parallel_logits = vocab_parallel_logits.unsqueeze(0)
 
     # Apply distributed log probability computation
@@ -1152,15 +1176,9 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         )
 
     if cp_size > 1:
-        # per-sequence cp_allgather
-        final_probs = torch.zeros(probs.shape[0] * cp_size, device=probs.device)
-        for i in range(batch_size):
-            start_idx = cu_seqlens_padded[i].item()
-            end_idx = cu_seqlens_padded[i + 1].item()
-            final_probs[start_idx:end_idx] = allgather_cp_sharded_tensor(
-                probs[start_idx // cp_size : end_idx // cp_size], cp_group, seq_dim=0
-            )
-        probs = final_probs
+        probs = allgather_packed_thd_cp_sharded_tensor(
+            probs, cu_seqlens_padded, cp_group, seq_dim=0
+        )
 
     out_logprobs = torch.zeros(
         (batch_size, unpacked_seqlen - 1), dtype=probs.dtype, device=probs.device
@@ -1220,6 +1238,122 @@ def _get_tokens_on_this_cp_rank(
 
     ids = torch.cat(ids_chunks, dim=seq_dim)
     return ids
+
+
+def _get_thd_partitioned_indices(
+    cu_seqlens_padded: torch.Tensor,
+    total_tokens: int,
+    cp_size: int,
+    cp_rank: int,
+) -> torch.Tensor:
+    """Return Megatron/TE's packed-THD CP indices for one CP rank."""
+    if cp_size == 1:
+        return torch.arange(total_tokens, device=cu_seqlens_padded.device)
+
+    try:
+        import transformer_engine_torch as tex
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Packed THD context parallelism requires transformer_engine_torch."
+        ) from exc
+
+    return tex.thd_get_partitioned_indices(
+        cu_seqlens_padded,
+        total_tokens,
+        cp_size,
+        cp_rank,
+    )
+
+
+def _get_packed_thd_tokens_on_this_cp_rank(
+    tensor: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    cp_rank: int,
+    cp_size: int,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Slice a packed token-aligned tensor with Megatron's THD CP topology."""
+    if cp_size == 1:
+        return tensor
+
+    index = _get_thd_partitioned_indices(
+        cu_seqlens_padded,
+        tensor.shape[seq_dim],
+        cp_size,
+        cp_rank,
+    ).to(device=tensor.device, dtype=torch.long)
+    return tensor.index_select(seq_dim, index)
+
+
+def allgather_packed_thd_cp_sharded_tensor(
+    tensor: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    cp_group: torch.distributed.ProcessGroup,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Invert Megatron/TE packed-THD CP slicing."""
+    if torch.distributed.get_world_size(cp_group) == 1:
+        return tensor
+    return AllGatherPackedTHDCPTensor.apply(
+        tensor, cu_seqlens_padded, cp_group, seq_dim
+    )
+
+
+class AllGatherPackedTHDCPTensor(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        cu_seqlens_padded: torch.Tensor,
+        cp_group: torch.distributed.ProcessGroup,
+        seq_dim: int = 1,
+    ) -> torch.Tensor:
+        cp_size = torch.distributed.get_world_size(cp_group)
+        cp_rank_chunks = [torch.empty_like(tensor) for _ in range(cp_size)]
+
+        torch.distributed.all_gather(
+            tensor_list=cp_rank_chunks, tensor=tensor, group=cp_group
+        )
+
+        total_tokens = int(cu_seqlens_padded[-1].item())
+        output_shape = list(tensor.shape)
+        output_shape[seq_dim] = total_tokens
+        ret_tensor = torch.zeros(
+            output_shape,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+
+        for cp_rank, chunk in enumerate(cp_rank_chunks):
+            index = _get_thd_partitioned_indices(
+                cu_seqlens_padded,
+                total_tokens,
+                cp_size,
+                cp_rank,
+            ).to(device=tensor.device, dtype=torch.long)
+            ret_tensor.index_copy_(seq_dim, index, chunk)
+
+        ctx.seq_dim = seq_dim
+        ctx.cp_group = cp_group
+        ctx.cu_seqlens_padded = cu_seqlens_padded
+
+        return ret_tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        cp_size = torch.distributed.get_world_size(ctx.cp_group)
+        cp_rank = torch.distributed.get_rank(ctx.cp_group)
+        torch.distributed.all_reduce(grad_output, group=ctx.cp_group)
+
+        index = _get_thd_partitioned_indices(
+            ctx.cu_seqlens_padded,
+            grad_output.shape[ctx.seq_dim],
+            cp_size,
+            cp_rank,
+        ).to(device=grad_output.device, dtype=torch.long)
+        grad_input = grad_output.index_select(ctx.seq_dim, index)
+
+        return grad_input, None, None, None
 
 
 def allgather_cp_sharded_tensor(
@@ -1355,6 +1489,7 @@ def get_next_token_logprobs_from_logits(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    cu_seqlens_padded: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute token log-probabilities from logits, handling parallel and non-parallel cases.
 
@@ -1371,6 +1506,7 @@ def get_next_token_logprobs_from_logits(
         vocab_parallel_group: Process group for vocab parallelism
         context_parallel_group: Process group for context parallelism
         sampling_params: Sampling parameters for top-k/top-p filtering
+        cu_seqlens_padded: Packed THD cumulative sequence lengths for packed CP logits.
 
     Returns:
         Token log-probabilities of shape [batch_size, seq_len - 1]
@@ -1390,6 +1526,7 @@ def get_next_token_logprobs_from_logits(
             inference_only=False,
             cp_group=context_parallel_group,
             sampling_params=sampling_params,
+            cu_seqlens_padded=cu_seqlens_padded,
         )
         # slice off to the correct length to remove potential CP padding
         logprobs = logprobs[:, : input_ids.shape[1] - 1]

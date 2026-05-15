@@ -33,6 +33,10 @@ from megatron.training.utils import get_ltor_masks_and_position_ids
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.megatron.common import _round_up_to_multiple
+from nemo_rl.utils.r3_trace import (
+    r3_trace_verify_forward_enabled,
+    trace_cp_routed_experts,
+)
 
 
 @dataclass
@@ -237,6 +241,7 @@ def process_microbatch(
         routed_experts = (
             data_dict["routed_experts"] if "routed_experts" in data_dict else None
         )
+        token_identity_cp_sharded = None
         if routed_experts is not None and routed_experts.dim() != 4:
             raise ValueError(
                 "routed_experts must have shape [batch, seq, num_moe_layers, topk] "
@@ -265,6 +270,10 @@ def process_microbatch(
             token_aligned_tensors = {"tokens": input_ids}
             if routed_experts is not None:
                 token_aligned_tensors["routed_experts"] = routed_experts
+                if r3_trace_verify_forward_enabled():
+                    token_aligned_tensors["_r3_trace_token_identity"] = (
+                        _make_r3_trace_token_identity(input_ids, seq_lengths)
+                    )
 
             (
                 packed_batch,
@@ -285,6 +294,7 @@ def process_microbatch(
             input_ids_cp_sharded = cp_packed_batch["tokens"]
             routed_experts = packed_batch.get("routed_experts")
             routed_experts_cp_sharded = cp_packed_batch.get("routed_experts")
+            token_identity_cp_sharded = cp_packed_batch.get("_r3_trace_token_identity")
             if (
                 routed_experts_cp_sharded is not None
                 and routed_experts_cp_sharded.dim() != 4
@@ -294,6 +304,21 @@ def process_microbatch(
                     "num_moe_layers, topk] after Megatron packing; got "
                     f"{tuple(routed_experts_cp_sharded.shape)}"
                 )
+            verified_token_count = _verify_r3_trace_cp_token_alignment(
+                source_input_ids=data_dict["input_ids"],
+                source_routed_experts=data_dict.get("routed_experts"),
+                input_ids_cp_sharded=input_ids_cp_sharded,
+                routed_experts_cp_sharded=routed_experts_cp_sharded,
+                token_identity_cp_sharded=token_identity_cp_sharded,
+            )
+            trace_cp_routed_experts(
+                routed_experts_cp_sharded=routed_experts_cp_sharded,
+                token_identity_cp_sharded=token_identity_cp_sharded,
+                input_ids_cp_sharded=input_ids_cp_sharded,
+                cp_token_identity_verified_count=verified_token_count,
+                cp_rank=get_context_parallel_rank(),
+                cp_size=get_context_parallel_world_size(),
+            )
 
             # For packed sequences, position_ids and attention_mask are typically None
             # The PackedSeqParams handles all necessary sequence information
@@ -312,7 +337,27 @@ def process_microbatch(
                     data_dict["input_lengths"],
                 )
                 routed_experts_cp_sharded = routed_experts
+                if r3_trace_verify_forward_enabled():
+                    token_identity_cp_sharded = _make_r3_trace_token_identity(
+                        input_ids,
+                        data_dict["input_lengths"],
+                    )
             input_ids_cp_sharded = input_ids
+            verified_token_count = _verify_r3_trace_cp_token_alignment(
+                source_input_ids=data_dict["input_ids"],
+                source_routed_experts=data_dict.get("routed_experts"),
+                input_ids_cp_sharded=input_ids_cp_sharded,
+                routed_experts_cp_sharded=routed_experts_cp_sharded,
+                token_identity_cp_sharded=token_identity_cp_sharded,
+            )
+            trace_cp_routed_experts(
+                routed_experts_cp_sharded=routed_experts_cp_sharded,
+                token_identity_cp_sharded=token_identity_cp_sharded,
+                input_ids_cp_sharded=input_ids_cp_sharded,
+                cp_token_identity_verified_count=verified_token_count,
+                cp_rank=get_context_parallel_rank(),
+                cp_size=get_context_parallel_world_size(),
+            )
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                 data=input_ids,
                 eod_token=0,  # used for loss_mask, which we don't use
@@ -332,6 +377,120 @@ def process_microbatch(
         routed_experts=routed_experts,
         routed_experts_cp_sharded=routed_experts_cp_sharded,
     )
+
+
+def _make_r3_trace_token_identity(
+    input_ids: torch.Tensor,
+    seq_lengths: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build debug-only ``[batch_idx, token_pos, valid]`` token identities."""
+    batch_size, seq_len = input_ids.shape[:2]
+    batch_idx = torch.arange(
+        batch_size,
+        dtype=torch.int32,
+        device=input_ids.device,
+    ).view(batch_size, 1, 1)
+    token_pos = torch.arange(
+        seq_len,
+        dtype=torch.int32,
+        device=input_ids.device,
+    ).view(1, seq_len, 1)
+    if seq_lengths is None:
+        valid = torch.ones(
+            batch_size,
+            seq_len,
+            1,
+            dtype=torch.int32,
+            device=input_ids.device,
+        )
+    else:
+        valid = (
+            token_pos.expand(batch_size, seq_len, 1)
+            < seq_lengths.to(device=input_ids.device, dtype=torch.int32).view(
+                batch_size,
+                1,
+                1,
+            )
+        ).to(dtype=torch.int32)
+    return torch.cat(
+        (
+            batch_idx.expand(batch_size, seq_len, 1),
+            token_pos.expand(batch_size, seq_len, 1),
+            valid,
+        ),
+        dim=-1,
+    )
+
+
+def _verify_r3_trace_cp_token_alignment(
+    *,
+    source_input_ids: torch.Tensor,
+    source_routed_experts: Optional[torch.Tensor],
+    input_ids_cp_sharded: torch.Tensor,
+    routed_experts_cp_sharded: Optional[torch.Tensor],
+    token_identity_cp_sharded: Optional[torch.Tensor],
+) -> Optional[int]:
+    """Verify debug identities line up with CP-local tokens and routed experts."""
+    if not r3_trace_verify_forward_enabled() or token_identity_cp_sharded is None:
+        return None
+    if source_routed_experts is None or routed_experts_cp_sharded is None:
+        raise RuntimeError(
+            "R3 forward verifier expected routed_experts and token identity tensors "
+            "to be present together."
+        )
+    if token_identity_cp_sharded.shape[-1] != 3:
+        raise RuntimeError(
+            "R3 token identity must have trailing [batch_idx, token_pos, valid] "
+            f"dimension; got {tuple(token_identity_cp_sharded.shape)}"
+        )
+
+    flat_identity = token_identity_cp_sharded.reshape(-1, 3).to(dtype=torch.long)
+    flat_tokens = input_ids_cp_sharded.reshape(-1)
+    flat_routed = routed_experts_cp_sharded.reshape(
+        -1,
+        *routed_experts_cp_sharded.shape[2:],
+    )
+    if (
+        flat_identity.shape[0] != flat_tokens.shape[0]
+        or flat_identity.shape[0] != flat_routed.shape[0]
+    ):
+        raise RuntimeError(
+            "R3 token identity, input_ids, and routed_experts CP slices have "
+            "different token counts: "
+            f"identity={flat_identity.shape[0]} tokens={flat_tokens.shape[0]} "
+            f"routed={flat_routed.shape[0]}"
+        )
+
+    valid_mask = flat_identity[:, 2] == 1
+    checked = int(valid_mask.sum().item())
+    if checked == 0:
+        return 0
+
+    source_rows = flat_identity[valid_mask, 0]
+    source_cols = flat_identity[valid_mask, 1]
+    expected_tokens = source_input_ids[source_rows, source_cols].to(
+        device=flat_tokens.device,
+        dtype=flat_tokens.dtype,
+    )
+    actual_tokens = flat_tokens[valid_mask]
+    if not bool(torch.equal(actual_tokens, expected_tokens)):
+        raise RuntimeError(
+            "R3 CP token identity verifier found input_ids that do not match "
+            "their source [batch_idx, token_pos] identities."
+        )
+
+    expected_routed = source_routed_experts[source_rows, source_cols].to(
+        device=flat_routed.device,
+        dtype=flat_routed.dtype,
+    )
+    actual_routed = flat_routed[valid_mask]
+    if not bool(torch.equal(actual_routed, expected_routed)):
+        raise RuntimeError(
+            "R3 CP token identity verifier found routed_experts that do not match "
+            "their source [batch_idx, token_pos] identities."
+        )
+
+    return checked
 
 
 def _fill_routed_experts_padding(
@@ -611,6 +770,12 @@ def _pack_token_aligned_batch_for_megatron(
         cp_rank=cp_rank,
         cp_size=cp_size,
     )
+    # NeMo-RL materializes padded THD tokens, and the previous packed CP path
+    # passed padded boundaries as the logical sequence boundaries too. Keep that
+    # behavior for now: using unpadded boundaries with padded CP partitions can
+    # misalign valid-token logits on the current GRPO packed path.
+    packed_seq_params.cu_seqlens_q = cu_seqlens_padded
+    packed_seq_params.cu_seqlens_kv = cu_seqlens_padded
 
     return (
         {key: value.contiguous() for key, value in packed_batch.items()},
@@ -720,6 +885,8 @@ def _pack_sequences_for_megatron(
         cp_rank=cp_rank,
         cp_size=cp_size,
     )
+    packed_seq_params.cu_seqlens_q = cu_seqlens_padded
+    packed_seq_params.cu_seqlens_kv = cu_seqlens_padded
     packed_input_ids = cp_packed_batch["tokens"]
 
     return (

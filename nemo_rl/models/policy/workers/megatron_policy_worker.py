@@ -93,6 +93,7 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -444,27 +445,28 @@ class MegatronPolicyWorkerImpl(
                         stage="train",
                         require=True,
                     )
-                    losses_reduced = megatron_forward_backward(
-                        model=self.model,
-                        data_iterator=data_iterator,
-                        num_microbatches=num_microbatches,
-                        seq_length=padded_seq_length,
-                        mbs=micro_batch_size,
-                        post_processing_fn=loss_post_processor,
-                        forward_only=eval_mode,
-                        defer_fp32_logits=self.defer_fp32_logits,
-                        global_valid_seqs=global_valid_seqs,
-                        global_valid_toks=global_valid_toks,
-                        sampling_params=self.sampling_params,
-                        straggler_timer=self.mcore_state.straggler_timer,
-                        draft_model=self.draft_model,
-                        enable_hidden_capture=draft_enabled,
-                        use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
-                            "use_linear_ce_fusion_loss", False
-                        ),
-                        use_router_replay=use_router_replay,
-                        router_replay_train=not eval_mode,
-                    )
+                    with maybe_r3_trace_stage("train", enabled=use_router_replay):
+                        losses_reduced = megatron_forward_backward(
+                            model=self.model,
+                            data_iterator=data_iterator,
+                            num_microbatches=num_microbatches,
+                            seq_length=padded_seq_length,
+                            mbs=micro_batch_size,
+                            post_processing_fn=loss_post_processor,
+                            forward_only=eval_mode,
+                            defer_fp32_logits=self.defer_fp32_logits,
+                            global_valid_seqs=global_valid_seqs,
+                            global_valid_toks=global_valid_toks,
+                            sampling_params=self.sampling_params,
+                            straggler_timer=self.mcore_state.straggler_timer,
+                            draft_model=self.draft_model,
+                            enable_hidden_capture=draft_enabled,
+                            use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
+                                "use_linear_ce_fusion_loss", False
+                            ),
+                            use_router_replay=use_router_replay,
+                            router_replay_train=not eval_mode,
+                        )
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -641,21 +643,22 @@ class MegatronPolicyWorkerImpl(
             require=require_router_replay,
         )
 
-        list_of_logprobs = megatron_forward_backward(
-            model=self.model,
-            data_iterator=mb_iterator,
-            seq_length=padded_seq_length,
-            mbs=micro_batch_size,
-            num_microbatches=num_microbatches,
-            post_processing_fn=logprobs_post_processor,
-            forward_only=True,
-            defer_fp32_logits=self.defer_fp32_logits,
-            sampling_params=self.sampling_params,
-            straggler_timer=self.mcore_state.straggler_timer,
-            use_linear_ce_fusion_loss=use_linear_ce_fusion,
-            use_router_replay=use_router_replay,
-            router_replay_train=False,
-        )
+        with maybe_r3_trace_stage("prev-logprob", enabled=use_router_replay):
+            list_of_logprobs = megatron_forward_backward(
+                model=self.model,
+                data_iterator=mb_iterator,
+                seq_length=padded_seq_length,
+                mbs=micro_batch_size,
+                num_microbatches=num_microbatches,
+                post_processing_fn=logprobs_post_processor,
+                forward_only=True,
+                defer_fp32_logits=self.defer_fp32_logits,
+                sampling_params=self.sampling_params,
+                straggler_timer=self.mcore_state.straggler_timer,
+                use_linear_ce_fusion_loss=use_linear_ce_fusion,
+                use_router_replay=use_router_replay,
+                router_replay_train=False,
+            )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             all_log_probs_padded = []

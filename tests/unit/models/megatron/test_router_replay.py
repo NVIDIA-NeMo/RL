@@ -471,6 +471,61 @@ def test_router_replay_backward_recompute_matches_baseline_grad():
 
 
 @pytest.mark.mcore
+def test_r3_trace_forward_verifier_records_actual_replayed_topk(tmp_path, monkeypatch):
+    import json
+
+    from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
+    from megatron.core.transformer.moe.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+
+    from nemo_rl.utils.r3_trace import r3_trace_stage
+
+    monkeypatch.setenv("NRL_R3_TRACE", "1")
+    monkeypatch.setenv("NRL_R3_TRACE_VERIFY_FORWARD", "1")
+    monkeypatch.setenv("NRL_R3_TRACE_DIR", str(tmp_path))
+    RouterReplay.clear_global_router_replay_instances()
+
+    try:
+        replay = RouterReplay()
+        replay._nrl_layer_number = 7
+        target = torch.tensor([[1, 2], [0, 3]], dtype=torch.long)
+        replay.set_target_indices(target)
+        replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
+        logits = torch.randn(2, 5)
+        with r3_trace_stage("unit-forward"):
+            _, top_indices = topk_routing_with_score_function(
+                logits=logits,
+                topk=2,
+                use_pre_softmax=True,
+                router_replay=replay,
+                score_function="softmax",
+                dense_output=True,
+            )
+
+        assert torch.equal(top_indices, target)
+        records = [
+            json.loads(line)
+            for path in tmp_path.glob("*.jsonl")
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+        verify_records = [
+            record
+            for record in records
+            if record.get("event") == "router_replay_forward_verify"
+        ]
+        assert len(verify_records) == 1
+        assert verify_records[0]["stage"] == "unit-forward"
+        assert verify_records[0]["action"] == "replay_forward"
+        assert verify_records[0]["layer_number"] == 7
+        assert verify_records[0]["matches_expected"] is True
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_mcore_moe_replay_backward_recompute_matches_parameter_grads(tmp_path):
     import torch.distributed as dist

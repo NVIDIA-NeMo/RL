@@ -65,6 +65,7 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 
 def kv_first_write(
@@ -123,6 +124,7 @@ def kv_first_write(
             wire[k] = v
 
     bulk = TensorDict(wire, batch_size=[n])
+    trace_rollout_payload(keys=keys, data=final_batch_cpu)
     dp_client.kv_batch_put(
         keys=keys,
         partition_id=partition_id,

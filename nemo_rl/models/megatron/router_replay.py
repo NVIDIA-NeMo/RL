@@ -22,6 +22,10 @@ from typing import Any, Optional
 import torch
 
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.utils.r3_trace import (
+    trace_router_replay_action,
+    trace_router_replay_assignment,
+)
 
 _ROUTER_REPLAY_VALIDATE_ENV = "NRL_ROUTER_REPLAY_VALIDATE"
 
@@ -349,6 +353,11 @@ def build_router_replay_assignments(
             layer_number=layer_number,
             payload_idx=payload_idx,
         )
+        trace_router_replay_assignment(
+            layer_number=layer_number,
+            payload_idx=payload_idx,
+            replay_tensor=replay_tensor,
+        )
         replay_assignments.append(
             (
                 replay_instance,
@@ -366,6 +375,14 @@ def set_router_replay_forward(model: Any, routed_experts: torch.Tensor) -> None:
         model, routed_experts
     ):
         replay_instance.set_target_indices(replay_tensor)
+        trace_router_replay_action(
+            action="replay_forward",
+            layer_number=getattr(replay_instance, "_nrl_layer_number", None),
+            replay_tensor=replay_tensor,
+            replay_backward_list_len=len(
+                getattr(replay_instance, "replay_backward_list", [])
+            ),
+        )
         replay_instance.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
 
@@ -373,6 +390,14 @@ def set_router_replay_backward(model: Any) -> None:
     from megatron.core.transformer.moe.router_replay import RouterReplayAction
 
     for replay_instance, _ in _router_replay_instances_for_model(model):
+        replay_backward_list = getattr(replay_instance, "replay_backward_list", [])
+        next_replay_tensor = replay_backward_list[0] if replay_backward_list else None
+        trace_router_replay_action(
+            action="replay_backward",
+            layer_number=getattr(replay_instance, "_nrl_layer_number", None),
+            replay_tensor=next_replay_tensor,
+            replay_backward_list_len=len(replay_backward_list),
+        )
         replay_instance.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
 
 

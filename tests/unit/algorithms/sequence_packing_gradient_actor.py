@@ -35,7 +35,9 @@ class SequencePackingGradientTestActor:
         self.env_vars = dict(os.environ)
 
     def test_sequence_packing_gradients(self):
-        from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+        from nemo_rl.distributed.model_utils import (
+            _get_packed_thd_tokens_on_this_cp_rank,
+        )
         from nemo_rl.models.megatron.data import (
             _pack_sequences_for_megatron,
             make_processed_microbatch_iterator,
@@ -196,10 +198,9 @@ class SequencePackingGradientTestActor:
 
         # For CP, logits are sharded across context parallel ranks
         def make_packed_logits(logits):
-            packed_logits = torch.zeros(
-                1, packed_input_ids_cp.shape[1], vocab_size, device="cuda"
+            full_packed_logits = torch.zeros(
+                1, int(cu_seqlens_padded[-1].item()), vocab_size, device="cuda"
             )
-            run_seq = 0
             for i, seq_len in enumerate(seq_lengths):
                 padded_seqlen = cu_seqlens_padded[i + 1] - cu_seqlens_padded[i]
                 if padded_seqlen > baseline_logits.shape[1]:
@@ -210,11 +211,15 @@ class SequencePackingGradientTestActor:
                     tmp_logits[:, :seq_len] = baseline_logits[i : i + 1, :seq_len]
                 else:
                     tmp_logits = baseline_logits[i : i + 1, :padded_seqlen]
-                packed_logits[
-                    :, run_seq // cp_size : (run_seq + padded_seqlen) // cp_size, :
-                ] = _get_tokens_on_this_cp_rank(tmp_logits, rank, cp_size)
-                run_seq += padded_seqlen
-            return packed_logits
+                offset = int(cu_seqlens_padded[i].item())
+                full_packed_logits[:, offset : offset + padded_seqlen, :] = tmp_logits
+            return _get_packed_thd_tokens_on_this_cp_rank(
+                full_packed_logits,
+                cu_seqlens_padded,
+                rank,
+                cp_size,
+                seq_dim=1,
+            )
 
         packed_logits = make_packed_logits(baseline_logits)
 

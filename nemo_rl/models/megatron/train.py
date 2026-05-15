@@ -45,7 +45,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    allgather_cp_sharded_tensor,
+    allgather_packed_thd_cp_sharded_tensor,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
@@ -619,56 +619,12 @@ class TopkLogitsPostProcessor:
             if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                 cp_grp = get_context_parallel_group()
                 if pack:
-                    # Per-sequence CP allgather following packed-sequence logic
-                    batch_size = data_dict["input_ids"].shape[0]
-                    total_packed_len = int(cu_seqlens_padded[-1].item())
-
-                    topk_vals_full = torch.zeros(
-                        (1, total_packed_len, self.k),
-                        dtype=topk_vals_local.dtype,
-                        device=topk_vals_local.device,
+                    topk_vals_full = allgather_packed_thd_cp_sharded_tensor(
+                        topk_vals_local, cu_seqlens_padded, cp_grp, seq_dim=1
                     )
-                    topk_idx_full = torch.zeros(
-                        (1, total_packed_len, self.k),
-                        dtype=topk_idx_local.dtype,
-                        device=topk_idx_local.device,
+                    topk_idx_full = allgather_packed_thd_cp_sharded_tensor(
+                        topk_idx_local, cu_seqlens_padded, cp_grp, seq_dim=1
                     )
-
-                    for i in range(batch_size):
-                        start_idx = int(cu_seqlens_padded[i].item())
-                        end_idx = int(cu_seqlens_padded[i + 1].item())
-                        if end_idx > start_idx:
-                            local_vals_slice = topk_vals_local[
-                                :, start_idx // cp_size : end_idx // cp_size, :
-                            ]
-                            local_idx_slice = topk_idx_local[
-                                :, start_idx // cp_size : end_idx // cp_size, :
-                            ]
-                            gathered_vals = allgather_cp_sharded_tensor(
-                                local_vals_slice, cp_grp, seq_dim=1
-                            )
-                            gathered_idx = allgather_cp_sharded_tensor(
-                                local_idx_slice, cp_grp, seq_dim=1
-                            )
-                            # Some kernels may return [X, Y, k] where X*Y = (end_idx - start_idx).
-                            # Flatten leading dims and reshape to [1, expected_len, k] to match target.
-                            expected_len = end_idx - start_idx
-                            if (
-                                gathered_vals.dim() == 3
-                                and gathered_vals.shape[1] != expected_len
-                            ):
-                                gathered_vals = gathered_vals.reshape(
-                                    1, expected_len, gathered_vals.shape[-1]
-                                )
-                            if (
-                                gathered_idx.dim() == 3
-                                and gathered_idx.shape[1] != expected_len
-                            ):
-                                gathered_idx = gathered_idx.reshape(
-                                    1, expected_len, gathered_idx.shape[-1]
-                                )
-                            topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
-                            topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
                 else:
                     # Sequence packing must be enabled when CP > 1
                     raise RuntimeError(

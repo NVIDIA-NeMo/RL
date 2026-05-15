@@ -101,6 +101,12 @@ class SequencePackingLossWrapper:
                 if self.context_parallel_group is None
                 else torch.distributed.get_world_size(self.context_parallel_group)
             )
+            if cp_size > 1 and self.cu_seqlens_q_padded is not None:
+                unpadded_seq_data["_packed_cp_cu_seqlens_padded"] = torch.tensor(
+                    [0, int(padded_seq_lengths[seq_idx].item())],
+                    dtype=torch.int32,
+                    device=next_token_logits.device,
+                )
             # prepare data for loss function
             if (
                 hasattr(self.loss_fn, "use_linear_ce_fusion")

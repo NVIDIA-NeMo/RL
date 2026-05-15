@@ -569,6 +569,48 @@ class TestPackedContextParallelTokenMapping:
             cp_packed["routed_experts"], packed["routed_experts"][:, ::2]
         )
 
+    def test_r3_trace_token_identity_verifies_cp_alignment(self, monkeypatch):
+        from nemo_rl.models.megatron import data as megatron_data
+
+        monkeypatch.setenv("NRL_R3_TRACE", "1")
+        monkeypatch.setenv("NRL_R3_TRACE_VERIFY_FORWARD", "1")
+
+        input_ids = torch.tensor([[10, 11, 12, 0], [20, 21, 0, 0]])
+        input_lengths = torch.tensor([3, 2])
+        routed_experts = torch.arange(2 * 4 * 2 * 1, dtype=torch.int32).reshape(
+            2, 4, 2, 1
+        )
+        identity = megatron_data._make_r3_trace_token_identity(
+            input_ids,
+            input_lengths,
+        )
+        cp_identity = identity[:, [0, 2, 3]]
+
+        source_rows = cp_identity.reshape(-1, 3)[:, 0].long()
+        source_cols = cp_identity.reshape(-1, 3)[:, 1].long()
+        valid = cp_identity.reshape(-1, 3)[:, 2].bool()
+        cp_tokens = input_ids[source_rows, source_cols].reshape(1, -1)
+        cp_routed = routed_experts[source_rows, source_cols].reshape(1, -1, 2, 1)
+
+        assert megatron_data._verify_r3_trace_cp_token_alignment(
+            source_input_ids=input_ids,
+            source_routed_experts=routed_experts,
+            input_ids_cp_sharded=cp_tokens,
+            routed_experts_cp_sharded=cp_routed,
+            token_identity_cp_sharded=cp_identity,
+        ) == int(valid.sum().item())
+
+        broken_routed = cp_routed.clone()
+        broken_routed[:, 0] += 1
+        with pytest.raises(RuntimeError, match="routed_experts"):
+            megatron_data._verify_r3_trace_cp_token_alignment(
+                source_input_ids=input_ids,
+                source_routed_experts=routed_experts,
+                input_ids_cp_sharded=cp_tokens,
+                routed_experts_cp_sharded=broken_routed,
+                token_identity_cp_sharded=cp_identity,
+            )
+
 
 @pytest.mark.mcore
 class TestProcessGlobalBatch:

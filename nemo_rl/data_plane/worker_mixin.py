@@ -42,6 +42,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
+from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 if TYPE_CHECKING:
@@ -241,6 +242,7 @@ class TQWorkerMixin:
             attach_message_log_view(data)
             if preprocess is not None:
                 data = preprocess(self, data)
+            trace_tq_fetch_payload(stage=meta.task_name, keys=meta.keys, data=data)
             return data
 
         td = self._require_dp_client().kv_batch_get(
@@ -257,6 +259,7 @@ class TQWorkerMixin:
         attach_message_log_view(data)
         if preprocess is not None:
             data = preprocess(self, data)
+        trace_tq_fetch_payload(stage=meta.task_name, keys=meta.keys, data=data)
         return data
 
     def _apply_packing_prep(self, data: BatchedDataDict[Any]) -> BatchedDataDict[Any]:
