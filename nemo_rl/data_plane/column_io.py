@@ -29,7 +29,7 @@ equivalents on ``AbstractPolicyWorker`` (``self._fetch(meta)`` /
     :class:`KVBatchMeta`.
 """
 
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -155,7 +155,7 @@ def kv_first_write(
             f"kv_first_write: keys ({len(keys)}) must match batch size ({n})"
         )
     lengths = final_batch_cpu["input_lengths"]
-    fields: Mapping[str, torch.Tensor | np.ndarray] = {
+    fields: dict[str, torch.Tensor | np.ndarray] = {
         k: v
         for k, v in final_batch_cpu.items()
         if isinstance(v, torch.Tensor)

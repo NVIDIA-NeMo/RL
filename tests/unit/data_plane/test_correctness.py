@@ -37,6 +37,7 @@ from nemo_rl.data_plane.column_io import kv_first_write
 def _keys_from_uids(uids: list[str], n_gen: int = 1) -> list[str]:
     return [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]
 
+
 # ── helpers ────────────────────────────────────────────────────────────
 
 

@@ -40,6 +40,7 @@ from typing import Any, Optional
 
 import numpy as np
 import ray
+import torch
 
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
