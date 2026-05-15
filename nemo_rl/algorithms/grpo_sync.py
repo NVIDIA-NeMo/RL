@@ -221,7 +221,7 @@ def grpo_train_sync(
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True
-    assert policy_generation is not None  # for mypy type check
+    assert policy_generation is not None
 
     if master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
         assert master_config["loss_fn"]["reference_policy_kl_penalty"] == 0
@@ -246,7 +246,7 @@ def grpo_train_sync(
     adv_estimator = _create_advantage_estimator(master_config)
 
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
-    # Sync trainer requires a TQ-mediated policy. The TQPolicy ctor
+    # Sync trainer requires a TQ-mediated policy. The TQPolicy actor
     # bootstraps the controller and attaches workers; ``policy.dp_cfg``
     # is the public marker. The explicit master_config check is the
     # entry-guard so users running this trainer with the legacy policy

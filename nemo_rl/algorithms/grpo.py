@@ -1368,7 +1368,7 @@ def grpo_train(
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
-    assert policy_generation is not None  # for mypy type check
+    assert policy_generation is not None
 
     # Check if we need to sync KV cache scales
     # When fallback to policy as the policy_generation, we use getattr to check.
