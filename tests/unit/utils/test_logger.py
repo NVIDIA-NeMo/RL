@@ -20,12 +20,14 @@ import pytest
 import torch
 
 from nemo_rl.utils.logger import (
+    CometLogger,
     Logger,
     MLflowLogger,
     RayGpuMonitorLogger,
     SwanlabLogger,
     TensorboardLogger,
     WandbLogger,
+    _coerce_to_scalar,
     flatten_dict,
     print_message_log_samples,
 )
@@ -54,6 +56,55 @@ class TestFlattenDict:
         d = {"a": 1, "b": {"c": 2, "d": 3}}
         expected = {"a": 1, "b_c": 2, "b_d": 3}
         assert flatten_dict(d, sep="_") == expected
+
+
+class TestCoerceToScalar:
+    """Test the module-level _coerce_to_scalar utility."""
+
+    def test_python_primitives(self):
+        """Test that Python primitives pass through unchanged."""
+        assert _coerce_to_scalar(42) == 42
+        assert _coerce_to_scalar(3.14) == 3.14
+        assert _coerce_to_scalar(True) is True
+        assert _coerce_to_scalar("hello") == "hello"
+
+    def test_numpy_types(self):
+        """Test that numpy scalar types are coerced to Python primitives."""
+        import numpy as np
+
+        # numpy scalar types
+        assert _coerce_to_scalar(np.float32(1.5)) == 1.5
+        assert _coerce_to_scalar(np.float64(2.5)) == 2.5
+        assert _coerce_to_scalar(np.int32(10)) == 10
+        assert _coerce_to_scalar(np.int64(20)) == 20
+        assert _coerce_to_scalar(np.bool_(True)) is True
+
+        # 0-d numpy arrays
+        assert _coerce_to_scalar(np.array(3.14)) == 3.14
+        # 1-element numpy arrays
+        assert _coerce_to_scalar(np.array([42])) == 42
+
+        # Multi-element arrays should return None
+        assert _coerce_to_scalar(np.array([1, 2, 3])) is None
+
+    def test_torch_tensors(self):
+        """Test that torch scalar tensors are coerced to Python primitives."""
+        # 0-d tensors
+        assert _coerce_to_scalar(torch.tensor(3.14)) == pytest.approx(3.14)
+        assert _coerce_to_scalar(torch.tensor(42)) == 42
+
+        # 1-element tensors
+        assert _coerce_to_scalar(torch.tensor([99])) == 99
+
+        # Multi-element tensors should return None
+        assert _coerce_to_scalar(torch.tensor([1, 2, 3])) is None
+
+    def test_incompatible_types(self):
+        """Test that incompatible types return None."""
+        assert _coerce_to_scalar({"key": "value"}) is None
+        assert _coerce_to_scalar([1, 2, 3]) is None
+        assert _coerce_to_scalar(None) is None
+        assert _coerce_to_scalar(object()) is None
 
 
 class TestTensorboardLogger:
@@ -127,67 +178,6 @@ class TestTensorboardLogger:
             "batch_size": 32,
             "model.hidden_size": 128,
         }
-
-    @patch("nemo_rl.utils.logger.SummaryWriter")
-    def test_coerce_to_scalar_python_primitives(self, mock_summary_writer, temp_dir):
-        """Test that Python primitives pass through unchanged."""
-        cfg = {"log_dir": temp_dir}
-        logger = TensorboardLogger(cfg, log_dir=temp_dir)
-
-        assert logger._coerce_to_scalar(42) == 42
-        assert logger._coerce_to_scalar(3.14) == 3.14
-        assert logger._coerce_to_scalar(True) is True
-        assert logger._coerce_to_scalar("hello") == "hello"
-
-    @patch("nemo_rl.utils.logger.SummaryWriter")
-    def test_coerce_to_scalar_numpy_types(self, mock_summary_writer, temp_dir):
-        """Test that numpy scalar types are coerced to Python primitives."""
-        import numpy as np
-
-        cfg = {"log_dir": temp_dir}
-        logger = TensorboardLogger(cfg, log_dir=temp_dir)
-
-        # numpy scalar types
-        assert logger._coerce_to_scalar(np.float32(1.5)) == 1.5
-        assert logger._coerce_to_scalar(np.float64(2.5)) == 2.5
-        assert logger._coerce_to_scalar(np.int32(10)) == 10
-        assert logger._coerce_to_scalar(np.int64(20)) == 20
-        assert logger._coerce_to_scalar(np.bool_(True)) is True
-
-        # 0-d numpy arrays
-        assert logger._coerce_to_scalar(np.array(3.14)) == 3.14
-        # 1-element numpy arrays
-        assert logger._coerce_to_scalar(np.array([42])) == 42
-
-        # Multi-element arrays should return None
-        assert logger._coerce_to_scalar(np.array([1, 2, 3])) is None
-
-    @patch("nemo_rl.utils.logger.SummaryWriter")
-    def test_coerce_to_scalar_torch_tensors(self, mock_summary_writer, temp_dir):
-        """Test that torch scalar tensors are coerced to Python primitives."""
-        cfg = {"log_dir": temp_dir}
-        logger = TensorboardLogger(cfg, log_dir=temp_dir)
-
-        # 0-d tensors
-        assert logger._coerce_to_scalar(torch.tensor(3.14)) == pytest.approx(3.14)
-        assert logger._coerce_to_scalar(torch.tensor(42)) == 42
-
-        # 1-element tensors
-        assert logger._coerce_to_scalar(torch.tensor([99])) == 99
-
-        # Multi-element tensors should return None
-        assert logger._coerce_to_scalar(torch.tensor([1, 2, 3])) is None
-
-    @patch("nemo_rl.utils.logger.SummaryWriter")
-    def test_coerce_to_scalar_incompatible_types(self, mock_summary_writer, temp_dir):
-        """Test that incompatible types return None."""
-        cfg = {"log_dir": temp_dir}
-        logger = TensorboardLogger(cfg, log_dir=temp_dir)
-
-        assert logger._coerce_to_scalar({"key": "value"}) is None
-        assert logger._coerce_to_scalar([1, 2, 3]) is None
-        assert logger._coerce_to_scalar(None) is None
-        assert logger._coerce_to_scalar(object()) is None
 
     @patch("nemo_rl.utils.logger.SummaryWriter")
     def test_log_metrics_coerces_numpy_and_torch(self, mock_summary_writer, temp_dir):
@@ -746,6 +736,151 @@ class TestMLflowLogger:
         mock_mlflow.start_run.assert_called_once_with(run_name=cfg["run_name"])
 
 
+class TestCometLogger:
+    """Test the CometLogger class."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        """Create a temporary directory for logs."""
+        temp_dir = tempfile.mkdtemp()
+        yield temp_dir
+        shutil.rmtree(temp_dir)
+
+    @patch("nemo_rl.utils.logger.comet_ml")
+    def test_init_offline(self, mock_comet_ml, temp_dir):
+        """Offline mode forwards offline=False and wires offline_directory to log_dir."""
+        cfg = {"workspace": "ws", "project_name": "proj", "online": False}
+        CometLogger(cfg, log_dir=temp_dir)
+
+        mock_comet_ml.start.assert_called_once()
+        kwargs = mock_comet_ml.start.call_args.kwargs
+        assert kwargs["workspace"] == "ws"
+        assert kwargs["project_name"] == "proj"
+        assert kwargs["online"] is False
+        mock_comet_ml.ExperimentConfig.assert_called_once()
+        exp_cfg_kwargs = mock_comet_ml.ExperimentConfig.call_args.kwargs
+        assert exp_cfg_kwargs["offline_directory"] == temp_dir
+
+    @patch("nemo_rl.utils.logger.comet_ml")
+    def test_init_default_online_true(self, mock_comet_ml, temp_dir):
+        """When `online` is omitted, the logger starts in online mode."""
+        cfg = {"workspace": "ws", "project_name": "proj"}
+        CometLogger(cfg, log_dir=temp_dir)
+
+        assert mock_comet_ml.start.call_args.kwargs["online"] is True
+
+    @patch("nemo_rl.utils.logger.comet_ml")
+    def test_init_name_and_tags(self, mock_comet_ml, temp_dir):
+        """Experiment name and tags are propagated through ExperimentConfig."""
+        cfg = {
+            "workspace": "ws",
+            "project_name": "proj",
+            "online": False,
+            "experiment_name": "run-1",
+            "tags": ["a", "b"],
+        }
+        CometLogger(cfg, log_dir=temp_dir)
+
+        exp_cfg_kwargs = mock_comet_ml.ExperimentConfig.call_args.kwargs
+        assert exp_cfg_kwargs["name"] == "run-1"
+        assert exp_cfg_kwargs["tags"] == ["a", "b"]
+
+    @patch("nemo_rl.utils.logger.comet_ml")
+    def test_log_metrics_with_prefix(self, mock_comet_ml, temp_dir):
+        """Prefix is applied to every key except `step_metric`."""
+        cfg = {"workspace": "ws", "project_name": "proj", "online": False}
+        logger = CometLogger(cfg, log_dir=temp_dir)
+        mock_experiment = mock_comet_ml.start.return_value
+
+        logger.log_metrics(
+            {"loss": 0.5, "global_step": 7},
+            step=10,
+            prefix="train",
+            step_metric="global_step",
+        )
+
+        logged_names = {c.args[0] for c in mock_experiment.log_metric.call_args_list}
+        assert logged_names == {"train/loss", "global_step"}
+
+    @patch("nemo_rl.utils.logger.comet_ml")
+    def test_log_metrics_skips_non_scalar(self, mock_comet_ml, temp_dir):
+        """Non-scalar values are silently skipped."""
+        cfg = {"workspace": "ws", "project_name": "proj", "online": False}
+        logger = CometLogger(cfg, log_dir=temp_dir)
+        mock_experiment = mock_comet_ml.start.return_value
+
+        logger.log_metrics(
+            {"scalar": 0.5, "vector": torch.tensor([1.0, 2.0, 3.0])}, step=1
+        )
+
+        logged_names = {c.args[0] for c in mock_experiment.log_metric.call_args_list}
+        assert logged_names == {"scalar"}
+
+    @patch("nemo_rl.utils.logger.comet_ml")
+    def test_log_metrics_coerces_torch_tensor(self, mock_comet_ml, temp_dir):
+        """0-d torch tensors are coerced to Python scalars."""
+        cfg = {"workspace": "ws", "project_name": "proj", "online": False}
+        logger = CometLogger(cfg, log_dir=temp_dir)
+        mock_experiment = mock_comet_ml.start.return_value
+
+        logger.log_metrics({"x": torch.tensor(0.5)}, step=1)
+
+        mock_experiment.log_metric.assert_called_once_with("x", 0.5, step=1)
+
+    @patch("nemo_rl.utils.logger.comet_ml")
+    def test_log_hyperparams_flattens(self, mock_comet_ml, temp_dir):
+        """Nested params are flattened with '/' before being sent to Comet."""
+        cfg = {"workspace": "ws", "project_name": "proj", "online": False}
+        logger = CometLogger(cfg, log_dir=temp_dir)
+        mock_experiment = mock_comet_ml.start.return_value
+
+        logger.log_hyperparams(
+            {"model": {"layers": 3, "units": 128}, "optimizer": {"lr": 0.001}}
+        )
+
+        mock_experiment.log_parameters.assert_called_once_with(
+            {"model/layers": 3, "model/units": 128, "optimizer/lr": 0.001}
+        )
+
+    @patch("nemo_rl.utils.logger.comet_ml")
+    def test_log_plot(self, mock_comet_ml, temp_dir):
+        """log_plot forwards to Comet's log_figure with the expected keyword args."""
+        cfg = {"workspace": "ws", "project_name": "proj", "online": False}
+        logger = CometLogger(cfg, log_dir=temp_dir)
+        mock_experiment = mock_comet_ml.start.return_value
+        figure = MagicMock()
+
+        logger.log_plot(figure, step=3, name="my_plot")
+
+        mock_experiment.log_figure.assert_called_once_with(
+            figure_name="my_plot", figure=figure, step=3
+        )
+
+    @patch("nemo_rl.utils.logger.comet_ml")
+    def test_log_histogram(self, mock_comet_ml, temp_dir):
+        """log_histogram forwards to Comet's log_histogram_3d."""
+        cfg = {"workspace": "ws", "project_name": "proj", "online": False}
+        logger = CometLogger(cfg, log_dir=temp_dir)
+        mock_experiment = mock_comet_ml.start.return_value
+
+        logger.log_histogram([1.0, 2.0, 3.0], step=4, name="hist")
+
+        mock_experiment.log_histogram_3d.assert_called_once_with(
+            [1.0, 2.0, 3.0], name="hist", step=4
+        )
+
+    @patch("nemo_rl.utils.logger.comet_ml")
+    def test_del_ends_experiment(self, mock_comet_ml, temp_dir):
+        """__del__ ends the underlying Comet experiment."""
+        cfg = {"workspace": "ws", "project_name": "proj", "online": False}
+        logger = CometLogger(cfg, log_dir=temp_dir)
+        mock_experiment = mock_comet_ml.start.return_value
+
+        logger.__del__()
+
+        mock_experiment.end.assert_called_once()
+
+
 class TestRayGpuMonitorLogger:
     """Test the RayGpuMonitorLogger class."""
 
@@ -1254,6 +1389,7 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
             "tensorboard_enabled": True,
             "mlflow_enabled": False,
             "swanlab_enabled": False,
+            "comet_enabled": False,
             "monitor_gpus": True,
             "gpu_monitoring": {
                 "collection_interval": 15.0,
@@ -1301,6 +1437,7 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
             "tensorboard_enabled": True,
             "mlflow_enabled": False,
             "swanlab_enabled": False,
+            "comet_enabled": False,
             "monitor_gpus": True,
             "gpu_monitoring": {
                 "collection_interval": 15.0,
@@ -1341,6 +1478,7 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
             "swanlab_enabled": False,
             "tensorboard_enabled": False,
             "mlflow_enabled": False,
+            "comet_enabled": False,
             "monitor_gpus": True,
             "gpu_monitoring": {
                 "collection_interval": 15.0,
@@ -1394,6 +1532,7 @@ class TestLogger:
             "tensorboard_enabled": False,
             "mlflow_enabled": False,
             "swanlab_enabled": False,
+            "comet_enabled": False,
             "monitor_gpus": False,
             "log_dir": temp_dir,
         }
@@ -1412,6 +1551,7 @@ class TestLogger:
             "tensorboard_enabled": False,
             "mlflow_enabled": False,
             "swanlab_enabled": False,
+            "comet_enabled": False,
             "monitor_gpus": False,
             "wandb": {"project": "test-project"},
             "log_dir": temp_dir,
@@ -1434,6 +1574,7 @@ class TestLogger:
             "tensorboard_enabled": False,
             "mlflow_enabled": False,
             "swanlab_enabled": True,
+            "comet_enabled": False,
             "monitor_gpus": False,
             "swanlab": {"project": "test-project"},
             "log_dir": temp_dir,
@@ -1455,6 +1596,7 @@ class TestLogger:
             "tensorboard_enabled": True,
             "mlflow_enabled": False,
             "swanlab_enabled": False,
+            "comet_enabled": False,
             "monitor_gpus": False,
             "tensorboard": {"log_dir": "test_logs"},
             "log_dir": temp_dir,
@@ -1476,6 +1618,7 @@ class TestLogger:
             "tensorboard_enabled": True,
             "mlflow_enabled": False,
             "swanlab_enabled": False,
+            "comet_enabled": False,
             "monitor_gpus": False,
             "wandb": {"project": "test-project"},
             "tensorboard": {"log_dir": "test_logs"},
@@ -1501,6 +1644,7 @@ class TestLogger:
             "tensorboard_enabled": True,
             "mlflow_enabled": False,
             "swanlab_enabled": False,
+            "comet_enabled": False,
             "monitor_gpus": False,
             "wandb": {"project": "test-project"},
             "tensorboard": {"log_dir": "test_logs"},
@@ -1533,6 +1677,7 @@ class TestLogger:
             "tensorboard_enabled": True,
             "mlflow_enabled": False,
             "swanlab_enabled": False,
+            "comet_enabled": False,
             "monitor_gpus": False,
             "wandb": {"project": "test-project"},
             "tensorboard": {"log_dir": "test_logs"},
@@ -1563,6 +1708,7 @@ class TestLogger:
             "tensorboard_enabled": True,
             "mlflow_enabled": False,
             "swanlab_enabled": False,
+            "comet_enabled": False,
             "monitor_gpus": True,
             "gpu_monitoring": {
                 "collection_interval": 15.0,
@@ -1609,6 +1755,7 @@ class TestLogger:
             "tensorboard_enabled": True,
             "mlflow_enabled": False,
             "swanlab_enabled": False,
+            "comet_enabled": False,
             "monitor_gpus": False,
             "wandb": {"project": "test-project"},
             "tensorboard": {"log_dir": "test_logs"},
@@ -1648,6 +1795,7 @@ class TestLogger:
             "tensorboard_enabled": True,
             "mlflow_enabled": False,
             "swanlab_enabled": False,
+            "comet_enabled": False,
             "monitor_gpus": False,
             "wandb": {"project": "test-project"},
             "tensorboard": {"log_dir": "test_logs"},
@@ -1706,6 +1854,7 @@ class TestLogger:
             "tensorboard_enabled": False,
             "mlflow_enabled": True,
             "swanlab_enabled": False,
+            "comet_enabled": False,
             "monitor_gpus": False,
             "mlflow": {
                 "experiment_name": "test-experiment",
@@ -1724,9 +1873,42 @@ class TestLogger:
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     @patch("nemo_rl.utils.logger.MLflowLogger")
+    @patch("nemo_rl.utils.logger.CometLogger")
+    def test_init_comet_only(
+        self,
+        mock_comet_logger,
+        mock_mlflow_logger,
+        mock_tb_logger,
+        mock_wandb_logger,
+        temp_dir,
+    ):
+        """Test initialization with only CometLogger enabled."""
+        cfg = {
+            "wandb_enabled": False,
+            "tensorboard_enabled": False,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "comet_enabled": True,
+            "monitor_gpus": False,
+            "comet": {"workspace": "ws", "project_name": "proj"},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        assert len(logger.loggers) == 1
+        mock_wandb_logger.assert_not_called()
+        mock_tb_logger.assert_not_called()
+        mock_mlflow_logger.assert_not_called()
+        mock_comet_logger.assert_called_once()
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
+    @patch("nemo_rl.utils.logger.MLflowLogger")
     @patch("nemo_rl.utils.logger.SwanlabLogger")
+    @patch("nemo_rl.utils.logger.CometLogger")
     def test_init_all_loggers(
         self,
+        mock_comet_logger,
         mock_swanlab_logger,
         mock_mlflow_logger,
         mock_tb_logger,
@@ -1739,6 +1921,7 @@ class TestLogger:
             "tensorboard_enabled": True,
             "mlflow_enabled": True,
             "swanlab_enabled": True,
+            "comet_enabled": True,
             "monitor_gpus": False,
             "wandb": {"project": "test-project"},
             "swanlab": {"project": "test-project"},
@@ -1748,22 +1931,26 @@ class TestLogger:
                 "tracking_uri": None,
                 "run_name": "test-run",
             },
+            "comet": {"workspace": "ws", "project_name": "proj"},
             "log_dir": temp_dir,
         }
         logger = Logger(cfg)
 
-        assert len(logger.loggers) == 4
+        assert len(logger.loggers) == 5
         mock_wandb_logger.assert_called_once()
         mock_tb_logger.assert_called_once()
         mock_mlflow_logger.assert_called_once()
         mock_swanlab_logger.assert_called_once()
+        mock_comet_logger.assert_called_once()
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     @patch("nemo_rl.utils.logger.MLflowLogger")
     @patch("nemo_rl.utils.logger.SwanlabLogger")
+    @patch("nemo_rl.utils.logger.CometLogger")
     def test_log_metrics_with_mlflow(
         self,
+        mock_comet_logger,
         mock_swanlab_logger,
         mock_mlflow_logger,
         mock_tb_logger,
@@ -1776,6 +1963,7 @@ class TestLogger:
             "swanlab_enabled": True,
             "tensorboard_enabled": True,
             "mlflow_enabled": True,
+            "comet_enabled": True,
             "monitor_gpus": False,
             "wandb": {"project": "test-project"},
             "swanlab": {"project": "test-project"},
@@ -1785,6 +1973,7 @@ class TestLogger:
                 "tracking_uri": None,
                 "run_name": "test-run",
             },
+            "comet": {"workspace": "ws", "project_name": "proj"},
             "log_dir": temp_dir,
         }
         logger = Logger(cfg)
@@ -1794,6 +1983,7 @@ class TestLogger:
         mock_tb_instance = mock_tb_logger.return_value
         mock_mlflow_instance = mock_mlflow_logger.return_value
         mock_swanlab_instance = mock_swanlab_logger.return_value
+        mock_comet_instance = mock_comet_logger.return_value
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
         step = 10
@@ -1812,13 +2002,18 @@ class TestLogger:
         mock_mlflow_instance.log_metrics.assert_called_once_with(
             metrics, step, "", None, False
         )
+        mock_comet_instance.log_metrics.assert_called_once_with(
+            metrics, step, "", None, False
+        )
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     @patch("nemo_rl.utils.logger.MLflowLogger")
     @patch("nemo_rl.utils.logger.SwanlabLogger")
+    @patch("nemo_rl.utils.logger.CometLogger")
     def test_log_hyperparams_with_mlflow(
         self,
+        mock_comet_logger,
         mock_swanlab_logger,
         mock_mlflow_logger,
         mock_tb_logger,
@@ -1831,11 +2026,13 @@ class TestLogger:
             "swanlab_enabled": True,
             "tensorboard_enabled": True,
             "mlflow_enabled": True,
+            "comet_enabled": True,
             "monitor_gpus": False,
             "wandb": {"project": "test-project"},
             "swanlab": {"project": "test-project"},
             "tensorboard": {"log_dir": "test_logs"},
             "mlflow": {"experiment_name": "test-experiment"},
+            "comet": {"workspace": "ws", "project_name": "proj"},
             "log_dir": temp_dir,
         }
         logger = Logger(cfg)
@@ -1845,6 +2042,7 @@ class TestLogger:
         mock_tb_instance = mock_tb_logger.return_value
         mock_mlflow_instance = mock_mlflow_logger.return_value
         mock_swanlab_instance = mock_swanlab_logger.return_value
+        mock_comet_instance = mock_comet_logger.return_value
 
         params = {"lr": 0.001, "batch_size": 32}
         logger.log_hyperparams(params)
@@ -1854,6 +2052,7 @@ class TestLogger:
         mock_tb_instance.log_hyperparams.assert_called_once_with(params)
         mock_mlflow_instance.log_hyperparams.assert_called_once_with(params)
         mock_swanlab_instance.log_hyperparams.assert_called_once_with(params)
+        mock_comet_instance.log_hyperparams.assert_called_once_with(params)
 
     def test_log_plot_per_worker_timeline_metrics_logs_expected_series(self):
         """Ensure per-worker and average plots are produced and logged."""

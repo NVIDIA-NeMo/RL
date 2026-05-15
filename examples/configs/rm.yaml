@@ -200,6 +200,7 @@ logger:
   tensorboard_enabled: true
   mlflow_enabled: false
   swanlab_enabled: false # Disable SwanLab logging
+  comet_enabled: false   # Disable Comet ML logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "rm-dev"
@@ -213,6 +214,10 @@ logger:
     experiment_name: "rm-dev"
     run_name: "rm-dev-${data.train.dataset_name}"
     tracking_uri: "http://localhost:5000"
+  comet:
+    workspace: "nemo-rl"
+    project_name: "rm-dev"
+    experiment_name: "rm-dev-${data.train.dataset_name}"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

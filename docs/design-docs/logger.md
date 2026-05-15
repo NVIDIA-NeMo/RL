@@ -1,6 +1,6 @@
 # Logger
 
-The logger is designed to track key training metrics (including distributed metrics with reductions and timing), as well as providing integration with logging backends like WandB, Tensorboard, MLflow and Swanlab.
+The logger is designed to track key training metrics (including distributed metrics with reductions and timing), as well as providing integration with logging backends like WandB, Tensorboard, MLflow, Swanlab and Comet.
 
 ## Requirements
 
@@ -11,12 +11,13 @@ The logger is designed to track key training metrics (including distributed metr
    * Tensorboard
    * MLflow
    * Swanlab
+   * Comet ML
 
 ## Overall Design
 
 Since there is a single controller, the single process running the main training loop will gather the metrics and do the logging.
 
-To handle multiple logger backends, we will have a {py:class}`LoggerInterface <nemo_rl.utils.logger.LoggerInterface>` interface that the {py:class}`TensorboardLogger <nemo_rl.utils.logger.TensorboardLogger>`, {py:class}`WandbLogger <nemo_rl.utils.logger.WandbLogger>`, {py:class}`MLflowLogger <nemo_rl.utils.logger.MLflowLogger>` and {py:class}`SwanlabLogger <nemo_rl.utils.logger.SwanlabLogger>` will implement:
+To handle multiple logger backends, we will have a {py:class}`LoggerInterface <nemo_rl.utils.logger.LoggerInterface>` interface that the {py:class}`TensorboardLogger <nemo_rl.utils.logger.TensorboardLogger>`, {py:class}`WandbLogger <nemo_rl.utils.logger.WandbLogger>`, {py:class}`MLflowLogger <nemo_rl.utils.logger.MLflowLogger>`, {py:class}`SwanlabLogger <nemo_rl.utils.logger.SwanlabLogger>` and {py:class}`CometLogger <nemo_rl.utils.logger.CometLogger>` will implement:
 
 ```python
 class LoggerInterface(ABC):
@@ -152,6 +153,26 @@ Then access the UI at `http://127.0.0.1:5000/` to view:
 - Hyperparameters
 - Model artifacts and checkpoints
 
+### Comet ML
+- Cloud experiment tracking with rich figure, histogram, and scalar logging
+- Automatic capture of code, git metadata, and environment details
+- Online and offline modes (offline runs are written to `<log_dir>/comet/`)
+- Hyperparameter logging
+- Tag-based organization for experiments
+
+#### Comet ML Configuration
+
+```python
+comet:
+  workspace: "nemo-rl"                  # Comet workspace
+  project_name: "grpo-dev"              # Comet project
+  experiment_name: "grpo-dev-logger"    # Optional experiment name
+  tags: []                              # Optional list of tags
+  online: true                          # OpSet false to write an offline archive
+```
+
+Set `COMET_API_KEY` in your environment before running with `online: true`.
+
 ## Validation Pretty Logging
 
 The logger supports pretty-formatted logging of validation samples to help visualize model outputs during training. This feature is controlled by the `num_val_samples_to_print` configuration parameter.
@@ -179,7 +200,7 @@ When enabled, the pretty logging will generate formatted text similar to:
 
 ## GPU Metric Logging
 
-NeMo RL monitors GPU memory and utilization through [system metrics](https://docs.ray.io/en/latest/ray-observability/reference/system-metrics.html#system-metrics) exposed by Ray nodes. While Ray makes these metrics available for tools like Prometheus, NeMo RL directly polls GPU memory and utilization data and logs them to TensorBoard, WandB, MLflow and/or SwanLab.
+NeMo RL monitors GPU memory and utilization through [system metrics](https://docs.ray.io/en/latest/ray-observability/reference/system-metrics.html#system-metrics) exposed by Ray nodes. While Ray makes these metrics available for tools like Prometheus, NeMo RL directly polls GPU memory and utilization data and logs them to TensorBoard, WandB, MLflow, SwanLab and/or Comet ML.
 
 This approach allows us to offer the same GPU metric tracking on all loggers and simplifies the implementation greatly.
 
@@ -202,7 +223,7 @@ logger:
 > * Logs sent back to the driver do not introduce significant overhead.
 > * Metrics remain clear and interpretable, avoiding issues like double counting caused by colocated workers.
 > * Workers can gracefully flush their logs in case of failure.
-> * Logging behaves consistently across TensorBoard, WandB, MLflow and Swanlab.
+> * Logging behaves consistently across TensorBoard, WandB, MLflow, Swanlab and Comet ML.
 > * Workers that spawn other workers accurately report the total resource usage of any grandchild workers.
 >
 > Due to these complexities, we opted for a simpler approach: collecting metrics exposed by the Ray metrics server from the driver.
