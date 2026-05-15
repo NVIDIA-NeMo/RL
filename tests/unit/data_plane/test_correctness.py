@@ -26,12 +26,11 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
-from nemo_rl.data_plane.column_io import read_columns, write_columns
+from nemo_rl.data_plane.column_io import kv_first_write, read_columns, write_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.data_plane.column_io import kv_first_write
 
 
 def _keys_from_uids(uids: list[str], n_gen: int = 1) -> list[str]:
