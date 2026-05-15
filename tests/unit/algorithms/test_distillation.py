@@ -297,6 +297,61 @@ def test_validate_function(mock_components):
     # Note: validate() function itself doesn't call logger.log_metrics - that's done by the caller
 
 
+def _rollout_return_for(batch):
+    enriched = BatchedDataDict[DatumSpec](dict(batch))
+    enriched["total_reward"] = torch.tensor([1.0])
+    return (enriched, {"mean_gen_tokens_per_sample": 10.0})
+
+
+def test_validate_iterates_full_dataloader_when_max_val_samples_is_none(
+    mock_components,
+):
+    """When max_val_samples is omitted, validate iterates the entire val_dataloader."""
+    config = mock_components["master_config"]
+    # Simulate a recipe that does not specify max_val_samples.
+    config.distillation.pop("max_val_samples", None)
+    config.distillation["val_batch_size"] = 1
+
+    expected_batches = mock_components["val_dataloader"].__len__.return_value
+    sample_batch = next(iter(mock_components["val_dataloader"]))
+
+    with patch.object(distil_mod, "run_multi_turn_rollout") as mock_rollout:
+        mock_rollout.return_value = _rollout_return_for(sample_batch)
+        validate(
+            mock_components["student_generation"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=0,
+            master_config=config,
+        )
+
+    assert mock_rollout.call_count == expected_batches
+
+
+def test_validate_floor_divides_max_val_samples_by_val_batch_size(mock_components):
+    """When max_val_samples is set, validate truncates with floor division (matches GRPO)."""
+    config = mock_components["master_config"]
+    config.distillation["max_val_samples"] = 7
+    config.distillation["val_batch_size"] = 2
+
+    sample_batch = next(iter(mock_components["val_dataloader"]))
+
+    with patch.object(distil_mod, "run_multi_turn_rollout") as mock_rollout:
+        mock_rollout.return_value = _rollout_return_for(sample_batch)
+        validate(
+            mock_components["student_generation"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=0,
+            master_config=config,
+        )
+
+    # 7 // 2 == 3 batches; previous ceiling-division behaviour would have been 4.
+    assert mock_rollout.call_count == 3
+
+
 def test_check_vocab_equality_pass(monkeypatch):
     student_tokenizer = MagicMock()
     student_tokenizer.get_vocab.return_value = {"a": 0, "b": 1}

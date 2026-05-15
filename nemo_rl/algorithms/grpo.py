@@ -2288,10 +2288,11 @@ def validate(
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config.grpo["max_val_samples"]
-            // master_config.grpo["val_batch_size"]
-        )
+        max_val_samples = master_config.grpo.get("max_val_samples")
+        if max_val_samples is None:
+            max_batches = len(val_dataloader)
+        else:
+            max_batches = max_val_samples // master_config.grpo["val_batch_size"]
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break

@@ -83,7 +83,7 @@ class DistillationConfig(TypedDict):
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
-    max_val_samples: int
+    max_val_samples: NotRequired[int]
     topk_logits_k: int
     seed: int
 
@@ -977,11 +977,13 @@ def validate(
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config.distillation["max_val_samples"]
-            + master_config.distillation["val_batch_size"]
-            - 1
-        ) // master_config.distillation["val_batch_size"]
+        max_val_samples = master_config.distillation.get("max_val_samples")
+        if max_val_samples is None:
+            max_batches = len(val_dataloader)
+        else:
+            max_batches = (
+                max_val_samples // master_config.distillation["val_batch_size"]
+            )
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
