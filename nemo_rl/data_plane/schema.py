@@ -50,3 +50,10 @@ LP_SEED_FIELDS = (
     "token_mask",
     "sample_mask",
 )
+
+# Train-partition fields NOT needed for KV-scale calibration. Derived
+# from ``DP_TRAIN_FIELDS`` so a new train-side column added to the
+# schema is excluded-by-default — to include a new column in
+# calibration, add it to the private set below.
+_DP_CALIB_INPUT_FIELDS = frozenset({INPUT_IDS, INPUT_LENGTHS})
+DP_CALIB_EXCLUDED_FIELDS = frozenset(DP_TRAIN_FIELDS) - _DP_CALIB_INPUT_FIELDS

@@ -65,6 +65,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.column_io import read_columns, write_columns
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
+from nemo_rl.data_plane.schema import DP_CALIB_EXCLUDED_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
@@ -719,25 +720,11 @@ def grpo_train_sync(
                             "▶ Recomputing KV cache scales after policy update...",
                             flush=True,
                         )
-                        # Calibration needs input_ids + input_lengths +
-                        # multimodal fields. The actor wrote all of those
-                        # to TQ at rollout time; fetch them back as a
-                        # slice — pull what you compute against, transform,
-                        # no need to refetch the bulk schema. Logprob /
-                        # mask / adv columns added later are irrelevant
-                        # here.
+                        # Exclude logprobs, masks, and advantages; multimodal extras pass through.
                         _calib_fields = [
                             f
                             for f in (meta.fields or [])
-                            if f
-                            not in (
-                                "generation_logprobs",
-                                "token_mask",
-                                "sample_mask",
-                                "prev_logprobs",
-                                "reference_policy_logprobs",
-                                "advantages",
-                            )
+                            if f not in DP_CALIB_EXCLUDED_FIELDS
                         ]
                         calibration_data = read_columns(
                             policy.dp_client,
