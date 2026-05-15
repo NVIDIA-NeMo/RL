@@ -137,6 +137,12 @@ nvrx = [
   "nvidia-resiliency-ext",
 ] # for ft_launcher (fault-tolerant training launcher)
 nemo_gym = ["nemo_gym"]
+muon = [
+  # Newton-Schulz orthogonalization primitives shared with the Megatron-side
+  # dist_muon adapter. DTensor recipes that select
+  # `nemo_rl.algorithms.muon.build_dtensor_muon` need this.
+  "emerging-optimizers==0.2.0",
+]
 
 [dependency-groups]
 

@@ -8,10 +8,43 @@ This guide explains how to use the Muon optimizer with NeMo RL for training larg
 
 ## Requirements
 
-Muon is only supported with the **Megatron backend**. Ensure you have:
+Muon is supported with both backends. Pick the section that matches your setup.
+
+### Megatron backend
 
 1. Megatron submodules initialized: `git submodule update --init --recursive`
 2. Megatron backend enabled in your configuration: `policy.megatron_cfg.enabled=true`
+3. The `mcore` extras installed (`uv sync --extra mcore`) since they pull in `emerging-optimizers`, the package that provides the Newton-Schulz primitives.
+
+### DTensor backend (FSDP2 / TP)
+
+1. The `muon` extras installed: `uv sync --extra muon`. This thin extras group only adds `emerging-optimizers`; the Megatron submodules are not required.
+2. DTensor backend enabled in your configuration (`policy.dtensor_cfg.enabled=true`, the default for non-Megatron recipes).
+3. Select the DTensor Muon builder in the optimizer config:
+
+   ```yaml
+   policy:
+     optimizer:
+       name: nemo_rl.algorithms.muon.build_dtensor_muon
+       kwargs:
+         lr: 2.0e-5
+         weight_decay: 0.1
+         muon_momentum: 0.9
+         muon_use_nesterov: false
+         muon_scale_mode: spectral
+         muon_extra_scale_factor: 0.2
+         muon_tp_mode: duplicated   # or distributed / blockwise
+         muon_split_qkv: true
+         adamw_kwargs:              # forwarded to torch.optim.AdamW for non-linear params
+           betas: [0.9, 0.999]
+           eps: 1.0e-8
+   ```
+
+   The builder routes 2D linear weights through `DTensorMuon` and everything else (embeddings, norms, the LM head, biases) through `torch.optim.AdamW`, mirroring the Megatron `dist_muon` parameter split. Fused QKV (`*.linear_qkv.weight`) is handled via the per-head split-orthogonalize-concat path; HF-style separated `q_proj` / `k_proj` / `v_proj` are just three normal Muon parameters.
+
+   The `use_distributed_optimizer` and `overlap_param_gather` Megatron knobs do not apply here — DTensor's FSDP2 already shards optimizer state implicitly, and there is no analogous overlap-param-gather toggle.
+
+   See `examples/configs/recipes/llm/sft-llama3.2-1b-1n8g-fsdp2tp1-muon.v1.yaml` for a runnable nightly recipe.
 
 ## Basic Usage
 
