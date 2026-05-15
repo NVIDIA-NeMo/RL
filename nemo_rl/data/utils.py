@@ -152,12 +152,15 @@ def setup_response_data(
     val_task_data_processors = {}
     val_task_data_preprocessors = {}
     val_task_to_env = {}
-    val_data_list = []
+    # (task_name, raw_dataset) pairs preserved in load order so each appears
+    # as its own entry in the returned dict and gets per-dataset metrics
+    # downstream. Mirrors the pattern DPO uses in its setup.
+    val_data_pairs: list[tuple[str, Any]] = []
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
     for data in data_list:
         if hasattr(data, "val_dataset") and data.val_dataset is not None:
-            val_data_list.append(data.val_dataset)
+            val_data_pairs.append((data.task_name, data.val_dataset))
             print(
                 f"  - Loaded validation dataset {data.task_name} with {len(data.val_dataset)} samples."
             )
@@ -181,7 +184,7 @@ def setup_response_data(
             if "default" in data_config and data_config["default"] is not None:
                 update_single_dataset_config(cfg, data_config["default"])
             val_data = load_response_dataset(cfg)
-            val_data_list.append(val_data.dataset)
+            val_data_pairs.append((val_data.task_name, val_data.dataset))
             print(
                 f"  - Loaded validation dataset {val_data.task_name} with {len(val_data.dataset)} samples."
             )
@@ -196,19 +199,36 @@ def setup_response_data(
             if has_envs:
                 val_task_to_env[task_name] = envs[cfg["env_name"]]
 
-    # merge datasets
-    val_dataset = None
-    if len(val_data_list) > 0:
-        merged_val_data = concatenate_datasets(val_data_list)
-        val_dataset = AllTaskProcessedDataset(
-            merged_val_data,
-            tokenizer,
-            None,
-            val_task_data_processors,
-            task_data_preprocessors=val_task_data_preprocessors,
-            max_seq_length=data_config["max_input_seq_length"],
+    # Build a dict[name -> AllTaskProcessedDataset] so the algorithm setup
+    # can produce one StatefulDataLoader per dataset and validate() can emit
+    # per-dataset metrics under a `validation-<name>/` prefix.
+    val_dataset: Optional[dict[str, AllTaskProcessedDataset]] = None
+    if len(val_data_pairs) > 0:
+        seen_names: set[str] = set()
+        for name, _ in val_data_pairs:
+            if name in seen_names:
+                raise ValueError(
+                    f"Duplicate validation task_name '{name}'. Each entry under "
+                    "data.validation must produce a unique task_name so that "
+                    "per-dataset metrics can be reported under a distinct "
+                    "validation-<name>/ wandb prefix."
+                )
+            seen_names.add(name)
+        val_dataset = {
+            name: AllTaskProcessedDataset(
+                raw,
+                tokenizer,
+                None,
+                val_task_data_processors,
+                task_data_preprocessors=val_task_data_preprocessors,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
+            for name, raw in val_data_pairs
+        }
+        total = sum(len(ds) for ds in val_dataset.values())
+        print(
+            f"  ✓ Validation datasets loaded: {total} samples across {len(val_dataset)} dataset(s)."
         )
-        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
 
     if has_envs:
         return dataset, val_dataset, task_to_env, val_task_to_env

@@ -95,13 +95,15 @@ def mock_components():
     train_dataloader.__iter__ = train_iter
     train_dataloader.__len__ = MagicMock(return_value=10)
 
-    val_dataloader = MagicMock(spec=StatefulDataLoader)
+    val_dataloader_single = MagicMock(spec=StatefulDataLoader)
 
     def val_iter(self):
         return iter([mock_batch] * 10)
 
-    val_dataloader.__iter__ = val_iter
-    val_dataloader.__len__ = MagicMock(return_value=10)
+    val_dataloader_single.__iter__ = val_iter
+    val_dataloader_single.__len__ = MagicMock(return_value=10)
+    # validate() now takes a dict[name -> StatefulDataLoader] for per-dataset metrics.
+    val_dataloader = {"test_dataset": val_dataloader_single}
 
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
@@ -294,7 +296,99 @@ def test_validate_function(mock_components):
     assert isinstance(validation_timings, dict)
     # For distillation, we don't need environment interaction since max_rollout_turns=0
     # The validation focuses on generation and teacher-student knowledge transfer
-    # Note: validate() function itself doesn't call logger.log_metrics - that's done by the caller
+
+
+def _build_single_batch_loader(reward: float):
+    batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {"token_ids": torch.tensor([1, 2]), "role": "user", "content": "q"},
+                    {"token_ids": torch.tensor([3, 4]), "role": "assistant", "content": "a"},
+                ]
+            ],
+            "loss_multiplier": torch.tensor([1.0]),
+            "task_name": ["dummy"],
+            "extra_env_info": [{}],
+            "length": torch.tensor([4]),
+            "idx": torch.tensor([0]),
+            "total_reward": torch.tensor([reward]),
+        }
+    )
+    dl = MagicMock(spec=StatefulDataLoader)
+    dl.__iter__ = MagicMock(side_effect=lambda: iter([batch]))
+    dl.__len__ = MagicMock(return_value=1)
+    return dl, batch
+
+
+def test_validate_emits_per_dataset_prefixed_metrics_and_logs(mock_components):
+    """validate() splits metrics per dataset and logs each under validation-<name>."""
+    config = mock_components["master_config"]
+    config.distillation["val_batch_size"] = 1
+    config.distillation["max_val_samples"] = 1
+
+    dl_a, batch_a = _build_single_batch_loader(1.0)
+    dl_b, batch_b = _build_single_batch_loader(0.0)
+    val_dataloader = {"gsm8k": dl_a, "math500": dl_b}
+
+    rollout_returns = iter(
+        [
+            (batch_a, {"mean_gen_tokens_per_sample": 10.0}),
+            (batch_b, {"mean_gen_tokens_per_sample": 12.0}),
+        ]
+    )
+    logger = MagicMock()
+
+    with patch.object(distil_mod, "run_multi_turn_rollout") as mock_rollout:
+        mock_rollout.side_effect = lambda *a, **k: next(rollout_returns)
+        val_metrics, validation_timings = validate(
+            mock_components["student_generation"],
+            val_dataloader,
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=0,
+            master_config=config,
+            logger=logger,
+        )
+
+    # Per-dataset metric keys present in the returned dict.
+    assert val_metrics["validation-gsm8k_accuracy"] == 1.0
+    assert val_metrics["validation-math500_accuracy"] == 0.0
+    # Aggregated key is the macro-mean across datasets (preserved for save_state).
+    assert val_metrics["accuracy"] == pytest.approx(0.5)
+    # Per-dataset wandb prefixes were used.
+    logged_prefixes = {call.kwargs.get("prefix") for call in logger.log_metrics.call_args_list}
+    assert "validation-gsm8k" in logged_prefixes
+    assert "validation-math500" in logged_prefixes
+    # Total validation time is also logged once.
+    assert "timing/validation" in logged_prefixes
+    assert "total_validation_time" in validation_timings
+
+
+def test_validate_iterates_full_dataloader_when_max_val_samples_is_none(mock_components):
+    """When max_val_samples is omitted, validate iterates the entire val_dataloader."""
+    config = mock_components["master_config"]
+    config.distillation.pop("max_val_samples", None)
+    config.distillation["val_batch_size"] = 1
+
+    expected_batches = mock_components["val_dataloader"]["test_dataset"].__len__.return_value
+    sample_batch = next(iter(mock_components["val_dataloader"]["test_dataset"]))
+
+    enriched = BatchedDataDict[DatumSpec](dict(sample_batch))
+    enriched["total_reward"] = torch.tensor([1.0])
+
+    with patch.object(distil_mod, "run_multi_turn_rollout") as mock_rollout:
+        mock_rollout.return_value = (enriched, {"mean_gen_tokens_per_sample": 10.0})
+        validate(
+            mock_components["student_generation"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=0,
+            master_config=config,
+        )
+
+    assert mock_rollout.call_count == expected_batches
 
 
 def test_check_vocab_equality_pass(monkeypatch):
