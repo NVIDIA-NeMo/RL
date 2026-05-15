@@ -19,7 +19,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.loss import PreferenceLossFn
-from nemo_rl.algorithms.rm import MasterConfig, _default_rm_save_state, rm_train
+from nemo_rl.algorithms.rm import MasterConfig, _default_rm_save_state, rm_train, setup
 
 
 @pytest.fixture
@@ -123,6 +123,69 @@ def mock_components():
         "checkpointer": checkpointer,
         "master_config": master_config,
     }
+
+
+def test_context_parallel_rejected_for_dtensor_rm():
+    """Test that context_parallel_size > 1 raises ValueError for DTensor RM training.
+
+    TODO(https://github.com/NVIDIA-NeMo/RL/issues/2482): remove when CP is supported for RM.
+    """
+    config = MasterConfig.model_construct(
+        **{
+            "policy": {
+                "dtensor_cfg": {
+                    "enabled": True,
+                    "context_parallel_size": 2,
+                    "tensor_parallel_size": 1,
+                    "sequence_parallel": False,
+                    "activation_checkpointing": False,
+                    "cpu_offload": False,
+                },
+            },
+            "rm": {"seed": 42},
+            "data": {},
+            "logger": {},
+            "cluster": {},
+            "checkpointing": {},
+        }
+    )
+    with pytest.raises(
+        ValueError,
+        match="Context parallelism.*is not supported for reward model training",
+    ):
+        setup(config, MagicMock(), MagicMock(), {})
+
+
+def test_context_parallel_allowed_when_one():
+    """Test that context_parallel_size=1 does not raise for DTensor RM training.
+
+    We verify the CP check passes by confirming the error comes from a later
+    setup stage, not from our validation.
+
+    TODO(https://github.com/NVIDIA-NeMo/RL/issues/2482): remove when CP is supported for RM.
+    """
+    config = MasterConfig.model_construct(
+        **{
+            "policy": {
+                "dtensor_cfg": {
+                    "enabled": True,
+                    "context_parallel_size": 1,
+                    "tensor_parallel_size": 1,
+                    "sequence_parallel": False,
+                    "activation_checkpointing": False,
+                    "cpu_offload": False,
+                },
+            },
+            "rm": {"seed": 42},
+            "data": {},
+            "logger": {},
+            "cluster": {},
+            "checkpointing": {},
+        }
+    )
+    with pytest.raises(Exception) as excinfo:
+        setup(config, MagicMock(), MagicMock(), {})
+    assert "Context parallelism" not in str(excinfo.value)
 
 
 def test_exit_on_max_steps(mock_components):
