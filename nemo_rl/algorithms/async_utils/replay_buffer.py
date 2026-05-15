@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import threading as _threading
-from typing import Any, Optional
+from collections import Counter
+from typing import Any, Iterable, Optional
 
 import ray
 
@@ -87,6 +88,13 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         with self._lock:
             return set(self.target_weight_versions)
 
+    def _remove_indices(self, indices: Iterable[int]) -> None:
+        """Remove trajectories at the given indices."""
+        for idx in sorted(indices, reverse=True):
+            self.trajectory_versions.pop(idx)
+            self.target_weight_versions.pop(idx)
+            self.trajectories.pop(idx)
+
     def sample(
         self,
         num_prompt_groups: int,
@@ -113,8 +121,6 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             print(f"   {self.trajectory_versions=}")
 
             # For debugging: check for unexpected old trajectories
-            from collections import Counter
-
             version_counts = Counter(self.trajectory_versions)
             print(f"   {version_counts=}")
 
@@ -180,8 +186,6 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 f"   ✅ Selected {len(selected)} trajectories all intended for step {current_weight_version}"
             )
 
-            from collections import Counter
-
             sampled_weights = [self.trajectory_versions[i] for i in selected]
             avg_trajectory_age = current_weight_version - sum(sampled_weights) / len(
                 sampled_weights
@@ -194,13 +198,9 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 f"🎯 All selected trajectories target step {current_weight_version} (100% target match)"
             )
 
-            sampled_items = [self.trajectories[i] for i in selected]
-
             # Remove selected items in reverse order to maintain correct indices
-            for idx in sorted(selected, reverse=True):
-                self.trajectory_versions.pop(idx)
-                self.target_weight_versions.pop(idx)
-                self.trajectories.pop(idx)
+            sampled_items = [self.trajectories[i] for i in selected]
+            self._remove_indices(selected)
             print(
                 f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
             )
@@ -209,11 +209,6 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 "trajectories": sampled_items,
                 "avg_trajectory_age": avg_trajectory_age,
             }
-
-    def evict(self) -> None:
-        """Evict old trajectories."""
-        # Adding for backward compatibility.
-        pass
 
     def size(self) -> int:
         """Return current buffer size."""
@@ -233,6 +228,93 @@ class ReplayBuffer(ReplayBufferImpl):
     pass
 
 
+# WIP: DO NOT USE - This class is WIP and may be changed without notice, please DO NOT USE it.
+# Will be replaced by TQReplayBuffer once TQ is ready.
 @ray.remote  # pragma: no cover
 class ReplayBufferNew(ReplayBufferImpl):
-    pass
+    """Staleness-window replay buffer.
+
+    -- WIP: DO NOT USE --
+    This class is WIP and may be changed without notice, please DO NOT USE it.
+
+    Differences from ReplayBuffer:
+    - _evict(): Stale rows (trainer_version - weight_version > max_staleness) are evicted
+      at the start of every sample() call.
+    - sample(): selects trajectories in freshest-first order (default) or FIFO order,
+      controlled by the sample_freshest_first flag, from whatever remains in the buffer
+      after eviction.
+
+    TODO: remove when cleaning up
+    - max_age_steps won't be used in ReplayBufferNew;
+    - self.target_weight_versions won't be used in ReplayBufferNew and will be removed
+      when cleaning up. target_weight_versions gates generation on specific trainer steps,
+      which causes generation pauses; ReplayBufferNew intentionally avoids this.
+    - add this class to nemo_rl/algorithms/async_utils/__init__.py
+    """
+
+    def __init__(
+        self, max_size: int, max_staleness: int, sample_freshest_first: bool = True
+    ):
+        super().__init__(max_size)
+        if max_staleness < 0:
+            raise ValueError(f"max_staleness must be non-negative, got {max_staleness}")
+        self.max_staleness = max_staleness
+        # will move to StalenessSampler when we implement it
+        self.sample_freshest_first = sample_freshest_first
+
+    def _evict(self, current_weight_version: int) -> None:
+        """Evict rows where trainer_version - weight_version > max_staleness.
+
+        Must be called with self._lock held.
+        """
+        min_valid = current_weight_version - self.max_staleness
+        stale = [i for i, v in enumerate(self.trajectory_versions) if v < min_valid]
+        self._remove_indices(stale)
+
+    def sample(
+        self,
+        num_prompt_groups: int,
+        current_weight_version: int,
+        max_age_steps: int,
+    ) -> Optional[dict[str, Any]]:
+        """Sample num_prompt_groups trajectories, freshest-first.
+
+        Will evict stale rows before sampling, so we will get [current_weight_version - self.max_staleness, current_weight_version] valid trajectories.
+
+        Returns:
+            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None.
+        """
+        with self._lock:
+            self._evict(current_weight_version)
+
+            if not self.trajectories:
+                return None
+
+            all_indices = range(len(self.trajectory_versions))
+            if self.sample_freshest_first:
+                all_indices = sorted(
+                    all_indices,
+                    key=lambda i: self.trajectory_versions[i],
+                    reverse=True,
+                )
+
+            if len(all_indices) < num_prompt_groups:
+                print(
+                    f"Insufficient trajectories: have {len(all_indices)}, "
+                    f"need {num_prompt_groups}. Waiting."
+                )
+                return None
+
+            selected = all_indices[:num_prompt_groups]
+            sampled_weights = [self.trajectory_versions[i] for i in selected]
+            avg_trajectory_age = current_weight_version - sum(sampled_weights) / len(
+                sampled_weights
+            )
+
+            sampled_items = [self.trajectories[i] for i in selected]
+            self._remove_indices(selected)
+
+            return {
+                "trajectories": sampled_items,
+                "avg_trajectory_age": avg_trajectory_age,
+            }
