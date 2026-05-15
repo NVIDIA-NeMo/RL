@@ -587,14 +587,14 @@ class TQDataPlaneClient(DataPlaneClient):
         self,
         keys: list[str],
         partition_id: str,
-        select_fields: list[str] | None = None,
+        select_fields: list[str],
     ) -> TensorDict:
         if not keys:
             return TensorDict({}, batch_size=(0,))
         td = self._tq.kv_batch_get(
             keys=list(keys),
             partition_id=partition_id,
-            select_fields=list(select_fields) if select_fields else None,
+            select_fields=select_fields,
         )
         if self._promote_1d:
             td = _from_wire(td)

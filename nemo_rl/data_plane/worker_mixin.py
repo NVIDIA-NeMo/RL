@@ -221,7 +221,7 @@ class TQWorkerMixin:
                 td = self._require_dp_client().kv_batch_get(
                     keys=meta.keys,
                     partition_id=meta.partition_id,
-                    select_fields=list(meta.fields) if meta.fields else None,
+                    select_fields=list(meta.fields),
                 )
                 data = materialize(
                     td,
@@ -246,7 +246,7 @@ class TQWorkerMixin:
         td = self._require_dp_client().kv_batch_get(
             keys=meta.keys,
             partition_id=meta.partition_id,
-            select_fields=list(meta.fields) if meta.fields else None,
+            select_fields=list(meta.fields),
         )
         data = materialize(
             td,

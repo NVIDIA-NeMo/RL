@@ -312,17 +312,22 @@ class DataPlaneClient(ABC):
         self,
         keys: list[str],
         partition_id: str,
-        select_fields: list[str] | None = None,
+        select_fields: list[str],
     ) -> TensorDict:
         """Direct fetch by uids.
 
         Used by per-DP-rank slice fetches. Does NOT advance any per-task
         consumption cursor — that only happens via :meth:`claim_meta`.
 
+        ``select_fields`` is required (no implicit "fetch every field"
+        fallback): bulk schemas are wide and silent over-fetch is the
+        most expensive shape the wire can take. Callers must name what
+        they read.
+
         Args:
             keys: Uids to fetch.
             partition_id: Partition the keys live in.
-            select_fields: Subset of fields; ``None`` fetches every registered field.
+            select_fields: Subset of fields to fetch.
 
         Returns:
             ``TensorDict`` keyed by field name, batched along ``keys``.

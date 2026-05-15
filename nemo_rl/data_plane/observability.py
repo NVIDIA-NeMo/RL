@@ -308,7 +308,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._record_put(partition_id, keys_list, n_bytes)
         return out
 
-    def kv_batch_get(self, keys, partition_id, select_fields=None):
+    def kv_batch_get(self, keys, partition_id, select_fields):
         return self._run(
             "get",
             partition_id,

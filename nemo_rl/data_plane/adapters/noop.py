@@ -199,15 +199,11 @@ class NoOpDataPlaneClient(DataPlaneClient):
         self,
         keys: list[str],
         partition_id: str,
-        select_fields: list[str] | None = None,
+        select_fields: list[str],
     ) -> TensorDict:
         rec = self._partitions[partition_id]
         if not keys:
             return TensorDict({}, batch_size=(0,))
-
-        if select_fields is None:
-            available = set.intersection(*(set(rec.rows[k].keys()) for k in keys))
-            select_fields = sorted(available)
 
         out: dict[str, list[torch.Tensor]] = {f: [] for f in select_fields}
         for key in keys:
