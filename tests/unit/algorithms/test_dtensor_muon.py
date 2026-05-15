@@ -284,3 +284,147 @@ def test_optimizer_factory_dispatches_muon_builder_path():
     assert isinstance(opt, ChainedTorchOptimizer)
     assert isinstance(opt.optimizers[0], DTensorMuon)
     assert isinstance(opt.optimizers[1], torch.optim.AdamW)
+
+
+# ---------------------------------------------------------------------------
+# Multi-rank TP equivalence tests (CPU + gloo backend via mp.spawn)
+# ---------------------------------------------------------------------------
+
+
+def _tp_worker(
+    rank: int,
+    world_size: int,
+    init_full: torch.Tensor,
+    grad_full: torch.Tensor,
+    tp_mode: str,
+    shard_dim: int,
+    out_path: str,
+) -> None:
+    import os
+    import pickle
+
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29501")
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    torch.distributed.init_process_group(
+        backend="gloo", rank=rank, world_size=world_size
+    )
+    try:
+        mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("tp",))
+        # Build a DTensor by sharding the full init tensor.
+        full = init_full.detach().clone()
+        param = nn.Parameter(
+            DTensor.from_local(
+                full.tensor_split(world_size, dim=shard_dim)[rank],
+                mesh,
+                [Shard(shard_dim)],
+                run_check=False,
+            )
+        )
+        grad_local = grad_full.tensor_split(world_size, dim=shard_dim)[rank]
+        param.grad = DTensor.from_local(
+            grad_local, mesh, [Shard(shard_dim)], run_check=False
+        )
+
+        opt = DTensorMuon(
+            [param],
+            lr=1e-3,
+            momentum=0.0,
+            weight_decay=0.0,
+            nesterov=False,
+            tp_mode=tp_mode,  # type: ignore[arg-type]
+        )
+        opt.step()
+        # Materialize the global parameter tensor and write from rank 0.
+        full_after = param.full_tensor().detach().clone()
+        if rank == 0:
+            with open(out_path, "wb") as f:
+                pickle.dump(full_after, f)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def _reference_single_rank_step(
+    init_full: torch.Tensor,
+    grad_full: torch.Tensor,
+) -> torch.Tensor:
+    w = nn.Parameter(init_full.detach().clone())
+    w.grad = grad_full.clone()
+    DTensorMuon(
+        [w], lr=1e-3, momentum=0.0, weight_decay=0.0, nesterov=False
+    ).step()
+    return w.data
+
+
+@pytest.mark.parametrize("shard_dim", [0, 1])
+@pytest.mark.parametrize("tp_mode", ["duplicated", "blockwise"])
+def test_dtensor_muon_tp2_duplicated_matches_single_rank(
+    tmp_path, shard_dim, tp_mode
+):
+    """TP=2 + duplicated/blockwise mode all-gathers the full gradient before
+    Newton-Schulz, so the global parameter must equal the single-rank result
+    bit-for-bit."""
+    import multiprocessing as mp
+    import pickle
+
+    _seed()
+    init_full = torch.randn(8, 16)
+    grad_full = torch.randn(8, 16)
+
+    out_path = tmp_path / "result.pkl"
+    ctx = mp.get_context("spawn")
+    procs = []
+    for rank in range(2):
+        p = ctx.Process(
+            target=_tp_worker,
+            args=(rank, 2, init_full, grad_full, tp_mode, shard_dim, str(out_path)),
+        )
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join(timeout=120)
+        assert p.exitcode == 0, f"worker exited {p.exitcode}"
+
+    with open(out_path, "rb") as f:
+        tp_full = pickle.load(f)
+    ref = _reference_single_rank_step(init_full, grad_full)
+    torch.testing.assert_close(tp_full, ref, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("shard_dim", [0, 1])
+def test_dtensor_muon_tp2_distributed_matches_single_rank(tmp_path, shard_dim):
+    """The distributed mode runs Newton-Schulz on the local shard with
+    cross-rank communication. Some FP non-determinism is acceptable, but the
+    global parameter should still be very close to the single-rank result."""
+    import multiprocessing as mp
+    import pickle
+
+    _seed()
+    init_full = torch.randn(8, 16)
+    grad_full = torch.randn(8, 16)
+
+    out_path = tmp_path / "result.pkl"
+    ctx = mp.get_context("spawn")
+    procs = []
+    for rank in range(2):
+        p = ctx.Process(
+            target=_tp_worker,
+            args=(rank, 2, init_full, grad_full, "distributed", shard_dim, str(out_path)),
+        )
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join(timeout=120)
+        assert p.exitcode == 0, f"worker exited {p.exitcode}"
+
+    with open(out_path, "rb") as f:
+        tp_full = pickle.load(f)
+    ref = _reference_single_rank_step(init_full, grad_full)
+    # Distributed mode does its own all-reduces inside Newton-Schulz; allow
+    # some FP slack vs the single-rank computation.
+    torch.testing.assert_close(tp_full, ref, rtol=5e-4, atol=5e-4)
