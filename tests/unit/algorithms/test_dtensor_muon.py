@@ -265,6 +265,86 @@ def test_optimizer_factory_dispatches_default_adamw_path():
     assert opt.param_groups[0]["lr"] == 1e-3
 
 
+def test_build_dtensor_muon_separated_qkv_skips_split_path():
+    """HF-style separated q/k/v projections are normal 2D weights and must
+    end up as ordinary Muon params; the QKV-split path stays inactive."""
+
+    class TinyAttn(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.q_proj = nn.Linear(8, 8, bias=False)
+            self.k_proj = nn.Linear(8, 8, bias=False)
+            self.v_proj = nn.Linear(8, 8, bias=False)
+            self.norm = nn.LayerNorm(8)
+
+    opt = build_dtensor_muon(TinyAttn(), lr=1e-3)
+    muon_opt = opt.optimizers[0]
+    assert isinstance(muon_opt, DTensorMuon)
+    assert muon_opt._split_qkv is False
+    assert muon_opt._is_qkv_fn is None
+
+
+def test_build_dtensor_muon_fused_qkv_with_explicit_shapes():
+    """A fused ``linear_qkv.weight`` parameter must enable the split path
+    when ``qkv_split_shapes`` is supplied (or derivable)."""
+
+    class FusedAttn(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            # Single fused QKV weight of shape (q+k+v rows, hidden).
+            self.self_attention = nn.Module()
+            self.self_attention.linear_qkv = nn.Linear(8, 24, bias=False)
+
+    model = FusedAttn()
+    opt = build_dtensor_muon(
+        model,
+        lr=1e-3,
+        muon_split_qkv=True,
+        qkv_split_shapes=(8, 8, 8),
+    )
+    muon_opt = opt.optimizers[0]
+    assert muon_opt._split_qkv is True
+    assert muon_opt._is_qkv_fn is not None
+    assert muon_opt._is_qkv_fn(model.self_attention.linear_qkv.weight)
+    assert muon_opt._qkv_split_shapes == (8, 8, 8)
+
+
+def test_dtensor_muon_qkv_split_matches_per_slice_orthogonalize():
+    """The fused-QKV split-orth-concat must equal stacking the result of
+    orthogonalizing each Q/K/V slice independently."""
+    _seed()
+    # Per-head shapes: q=8 rows, k=4 rows, v=4 rows; 2 query groups; hidden=16.
+    shapes = (8, 4, 4)
+    num_query_groups = 2
+    hidden = 16
+    full_rows = num_query_groups * sum(shapes)
+    grad = torch.randn(full_rows, hidden)
+    fused_param = nn.Parameter(torch.zeros(full_rows, hidden))
+
+    # Reference: split, orthogonalize each slice with vanilla Muon math, concat.
+    ref_optim = DTensorMuon(
+        [nn.Parameter(torch.empty(0, hidden))],  # placeholder; we just want the fn
+        lr=1e-3,
+    )
+    grad_view = grad.view(num_query_groups, sum(shapes), -1)
+    slices = torch.split(grad_view, list(shapes), dim=1)
+    flat_slices = [s.reshape(-1, hidden) for s in slices]
+    orth_slices = [ref_optim.scaled_orthogonalize_fn(s) for s in flat_slices]
+    reshaped = [s.view(num_query_groups, -1, hidden) for s in orth_slices]
+    expected = torch.cat(reshaped, dim=1).view(full_rows, hidden)
+
+    # Subject under test.
+    optim = DTensorMuon(
+        [fused_param],
+        lr=1e-3,
+        split_qkv=True,
+        is_qkv_fn=lambda p: p is fused_param,
+        qkv_split_shapes=shapes,
+    )
+    actual = optim._qkv_split_orthogonalize(grad)
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
 def test_optimizer_factory_dispatches_muon_builder_path():
     """A builder marked with `_builds_optimizer_from_model = True` must
     receive the model directly so it can split parameters."""
