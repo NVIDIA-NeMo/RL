@@ -10,8 +10,12 @@ adapter.
 
 ## Vocabulary
 
-- **partition** — a named bucket of samples in TQ (e.g. `"train"`,
-  `"val"`). One per training step.
+- **partition** — a named data-flow scope in TQ (e.g. `"train"`,
+  `"val"`). Each partition owns its own field schema, consumer task
+  set, and per-sample production-status matrix. Sync GRPO uses one
+  stable partition (`"train"`) that is cleared and reused across
+  steps — different partitions are for different data flows
+  (training vs validation vs replay buffer), not for different steps.
 - **sample** — one row in a partition, identified by a per-sample **key**
   (e.g. `"<uid>_g0"`). Lives in TQ until `kv_clear`.
 - **field** — a named column (e.g. `input_ids`, `advantages`). Producers
@@ -27,11 +31,15 @@ adapter.
 
 ## Mental model
 
-**TQ is a bus, not a database.** Bulk tensors (input_ids, logprobs,
-masks) live in TQ for the duration of one GRPO step. The driver never
-holds bulk between rollout and training — it only handles small
-per-sample slices (rewards, advantages) and metadata (`KVBatchMeta`).
-At the end of the step, `kv_clear` drops everything.
+**TQ is a distributed storage and transfer engine.** It holds bulk
+tensors (input_ids, logprobs, masks) addressed by per-sample keys,
+moves them between producer and consumer Ray actors over the wire,
+and tracks per-`(sample, field)` production status so consumers know
+when their inputs are ready. Storage is transient: data lives in TQ
+for the duration of one GRPO step and `kv_clear` drops it at step
+end. The driver never holds bulk between rollout and training — only
+small per-sample slices (rewards, advantages) and metadata
+(`KVBatchMeta`) cross the driver.
 
 **Three layers, one-way dependency:**
 
