@@ -778,6 +778,66 @@ def test_clipped_pg_loss_kl_penalty():
     torch.testing.assert_close(actual_loss, expected_loss)
 
 
+@pytest.mark.parametrize("use_on_policy_kl_approximation", [False, True])
+def test_clipped_pg_loss_kl_gradient_includes_sampling_term(
+    use_on_policy_kl_approximation,
+):
+    """Tests that KL gradients include the sampled-policy score term."""
+    curr_logprobs = torch.tensor([[-1.2, -0.7]])
+    prev_logprobs = torch.tensor([[-1.0, -0.8]])
+    generation_logprobs = torch.tensor([[-1.5, -0.4]])
+    reference_policy_logprobs = torch.tensor([[-0.9, -1.1]])
+    advantages = torch.tensor([[0.4, -0.2]])
+    beta = 0.3
+
+    def loss_gradient(reference_policy_kl_penalty):
+        next_token_logprobs = curr_logprobs.clone().requires_grad_(True)
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros((1, 3), dtype=torch.int64),
+                "token_mask": torch.tensor([[0, 1, 1]]),
+                "sample_mask": torch.tensor([1]),
+                "advantages": torch.cat([torch.zeros((1, 1)), advantages], dim=-1),
+                "prev_logprobs": torch.cat(
+                    [torch.zeros((1, 1)), prev_logprobs], dim=-1
+                ),
+                "generation_logprobs": torch.cat(
+                    [torch.zeros((1, 1)), generation_logprobs], dim=-1
+                ),
+                "reference_policy_logprobs": torch.cat(
+                    [torch.zeros((1, 1)), reference_policy_logprobs], dim=-1
+                ),
+            }
+        )
+        cfg = ClippedPGLossConfig(
+            reference_policy_kl_penalty=reference_policy_kl_penalty,
+            use_on_policy_kl_approximation=use_on_policy_kl_approximation,
+        )
+        loss_fn = ClippedPGLossFn(cfg)
+        loss, _ = loss_fn(
+            next_token_logprobs=next_token_logprobs,
+            data=data,
+            global_valid_seqs=torch.sum(data["sample_mask"]),
+            global_valid_toks=torch.sum(
+                data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+            ),
+        )
+        loss.backward()
+        return next_token_logprobs.grad
+
+    actual_kl_gradient = loss_gradient(beta) - loss_gradient(0.0)
+    log_ratio = reference_policy_logprobs - curr_logprobs
+    kl = torch.exp(log_ratio) - 1 - log_ratio
+    kl_gradient = 1 - torch.exp(log_ratio)
+    if use_on_policy_kl_approximation:
+        kl_weight = torch.exp(curr_logprobs - generation_logprobs)
+    else:
+        kl_weight = torch.ones_like(curr_logprobs)
+    expected_kl_gradient = beta * kl_weight * (kl + kl_gradient) / curr_logprobs.numel()
+
+    torch.testing.assert_close(actual_kl_gradient, expected_kl_gradient)
+
+
 # Masking tests - Should work with original Loss Fn if needed, but less critical
 def test_clipped_pg_loss_masking():
     """Tests the effect of token_mask and sample_mask."""
