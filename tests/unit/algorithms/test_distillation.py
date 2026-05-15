@@ -329,6 +329,58 @@ def test_validate_iterates_full_dataloader_when_max_val_samples_is_none(
     assert mock_rollout.call_count == expected_batches
 
 
+def test_validate_emits_per_task_accuracy_keys(mock_components):
+    """Multi-task validation produces accuracy_<task> and num_samples_<task> entries."""
+    config = mock_components["master_config"]
+    config.distillation["max_val_samples"] = 4
+    config.distillation["val_batch_size"] = 1
+
+    # Two batches per task; reward 1.0 for gsm8k, 0.0 for math500.
+    task_sequence = ["gsm8k", "math500", "gsm8k", "math500"]
+    reward_sequence = [1.0, 0.0, 1.0, 0.0]
+
+    def make_batch(task, reward):
+        batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [
+                        {"token_ids": torch.tensor([1, 2]), "role": "user", "content": "q"},
+                        {"token_ids": torch.tensor([3, 4]), "role": "assistant", "content": "a"},
+                    ]
+                ],
+                "loss_multiplier": torch.tensor([1.0]),
+                "task_name": [task],
+                "extra_env_info": [{}],
+                "length": torch.tensor([4]),
+                "idx": torch.tensor([0]),
+                "total_reward": torch.tensor([reward]),
+            }
+        )
+        return batch
+
+    rollout_batches = [make_batch(t, r) for t, r in zip(task_sequence, reward_sequence)]
+
+    with patch.object(distil_mod, "run_multi_turn_rollout") as mock_rollout:
+        mock_rollout.side_effect = [
+            (b, {"mean_gen_tokens_per_sample": 4.0}) for b in rollout_batches
+        ]
+        val_metrics, _ = validate(
+            mock_components["student_generation"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=0,
+            master_config=config,
+        )
+
+    assert val_metrics["accuracy_gsm8k"] == 1.0
+    assert val_metrics["accuracy_math500"] == 0.0
+    assert val_metrics["num_samples_gsm8k"] == 2
+    assert val_metrics["num_samples_math500"] == 2
+    # Aggregated key is preserved with the same definition (sample-weighted mean).
+    assert val_metrics["accuracy"] == pytest.approx(0.5)
+
+
 def test_validate_floor_divides_max_val_samples_by_val_batch_size(mock_components):
     """When max_val_samples is set, validate truncates with floor division (matches GRPO)."""
     config = mock_components["master_config"]

@@ -2433,6 +2433,108 @@ class TestValidateFunction:
 
         assert mock_rollout.call_count == num_batches
 
+    def test_validate_emits_per_task_accuracy_keys(self):
+        """Multi-task validation produces accuracy_<task> and num_samples_<task> keys."""
+        mock_policy_gen = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token_id = 0
+
+        def make_batch(task, reward):
+            return BatchedDataDict[DatumSpec](
+                {
+                    "message_log": [
+                        [
+                            {
+                                "role": "user",
+                                "content": "q",
+                                "token_ids": torch.tensor([1, 2]),
+                            },
+                            {
+                                "role": "assistant",
+                                "content": "a",
+                                "token_ids": torch.tensor([3, 4]),
+                            },
+                        ],
+                    ],
+                    "task_name": [task],
+                    "extra_env_info": [{}],
+                    "loss_multiplier": torch.tensor([1.0]),
+                    "idx": torch.tensor([0]),
+                    "length": torch.tensor([4]),
+                    "total_reward": torch.tensor([reward]),
+                }
+            )
+
+        # Two batches per task; gsm8k all correct, math500 all wrong.
+        task_sequence = ["gsm8k", "math500", "gsm8k", "math500"]
+        reward_sequence = [1.0, 0.0, 1.0, 0.0]
+        rollout_batches = [
+            make_batch(t, r) for t, r in zip(task_sequence, reward_sequence)
+        ]
+
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(
+            return_value=iter([make_batch("placeholder", 0.0)] * len(rollout_batches))
+        )
+        mock_dataloader.__len__ = MagicMock(return_value=len(rollout_batches))
+
+        mock_env = MagicMock(spec=EnvironmentInterface)
+        mock_env.global_post_process_and_metrics.return_value = (
+            rollout_batches[0],
+            {},
+        )
+
+        mock_config = MasterConfig.model_construct(
+            **{
+                "grpo": {
+                    "max_val_samples": 4,
+                    "val_batch_size": 1,
+                    "max_rollout_turns": 1,
+                },
+                "policy": {
+                    "max_total_sequence_length": 2048,
+                    "generation": {
+                        "temperature": 1.0,
+                        "top_p": 1.0,
+                        "top_k": None,
+                        "backend": "vllm",
+                        "colocated": {"enabled": True},
+                        "vllm_cfg": {"async_engine": False},
+                    },
+                },
+                "logger": {"num_val_samples_to_print": 1},
+            }
+        )
+
+        with patch("nemo_rl.algorithms.grpo.run_multi_turn_rollout") as mock_rollout:
+            mock_rollout.side_effect = [
+                (b, {"mean_gen_tokens_per_sample": 4.0}) for b in rollout_batches
+            ]
+            with patch(
+                "nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False
+            ):
+                with patch(
+                    "nemo_rl.algorithms.grpo._should_use_async_rollouts",
+                    return_value=False,
+                ):
+                    with patch("nemo_rl.algorithms.grpo.print_message_log_samples"):
+                        val_metrics, _ = validate(
+                            mock_policy_gen,
+                            mock_dataloader,
+                            mock_tokenizer,
+                            {"math": mock_env},
+                            step=0,
+                            master_config=mock_config,
+                            logger=None,
+                        )
+
+        assert val_metrics["accuracy_gsm8k"] == 1.0
+        assert val_metrics["accuracy_math500"] == 0.0
+        assert val_metrics["num_samples_gsm8k"] == 2
+        assert val_metrics["num_samples_math500"] == 2
+        # Aggregated key is preserved with the same definition.
+        assert val_metrics["accuracy"] == pytest.approx(0.5)
+
 
 # ============================================================================
 # Tests for compute_and_apply_seq_logprob_error_masking function

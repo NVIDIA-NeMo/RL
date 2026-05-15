@@ -976,6 +976,10 @@ def validate(
         total_rewards = []  # Can be any metric. Setted to 'accuracy' by default.
         total_lengths = []
         all_message_logs = []  # Collect all message logs
+        # Per-task accuracy breakdown. Multi-validation concatenates several
+        # datasets into one dataloader; without this split the aggregated
+        # `accuracy` hides per-task progress (e.g. gsm8k vs math500).
+        per_task_rewards: dict[str, list[float]] = {}
 
         max_val_samples = master_config.distillation.get("max_val_samples")
         if max_val_samples is None:
@@ -1011,9 +1015,20 @@ def validate(
                     greedy=False,
                 )
             rewards = val_batch["total_reward"]
+            rewards_list = rewards.tolist()
 
-            total_rewards.extend(rewards.tolist())
+            total_rewards.extend(rewards_list)
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+
+            # task_name is set per sample by rl_collate_fn from
+            # DatumSpec.task_name. Skip entries that lack it for backwards
+            # compatibility with single-task or legacy datasets.
+            batch_task_names = val_batch.get("task_name")
+            if batch_task_names is not None:
+                for r, t in zip(rewards_list, batch_task_names):
+                    if t is None:
+                        continue
+                    per_task_rewards.setdefault(t, []).append(r)
 
             # Collect message logs for later display
             to_env = [
@@ -1037,6 +1052,11 @@ def validate(
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
+        for task_name, task_rewards in per_task_rewards.items():
+            val_metrics[f"accuracy_{task_name}"] = sum(task_rewards) / len(
+                task_rewards
+            )
+            val_metrics[f"num_samples_{task_name}"] = len(task_rewards)
 
         # Print sample conversations only once at the end of validation
         try:
@@ -1062,6 +1082,14 @@ def validate(
     print(f"    • Accuracy: {accuracy:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
+    if per_task_rewards:
+        print("    • Per-task accuracy:")
+        for task_name in sorted(per_task_rewards.keys()):
+            tr = per_task_rewards[task_name]
+            print(
+                f"        - {task_name}: {sum(tr) / len(tr):.4f} (n={len(tr)})",
+                flush=True,
+            )
 
     # Print timing information
     print("\n  ⏱️  Validation Timing:")
