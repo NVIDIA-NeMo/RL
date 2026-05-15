@@ -623,13 +623,12 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     # Activation checkpointing
     if config["megatron_cfg"]["activation_checkpointing"]:
-        granularity = config["megatron_cfg"]["recompute_granularity"]
+        granularity = config["megatron_cfg"].get("recompute_granularity", "full")
         model_cfg.recompute_granularity = granularity
         if granularity == "full":
             model_cfg.recompute_method = "uniform"
             model_cfg.recompute_num_layers = 1
         elif granularity == "selective":
-            recompute_modules = config["megatron_cfg"].get("recompute_modules")
             recompute_modules = config["megatron_cfg"].get("recompute_modules")
             if recompute_modules is not None:
                 # NOTE: MCore validates recompute_modules in TransformerConfig.__post_init__,
@@ -637,7 +636,6 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 # Valid values: core_attn, moe_act, layernorm, mla_up_proj, mlp, moe, shared_experts
                 # See: https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L1365
                 # Tracking: https://github.com/NVIDIA-NeMo/RL/issues/2291
-                model_cfg.recompute_modules = recompute_modules
                 model_cfg.recompute_modules = recompute_modules
             # else: MCore defaults to ["core_attn"] when recompute_modules is None
         else:
