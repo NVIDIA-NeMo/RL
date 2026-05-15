@@ -133,3 +133,9 @@ def build_dtensor_muon(
             )
         )
     return ChainedTorchOptimizer(optimizers)
+
+
+# Tell build_optimizer_from_cfg to hand us the full module rather than
+# model.parameters(); we need the named-parameter walk for the Muon vs
+# AdamW split.
+build_dtensor_muon._builds_optimizer_from_model = True  # type: ignore[attr-defined]

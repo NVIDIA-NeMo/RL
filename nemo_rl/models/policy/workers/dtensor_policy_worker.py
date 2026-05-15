@@ -91,6 +91,7 @@ from nemo_rl.utils.native_checkpoint import (
     save_checkpoint,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.optimizer_factory import build_optimizer_from_cfg
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
@@ -439,9 +440,8 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
 
         if init_optimizer:
-            optimizer_cls = get_class(self.cfg["optimizer"]["name"])
-            self.optimizer = optimizer_cls(
-                self.model.parameters(), **self.cfg["optimizer"]["kwargs"]
+            self.optimizer = build_optimizer_from_cfg(
+                self.model, self.cfg["optimizer"]
             )
         else:
             self.optimizer = None

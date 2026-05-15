@@ -247,3 +247,40 @@ def test_build_dtensor_muon_raises_when_no_trainable_params():
         p.requires_grad = False
     with pytest.raises(ValueError):
         build_dtensor_muon(model, lr=1e-3)
+
+
+def test_optimizer_factory_dispatches_default_adamw_path():
+    """The factory must keep the legacy `cls(model.parameters(), **kwargs)`
+    semantics for vanilla optimizers so existing AdamW recipes are
+    untouched."""
+    from nemo_rl.utils.optimizer_factory import build_optimizer_from_cfg
+
+    model = nn.Linear(4, 4)
+    cfg = {
+        "name": "torch.optim.AdamW",
+        "kwargs": {"lr": 1e-3, "weight_decay": 0.01},
+    }
+    opt = build_optimizer_from_cfg(model, cfg)
+    assert isinstance(opt, torch.optim.AdamW)
+    assert opt.param_groups[0]["lr"] == 1e-3
+
+
+def test_optimizer_factory_dispatches_muon_builder_path():
+    """A builder marked with `_builds_optimizer_from_model = True` must
+    receive the model directly so it can split parameters."""
+    from nemo_rl.utils.optimizer_factory import build_optimizer_from_cfg
+
+    class Tiny(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fc = nn.Linear(8, 8)
+            self.norm = nn.LayerNorm(8)
+
+    cfg = {
+        "name": "nemo_rl.algorithms.muon.build_dtensor_muon",
+        "kwargs": {"lr": 1e-3, "weight_decay": 0.01},
+    }
+    opt = build_optimizer_from_cfg(Tiny(), cfg)
+    assert isinstance(opt, ChainedTorchOptimizer)
+    assert isinstance(opt.optimizers[0], DTensorMuon)
+    assert isinstance(opt.optimizers[1], torch.optim.AdamW)
