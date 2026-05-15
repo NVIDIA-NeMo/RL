@@ -1,5 +1,8 @@
 # R3 Validation
 
+Effectiveness report:
+https://wandb.ai/joc/grpo-r3-effectiveness-0515-zezhou/reports/R3-Effectiveness-Check---VmlldzoxNjg5Njg3NQ
+
 ## How To Use
 
 Enable the default-off R3 trace:
