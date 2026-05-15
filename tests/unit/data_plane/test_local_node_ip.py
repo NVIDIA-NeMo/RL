@@ -16,10 +16,10 @@ assignment in the mooncake_cpu adapter path.
 
 Covers P3: multi-node correctness of the per-process IP binding.
 
-Implementation note: the actual function uses socket.gethostbyname /
-socket.gethostname rather than socket.getaddrinfo, and currently only
-skips IPv4 link-local addresses (169.254.x.x). Loopback (127.0.0.1) is
-NOT skipped by the current implementation — tests reflect the real code.
+The helper rejects two classes of non-routable address:
+* link-local (169.254/16, fe80::/10) — APIPA via ``avahi-autoipd``
+* loopback (127.0.0.0/8, ::1) — when ``/etc/hosts`` maps the
+  hostname to 127.0.0.1
 """
 
 from __future__ import annotations
@@ -72,6 +72,30 @@ def test_local_node_ip_skips_link_local(monkeypatch) -> None:
     assert result == "", (
         f"Expected empty string for link-local 169.254.1.1, got {result!r}. "
         "Link-local addresses must not be announced to Mooncake peers."
+    )
+
+
+def test_local_node_ip_skips_loopback(monkeypatch) -> None:
+    """When gethostbyname returns the loopback address (127.0.0.1), the
+    helper returns an empty string rather than announcing an unroutable
+    address to Mooncake peers.
+
+    Hosts where ``/etc/hosts`` maps the hostname to 127.0.0.1 would
+    otherwise cause cross-node 'connection refused' on Mooncake.
+    """
+    import socket
+
+    fn = _import_helper()
+    if fn is None:
+        pytest.skip("transfer_queue adapter not importable in this environment")
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "fake-host")
+    monkeypatch.setattr(socket, "gethostbyname", lambda _: "127.0.0.1")
+
+    result = fn()
+    assert result == "", (
+        f"Expected empty string for loopback 127.0.0.1, got {result!r}. "
+        "Loopback addresses must not be announced to Mooncake peers."
     )
 
 

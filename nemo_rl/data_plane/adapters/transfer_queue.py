@@ -52,8 +52,8 @@ def _tq():  # pragma: no cover - trivially exercised by smoke tests
     except ImportError as e:  # noqa: F841
         raise ImportError(
             "transfer_queue is not installed. It is a base dependency of "
-            "nemo-rl — try `uv sync` to refresh, or `pip install "
-            "TransferQueue==0.1.6` if you're not using uv."
+            "nemo-rl — try `uv sync` to refresh. The exact pin lives in "
+            "pyproject.toml under the ``TransferQueue`` dependency."
         ) from e
     return tq
 
@@ -68,13 +68,20 @@ def _get_local_node_ip() -> str:
 
     Each Ray actor process must use its own node's IP so Mooncake's
     announce address (``MC_TCP_BIND_ADDRESS`` → ``desc.ip_or_host_name``
-    in ``transfer_engine_impl.cpp``) is routable cross-node. Link-local
-    (169.254/16, fe80::/10) is rejected — ``gethostbyname`` can resolve
-    to APIPA on hosts where ``avahi-autoipd`` is active.
+    in ``transfer_engine_impl.cpp``) is routable cross-node.
+    Non-routable addresses are rejected:
+
+    * Link-local (169.254/16, fe80::/10) — ``gethostbyname`` can
+      resolve to APIPA on hosts where ``avahi-autoipd`` is active.
+    * Loopback (127.0.0.0/8, ::1) — hosts whose ``/etc/hosts`` maps
+      the hostname to 127.0.0.1 would otherwise announce an
+      unroutable address to Mooncake peers, causing cross-node
+      ``connection refused``.
     """
     try:
         ip = socket.gethostbyname(socket.gethostname())
-        if ipaddress.ip_address(ip).is_link_local:
+        addr = ipaddress.ip_address(ip)
+        if addr.is_link_local or addr.is_loopback:
             return ""
         return ip
     except Exception:
@@ -120,8 +127,27 @@ def _connect_existing() -> None:
 _TQ_RUNTIME_ENV_PATCHED = False
 
 
+def _resolve_tq_pin() -> str:
+    """Return the ``TransferQueue`` requirement string from nemo-rl metadata.
+
+    Single source of truth is ``pyproject.toml`` — we read it back via
+    ``importlib.metadata.requires`` so the runtime_env injection cannot
+    drift from the dependency declaration.
+    """
+    from importlib.metadata import requires
+
+    for req in requires("nemo-rl") or []:
+        spec = req.split(";")[0].strip()
+        if spec.lower().startswith("transferqueue"):
+            return spec
+    raise RuntimeError(
+        "Could not resolve TransferQueue dependency from nemo-rl metadata. "
+        "Check pyproject.toml under [project.dependencies]."
+    )
+
+
 def _patch_tq_actor_runtime_env() -> None:
-    """Inject ``{"pip": ["TransferQueue==0.1.6"]}`` into TQ's actor ``.options()``.
+    """Inject a per-actor ``runtime_env`` pin into TQ's actor ``.options()``.
 
     TQ spawns ``SimpleStorageUnit`` and ``TransferQueueController`` via
     ``Cls.options(...).remote(...)`` without a runtime_env, so they
@@ -133,12 +159,23 @@ def _patch_tq_actor_runtime_env() -> None:
     per-node by Ray afterwards). Idempotent. Couples us to TQ's internal
     class layout — if TQ restructures, this becomes a no-op with a
     logged warning and we fall back to per-node ``uv sync``.
+
+    The pin is sourced from nemo-rl's installed metadata via
+    :func:`_resolve_tq_pin` so it cannot drift from ``pyproject.toml``.
+
+    TODO(zhiyul): remove this patch once the nightly container image
+    is published with ``TransferQueue`` baked in via ``pyproject.toml``.
+    When every node starts from that image, the base env already has TQ
+    and Ray actors inherit it — this injection then becomes pure
+    overhead (Ray builds a redundant per-actor pip env on top of the
+    container's existing TQ install). Drop the call from
+    ``TQDataPlaneClient.__init__`` and delete this function.
     """
     global _TQ_RUNTIME_ENV_PATCHED
     if _TQ_RUNTIME_ENV_PATCHED:
         return
 
-    runtime_env = {"pip": ["TransferQueue==0.1.6"]}
+    runtime_env = {"pip": [_resolve_tq_pin()]}
 
     def _install(cls) -> bool:
         if not hasattr(cls, "options"):
