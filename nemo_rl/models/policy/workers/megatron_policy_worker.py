@@ -200,7 +200,7 @@ class MegatronPolicyWorkerImpl(
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
-        self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
+        self.timer = Timer()
 
         # Step 1: Setup distributed
         setup_distributed()
@@ -245,8 +245,7 @@ class MegatronPolicyWorkerImpl(
             hf_model_name,
             pretrained_path,
             weights_path,
-            tokenizer,
-            load_optim=init_optimizer,
+            optimizer_path,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
@@ -477,7 +476,6 @@ class MegatronPolicyWorkerImpl(
                     draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
                     losses_reduced = megatron_forward_backward(
                         model=self.model,
-                        cfg=self.cfg,
                         data_iterator=data_iterator,
                         num_microbatches=num_microbatches,
                         seq_length=padded_seq_length,
@@ -660,7 +658,6 @@ class MegatronPolicyWorkerImpl(
 
         list_of_logprobs = megatron_forward_backward(
             model=self.model,
-            cfg=self.cfg,
             data_iterator=mb_iterator,
             seq_length=padded_seq_length,
             mbs=micro_batch_size,
@@ -868,7 +865,6 @@ class MegatronPolicyWorkerImpl(
 
         list_of_outputs = megatron_forward_backward(
             model=self.model,
-            cfg=self.cfg,
             data_iterator=mb_iterator,
             seq_length=padded_seq_length,
             mbs=micro_batch_size,
@@ -992,7 +988,7 @@ class MegatronPolicyWorkerImpl(
             buffer_size_gb=buffer_size_gb,
             num_cuda_graphs=num_cuda_graphs,
             max_tokens=max_tokens,
-            max_sequence_length=self.cfg["generation"]["max_new_tokens"],
+            max_sequence_length=self.cfg["max_total_sequence_length"],
             unified_memory_level=unified_memory_level,
             kv_cache_management_mode=KVCacheManagementMode(kv_cache_management_mode),
             static_kv_memory_pointers=static_kv_memory_pointers,
@@ -1006,7 +1002,7 @@ class MegatronPolicyWorkerImpl(
             pg_collection=pg_collection,
             mamba_inference_state_config=mamba_inference_state_config,
             mamba_memory_ratio=0.1 + 0.1 * num_speculative_tokens, # Hack to account for the effect of speculative decode slots
-            logging_step_interval=1,
+            logging_step_interval=mcore_generation_config.get("logging_step_interval", 0),
             num_speculative_tokens=num_speculative_tokens,
             max_requests=max_requests,
          )
@@ -1261,8 +1257,7 @@ class MegatronPolicyWorkerImpl(
                 top_p=top_p_val,
                 skip_prompt_log_probs=False,
                 return_log_probs=True,
-                num_tokens_total=self.cfg["generation"]["max_new_tokens"],
-                num_tokens_to_generate=None,
+                num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"],
                 termination_id=self.megatron_tokenizer.eod,
             )
 

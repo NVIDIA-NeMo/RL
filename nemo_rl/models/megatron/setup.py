@@ -505,6 +505,8 @@ def setup_model_config(
     if fmt == "megatron_lm":
         model_cfg.finalize()
 
+    model_cfg.__post_init__()
+
     # Create checkpoint configs
     checkpoint_config = _create_checkpoint_config(
         pretrained_path, weights_path, optimizer_path
@@ -581,6 +583,26 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][
         "moe_token_dispatcher_type"
     ]
+    if "inference_moe_token_dispatcher_type" in config["megatron_cfg"]:
+        model_cfg.inference_moe_token_dispatcher_type = config["megatron_cfg"][
+            "inference_moe_token_dispatcher_type"
+        ]
+    if "inference_grouped_gemm_backend" in config["megatron_cfg"]:
+        model_cfg.inference_grouped_gemm_backend = config["megatron_cfg"][
+            "inference_grouped_gemm_backend"
+        ]
+    if "moe_router_num_groups" in config["megatron_cfg"]:
+        model_cfg.moe_router_num_groups = config["megatron_cfg"][
+            "moe_router_num_groups"
+        ]
+    if "moe_router_group_topk" in config["megatron_cfg"]:
+        model_cfg.moe_router_group_topk = config["megatron_cfg"][
+            "moe_router_group_topk"
+        ]
+    if "moe_pad_experts_for_cuda_graph_inference" in config["megatron_cfg"]:
+        model_cfg.moe_pad_experts_for_cuda_graph_inference = config["megatron_cfg"][
+            "moe_pad_experts_for_cuda_graph_inference"
+        ]
     model_cfg.moe_shared_expert_overlap = config["megatron_cfg"][
         "moe_shared_expert_overlap"
     ]
@@ -718,6 +740,14 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Invalid attention backend: {attention_backend}. "
                 f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
+
+    # These overrides need to be applied before the workers spawn.
+    if "transformer_impl" in config["megatron_cfg"]:
+        model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
+    if "cuda_graph_impl" in config["megatron_cfg"]:
+        model_cfg.cuda_graph_impl = config["megatron_cfg"]["cuda_graph_impl"]
+    if "cuda_graph_scope" in config["megatron_cfg"]:
+        model_cfg.cuda_graph_scope = config["megatron_cfg"]["cuda_graph_scope"]
 
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -1102,19 +1132,17 @@ def setup_model_and_optimizer(
         patch_gpt_model_forward_for_linear_ce_fusion(
             chunk_size=policy_cfg["megatron_cfg"]["linear_ce_fusion_chunk_size"]
         )
-    inference_ctx = torch.inference_mode() if inference_only else nullcontext()
-    with inference_ctx:
-        model = get_model(
-            megatron_cfg.model,
-            megatron_cfg.ddp,
-            use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
-            overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
-            data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
-            pre_wrap_hook=pre_wrap_hook,
-            mixed_precision_wrapper=mixed_precision_wrapper,
-            pg_collection=pg_collection,
-            wrap_with_ddp=load_optimizer,
-        )
+    model = get_model(
+        megatron_cfg.model,
+        megatron_cfg.ddp,
+        use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
+        overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
+        data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
+        pre_wrap_hook=pre_wrap_hook,
+        mixed_precision_wrapper=mixed_precision_wrapper,
+        pg_collection=pg_collection,
+        wrap_with_ddp=load_optimizer,
+    )
 
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(

@@ -1113,7 +1113,10 @@ def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+    if "vllm_cfg" in policy_generation.cfg:
+        engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+    else:
+        engine_max_model_len = policy_generation.cfg["max_total_sequence_length"]
     if max_seq_len is not None and max_seq_len > engine_max_model_len:
         warnings.warn(
             f"policy max_total_sequence_length ({max_seq_len}) is greater than the "
@@ -1175,7 +1178,14 @@ def run_async_nemo_gym_rollout(
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
-        max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+        if "vllm_cfg" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
+                "max_model_len"
+            ]
+        else:
+            max_total_tokens_per_sample = policy_generation.cfg[
+                "max_total_sequence_length"
+            ]
         all_sample_metrics = [
             {
                 "total_reward": r["full_result"]["reward"],

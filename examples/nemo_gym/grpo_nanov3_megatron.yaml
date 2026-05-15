@@ -26,6 +26,10 @@ policy:
       cuda_graph_scope: "full_iteration_inference"
       moe_pad_experts_for_cuda_graph_inference: false
       mamba_inference_ssm_states_dtype: "float32"
+      inference_moe_token_dispatcher_type: "nccl"  # Fall back to NCCL for now
+      inference_grouped_gemm_backend: "vllm"
+      moe_router_num_groups: null  # InferenceTopKRouter requires num_groups=None
+      moe_router_group_topk: null  # paired with moe_router_num_groups=null
       pipeline_model_parallel_size: 1
       expert_tensor_parallel_size: 1
       expert_model_parallel_size: 8

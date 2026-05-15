@@ -92,6 +92,9 @@ class MegatronGeneration(GenerationInterface):
             weights_path=weights_path,
         )
 
+        # Start the inference engine + HTTP server during construction.
+        self.prepare_for_generation()
+
     @property
     def dp_openai_server_base_urls(self) -> list[Optional[str]]:
         return self._policy.report_dp_openai_server_base_urls()
@@ -173,12 +176,16 @@ class MegatronGeneration(GenerationInterface):
             yield result
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Prepare the inference workers for generation.
+        """Initialize / re-enter inference mode on every worker.
 
-        For Megatron generation, this is a no-op since the workers
-        are always ready for inference.
+        First call starts the persistent inference engine, coordinator, and the OpenAI HTTP server.
+        Subsequent calls re-enter inference mode after a refit.
         """
-        return self._policy.prepare_for_generation(*args, **kwargs)
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "prepare_for_generation", **kwargs
+        )
+        ray.get(futures)
+        return True
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Clean up after generation.
