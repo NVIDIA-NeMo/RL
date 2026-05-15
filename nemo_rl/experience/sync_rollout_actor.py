@@ -97,14 +97,31 @@ class SyncRolloutActor:
         dict[str, Any],
         Optional[dict[str, Any]],
     ]:
-        """Rollout → flatten + mask + prompt extraction → flat ``kv_batch_put``.
+        """Run the full per-step generation cycle and write bulk data to TQ.
 
-        ``slice`` carries only the small per-sample tensors the driver
-        needs for its own per-sample compute (scale_rewards,
-        reward_shaping, overlong filtering, baseline/std,
-        dynamic_sampling, advantage). The actor handles the bulk-touching
-        ops (flatten / mask / prompt extraction) that require
-        ``message_log`` and would otherwise force bulk onto the driver.
+        Bundles six steps into one Ray round-trip so the driver only sees
+        a single RPC instead of separate calls for each:
+
+        1. **Reset metrics** — ``policy_generation.clear_logger_metrics()``
+           clears per-step generation accumulators before the rollout.
+        2. **Rollout** — runs ``run_multi_turn_rollout`` (or the async /
+           nemo-gym variants) to produce ``final_batch``.
+        3. **Flatten + mask + prompt extraction** — converts
+           ``message_log`` layout to flat tensors; builds token mask,
+           sample mask, prompt-only ids, baseline/std.
+        4. **Write bulk to TQ** — ``kv_first_write`` puts every tensor
+           field in one flat ``kv_batch_put``; the driver never touches
+           bulk bytes.
+        5. **Release GPU** — ``policy_generation.finish_generation()``
+           frees KV cache and inference state so the trainer can use the
+           GPU immediately.
+        6. **Capture metrics** — ``policy_generation.get_logger_metrics()``
+           collects generation stats (throughput, etc.) and returns them
+           to the driver in the result tuple.
+
+        The driver receives ``(meta, slice, rollout_metrics,
+        generation_logger_metrics)`` and uses only the small per-sample
+        slice for its own compute (rewards, advantages, dynamic sampling).
 
         Args:
             input_batch: Per-step prompt batch (already repeat-interleaved).
@@ -289,21 +306,6 @@ class SyncRolloutActor:
         else:
             gen_metrics = None
         return meta, slice_extras, rollout_metrics, gen_metrics
-
-    def finish_generation(self) -> None:
-        """Forward to ``policy_generation.finish_generation``."""
-        if self.policy_generation is not None:
-            self.policy_generation.finish_generation()
-
-    def get_logger_metrics(self) -> Optional[dict[str, Any]]:
-        if self.policy_generation is None:
-            return None
-        return self.policy_generation.get_logger_metrics()
-
-    def clear_logger_metrics(self) -> None:
-        if self.policy_generation is None:
-            return
-        self.policy_generation.clear_logger_metrics()
 
     def shutdown(self) -> None:
         try:
