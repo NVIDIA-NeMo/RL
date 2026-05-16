@@ -23,6 +23,7 @@ from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 import numpy as np
 import ray
 import torch
+from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -38,12 +39,12 @@ from nemo_rl.algorithms.grpo import (
     _should_use_async_rollouts,
     _should_use_nemo_gym,
 )
-from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -104,7 +105,7 @@ class RewardScalingConfig(TypedDict):
     target_max: NotRequired[float]
 
 
-class AsyncGRPOConfig(TypedDict):
+class AsyncPPOConfig(TypedDict):
     enabled: bool
     # Maximum trajectory age in training steps for samples drawn from the
     # async replay buffer. Trajectories older than this are excluded during
@@ -128,7 +129,7 @@ class AdvEstimatorConfig(TypedDict):
     minus_baseline: NotRequired[bool]
 
 
-class GRPOConfig(TypedDict):
+class PPOConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
     max_num_epochs: int
@@ -145,7 +146,7 @@ class GRPOConfig(TypedDict):
     max_val_samples: int
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
-    async_grpo: NotRequired[AsyncGRPOConfig]
+    async_ppo: NotRequired[AsyncPPOConfig]
     overlong_filtering: NotRequired[bool]
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
@@ -156,6 +157,7 @@ class GRPOConfig(TypedDict):
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: NotRequired[float]
+    steps_per_epoch: int
     reward_shaping: RewardShapingConfig
     reward_scaling: RewardScalingConfig
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
@@ -168,7 +170,7 @@ class GRPOConfig(TypedDict):
     policy_training_start_step: NotRequired[int]
 
 
-class GRPOSaveState(TypedDict):
+class PPOSaveState(TypedDict):
     consumed_samples: int
     current_step: int
     current_epoch: int
@@ -179,7 +181,7 @@ class GRPOSaveState(TypedDict):
     ]  # Optional field - may not be present during training
 
 
-def _default_ppo_save_state() -> GRPOSaveState:
+def _default_ppo_save_state() -> PPOSaveState:
     return {
         "consumed_samples": 0,
         "current_step": 0,
@@ -190,18 +192,18 @@ def _default_ppo_save_state() -> GRPOSaveState:
     }
 
 
-class GRPOLoggerConfig(LoggerConfig):
+class PPOLoggerConfig(LoggerConfig):
     num_val_samples_to_print: int  # number of val samples to print to stdout
 
 
-class MasterConfig(TypedDict):
+class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
-    value: NotRequired[ValueConfig]  # Value model configuration
+    value: Optional[ValueConfig] = None
     loss_fn: ClippedPGLossConfig
     env: dict[str, Any]
     data: DataConfig
-    grpo: GRPOConfig
-    logger: GRPOLoggerConfig
+    ppo: PPOConfig
+    logger: PPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
 
@@ -227,7 +229,7 @@ def setup(
     ClippedPGLossFn,
     Logger,
     CheckpointManager,
-    GRPOSaveState,
+    PPOSaveState,
     MasterConfig,
 ]:
     """Main entry point for running PPO algorithm.
@@ -239,15 +241,15 @@ def setup(
     setup_start_time = time.perf_counter()
 
     # Extract individual configs for easier access
-    policy_config = master_config["policy"]
-    value_config = master_config.get("value", None)
-    generation_config = master_config["policy"]["generation"]
-    env_configs = master_config["env"]
-    loss_config = master_config["loss_fn"]
-    ppo_config = master_config["ppo"]
-    data_config = master_config["data"]
-    logger_config = master_config["logger"]
-    cluster_config = master_config["cluster"]
+    policy_config = master_config.policy
+    value_config = master_config.value
+    generation_config = master_config.policy["generation"]
+    env_configs = master_config.env
+    loss_config: ClippedPGLossConfig = master_config.loss_fn
+    ppo_config = master_config.ppo
+    data_config = master_config.data
+    logger_config = master_config.logger
+    cluster_config = master_config.cluster
 
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
@@ -260,15 +262,15 @@ def setup(
     #         Logger
     # ==========================
     logger = Logger(logger_config)
-    logger.log_hyperparams(master_config)
+    logger.log_hyperparams(master_config.model_dump())
 
     # ==========================
     #      Checkpointing
     # ==========================
-    checkpointer = CheckpointManager(master_config["checkpointing"])
+    checkpointer = CheckpointManager(master_config.checkpointing)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    ppo_save_state: Optional[GRPOSaveState] = cast(
-        Optional[GRPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
+    ppo_save_state: Optional[PPOSaveState] = cast(
+        Optional[PPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
     )
     if ppo_save_state is None:
         ppo_save_state = _default_ppo_save_state()
@@ -330,12 +332,12 @@ def setup(
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
     value_loss_fn = MseValueLossFn(
-        scale=loss_config["value_loss_scale"],
-        cliprange=loss_config.get("value_cliprange", None),
+        scale=loss_config.value_loss_scale,
+        cliprange=loss_config.value_cliprange,
     )
 
     # Validate force_on_policy_ratio
-    if loss_config.get("force_on_policy_ratio", False):
+    if loss_config.force_on_policy_ratio:
         assert (
             ppo_config["num_prompts_per_step"]
             * ppo_config["num_generations_per_prompt"]
@@ -563,7 +565,6 @@ def setup(
             value_weights_path = None
             value_optimizer_path = None
 
-        # TODO: Proper implementation of the value model
         v = Value(
             cluster=train_cluster,
             config=value_config,
@@ -573,7 +574,6 @@ def setup(
             optimizer_path=value_optimizer_path,
             init_optimizer=True,
         )
-        # v = None
         return v, time.perf_counter() - t0
 
     def init_vllm():
@@ -691,7 +691,7 @@ def setup(
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
         if generation_config["vllm_cfg"]["precision"] == "fp8":
-            assert loss_config["use_importance_sampling_correction"] is True, (
+            assert loss_config.use_importance_sampling_correction is True, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
         if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
@@ -712,7 +712,7 @@ def setup(
             )
 
         ## make vllm hf overrides match the training policy
-        generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
+        generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
             "hf_config_overrides", {}
         )
 
@@ -873,8 +873,8 @@ def dynamic_sampling(
 
     # Required batch size for training
     train_prompts_size = (
-        master_config["ppo"]["num_prompts_per_step"]
-        * master_config["ppo"]["num_generations_per_prompt"]
+        master_config.ppo["num_prompts_per_step"]
+        * master_config.ppo["num_generations_per_prompt"]
     )
     # Store the baseline, std and total_reward for the current unfiltered batch.
     repeated_batch["baseline"] = baseline
@@ -885,7 +885,7 @@ def dynamic_sampling(
     # Dynamic sampling algorithm (used in DAPO algorithm)
     # This block implements dynamic sampling by selecting prompt groups with non-zero std.
     # If sampled prompts (with non-zero std) are fewer than num_prompts_per_step * num_generations_per_prompt, continue sampling until dynamic_sampling_max_gen_batches is reached.
-    if master_config["ppo"]["use_dynamic_sampling"]:
+    if master_config.ppo["use_dynamic_sampling"]:
         with timer.time("dynamic_sampling"):
             # Get the prompt indices with non-zero std
             non_zero_std_mask = std != 0.0
@@ -928,7 +928,7 @@ def dynamic_sampling(
 
             # If the generation samples size is smaller than a fixed threshold (train_prompts_size), keep generating by processing the next batch
             if filtered_prompts_size < train_prompts_size:
-                dynamic_sampling_max_gen_batches = master_config["ppo"][
+                dynamic_sampling_max_gen_batches = master_config.ppo[
                     "dynamic_sampling_max_gen_batches"
                 ]
                 assert dynamic_sampling_max_gen_batches > 0, (
@@ -956,7 +956,7 @@ def dynamic_sampling(
 
     batch_to_return = (
         filtered_repeated_batch
-        if master_config["ppo"]["use_dynamic_sampling"]
+        if master_config.ppo["use_dynamic_sampling"]
         else repeated_batch
     )
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
@@ -1015,8 +1015,8 @@ def _create_advantage_estimator(master_config: MasterConfig):
     Raises:
         ValueError: If the advantage estimator name is not recognized.
     """
-    ppo_config = master_config["ppo"]
-    loss_config = master_config["loss_fn"]
+    ppo_config = master_config.ppo
+    loss_config = master_config.loss_fn
 
     # Provide backward-compatible defaults when adv_estimator is not in config.
     # Fall back to top-level ppo.normalize_rewards / ppo.use_leave_one_out_baseline
@@ -1217,7 +1217,7 @@ def ppo_train(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     logger: Logger,
     checkpointer: CheckpointManager,
-    ppo_save_state: GRPOSaveState,
+    ppo_save_state: PPOSaveState,
     master_config: MasterConfig,
 ) -> None:
     """Run PPO training algorithm.
@@ -1230,7 +1230,7 @@ def ppo_train(
     """
     timer = Timer()
     timeout = TimeoutChecker(
-        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -1246,8 +1246,8 @@ def ppo_train(
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
 
-    if master_config["ppo"].get("skip_reference_policy_logprobs_calculation"):
-        assert master_config["loss_fn"]["reference_policy_kl_penalty"] == 0
+    if master_config.ppo.get("skip_reference_policy_logprobs_calculation"):
+        assert master_config.loss_fn.reference_policy_kl_penalty == 0
         print(
             "Reference policy logprob calculation will be skipped since `ppo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
         )
@@ -1258,22 +1258,20 @@ def ppo_train(
     # common config/state
     current_step = ppo_save_state["current_step"]
     total_steps = ppo_save_state["total_steps"]
-    max_num_steps = master_config["ppo"]["max_num_steps"]
+    max_num_steps = master_config.ppo["max_num_steps"]
     current_epoch = ppo_save_state["current_epoch"]
-    max_num_epochs = master_config["ppo"]["max_num_epochs"]
-    steps_per_epoch = master_config["ppo"]["steps_per_epoch"]
+    max_num_epochs = master_config.ppo["max_num_epochs"]
+    steps_per_epoch = master_config.ppo["steps_per_epoch"]
     # Number of PPO steps to train only the critic before starting policy
     # training.  Despite the legacy name, this is compared against total_steps
     # (not current_epoch) to match veRL's critic_warmup semantics.
-    policy_training_start_step = master_config["ppo"].get(
-        "policy_training_start_step", 0
-    )
+    policy_training_start_step = master_config.ppo.get("policy_training_start_step", 0)
     consumed_samples = ppo_save_state["consumed_samples"]
     total_valid_tokens = ppo_save_state.get("total_valid_tokens", 0)
-    val_at_start = master_config["ppo"]["val_at_start"]
-    val_at_end = master_config["ppo"]["val_at_end"]
-    val_period = master_config["ppo"]["val_period"]
-    colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    val_at_start = master_config.ppo["val_at_start"]
+    val_at_end = master_config.ppo["val_at_end"]
+    val_period = master_config.ppo["val_period"]
+    colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -1324,7 +1322,7 @@ def ppo_train(
                 with timer.time("data_processing"):
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
-                            master_config["ppo"]["num_generations_per_prompt"]
+                            master_config.ppo["num_generations_per_prompt"]
                         )
                     )
                     batched_flat, input_lengths = batched_message_log_to_flat_message(
@@ -1350,9 +1348,9 @@ def ppo_train(
                                     pad_value_dict={
                                         "token_ids": tokenizer.pad_token_id
                                     },
-                                    make_sequence_length_divisible_by=master_config[
-                                        "policy"
-                                    ]["make_sequence_length_divisible_by"],
+                                    make_sequence_length_divisible_by=master_config.policy[
+                                        "make_sequence_length_divisible_by"
+                                    ],
                                 )
                             )
                             calibration_data = BatchedDataDict[ClippedPGLossDataDict](
@@ -1384,7 +1382,7 @@ def ppo_train(
                         policy_generation.clear_logger_metrics()
 
                     if _should_use_nemo_gym(master_config):
-                        generation_config = master_config["policy"]["generation"]
+                        generation_config = master_config.policy["generation"]
                         nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,
@@ -1414,10 +1412,10 @@ def ppo_train(
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
-                            max_seq_len=master_config["policy"][
+                            max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config["ppo"]["max_rollout_turns"],
+                            max_rollout_turns=master_config.ppo["max_rollout_turns"],
                             greedy=False,
                         )
                     else:
@@ -1426,20 +1424,13 @@ def ppo_train(
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
-                            max_seq_len=master_config["policy"][
+                            max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config["ppo"]["max_rollout_turns"],
+                            max_rollout_turns=master_config.ppo["max_rollout_turns"],
                             greedy=False,
                         )
                     policy_generation.finish_generation()
-                    _free, _total = torch.cuda.mem_get_info()
-                    _used = (_total - _free) / (1024**3)
-                    _total_gb = _total / (1024**3)
-                    print(
-                        f"[GPU mem] after finish_generation (vLLM asleep): {_used:.2f}GB / {_total_gb:.2f}GB used",
-                        flush=True,
-                    )
                     if policy_generation is not None:
                         generation_logger_metrics = (
                             policy_generation.get_logger_metrics()
@@ -1451,11 +1442,11 @@ def ppo_train(
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
 
                 repeated_batch = scale_rewards(
-                    repeated_batch, master_config["ppo"]["reward_scaling"]
+                    repeated_batch, master_config.ppo["reward_scaling"]
                 )
-                if master_config["ppo"]["reward_shaping"]["enabled"]:
+                if master_config.ppo["reward_shaping"]["enabled"]:
                     repeated_batch = apply_reward_shaping(
-                        repeated_batch, master_config["ppo"]["reward_shaping"]
+                        repeated_batch, master_config.ppo["reward_shaping"]
                     )
 
                 # Process rewards and build training data
@@ -1465,7 +1456,7 @@ def ppo_train(
                     rewards = repeated_batch["total_reward"]
 
                 with timer.time("data_processing"):
-                    use_overlong_filtering = master_config["ppo"].get(
+                    use_overlong_filtering = master_config.ppo.get(
                         "overlong_filtering", False
                     )
                     if use_overlong_filtering:
@@ -1494,7 +1485,7 @@ def ppo_train(
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=master_config["policy"][
+                        make_sequence_length_divisible_by=master_config.policy[
                             "make_sequence_length_divisible_by"
                         ],
                     )
@@ -1523,22 +1514,9 @@ def ppo_train(
                     print("▶ Computing values...", flush=True)
                     with timer.time("value_inference"):
                         value_model.prepare_for_inference()
-                        _free, _total = torch.cuda.mem_get_info()
-                        _used = (_total - _free) / (1024**3)
-                        _total_gb = _total / (1024**3)
-                        print(
-                            f"[GPU mem] after value prepare_for_inference: {_used:.2f}GB / {_total_gb:.2f}GB used",
-                            flush=True,
-                        )
                         values = value_model.get_values(train_data)
                         train_data["values"] = values["values"].squeeze(-1)
                         value_model.finish_inference()
-                        _free, _total = torch.cuda.mem_get_info()
-                        _used = (_total - _free) / (1024**3)
-                        print(
-                            f"[GPU mem] after value finish_inference: {_used:.2f}GB / {_total_gb:.2f}GB used",
-                            flush=True,
-                        )
 
                 print(
                     f"  • Average batch reward: {rewards.mean().numpy():.4f}\n"
@@ -1550,13 +1528,6 @@ def ppo_train(
                 print("▶ Preparing for logprob inference...", flush=True)
                 with timer.time("logprob_inference_prep"):
                     policy.prepare_for_lp_inference()
-                    _free, _total = torch.cuda.mem_get_info()
-                    _used = (_total - _free) / (1024**3)
-                    _total_gb = _total / (1024**3)
-                    print(
-                        f"[GPU mem] after policy prepare_for_lp_inference: {_used:.2f}GB / {_total_gb:.2f}GB used",
-                        flush=True,
-                    )
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
@@ -1571,7 +1542,7 @@ def ppo_train(
                         logprob_data, timer=timer
                     )["logprobs"]
 
-                    if not master_config["ppo"].get(
+                    if not master_config.ppo.get(
                         "skip_reference_policy_logprobs_calculation"
                     ):
                         train_data["reference_policy_logprobs"] = (
@@ -1585,13 +1556,6 @@ def ppo_train(
                     del extra_multimodal_data
 
                     policy.finish_inference()
-                    _free, _total = torch.cuda.mem_get_info()
-                    _used = (_total - _free) / (1024**3)
-                    _total_gb = _total / (1024**3)
-                    print(
-                        f"[GPU mem] after policy finish_inference: {_used:.2f}GB / {_total_gb:.2f}GB used",
-                        flush=True,
-                    )
 
                 # Build prompt IDs for advantage estimation (groups responses from same prompt)
                 with timer.time("advantage_calculation"):
@@ -1630,13 +1594,6 @@ def ppo_train(
 
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
-                _free, _total = torch.cuda.mem_get_info()
-                _used = (_total - _free) / (1024**3)
-                _total_gb = _total / (1024**3)
-                print(
-                    f"[GPU mem] baseline before training loop: {_used:.2f}GB / {_total_gb:.2f}GB used",
-                    flush=True,
-                )
                 for step in range(steps_per_epoch):
                     print(
                         f"▶ Step {step + 1}/{steps_per_epoch}...",
@@ -1649,14 +1606,6 @@ def ppo_train(
                         with timer.time("value_training_prep"):
                             value_model.prepare_for_training()
 
-                        _free, _total = torch.cuda.mem_get_info()
-                        _used = (_total - _free) / (1024**3)
-                        _total_gb = _total / (1024**3)
-                        print(
-                            f"[GPU mem] after value prepare_for_training: {_used:.2f}GB / {_total_gb:.2f}GB used",
-                            flush=True,
-                        )
-
                         with timer.time("value_training"):
                             print("▶ Training value...", flush=True)
                             value_results = value_model.train(
@@ -1665,21 +1614,7 @@ def ppo_train(
                                 timer=timer,
                             )
 
-                            _free, _total = torch.cuda.mem_get_info()
-                            _used = (_total - _free) / (1024**3)
-                            print(
-                                f"[GPU mem] after value train (before finish): {_used:.2f}GB / {_total_gb:.2f}GB used",
-                                flush=True,
-                            )
-
                             value_model.finish_training()
-
-                            _free, _total = torch.cuda.mem_get_info()
-                            _used = (_total - _free) / (1024**3)
-                            print(
-                                f"[GPU mem] after value finish_training: {_used:.2f}GB / {_total_gb:.2f}GB used",
-                                flush=True,
-                            )
 
                     train_results = None
                     if total_steps >= policy_training_start_step:
@@ -1697,13 +1632,6 @@ def ppo_train(
                             policy.prepare_for_training()
                             POLICY_GENERATION_STALE = True
 
-                        _free, _total = torch.cuda.mem_get_info()
-                        _used = (_total - _free) / (1024**3)
-                        print(
-                            f"[GPU mem] after policy prepare_for_training: {_used:.2f}GB / {_total_gb:.2f}GB used",
-                            flush=True,
-                        )
-
                         print("▶ Training policy...", flush=True)
                         with timer.time("policy_training"):
                             train_results = policy.train(
@@ -1712,13 +1640,6 @@ def ppo_train(
                                 timer=timer,
                             )
                             policy.finish_training()
-
-                        _free, _total = torch.cuda.mem_get_info()
-                        _used = (_total - _free) / (1024**3)
-                        print(
-                            f"[GPU mem] after policy finish_training: {_used:.2f}GB / {_total_gb:.2f}GB used",
-                            flush=True,
-                        )
 
                     if train_results is not None:
                         print(
@@ -1899,18 +1820,18 @@ def ppo_train(
                     total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
-                consumed_samples += master_config["ppo"]["num_prompts_per_step"]
+                consumed_samples += master_config.ppo["num_prompts_per_step"]
                 timeout.mark_iteration()
 
                 should_save_by_step = (
                     is_last_step
-                    or (total_steps + 1) % master_config["checkpointing"]["save_period"]
+                    or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
                 )
                 should_save_by_timeout = timeout.check_save()
 
                 memory_tracker.snapshot_start_of_stage("Checkpointing", dir())
-                if master_config["checkpointing"]["enabled"] and (
+                if master_config.checkpointing["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     ppo_save_state["current_step"] = current_step + 1
@@ -1923,7 +1844,7 @@ def ppo_train(
                         del ppo_save_state["val_reward"]
                     ppo_save_state["consumed_samples"] = consumed_samples
 
-                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
                         assert full_metric_name.startswith(
                             "train:"
@@ -1981,7 +1902,7 @@ def ppo_train(
                                 tokenizer_path=os.path.join(
                                     checkpoint_path, "policy", "tokenizer"
                                 ),
-                                checkpointing_cfg=master_config["checkpointing"],
+                                checkpointing_cfg=master_config.checkpointing,
                             )
                             policy.finish_training()
                         else:
@@ -2003,7 +1924,7 @@ def ppo_train(
                                 tokenizer_path=os.path.join(
                                     checkpoint_path, "value", "tokenizer"
                                 ),
-                                checkpointing_cfg=master_config["checkpointing"],
+                                checkpointing_cfg=master_config.checkpointing,
                             )
                             value_model.finish_training()
 
@@ -2042,12 +1963,12 @@ def ppo_train(
             total_time = timing_metrics.get("total_step_time", 0)
 
             number_of_samples_per_step = (
-                master_config["ppo"]["num_prompts_per_step"]
-                * master_config["ppo"]["num_generations_per_prompt"]
+                master_config.ppo["num_prompts_per_step"]
+                * master_config.ppo["num_generations_per_prompt"]
             )
             total_num_gpus = (
-                master_config["cluster"]["num_nodes"]
-                * master_config["cluster"]["gpus_per_node"]
+                master_config.cluster["num_nodes"]
+                * master_config.cluster["gpus_per_node"]
             )
 
             print(f"  • Total step time: {total_time:.2f}s", flush=True)
@@ -2087,8 +2008,7 @@ def ppo_train(
             del repeated_batch
             del rewards
             del metrics
-            if "val_metrics" in dir():
-                del val_metrics
+            del val_metrics
 
             timer.reset()
             current_step += 1
@@ -2120,7 +2040,7 @@ def validate(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
-        assert val_dataloader is not None or master_config["ppo"]["val_period"] == 0, (
+        assert val_dataloader is not None or master_config.ppo["val_period"] == 0, (
             "val_dataloader is None, so ppo.val_period must be 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
@@ -2135,8 +2055,7 @@ def validate(
         all_message_logs = []  # Collect all message logs
 
         max_batches = (
-            master_config["ppo"]["max_val_samples"]
-            // master_config["ppo"]["val_batch_size"]
+            master_config.ppo["max_val_samples"] // master_config.ppo["val_batch_size"]
         )
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
@@ -2149,8 +2068,8 @@ def validate(
                 val_batch,
                 tokenizer,
                 val_task_to_env,
-                max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                max_rollout_turns=master_config["ppo"]["max_rollout_turns"],
+                max_seq_len=master_config.policy["max_total_sequence_length"],
+                max_rollout_turns=master_config.ppo["max_rollout_turns"],
                 greedy=False,
             )
 
@@ -2191,7 +2110,7 @@ def validate(
                 all_message_logs,
                 total_rewards,
                 num_samples=min(
-                    master_config["logger"]["num_val_samples_to_print"],
+                    master_config.logger["num_val_samples_to_print"],
                     len(all_message_logs),
                 ),
                 step=step,
@@ -2212,7 +2131,6 @@ def validate(
 
     # Print timing information
     print("\n  ⏱️  Validation Timing:")
-    validation_time = timing_metrics.get("total_validation_time", 0)
     print(f"    • Total validation time: {validation_time:.2f}s", flush=True)
 
     # Log validation data to JSONL file

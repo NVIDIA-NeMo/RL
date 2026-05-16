@@ -16,7 +16,7 @@ from typing import Any, Optional, TypedDict
 
 import torch
 
-from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.utils.timer import Timer

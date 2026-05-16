@@ -1,0 +1,67 @@
+defaults: ../../ppo_math_1B_megatron.yaml
+ppo:
+  num_prompts_per_step: 2048
+  num_generations_per_prompt: 1
+  steps_per_epoch: 1
+  max_num_steps: 20
+  val_period: 5
+  val_at_start: false
+  skip_reference_policy_logprobs_calculation: false
+  reward_shaping:
+    enabled: false
+  adv_estimator:
+    gae_lambda: 1
+loss_fn:
+  reference_policy_kl_penalty: 0.001
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "tis"
+  truncated_importance_sampling_ratio: 5
+  ratio_clip_max: 0.2
+  ratio_clip_c: 3
+  value_loss_scale: 1.0
+  value_cliprange: 0.5
+checkpointing:
+  checkpoint_dir: results/ppo-dsr1-7b-math-8n8g-megatron
+policy:
+  model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  tokenizer:
+    name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 10240
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      max_model_len: 10240
+      gpu_memory_utilization: 0.65
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    optimizer:
+      weight_decay: 0.01
+    scheduler:
+      lr_warmup_init: 0
+      start_weight_decay: 0.01
+      end_weight_decay: 0.01
+value:
+  model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  tokenizer:
+    name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  train_micro_batch_size: 1
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    optimizer:
+      lr: 2.0e-05
+      weight_decay: 0.01
+    scheduler:
+      lr_warmup_iters: 0
+      start_weight_decay: 0.01
+      end_weight_decay: 0.01
+logger:
+  log_dir: logs/ppo-dsr1-7b-math-8n8g-megatron
+  wandb:
+    project: nemo-rl
+    name: ppo-dsr1-7b-math-8n8g-megatron
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8

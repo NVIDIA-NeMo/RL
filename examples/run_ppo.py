@@ -33,7 +33,7 @@ from nemo_rl.utils.logger import get_next_experiment_dir
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Run GRPO training with configuration")
+    parser = argparse.ArgumentParser(description="Run PPO training with configuration")
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML config file"
     )
@@ -52,7 +52,7 @@ def main() -> None:
 
     if not args.config:
         args.config = os.path.join(
-            os.path.dirname(__file__), "configs", "ppo_math_1B.yaml"
+            os.path.dirname(__file__), "configs", "ppo_math_1B_megatron.yaml"
         )
 
     config = load_config(args.config)
@@ -62,7 +62,8 @@ def main() -> None:
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Print config
@@ -70,22 +71,22 @@ def main() -> None:
     pprint.pprint(config)
 
     # Get the next experiment directory with incremented ID
-    config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
-    print(f"📊 Using log directory: {config['logger']['log_dir']}")
-    if config["checkpointing"]["enabled"]:
+    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    if config.checkpointing["enabled"]:
         print(
-            f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
+            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
     init_ray()
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-    assert config["policy"]["generation"] is not None, (
-        "A generation config is required for GRPO"
+    tokenizer = get_tokenizer(config.policy["tokenizer"])
+    assert config.policy["generation"] is not None, (
+        "A generation config is required for PPO"
     )
-    config["policy"]["generation"] = configure_generation_config(
-        config["policy"]["generation"], tokenizer
+    config.policy["generation"] = configure_generation_config(
+        config.policy["generation"], tokenizer
     )
 
     # setup data
@@ -94,7 +95,7 @@ def main() -> None:
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_response_data(tokenizer, config["data"], config["env"])
+    ) = setup_response_data(tokenizer, config.data, config.env)
 
     (
         policy,

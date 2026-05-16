@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import torch
@@ -243,9 +244,7 @@ def extract_value_head_from_hf_checkpoint(
             return score_weights
 
     if not list(model_path.glob("*.safetensors")) and not bin_path.exists():
-        raise FileNotFoundError(
-            f"No checkpoint files found in {hf_model_path}"
-        )
+        raise FileNotFoundError(f"No checkpoint files found in {hf_model_path}")
 
     raise ValueError(
         f"No score.* keys found in checkpoint at {hf_model_path}. "

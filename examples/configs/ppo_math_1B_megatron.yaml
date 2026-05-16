@@ -63,9 +63,6 @@ loss_fn:
   ratio_clip_c: 10  # DAPO: dual-clip with c=10
   use_on_policy_kl_approximation: false
   use_importance_sampling_correction: false
-  truncated_importance_sampling_ratio: null
-  truncated_importance_sampling_ratio_min: null
-  truncated_importance_sampling_type: tis
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false
@@ -85,6 +82,7 @@ checkpointing:
   checkpoint_must_save_by: null
   model_save_format: "safetensors"
   save_consolidated: false
+  save_optimizer: true
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
@@ -146,6 +144,7 @@ policy:
     moe_shared_expert_overlap: false
     apply_rope_fusion: True
     bias_activation_fusion: True
+    gradient_accumulation_fusion: false
     defer_fp32_logits: False
     moe_per_layer_logging: False
 
@@ -308,6 +307,7 @@ value:
     moe_shared_expert_overlap: false
     apply_rope_fusion: True
     bias_activation_fusion: True
+    gradient_accumulation_fusion: false
     defer_fp32_logits: False
     moe_per_layer_logging: False
 

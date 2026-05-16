@@ -23,7 +23,7 @@ def extract_solution(solution_str: str, method: str = "strict") -> str | None:
 
     Args:
         solution_str: The model's response string.
-        method: 'strict' requires #### prefix; 'flexible' finds any number.
+        method: 'strict' requires #### prefix or <answer> tags; 'flexible' finds any number.
 
     Returns:
         The extracted numeric answer string, or None if not found.
@@ -34,6 +34,12 @@ def extract_solution(solution_str: str, method: str = "strict") -> str | None:
         solution_str = solution_str[-_SOLUTION_CLIP_CHARS:]
 
     if method == "strict":
+        # Try <answer> tags first (matches gsm8k.txt prompt format)
+        xml_match = re.findall(r"<answer>\s*(\-?[0-9\.\,]+)\s*</answer>", solution_str)
+        if xml_match:
+            final_answer = xml_match[-1].replace(",", "").replace("$", "")
+            return final_answer
+        # Fall back to #### prefix (original GSM8K format)
         solutions = re.findall(r"#### (\-?[0-9\.\,]+)", solution_str)
         if len(solutions) == 0:
             return None

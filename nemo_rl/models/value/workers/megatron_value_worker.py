@@ -25,6 +25,7 @@ from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
 )
+from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
@@ -48,7 +49,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -216,7 +217,10 @@ def forward_step_value(
         # overlap_grad_reduce=True requires every registered parameter to
         # produce a gradient for bucket sync; without this the output_layer
         # weight has no grad and finish_grad_sync() raises an AssertionError.
-        if original_output_layer is not None:
+        if (
+            original_output_layer is not None
+            and original_output_layer.weight is not None
+        ):
             values = values + 0.0 * original_output_layer.weight.view(-1)[0]
         output_tensor = values
     else:
@@ -334,7 +338,7 @@ class MegatronValueWorker(AbstractPolicyWorker):
             hf_model_name,
             pretrained_path,
             weights_path,
-            tokenizer,
+            optimizer_path,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
@@ -468,6 +472,7 @@ class MegatronValueWorker(AbstractPolicyWorker):
         megatron_cfg.setdefault("num_layers_in_last_pipeline_stage", None)
         megatron_cfg.setdefault("apply_rope_fusion", True)
         megatron_cfg.setdefault("bias_activation_fusion", True)
+        megatron_cfg.setdefault("gradient_accumulation_fusion", False)
         megatron_cfg.setdefault("defer_fp32_logits", False)
         megatron_cfg.setdefault("force_overwrite_initial_ckpt", False)
 
@@ -638,7 +643,6 @@ class MegatronValueWorker(AbstractPolicyWorker):
                         micro_batch_size=mbs,
                         decoder_seq_length=padded_seq_length,
                         forward_only=eval_mode,
-                        do_not_average_loss=True,
                     )
 
                 # Empty unused memory
@@ -687,10 +691,13 @@ class MegatronValueWorker(AbstractPolicyWorker):
                             )
                         self.value_head_optimizer.step()
 
+                    pg_collection = get_pg_collection(self.model)
                     update_successful = logical_and_across_model_parallel_group(
-                        update_successful
+                        update_successful, mp_group=pg_collection.mp
                     )
-                    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
+                    grad_norm = reduce_max_stat_across_model_parallel_group(
+                        grad_norm, mp_group=pg_collection.mp
+                    )
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (
                         True,

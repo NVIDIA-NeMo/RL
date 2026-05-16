@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-import warnings
 from contextlib import nullcontext
 from typing import Any, Optional, Union
 
@@ -20,7 +19,7 @@ import numpy as np
 import ray
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -86,7 +85,9 @@ class Value(ValueInterface):
             )
 
         if megatron_enable:
-            worker_builder_cls = "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker"
+            worker_builder_cls = (
+                "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker"
+            )
 
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
@@ -94,32 +95,10 @@ class Value(ValueInterface):
 
             env_vars = config["megatron_cfg"].get("env_vars", {})
         else:
-            if not dtensor_enable:
-                raise ValueError(
-                    "Please set value.dtensor_cfg.enabled=true to use DTensor training backend."
-                )
-
-            # Check if _v2 is enabled (defaults to False for backward compatibility)
-            use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
-            if use_v2:
-                worker_builder_cls = "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2"
-
-                if "TORCH_CUDA_ARCH_LIST" not in os.environ:
-                    warnings.warn(
-                        "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorValueWorker V2. "
-                        "This variable is set in our container, but if you are running a custom container or baremetal, "
-                        "you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
-                    )
-            else:
-                raise NotImplementedError(
-                    "DTensor V1 backend is not implemented for Value models. "
-                    "Please set value.dtensor_cfg._v2=true to use DTensor V2."
-                )
-
-            tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
-            cp_size = config["dtensor_cfg"]["context_parallel_size"]
-
-            env_vars = config["dtensor_cfg"].get("env_vars", {})
+            raise NotImplementedError(
+                "DTensor backend for value model is not yet validated. "
+                "Please use Megatron-Core backend (value.megatron_cfg.enabled=true)."
+            )
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
@@ -280,11 +259,7 @@ class Value(ValueInterface):
                     batch_size=None,
                 )
 
-        with (
-            timer.time("get_values/submit_value_futures")
-            if timer
-            else nullcontext()
-        ):
+        with timer.time("get_values/submit_value_futures") if timer else nullcontext():
             futures = self.worker_group.run_all_workers_sharded_data(
                 "get_values",
                 data=sharded_data,
@@ -437,9 +412,7 @@ class Value(ValueInterface):
         checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the value model."""
-        megatron_enable = bool(
-            self.cfg.get("megatron_cfg", {}).get("enabled", False)
-        )
+        megatron_enable = bool(self.cfg.get("megatron_cfg", {}).get("enabled", False))
 
         if megatron_enable:
             futures = self.worker_group.run_all_workers_single_data(

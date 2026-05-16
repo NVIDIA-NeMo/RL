@@ -106,7 +106,6 @@ __all__ = [
     "DAPOMathAIME2024Dataset",
     "GSM8KDataset",
     "DeepScalerDataset",
-    "GSM8KDataset",
     "Geometry3KDataset",
     "HelpSteer3Dataset",
     "NemoGymDataset",

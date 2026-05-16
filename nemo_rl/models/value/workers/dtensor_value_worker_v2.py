@@ -15,10 +15,8 @@
 import contextlib
 import gc
 import warnings
-from contextlib import AbstractContextManager, contextmanager, nullcontext
-from re import S
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Generator, Optional
-from unittest import skip
 
 import ray
 import torch
@@ -34,7 +32,7 @@ from transformers import (
     AutoTokenizer,
 )
 
-from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
@@ -47,7 +45,6 @@ from nemo_rl.models.automodel.setup import (
     validate_and_prepare_config,
 )
 from nemo_rl.models.automodel.train import (
-    LogprobsPostProcessor,
     LossPostProcessor,
     ScorePostProcessor,
     aggregate_training_statistics,
@@ -149,7 +146,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
                 "reward_model_type": "regression",  # Value is a regression task
             }
 
-        print(f"Initializing DTensorValueWorkerV2")
+        print("Initializing DTensorValueWorkerV2")
 
         # Initialize checkpoint manager
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
@@ -206,7 +203,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             init_optimizer=init_optimizer,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
-            #optimizer_module_filter=["score."],
+            # optimizer_module_filter=["score."],
         )
 
         # Set instance attributes from model and optimizer state

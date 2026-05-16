@@ -298,8 +298,8 @@ class GeneralizedAdvantageEstimator:
         # Length-adaptive λ_policy = 1 - 1/(α·l).  0 = disabled (use fixed λ).
         self.length_adaptive_alpha = estimator_config.get("length_adaptive_alpha", 0.0)
 
-        self.kl_coef = loss_config.get("reference_policy_kl_penalty", 0.1)
-        self.kl_type = loss_config.get("reference_policy_kl_type", "k1")
+        self.kl_coef = getattr(loss_config, "reference_policy_kl_penalty", 0.1)
+        self.kl_type = getattr(loss_config, "reference_policy_kl_type", "k1")
 
     def _reward_whiten(
         self,
