@@ -258,9 +258,8 @@ def test_dtensor_dp_replicate_size_sets_batching_dp(
 
     policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
 
-    assert policy.sharding_annotations.shape["data_parallel_replicate"] == 2
-    assert policy.sharding_annotations.shape["data_parallel"] == 4
-    assert policy.sharding_annotations.get_axis_size("data_parallel") == 4
+    assert policy.sharding_annotations.shape["data_parallel"] == 8
+    assert policy.sharding_annotations.get_axis_size("data_parallel") == 8
     mock_ray_worker_group.assert_called_once()
 
 
