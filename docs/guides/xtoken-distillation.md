@@ -143,7 +143,7 @@ step sorts each row by weight and trims to the chosen runtime cap.
 
 ```bash
 uv run python -m nemo_rl.utils.x_token.sort_and_cut_projection_matrix \
-    cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special_exact_map_remapped.pt \
+    --initial-projection-path cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special_exact_map_remapped.pt \
     --top_k 4 \
     --output_path cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
 ```

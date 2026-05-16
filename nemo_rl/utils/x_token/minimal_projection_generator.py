@@ -520,6 +520,9 @@ if __name__ == "__main__":
         output_filename = output_filename.replace(".pt", f"_thresh_{args.weight_threshold:.3f}.pt")
     output_path = os.path.join(args.data_dir, output_filename)
 
+    # Metadata keys use the student/teacher framing; legacy `model_A_id`/
+    # `model_B_id` from older PT-reference artifacts are accepted on the
+    # load side in minimal_projection_via_multitoken.py.
     torch.save(
         {
             "indices": top_k_indices_student_to_teacher.cpu(),

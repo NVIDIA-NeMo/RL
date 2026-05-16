@@ -182,6 +182,16 @@ if __name__ == "__main__":
     # load initial projection map
     initial_projection_path = args.initial_projection_path
     initial_projection_map = torch.load(initial_projection_path)
+    if not (
+        isinstance(initial_projection_map, dict)
+        and "indices" in initial_projection_map
+        and "likelihoods" in initial_projection_map
+    ):
+        raise ValueError(
+            f"Projection map at {initial_projection_path} is not a dict with "
+            f"'indices' and 'likelihoods' tensors; got "
+            f"{type(initial_projection_map).__name__}."
+        )
 
     # go through token in projection map. For each token present in match_indices_student, set it's likelihoods and incices to 1.0 and the exact match teacher token
     non_exact_map_tokens = list(range(len(initial_projection_map["likelihoods"])))
