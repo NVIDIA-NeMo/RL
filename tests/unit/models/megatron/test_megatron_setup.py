@@ -619,6 +619,29 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_token_dispatcher_type == "alltoall"
         assert model_cfg.moe_shared_expert_overlap is True
 
+    @pytest.mark.parametrize("moe_grouped_gemm", [True, False])
+    def test_moe_grouped_gemm_explicit(self, moe_grouped_gemm):
+        """Test that moe_grouped_gemm is applied when present in config."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        config = {"megatron_cfg": {"moe_grouped_gemm": moe_grouped_gemm}}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_grouped_gemm is moe_grouped_gemm
+
+    def test_moe_grouped_gemm_absent_keeps_default(self):
+        """Test that moe_grouped_gemm attribute is not touched when key absent."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock(spec=[])
+        config = {"megatron_cfg": {}}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert not hasattr(model_cfg, "moe_grouped_gemm")
+
 
 @pytest.mark.mcore
 class TestApplyPrecisionConfig:
