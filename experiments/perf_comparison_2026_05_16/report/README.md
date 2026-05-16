@@ -420,3 +420,72 @@ Total step time: 354.29s
 
 **JIT compile cost**: implicit, included in step 1's policy_training. With ray_only train=108.64s and HybridEP train=111.83s, the JIT compile + first MoE forward overhead is ~3s — negligible. The compiled hybrid_ep kernels are cached locally for the rest of the run.
 
+
+---
+
+### MXFP8 Architectural Blocker: Deeper Analysis (newer container inspection)
+
+**Investigated newer NeMo-RL containers** under `/lustre/fsw/portfolios/coreai/users/yukih/enroot-images/nvcr.io/nvidian/`:
+
+| Container | Date | Python | torch | vllm | CUDA |
+|-----------|------|--------|-------|------|------|
+| 7684dc2-45115915 (current) | Mar 2 | 3.12 | 2.9.0 | 0.13.0 (URL pin) | 12.9 |
+| 5f9d5cf-46314497 | Mar 18 | — | — | — | — |
+| c8d167a-48250558 | Apr 10 | — | — | — | — |
+| f947d78-50755450 | May 9 | — | — | — | — |
+| **4641794-51006907** | **May 13** | **3.13** | **2.10.0** | **0.17.1+cu130** | **13.0** |
+
+**Bumped to May 13 container hypothetically resolves**:
+- vllm version: 0.13 → 0.17.1 (has `ModelOptMxFp8Config` + `ModelOptMxFp8LinearMethod`)
+- torch: 2.9 → 2.10
+- CUDA: 12.9 → 13.0
+
+**Bumped container still does NOT resolve** (verified by extracting `modelopt.py` from May 13 squashfs):
+
+1. **`ModelOptMxFp8FusedMoE` class still missing**. Only present classes: `ModelOptMxFp8Config`, `ModelOptMxFp8LinearMethod`. `fp8.py:147` `patch.start()` still raises `AttributeError`. PR #1887 was authored against vllm 0.18+ which adds this class.
+
+2. **Hardware capability check rejects sm_90**. vllm 0.17 `modelopt.py:1487`:
+   ```python
+   @classmethod
+   def get_min_capability(cls) -> int:
+       # MXFP8 hardware acceleration requires Blackwell (SM100) or newer
+       return 100
+   ```
+   CW H100 nodes are sm_90. vllm refuses to load MXFP8 quantization on hardware below SM100.
+
+3. **FusedMoE rejection at config level**. `modelopt.py:1493`:
+   ```python
+   def get_quant_method(self, layer, prefix):
+       # MXFP8 does not yet support MoE models
+       if isinstance(layer, FusedMoE):
+           raise NotImplementedError(
+               "MXFP8 quantization does not yet support MoE models. "
+               "Please use FP8 or NVFP4 quantization for MoE models."
+           )
+   ```
+   Qwen3-235B-A22B is MoE. vllm raises `NotImplementedError` at model load before any of PR #1887's patches fire.
+
+**PR #1887 scope** (verified via `git show d15d7c05d --stat`):
+- Touches only: `nemo_rl/models/generation/vllm/quantization/fp8.py` (+278/-16) + `vllm_backend.py` (+15/-4)
+- Patches: `process_weights_after_loading` (linear + MoE) only
+- Does NOT patch: `get_min_capability`, `get_quant_method`, define a custom `ModelOptMxFp8FusedMoE`
+
+**Verdict**: MXFP8 + MoE on H100 (sm_90) is **infeasible** with the current PR #1887 codebase, regardless of container version. The blocker is not pyproject.toml/lockfile resolution — it's:
+- (a) Hardware: vllm's MXFP8 GEMM kernels target Blackwell tensor cores; sm_90 lacks the hardware path
+- (b) PR scope: #1887 assumes vllm 0.18+ which adds `ModelOptMxFp8FusedMoE` AND lowers the capability check (verification pending)
+- (c) MoE constraint: vllm 0.17 explicitly rejects MoE for MXFP8 at `get_quant_method`
+
+**To unblock for an H100 run**, the work required:
+1. Upgrade to vllm 0.18+ container (none currently cached on CW for this team)
+2. Add monkey-patches in `fp8.py` to override `ModelOptMxFp8Config.get_min_capability` → return 90
+3. Add monkey-patches to override `ModelOptMxFp8Config.get_quant_method` to allow FusedMoE
+4. Define/import a working `ModelOptMxFp8FusedMoE` class with correct weight layout
+5. Validate emulated MXFP8 GEMM correctness on H100 (no hardware tensor-core path)
+6. Validate Qwen3-235B-A22B reward/loss equivalence vs bf16 baseline
+
+Estimated: **8-16 GPU-hours of integration + correctness validation** beyond the previously-cited container/torch chain work. Outside the scope of a single perf-comparison run.
+
+**HybridEP + MXFP8 combined**: transitively blocked. No attempt possible without (1)-(6) above.
+
+**Recommendation**: deliver HybridEP perf data (in progress, 2/20+ steps done at time of writing) + ray_only baseline data (17/20 steps done). Treat MXFP8 as a separate workstream requiring infrastructure work that does not fit a same-day perf-comparison sprint.
+
