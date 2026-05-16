@@ -619,24 +619,54 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_token_dispatcher_type == "alltoall"
         assert model_cfg.moe_shared_expert_overlap is True
 
+    @staticmethod
+    def _base_moe_megatron_cfg() -> dict:
+        return {
+            "expert_tensor_parallel_size": 2,
+            "expert_model_parallel_size": 4,
+            "moe_router_dtype": "float32",
+            "moe_router_load_balancing_type": "none",
+            "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": True,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_shared_expert_overlap": True,
+        }
+
     @pytest.mark.parametrize("moe_grouped_gemm", [True, False])
     def test_moe_grouped_gemm_explicit(self, moe_grouped_gemm):
-        """Test that moe_grouped_gemm is applied when present in config."""
+        """moe_grouped_gemm is applied when present in config."""
         from nemo_rl.models.megatron.setup import _apply_moe_config
 
         model_cfg = MagicMock()
-        config = {"megatron_cfg": {"moe_grouped_gemm": moe_grouped_gemm}}
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["moe_grouped_gemm"] = moe_grouped_gemm
+        config = {"megatron_cfg": megatron_cfg}
 
         _apply_moe_config(model_cfg, config)
 
         assert model_cfg.moe_grouped_gemm is moe_grouped_gemm
 
     def test_moe_grouped_gemm_absent_keeps_default(self):
-        """Test that moe_grouped_gemm attribute is not touched when key absent."""
+        """Absent key leaves the attr unset on the model cfg."""
         from nemo_rl.models.megatron.setup import _apply_moe_config
 
-        model_cfg = MagicMock(spec=[])
-        config = {"megatron_cfg": {}}
+        # spec lists everything _apply_moe_config writes so we can detect
+        # whether the moe_grouped_gemm branch fires.
+        model_cfg = MagicMock(
+            spec=[
+                "expert_tensor_parallel_size",
+                "expert_model_parallel_size",
+                "moe_router_dtype",
+                "moe_router_load_balancing_type",
+                "moe_router_bias_update_rate",
+                "moe_permute_fusion",
+                "moe_enable_deepep",
+                "moe_token_dispatcher_type",
+                "moe_shared_expert_overlap",
+            ]
+        )
+        config = {"megatron_cfg": self._base_moe_megatron_cfg()}
 
         _apply_moe_config(model_cfg, config)
 
