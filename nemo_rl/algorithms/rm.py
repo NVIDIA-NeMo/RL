@@ -116,6 +116,21 @@ def setup(
 
     # Extract individual configs for easier access
     policy_config = master_config.policy
+
+    # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2482): remove once CP is supported for RM training.
+    dtensor_cfg = policy_config.get("dtensor_cfg", {})
+    if (
+        dtensor_cfg.get("enabled", False)
+        and dtensor_cfg.get("context_parallel_size", 1) > 1
+    ):
+        raise ValueError(
+            "Context parallelism (context_parallel_size > 1) is not supported for reward model "
+            "training on the DTensor backend. The log_sigmoid operator used in the RM loss does "
+            "not have a DTensor sharding strategy registered for CP meshes. "
+            "Please set policy.dtensor_cfg.context_parallel_size=1. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2482 for tracking."
+        )
+
     data_config = master_config.data
     rm_config = master_config.rm
     logger_config = master_config.logger
