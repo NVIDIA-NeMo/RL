@@ -95,7 +95,7 @@ git pull --ff-only
 
 export OMP_NUM_THREADS=16
 export CONTAINER
-export MOUNTS="/lustre:/lustre,${REPO_DIR}:${REPO_DIR},${REPO_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+export MOUNTS="/lustre:/lustre,${REPO_DIR}:${REPO_DIR},${REPO_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym,${REPO_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
 
 # Sandbox: baseline 11777073 skipped this. SWE-bench apptainer is installed via SETUP_COMMAND
 # instead of via a separate ray.sub sandbox srun.
