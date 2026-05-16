@@ -297,10 +297,16 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
 def is_fp8_model(vllm_config):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+
+    try:
+        from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+
+        fp8_types = (Fp8Config, ModelOptMxFp8Config)
+    except ImportError:
+        fp8_types = (Fp8Config,)
 
     if hasattr(vllm_config, "quant_config") and isinstance(
-        vllm_config.quant_config, (Fp8Config, ModelOptMxFp8Config)
+        vllm_config.quant_config, fp8_types
     ):
         if isinstance(vllm_config.quant_config, Fp8Config):
             assert vllm_config.quant_config.weight_block_size is not None, (
