@@ -181,7 +181,7 @@ sequenceDiagram
     GRPO->>Policy: Compute loss and train
 ```
 
-> **NeMo Gym server types** (see [Core Components](https://docs.nvidia.com/nemo/gym/about/core-components)):
+> **NeMo Gym server types** (see [Core Components](https://docs.nvidia.com/nemo/gym/v0.2.1/about/concepts/core-components/)):
 > - **Agent Server**: Orchestrates the rollout loop
 > - **Model Server**: HTTP proxy to vLLM; translates Responses API ↔ Chat Completions
 > - **Resource Server**: Provides tools and rewards
