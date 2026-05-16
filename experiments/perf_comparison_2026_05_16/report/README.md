@@ -384,3 +384,39 @@ fp8_state.vllm_patches.append(
 2. ray_only (job 11793255) — 15/20 step threshold MET, continuing to step 20 for tighter mean.
 3. MXFP8 (PR #1887) — BLOCKED on vllm 0.13 → 0.18 + torch 2.9 → 2.10 chain. Not submitting.
 4. HybridEP + MXFP8 combined — transitively blocked on (3).
+
+---
+
+### HybridEP Attempt 7 (job 11795544): STEP 1 SUCCESS
+
+**Step 1 fired and completed without JIT failure.** deep_ep `hybrid_ep_dispatch` runtime compile via `/bin/nvcc -> /usr/local/cuda-12.9/bin/nvcc` worked. No reaper kill (job survived past 22min threshold because step 0 ready=True fired at iter 460, ~20min in, before reaper window).
+
+**Step 1 timing breakdown** (driver log line 14960):
+
+```
+Total step time: 354.29s
+  policy_and_reference_logprobs: 112.06s (31.6%)
+  policy_training:               111.83s (31.6%)
+  exposed_generation:            105.12s (29.7%)
+  weight_sync:                    23.96s (6.8%)
+  logprob_inference_prep:          1.06s (0.3%)
+```
+
+**Comparison vs other variants at step 1**:
+
+| Variant | Step 1 Total | LogProb | Train | ExposedGen | WSync |
+|---------|--------------|---------|-------|------------|-------|
+| ray_only (baseline ray opts) | 360.07s | 223.51s | 108.64s | 1.04s | — |
+| HybridEP attempt 7 | **354.29s** | 112.06s | 111.83s | 105.12s | 23.96s |
+| baseline 11772327 (older) | ~470s | ~115s | ~70s | ~280s | — |
+
+**Observations**:
+- HybridEP step 1 wall is 5.78s faster than ray_only step 1
+- LogProb time: HybridEP 112.06s vs ray_only 223.51s — half. Likely because ray_only step 1 paid vllm graph compile during logprob phase, but HybridEP's buffer-ready milestone fired *after* the vllm compile completed (iter 460 vs ray_only's earlier ready), so HybridEP step 1 logprob is already at steady-state
+- Train time: 111.83s vs 108.64s — within 3% of ray_only despite HybridEP doing the additional deep_ep JIT compile + first MoE forward through `_HybridEPManager`
+- ExposedGen: HybridEP 105.12s (already in async overlap) vs ray_only 1.04s (step 1 didn't overlap yet) — different async coordination points, not directly comparable for step 1
+
+**Step 2 already started** (driver log line 15749: `========================= Step 2/1000000 =========================`) — JIT cache now warm, steady-state begins.
+
+**JIT compile cost**: implicit, included in step 1's policy_training. With ray_only train=108.64s and HybridEP train=111.83s, the JIT compile + first MoE forward overhead is ~3s — negligible. The compiled hybrid_ep kernels are cached locally for the rest of the run.
+
