@@ -427,9 +427,9 @@ class SGLangGenerationWorker:
             stop_string: Optional stop string for this sample
 
         Returns:
-            Tuple of (generated_tokens, logprobs):
-                - generated_tokens: List of generated token IDs
-                - logprobs: List of log probabilities for generated tokens
+            Tuple of (``generated_tokens``, ``logprobs``):
+                - ``generated_tokens``: List of generated token IDs
+                - ``logprobs``: List of log probabilities for generated tokens
         """
         # Prepare payload for SGLang API
         # Note: stop should be in sampling_params, not in payload top level
@@ -561,10 +561,10 @@ class SGLangGenerationWorker:
 
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
-                - output_ids: input + generated token IDs with proper padding
-                - logprobs: Log probabilities for tokens
-                - generation_lengths: Lengths of each response
-                - unpadded_sequence_lengths: Lengths of each input + generated sequence
+                - ``output_ids``: input + generated token IDs with proper padding
+                - ``logprobs``: Log probabilities for tokens
+                - ``generation_lengths``: Lengths of each response
+                - ``unpadded_sequence_lengths``: Lengths of each input + generated sequence
         """
         # Handle empty input case
         if len(data["input_ids"]) == 0:

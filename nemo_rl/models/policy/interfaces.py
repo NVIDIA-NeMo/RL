@@ -64,7 +64,7 @@ class PolicyInterface(ABC):
 
         Returns:
             BatchedDataDict containing:
-                - logprobs: Tensor of logprobs of actions
+                - ``logprobs``: Tensor of logprobs of actions
         """
         pass
 
@@ -82,7 +82,7 @@ class PolicyInterface(ABC):
 
         Returns:
             BatchedDataDict containing:
-                - logprobs: Tensor of logprobs of actions
+                - ``logprobs``: Tensor of logprobs of actions
         """
         pass
 
