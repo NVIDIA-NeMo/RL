@@ -794,6 +794,99 @@ class TestApplyPerformanceConfig:
         with pytest.warns(UserWarning, match="fp8_param=True sometimes causes NaN"):
             _apply_performance_config(model_cfg, config)
 
+    def test_fine_grained_activation_offloading_enabled(self):
+        """Test happy path: enabled with non-empty offload_modules list."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock()
+        model_cfg.gated_linear_unit = True
+        offload_modules = ["mlp", "moe_act"]
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": False,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+                "fine_grained_activation_offloading": True,
+                "offload_modules": offload_modules,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.fine_grained_activation_offloading is True
+        assert model_cfg.offload_modules == offload_modules
+
+    def test_fine_grained_activation_offloading_disabled_skips(self):
+        """When flag is False (default), no offload attrs should be set."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock(spec=["gated_linear_unit"])
+        model_cfg.gated_linear_unit = True
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": False,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert not hasattr(model_cfg, "fine_grained_activation_offloading")
+        assert not hasattr(model_cfg, "offload_modules")
+
+    @pytest.mark.parametrize(
+        "offload_modules",
+        [[], None, "mlp", 42],
+        ids=["empty_list", "none", "string", "int"],
+    )
+    def test_fine_grained_activation_offloading_invalid_modules_raises(
+        self, offload_modules
+    ):
+        """offload_modules must be a non-empty list when feature is enabled."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock()
+        model_cfg.gated_linear_unit = True
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": False,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+                "fine_grained_activation_offloading": True,
+                "offload_modules": offload_modules,
+            }
+        }
+
+        with pytest.raises(
+            ValueError, match="offload_modules must be a non-empty list"
+        ):
+            _apply_performance_config(model_cfg, config)
+
+    def test_fine_grained_activation_offloading_missing_modules_raises(self):
+        """When enabled but offload_modules key is absent, defaults to [] → raises."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock()
+        model_cfg.gated_linear_unit = True
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": False,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+                "fine_grained_activation_offloading": True,
+            }
+        }
+
+        with pytest.raises(
+            ValueError, match="offload_modules must be a non-empty list"
+        ):
+            _apply_performance_config(model_cfg, config)
+
 
 @pytest.mark.mcore
 class TestValidateOptimizerConfig:
