@@ -165,6 +165,23 @@ if [ -f "$GYM_PYP" ]; then
   grep -n "ray\\[default\\]" "$GYM_PYP" | head -3 || true
 fi
 
+# Wipe Gym subprocess .venv dirs whose interpreter cannot import ray. May-13 container
+# is py3.13 but venvs from earlier super-v3 runs were built as py3.12, leaving
+# lib/python3.13/site-packages empty. NEMO_GYM_SKIP_VENV_IF_PRESENT=1 keeps them
+# unchanged, so app.py crashes with ModuleNotFoundError: No module named 'ray'.
+# Wiping forces a clean rebuild on the next NemoGym _spinup() under current container python.
+for VENV in /opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/.venv \
+            /opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/.venv; do
+  if [ -f "$VENV/bin/python" ]; then
+    if ! "$VENV/bin/python" -c "import ray" 2>/dev/null; then
+      echo "[SETUP] Wiping stale Gym subprocess venv (ray not importable): $VENV"
+      rm -rf "$VENV"
+    else
+      echo "[SETUP] Gym subprocess venv OK (ray importable): $VENV"
+    fi
+  fi
+done
+
 __UV_SYNC_BLOCK__
 SETUP_EOF
 
