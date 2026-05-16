@@ -367,13 +367,7 @@ def test_optimizer_factory_dispatches_muon_builder_path():
 
 
 def test_optimizer_factory_drops_none_valued_kwargs():
-    """Recipes that inherit from a parent (e.g. ``sft.yaml`` whose default
-    optimizer is AdamW) and then switch to an optimizer with a different
-    signature have to neutralize the inherited fields by setting them to
-    ``None``. ``build_optimizer_from_cfg`` must drop them before ``**kwargs``
-    unpacking; otherwise the inherited keys hit a callable that does not
-    accept them and we get ``TypeError: unexpected keyword argument``.
-    """
+    """Inherited None-valued kwargs are filtered before ``**kwargs`` unpacking."""
     from nemo_rl.utils.optimizer_factory import build_optimizer_from_cfg
 
     class Tiny(nn.Module):
@@ -386,8 +380,6 @@ def test_optimizer_factory_drops_none_valued_kwargs():
         "kwargs": {
             "lr": 1e-3,
             "weight_decay": 0.01,
-            # Fields inherited from a base AdamW config that the Muon builder
-            # does not accept. The factory must filter these out.
             "betas": None,
             "eps": None,
             "foreach": None,
@@ -396,6 +388,7 @@ def test_optimizer_factory_drops_none_valued_kwargs():
     }
     opt = build_optimizer_from_cfg(Tiny(), cfg)
     assert isinstance(opt, ChainedTorchOptimizer)
+    assert isinstance(opt.optimizers[0], DTensorMuon)
 
 
 # ---------------------------------------------------------------------------
