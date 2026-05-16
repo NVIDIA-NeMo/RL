@@ -507,9 +507,139 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 return super().model_post_init(context)
 
         class NeMoRLOpenAIServingMixin:
-            async def _preprocess_chat(
+            async def _preprocess_chat(self, *args, **kwargs):
+                # vllm 0.17.1 renamed signature: chat_template -> default_template,
+                # chat_template_kwargs -> default_template_kwargs, removed tokenizer arg.
+                # Detect which API the caller is using and dispatch.
+                if (
+                    "default_template" in kwargs
+                    or "default_template_content_format" in kwargs
+                    or "default_template_kwargs" in kwargs
+                ):
+                    return await self._preprocess_chat_v017(*args, **kwargs)
+                return await self._preprocess_chat_v013(*args, **kwargs)
+
+            async def _preprocess_chat_v017(
                 self,
-                request: NeMoRLOpenAIChatRequestMixin,
+                request,
+                messages,
+                default_template,
+                default_template_content_format,
+                default_template_kwargs,
+                tool_dicts=None,
+                tool_parser=None,
+            ):
+                # vllm 0.17.1 path. Mirrors main NeMo-RL implementation.
+                if _chat_template_kwargs_override:
+                    default_template_kwargs = {
+                        **(default_template_kwargs or {}),
+                        **_chat_template_kwargs_override,
+                    }
+
+                for message in messages:
+                    if message.get("tool_calls"):
+                        message["tool_calls"] = list(message["tool_calls"])
+
+                    if "content" in message:
+                        content = message["content"]
+                        if isinstance(content, (list, str)):
+                            continue
+                        try:
+                            message["content"] = list(content)
+                        except Exception:
+                            message["content"] = []
+
+                exclude_fields = {
+                    "prompt_token_ids",
+                    "generation_token_ids",
+                    "generation_log_probs",
+                }
+                messages_for_replace_prefix_tokens = []
+                for msg in messages:
+                    if isinstance(msg, dict):
+                        new_msg = {}
+                        for k, v in msg.items():
+                            if k not in exclude_fields:
+                                new_msg[k] = deepcopy(v)
+                        messages_for_replace_prefix_tokens.append(new_msg)
+                    else:
+                        messages_for_replace_prefix_tokens.append(deepcopy(msg))
+
+                try:
+                    res = await super()._preprocess_chat(
+                        request=request,
+                        messages=messages,
+                        default_template=default_template,
+                        default_template_content_format=default_template_content_format,
+                        default_template_kwargs=default_template_kwargs,
+                        tool_dicts=tool_dicts,
+                        tool_parser=tool_parser,
+                    )
+                except ValueError as e:
+                    if "maximum context length" in str(e):
+                        import logging
+
+                        logging.getLogger(__name__).warning(
+                            "Prompt exceeds max_model_len: %s", e
+                        )
+                    raise
+
+                if request.required_prefix_token_ids is None:
+                    return res
+
+                last_assistant_message_idx = None
+                for i in reversed(range(len(messages_for_replace_prefix_tokens))):
+                    if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
+                        last_assistant_message_idx = i
+                        break
+
+                if last_assistant_message_idx is None:
+                    messages_to_last_assistant_message = (
+                        messages_for_replace_prefix_tokens
+                    )
+                else:
+                    messages_to_last_assistant_message = (
+                        messages_for_replace_prefix_tokens[
+                            : last_assistant_message_idx + 1
+                        ]
+                    )
+
+                modified_request = request.model_copy(
+                    update={"add_generation_prompt": False}
+                )
+
+                corresponding_res = await super()._preprocess_chat(
+                    request=modified_request,
+                    messages=messages_to_last_assistant_message,
+                    default_template=default_template,
+                    default_template_content_format=default_template_content_format,
+                    default_template_kwargs=default_template_kwargs,
+                    tool_dicts=tool_dicts,
+                    tool_parser=tool_parser,
+                )
+                actual_corresponding_token_ids = corresponding_res[1][0][
+                    "prompt_token_ids"
+                ]
+
+                engine_prompt = res[1][0]
+
+                # tokenizer is no longer passed; pull from renderer.
+                tokenizer = self.renderer.tokenizer
+
+                final_prompt_token_ids = _replace_prefix_tokens(
+                    tokenizer=tokenizer,
+                    model_prefix_token_ids=request.required_prefix_token_ids,
+                    template_prefix_token_ids=actual_corresponding_token_ids,
+                    template_token_ids=engine_prompt["prompt_token_ids"],
+                )
+
+                engine_prompt["prompt_token_ids"] = final_prompt_token_ids
+
+                return res
+
+            async def _preprocess_chat_v013(
+                self,
+                request,
                 tokenizer,
                 messages,
                 chat_template,
