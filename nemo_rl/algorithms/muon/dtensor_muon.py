@@ -46,7 +46,8 @@ except ImportError:  # pragma: no cover - exercised only when extras missing
 
 _MISSING_DEP_MSG = (
     "DTensorMuon requires the 'emerging_optimizers' package. Install the NeMo-RL "
-    "'mcore' or 'muon' extras (e.g. `uv sync --extra muon`)."
+    "'automodel' extras for the DTensor backend (`uv sync --extra automodel`) "
+    "or the 'mcore' extras for the Megatron backend."
 )
 
 WeightDecayMethodT = Literal["decoupled", "independent", "l2"]

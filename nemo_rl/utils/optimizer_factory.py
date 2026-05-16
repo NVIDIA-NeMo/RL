@@ -63,7 +63,13 @@ def build_optimizer_from_cfg(
         ``_builds_optimizer_from_model`` attribute.
     """
     cls_or_builder = _resolve_dotted(optimizer_cfg["name"])
-    kwargs = optimizer_cfg["kwargs"]
+    raw_kwargs = optimizer_cfg["kwargs"]
+    # Drop keys explicitly set to None in the recipe. Recipes inherit from a
+    # base optimizer config (e.g. sft.yaml's AdamW with betas/eps/foreach/fused)
+    # and then null those out when switching to a different optimizer whose
+    # signature does not accept them; OmegaConf still surfaces the keys, so
+    # we filter here before unpacking via **kwargs.
+    kwargs = {k: v for k, v in raw_kwargs.items() if v is not None}
     if getattr(cls_or_builder, "_builds_optimizer_from_model", False):
         return cls_or_builder(model, **kwargs)
     return cls_or_builder(model.parameters(), **kwargs)

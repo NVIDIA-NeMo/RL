@@ -16,7 +16,7 @@ policy:
       lr: 2.0e-5
       weight_decay: 0.1
       muon_momentum: 0.9
-      muon_use_nesterov: false
+      muon_nesterov: false
       muon_scale_mode: spectral
       muon_extra_scale_factor: 0.2
       muon_tp_mode: duplicated

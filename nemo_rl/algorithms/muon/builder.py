@@ -131,7 +131,7 @@ def build_dtensor_muon(
     lr: float,
     weight_decay: float = 0.01,
     muon_momentum: float = 0.95,
-    muon_use_nesterov: bool = False,
+    muon_nesterov: bool = False,
     muon_weight_decay_method: str = "decoupled",
     muon_fp32_matmul_prec: str = "medium",
     muon_coefficient_type: str = "quintic",
@@ -184,7 +184,7 @@ def build_dtensor_muon(
                 lr=lr,
                 momentum=muon_momentum,
                 weight_decay=weight_decay,
-                nesterov=muon_use_nesterov,
+                nesterov=muon_nesterov,
                 weight_decay_method=muon_weight_decay_method,  # type: ignore[arg-type]
                 fp32_matmul_prec=muon_fp32_matmul_prec,  # type: ignore[arg-type]
                 coefficient_type=muon_coefficient_type,  # type: ignore[arg-type]

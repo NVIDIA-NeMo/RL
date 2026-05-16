@@ -18,7 +18,7 @@ Muon is supported with both backends. Pick the section that matches your setup.
 
 ### DTensor backend (FSDP2 / TP)
 
-1. The `muon` extras installed: `uv sync --extra muon`. This thin extras group only adds `emerging-optimizers`; the Megatron submodules are not required.
+1. The `automodel` extras installed: `uv sync --extra automodel`. `emerging-optimizers` (which provides the Newton-Schulz primitives) is bundled into the `automodel` extras precisely so DTensor users do not need to pull in the full Megatron stack to use Muon.
 2. DTensor backend enabled in your configuration (`policy.dtensor_cfg.enabled=true`, the default for non-Megatron recipes).
 3. Select the DTensor Muon builder in the optimizer config:
 
@@ -30,7 +30,7 @@ Muon is supported with both backends. Pick the section that matches your setup.
          lr: 2.0e-5
          weight_decay: 0.1
          muon_momentum: 0.9
-         muon_use_nesterov: false
+         muon_nesterov: false      # matches Megatron's muon_nesterov knob name
          muon_scale_mode: spectral
          muon_extra_scale_factor: 0.2
          muon_tp_mode: duplicated   # or distributed / blockwise

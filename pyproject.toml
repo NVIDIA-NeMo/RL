@@ -87,6 +87,11 @@ automodel = [
   "nv-grouped-gemm",
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  # Newton-Schulz orthogonalization primitives for DTensor recipes that select
+  # nemo_rl.algorithms.muon.build_dtensor_muon. Lives here (and in mcore) so the
+  # DTensor backend can opt in without depending on the full mcore stack, which
+  # is mutually exclusive with automodel.
+  "emerging-optimizers==0.2.0",
 ]
 vllm = [
   "cuda-python",
@@ -137,12 +142,6 @@ nvrx = [
   "nvidia-resiliency-ext",
 ] # for ft_launcher (fault-tolerant training launcher)
 nemo_gym = ["nemo_gym"]
-muon = [
-  # Newton-Schulz orthogonalization primitives shared with the Megatron-side
-  # dist_muon adapter. DTensor recipes that select
-  # `nemo_rl.algorithms.muon.build_dtensor_muon` need this.
-  "emerging-optimizers==0.2.0",
-]
 
 [dependency-groups]
 
