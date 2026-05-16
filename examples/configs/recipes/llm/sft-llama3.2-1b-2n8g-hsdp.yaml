@@ -1,0 +1,34 @@
+defaults: ../../sft.yaml
+sft:
+  max_num_steps: 500
+checkpointing:
+  checkpoint_dir: results/sft-llama3.2-1b-2n8g-hsdp
+  save_period: 100
+policy:
+  tokenizer:
+    name: meta-llama/Llama-3.2-1B
+  make_sequence_length_divisible_by: 1
+  dtensor_cfg:
+    _v2: true
+    dp_replicate_size: 2
+data:
+  add_generation_prompt: true
+  train:
+    dataset_name: OpenMathInstruct-2
+    output_key: generated_solution
+    split: train_1M
+    split_validation_size: 0.05
+    seed: ${sft.seed}
+  validation: null
+  default:
+    prompt_file: examples/prompts/math.txt
+logger:
+  log_dir: logs/sft-llama3.2-1b-2n8g-hsdp
+  wandb:
+    project: nemo-rl
+    name: sft-llama3.2-1b-2n8g-hsdp
+  tensorboard:
+    log_dir: tb_logs-sft-llama3.2-1b-2n8g-hsdp
+cluster:
+  num_nodes: 2
+  gpus_per_node: 8
