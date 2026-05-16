@@ -191,91 +191,188 @@ Worker write-backs append new columns under the same keys.
 
 ### Call shapes
 
-**Rollout produces (one Ray RPC, bundles 6 steps — see `rollout_to_tq` docstring):**
+A real step at production scale —
+`num_prompts_per_step=128, num_generations_per_prompt=4`, DP world = 8,
+prompt ≈ 512 tok, response ≤ 1024 tok. Final batch is `128 × 4 = 512`
+rows.
+
+**1. Step prepare + rollout** (driver — `grpo_train_sync` body):
 
 ```python
-# In grpo_sync.py — train path; full driver_carry returned
-uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
-(meta, driver_carry, rollout_metrics, gen_metrics) = ray.get(
+# Open the per-step TQ partition. Cleared and reused across steps.
+policy.prepare_step(num_samples=512, group_size=4)
+
+# One Ray RPC bundles: clear gen metrics → rollout → flatten + mask →
+# kv_first_write of bulk to TQ → finish_generation → metrics snapshot.
+# The actor handles 6 stages internally; the driver gets back the
+# meta handle + a small per-row tensor slice.
+n_prompts = repeated_batch.size                # 512 (= 128 prompts × 4 gens)
+uids = [str(uuid.uuid4()) for _ in range(n_prompts // 4)]   # 128 uids
+meta, driver_carry, rollout_metrics, gen_metrics = ray.get(
     rollout_actor.rollout_to_tq.remote(
         repeated_batch,
         uids=uids,
-        partition_id=policy.tq_partition_id,
+        partition_id=policy.tq_partition_id,         # "train"
         first_iter=(dynamic_sampling_num_gen_batches == 1),
     )
 )
-# meta.keys             = ["<uid>_g0", "<uid>_g1", …]
-# meta.sequence_lengths = [<actual content lengths>]
-# meta.fields           = ["input_ids", "input_lengths", "generation_logprobs",
-#                          "token_mask", "sample_mask", …multimodal extras…]
-# driver_carry          = BDD with per-row tensors the driver needs
+# meta.keys             ≈ ["a3f9_g0", "a3f9_g1", "a3f9_g2", "a3f9_g3",
+#                          "b7c1_g0", …]                       (512 keys)
+# meta.sequence_lengths ≈ [847, 612, 1503, 989, 711, …]        (actual lens)
+# meta.fields           = ["input_ids", "input_lengths",
+#                          "generation_logprobs", "token_mask",
+#                          "sample_mask", …multimodal extras…]
+# driver_carry          : BatchedDataDict of per-row tensors
 #                         (total_reward, loss_multiplier, truncated,
 #                          length, input_lengths, prompt_ids_for_adv,
-#                          response_token_lengths, GDPO components).
+#                          response_token_lengths, GDPO components)
+```
 
-# In validate_sync — val only needs total_reward; pass carry_keys to
-# avoid wasting Ray transfer on the rest.
-(meta, driver_carry, rollout_metrics, _) = ray.get(
-    rollout_actor.rollout_to_tq.remote(
-        val_batch, uids=uids, partition_id="val",
-        carry_keys=["total_reward"],   # slim — returns 1-key BDD
+**2. Reward + dynamic sampling** (driver, on `driver_carry` only):
+
+```python
+driver_carry = scale_rewards(driver_carry, cfg["grpo"]["reward_scaling"])
+if cfg["grpo"]["reward_shaping"]["enabled"]:
+    driver_carry = apply_reward_shaping(driver_carry, cfg["grpo"]["reward_shaping"])
+driver_carry["baseline"], driver_carry["std"] = (
+    calculate_baseline_and_std_per_prompt(
+        driver_carry["prompt_ids_for_adv"],
+        driver_carry["total_reward"],
+        torch.ones_like(driver_carry["total_reward"]),
+        leave_one_out_baseline=cfg["grpo"]["use_leave_one_out_baseline"],
     )
+)
+# Mirror std/baseline onto meta so dynamic sampling can filter on
+# meta alone (no tensor fetch).
+meta.stamp_tags(
+    {
+        "std": driver_carry["std"].tolist(),
+        "baseline": driver_carry["baseline"].tolist(),
+    }
+)
+
+# DAPO non-zero-std filter — drops rows where the prompt's reward
+# variance is zero, kv_clears their bulk, accumulates survivors
+# across iterations until train_prompts_size (512) is reached.
+if cfg["grpo"]["use_dynamic_sampling"]:
+    pending_meta, pending_carry, *_ = _apply_dynamic_sampling(
+        meta=meta, driver_carry=driver_carry,
+        pending_meta=pending_meta, pending_carry=pending_carry,
+        train_prompts_size=512,
+        num_gen_batches=dynamic_sampling_num_gen_batches,
+        max_gen_batches=cfg["grpo"]["dynamic_sampling_max_gen_batches"],
+        dp_client=policy.dp_client,
+    )
+```
+
+**3. Logprob + advantage + write-back**:
+
+```python
+# Worker fan-out happens inside these. Per-DP-rank shard via
+# shard_meta_for_dp(meta, dp_world=8, …); each worker fetches its
+# ~64 keys via kv_batch_get and writes back the result column under
+# the same keys on the leader.
+prev_lp = policy.get_logprobs_from_meta(meta, timer=timer)["logprobs"]
+ref_lp  = policy.get_reference_policy_logprobs_from_meta(meta, timer=timer)
+ref_lp  = ref_lp["reference_logprobs"]
+
+# Driver-side per-token columns for masking. Tiny delta — just two
+# fields × 512 rows.
+extras = policy.read_from_dataplane(
+    meta,
+    select_fields=["generation_logprobs", "token_mask"],
+    pad_value_dict=_pad_dict,
+)
+advantages = adv_estimator.compute_advantage(
+    prompt_ids=driver_carry["prompt_ids_for_adv"],
+    rewards=rewards, mask=mask,
+    repeated_batch=adv_inputs,
+    logprobs_policy=prev_lp,
+    logprobs_reference=ref_lp,
+)
+
+# Write the per-token advantage + post-masking sample_mask back to TQ
+# under meta.keys so workers fetch the unified view in train.
+policy.write_to_dataplane(
+    meta,
+    fields={"advantages": advantages, "sample_mask": sample_mask},
 )
 ```
 
-**Driver appends a column (small delta, no bulk crosses):**
-
-```python
-adv_inputs = policy.read_from_dataplane(meta,
-                                        select_fields=["token_logprobs", "rewards"])
-advantages = compute_advantages(adv_inputs)
-policy.write_to_dataplane(meta, {"advantages": advantages})
-```
-
-**Worker fan-out + step end:**
+**4. Train + cleanup**:
 
 ```python
 train_results = policy.train_from_meta(meta, loss_fn=loss_fn, timer=timer)
-# (shard_meta_for_dp + Ray fan-out + worker fetch / leader write-back
-# all happen inside the policy method — see E2E diagram above.)
+policy.finish_step(meta)                              # drop step's bulk from TQ
+```
 
-policy.finish_step(meta)   # drop step's bulk from TQ
+**5. Validation path** — slim `driver_carry` to skip ~1 MB/batch:
+
+```python
+# inside validate_sync; val_batch_size ≈ 64
+policy.prepare_val_partition(n_prompts, partition_id="val")
+meta, driver_carry, rollout_metrics, _ = ray.get(
+    rollout_actor.rollout_to_tq.remote(
+        val_batch, uids=uids, partition_id="val",
+        finish_generation=False,                       # keep inference state warm
+        task_to_env_override=val_task_to_env,
+        carry_keys=["total_reward"],                   # only field val consumes
+    )
+)
+total_rewards.extend(driver_carry["total_reward"].tolist())
+mlog_cols = policy.read_from_dataplane(
+    meta, select_fields=["turn_roles", "turn_contents"],
+)
+policy.finish_step(meta)
 ```
 
 ### Sequence-length flow (seqpack / dynbatch)
 
-How `meta.sequence_lengths` routes samples to DP ranks. Worked example:
-2 prompts × 2 generations = 4 samples.
+How `meta.sequence_lengths` routes samples to DP ranks. Worked example
+sized to one production microbatch — 4 prompts × 2 generations = 8
+samples, DP world = 4, lengths typical of math/code rollouts.
 
 ```
-# Rollout actor produces flat sequences (prompt + response per row):
-# input_lengths[i] = prompt_len_i + response_len_i.
-sample 0 (u0_g0):  prompt=3, response=4 → input_lengths=7
-sample 1 (u0_g1):  prompt=3, response=2 → input_lengths=5
-sample 2 (u1_g0):  prompt=2, response=6 → input_lengths=8
-sample 3 (u1_g1):  prompt=2, response=3 → input_lengths=5
+# Rollout actor flattens prompt + response per sample.
+# input_lengths[i] = prompt_len_i + response_len_i (actual content,
+# unpadded).
+sample 0 (a3f9_g0):  prompt=312, response=  892 → input_lengths=1204
+sample 1 (a3f9_g1):  prompt=312, response=  187 → input_lengths= 499
+sample 2 (b7c1_g0):  prompt=421, response= 1024 → input_lengths=1445   ← long
+sample 3 (b7c1_g1):  prompt=421, response=  455 → input_lengths= 876
+sample 4 (c0d8_g0):  prompt=148, response=  213 → input_lengths= 361   ← short
+sample 5 (c0d8_g1):  prompt=148, response=  339 → input_lengths= 487
+sample 6 (d2e1_g0):  prompt=276, response=  651 → input_lengths= 927
+sample 7 (d2e1_g1):  prompt=276, response=  402 → input_lengths= 678
 
 # kv_first_write returns meta row-aligned with keys:
-meta.keys             = ["u0_g0", "u0_g1", "u1_g0", "u1_g1"]
-meta.sequence_lengths = [   7,        5,       8,        5  ]
+meta.keys             = ["a3f9_g0", "a3f9_g1", "b7c1_g0", "b7c1_g1",
+                         "c0d8_g0", "c0d8_g1", "d2e1_g0", "d2e1_g1"]
+meta.sequence_lengths = [    1204,       499,      1445,       876,
+                              361,       487,       927,       678 ]
 
-# shard_meta_for_dp slices both keys and sequence_lengths with the
-# same idx_list — driver-side, no TQ I/O. With 2 DP ranks + seqpack:
-rank 0: idx=[2, 1]  → shard.keys=["u1_g0","u0_g1"]  lens=[8,5]  (=13)
-rank 1: idx=[0, 3]  → shard.keys=["u0_g0","u1_g1"]  lens=[7,5]  (=12)
+# shard_meta_for_dp slices keys + sequence_lengths with the SAME
+# idx_list — driver-side, no TQ I/O. Length-balanced via seqpack:
+rank 0:  idx=[2, 4]      → keys=["b7c1_g0","c0d8_g0"]   lens=[1445, 361]   = 1806
+rank 1:  idx=[0, 5]      → keys=["a3f9_g0","c0d8_g1"]   lens=[1204, 487]   = 1691
+rank 2:  idx=[6, 1]      → keys=["d2e1_g0","a3f9_g1"]   lens=[ 927, 499]   = 1426
+rank 3:  idx=[3, 7]      → keys=["b7c1_g1","d2e1_g1"]   lens=[ 876, 678]   = 1554
+# Σ packed lengths per rank within ~25% — well-balanced.
 
-# Each worker then fetches its slice from TQ:
-data = self._fetch(shard)  # kv_batch_get(keys=shard.keys, …)
+# Each worker fetches its own ~64 keys per step from TQ:
+data = self._fetch(shard)  # kv_batch_get(shard.keys, select_fields=…)
 ```
 
-**Gotcha — `make_sequence_length_divisible_by`**: `input_ids` is padded
-to a TP×CP multiple, but `input_lengths` is the actual content length.
-Seqpack balances on actual lengths; padding is reapplied per shard.
+**Gotcha — `make_sequence_length_divisible_by` (TP×CP alignment)**:
+`input_ids` is padded to a multiple of TP×CP at write time (e.g. 8 for
+TP=4, CP=2), but `input_lengths` is the actual content length. Seqpack
+balances on actual lengths; padding is reapplied per shard.
 
 ```
-input_ids:             [1,2,3,4,5,6,7, 0,0]   # padded to 9 (mult of 4)
-input_lengths:                       7        # actual
-meta.sequence_lengths:               7        # what seqpack uses ✓
+# row with input_lengths=1204, TP×CP=8 → input_ids padded to 1208:
+input_ids:             [t0, t1, …, t1203,  0, 0, 0, 0]   # 1208 elems
+input_lengths:                                   1204     # actual
+meta.sequence_lengths:                           1204     # what seqpack uses ✓
 ```
 
 ---
