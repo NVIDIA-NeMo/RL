@@ -35,7 +35,10 @@ import gc
 import os
 import uuid
 import warnings
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from nemo_rl.models.policy.tq_policy import TQPolicy
 
 import numpy as np
 import ray
@@ -67,9 +70,8 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-from nemo_rl.data_plane.column_io import read_columns, write_columns
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
-from nemo_rl.data_plane.schema import DP_CALIB_EXCLUDED_FIELDS, DP_TRAIN_FIELDS
+from nemo_rl.data_plane.schema import DP_CALIB_EXCLUDED_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
@@ -193,7 +195,7 @@ def _apply_dynamic_sampling(
 def validate_sync(
     *,
     rollout_actor: SyncRolloutActor,
-    dp_client: DataPlaneClient,
+    policy: "TQPolicy",
     val_dataloader: Optional[StatefulDataLoader],
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
@@ -203,11 +205,12 @@ def validate_sync(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """TQ-mediated counterpart to :func:`nemo_rl.algorithms.grpo.validate`.
 
-    Per-batch: ``register_partition`` → ``rollout_to_tq`` →
-    ``read_columns(turn_roles, turn_contents)`` → ``kv_clear``. Caller
-    owns ``policy_generation.prepare_for_generation`` / ``finish_generation``
-    around the call; the actor's per-rollout ``finish_generation`` is
-    suppressed so inference state stays warm across batches.
+    Per-batch: register the val partition → ``rollout_to_tq`` →
+    ``policy.read_from_dataplane`` for message logs → ``policy.finish_step``.
+    Caller owns ``policy_generation.prepare_for_generation`` /
+    ``finish_generation`` around the call; the actor's per-rollout
+    ``finish_generation`` is suppressed so inference state stays warm
+    across batches.
     """
     if val_dataloader is None:
         assert master_config.grpo["val_period"] == 0, (
@@ -221,8 +224,6 @@ def validate_sync(
     total_lengths: list[float] = []
     all_message_logs: list[list[dict[str, str]]] = []
     additional_metrics: dict[str, Any] = {}
-    # Per-batch invariants — hoisted out of the loop.
-    fields = list(DP_TRAIN_FIELDS)
     capture_extras = _should_use_nemo_gym(master_config)
 
     with timer.time("total_validation_time"):
@@ -236,13 +237,7 @@ def validate_sync(
                 break
             n_prompts = int(val_batch.size)
             uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
-            dp_client.register_partition(
-                partition_id=partition_id,
-                fields=fields,
-                num_samples=n_prompts,
-                consumer_tasks=[partition_id],
-                grpo_group_size=None,
-            )
+            policy.prepare_val_partition(n_prompts, partition_id=partition_id)
             meta, driver_carry, rollout_metrics, _ = ray.get(
                 rollout_actor.rollout_to_tq.remote(
                     val_batch,
@@ -254,8 +249,8 @@ def validate_sync(
                     carry_keys=["total_reward"],
                 )
             )
-            mlog_cols = read_columns(
-                dp_client, meta, select_fields=["turn_roles", "turn_contents"]
+            mlog_cols = policy.read_from_dataplane(
+                meta, select_fields=["turn_roles", "turn_contents"]
             )
             roles, contents = mlog_cols["turn_roles"], mlog_cols["turn_contents"]
             total_rewards.extend(driver_carry["total_reward"].tolist())
@@ -266,7 +261,7 @@ def validate_sync(
             )
             if capture_extras:
                 additional_metrics = rollout_metrics
-            dp_client.kv_clear(keys=meta.keys, partition_id=partition_id)
+            policy.finish_step(meta)
 
         accuracy = (
             torch.tensor(total_rewards, dtype=torch.float32).mean().item()
@@ -446,7 +441,7 @@ def grpo_train_sync(
             policy_generation.prepare_for_generation()
         val_metrics, validation_timings = validate_sync(
             rollout_actor=rollout_actor,
-            dp_client=policy.dp_client,
+            policy=policy,
             val_dataloader=val_dataloader,
             val_task_to_env=val_task_to_env,
             step=0,
@@ -639,16 +634,12 @@ def grpo_train_sync(
                     )
                     # Mirror std onto meta so dynamic_sampling can filter
                     # without fetching tensor data.
-                    if meta.tags is None:
-                        meta.tags = [{} for _ in meta.keys]
-                    for i, (s, b) in enumerate(
-                        zip(
-                            driver_carry["std"].tolist(),
-                            driver_carry["baseline"].tolist(),
-                        )
-                    ):
-                        meta.tags[i]["std"] = float(s)
-                        meta.tags[i]["baseline"] = float(b)
+                    meta.stamp_tags(
+                        {
+                            "std": driver_carry["std"].tolist(),
+                            "baseline": driver_carry["baseline"].tolist(),
+                        }
+                    )
 
                 # ── Dynamic sampling (DAPO non-zero-std filter) ────────
                 # Slice-only; bulk in TQ untouched except for kv_clear
@@ -758,8 +749,7 @@ def grpo_train_sync(
                     # for masking / advantage. Bulk (input_ids, multimodal,
                     # output_ids, attention_mask, position_ids) stays in
                     # TQ — workers will fetch it via ``train_presharded``.
-                    extras_bdd = read_columns(
-                        policy.dp_client,
+                    extras_bdd = policy.read_from_dataplane(
                         meta,
                         select_fields=["generation_logprobs", "token_mask"],
                         pad_value_dict=_pad_dict,
@@ -834,8 +824,7 @@ def grpo_train_sync(
                 # ── Driver delta-write: advantages + (post-masking)
                 # sample_mask under the same meta.keys so workers fetch
                 # the union via train_presharded.
-                write_columns(
-                    policy.dp_client,
+                policy.write_to_dataplane(
                     meta,
                     fields={
                         "advantages": advantages,
@@ -872,8 +861,7 @@ def grpo_train_sync(
                             for f in (meta.fields or [])
                             if f not in DP_CALIB_EXCLUDED_FIELDS
                         ]
-                        calibration_data = read_columns(
-                            policy.dp_client,
+                        calibration_data = policy.read_from_dataplane(
                             meta,
                             select_fields=_calib_fields,
                             pad_value_dict=_pad_dict,
@@ -896,8 +884,7 @@ def grpo_train_sync(
                     _log_select = ["input_ids"]
                     if "content" in (meta.fields or []):
                         _log_select.append("content")
-                    _log_extras = read_columns(
-                        policy.dp_client,
+                    _log_extras = policy.read_from_dataplane(
                         meta,
                         select_fields=_log_select,
                         pad_value_dict=_pad_dict,
@@ -906,10 +893,7 @@ def grpo_train_sync(
                     _log_content = _log_extras.get("content")
 
                 # ── Step-end TQ cleanup ────────────────────────────────
-                policy.dp_client.kv_clear(
-                    keys=meta.keys,
-                    partition_id=meta.partition_id,
-                )
+                policy.finish_step(meta)
 
                 is_last_step = total_steps + 1 >= max_num_steps
                 if not master_config["data"]["use_multiple_dataloader"]:
@@ -936,7 +920,7 @@ def grpo_train_sync(
                         policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate_sync(
                         rollout_actor=rollout_actor,
-                        dp_client=policy.dp_client,
+                        policy=policy,
                         val_dataloader=val_dataloader,
                         val_task_to_env=val_task_to_env,
                         step=total_steps + 1,

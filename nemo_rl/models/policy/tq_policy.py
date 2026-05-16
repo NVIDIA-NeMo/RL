@@ -39,6 +39,7 @@ import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
+from nemo_rl.data_plane.column_io import read_columns, write_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, LP_SEED_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -169,6 +170,46 @@ class TQPolicy(Policy):
             consumer_tasks=["prev_lp", "ref_lp", "train"],
             grpo_group_size=group_size,
         )
+
+    def prepare_val_partition(
+        self, num_samples: int, *, partition_id: str = "val"
+    ) -> None:
+        """Register a per-batch val partition (single consumer, no GRPO grouping).
+
+        Sync val trainers call this at the start of each val batch.
+        Distinct from :meth:`prepare_step` because val has its own
+        partition id and a single consumer task.
+        """
+        self.dp_client.register_partition(
+            partition_id=partition_id,
+            fields=list(DP_TRAIN_FIELDS),
+            num_samples=num_samples,
+            consumer_tasks=[partition_id],
+            grpo_group_size=None,
+        )
+
+    def finish_step(self, meta: KVBatchMeta) -> None:
+        """Drop this step's bulk from TQ. Mirror of :meth:`prepare_step`."""
+        self.dp_client.kv_clear(keys=meta.keys, partition_id=meta.partition_id)
+
+    def read_from_dataplane(
+        self,
+        meta: KVBatchMeta,
+        *,
+        select_fields: list[str],
+        pad_value_dict: Optional[dict[str, Any]] = None,
+    ) -> BatchedDataDict[Any]:
+        """Fetch + materialize columns from the data plane (TQ)."""
+        return read_columns(
+            self.dp_client,
+            meta,
+            select_fields=select_fields,
+            pad_value_dict=pad_value_dict,
+        )
+
+    def write_to_dataplane(self, meta: KVBatchMeta, fields: dict[str, Any]) -> None:
+        """Write driver-computed columns to the data plane (TQ)."""
+        write_columns(self.dp_client, meta, fields=fields)
 
     # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────
 

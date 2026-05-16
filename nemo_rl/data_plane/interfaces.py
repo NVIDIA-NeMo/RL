@@ -118,6 +118,24 @@ class KVBatchMeta:
     def size(self) -> int:
         return len(self.keys)
 
+    def stamp_tags(self, scalars: dict[str, "Sequence[Any]"]) -> None:
+        """Mirror per-row scalar columns onto :attr:`tags`.
+
+        Each entry in ``scalars`` is a length-``size`` sequence (list,
+        tensor, ndarray) whose elements are written to ``tags[i][name]``.
+        Initializes ``tags`` to a list of empty dicts if currently None.
+        """
+        n = self.size
+        if self.tags is None:
+            self.tags = [{} for _ in range(n)]
+        for name, values in scalars.items():
+            if len(values) != n:
+                raise ValueError(
+                    f"stamp_tags: {name!r} has {len(values)} values, expected {n}"
+                )
+            for i, v in enumerate(values):
+                self.tags[i][name] = v
+
     # ── Pure-metadata transforms (no I/O) ──────────────────────────────
     # Used by dynamic_sampling on the meta path: filter zero-std rows
     # (subset), accumulate survivors across iterations (concat), trim
