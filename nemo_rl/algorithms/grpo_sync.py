@@ -627,10 +627,6 @@ def grpo_train_sync(
                             driver_carry,
                             master_config["grpo"]["reward_shaping"],
                         )
-                    if master_config["grpo"]["overlong_filtering"]:
-                        lm = driver_carry["loss_multiplier"].clone()
-                        lm[driver_carry["truncated"]] = 0
-                        driver_carry["loss_multiplier"] = lm
                     driver_carry["baseline"], driver_carry["std"] = (
                         calculate_baseline_and_std_per_prompt(
                             driver_carry["prompt_ids_for_adv"],
@@ -704,6 +700,13 @@ def grpo_train_sync(
                         driver_carry = pending_carry
                         pending_meta = None
                         pending_carry = None
+
+                # Mirrors legacy ``grpo.py:1707-1716`` — applied on the
+                # post-DS survivors so dropped rows don't affect this set.
+                if master_config["grpo"]["overlong_filtering"]:
+                    lm = driver_carry["loss_multiplier"].clone()
+                    lm[driver_carry["truncated"]] = 0
+                    driver_carry["loss_multiplier"] = lm
 
                 # ── Unpack slice (small per-sample tensors) ────────────
                 rewards = (
