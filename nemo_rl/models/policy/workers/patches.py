@@ -16,8 +16,22 @@ import os
 from importlib.util import find_spec
 
 import torch
-from torch.distributed.tensor._ops._tensor_ops import propagate_single_input_strategy
-from torch.distributed.tensor._ops.utils import register_op_strategy
+
+# torch 2.9 needs a local sharding-strategy patch for aten.alias.default
+# (see apply_torch_aten_alias_tensor_patch below). torch 2.10+ ships the fix
+# upstream (pytorch/pytorch#166867) and removed register_op_strategy /
+# propagate_single_input_strategy from these import paths, so guard the import.
+_TORCH_29_PATCH_AVAILABLE = False
+try:
+    from torch.distributed.tensor._ops._tensor_ops import (
+        propagate_single_input_strategy,
+    )
+    from torch.distributed.tensor._ops.utils import register_op_strategy
+
+    _TORCH_29_PATCH_AVAILABLE = True
+except ImportError:
+    propagate_single_input_strategy = None  # type: ignore[assignment]
+    register_op_strategy = None  # type: ignore[assignment]
 
 
 def _get_transformer_engine_file(relative_path: str) -> str:
@@ -117,8 +131,12 @@ def apply_torch_aten_alias_tensor_patch():
     in PyTorch 2.9. See https://github.com/pytorch/pytorch/pull/166867 for the upstream fix.
     We can remove this patch when we upgrade torch to include this fix.
     """
-    assert torch.__version__.startswith("2.9.0"), (
-        "This patch is needed for torch 2.9.0. Please retest if you upgrade torch to a newer version and remove this patch."
+    if not _TORCH_29_PATCH_AVAILABLE:
+        # torch 2.10+ ships the aten.alias.default sharding strategy upstream
+        # (pytorch/pytorch#166867). Nothing to patch.
+        return
+    assert torch.__version__.startswith("2.9."), (
+        "This patch is only for torch 2.9.x. Upgrade torch to >=2.10 and the patch is a no-op."
     )
     try:
         register_op_strategy(torch.ops.aten.alias.default)(
