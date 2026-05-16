@@ -172,8 +172,11 @@ fi
 # Wiping forces a clean rebuild on the next NemoGym _spinup() under current container python.
 for VENV in /opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/.venv \
             /opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/.venv; do
-  if [ -f "$VENV/bin/python" ]; then
-    if ! "$VENV/bin/python" -c "import ray" 2>/dev/null; then
+  if [ -d "$VENV" ]; then
+    if [ ! -x "$VENV/bin/python" ]; then
+      echo "[SETUP] Wiping half-built Gym subprocess venv (missing bin/python): $VENV"
+      rm -rf "$VENV"
+    elif ! "$VENV/bin/python" -c "import ray" 2>/dev/null; then
       echo "[SETUP] Wiping stale Gym subprocess venv (ray not importable): $VENV"
       rm -rf "$VENV"
     else
