@@ -659,7 +659,11 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
         raise ValueError(
             f"MXFP8 linear layer weight must be 2D, but got {layer.weight.ndim}D"
         )
-    assert self.backend == Mxfp8LinearBackend.FLASHINFER_CUTLASS
+    # When _apply_mxfp8_sm90_bypass forces EMULATION (H100 sm_90), raw
+    # weight_scale is consumed directly by Mxfp8LinearOp.dequant; swizzling
+    # is FLASHINFER_CUTLASS-specific and unnecessary for EMULATION.
+    if self.backend != Mxfp8LinearBackend.FLASHINFER_CUTLASS:
+        return
     weight = layer.weight.data  # [N, K]
     N, K = weight.shape
 
