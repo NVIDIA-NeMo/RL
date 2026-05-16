@@ -154,6 +154,17 @@ rm -rf /tmp/nemo_rl_vllm_cache /tmp/nemo_rl_vllm_cache_*
 rm -rf "/tmp/nemo_rl_inductor_cache" "/tmp/nemo_rl_triton_cache"
 mkdir -p "/tmp/nemo_rl_inductor_cache" "/tmp/nemo_rl_triton_cache"
 
+# Relax Gym ray pin so subprocess uv installs match parent ray (head_server_deps
+# injects parent ray version: 2.54.0 on May-13 container, vs Gym pin 2.49.2).
+# Without this, policy_model/swe_agents/vllm_model venv creation fails with
+# uv resolver "unsatisfiable" and Process `policy_model` finished unexpectedly.
+GYM_PYP=/opt/nemo-rl/3rdparty/Gym-workspace/Gym/pyproject.toml
+if [ -f "$GYM_PYP" ]; then
+  sed -i "s|\"ray\\[default\\]==[0-9.]\\+\"|\"ray[default]\"|g" "$GYM_PYP"
+  echo "[SETUP] Gym ray pin relaxed:"
+  grep -n "ray\\[default\\]" "$GYM_PYP" | head -3 || true
+fi
+
 __UV_SYNC_BLOCK__
 SETUP_EOF
 
