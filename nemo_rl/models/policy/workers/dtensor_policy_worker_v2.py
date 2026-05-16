@@ -255,7 +255,13 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         self.rank = torch.distributed.get_rank()
         self.device_mesh = distributed_context.device_mesh
         self.dp_cp_mesh = self.device_mesh["dp_cp"]
-        self.dp_mesh = self.device_mesh["dp_shard"]
+        # Use the full DP mesh (dp_replicate × dp_shard) for data-level
+        # all-reduces.  FSDP handles HSDP grad sync via the device_mesh
+        # internally, so self.dp_mesh is only used for data coordination.
+        if "dp_replicate" in self.device_mesh.mesh_dim_names:
+            self.dp_mesh = self.device_mesh["dp"]
+        else:
+            self.dp_mesh = self.device_mesh["dp_shard"]
         self.tp_mesh = self.device_mesh["tp"]
         self.cp_mesh = self.device_mesh["cp"]
         self.moe_mesh = distributed_context.moe_mesh

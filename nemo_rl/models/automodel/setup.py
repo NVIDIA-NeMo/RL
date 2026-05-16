@@ -471,8 +471,13 @@ def setup_distributed(
         world_size=world_size,
     )
 
-    # Derive sizes from mesh
-    resolved_dp_size = device_mesh["dp_shard"].size()
+    # Derive sizes from mesh — dp_size must include dp_replicate for HSDP
+    dp_replicate_dim = (
+        device_mesh["dp_replicate"].size()
+        if "dp_replicate" in device_mesh.mesh_dim_names
+        else 1
+    )
+    resolved_dp_size = device_mesh["dp_shard"].size() * dp_replicate_dim
     resolved_tp_size = device_mesh["tp"].size()
     resolved_cp_size = device_mesh["cp"].size()
 
