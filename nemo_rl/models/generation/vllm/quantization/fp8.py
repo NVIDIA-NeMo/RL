@@ -240,6 +240,13 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         is_mx = vllm_cfg.get("is_mx", False)
     else:
         is_mx = False
+    # MXFP8 sm_90 bypass must fire in THIS process before AsyncLLM.from_engine_args runs,
+    # because vllm 0.17.1 validates ModelOptMxFp8Config.get_min_capability inside VllmConfig().
+    # Worker subprocesses get re-patched by apply_fp8_patches via collective_rpc; this only
+    # handles the parent VllmAsyncGenerationWorker actor where create_engine_config runs.
+    if is_mx:
+        _apply_mxfp8_sm90_bypass()
+
     fp8_config_kwargs = {
         "num_first_layers_in_bf16": vllm_cfg.get("num_first_layers_in_bf16", 0),
         "num_last_layers_in_bf16": vllm_cfg.get("num_last_layers_in_bf16", 0),
