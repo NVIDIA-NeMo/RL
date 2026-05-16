@@ -106,7 +106,7 @@ def main():
     # Init ray
     init_ray()
 
-    is_random_dataset = config["data"].get("dataset_name") == "random"
+    is_random_dataset = config.data.get("dataset_name") == "random"
 
     # Setup tokenizer — get_tokenizer handles both text-only and multimodal
     is_multimodal = _is_multimodal_dataset(config.data["dataset_name"])
@@ -122,7 +122,7 @@ def main():
         config["generation"]["vllm_cfg"]["load_format"] = "dummy"
 
     # Setup data
-    if config["data"].get("dataset_name") == "random":
+    if is_random_dataset:
         (dataset, _, task_to_env, _) = setup_random_data(tokenizer, config.data)
         env = task_to_env["random"]
     else:
