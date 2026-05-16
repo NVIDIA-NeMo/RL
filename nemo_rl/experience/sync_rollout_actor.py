@@ -94,6 +94,7 @@ class SyncRolloutActor:
         first_iter: bool = True,
         finish_generation: bool = True,
         task_to_env_override: Optional[dict[str, EnvironmentInterface]] = None,
+        carry_keys: Optional[list[str]] = None,
     ) -> tuple[
         KVBatchMeta,
         dict[str, Any],
@@ -143,6 +144,11 @@ class SyncRolloutActor:
                 ``self.task_to_env`` (training envs supplied at construction).
                 Validation passes ``val_task_to_env`` here so val rollouts
                 run against the val env set without rebuilding the actor.
+            carry_keys: Names of per-row tensors to return in
+                ``driver_carry``. ``None`` returns every available key
+                (training uses this). Validation passes a slim list
+                (e.g. ``["total_reward"]``) to avoid wasting Ray transfer
+                on fields it doesn't consume.
 
         Returns:
             ``(meta, driver_carry, rollout_metrics, generation_logger_metrics)``
@@ -301,6 +307,14 @@ class SyncRolloutActor:
         # rather than forcing a separate TQ fetch.
         for k in get_gdpo_reward_component_keys(fb):
             driver_carry[k] = fb[k]
+        if carry_keys is not None:
+            missing = set(carry_keys) - driver_carry.keys()
+            if missing:
+                raise KeyError(
+                    f"rollout_to_tq: carry_keys {sorted(missing)} not produced; "
+                    f"valid keys: {sorted(driver_carry)}"
+                )
+            driver_carry = {k: driver_carry[k] for k in carry_keys}
 
         n_samples = int(bulk_batch["sample_mask"].shape[0])
         if len(uids) == 0 or n_samples % len(uids) != 0:

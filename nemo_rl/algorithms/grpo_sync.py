@@ -251,6 +251,7 @@ def validate_sync(
                     first_iter=False,
                     finish_generation=False,
                     task_to_env_override=val_task_to_env,
+                    carry_keys=["total_reward"],
                 )
             )
             mlog_cols = read_columns(
