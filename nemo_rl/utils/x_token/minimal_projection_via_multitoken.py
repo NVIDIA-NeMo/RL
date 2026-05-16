@@ -480,6 +480,17 @@ def parse_arguments():
         default="cross_tokenizer_data",
         help="Output directory for saving projection maps"
     )
+    parser.add_argument(
+        "--output-filename",
+        type=str,
+        default=None,
+        help=(
+            "Optional output filename stem (without extension). When unset, "
+            "the stem is auto-derived from cleaned student and teacher model "
+            "names; recipe-driven runs (e.g. tokenalign/commands.txt) pass "
+            "an explicit stem like 'llama_qwen_best' to lock the filename."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -532,15 +543,20 @@ if __name__ == "__main__":
     tokenizer_teacher_total_vocab_size = len(tokenizer_teacher)
     model_A_config = AutoConfig.from_pretrained(student_model_name)
     model_B_config = AutoConfig.from_pretrained(teacher_model_name)
-    if "gemma" not in student_model_name.lower():
-        source_vocab_size = model_A_config.vocab_size
-    else:
+    # Gemma and Qwen3.5 nest `vocab_size` under `config.text_config`; the
+    # rest of the supported families expose it directly on the top-level
+    # config. Mirrors the PT reference.
+    student_name_lower = student_model_name.lower()
+    if "gemma" in student_name_lower or "qwen3.5" in student_name_lower:
         source_vocab_size = model_A_config.text_config.vocab_size
-
-    if "gemma" not in teacher_model_name.lower():
-        target_vocab_size = model_B_config.vocab_size
     else:
+        source_vocab_size = model_A_config.vocab_size
+
+    teacher_name_lower = teacher_model_name.lower()
+    if "gemma" in teacher_name_lower or "qwen3.5" in teacher_name_lower:
         target_vocab_size = model_B_config.text_config.vocab_size
+    else:
+        target_vocab_size = model_B_config.vocab_size
 
     tokenizer_student_total_vocab_size = source_vocab_size
     tokenizer_teacher_total_vocab_size = target_vocab_size
@@ -856,24 +872,33 @@ if __name__ == "__main__":
 
     #set indices to -1 where likelihood is 0
 
-    # Create filename in same format as minimal_projection_generator.py
-    student_clean_name = clean_model_name_for_filename(student_model_name.split("/")[-1])
-    teacher_clean_name = clean_model_name_for_filename(teacher_model_name.split("/")[-1])
-
-    output_filename = f"projection_map_{student_clean_name}_to_{teacher_clean_name}_multitoken_top_{TOP_K}_double"
-    # if USE_RAW_TOKENS:
-    #     output_filename += "_raw_tokens"
+    # Build the output filename. If the caller provided an explicit
+    # `--output-filename` stem, honor it (recipe-driven runs lock the name);
+    # otherwise auto-derive from cleaned student/teacher names so ad-hoc
+    # runs produce a self-describing default that matches the format used by
+    # minimal_projection_generator.py.
+    if args.output_filename is not None:
+        output_filename = args.output_filename
+    else:
+        student_clean_name = clean_model_name_for_filename(student_model_name.split("/")[-1])
+        teacher_clean_name = clean_model_name_for_filename(teacher_model_name.split("/")[-1])
+        output_filename = (
+            f"projection_map_{student_clean_name}_to_{teacher_clean_name}"
+            f"_multitoken_top_{TOP_K}_double"
+        )
     if ENABLE_SPECIAL_TOKEN_MAPPING:
         output_filename += "_special"
-    output_filename += ".pt"
-    # if ENABLE_REVERSE_PASS:
-    #     output_filename = output_filename.replace(".pt", "_bidirectional.pt")
+    if not output_filename.endswith(".pt"):
+        output_filename += ".pt"
     output_path = os.path.join(args.output_dir, output_filename)
 
     # Save in same format as minimal_projection_generator.py.
     # `enable_scale_trick` is persisted so downstream tools (e.g.
     # `sort_and_cut_projection_matrix.py`) can decide whether the last
     # column carries a tunable scale slot without the user re-specifying.
+    # Metadata keys use the student/teacher framing; legacy `model_A_id`/
+    # `model_B_id` produced by older PT-reference artifacts are accepted on
+    # the load side (see the fallback near line 574).
     torch.save({
         "indices": top_k_indices,
         "likelihoods": top_k_likelihoods,
