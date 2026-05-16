@@ -552,6 +552,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     inference_only: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     chunk_size: Optional[int] = None,
+    target_is_pre_rolled: bool = False,
 ) -> torch.Tensor:
     """Get log probabilities from TP sharded vocab logits for packed sequences.
 
@@ -582,20 +583,26 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
     cp_rank = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
 
-    # Roll each sequence individually
-    rolled_targets = torch.zeros(
-        target.shape[0] // cp_size, dtype=target.dtype, device=target.device
-    )
-    for i in range(batch_size):
-        start_idx = cu_seqlens_padded[i].item()
-        end_idx = cu_seqlens_padded[i + 1].item()
-
-        # Get the sequence targets and roll by -1
-        seq_targets = target[start_idx:end_idx]
-        rolled_seq_targets = seq_targets.roll(shifts=-1, dims=0)
-        rolled_targets[start_idx // cp_size : end_idx // cp_size] = (
-            _get_tokens_on_this_cp_rank(rolled_seq_targets, cp_rank, cp_size, seq_dim=0)
+    if target_is_pre_rolled:
+        # Caller (e.g., SequencePackingFusionLossWrapper via _pack_input_ids
+        # with roll_shift=-1) already rolled and CP-sharded; target shape is
+        # [T_packed // CP] after the squeeze(0) above.
+        rolled_targets = target
+    else:
+        # Roll each sequence individually
+        rolled_targets = torch.zeros(
+            target.shape[0] // cp_size, dtype=target.dtype, device=target.device
         )
+        for i in range(batch_size):
+            start_idx = cu_seqlens_padded[i].item()
+            end_idx = cu_seqlens_padded[i + 1].item()
+
+            # Get the sequence targets and roll by -1
+            seq_targets = target[start_idx:end_idx]
+            rolled_seq_targets = seq_targets.roll(shifts=-1, dims=0)
+            rolled_targets[start_idx // cp_size : end_idx // cp_size] = (
+                _get_tokens_on_this_cp_rank(rolled_seq_targets, cp_rank, cp_size, seq_dim=0)
+            )
 
     # Add batch dimension back for DistributedLogprob
     rolled_targets = rolled_targets.unsqueeze(0)

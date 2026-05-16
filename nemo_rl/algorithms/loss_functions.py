@@ -26,6 +26,7 @@ from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     from_parallel_logits_to_logprobs,
+    from_parallel_logits_to_logprobs_packed_sequences,
     gather_logits_at_global_indices,
     get_logprobs_from_vocab_parallel_logits,
 )
@@ -198,13 +199,14 @@ class ClippedPGLossFn(LossFunction):
 
     def __call__(
         self,
-        next_token_logits: Tensor,
+        next_token_logits: Optional[Tensor],
         data: BatchedDataDict[ClippedPGLossDataDict],
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        precomputed_curr_logprobs: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss function."""
         token_mask = data["token_mask"][:, 1:]
@@ -219,38 +221,47 @@ class ClippedPGLossFn(LossFunction):
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        next_token_logits = next_token_logits.to(torch.float32)
-
-        if vocab_parallel_group is not None:
-            assert vocab_parallel_rank is not None, (
-                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-            )
-            curr_logprobs = from_parallel_logits_to_logprobs(
-                next_token_logits,
-                data["input_ids"],
-                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
-                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                tp_group=vocab_parallel_group,
-                inference_only=False,
-                cp_group=context_parallel_group,
-            )
-            # slice off to the correct length to remove potential CP padding
+        if precomputed_curr_logprobs is not None:
+            # Fusion path: logprobs already computed by
+            # SequencePackingFusionLossWrapper in a single packed forward pass.
+            curr_logprobs = precomputed_curr_logprobs
             curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
-        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-            curr_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
-            )
         else:
-            next_token_logits_wo_last = next_token_logits[
-                :, :-1
-            ]  # Remove last position's logits
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits_wo_last, dim=-1
+            assert next_token_logits is not None, (
+                "next_token_logits required when precomputed_curr_logprobs is not provided"
             )
-            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
-            curr_logprobs = next_token_logprobs.gather(
-                dim=-1, index=next_tokens.unsqueeze(-1)
-            ).squeeze(-1)
+            next_token_logits = next_token_logits.to(torch.float32)
+
+            if vocab_parallel_group is not None:
+                assert vocab_parallel_rank is not None, (
+                    "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+                )
+                curr_logprobs = from_parallel_logits_to_logprobs(
+                    next_token_logits,
+                    data["input_ids"],
+                    vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
+                    vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
+                    tp_group=vocab_parallel_group,
+                    inference_only=False,
+                    cp_group=context_parallel_group,
+                )
+                # slice off to the correct length to remove potential CP padding
+                curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
+            elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+                curr_logprobs = get_logprobs_from_vocab_parallel_logits(
+                    next_token_logits, data["input_ids"], seq_index=seq_index
+                )
+            else:
+                next_token_logits_wo_last = next_token_logits[
+                    :, :-1
+                ]  # Remove last position's logits
+                next_token_logprobs = torch.nn.functional.log_softmax(
+                    next_token_logits_wo_last, dim=-1
+                )
+                next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
+                curr_logprobs = next_token_logprobs.gather(
+                    dim=-1, index=next_tokens.unsqueeze(-1)
+                ).squeeze(-1)
 
         # For truly on-policy training, use curr_logprobs as prev_logprobs
         # This avoids computing prev_logprobs upstream
@@ -1343,3 +1354,135 @@ class DistillationLossFn(LossFunction):
         }
 
         return kl_loss, metrics
+
+
+
+def _pack_input_ids(
+    input_ids: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_q_padded: torch.Tensor,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    roll_shift: int = 0,
+) -> torch.Tensor:
+    """Pack input_ids from [B, S] to [1, T_packed // CP] using sequence boundaries.
+
+    Each sequence is individually padded to its padded length (from
+    cu_seqlens_q_padded), optionally rolled, and CP-sharded at that padded
+    length before being placed into the packed output.  This matches how
+    Megatron packs and CP-shards sequences in _pack_sequences_for_megatron.
+
+    Ported from PR #1904 nemo_rl/algorithms/loss/utils.py::_pack_input_ids.
+    """
+    batch_size = input_ids.shape[0]
+    total_packed_len = int(cu_seqlens_q_padded[-1].item()) // cp_size
+    packed = torch.zeros(
+        total_packed_len, dtype=input_ids.dtype, device=input_ids.device
+    )
+    for i in range(batch_size):
+        actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item())
+        padded_len = int((cu_seqlens_q_padded[i + 1] - cu_seqlens_q_padded[i]).item())
+        packed_start = int(cu_seqlens_q_padded[i].item())
+        seq = torch.zeros(padded_len, dtype=input_ids.dtype, device=input_ids.device)
+        seq[:actual_len] = input_ids[i, :actual_len]
+        if roll_shift != 0:
+            seq = seq.roll(shifts=roll_shift, dims=0)
+        sharded = _get_tokens_on_this_cp_rank(seq, cp_rank, cp_size, seq_dim=0)
+        packed[packed_start // cp_size : (packed_start + padded_len) // cp_size] = (
+            sharded
+        )
+    return packed.unsqueeze(0)
+
+
+class SequencePackingFusionLossWrapper:
+    """Fused sequence-packing loss wrapper for ClippedPGLossFn (PR #1904 port).
+
+    Unlike :class:`SequencePackingLossWrapper` which iterates over sequences
+    one at a time and calls ``from_parallel_logits_to_logprobs`` per sequence
+    (one collective per sequence), this wrapper:
+
+    1. Packs / rolls / CP-shards all targets once via ``_pack_input_ids``.
+    2. Calls ``from_parallel_logits_to_logprobs_packed_sequences`` once on the
+       full packed logits with ``target_is_pre_rolled=True``.
+    3. Invokes the wrapped loss function once with the pre-computed unpacked
+       logprobs via ``precomputed_curr_logprobs``.
+
+    This collapses per-sequence kernel launches + TP/CP collectives into a
+    single fused pass. Only the LOGPROB-style consumer (ClippedPGLossFn) is
+    supported here; distillation / top-k filtering paths from PR #1904 are
+    intentionally omitted.
+    """
+
+    def __init__(
+        self,
+        loss_fn: LossFunction,
+        cu_seqlens_q: Tensor,
+        cu_seqlens_q_padded: Optional[Tensor] = None,
+    ):
+        self.loss_fn = loss_fn
+        self.cu_seqlens_q = cu_seqlens_q
+        self.cu_seqlens_q_padded = (
+            cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
+        )
+
+    def __call__(
+        self,
+        next_token_logits: Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: Tensor | None,
+        global_valid_toks: Tensor | None,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[Tensor, dict[str, Any]]:
+        assert vocab_parallel_group is not None and vocab_parallel_rank is not None, (
+            "SequencePackingFusionLossWrapper requires vocab_parallel_group/rank "
+            "(Megatron TP). Use SequencePackingLossWrapper for non-Megatron paths."
+        )
+
+        input_ids = data["input_ids"]
+        unpacked_seqlen = input_ids.shape[1]
+        cp_size = (
+            1
+            if context_parallel_group is None
+            else torch.distributed.get_world_size(context_parallel_group)
+        )
+        cp_rank = (
+            0
+            if context_parallel_group is None
+            else torch.distributed.get_rank(context_parallel_group)
+        )
+
+        packed_rolled_targets = _pack_input_ids(
+            input_ids,
+            self.cu_seqlens_q,
+            self.cu_seqlens_q_padded,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            roll_shift=-1,
+        )
+
+        next_token_logits = next_token_logits.to(torch.float32)
+        curr_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+            next_token_logits,
+            packed_rolled_targets,
+            self.cu_seqlens_q_padded,
+            unpacked_seqlen,
+            vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
+            vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
+            group=vocab_parallel_group,
+            inference_only=False,
+            cp_group=context_parallel_group,
+            target_is_pre_rolled=True,
+        )
+
+        return self.loss_fn(
+            None,
+            data,
+            global_valid_seqs,
+            global_valid_toks,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            precomputed_curr_logprobs=curr_logprobs,
+        )
