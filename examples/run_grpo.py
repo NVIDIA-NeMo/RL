@@ -96,7 +96,7 @@ def main() -> None:
     )
 
     # setup data — branch on synthetic random-data path for benchmarking
-    if config["data"].get("dataset_name") == "random":
+    if config.data.get("dataset_name") == "random":
         (
             dataset,
             val_dataset,
