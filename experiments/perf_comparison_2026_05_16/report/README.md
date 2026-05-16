@@ -489,3 +489,66 @@ Estimated: **8-16 GPU-hours of integration + correctness validation** beyond the
 
 **Recommendation**: deliver HybridEP perf data (in progress, 2/20+ steps done at time of writing) + ray_only baseline data (17/20 steps done). Treat MXFP8 as a separate workstream requiring infrastructure work that does not fit a same-day perf-comparison sprint.
 
+
+---
+
+### MXFP8 EMULATION Backend Discovery (May 13 container deep-dive)
+
+Re-examined `mxfp8_utils.py` and `modelopt.py` extracted from May 13 squashfs (4641794-51006907). The **`get_min_capability=100` check is the only hardware-coupled choke point** — the underlying MXFP8 GEMM has a portable emulation path.
+
+#### Mxfp8LinearBackend has two modes
+
+`vllm/model_executor/layers/quantization/utils/mxfp8_utils.py`:
+
+```python
+class Mxfp8LinearBackend(Enum):
+    EMULATION = "emulation"           # dequant -> bf16 -> torch.nn.functional.linear
+    FLASHINFER_CUTLASS = "flashinfer-cutlass"   # Blackwell-only mm_mxfp8
+
+class Mxfp8LinearOp:
+    def _apply_emulation(self, input, weight, weight_scale, out_dtype, bias=None):
+        weight_bf16 = dequant_mxfp8_to_bf16(weight, weight_scale)
+        output = torch.nn.functional.linear(input, weight_bf16, bias)
+        return output.to(out_dtype)
+```
+
+`Mxfp8LinearBackend.EMULATION` is pure-torch (no flashinfer, no cutlass, no Blackwell tensor cores). Runs on **any GPU including sm_90 H100**.
+
+#### What gates MXFP8 from sm_90
+
+Three independent gates in `modelopt.py`:
+
+1. **`ModelOptMxFp8Config.get_min_capability` → 100** (refuses to load on sm_90)
+2. **`ModelOptMxFp8Config.get_quant_method` raises NotImplementedError on FusedMoE** (rejects MoE config)
+3. **`ModelOptMxFp8LinearMethod.__init__` hardcodes `FLASHINFER_CUTLASS` backend** (line 1554) — bypasses EMULATION path silently
+
+None of these are hardware-fundamental. The EMULATION backend dequantizes MXFP8 to bf16 and runs bf16 GEMM, which is correctness-preserving but slower than Blackwell native MXFP8 GEMM.
+
+#### Implementation plan for MXFP8 + Qwen3-235B on H100 sm_90
+
+A working MXFP8 path on H100 requires:
+
+| Gate | Patch in `fp8.py` |
+|------|-------------------|
+| `get_min_capability=100` | Monkey-patch `ModelOptMxFp8Config.get_min_capability = classmethod(lambda cls: 80)` |
+| `get_quant_method` FusedMoE rejection | Monkey-patch `get_quant_method` to fall through to `ModelOptFp8MoEMethod` (or skip) when `isinstance(layer, FusedMoE)` |
+| `Mxfp8LinearOp` backend | Monkey-patch `ModelOptMxFp8LinearMethod.__init__` to construct with `Mxfp8LinearBackend.EMULATION` |
+| Missing `ModelOptMxFp8FusedMoE` class | Skip the patch.start() call if class doesn't exist (try/except) OR write a custom MXFP8 FusedMoE class |
+
+PR #1887's current patches (`process_weights_after_loading_mxfp8_linear`, `process_weights_after_loading_mxfp8_moe`) need wrapping in `try/except AttributeError` for the FusedMoE path.
+
+#### Container + venv requirement
+
+- **Container**: `nemo-rl:4641794-51006907.squashfs` (May 13, vllm 0.17.1+cu130, py3.13, torch 2.10)
+- **Venv**: cold rebuild required (current venv is py3.12 against `7684dc2-45115915`). Build cost: ~30-60 min on first-launch. transformer-engine pin (`==2.8.0`) needs to relax to a torch-2.10-compatible version (2.14.1+).
+
+#### Performance expectation
+
+EMULATION = dequant overhead + bf16 GEMM. On Blackwell (B200/GB200), native MXFP8 GEMM at `FLASHINFER_CUTLASS` is ~2x bf16. On H100 EMULATION, expect **slower than baseline bf16** (extra dequant per layer) — useful as a correctness validation only, not a perf win.
+
+For real MXFP8 perf numbers, the Blackwell cluster pivot (OCI-Hsg or Lyris) is required. CW H100 can validate "MXFP8 rollout executes end-to-end" but cannot show MXFP8 as a speedup.
+
+#### Risk to in-flight HybridEP run
+
+HybridEP attempt 7 (job 11795544) currently at step 5 of 20 with steady-state ~415s/step (ETA to step 15: ~70min from step 5). Any container/venv churn risks disrupting it. **MXFP8 submission must wait until HybridEP completes or is at a safe stopping point.**
+
