@@ -113,6 +113,45 @@ def monkey_patch_vllm_ray_executor(fp8_config):
         fp8_patches_applied = True
 
 
+def _apply_mxfp8_sm90_bypass():
+    # vllm 0.17.1 gates MXFP8 to Blackwell sm_100+ via three software checks. The
+    # underlying EMULATION backend (dequant -> bf16 -> torch.linear) is portable.
+    # Drop the gates so MXFP8 linear weights load and forward on H100 sm_90.
+    from vllm.model_executor.layers.quantization import modelopt
+
+    if not hasattr(modelopt, "ModelOptMxFp8Config"):
+        return False  # older vllm without MXFP8 classes; nothing to bypass
+
+    modelopt.ModelOptMxFp8Config.get_min_capability = classmethod(lambda cls: 80)
+
+    def _patched_get_quant_method(self, layer, prefix):
+        if isinstance(layer, FusedMoE):
+            return None  # leave MoE in bf16 (no ModelOptMxFp8FusedMoE class yet)
+        return super(modelopt.ModelOptMxFp8Config, self).get_quant_method(layer, prefix)
+
+    modelopt.ModelOptMxFp8Config.get_quant_method = _patched_get_quant_method
+
+    if hasattr(modelopt, "ModelOptMxFp8LinearMethod"):
+        try:
+            from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+                Mxfp8LinearBackend,
+                Mxfp8LinearOp,
+            )
+        except ImportError:
+            return True
+
+        _orig_init = modelopt.ModelOptMxFp8LinearMethod.__init__
+
+        def _patched_init(self, quant_config):
+            _orig_init(self, quant_config)
+            self.backend = Mxfp8LinearBackend.EMULATION
+            self.mxfp8_linear_op = Mxfp8LinearOp(backend=self.backend)
+
+        modelopt.ModelOptMxFp8LinearMethod.__init__ = _patched_init
+
+    return True
+
+
 def apply_fp8_patches(self, fp8_config):
     global global_fp8_config, fp8_patches_applied
     assert not fp8_patches_applied
@@ -125,6 +164,8 @@ def apply_fp8_patches(self, fp8_config):
 
     # Apply weight-related patches only when using FP8 weights (precision=fp8)
     if global_fp8_config.use_fp8_weights:
+        _apply_mxfp8_sm90_bypass()
+
         # This patch is used to support torch.compile with vllm parameter subclasses, such as
         # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
         # refit, we patch fp8 parameters to have a reference to their weight loader. Eventually
@@ -136,18 +177,22 @@ def apply_fp8_patches(self, fp8_config):
         func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
         patcher2 = patch(func2_path, process_weights_after_loading_moe)
         fp8_state.vllm_patches.append(patcher2)
-        fp8_state.vllm_patches.append(
-            patch(
-                "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8LinearMethod.process_weights_after_loading",
-                process_weights_after_loading_mxfp8_linear,
+        from vllm.model_executor.layers.quantization import modelopt as _modelopt
+
+        if hasattr(_modelopt, "ModelOptMxFp8LinearMethod"):
+            fp8_state.vllm_patches.append(
+                patch(
+                    "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8LinearMethod.process_weights_after_loading",
+                    process_weights_after_loading_mxfp8_linear,
+                )
             )
-        )
-        fp8_state.vllm_patches.append(
-            patch(
-                "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8FusedMoE.process_weights_after_loading",
-                process_weights_after_loading_mxfp8_moe,
+        if hasattr(_modelopt, "ModelOptMxFp8FusedMoE"):
+            fp8_state.vllm_patches.append(
+                patch(
+                    "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8FusedMoE.process_weights_after_loading",
+                    process_weights_after_loading_mxfp8_moe,
+                )
             )
-        )
 
         # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
         # SNR compared to plain fp32 scaling factors. This feature is still under active research.
