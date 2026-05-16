@@ -48,6 +48,7 @@ from nemo_rl.models.automodel.config import (
 )
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
+from nemo_rl.utils.optimizer_factory import build_optimizer_from_cfg
 
 STRING_TO_DTYPE = {
     "float32": torch.float32,
@@ -710,8 +711,7 @@ def setup_model_and_optimizer(
     # Initialize optimizer
     optimizer = None
     if init_optimizer:
-        optimizer_cls = get_class(config["optimizer"]["name"])
-        optimizer = optimizer_cls(model.parameters(), **config["optimizer"]["kwargs"])
+        optimizer = build_optimizer_from_cfg(model, config["optimizer"])
 
     # Initialize scheduler
     scheduler = None
