@@ -74,7 +74,7 @@ case "$VARIANT" in
   policy.megatron_cfg.moe_shared_expert_overlap=True"
     EXTRA_ENVS="  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 \
   USE_MNNVL=False \
-  PYTHONPATH=/lustre/fsw/portfolios/coreai/users/sna/hybridep_overlay/site-packages:${PYTHONPATH}"
+  PYTHONPATH=/lustre/fsw/portfolios/coreai/users/sna/hybridep_overlay/site-packages:${PYTHONPATH:-}"
     export TORCH_CUDA_ARCH_LIST_OVERRIDE="9.0"
     ;;
   *)
