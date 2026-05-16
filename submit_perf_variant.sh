@@ -11,7 +11,21 @@ CACHE_BASE="/lustre/fsw/portfolios/coreai/users/sna/.cache/qwen3_235b_swe"
 HF_HOME_DIR="/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home"
 DATA_PATH="/lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/sdevare/repos/nano/dataset/rl/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl"
 CONFIG_PATH="${REPO_DIR}/grpo_qwen3_235b_swe.yaml"
-CONTAINER="/lustre/fsw/portfolios/coreai/users/yukih/enroot-images/nvcr.io/nvidian/nemo-rl:7684dc2-45115915.squashfs"
+
+# Container + branch + vllm-wheel choices are per-variant.
+# Default = current super-v3 perf chain (vllm 0.13 container, perf-patch branch).
+DEFAULT_CONTAINER="/lustre/fsw/portfolios/coreai/users/yukih/enroot-images/nvcr.io/nvidian/nemo-rl:7684dc2-45115915.squashfs"
+DEFAULT_BRANCH="sj/super-v3-perf-patch"
+DEFAULT_VLLM_WHEEL_URL="https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_x86_64.whl"
+
+# May-13 container (vllm 0.17.1+cu130, torch 2.10, py3.13) is required for MXFP8 EMULATION
+# bypass — it has ModelOptMxFp8Config + ModelOptMxFp8LinearMethod classes.
+MXFP8_CONTAINER="/lustre/fsw/portfolios/coreai/users/yukih/enroot-images/nvcr.io/nvidian/nemo-rl:4641794-51006907.squashfs"
+MXFP8_BRANCH="sj/super-v3-mxfp8-bypass"
+
+CONTAINER="${DEFAULT_CONTAINER}"
+BRANCH="${DEFAULT_BRANCH}"
+VLLM_WHEEL_URL="${DEFAULT_VLLM_WHEEL_URL}"
 
 # Variant-specific overrides and labels
 case "$VARIANT" in
@@ -22,14 +36,19 @@ case "$VARIANT" in
     ;;
   mxfp8)
     VARIANT_TAG="mxfp8"
+    CONTAINER="${MXFP8_CONTAINER}"
+    BRANCH="${MXFP8_BRANCH}"
+    # May-13 container has vllm 0.17.1 prebuilt in /root/.cache/uv. Don't force the 0.13 wheel.
+    VLLM_WHEEL_URL=""
+    # Trust the container venv — torch/vllm/TE pins in pyproject.toml are for the
+    # 0.13-container path and conflict with May-13 torch 2.10.
+    export NRL_FORCE_REBUILD_VENVS_OVERRIDE="false"
     EXTRA_OVERRIDES="  policy.generation.vllm_cfg.precision=fp8 \
   policy.generation.vllm_cfg.is_mx=true \
   policy.generation.vllm_cfg.pow2_weight_scaling_factors=true \
   policy.generation.vllm_cfg.pow2_activation_scaling_factors=true"
-    EXTRA_ENVS="  VLLM_USE_FLASHINFER_MOE_FP8=1 \
-  VLLM_FLASHINFER_MOE_BACKEND=latency \
-  VLLM_FLASHINFER_ALLREDUCE_BACKEND=mnnvl \
-  VLLM_ALLREDUCE_USE_FLASHINFER=1"
+    # EMULATION backend is pure-torch, no flashinfer dependencies. MNNVL not available on H100.
+    EXTRA_ENVS=""
     ;;
   hybridep)
     VARIANT_TAG="hybridep"
@@ -42,6 +61,10 @@ case "$VARIANT" in
     ;;
   both)
     VARIANT_TAG="mxfp8-hybridep"
+    CONTAINER="${MXFP8_CONTAINER}"
+    BRANCH="${MXFP8_BRANCH}"
+    VLLM_WHEEL_URL=""
+    export NRL_FORCE_REBUILD_VENVS_OVERRIDE="false"
     EXTRA_OVERRIDES="  policy.generation.vllm_cfg.precision=fp8 \
   policy.generation.vllm_cfg.is_mx=true \
   policy.generation.vllm_cfg.pow2_weight_scaling_factors=true \
@@ -50,11 +73,8 @@ case "$VARIANT" in
   ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep \
   policy.megatron_cfg.moe_shared_expert_overlap=True"
     EXTRA_ENVS="  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 \
-  USE_MNNVL=False \
-  VLLM_USE_FLASHINFER_MOE_FP8=1 \
-  VLLM_FLASHINFER_MOE_BACKEND=latency \
-  VLLM_FLASHINFER_ALLREDUCE_BACKEND=mnnvl \
-  VLLM_ALLREDUCE_USE_FLASHINFER=1"
+  USE_MNNVL=False"
+    export TORCH_CUDA_ARCH_LIST_OVERRIDE="9.0"
     ;;
   *)
     echo "Unknown VARIANT: $VARIANT" >&2
@@ -68,8 +88,8 @@ LOG_DIR="logs/${EXP_NAME}"
 
 cd "${REPO_DIR}"
 
-# Ensure branch is sj/super-v3-perf-patch
-git checkout sj/super-v3-perf-patch
+# Ensure correct branch is checked out for this variant.
+git checkout "${BRANCH}"
 git pull --ff-only
 
 export OMP_NUM_THREADS=16
@@ -80,7 +100,9 @@ export MOUNTS="/lustre:/lustre,${REPO_DIR}:${REPO_DIR},${REPO_DIR}/3rdparty/Gym-
 # instead of via a separate ray.sub sandbox srun.
 unset SANDBOX_CONTAINER SANDBOX_COMMAND SANDBOX_ENV_VARS 2>/dev/null || true
 
-# Setup command (apptainer + cache seed)
+# Setup command (apptainer + cache seed). Heredoc stays single-quoted to keep
+# loop vars (RET, attempt, NVCC_FOUND, ...) literal. The vllm wheel pin is
+# templated via __VLLM_WHEEL_LOC__ placeholder, substituted after the heredoc.
 read -r -d '' SETUP_COMMAND <<'SETUP_EOF' || true
 echo "[SETUP] Installing apptainer for SWE sandbox..."
 apt-get update && apt-get install -y git build-essential gcc wget 2>/dev/null || true
@@ -131,20 +153,37 @@ rm -rf /tmp/nemo_rl_vllm_cache /tmp/nemo_rl_vllm_cache_*
 rm -rf "/tmp/nemo_rl_inductor_cache" "/tmp/nemo_rl_triton_cache"
 mkdir -p "/tmp/nemo_rl_inductor_cache" "/tmp/nemo_rl_triton_cache"
 
-VLLM_USE_PRECOMPILED=1 \
-VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_x86_64.whl \
-UV_HTTP_TIMEOUT=3600 \
-uv sync --frozen
+__UV_SYNC_BLOCK__
 SETUP_EOF
+
+# Substitute __UV_SYNC_BLOCK__: rebuild from pyproject only when VLLM_WHEEL_URL is set
+# (the default super-v3 path). When empty (MXFP8 May-13 container), trust the container's
+# preinstalled vllm 0.17.1 + torch 2.10 + TE 2.14.1 venv to avoid pyproject pin conflicts.
+if [[ -n "${VLLM_WHEEL_URL}" ]]; then
+  UV_SYNC_BLOCK="VLLM_USE_PRECOMPILED=1 \\
+VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_WHEEL_URL} \\
+UV_HTTP_TIMEOUT=3600 \\
+uv sync --frozen"
+else
+  UV_SYNC_BLOCK="echo \"[SETUP] Skipping uv sync — using container preinstalled venv (vllm 0.17.1 + torch 2.10)\""
+fi
+SETUP_COMMAND="${SETUP_COMMAND//__UV_SYNC_BLOCK__/${UV_SYNC_BLOCK}}"
 export SETUP_COMMAND
 
-# Build COMMAND (matches baseline 11777073 with VARIANT overrides and env additions)
+# Build COMMAND (matches baseline 11777073 with VARIANT overrides and env additions).
+# When VLLM_WHEEL_URL is empty (mxfp8/both variants on May-13 container), drop the wheel
+# pin so uv uses the container's preinstalled vllm 0.17.1 cache.
+if [[ -n "${VLLM_WHEEL_URL}" ]]; then
+  VLLM_WHEEL_ENV="VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_WHEEL_URL}"
+else
+  VLLM_WHEEL_ENV=""
+fi
+
 export COMMAND="CUDA_HOME=/usr/local/cuda \
   CUDA_PATH=/usr/local/cuda \
   NRL_VLLM_USE_V1=1 \
   NRL_WG_USE_RAY_REF=1 \
-  VLLM_USE_PRECOMPILED=1 \
-  VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_x86_64.whl \
+  ${VLLM_WHEEL_ENV} \
   WANDB_API_KEY=${WANDB_API_KEY:-cd4db01aafd025d20369f8eee65e6292c28bfe0d} \
   HUGGINGFACE_TOKEN=${HF_TOKEN:-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} \
   HF_HOME=${HF_HOME_DIR} \
@@ -154,7 +193,7 @@ export COMMAND="CUDA_HOME=/usr/local/cuda \
   VLLM_CACHE_ROOT=${CACHE_BASE}/vllm_compile_cache \
   DG_JIT_CACHE_DIR=${CACHE_BASE}/vllm_compile_cache/deep_gemm \
   VLLM_DEEP_GEMM_WARMUP=skip \
-  NRL_FORCE_REBUILD_VENVS=true \
+  NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS_OVERRIDE:-true} \
   NRL_IGNORE_VERSION_MISMATCH=1 \
   RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
   UV_HTTP_TIMEOUT=3600 \
@@ -255,7 +294,9 @@ SBATCH_CMD=(
 echo "========================================"
 echo " VARIANT     : ${VARIANT} (tag: ${VARIANT_TAG})"
 echo " EXP_NAME    : ${EXP_NAME}"
+echo " Container   : ${CONTAINER}"
 echo " Branch      : $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)"
+echo " vllm wheel  : ${VLLM_WHEEL_URL:-<container default>}"
 echo " Extra ovrd  : ${EXTRA_OVERRIDES:-<none>}"
 echo " Extra envs  : ${EXTRA_ENVS:-<none>}"
 echo "========================================"
