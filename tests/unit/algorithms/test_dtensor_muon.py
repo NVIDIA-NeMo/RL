@@ -367,6 +367,171 @@ def test_optimizer_factory_dispatches_muon_builder_path():
 
 
 # ---------------------------------------------------------------------------
+# Operation-level unit tests for DTensorMuon-specific logic
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def single_rank_pg():
+    """Initialize a single-process gloo group so DTensor APIs work without
+    torchrun. Cheap enough to keep around for the whole module."""
+    import os
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29503")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            backend="gloo", rank=0, world_size=1
+        )
+        owned = True
+    else:
+        owned = False
+    yield
+    if owned:
+        torch.distributed.destroy_process_group()
+
+
+def test_placement_parser_replicate_only_dtensor_matches_plain_tensor(
+    single_rank_pg,
+):
+    """A DTensor with all-Replicate placements must route through the same
+    primitives as a plain tensor input — the per-step update is bit-identical."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Replicate
+
+    _seed()
+    full = torch.randn(16, 8)
+    grad = torch.randn(16, 8)
+
+    # Plain-tensor reference.
+    w_ref = nn.Parameter(full.clone())
+    w_ref.grad = grad.clone()
+    DTensorMuon([w_ref], lr=1e-3, momentum=0.0).step()
+
+    # Replicate-only DTensor.
+    mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
+    w_dt = nn.Parameter(
+        DTensor.from_local(full.clone(), mesh, [Replicate()], run_check=False)
+    )
+    w_dt.grad = DTensor.from_local(
+        grad.clone(), mesh, [Replicate()], run_check=False
+    )
+    DTensorMuon([w_dt], lr=1e-3, momentum=0.0).step()
+
+    _equal(w_dt.full_tensor(), w_ref.data)
+
+
+@pytest.mark.parametrize("shard_dim", [0, 1])
+def test_placement_parser_picks_shard_axis_on_2d_mesh(single_rank_pg, shard_dim):
+    """A 2D mesh that mirrors FSDP+TP composition must route through the
+    shard axis when one of its placements is Shard. Single-rank meshes make
+    the all-gather trivial but exercise the parsing branch."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Replicate, Shard
+
+    _seed()
+    full = torch.randn(16, 8)
+    grad = torch.randn(16, 8)
+
+    mesh = init_device_mesh("cpu", (1, 1), mesh_dim_names=("dp", "tp"))
+    placements = [Replicate(), Shard(shard_dim)]
+    w_dt = nn.Parameter(
+        DTensor.from_local(full.clone(), mesh, placements, run_check=False)
+    )
+    w_dt.grad = DTensor.from_local(
+        grad.clone(), mesh, placements, run_check=False
+    )
+    # Should not crash on a multi-axis mesh; the TP axis is the second one.
+    DTensorMuon([w_dt], lr=1e-3, momentum=0.0, tp_mode="duplicated").step()
+
+    # Compare against the plain-tensor reference; single-rank TP collapses
+    # to the no-comm path, so the result should be bit-identical.
+    w_ref = nn.Parameter(full.clone())
+    w_ref.grad = grad.clone()
+    DTensorMuon([w_ref], lr=1e-3, momentum=0.0).step()
+    _equal(w_dt.full_tensor(), w_ref.data)
+
+
+# ---------------------------------------------------------------------------
+# QKV reshape invariants
+# ---------------------------------------------------------------------------
+
+
+def _identity_orthogonalize_optim(qkv_shapes, hidden):
+    """Build a DTensorMuon whose orthogonalize is the identity so we can
+    isolate the QKV reshape logic from the Newton-Schulz math."""
+    optim = DTensorMuon(
+        [nn.Parameter(torch.empty(0, hidden))],
+        lr=1e-3,
+        split_qkv=True,
+        is_qkv_fn=lambda p: True,
+        qkv_split_shapes=qkv_shapes,
+    )
+    optim.scaled_orthogonalize_fn = lambda g: g  # identity for the reshape test
+    return optim
+
+
+def test_qkv_split_preserves_total_rows_and_hidden_dim():
+    """The split-orth-concat must reconstruct the same shape it consumed."""
+    hidden = 8
+    qkv_shapes = (4, 2, 2)
+    num_query_groups = 3
+    rows = num_query_groups * sum(qkv_shapes)
+    grad = torch.randn(rows, hidden)
+    out = _identity_orthogonalize_optim(qkv_shapes, hidden)._qkv_split_orthogonalize(grad)
+    assert out.shape == grad.shape
+    # With identity orthogonalize, the reshape round-trip must be lossless.
+    _equal(out, grad)
+
+
+@pytest.mark.parametrize("num_query_groups", [1, 2, 5])
+def test_qkv_split_preserves_slice_order_q_then_k_then_v(num_query_groups):
+    """Splits emerge in Q -> K -> V order (matches Megatron's convention at
+    muon.py:144-159). Build a grad with distinct constant values per slice
+    and assert the reconstructed output still has the same partition."""
+    hidden = 4
+    qkv_shapes = (3, 2, 2)
+    per_head = sum(qkv_shapes)
+    rows = num_query_groups * per_head
+    # Build a grad where each (query_group, slice) pair has a unique constant.
+    grad = torch.zeros(num_query_groups, per_head, hidden)
+    grad[:, 0 : qkv_shapes[0], :] = 1.0
+    grad[:, qkv_shapes[0] : qkv_shapes[0] + qkv_shapes[1], :] = 2.0
+    grad[:, qkv_shapes[0] + qkv_shapes[1] :, :] = 3.0
+    grad_flat = grad.view(rows, hidden)
+
+    out = _identity_orthogonalize_optim(qkv_shapes, hidden)._qkv_split_orthogonalize(
+        grad_flat
+    )
+    out_view = out.view(num_query_groups, per_head, hidden)
+    assert (out_view[:, 0 : qkv_shapes[0], :] == 1.0).all()
+    assert (
+        out_view[:, qkv_shapes[0] : qkv_shapes[0] + qkv_shapes[1], :] == 2.0
+    ).all()
+    assert (out_view[:, qkv_shapes[0] + qkv_shapes[1] :, :] == 3.0).all()
+
+
+def test_qkv_split_rejects_misaligned_grad_rows():
+    """Row count not divisible by sum(qkv_shapes) is an error: the per-head
+    reshape would silently bend the slice boundaries otherwise."""
+    optim = _identity_orthogonalize_optim((4, 2, 2), hidden=4)
+    bad_grad = torch.randn(9, 4)  # 9 is not a multiple of 8
+    with pytest.raises(ValueError, match="not divisible"):
+        optim._qkv_split_orthogonalize(bad_grad)
+
+
+def test_qkv_split_mha_equal_q_k_v_shapes():
+    """MHA (no GQA) has q == k == v per-head; the split path must still work."""
+    optim = _identity_orthogonalize_optim((4, 4, 4), hidden=8)
+    grad = torch.randn(24, 8)  # 2 query groups
+    out = optim._qkv_split_orthogonalize(grad)
+    assert out.shape == grad.shape
+    _equal(out, grad)
+
+
+# ---------------------------------------------------------------------------
 # Multi-rank TP equivalence tests (CPU + gloo backend via mp.spawn)
 # ---------------------------------------------------------------------------
 
@@ -386,8 +551,10 @@ def _tp_worker(
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import DTensor, Shard
 
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29501")
+    # Overwrite (not setdefault) so a parent-process group's env doesn't leak
+    # through into the spawned worker and pin it to the wrong port / size.
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29501"
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
 
