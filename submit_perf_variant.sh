@@ -44,9 +44,9 @@ case "$VARIANT" in
     # 0.13-container path and conflict with May-13 torch 2.10.
     export NRL_FORCE_REBUILD_VENVS_OVERRIDE="false"
     EXTRA_OVERRIDES="  policy.generation.vllm_cfg.precision=fp8 \
-  policy.generation.vllm_cfg.is_mx=true \
-  policy.generation.vllm_cfg.pow2_weight_scaling_factors=true \
-  policy.generation.vllm_cfg.pow2_activation_scaling_factors=true"
+  ++policy.generation.vllm_cfg.is_mx=true \
+  ++policy.generation.vllm_cfg.pow2_weight_scaling_factors=true \
+  ++policy.generation.vllm_cfg.pow2_activation_scaling_factors=true"
     # EMULATION backend is pure-torch, no flashinfer dependencies. MNNVL not available on H100.
     EXTRA_ENVS=""
     ;;
@@ -66,9 +66,9 @@ case "$VARIANT" in
     VLLM_WHEEL_URL=""
     export NRL_FORCE_REBUILD_VENVS_OVERRIDE="false"
     EXTRA_OVERRIDES="  policy.generation.vllm_cfg.precision=fp8 \
-  policy.generation.vllm_cfg.is_mx=true \
-  policy.generation.vllm_cfg.pow2_weight_scaling_factors=true \
-  policy.generation.vllm_cfg.pow2_activation_scaling_factors=true \
+  ++policy.generation.vllm_cfg.is_mx=true \
+  ++policy.generation.vllm_cfg.pow2_weight_scaling_factors=true \
+  ++policy.generation.vllm_cfg.pow2_activation_scaling_factors=true \
   policy.megatron_cfg.moe_token_dispatcher_type=flex \
   ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep \
   policy.megatron_cfg.moe_shared_expert_overlap=True"
