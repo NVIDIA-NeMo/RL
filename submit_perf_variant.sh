@@ -95,7 +95,7 @@ git pull --ff-only
 
 export OMP_NUM_THREADS=16
 export CONTAINER
-export MOUNTS="/lustre:/lustre,${REPO_DIR}:${REPO_DIR},${REPO_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+export MOUNTS="/lustre:/lustre,${REPO_DIR}:${REPO_DIR},${REPO_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym,${REPO_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
 
 # Sandbox: baseline 11777073 skipped this. SWE-bench apptainer is installed via SETUP_COMMAND
 # instead of via a separate ray.sub sandbox srun.
@@ -154,6 +154,37 @@ rm -rf /tmp/nemo_rl_vllm_cache /tmp/nemo_rl_vllm_cache_*
 rm -rf "/tmp/nemo_rl_inductor_cache" "/tmp/nemo_rl_triton_cache"
 mkdir -p "/tmp/nemo_rl_inductor_cache" "/tmp/nemo_rl_triton_cache"
 
+# Relax Gym ray pin so subprocess uv installs match parent ray (head_server_deps
+# injects parent ray version: 2.54.0 on May-13 container, vs Gym pin 2.49.2).
+# Without this, policy_model/swe_agents/vllm_model venv creation fails with
+# uv resolver "unsatisfiable" and Process `policy_model` finished unexpectedly.
+GYM_PYP=/opt/nemo-rl/3rdparty/Gym-workspace/Gym/pyproject.toml
+if [ -f "$GYM_PYP" ]; then
+  sed -i "s|\"ray\\[default\\]==[0-9.]\\+\"|\"ray[default]\"|g" "$GYM_PYP"
+  echo "[SETUP] Gym ray pin relaxed:"
+  grep -n "ray\\[default\\]" "$GYM_PYP" | head -3 || true
+fi
+
+# Wipe Gym subprocess .venv dirs whose interpreter cannot import ray. May-13 container
+# is py3.13 but venvs from earlier super-v3 runs were built as py3.12, leaving
+# lib/python3.13/site-packages empty. NEMO_GYM_SKIP_VENV_IF_PRESENT=1 keeps them
+# unchanged, so app.py crashes with ModuleNotFoundError: No module named 'ray'.
+# Wiping forces a clean rebuild on the next NemoGym _spinup() under current container python.
+for VENV in /opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/.venv \
+            /opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/.venv; do
+  if [ -d "$VENV" ]; then
+    if [ ! -x "$VENV/bin/python" ]; then
+      echo "[SETUP] Wiping half-built Gym subprocess venv (missing bin/python): $VENV"
+      rm -rf "$VENV"
+    elif ! "$VENV/bin/python" -c "import ray" 2>/dev/null; then
+      echo "[SETUP] Wiping stale Gym subprocess venv (ray not importable): $VENV"
+      rm -rf "$VENV"
+    else
+      echo "[SETUP] Gym subprocess venv OK (ray importable): $VENV"
+    fi
+  fi
+done
+
 __UV_SYNC_BLOCK__
 SETUP_EOF
 
@@ -164,6 +195,7 @@ if [[ -n "${VLLM_WHEEL_URL}" ]]; then
   UV_SYNC_BLOCK="VLLM_USE_PRECOMPILED=1 \\
 VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_WHEEL_URL} \\
 UV_HTTP_TIMEOUT=3600 \\
+UV_LOCK_TIMEOUT=3600 \\
 uv sync --frozen"
 else
   UV_SYNC_BLOCK="echo \"[SETUP] Skipping uv sync — using container preinstalled venv (vllm 0.17.1 + torch 2.10)\""
@@ -209,6 +241,7 @@ export COMMAND="CUDA_HOME=/usr/local/cuda \
   NRL_IGNORE_VERSION_MISMATCH=1 \
   RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
   UV_HTTP_TIMEOUT=3600 \
+  UV_LOCK_TIMEOUT=3600 \
   TORCH_CUDA_ARCH_LIST='${TORCH_CUDA_ARCH_LIST_OVERRIDE:-9.0 10.0}' \
   NEMO_GYM_SKIP_VENV_IF_PRESENT=1 ${LOCAL_NEMO_RL_PYTHONPATH} ${EXTRA_ENVS} \
   ${LAUNCHER} ./examples/nemo_gym/run_grpo_nemo_gym.py \
