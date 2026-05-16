@@ -529,10 +529,12 @@ class TQDataPlaneClient(DataPlaneClient):
             partition_id=partition_id,
         )
 
-        # Lift sequence lengths from the rollout-side `input_lengths` tag
-        # if present. Driver-side balancing (shard_meta_for_dp) needs
-        # this; the task-mediated path does not.
-        tags = tq_meta.custom_meta or [{} for _ in keys]
+        # Propagate per-key tags. ``sequence_lengths`` is lifted out of
+        # the ``input_lengths`` tag if present (kept as a typed list
+        # because shard_meta_for_dp reads it directly), but the rest
+        # of the tag dict travels through unchanged so consumers can
+        # filter on it without fetching data.
+        tags = list(tq_meta.custom_meta) if tq_meta.custom_meta else [{} for _ in keys]
         seqlens: list[int] | None = None
         if tags and any("input_lengths" in t for t in tags):
             seqlens = [int(t.get("input_lengths", 0)) for t in tags]
@@ -543,6 +545,7 @@ class TQDataPlaneClient(DataPlaneClient):
             keys=keys,
             fields=list(required_fields),
             sequence_lengths=seqlens,
+            tags=tags if tags else None,
         )
 
     def get_data(
@@ -618,6 +621,7 @@ class TQDataPlaneClient(DataPlaneClient):
             task_name=None,
             keys=list(keys),
             fields=field_names,
+            tags=[dict(t) for t in tags] if tags else None,
         )
 
     def kv_batch_get(

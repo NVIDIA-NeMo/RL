@@ -66,6 +66,7 @@ def test_kvbatchmeta_schema_unchanged() -> None:
         "fields",
         "sequence_lengths",
         "extra_info",
+        "tags",
     }
     actual_fields = {f.name for f in KVBatchMeta.__dataclass_fields__.values()}
     assert actual_fields == expected_fields, (

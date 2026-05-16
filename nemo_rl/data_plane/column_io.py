@@ -123,6 +123,7 @@ def kv_first_write(
     extra_info: dict[str, Any] | None = None,
     task_name: str = "train",
     pad_to_multiple: int = 1,
+    tags: list[dict[str, Any]] | None = None,
 ) -> KVBatchMeta:
     """Single flat ``kv_batch_put`` of every tensor field in ``final_batch_cpu``.
 
@@ -145,6 +146,10 @@ def kv_first_write(
         pad_to_multiple: Seq-dim alignment recorded in ``extra_info`` so
             readers pad to a multiple compatible with downstream backends
             (mcore SP, PyTorch CP).
+        tags: Optional per-key primitive metadata (one dict per row).
+            Stored on the TQ controller alongside keys; travels with
+            ``KVBatchMeta`` through ``subset`` / ``concat`` / ``slice``
+            so consumers can filter on it without fetching tensor data.
 
     Returns:
         ``KVBatchMeta`` covering the written keys.
@@ -153,6 +158,10 @@ def kv_first_write(
     if n == 0 or len(keys) != n:
         raise ValueError(
             f"kv_first_write: keys ({len(keys)}) must match batch size ({n})"
+        )
+    if tags is not None and len(tags) != n:
+        raise ValueError(
+            f"kv_first_write: tags ({len(tags)}) must match batch size ({n})"
         )
     lengths = final_batch_cpu["input_lengths"]
     fields: dict[str, torch.Tensor | np.ndarray] = {
@@ -166,6 +175,7 @@ def kv_first_write(
         keys=list(keys),
         partition_id=partition_id,
         fields=td,
+        tags=tags,
     )
 
     extras = dict(extra_info or {})
@@ -178,4 +188,5 @@ def kv_first_write(
         fields=list(td.keys()),
         sequence_lengths=[int(s) for s in lengths.tolist()],
         extra_info=extras,
+        tags=[dict(t) for t in tags] if tags is not None else None,
     )

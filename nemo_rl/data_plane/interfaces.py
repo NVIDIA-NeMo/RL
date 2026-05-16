@@ -100,6 +100,19 @@ class KVBatchMeta:
     fields: list[str] | None = None
     sequence_lengths: list[int] | None = None
     extra_info: dict[str, Any] = field(default_factory=dict)
+    # Per-key primitive sidecar. Aligned 1:1 with ``keys`` when
+    # populated. Producers stamp filter scalars (std, total_reward,
+    # weight_version, …) here at ``kv_batch_put`` time so consumers
+    # can filter without fetching tensor data. Mirrors verl's pattern
+    # and TQ's underlying ``KVBatchMeta.tags``.
+    tags: list[dict[str, Any]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.tags is not None and len(self.tags) != len(self.keys):
+            raise ValueError(
+                f"KVBatchMeta: tags ({len(self.tags)}) must align 1:1 with "
+                f"keys ({len(self.keys)})"
+            )
 
     @property
     def size(self) -> int:
@@ -117,8 +130,9 @@ class KVBatchMeta:
         *,
         keys: list[str],
         sequence_lengths: list[int] | None,
+        tags: list[dict[str, Any]] | None = None,
     ) -> "KVBatchMeta":
-        """Return a copy with new keys/sequence_lengths, same metadata otherwise."""
+        """Return a copy with new keys/sequence_lengths/tags, same metadata otherwise."""
         return KVBatchMeta(
             partition_id=self.partition_id,
             task_name=self.task_name,
@@ -128,6 +142,7 @@ class KVBatchMeta:
             if sequence_lengths is not None
             else None,
             extra_info=dict(self.extra_info or {}),
+            tags=list(tags) if tags is not None else None,
         )
 
     def subset(self, indices: "Sequence[int]") -> "KVBatchMeta":
@@ -138,6 +153,9 @@ class KVBatchMeta:
                 [self.sequence_lengths[i] for i in indices]
                 if self.sequence_lengths is not None
                 else None
+            ),
+            tags=(
+                [self.tags[i] for i in indices] if self.tags is not None else None
             ),
         )
 
@@ -150,6 +168,7 @@ class KVBatchMeta:
                 if self.sequence_lengths is not None
                 else None
             ),
+            tags=self.tags[start:stop] if self.tags is not None else None,
         )
 
     def concat(self, *others: "KVBatchMeta") -> "KVBatchMeta":
@@ -164,7 +183,11 @@ class KVBatchMeta:
             if all_have_lens
             else None
         )
-        return self._replace(keys=keys, sequence_lengths=seq_lens)
+        all_have_tags = all(m.tags is not None for m in all_m)
+        tags = (
+            [t for m in all_m for t in (m.tags or [])] if all_have_tags else None
+        )
+        return self._replace(keys=keys, sequence_lengths=seq_lens, tags=tags)
 
 
 class DataPlaneClient(ABC):

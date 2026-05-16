@@ -205,7 +205,7 @@ def test_kv_clear_uses_meta_keys_minted_at_rollout():
 # grpo_sync.py without requiring a full trainer to spin up.
 
 
-def _slice_data(rewards: list[float], stds: list[float]) -> BatchedDataDict:
+def _make_driver_carry(rewards: list[float], stds: list[float]) -> BatchedDataDict:
     n = len(rewards)
     return BatchedDataDict(
         {
@@ -231,19 +231,28 @@ def _seed_meta(client: NoOpDataPlaneClient, prefix: str, n: int) -> KVBatchMeta:
     )
 
 
+def _stamp_filter_tags(meta: KVBatchMeta, stds: list[float]) -> KVBatchMeta:
+    """Mirror the driver's post-baseline/std step: stamp ``std`` into
+    ``meta.tags`` so ``_apply_dynamic_sampling`` can read the filter
+    criterion from the meta alone."""
+    meta.tags = [{"std": float(s)} for s in stds]
+    return meta
+
+
 def test_apply_dynamic_sampling_filters_zero_std():
     """Drops uids whose std == 0 and clears their TQ payload."""
     from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
 
     client = NoOpDataPlaneClient()
     meta = _seed_meta(client, "u", n=4)
-    sd = _slice_data([1.0, 2.0, 3.0, 4.0], [0.5, 0.0, 0.5, 0.0])
+    _stamp_filter_tags(meta, [0.5, 0.0, 0.5, 0.0])
+    sd = _make_driver_carry([1.0, 2.0, 3.0, 4.0], [0.5, 0.0, 0.5, 0.0])
 
     pm, ps, pur, complete, ds_metrics, _ = _apply_dynamic_sampling(
         meta=meta,
-        slice_data=sd,
+        driver_carry=sd,
         pending_meta=None,
-        pending_slice=None,
+        pending_carry=None,
         pending_unfiltered_rewards=[],
         train_prompts_size=4,
         num_gen_batches=1,
@@ -283,13 +292,14 @@ def test_apply_dynamic_sampling_completes_when_train_size_reached():
 
     client = NoOpDataPlaneClient()
     meta = _seed_meta(client, "u", n=4)
-    sd = _slice_data([1.0, 2.0, 3.0, 4.0], [0.5, 0.5, 0.5, 0.5])
+    _stamp_filter_tags(meta, [0.5, 0.5, 0.5, 0.5])
+    sd = _make_driver_carry([1.0, 2.0, 3.0, 4.0], [0.5, 0.5, 0.5, 0.5])
 
     pm, ps, _, complete, ds_metrics, unfiltered = _apply_dynamic_sampling(
         meta=meta,
-        slice_data=sd,
+        driver_carry=sd,
         pending_meta=None,
-        pending_slice=None,
+        pending_carry=None,
         pending_unfiltered_rewards=[],
         train_prompts_size=4,
         num_gen_batches=1,
@@ -309,13 +319,14 @@ def test_apply_dynamic_sampling_overflow_slices_and_clears():
 
     client = NoOpDataPlaneClient()
     meta = _seed_meta(client, "u", n=6)
-    sd = _slice_data([1.0] * 6, [0.5] * 6)
+    _stamp_filter_tags(meta, [0.5] * 6)
+    sd = _make_driver_carry([1.0] * 6, [0.5] * 6)
 
     pm, ps, _, complete, ds_metrics, _ = _apply_dynamic_sampling(
         meta=meta,
-        slice_data=sd,
+        driver_carry=sd,
         pending_meta=None,
-        pending_slice=None,
+        pending_carry=None,
         pending_unfiltered_rewards=[],
         train_prompts_size=4,  # only need 4; 2 should be discarded
         num_gen_batches=1,
@@ -342,16 +353,17 @@ def test_apply_dynamic_sampling_raises_on_max_gen_batches():
 
     client = NoOpDataPlaneClient()
     meta = _seed_meta(client, "u", n=2)
-    sd = _slice_data([1.0, 2.0], [0.0, 0.0])  # all dropped
+    _stamp_filter_tags(meta, [0.0, 0.0])
+    sd = _make_driver_carry([1.0, 2.0], [0.0, 0.0])  # all dropped
 
     import pytest
 
     with pytest.raises(ValueError, match=r"max_gen_batches"):
         _apply_dynamic_sampling(
             meta=meta,
-            slice_data=sd,
+            driver_carry=sd,
             pending_meta=None,
-            pending_slice=None,
+            pending_carry=None,
             pending_unfiltered_rewards=[],
             train_prompts_size=4,
             num_gen_batches=11,

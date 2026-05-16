@@ -17,10 +17,13 @@ Sibling fork of ``nemo_rl.algorithms.grpo``. Each file has zero
 internal branching on whether TQ is engaged; the example script
 chooses one or the other based on ``data_plane.enabled``.
 
-Setup, helpers, and ``validate`` are re-imported from ``grpo``; only the
-training loop body is duplicated here so the per-step lifecycle hooks
-(register / seed-put / per-rank fetch / clear) can live in straight
-sequential code.
+Setup and helpers are re-imported from ``grpo``; the training loop body
+is duplicated here so the per-step lifecycle hooks (register / seed-put
+/ per-rank fetch / clear) can live in straight sequential code.
+Validation is implemented locally as :func:`validate_sync` — a
+TQ-mediated sibling of :func:`nemo_rl.algorithms.grpo.validate` that
+routes val rollouts through ``SyncRolloutActor.rollout_to_tq`` into a
+per-batch ``"val"`` partition.
 
 Parity with the legacy path is verified by running the same config
 against both entrypoints and diffing the wandb runs.
@@ -28,6 +31,7 @@ against both entrypoints and diffing the wandb runs.
 
 from __future__ import annotations
 
+import gc
 import os
 import uuid
 import warnings
@@ -45,10 +49,10 @@ from nemo_rl.algorithms.grpo import (
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
     _should_log_nemo_gym_responses,
+    _should_use_nemo_gym,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
     scale_rewards,
-    validate,
 )
 from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
@@ -65,14 +69,14 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.column_io import read_columns, write_columns
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
-from nemo_rl.data_plane.schema import DP_CALIB_EXCLUDED_FIELDS
+from nemo_rl.data_plane.schema import DP_CALIB_EXCLUDED_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.checkpoint import CheckpointManager
-from nemo_rl.utils.logger import Logger
+from nemo_rl.utils.logger import Logger, print_message_log_samples
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -83,15 +87,13 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 # on std != 0, accumulate survivors across iterations, slice on overflow.
 # Bulk in TQ untouched except for kv_clear of dropped/discarded uids.
 
-_DSlice = BatchedDataDict[Any]
-
 
 def _apply_dynamic_sampling(
     *,
     meta: KVBatchMeta,
-    slice_data: _DSlice,
+    driver_carry: BatchedDataDict,
     pending_meta: Optional[KVBatchMeta],
-    pending_slice: Optional[_DSlice],
+    pending_carry: Optional[BatchedDataDict],
     pending_unfiltered_rewards: list[torch.Tensor],
     train_prompts_size: int,
     num_gen_batches: int,
@@ -99,7 +101,7 @@ def _apply_dynamic_sampling(
     dp_client: DataPlaneClient,
 ) -> tuple[
     Optional[KVBatchMeta],
-    Optional[_DSlice],
+    Optional[BatchedDataDict],
     list[torch.Tensor],
     bool,
     dict[str, Any],
@@ -114,9 +116,10 @@ def _apply_dynamic_sampling(
 
     Args:
         meta: This iteration's ``KVBatchMeta``.
-        slice_data: Per-sample driver-side slice for this iteration.
+        driver_carry: Per-row driver-local tensors for this iteration
+            (rewards, masks, prompt_ids_for_adv, baseline/std, …).
         pending_meta: Survivors accumulated from prior iterations.
-        pending_slice: Slice data for ``pending_meta``.
+        pending_carry: ``driver_carry`` rows aligned to ``pending_meta``.
         pending_unfiltered_rewards: All iterations' rewards pre-filter,
             for legacy reward metric parity.
         train_prompts_size: Target batch size.
@@ -125,31 +128,40 @@ def _apply_dynamic_sampling(
         dp_client: Data-plane client used to clear filtered keys.
 
     Returns:
-        ``(pending_meta, pending_slice, pending_rewards, is_complete,
+        ``(pending_meta, pending_carry, pending_rewards, is_complete,
         ds_metrics, unfiltered_for_log)``.
     """
     # Cumulative unfiltered total_reward for legacy metrics["reward"]
     # parity. Reference-only append (no copy) — slice tensors are
     # produced fresh per iteration, not aliased to TQ-owned bulk.
-    pending_unfiltered_rewards.append(slice_data["total_reward"])
+    pending_unfiltered_rewards.append(driver_carry["total_reward"])
 
-    keep_mask = slice_data["std"] != 0.0
-    keep_idx = keep_mask.nonzero(as_tuple=True)[0].tolist()
-    drop_keys = [k for k, keep in zip(meta.keys, keep_mask.tolist()) if not keep]
+    # Filter input comes from ``meta.tags`` so the filter decision is
+    # meta-only — no tensor data needed. The driver mirrored ``std``
+    # into tags right after baseline/std compute.
+    if meta.tags is None:
+        raise ValueError(
+            "_apply_dynamic_sampling: meta.tags is None — driver must "
+            "stamp 'std' into meta.tags before this call."
+        )
+    keep_idx = [i for i, t in enumerate(meta.tags) if t["std"] != 0.0]
+    drop_keys = [k for k, t in zip(meta.keys, meta.tags) if t["std"] == 0.0]
     if drop_keys:
         dp_client.kv_clear(keys=drop_keys, partition_id=meta.partition_id)
 
-    # Subset this iteration's survivors and merge into the running cache.
+    # Subset survivors and merge into the running cache.
     if keep_idx:
-        km = meta.subset(keep_idx)
-        ks = slice_data.select_indices(keep_idx)
-        ks["filtered_reward"] = ks["total_reward"]
+        survivors_meta = meta.subset(keep_idx)
+        survivors_carry = driver_carry.select_indices(keep_idx)
+        survivors_carry["filtered_reward"] = survivors_carry["total_reward"]
         if pending_meta is None:
-            pending_meta, pending_slice = km, ks
+            pending_meta, pending_carry = survivors_meta, survivors_carry
         else:
-            assert pending_slice is not None
-            pending_meta = pending_meta.concat(km)
-            pending_slice = BatchedDataDict.from_batches([pending_slice, ks])
+            assert pending_carry is not None
+            pending_meta = pending_meta.concat(survivors_meta)
+            pending_carry = BatchedDataDict.from_batches(
+                [pending_carry, survivors_carry]
+            )
 
     n = len(pending_meta.keys) if pending_meta is not None else 0
     if n < train_prompts_size:
@@ -159,23 +171,144 @@ def _apply_dynamic_sampling(
                 f"Increase grpo.dynamic_sampling_max_gen_batches or revisit "
                 f"data diversity / num_prompts_per_step / num_generations_per_prompt."
             )
-        return pending_meta, pending_slice, pending_unfiltered_rewards, False, {}, None
+        return pending_meta, pending_carry, pending_unfiltered_rewards, False, {}, None
 
     ds_metrics: dict[str, Any] = {"dynamic_sampling_num_gen_batches": num_gen_batches}
+    assert pending_meta is not None and pending_carry is not None
     if n > train_prompts_size:
-        assert pending_meta is not None and pending_slice is not None
         dp_client.kv_clear(
             keys=list(pending_meta.keys[train_prompts_size:]),
             partition_id=pending_meta.partition_id,
         )
         pending_meta = pending_meta.slice(0, train_prompts_size)
-        pending_slice = pending_slice.slice(0, train_prompts_size)
+        pending_carry = pending_carry.slice(0, train_prompts_size)
         ds_metrics["dynamic_sampling_num_discarded_valid_samples"] = (
             n - train_prompts_size
         )
 
     unfiltered_for_log = torch.cat(pending_unfiltered_rewards)[:train_prompts_size]
-    return pending_meta, pending_slice, [], True, ds_metrics, unfiltered_for_log
+    return pending_meta, pending_carry, [], True, ds_metrics, unfiltered_for_log
+
+
+def validate_sync(
+    *,
+    rollout_actor: SyncRolloutActor,
+    dp_client: DataPlaneClient,
+    val_dataloader: Optional[StatefulDataLoader],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    step: int,
+    master_config: MasterConfig,
+    logger: Optional[Logger] = None,
+    partition_id: str = "val",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """TQ-mediated counterpart to :func:`nemo_rl.algorithms.grpo.validate`.
+
+    Per-batch: ``register_partition`` → ``rollout_to_tq`` →
+    ``read_columns(turn_roles, turn_contents)`` → ``kv_clear``. Caller
+    owns ``policy_generation.prepare_for_generation`` / ``finish_generation``
+    around the call; the actor's per-rollout ``finish_generation`` is
+    suppressed so inference state stays warm across batches.
+    """
+    if val_dataloader is None:
+        assert master_config.grpo["val_period"] == 0, (
+            "val_dataloader is None, so grpo.val_period must be 0"
+        )
+        print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
+        return {}, {}
+
+    timer = Timer()
+    total_rewards: list[float] = []
+    total_lengths: list[float] = []
+    all_message_logs: list[list[dict[str, str]]] = []
+    additional_metrics: dict[str, Any] = {}
+    # Per-batch invariants — hoisted out of the loop.
+    fields = list(DP_TRAIN_FIELDS)
+    capture_extras = _should_use_nemo_gym(master_config)
+
+    with timer.time("total_validation_time"):
+        print(f"▶ Starting validation at step {step}...", flush=True)
+        max_batches = (
+            master_config.grpo["max_val_samples"]
+            // master_config.grpo["val_batch_size"]
+        )
+        for batch_idx, val_batch in enumerate(val_dataloader):
+            if batch_idx >= max_batches:
+                break
+            n_prompts = int(val_batch.size)
+            uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
+            dp_client.register_partition(
+                partition_id=partition_id,
+                fields=fields,
+                num_samples=n_prompts,
+                consumer_tasks=[partition_id],
+                grpo_group_size=None,
+            )
+            meta, driver_carry, rollout_metrics, _ = ray.get(
+                rollout_actor.rollout_to_tq.remote(
+                    val_batch,
+                    uids=uids,
+                    partition_id=partition_id,
+                    first_iter=False,
+                    finish_generation=False,
+                    task_to_env_override=val_task_to_env,
+                )
+            )
+            mlog_cols = read_columns(
+                dp_client, meta, select_fields=["turn_roles", "turn_contents"]
+            )
+            roles, contents = mlog_cols["turn_roles"], mlog_cols["turn_contents"]
+            total_rewards.extend(driver_carry["total_reward"].tolist())
+            total_lengths.append(rollout_metrics["mean_gen_tokens_per_sample"])
+            all_message_logs.extend(
+                [{"role": r, "content": c} for r, c in zip(roles[i], contents[i])]
+                for i in range(n_prompts)
+            )
+            if capture_extras:
+                additional_metrics = rollout_metrics
+            dp_client.kv_clear(keys=meta.keys, partition_id=partition_id)
+
+        accuracy = (
+            torch.tensor(total_rewards, dtype=torch.float32).mean().item()
+            if total_rewards
+            else 0.0
+        )
+        avg_length = (
+            sum(total_lengths) / len(total_lengths) if total_lengths else 0.0
+        )
+        val_metrics = {"accuracy": accuracy, "avg_length": avg_length, **additional_metrics}
+        try:
+            print_message_log_samples(
+                all_message_logs,
+                total_rewards,
+                num_samples=min(
+                    master_config.logger["num_val_samples_to_print"],
+                    len(all_message_logs),
+                ),
+                step=step,
+            )
+        except Exception as e:
+            print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
+            print("  ⚠️ Continuing validation without displaying samples...", flush=True)
+
+    timing_metrics = timer.get_timing_metrics(reduction_op="sum")
+    print(
+        f"\n📊 Validation Results:\n"
+        f"    • Accuracy: {accuracy:.4f}\n"
+        f"    • Average response length: {avg_length:.1f} tokens\n"
+        f"    • Samples processed: {len(total_rewards)}\n"
+        f"  ⏱️  Total validation time: "
+        f"{timing_metrics.get('total_validation_time', 0):.2f}s",
+        flush=True,
+    )
+    if logger is not None:
+        logger.log_batched_dict_as_jsonl(
+            {"content": all_message_logs, "rewards": total_rewards},
+            f"val_data_step{step}.jsonl",
+        )
+    timer.reset()
+    gc.collect()
+    torch.cuda.empty_cache()
+    return val_metrics, timing_metrics
 
 
 def grpo_train_sync(
@@ -310,11 +443,11 @@ def grpo_train_sync(
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
-        val_metrics, validation_timings = validate(
-            policy_generation,
-            val_dataloader,
-            tokenizer,
-            val_task_to_env,
+        val_metrics, validation_timings = validate_sync(
+            rollout_actor=rollout_actor,
+            dp_client=policy.dp_client,
+            val_dataloader=val_dataloader,
+            val_task_to_env=val_task_to_env,
             step=0,
             master_config=master_config,
             logger=logger,
@@ -341,7 +474,7 @@ def grpo_train_sync(
         # legacy ``metrics["reward"]`` semantics (cumulative unfiltered
         # total_reward across all contributing iterations).
         pending_meta = None
-        pending_slice: Optional[_DSlice] = None
+        pending_carry: Optional[BatchedDataDict] = None
         pending_unfiltered_rewards: list[torch.Tensor] = []
         dynamic_sampling_num_gen_batches = 0
 
@@ -454,7 +587,7 @@ def grpo_train_sync(
                     # sync if either is renamed.
                     (
                         meta,
-                        slice_extras,
+                        driver_carry,
                         rollout_metrics,
                         generation_logger_metrics,
                     ) = ray.get(
@@ -465,8 +598,6 @@ def grpo_train_sync(
                             first_iter=(dynamic_sampling_num_gen_batches == 1),
                         )
                     )
-                    slice_data: _DSlice = BatchedDataDict[Any](slice_extras)
-                    del slice_extras
 
                     if not _should_log_nemo_gym_responses(master_config):
                         for key in list(rollout_metrics):
@@ -486,29 +617,41 @@ def grpo_train_sync(
                 # now back on the driver where they belong (no bulk
                 # touched by any of these ops).
                 with timer.time("reward_calculation"):
-                    slice_data = scale_rewards(
-                        slice_data,
+                    driver_carry = scale_rewards(
+                        driver_carry,
                         master_config["grpo"]["reward_scaling"],
                     )
                     if master_config["grpo"]["reward_shaping"]["enabled"]:
-                        slice_data = apply_reward_shaping(
-                            slice_data,
+                        driver_carry = apply_reward_shaping(
+                            driver_carry,
                             master_config["grpo"]["reward_shaping"],
                         )
                     if master_config["grpo"]["overlong_filtering"]:
-                        lm = slice_data["loss_multiplier"].clone()
-                        lm[slice_data["truncated"]] = 0
-                        slice_data["loss_multiplier"] = lm
-                    slice_data["baseline"], slice_data["std"] = (
+                        lm = driver_carry["loss_multiplier"].clone()
+                        lm[driver_carry["truncated"]] = 0
+                        driver_carry["loss_multiplier"] = lm
+                    driver_carry["baseline"], driver_carry["std"] = (
                         calculate_baseline_and_std_per_prompt(
-                            slice_data["prompt_ids_for_adv"],
-                            slice_data["total_reward"],
-                            torch.ones_like(slice_data["total_reward"]),
+                            driver_carry["prompt_ids_for_adv"],
+                            driver_carry["total_reward"],
+                            torch.ones_like(driver_carry["total_reward"]),
                             leave_one_out_baseline=master_config["grpo"][
                                 "use_leave_one_out_baseline"
                             ],
                         )
                     )
+                    # Mirror std onto meta so dynamic_sampling can filter
+                    # without fetching tensor data.
+                    if meta.tags is None:
+                        meta.tags = [{} for _ in meta.keys]
+                    for i, (s, b) in enumerate(
+                        zip(
+                            driver_carry["std"].tolist(),
+                            driver_carry["baseline"].tolist(),
+                        )
+                    ):
+                        meta.tags[i]["std"] = float(s)
+                        meta.tags[i]["baseline"] = float(b)
 
                 # ── Dynamic sampling (DAPO non-zero-std filter) ────────
                 # Slice-only; bulk in TQ untouched except for kv_clear
@@ -523,16 +666,16 @@ def grpo_train_sync(
                         )
                         (
                             pending_meta,
-                            pending_slice,
+                            pending_carry,
                             pending_unfiltered_rewards,
                             is_complete,
                             ds_metrics,
                             unfiltered_rewards_for_logging,
                         ) = _apply_dynamic_sampling(
                             meta=meta,
-                            slice_data=slice_data,
+                            driver_carry=driver_carry,
                             pending_meta=pending_meta,
-                            pending_slice=pending_slice,
+                            pending_carry=pending_carry,
                             pending_unfiltered_rewards=pending_unfiltered_rewards,
                             train_prompts_size=train_prompts_size,
                             num_gen_batches=dynamic_sampling_num_gen_batches,
@@ -557,23 +700,23 @@ def grpo_train_sync(
 
                         # Adopt the now-complete cache as this step's batch.
                         meta = pending_meta
-                        slice_data = pending_slice
+                        driver_carry = pending_carry
                         pending_meta = None
-                        pending_slice = None
+                        pending_carry = None
 
                 # ── Unpack slice (small per-sample tensors) ────────────
                 rewards = (
-                    slice_data["filtered_reward"]
+                    driver_carry["filtered_reward"]
                     if master_config["grpo"]["use_dynamic_sampling"]
-                    else slice_data["total_reward"]
+                    else driver_carry["total_reward"]
                 )
-                baseline = slice_data["baseline"]
-                std = slice_data["std"]
-                input_lengths = slice_data["input_lengths"]
-                prompt_ids_for_adv = slice_data["prompt_ids_for_adv"]
-                loss_multiplier = slice_data["loss_multiplier"]
-                truncated = slice_data["truncated"]
-                length = slice_data["length"]
+                baseline = driver_carry["baseline"]
+                std = driver_carry["std"]
+                input_lengths = driver_carry["input_lengths"]
+                prompt_ids_for_adv = driver_carry["prompt_ids_for_adv"]
+                loss_multiplier = driver_carry["loss_multiplier"]
+                truncated = driver_carry["truncated"]
+                length = driver_carry["length"]
 
                 gen_step_metrics = {}
                 if hasattr(policy_generation, "get_step_metrics"):
@@ -650,27 +793,26 @@ def grpo_train_sync(
                     print("▶ Computing advantages...", flush=True)
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
-                    # Thin slice-shaped repeated_batch for compute_advantage.
-                    # GRPO and Reinforce++ estimators ignore repeated_batch
-                    # (swallowed via **kwargs); GDPO reads the per-component
-                    # reward keys discovered by get_gdpo_reward_component_keys.
-                    # The actor plumbs those keys into ``slice_data`` so the
-                    # thin BDD here is byte-equivalent to legacy passing the
-                    # full repeated_batch.
-                    rb_for_adv = BatchedDataDict[Any](
+                    # GRPO / Reinforce++ ignore ``repeated_batch`` (it's
+                    # swallowed via ``**kwargs``); GDPO reads the
+                    # per-component reward keys returned by
+                    # ``get_gdpo_reward_component_keys``. The actor stashes
+                    # those keys into ``driver_carry`` — same payload as
+                    # legacy passing the full repeated_batch.
+                    adv_inputs = BatchedDataDict(
                         {
                             "total_reward": rewards,
                             "baseline": baseline,
                             "std": std,
                         }
                     )
-                    for k in get_gdpo_reward_component_keys(slice_data):
-                        rb_for_adv[k] = slice_data[k]
+                    for k in get_gdpo_reward_component_keys(driver_carry):
+                        adv_inputs[k] = driver_carry[k]
                     advantages = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
                         mask=mask,
-                        repeated_batch=rb_for_adv,
+                        repeated_batch=adv_inputs,
                         logprobs_policy=prev_logprobs,
                         logprobs_reference=reference_policy_logprobs,
                     )
@@ -788,11 +930,11 @@ def grpo_train_sync(
                         if colocated_inference:
                             policy.offload_after_refit()
                         policy_generation.prepare_for_generation()
-                    val_metrics, validation_timings = validate(
-                        policy_generation,
-                        val_dataloader,
-                        tokenizer,
-                        val_task_to_env,
+                    val_metrics, validation_timings = validate_sync(
+                        rollout_actor=rollout_actor,
+                        dp_client=policy.dp_client,
+                        val_dataloader=val_dataloader,
+                        val_task_to_env=val_task_to_env,
                         step=total_steps + 1,
                         master_config=master_config,
                         logger=logger,

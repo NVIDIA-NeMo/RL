@@ -193,6 +193,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
             task_name=None,
             keys=list(keys),
             fields=list(fields.keys()) if fields is not None else None,
+            tags=[dict(t) for t in tags] if tags is not None else None,
         )
 
     def kv_batch_get(

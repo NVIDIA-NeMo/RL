@@ -105,3 +105,48 @@ def test_extra_info_default_is_unique_per_instance():
     b = KVBatchMeta(partition_id="p", task_name="t", keys=[])
     a.extra_info["x"] = 1
     assert "x" not in b.extra_info
+
+
+def test_tags_align_with_keys():
+    """``tags`` must be exactly one dict per key, or ``None``."""
+    KVBatchMeta(
+        partition_id="p", task_name="t", keys=["a", "b"], tags=[{"x": 1}, {"x": 2}]
+    )
+    with pytest.raises(ValueError, match=r"align 1:1"):
+        KVBatchMeta(
+            partition_id="p", task_name="t", keys=["a", "b"], tags=[{"x": 1}]
+        )
+
+
+def test_tags_travel_with_subset_slice_concat():
+    """Per-key tags must follow keys through ``subset`` / ``slice`` /
+    ``concat`` so consumers can filter on tags without fetching data."""
+    m = KVBatchMeta(
+        partition_id="p",
+        task_name="t",
+        keys=["a", "b", "c", "d"],
+        sequence_lengths=[1, 2, 3, 4],
+        tags=[{"std": 0.1}, {"std": 0.0}, {"std": 0.3}, {"std": 0.0}],
+    )
+
+    survivors = m.subset([0, 2])
+    assert survivors.keys == ["a", "c"]
+    assert survivors.tags == [{"std": 0.1}, {"std": 0.3}]
+    assert survivors.sequence_lengths == [1, 3]
+
+    front = m.slice(0, 2)
+    assert front.tags == [{"std": 0.1}, {"std": 0.0}]
+
+    joined = front.concat(m.slice(2, 4))
+    assert joined.keys == m.keys
+    assert joined.tags == m.tags
+
+
+def test_tags_none_when_either_side_missing_in_concat():
+    """``concat`` drops tags if either side has none — symmetric with
+    the ``sequence_lengths`` behavior."""
+    with_tags = KVBatchMeta(
+        partition_id="p", task_name="t", keys=["a"], tags=[{"x": 1}]
+    )
+    without = KVBatchMeta(partition_id="p", task_name="t", keys=["b"])
+    assert with_tags.concat(without).tags is None

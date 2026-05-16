@@ -19,8 +19,8 @@ reward shaping / baseline-std for a sync GRPO step. The driver dispatches
 a per-step prompt batch + uids; the actor runs ``run_multi_turn_rollout``
 (or async / nemo_gym variants), then writes the bulk schema to TQ via
 :func:`nemo_rl.data_plane.column_io.kv_first_write`. Only a ``KVBatchMeta``
-and a small per-sample slice (rewards, masks, lengths, baseline/std,
-prompt_ids_for_adv) cross back to the driver via Ray.
+and a small per-sample ``driver_carry`` dict (rewards, masks, lengths,
+baseline/std, prompt_ids_for_adv) cross back to the driver via Ray.
 
 **Goal — rollout 1-hop put**: bulk tensors (input_ids, output_ids,
 attention_mask, position_ids, multi_modal_inputs, generation_logprobs,
@@ -59,7 +59,7 @@ class SyncRolloutActor:
     """Per-step rollout dispatcher.
 
     Runs: rollout + flatten + mask + prompt extraction + baseline/std + TQ put.
-    Returns ``(meta, slice, metrics)``.
+    Returns ``(meta, driver_carry, rollout_metrics, gen_metrics)``.
 
     Lifecycle: one instance per ``grpo_train_sync`` invocation. The driver
     instantiates with the same handles it would normally pass to
@@ -92,6 +92,8 @@ class SyncRolloutActor:
         uids: list[str],
         partition_id: str,
         first_iter: bool = True,
+        finish_generation: bool = True,
+        task_to_env_override: Optional[dict[str, EnvironmentInterface]] = None,
     ) -> tuple[
         KVBatchMeta,
         dict[str, Any],
@@ -120,9 +122,9 @@ class SyncRolloutActor:
            collects generation stats (throughput, etc.) and returns them
            to the driver in the result tuple.
 
-        The driver receives ``(meta, slice, rollout_metrics,
-        generation_logger_metrics)`` and uses only the small per-sample
-        slice for its own compute (rewards, advantages, dynamic sampling).
+        The driver receives ``(meta, driver_carry, rollout_metrics,
+        generation_logger_metrics)`` and uses ``driver_carry`` for its
+        own per-row compute (rewards, advantages, dynamic sampling).
 
         Args:
             input_batch: Per-step prompt batch (already repeat-interleaved).
@@ -131,9 +133,22 @@ class SyncRolloutActor:
             first_iter: True on the first DS iteration of a step; drives
                 ``policy_generation.snapshot_step_metrics()`` so per-step
                 metrics align with the legacy ``grpo.grpo_train`` path.
+            finish_generation: Call ``policy_generation.finish_generation()``
+                at the tail. Default ``True`` matches the training step
+                (one rollout per step, release KV after). Validation sets
+                ``False`` so inference state survives across val batches;
+                the trainer owns the explicit ``finish_generation()`` call
+                at the end of the val pass.
+            task_to_env_override: Per-call task → env map. ``None`` uses
+                ``self.task_to_env`` (training envs supplied at construction).
+                Validation passes ``val_task_to_env`` here so val rollouts
+                run against the val env set without rebuilding the actor.
 
         Returns:
-            ``(meta, slice, rollout_metrics, generation_logger_metrics)``.
+            ``(meta, driver_carry, rollout_metrics, generation_logger_metrics)``
+            where ``driver_carry`` is a per-row dict of tensors the driver
+            uses for compute (rewards, masks, lengths, prompt_ids_for_adv,
+            …) — stays on the driver, never crosses an actor boundary.
         """
         # Lazy imports — avoid pulling grpo into this module at load.
         from nemo_rl.algorithms.grpo import (
@@ -159,11 +174,16 @@ class SyncRolloutActor:
             self.policy_generation.clear_logger_metrics()
 
         cfg = self.master_config
+        task_to_env = (
+            task_to_env_override
+            if task_to_env_override is not None
+            else self.task_to_env
+        )
         common = dict(
             policy_generation=self.policy_generation,
             input_batch=input_batch,
             tokenizer=self.tokenizer,
-            task_to_env=self.task_to_env,
+            task_to_env=task_to_env,
             greedy=False,
         )
 
@@ -264,7 +284,7 @@ class SyncRolloutActor:
         length = fb.get("length", input_lengths)
         if not isinstance(length, torch.Tensor):
             length = torch.tensor(length)
-        slice_extras = {
+        driver_carry = {
             "total_reward": fb["total_reward"],
             "loss_multiplier": fb["loss_multiplier"],
             "truncated": truncated,
@@ -277,10 +297,10 @@ class SyncRolloutActor:
         }
         # GDPO multi-reward components: scale_rewards iterates these
         # keys driver-side and the GDPO advantage estimator reads them
-        # from rb_for_adv. Plumb them through the slice rather than
-        # forcing a separate TQ fetch.
+        # from ``adv_inputs``. Plumb them through ``driver_carry``
+        # rather than forcing a separate TQ fetch.
         for k in get_gdpo_reward_component_keys(fb):
-            slice_extras[k] = fb[k]
+            driver_carry[k] = fb[k]
 
         n_samples = int(bulk_batch["sample_mask"].shape[0])
         if len(uids) == 0 or n_samples % len(uids) != 0:
@@ -302,11 +322,12 @@ class SyncRolloutActor:
         )
 
         if self.policy_generation is not None:
-            self.policy_generation.finish_generation()
+            if finish_generation:
+                self.policy_generation.finish_generation()
             gen_metrics = self.policy_generation.get_logger_metrics()
         else:
             gen_metrics = None
-        return meta, slice_extras, rollout_metrics, gen_metrics
+        return meta, BatchedDataDict(driver_carry), rollout_metrics, gen_metrics
 
     def shutdown(self) -> None:
         try:

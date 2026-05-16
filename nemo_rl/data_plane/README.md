@@ -338,7 +338,7 @@ calling `kv_first_write(batch, keys=…)`.
 ```python
 # In grpo_sync.py
 uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
-(meta, slice_extras, rollout_metrics, gen_metrics) = ray.get(
+(meta, driver_carry, rollout_metrics, gen_metrics) = ray.get(
     rollout_actor.rollout_to_tq.remote(
         repeated_batch,
         uids=uids,
