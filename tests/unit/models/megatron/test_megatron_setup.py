@@ -794,6 +794,93 @@ class TestApplyPerformanceConfig:
         with pytest.warns(UserWarning, match="fp8_param=True sometimes causes NaN"):
             _apply_performance_config(model_cfg, config)
 
+    def test_recompute_granularity_full_explicit(self):
+        """granularity='full' sets uniform method with 1 layer."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock()
+        model_cfg.gated_linear_unit = True
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": True,
+                "recompute_granularity": "full",
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.recompute_granularity == "full"
+        assert model_cfg.recompute_method == "uniform"
+        assert model_cfg.recompute_num_layers == 1
+
+    def test_recompute_granularity_selective_with_modules(self):
+        """granularity='selective' with explicit modules sets recompute_modules."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock()
+        model_cfg.gated_linear_unit = True
+        modules = ["core_attn", "moe_act"]
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": True,
+                "recompute_granularity": "selective",
+                "recompute_modules": modules,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.recompute_granularity == "selective"
+        assert model_cfg.recompute_modules == modules
+
+    def test_recompute_granularity_selective_without_modules_uses_mcore_default(self):
+        """granularity='selective' without recompute_modules leaves attr untouched (MCore default applies)."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock(spec=["gated_linear_unit"])
+        model_cfg.gated_linear_unit = True
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": True,
+                "recompute_granularity": "selective",
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.recompute_granularity == "selective"
+        assert not hasattr(model_cfg, "recompute_modules")
+        assert not hasattr(model_cfg, "recompute_method")
+        assert not hasattr(model_cfg, "recompute_num_layers")
+
+    def test_recompute_granularity_invalid_raises(self):
+        """Invalid granularity raises ValueError with a helpful message."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock()
+        model_cfg.gated_linear_unit = True
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": True,
+                "recompute_granularity": "block",
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+            }
+        }
+
+        with pytest.raises(ValueError, match="Invalid recompute_granularity"):
+            _apply_performance_config(model_cfg, config)
+
 
 @pytest.mark.mcore
 class TestValidateOptimizerConfig:
