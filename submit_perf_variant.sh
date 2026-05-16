@@ -192,6 +192,7 @@ if [[ -n "${VLLM_WHEEL_URL}" ]]; then
   UV_SYNC_BLOCK="VLLM_USE_PRECOMPILED=1 \\
 VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_WHEEL_URL} \\
 UV_HTTP_TIMEOUT=3600 \\
+UV_LOCK_TIMEOUT=3600 \\
 uv sync --frozen"
 else
   UV_SYNC_BLOCK="echo \"[SETUP] Skipping uv sync — using container preinstalled venv (vllm 0.17.1 + torch 2.10)\""
@@ -237,6 +238,7 @@ export COMMAND="CUDA_HOME=/usr/local/cuda \
   NRL_IGNORE_VERSION_MISMATCH=1 \
   RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
   UV_HTTP_TIMEOUT=3600 \
+  UV_LOCK_TIMEOUT=3600 \
   TORCH_CUDA_ARCH_LIST='${TORCH_CUDA_ARCH_LIST_OVERRIDE:-9.0 10.0}' \
   NEMO_GYM_SKIP_VENV_IF_PRESENT=1 ${LOCAL_NEMO_RL_PYTHONPATH} ${EXTRA_ENVS} \
   ${LAUNCHER} ./examples/nemo_gym/run_grpo_nemo_gym.py \
