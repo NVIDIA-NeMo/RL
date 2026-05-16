@@ -74,7 +74,7 @@ case "$VARIANT" in
   policy.megatron_cfg.moe_shared_expert_overlap=True"
     EXTRA_ENVS="  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 \
   USE_MNNVL=False \
-  PYTHONPATH=/lustre/fsw/portfolios/coreai/users/sna/hybridep_overlay/site-packages:${PYTHONPATH:-}"
+  PYTHONPATH=${REPO_DIR}:/lustre/fsw/portfolios/coreai/users/sna/hybridep_overlay/site-packages${PYTHONPATH:+:${PYTHONPATH}}"
     export TORCH_CUDA_ARCH_LIST_OVERRIDE="9.0"
     ;;
   *)
@@ -184,7 +184,12 @@ else
   # uv run --frozen would detect pyproject py3.12 pin and rebuild venv,
   # breaking the head ray cluster mid-run. Bypass uv by invoking python directly.
   LAUNCHER="/opt/nemo_rl_venv/bin/python"
+  # Force local nemo_rl checkout into sys.path so driver and per-actor
+  # venv builds (uv sync --directory git_root) resolve nemo_rl from the
+  # local pyproject + patched files instead of the containers /opt/nemo-rl copy.
+  LOCAL_NEMO_RL_PYTHONPATH="PYTHONPATH=${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 fi
+LOCAL_NEMO_RL_PYTHONPATH="${LOCAL_NEMO_RL_PYTHONPATH:-}"
 
 export COMMAND="CUDA_HOME=/usr/local/cuda \
   CUDA_PATH=/usr/local/cuda \
@@ -205,7 +210,7 @@ export COMMAND="CUDA_HOME=/usr/local/cuda \
   RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
   UV_HTTP_TIMEOUT=3600 \
   TORCH_CUDA_ARCH_LIST='${TORCH_CUDA_ARCH_LIST_OVERRIDE:-9.0 10.0}' \
-  NEMO_GYM_SKIP_VENV_IF_PRESENT=1 ${EXTRA_ENVS} \
+  NEMO_GYM_SKIP_VENV_IF_PRESENT=1 ${LOCAL_NEMO_RL_PYTHONPATH} ${EXTRA_ENVS} \
   ${LAUNCHER} ./examples/nemo_gym/run_grpo_nemo_gym.py \
   --config=${CONFIG_PATH} \
   cluster.num_nodes=16 \
