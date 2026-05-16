@@ -176,8 +176,14 @@ export SETUP_COMMAND
 # pin so uv uses the container's preinstalled vllm 0.17.1 cache.
 if [[ -n "${VLLM_WHEEL_URL}" ]]; then
   VLLM_WHEEL_ENV="VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_WHEEL_URL}"
+  # Default super-v3 path: pyproject-driven venv build, use uv run launcher.
+  LAUNCHER="uv run --frozen"
 else
   VLLM_WHEEL_ENV=""
+  # May-13 container has py3.13 preinstalled venv at /opt/nemo_rl_venv.
+  # uv run --frozen would detect pyproject py3.12 pin and rebuild venv,
+  # breaking the head ray cluster mid-run. Bypass uv by invoking python directly.
+  LAUNCHER="/opt/nemo_rl_venv/bin/python"
 fi
 
 export COMMAND="CUDA_HOME=/usr/local/cuda \
@@ -200,7 +206,7 @@ export COMMAND="CUDA_HOME=/usr/local/cuda \
   UV_HTTP_TIMEOUT=3600 \
   TORCH_CUDA_ARCH_LIST='${TORCH_CUDA_ARCH_LIST_OVERRIDE:-9.0 10.0}' \
   NEMO_GYM_SKIP_VENV_IF_PRESENT=1 ${EXTRA_ENVS} \
-  uv run --frozen ./examples/nemo_gym/run_grpo_nemo_gym.py \
+  ${LAUNCHER} ./examples/nemo_gym/run_grpo_nemo_gym.py \
   --config=${CONFIG_PATH} \
   cluster.num_nodes=16 \
   cluster.gpus_per_node=8 \
