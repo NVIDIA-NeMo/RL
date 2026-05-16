@@ -261,7 +261,14 @@ class VllmInternalWorkerExtension:
             # Also process weights after loading for drafter model (MTP) if present
             self._maybe_process_drafter_weights_after_loading()
 
-            # Process weights after loading for FP8 KV cache
+            # Process weights after loading
+            from vllm.model_executor.model_loader.utils import (
+                process_weights_after_loading,
+            )
+
+            process_weights_after_loading(
+                self.model_runner.model, self.model_config, self.device
+            )
             self._maybe_process_fp8_kv_cache()
 
         except Exception as e:
@@ -270,6 +277,8 @@ class VllmInternalWorkerExtension:
             )
             return False
 
+        gc.collect()
+        torch.cuda.empty_cache()
         return True
 
     def _maybe_load_drafter_weights(self, weights) -> None:
@@ -306,14 +315,18 @@ class VllmInternalWorkerExtension:
 
     def _maybe_process_drafter_weights_after_loading(self) -> None:
         """Process drafter model weights after loading."""
-        drafter_model = getattr(getattr(self.model_runner, "drafter", None), "model", None)
+        drafter_model = getattr(
+            getattr(self.model_runner, "drafter", None), "model", None
+        )
         if drafter_model is None:
             return
 
         from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
         spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
-        drafter_model_config = getattr(spec_config, "draft_model_config", None) or self.model_config
+        drafter_model_config = (
+            getattr(spec_config, "draft_model_config", None) or self.model_config
+        )
 
         process_weights_after_loading(drafter_model, drafter_model_config, self.device)
 
