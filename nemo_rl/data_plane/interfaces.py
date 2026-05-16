@@ -146,7 +146,7 @@ class KVBatchMeta:
                     f"stamp_tags: {name!r} has {len(values)} values, expected {n}"
                 )
             for i, v in enumerate(values):
-                self.tags[i][name] = v
+                self.tags[i][name] = v  # type: ignore[bad-specialization]
 
     # ── Pure-metadata transforms (no I/O) ──────────────────────────────
     # Used by dynamic_sampling on the meta path: filter zero-std rows
@@ -184,9 +184,7 @@ class KVBatchMeta:
                 if self.sequence_lengths is not None
                 else None
             ),
-            tags=(
-                [self.tags[i] for i in indices] if self.tags is not None else None
-            ),
+            tags=([self.tags[i] for i in indices] if self.tags is not None else None),
         )
 
     def slice(self, start: int, stop: int) -> "KVBatchMeta":
@@ -214,9 +212,7 @@ class KVBatchMeta:
             else None
         )
         all_have_tags = all(m.tags is not None for m in all_m)
-        tags = (
-            [t for m in all_m for t in (m.tags or [])] if all_have_tags else None
-        )
+        tags = [t for m in all_m for t in (m.tags or [])] if all_have_tags else None
         return self._replace(keys=keys, sequence_lengths=seq_lens, tags=tags)
 
 

@@ -113,9 +113,7 @@ def test_tags_align_with_keys():
         partition_id="p", task_name="t", keys=["a", "b"], tags=[{"x": 1}, {"x": 2}]
     )
     with pytest.raises(ValueError, match=r"align 1:1"):
-        KVBatchMeta(
-            partition_id="p", task_name="t", keys=["a", "b"], tags=[{"x": 1}]
-        )
+        KVBatchMeta(partition_id="p", task_name="t", keys=["a", "b"], tags=[{"x": 1}])
 
 
 def test_tags_travel_with_subset_slice_concat():

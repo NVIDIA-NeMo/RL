@@ -364,4 +364,4 @@ trainer uses only half of it**. The task-mediated half
 for the async trainer, which is not yet wired into production.
 
 Design proposal, filtering / staleness strategies, and open questions:
-see [`docs/data_plane_async_proposal.md`](docs/data_plane_async_proposal.md).
+see [`docs/data-plane-async-proposal.md`](docs/data-plane-async-proposal.md).

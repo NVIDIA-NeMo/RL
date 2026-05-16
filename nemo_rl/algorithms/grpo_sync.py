@@ -268,10 +268,12 @@ def validate_sync(
             if total_rewards
             else 0.0
         )
-        avg_length = (
-            sum(total_lengths) / len(total_lengths) if total_lengths else 0.0
-        )
-        val_metrics = {"accuracy": accuracy, "avg_length": avg_length, **additional_metrics}
+        avg_length = sum(total_lengths) / len(total_lengths) if total_lengths else 0.0
+        val_metrics = {
+            "accuracy": accuracy,
+            "avg_length": avg_length,
+            **additional_metrics,
+        }
         try:
             print_message_log_samples(
                 all_message_logs,
