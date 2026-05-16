@@ -286,6 +286,17 @@ class BaseVllmGenerationWorker:
 
             This is properly fixed in https://github.com/vllm-project/vllm/pull/28763. We can remove this patch once we upgrade to a version of vllm that contains this fix.
             """
+            # vllm >= 0.14 removed the standalone vllm/attention/layer.py. The
+            # PR #28763 fix already landed upstream there, so this patch is a
+            # no-op on newer vllm. Silently skip if the target file is gone.
+            from importlib.util import find_spec
+            spec = find_spec("vllm")
+            if spec is None or not spec.submodule_search_locations:
+                return
+            target = os.path.join(next(iter(spec.submodule_search_locations)), "attention", "layer.py")
+            if not os.path.exists(target):
+                logger.info("vllm/attention/layer.py not present (vllm>=0.14 layout); skipping vit flash-attn backend patch.")
+                return
             file_to_patch = _get_vllm_file("attention/layer.py")
             with open(file_to_patch, "r") as f:
                 content = f.read()
