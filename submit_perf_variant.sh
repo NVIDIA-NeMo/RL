@@ -141,7 +141,6 @@ export SETUP_COMMAND
 # Build COMMAND (matches baseline 11777073 with VARIANT overrides and env additions)
 export COMMAND="CUDA_HOME=/usr/local/cuda \
   CUDA_PATH=/usr/local/cuda \
-  PATH=/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin \
   NRL_VLLM_USE_V1=1 \
   NRL_WG_USE_RAY_REF=1 \
   VLLM_USE_PRECOMPILED=1 \
