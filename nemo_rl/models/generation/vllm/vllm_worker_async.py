@@ -156,10 +156,7 @@ def _replace_prefix_tokens(
             model_cut_end -= 1
 
     # Assert here to prepare for the logic below
-    if len(template_token_ids) <= len(
-        template_prefix_token_ids
-    ):
-
+    if len(template_token_ids) <= len(template_prefix_token_ids):
         error_message = f"""Found possibly non-monotonically increasing trajectory!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 
@@ -182,9 +179,7 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
             break
 
     # This should never be the case, but
-    if (
-        template_cut_start < 0
-    ):
+    if template_cut_start < 0:
         error_message = f"""No EOS token ID found in the chat-templated messages!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 
@@ -235,7 +230,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self._deferred_bundle_indices = None
         self._deferred_seed = None
 
-        super().__init__(config, bundle_indices, fraction_of_gpus, seed, defer_model_load)
+        super().__init__(
+            config, bundle_indices, fraction_of_gpus, seed, defer_model_load
+        )
 
         if not self.is_model_owner or not defer_model_load:
             return
@@ -264,7 +261,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         self._reserved_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._reserved_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._reserved_port = _bind_socket_in_range(self._reserved_socket, port_range_low, port_range_high)
+        self._reserved_port = _bind_socket_in_range(
+            self._reserved_socket, port_range_low, port_range_high
+        )
         self._reserved_socket.listen(128)
         self._reserved_socket.setblocking(False)
         self._reserved_node_ip = _get_node_ip_local()
@@ -431,21 +430,46 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
         from vllm import __version__ as vllm_version
-        from vllm.entrypoints.openai.api_server import (
-            BaseModelPath,
-            OpenAIServingChat,
-            OpenAIServingModels,
-            OpenAIServingTokenization,
-        )
-        from vllm.entrypoints.openai.protocol import (
-            ChatCompletionRequest,
-            ChatCompletionResponse,
-            ErrorResponse,
-            TokenizeChatRequest,
-            TokenizeCompletionRequest,
-            TokenizeResponse,
-        )
-        from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+
+        # vllm 0.17 reorganized vllm.entrypoints.openai.{api_server,protocol,tool_parsers}
+        # into submodules. Try the new paths first; fall back to the legacy single-file
+        # layout used by vllm <=0.16 so containers pinned to older vllm still work.
+        try:
+            from vllm.entrypoints.openai.models.protocol import BaseModelPath
+            from vllm.entrypoints.openai.chat_completion.serving import (
+                OpenAIServingChat,
+            )
+            from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+            from vllm.entrypoints.serve.tokenize.serving import (
+                OpenAIServingTokenization,
+            )
+            from vllm.entrypoints.openai.chat_completion.protocol import (
+                ChatCompletionRequest,
+                ChatCompletionResponse,
+            )
+            from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+            from vllm.entrypoints.serve.tokenize.protocol import (
+                TokenizeChatRequest,
+                TokenizeCompletionRequest,
+                TokenizeResponse,
+            )
+            from vllm.tool_parsers import ToolParserManager
+        except ImportError:
+            from vllm.entrypoints.openai.api_server import (
+                BaseModelPath,
+                OpenAIServingChat,
+                OpenAIServingModels,
+                OpenAIServingTokenization,
+            )
+            from vllm.entrypoints.openai.protocol import (
+                ChatCompletionRequest,
+                ChatCompletionResponse,
+                ErrorResponse,
+                TokenizeChatRequest,
+                TokenizeCompletionRequest,
+                TokenizeResponse,
+            )
+            from vllm.entrypoints.openai.tool_parsers import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
@@ -499,7 +523,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 add_special_tokens=False,
             ):
                 if _chat_template_kwargs_override:
-                    chat_template_kwargs = {**(chat_template_kwargs or {}), **_chat_template_kwargs_override}
+                    chat_template_kwargs = {
+                        **(chat_template_kwargs or {}),
+                        **_chat_template_kwargs_override,
+                    }
 
                 # Materialize the message tool calls so we can deepcopy below.
                 for message in messages:
@@ -653,14 +680,19 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         )
 
         # Load custom reasoning parser plugin if specified
-        reasoning_parser_plugin = serving_chat_kwargs.pop("reasoning_parser_plugin", None)
+        reasoning_parser_plugin = serving_chat_kwargs.pop(
+            "reasoning_parser_plugin", None
+        )
         if reasoning_parser_plugin:
             from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
+
             ReasoningParserManager.import_reasoning_parser(reasoning_parser_plugin)
 
         # Extract chat_template_kwargs before passing to OpenAIServingChat (not a vllm init param).
         # These are injected per-request in _preprocess_chat instead.
-        _chat_template_kwargs_override = serving_chat_kwargs.pop("chat_template_kwargs", None)
+        _chat_template_kwargs_override = serving_chat_kwargs.pop(
+            "chat_template_kwargs", None
+        )
 
         openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
 
