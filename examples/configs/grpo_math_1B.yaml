@@ -409,9 +409,11 @@ cluster:
 data_plane:
   enabled: false
   impl: transfer_queue
-  # backend: "simple"                 # NotRequired: TQ storage backend ('simple' or 'mooncake_cpu')
-  # storage_capacity: 1000000         # NotRequired
-  # num_storage_units: 2              # NotRequired
-  # claim_meta_poll_interval_s: 0.5   # NotRequired: blocking-claim poll cadence
+  backend: "simple"                  # TQ storage backend ('simple' or 'mooncake_cpu')
+  storage_capacity: 1000000          # max samples retained per partition
+  num_storage_units: 2               # storage shards
+  claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
+  global_segment_size: 549755813888  # 512 GiB — used when backend == "mooncake_cpu"
+  local_buffer_size:   68719476736   # 64 GiB  — used when backend == "mooncake_cpu"
   # observability:                    # NotRequired
   #   enabled: false

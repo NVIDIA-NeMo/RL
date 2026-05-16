@@ -226,9 +226,9 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
     tq = _tq()
     base = OmegaConf.load(str(resources.files("transfer_queue") / "config.yaml"))
 
-    backend = cfg.get("backend", "simple")
-    storage_capacity = cfg.get("storage_capacity", 1_000_000)
-    num_storage_units = cfg.get("num_storage_units", 2)
+    backend = cfg["backend"]
+    storage_capacity = cfg["storage_capacity"]
+    num_storage_units = cfg["num_storage_units"]
 
     # polling_mode=True: controller returns empty BatchMeta instead of raising
     # TimeoutError when no samples are ready yet. The client-side blocking
@@ -295,14 +295,8 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
             "backend": {
                 "storage_backend": "MooncakeStore",
                 "MooncakeStore": {
-                    # pyrefly: ignore  # no-matching-overload
-                    "global_segment_size": int(
-                        cfg.get("global_segment_size", 512 * 1024**3)
-                    ),
-                    # pyrefly: ignore  # no-matching-overload
-                    "local_buffer_size": int(
-                        cfg.get("local_buffer_size", 64 * 1024**3)
-                    ),
+                    "global_segment_size": int(cfg["global_segment_size"]),
+                    "local_buffer_size": int(cfg["local_buffer_size"]),
                     # _init_tq runs on the driver only — driver IS the
                     # head, so local_ip here is also the head's IP that
                     # mooncake_master + the metadata server bind to.
@@ -432,7 +426,7 @@ class TQDataPlaneClient(DataPlaneClient):
         #      that merge). Drop this once the wheel includes the fix.
         #   3. KV-path 1D promotion — works around TQ's
         #      extract_field_schema schema/data mismatch for 1D fields.
-        if cfg.get("backend") == "mooncake_cpu":
+        if cfg["backend"] == "mooncake_cpu":
             local_ip = _get_local_node_ip()
             if local_ip:
                 # Force-assign per-process: Ray actors inherit env vars
@@ -457,7 +451,7 @@ class TQDataPlaneClient(DataPlaneClient):
         # `kv_clear`) are module-level helpers; metadata ops (`claim_meta`,
         # `check_consumption_status`) go through `self._tq.get_client()`.
         self._tq = _tq()
-        self._poll_interval_s = cfg.get("claim_meta_poll_interval_s", 0.5)
+        self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._partitions: dict[str, _PartitionRecord] = {}
         self._closed = False
 

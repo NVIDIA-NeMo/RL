@@ -48,15 +48,27 @@ class DataPlaneConfig(TypedDict):
     ``backend`` is the storage backend *inside* TransferQueue; it is owned by
     the TQ adapter, not by NeMo-RL. ``impl`` selects which adapter we go
     through.
+
+    Required keys (always set in exemplar YAML — never defaulted in code):
+    ``enabled``, ``impl``, ``backend``, ``storage_capacity``,
+    ``num_storage_units``, ``claim_meta_poll_interval_s``,
+    ``global_segment_size``, ``local_buffer_size``.
+
+    ``global_segment_size`` / ``local_buffer_size`` are only *read* when
+    ``backend == "mooncake_cpu"``; the simple backend ignores them.
+    They are required (not NotRequired) so the YAML carries the full
+    schema and there are no hidden Python defaults.
     """
 
     enabled: bool
     impl: Literal["transfer_queue"]
-    backend: NotRequired[Literal["simple", "mooncake_cpu"]]
+    backend: Literal["simple", "mooncake_cpu"]
+    storage_capacity: int
+    num_storage_units: int
+    claim_meta_poll_interval_s: float
+    global_segment_size: int
+    local_buffer_size: int
     controller_address: NotRequired[str]
-    storage_capacity: NotRequired[int]
-    num_storage_units: NotRequired[int]
-    claim_meta_poll_interval_s: NotRequired[float]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
 
