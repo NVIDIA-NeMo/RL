@@ -693,6 +693,14 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
             weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
             weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
             layer.weight_scale.copy_(weight_scale_swizzled.contiguous())
+        else:
+            # EMULATION refit: forward path reads layer.weight_scale; refit loader
+            # writes to weight_scale_from_checkpoint. The first-time branch tried to
+            # alias them via ModelWeightParameter(data=layer.weight_scale.data), but
+            # the weight_loader reassigns .data rather than copying in-place, so
+            # weight_scale stays at the random dummy values from load_format=dummy.
+            # Sync explicitly to mirror the FLASHINFER branch.
+            layer.weight_scale.data.copy_(layer.weight_scale_from_checkpoint.data)
 
 
 def process_weights_after_loading_moe(self, layer) -> None:
