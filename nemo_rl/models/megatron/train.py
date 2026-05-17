@@ -29,7 +29,10 @@ from megatron.core.parallel_state import (
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.utils import StragglerDetector
 
-from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
+from nemo_rl.algorithms.loss_functions import (
+    LossFunction,
+    SequencePackingLossWrapper,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -314,8 +317,13 @@ class LossPostProcessor:
         loss_fn = self.loss_fn
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
-            # remove padding
-            loss_fn = SequencePackingLossWrapper(
+            fuse_loss = self.cfg["sequence_packing"].get("fuse_loss", False)
+            wrapper_cls = (
+                SequencePackingFusionLossWrapper
+                if fuse_loss
+                else SequencePackingLossWrapper
+            )
+            loss_fn = wrapper_cls(
                 loss_fn=loss_fn,
                 cu_seqlens_q=packed_seq_params.cu_seqlens_q,
                 cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,

@@ -205,13 +205,21 @@ class ClippedPGLossFn(LossFunction):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        next_token_logprobs: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
-        """Clipped Policy Gradient RL loss function."""
+        """Clipped Policy Gradient RL loss function.
+
+        If `next_token_logprobs` is provided, the internal logprob computation is
+        skipped and the supplied logprobs are used as `curr_logprobs`. This is the
+        opt-in fused path used by SequencePackingFusionLossWrapper.
+        """
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         advantages = data["advantages"][:, 1:]
         # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
-        prev_logprobs = None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+        prev_logprobs = (
+            None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+        )
         generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
             reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
@@ -219,38 +227,44 @@ class ClippedPGLossFn(LossFunction):
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        next_token_logits = next_token_logits.to(torch.float32)
-
-        if vocab_parallel_group is not None:
-            assert vocab_parallel_rank is not None, (
-                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-            )
-            curr_logprobs = from_parallel_logits_to_logprobs(
-                next_token_logits,
-                data["input_ids"],
-                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
-                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                tp_group=vocab_parallel_group,
-                inference_only=False,
-                cp_group=context_parallel_group,
-            )
-            # slice off to the correct length to remove potential CP padding
-            curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
-        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-            curr_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
-            )
+        if next_token_logprobs is not None:
+            # Fused path: caller supplied pre-computed logprobs (e.g. via
+            # SequencePackingFusionLossWrapper + prepare_packed_loss_input).
+            curr_logprobs = next_token_logprobs
         else:
-            next_token_logits_wo_last = next_token_logits[
-                :, :-1
-            ]  # Remove last position's logits
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits_wo_last, dim=-1
-            )
-            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
-            curr_logprobs = next_token_logprobs.gather(
-                dim=-1, index=next_tokens.unsqueeze(-1)
-            ).squeeze(-1)
+            next_token_logits = next_token_logits.to(torch.float32)
+
+            if vocab_parallel_group is not None:
+                assert vocab_parallel_rank is not None, (
+                    "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+                )
+                curr_logprobs = from_parallel_logits_to_logprobs(
+                    next_token_logits,
+                    data["input_ids"],
+                    vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
+                    vocab_end_index=(vocab_parallel_rank + 1)
+                    * next_token_logits.shape[-1],
+                    tp_group=vocab_parallel_group,
+                    inference_only=False,
+                    cp_group=context_parallel_group,
+                )
+                # slice off to the correct length to remove potential CP padding
+                curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
+            elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+                curr_logprobs = get_logprobs_from_vocab_parallel_logits(
+                    next_token_logits, data["input_ids"], seq_index=seq_index
+                )
+            else:
+                next_token_logits_wo_last = next_token_logits[
+                    :, :-1
+                ]  # Remove last position's logits
+                next_token_logprobs_local = torch.nn.functional.log_softmax(
+                    next_token_logits_wo_last, dim=-1
+                )
+                next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
+                curr_logprobs = next_token_logprobs_local.gather(
+                    dim=-1, index=next_tokens.unsqueeze(-1)
+                ).squeeze(-1)
 
         # For truly on-policy training, use curr_logprobs as prev_logprobs
         # This avoids computing prev_logprobs upstream
@@ -432,7 +446,13 @@ class ClippedPGLossFn(LossFunction):
         if self.truncated_importance_sampling_ratio is not None:
             with torch.no_grad():
                 # Divide by global_valid_toks (not local mask.sum()) so that np.sum aggregation in grpo.py gives the correct global fraction
-                tis_clipped_fraction = ((actor_importance_weights_expanded > self.truncated_importance_sampling_ratio) & mask.bool()).sum().item() / max(global_valid_toks.item(), 1)
+                tis_clipped_fraction = (
+                    (
+                        actor_importance_weights_expanded
+                        > self.truncated_importance_sampling_ratio
+                    )
+                    & mask.bool()
+                ).sum().item() / max(global_valid_toks.item(), 1)
             if self.truncated_importance_sampling_type == "tis":
                 token_in_bounds = (
                     actor_importance_weights_expanded
@@ -1094,6 +1114,172 @@ class SequencePackingLossWrapper:
                     metrics_accum[k] += val
 
         return loss_accum, metrics_accum
+
+
+def _pack_input_ids_for_fused_loss(
+    input_ids: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_q_padded: torch.Tensor,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    roll_shift: int = 0,
+) -> torch.Tensor:
+    """Pack unpacked input_ids [B, S] into [1, T_packed // CP] sequence boundaries.
+
+    Each sequence is padded to its padded length, optionally rolled, then CP-sharded.
+    Matches Megatron's `_pack_sequences_for_megatron` packing for the loss function.
+    Use roll_shift=-1 to build next-token targets directly in packed/sharded layout.
+    """
+    batch_size = input_ids.shape[0]
+    total_packed_len = int(cu_seqlens_q_padded[-1].item()) // cp_size
+    packed = torch.zeros(
+        total_packed_len, dtype=input_ids.dtype, device=input_ids.device
+    )
+    for i in range(batch_size):
+        actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item())
+        padded_len = int((cu_seqlens_q_padded[i + 1] - cu_seqlens_q_padded[i]).item())
+        packed_start = int(cu_seqlens_q_padded[i].item())
+        seq = torch.zeros(padded_len, dtype=input_ids.dtype, device=input_ids.device)
+        seq[:actual_len] = input_ids[i, :actual_len]
+        if roll_shift != 0:
+            seq = seq.roll(shifts=roll_shift, dims=0)
+        sharded = _get_tokens_on_this_cp_rank(seq, cp_rank, cp_size, seq_dim=0)
+        packed[packed_start // cp_size : (packed_start + padded_len) // cp_size] = (
+            sharded
+        )
+    return packed.unsqueeze(0)
+
+
+def prepare_packed_loss_input(
+    logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    loss_fn: "LossFunction",
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_q_padded: torch.Tensor,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
+    """Compute logprobs from packed logits in a single fused pass.
+
+    Currently only supports loss functions consuming `next_token_logprobs`
+    (e.g. ClippedPGLossFn). Distillation / logit-input loss functions are NOT
+    supported on the super-v3 fused path — fall back to SequencePackingLossWrapper.
+
+    Args:
+        logits: Packed logits [1, T_packed // CP, V // TP].
+        data: Microbatch data (unpacked, [B, S]).
+        loss_fn: Loss function.
+        cu_seqlens_q: Unpadded cumulative sequence lengths [B+1].
+        cu_seqlens_q_padded: Padded cumulative sequence lengths [B+1].
+        vocab_parallel_rank: Megatron TP rank.
+        vocab_parallel_group: Megatron TP group.
+        context_parallel_group: Megatron CP group.
+
+    Returns:
+        ({"next_token_logprobs": logprobs}, data)
+    """
+    assert vocab_parallel_group is not None, (
+        "prepare_packed_loss_input requires vocab_parallel_group (Megatron TP)."
+    )
+    assert vocab_parallel_rank is not None, (
+        "vocab_parallel_rank must be provided with vocab_parallel_group."
+    )
+
+    input_ids = data["input_ids"]
+    unpacked_seqlen = input_ids.shape[1]
+    cp_size = (
+        1
+        if context_parallel_group is None
+        else torch.distributed.get_world_size(context_parallel_group)
+    )
+    cp_rank = (
+        0
+        if context_parallel_group is None
+        else torch.distributed.get_rank(context_parallel_group)
+    )
+
+    packed_rolled_targets = _pack_input_ids_for_fused_loss(
+        input_ids,
+        cu_seqlens_q,
+        cu_seqlens_q_padded,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        roll_shift=-1,
+    )
+
+    logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+        logits.to(torch.float32),
+        packed_rolled_targets,
+        cu_seqlens_q_padded,
+        unpacked_seqlen,
+        vocab_start_index=vocab_parallel_rank * logits.shape[-1],
+        vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+        group=vocab_parallel_group,
+        inference_only=False,
+        cp_group=context_parallel_group,
+        target_is_pre_rolled=True,
+    )
+
+    return {"next_token_logprobs": logprobs}, data
+
+
+class SequencePackingFusionLossWrapper:
+    """Fused sequence-packing loss wrapper.
+
+    Unlike `SequencePackingLossWrapper` which iterates over sequences one at a
+    time, this wrapper computes log probabilities from the packed logits in a
+    single call to `prepare_packed_loss_input`, then invokes the loss function
+    once with the pre-computed `next_token_logprobs`.
+
+    Currently supports loss functions that accept the `next_token_logprobs`
+    kwarg (ClippedPGLossFn). DistillationLossFn is NOT supported on the
+    fused path — keep `fuse_loss=False` for distillation.
+    """
+
+    def __init__(
+        self,
+        loss_fn: LossFunction,
+        cu_seqlens_q: Tensor,
+        cu_seqlens_q_padded: Optional[Tensor] = None,
+    ):
+        self.loss_fn = loss_fn
+        self.cu_seqlens_q = cu_seqlens_q
+        self.cu_seqlens_q_padded = (
+            cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
+        )
+
+    def __call__(
+        self,
+        next_token_logits: Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: Tensor | None,
+        global_valid_toks: Tensor | None,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[Tensor, dict[str, Any]]:
+        loss_input, prepared_data = prepare_packed_loss_input(
+            logits=next_token_logits,
+            data=data,
+            loss_fn=self.loss_fn,
+            cu_seqlens_q=self.cu_seqlens_q,
+            cu_seqlens_q_padded=self.cu_seqlens_q_padded,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+
+        return self.loss_fn(
+            next_token_logits,
+            prepared_data,
+            global_valid_seqs,
+            global_valid_toks,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            **loss_input,
+        )
 
 
 class DistillationLossConfig(TypedDict):

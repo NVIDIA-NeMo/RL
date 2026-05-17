@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Submit one of: ray_only, mxfp8, hybridep, hybridep_skiplogprob, both
+# Submit one of: ray_only, mxfp8, hybridep, hybridep_skiplogprob, both, fuseloss, hybridep_fuseloss
 # Usage: VARIANT=ray_only ./submit_perf_variant.sh
 set -euo pipefail
 
-: "${VARIANT:?VARIANT is required: ray_only | mxfp8 | hybridep | hybridep_skiplogprob | both}"
+: "${VARIANT:?VARIANT is required: ray_only | mxfp8 | hybridep | hybridep_skiplogprob | both | fuseloss | hybridep_fuseloss}"
 DRY_RUN="${DRY_RUN:-false}"
 
 REPO_DIR="/lustre/fsw/portfolios/coreai/users/sna/repos/nemo-rl-qwen-swe"
@@ -71,6 +71,27 @@ case "$VARIANT" in
   VLLM_FLASHINFER_MOE_BACKEND=latency \
   VLLM_FLASHINFER_ALLREDUCE_BACKEND=mnnvl \
   VLLM_ALLREDUCE_USE_FLASHINFER=1"
+    ;;
+  fuseloss)
+    # fuse_loss standalone: SequencePackingFusionLossWrapper replaces SequencePackingLossWrapper.
+    # Single fused next_token_logprobs pass instead of per-sequence loop.
+    # Expected gain: Training stage cut on packed-seq codepath. ROI 2.3% E2E estimated.
+    VARIANT_TAG="fuseloss"
+    EXTRA_OVERRIDES="  policy.sequence_packing.fuse_loss=true"
+    EXTRA_ENVS=""
+    ;;
+  hybridep_fuseloss)
+    # HybridEP + fuse_loss combined: target stacked gain on policy_training.
+    # User binding goal: HybridEP와 함께 적용.
+    VARIANT_TAG="hybridep-fuseloss"
+    EXTRA_OVERRIDES="  policy.megatron_cfg.moe_token_dispatcher_type=flex \
+  ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep \
+  policy.megatron_cfg.moe_shared_expert_overlap=True \
+  policy.sequence_packing.fuse_loss=true"
+    EXTRA_ENVS="  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 \
+  USE_MNNVL=False \
+  PYTHONPATH=/lustre/fsw/portfolios/coreai/users/sna/hybridep_overlay_cp312/site-packages:${PYTHONPATH:-}"
+    export TORCH_CUDA_ARCH_LIST_OVERRIDE="9.0"
     ;;
   *)
     echo "Unknown VARIANT: $VARIANT" >&2

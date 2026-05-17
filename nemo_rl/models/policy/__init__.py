@@ -101,6 +101,7 @@ class SequencePackingConfig(TypedDict):
     # Not required because some algorithms like SFT don't calculate log probs
     logprob_mb_tokens: NotRequired[int]
     algorithm: str
+    fuse_loss: NotRequired[bool]
 
 
 class RewardModelConfig(TypedDict):
