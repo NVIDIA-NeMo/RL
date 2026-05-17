@@ -239,6 +239,22 @@ class VllmInternalWorkerExtension:
             """
             from nemo_rl.models.generation.vllm.quantization import fp8
 
+            # BF16 weights + FP8 KV cache: skip FP8 KV scale buffers in refit.
+            # vllm 0.13 qwen3_moe.load_weights ignore_suffixes covers .k_scale
+            # and .v_scale but omits .q_scale and .prob_scale; those are
+            # registered as Attention buffers (not named_parameters), so a
+            # naive params_dict[name] raises KeyError. Static KV scales were
+            # finalized at engine load; dynamic per-token scales are computed
+            # at runtime and do not need refit broadcasting.
+            _FP8KV_SCALE_SUFFIXES = (
+                ".q_scale", ".k_scale", ".v_scale",
+                ".prob_scale", ".kv_scale",
+            )
+            weights = [
+                (n, t) for (n, t) in weights
+                if not n.endswith(_FP8KV_SCALE_SUFFIXES)
+            ]
+
             if fp8.is_fp8_model(model_runner.vllm_config):
                 # the fp8 load_weights additionally casts bf16 weights into fp8
                 fp8.load_weights(weights, model_runner)
