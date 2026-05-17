@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Submit one of: ray_only, mxfp8, hybridep, both
+# Submit one of: ray_only, mxfp8, hybridep, hybridep_skiplogprob, both
 # Usage: VARIANT=ray_only ./submit_perf_variant.sh
 set -euo pipefail
 
-: "${VARIANT:?VARIANT is required: ray_only | mxfp8 | hybridep | both}"
+: "${VARIANT:?VARIANT is required: ray_only | mxfp8 | hybridep | hybridep_skiplogprob | both}"
 DRY_RUN="${DRY_RUN:-false}"
 
 REPO_DIR="/lustre/fsw/portfolios/coreai/users/sna/repos/nemo-rl-qwen-swe"
@@ -36,6 +36,21 @@ case "$VARIANT" in
     EXTRA_OVERRIDES="  policy.megatron_cfg.moe_token_dispatcher_type=flex \
   ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep \
   policy.megatron_cfg.moe_shared_expert_overlap=True"
+    EXTRA_ENVS="  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 \
+  USE_MNNVL=False \
+  PYTHONPATH=/lustre/fsw/portfolios/coreai/users/sna/hybridep_overlay_cp312/site-packages:${PYTHONPATH:-}"
+    export TORCH_CUDA_ARCH_LIST_OVERRIDE="9.0"
+    ;;
+  hybridep_skiplogprob)
+    # Row 4 of throughput tracker. HybridEP + force_on_policy_ratio prev_logprob skip.
+    # Setting grpo.seq_logprob_error_threshold=null flips the gate at grpo.py:2042:
+    #   skip_prev_logprobs = force_on_policy_ratio AND (threshold is None)
+    # Expected gain: LogProb stage ~17.7 s -> 0 s (additional ~ -4.4% E2E vs HybridEP).
+    VARIANT_TAG="hybridep-skiplogprob"
+    EXTRA_OVERRIDES="  policy.megatron_cfg.moe_token_dispatcher_type=flex \
+  ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep \
+  policy.megatron_cfg.moe_shared_expert_overlap=True \
+  grpo.seq_logprob_error_threshold=null"
     EXTRA_ENVS="  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 \
   USE_MNNVL=False \
   PYTHONPATH=/lustre/fsw/portfolios/coreai/users/sna/hybridep_overlay_cp312/site-packages:${PYTHONPATH:-}"
