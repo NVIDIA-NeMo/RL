@@ -84,6 +84,18 @@ class VllmInternalWorkerExtension:
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
+    def get_fp8_param_names(self, param_names: list[str]) -> set[str]:
+        """Classify which HF param names are FP8-quantized using vLLM's model.
+
+        This is the authoritative source of truth — it inspects the actual vLLM
+        model structure rather than relying on name-matching heuristics.
+        """
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if not fp8.is_fp8_model(self.model_runner.vllm_config):
+            return set()
+        return fp8.get_fp8_param_names(param_names, self.model_runner)
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming.
 
@@ -92,6 +104,9 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self._weights_pre_quantized = any(  # pyrefly: ignore[implicitly-defined-attribute]
+            k.endswith("_scale_inv") for k in state_dict_info
+        )
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -177,20 +192,10 @@ class VllmInternalWorkerExtension:
                 assert offset == used_bytes, (
                     "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
-                # Load weights into the model
-                from nemo_rl.models.generation.vllm.quantization import fp8
-
-                if fp8.is_fp8_model(self.model_runner.vllm_config):
-                    # the fp8 load_weights additionally casts bf16 weights into fp8
-                    fp8.load_weights(weights, self.model_runner)
-                else:
-                    self.model_runner.model.load_weights(weights=weights)
-
-                # Also load weights into the drafter model (MTP) if present
-                # The drafter has its own MTP-specific layers that need to be updated
-                # Note: embed_tokens and lm_head are shared with target model,
-                # so they're already updated above
-                self._maybe_load_drafter_weights(weights)
+                # Load weights into the model (re-uses the shared helper that
+                # skips FP8 quantization when weights arrive pre-quantized).
+                # Also loads drafter (MTP) weights when present.
+                self._load_model_weights(weights)
 
                 torch.cuda.current_stream().synchronize()
 
@@ -217,6 +222,32 @@ class VllmInternalWorkerExtension:
             )
             return False
 
+    def _load_model_weights(self, weights):
+        """Load model weights, skipping FP8 quantization when pre-quantized.
+
+        Uses the ``_weights_pre_quantized`` flag cached at ``prepare_refit_info``
+        time instead of scanning every batch for ``_scale_inv`` entries.
+
+        Also loads drafter (MTP) weights when a drafter model is present.
+        The drafter has its own MTP-specific layers that need to be updated.
+        Note: embed_tokens and lm_head are shared with the target model so
+        they're already updated above.
+        """
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            if getattr(self, "_weights_pre_quantized", False):
+                # Weights arrive pre-quantized (FP8 + scale_inv); load as-is.
+                self.model_runner.model.load_weights(weights=weights)
+            else:
+                # the fp8 load_weights additionally casts bf16 weights into fp8
+                fp8.load_weights(weights, self.model_runner)
+        else:
+            self.model_runner.model.load_weights(weights=weights)
+
+        # Also load weights into the drafter model (MTP) if present
+        self._maybe_load_drafter_weights(weights)
+
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
@@ -227,28 +258,9 @@ class VllmInternalWorkerExtension:
             "Please call prepare_refit_info when initializing the worker."
         )
 
-        def _load_model_weights(weights, model_runner):
-            """Load model weights.
-
-            Args:
-                weights: List[(name, tensor)]
-                model_runner: vLLM ModelRunner
-
-            Returns:
-                None
-            """
-            from nemo_rl.models.generation.vllm.quantization import fp8
-
-            if fp8.is_fp8_model(model_runner.vllm_config):
-                # the fp8 load_weights additionally casts bf16 weights into fp8
-                fp8.load_weights(weights, model_runner)
-            else:
-                model_runner.model.load_weights(weights=weights)
-
-            # Also load weights into the drafter model (MTP) if present
-            self._maybe_load_drafter_weights(weights)
-
-        load_model_weight_func = lambda x: _load_model_weights(x, self.model_runner)
+        # Re-use the shared helper so the collective broadcast path also
+        # benefits from the pre-quantized fast-path (skips redundant FP8 cast).
+        load_model_weight_func = lambda x: self._load_model_weights(x)
 
         try:
             packed_broadcast_consumer(
