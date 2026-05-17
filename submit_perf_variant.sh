@@ -77,7 +77,7 @@ case "$VARIANT" in
     # Single fused next_token_logprobs pass instead of per-sequence loop.
     # Expected gain: Training stage cut on packed-seq codepath. ROI 2.3% E2E estimated.
     VARIANT_TAG="fuseloss"
-    EXTRA_OVERRIDES="  policy.sequence_packing.fuse_loss=true"
+    EXTRA_OVERRIDES="  ++policy.sequence_packing.fuse_loss=True"
     EXTRA_ENVS=""
     ;;
   hybridep_fuseloss)
@@ -87,7 +87,7 @@ case "$VARIANT" in
     EXTRA_OVERRIDES="  policy.megatron_cfg.moe_token_dispatcher_type=flex \
   ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep \
   policy.megatron_cfg.moe_shared_expert_overlap=True \
-  policy.sequence_packing.fuse_loss=true"
+  ++policy.sequence_packing.fuse_loss=True"
     EXTRA_ENVS="  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 \
   USE_MNNVL=False \
   PYTHONPATH=/lustre/fsw/portfolios/coreai/users/sna/hybridep_overlay_cp312/site-packages:${PYTHONPATH:-}"
