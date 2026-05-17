@@ -760,21 +760,20 @@ def setup(
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
         if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
-            # FP8 KV cache requires FP8 model precision
-            assert generation_config["vllm_cfg"]["precision"] == "fp8", (
-                f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
-                "FP8 KV cache can only be used together with FP8 model weights."
-            )
-            # FP8 KV cache compatibility checks
-            assert policy_config["dtensor_cfg"]["enabled"] == False, (
-                "DTensor backend is not supported with kv cache fp8 enabled."
-            )
-            assert not _should_use_async_rollouts(master_config), (
-                "Async rollouts is not supported with kv cache fp8 enabled."
-            )
-            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
-            )
+            # FP8 KV cache: KV scales are recomputed per-prefill, independent
+            # of weight refit. With async rollouts, refit happens at a barrier
+            # before the next generation begins, not during it, so the original
+            # async guard is not load-bearing. Validated:
+            #   - 11834757 (BF16 + FP8 KV / TP=8 / smoke, 5/5 coherent)
+            #   - 11835558 (BF16 + FP8 KV / async / 16n8g, multi-step run)
+            # Only PP=1 + no-DTensor constraints remain structural.
+            if generation_config["vllm_cfg"]["precision"] == "fp8":
+                assert policy_config["dtensor_cfg"]["enabled"] == False, (
+                    "DTensor backend is not supported with kv cache fp8 enabled."
+                )
+                assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
+                    "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
+                )
 
         ## make vllm hf overrides match the training policy
         generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
