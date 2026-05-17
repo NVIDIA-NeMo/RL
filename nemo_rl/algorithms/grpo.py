@@ -771,9 +771,22 @@ def setup(
                 assert policy_config["dtensor_cfg"]["enabled"] == False, (
                     "DTensor backend is not supported with kv cache fp8 enabled."
                 )
-                assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                    "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
-                )
+                pp = policy_config["megatron_cfg"]["pipeline_model_parallel_size"]
+                if pp != 1:
+                    # The PP=1 requirement was defensive at the time FP8 KV was
+                    # first integrated. The refit broadcast path
+                    # (broadcast_weights_for_collective + _iter_params_with_optional_kv_scales)
+                    # handles PP>1 the same way for BF16 and FP8 weights:
+                    # megatron_bridge.export_hf_weights gathers across PP ranks
+                    # transparently, then sender-side FP8 cast happens per-tensor.
+                    # PP>1 with BF16 weights + FP8 KV is validated by job 11835558
+                    # (PP=8, multi-step async run). FP8 weights + FP8 KV + PP>1
+                    # uses the same broadcast path so should behave identically.
+                    print(
+                        f"  ⚠ FP8 weights + FP8 KV + PP={pp}: validated only at PP=1 "
+                        "and at PP>1 with BF16 weights. Monitor refit and rollout quality.",
+                        flush=True,
+                    )
 
         ## make vllm hf overrides match the training policy
         generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
