@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
-from copy import deepcopy
 
 import pytest
 import torch
@@ -27,23 +26,6 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-
-basic_pg_loss_test_config: ClippedPGLossConfig = {
-    "ratio_clip_min": 0.2,
-    "ratio_clip_max": 0.2,
-    "ratio_clip_c": None,
-    "disable_ppo_ratio": False,
-    "reference_policy_kl_penalty": 0.0,  # Disable KL
-    "reference_policy_kl_type": "k3",
-    "kl_input_clamp_value": 20.0,
-    "kl_output_clamp_value": 10.0,
-    "use_on_policy_kl_approximation": False,
-    "use_importance_sampling_correction": False,
-    "truncated_importance_sampling_ratio": None,  # Disable TIS
-    "sequence_level_importance_ratios": False,
-    "token_level_loss": True,
-    "force_on_policy_ratio": False,
-}
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
@@ -464,7 +446,7 @@ def test_clipped_pg_loss_ppo_clipping():
     device = "cuda"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
-    cfg = basic_pg_loss_test_config
+    cfg = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
     loss_fn = ClippedPGLossFn(cfg)
 
     adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
@@ -488,7 +470,7 @@ def test_clipped_pg_loss_ppo_clipping():
     )
 
     ratios_clamped = torch.clamp(
-        ratios, 1.0 - cfg["ratio_clip_min"], 1.0 + cfg["ratio_clip_max"]
+        ratios, 1.0 - cfg.ratio_clip_min, 1.0 + cfg.ratio_clip_max
     )  # [0.8, 1.0, 1.2]
     assert torch.allclose(
         ratios_clamped, torch.tensor([[0.8, 1.0, 1.2]], device=device), rtol=1e-3
@@ -632,10 +614,12 @@ def test_clipped_pg_loss_reinforce_mode():
     device = "cuda"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["disable_ppo_ratio"] = True
-    cfg["ratio_clip_min"] = 0.0
-    cfg["ratio_clip_max"] = 0.0
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        disable_ppo_ratio=True,
+        ratio_clip_min=0.0,
+        ratio_clip_max=0.0,
+    )
     loss_fn = ClippedPGLossFn(cfg)
 
     adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
@@ -681,8 +665,9 @@ def test_clipped_pg_loss_force_on_policy_ratio():
     device = "cuda"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["force_on_policy_ratio"] = True
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0, force_on_policy_ratio=True
+    )
     loss_fn = ClippedPGLossFn(cfg)
 
     # Use same logprob pattern as PPO clipping test to ensure
@@ -727,6 +712,62 @@ def test_clipped_pg_loss_force_on_policy_ratio():
     assert metrics["probs_ratio_max"] == 1.0
     assert metrics["probs_ratio_clamped_min"] == 1.0
     assert metrics["probs_ratio_clamped_max"] == 1.0
+
+
+def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
+    """Tests that force_on_policy_ratio ignores prev_logprobs from data and uses curr_logprobs instead.
+
+    When force_on_policy_ratio=True, the loss function should use curr_logprobs.detach()
+    as prev_logprobs, so the actual prev_logprobs in data are irrelevant. This allows
+    skipping the expensive prev_logprobs computation upstream.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
+
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        force_on_policy_ratio=True,
+    )
+    loss_fn = ClippedPGLossFn(cfg)
+
+    curr_lp = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    input_ids = data["input_ids"]
+    dummy_logits = _create_exact_logits(
+        curr_lp, input_ids, batch_size, seq_len, vocab_size, device
+    )
+
+    # Run with correct prev_logprobs
+    data_1, _, _, _ = _setup_clipped_pg_test_data(device=device)
+    data_1["prev_logprobs"][0, 1:] = curr_lp
+    loss_input_1, data_1 = prepare_loss_input(dummy_logits.clone(), data_1, loss_fn)
+    loss_1, metrics_1 = loss_fn(
+        data=data_1,
+        global_valid_seqs=torch.sum(data_1["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data_1["sample_mask"].unsqueeze(-1) * data_1["token_mask"]
+        ),
+        **loss_input_1,
+    )
+
+    # Run with wildly different prev_logprobs (should be ignored)
+    data_2, _, _, _ = _setup_clipped_pg_test_data(device=device)
+    data_2["prev_logprobs"][0, 1:] = torch.tensor([-10.0, -10.0, -10.0], device=device)
+    loss_input_2, data_2 = prepare_loss_input(dummy_logits.clone(), data_2, loss_fn)
+    loss_2, metrics_2 = loss_fn(
+        data=data_2,
+        global_valid_seqs=torch.sum(data_2["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data_2["sample_mask"].unsqueeze(-1) * data_2["token_mask"]
+        ),
+        **loss_input_2,
+    )
+
+    # Both should produce identical loss and ratios since prev_logprobs is ignored
+    torch.testing.assert_close(loss_1, loss_2)
+    assert metrics_1["probs_ratio"] == metrics_2["probs_ratio"] == 1.0
 
 
 @pytest.mark.parametrize("kl_type", ["k1", "k2", "k3"])
@@ -780,8 +821,7 @@ def test_clipped_pg_loss_kl_penalty():
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
     # --- Test Setup ---
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["reference_policy_kl_penalty"] = 0.1
+    cfg = ClippedPGLossConfig(reference_policy_kl_penalty=0.1)
     loss_fn = ClippedPGLossFn(cfg)
 
     adv_masked = torch.tensor([[0.0, 0.0, 0.0]], device=device)
@@ -810,7 +850,7 @@ def test_clipped_pg_loss_kl_penalty():
         expected_kl_mean, torch.tensor(0.362, device=device), rtol=1e-3
     )
 
-    expected_loss = cfg["reference_policy_kl_penalty"] * expected_kl_mean  # 0.0362
+    expected_loss = cfg.reference_policy_kl_penalty * expected_kl_mean  # 0.0362
     assert torch.allclose(expected_loss, torch.tensor(0.0362, device=device), rtol=1e-3)
 
     input_ids = data["input_ids"]
@@ -855,8 +895,7 @@ def test_clipped_pg_loss_masking():
     # Make advantages non-zero
     data["advantages"] = torch.randn_like(data["advantages"]) + 1.0
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["reference_policy_kl_penalty"] = 0.1
+    cfg = ClippedPGLossConfig(reference_policy_kl_penalty=0.1)
     loss_fn = ClippedPGLossFn(cfg)  # Use original loss fn
     loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
@@ -942,8 +981,7 @@ def test_clipped_pg_loss_zero_mask():
     # Need dummy logits
     dummy_logits = torch.randn(1, seq_len, vocab_size, device=device)
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["reference_policy_kl_penalty"] = 0.1
+    cfg = ClippedPGLossConfig(reference_policy_kl_penalty=0.1)
     loss_fn = ClippedPGLossFn(cfg)  # Use original loss fn
     loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
 
@@ -971,9 +1009,11 @@ def test_clipped_pg_loss_on_policy_kl_importance_sampling():
     device = "cuda"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["use_on_policy_kl_approximation"] = True
-    cfg["use_importance_sampling_correction"] = True
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_on_policy_kl_approximation=True,
+        use_importance_sampling_correction=True,
+    )
     loss_fn = ClippedPGLossFn(cfg)
 
     adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
@@ -1010,7 +1050,7 @@ def test_clipped_pg_loss_on_policy_kl_importance_sampling():
     )
 
     ratios_clamped = torch.clamp(
-        ratios, 1.0 - cfg["ratio_clip_min"], 1.0 + cfg["ratio_clip_max"]
+        ratios, 1.0 - cfg.ratio_clip_min, 1.0 + cfg.ratio_clip_max
     )  # [0.8, 1.0, 1.2]
     assert torch.allclose(
         ratios_clamped, torch.tensor([[0.8, 1.0, 1.2]], device=device), rtol=1e-3
@@ -1085,7 +1125,7 @@ def test_clipped_pg_loss_on_policy_kl_importance_sampling():
         importance_weighted_kl_term_per_token
     )  # mean([0.09308, 0.0, 0.08855]) = 0.060543
     expected_kl_loss = (
-        cfg["reference_policy_kl_penalty"] * expected_kl_mean
+        cfg.reference_policy_kl_penalty * expected_kl_mean
     )  # 0.1 * 0.060543 = 0.0060543
 
     expected_total_loss = (
@@ -1118,13 +1158,15 @@ def test_clipped_pg_loss_on_policy_truncated_importance_sampling(
     device = "cuda"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["use_importance_sampling_correction"] = True
-    cfg["truncated_importance_sampling_ratio"] = 0.8
-    cfg["truncated_importance_sampling_type"] = "tis"
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_ratio=0.8,
+        truncated_importance_sampling_type="tis",
+    )
     if sequence_level_importance_ratios:
-        cfg["sequence_level_importance_ratios"] = True
-        cfg["token_level_loss"] = False
+        cfg.sequence_level_importance_ratios = True
+        cfg.token_level_loss = False
     loss_fn = ClippedPGLossFn(cfg)
 
     adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
@@ -1154,8 +1196,8 @@ def test_clipped_pg_loss_on_policy_truncated_importance_sampling(
 
     # sequence-level: [[0.9086, 0.9086, 0.9086]]
     # token-level: [[0.8, 1.0, 1.2]]
-    clip_min = cfg["ratio_clip_min"]
-    clip_max = cfg["ratio_clip_max"]
+    clip_min = cfg.ratio_clip_min
+    clip_max = cfg.ratio_clip_max
     ratios_clamped = torch.clamp(ratios, 1.0 - clip_min, 1.0 + clip_max)
 
     # sequence-level: [[-0.9086, 0.9086, -1.8171]]
@@ -1194,7 +1236,7 @@ def test_clipped_pg_loss_on_policy_truncated_importance_sampling(
     # sequence-level: [[0.8000]]
     # token-level: [[0.6065, 0.8000, 0.8000]]
     truncated_actor_importance_weights = torch.clamp(
-        actor_importance_weights, max=cfg["truncated_importance_sampling_ratio"]
+        actor_importance_weights, max=cfg.truncated_importance_sampling_ratio
     )
 
     # sequence-level: [[-0.7268, 0.7268, -1.4537]]
@@ -1251,11 +1293,13 @@ def test_clipped_pg_loss_icepop_importance_sampling():
     device = "cuda"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["use_importance_sampling_correction"] = True
-    cfg["truncated_importance_sampling_ratio"] = 5.0  # max (ref)
-    cfg["truncated_importance_sampling_type"] = "icepop"
-    cfg["truncated_importance_sampling_ratio_min"] = 0.5  # min (ref)
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type="icepop",
+        truncated_importance_sampling_ratio=5.0,  # max (ref)
+        truncated_importance_sampling_ratio_min=0.5,  # min (ref)
+    )
     loss_fn = ClippedPGLossFn(cfg)
 
     # On-policy (curr = prev) → ratios = 1, clip_loss = -adv
@@ -1298,11 +1342,13 @@ def test_clipped_pg_loss_seq_mask_tis():
     device = "cuda"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["use_importance_sampling_correction"] = True
-    cfg["truncated_importance_sampling_ratio"] = 1.002  # max (ref)
-    cfg["truncated_importance_sampling_type"] = "seq-mask-tis"
-    cfg["truncated_importance_sampling_ratio_min"] = 0.999  # min (ref)
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type="seq-mask-tis",
+        truncated_importance_sampling_ratio=1.002,  # max (ref)
+        truncated_importance_sampling_ratio_min=0.999,  # min (ref)
+    )
     loss_fn = ClippedPGLossFn(cfg)
 
     # On-policy (curr = prev), gen very close to prev
@@ -1381,8 +1427,7 @@ def test_clipped_pg_loss_dual_clip():
     device = "cuda"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["ratio_clip_c"] = 3.0
+    cfg = ClippedPGLossConfig(reference_policy_kl_penalty=0.0, ratio_clip_c=3.0)
     loss_fn = ClippedPGLossFn(cfg)
 
     # Create test data with a mix of advantages: positive, slightly negative, strongly negative
@@ -1406,7 +1451,7 @@ def test_clipped_pg_loss_dual_clip():
     # --- Hand Calculation ---
     # Actor Loss Calculation
     ratios_clamped = torch.clamp(
-        ratios, 1.0 - cfg["ratio_clip_min"], 1.0 + cfg["ratio_clip_max"]
+        ratios, 1.0 - cfg.ratio_clip_min, 1.0 + cfg.ratio_clip_max
     )  # [0.8, 1.0, 1.2]
     assert torch.allclose(
         ratios_clamped, torch.tensor([[0.8, 1.0, 1.2]], device=device), rtol=1e-3
@@ -1430,7 +1475,7 @@ def test_clipped_pg_loss_dual_clip():
 
     # Dual clipping
     loss3 = (
-        -adv_masked * cfg["ratio_clip_c"]
+        -adv_masked * cfg.ratio_clip_c
     )  # -[1*3.0, -1*3.0, -4*3.0] = [-3.0, 3.0, 12.0]
     assert torch.allclose(
         loss3, torch.tensor([[-3.0, 3.0, 12.0]], device=device), rtol=1e-3
@@ -1474,7 +1519,7 @@ def test_clipped_pg_loss_entropy():
     device = "cuda"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
-    cfg = basic_pg_loss_test_config
+    cfg = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
     loss_fn = ClippedPGLossFn(cfg)
 
     # Log probs for 3 tokens (default token_mask is [0, 1, 1, 1], so 3 unmasked after slicing)
@@ -1528,9 +1573,11 @@ def test_clipped_pg_loss_gspo():
     device = "cuda"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["sequence_level_importance_ratios"] = True
-    cfg["token_level_loss"] = False
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        sequence_level_importance_ratios=True,
+        token_level_loss=False,
+    )
     loss_fn = ClippedPGLossFn(cfg)
 
     adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
@@ -1556,7 +1603,7 @@ def test_clipped_pg_loss_gspo():
     )
 
     ratios_clamped = torch.clamp(
-        ratios, 1.0 - cfg["ratio_clip_min"], 1.0 + cfg["ratio_clip_max"]
+        ratios, 1.0 - cfg.ratio_clip_min, 1.0 + cfg.ratio_clip_max
     )
     assert torch.allclose(
         ratios_clamped,
@@ -1609,9 +1656,11 @@ def test_clipped_pg_loss_gspo_batch_size_2():
         batch_size=2, device=device
     )
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["sequence_level_importance_ratios"] = True
-    cfg["token_level_loss"] = False
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        sequence_level_importance_ratios=True,
+        token_level_loss=False,
+    )
     loss_fn = ClippedPGLossFn(cfg)
 
     adv_masked = torch.tensor([[1.0, -1.0, 2.0], [1.0, -1.0, 2.0]], device=device)
@@ -1643,7 +1692,7 @@ def test_clipped_pg_loss_gspo_batch_size_2():
     )
 
     ratios_clamped = torch.clamp(
-        ratios, 1.0 - cfg["ratio_clip_min"], 1.0 + cfg["ratio_clip_max"]
+        ratios, 1.0 - cfg.ratio_clip_min, 1.0 + cfg.ratio_clip_max
     )
     assert torch.allclose(
         ratios_clamped,
@@ -1708,10 +1757,12 @@ def test_clipped_pg_loss_gspo_importance_sampling_correction():
     device = "cuda"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["use_importance_sampling_correction"] = True
-    cfg["sequence_level_importance_ratios"] = True
-    cfg["token_level_loss"] = False
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        sequence_level_importance_ratios=True,
+        token_level_loss=False,
+    )
     loss_fn = ClippedPGLossFn(cfg)
 
     adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
@@ -1750,7 +1801,7 @@ def test_clipped_pg_loss_gspo_importance_sampling_correction():
     )
 
     ratios_clamped = torch.clamp(
-        ratios, 1.0 - cfg["ratio_clip_min"], 1.0 + cfg["ratio_clip_max"]
+        ratios, 1.0 - cfg.ratio_clip_min, 1.0 + cfg.ratio_clip_max
     )
     assert torch.allclose(
         ratios_clamped,
