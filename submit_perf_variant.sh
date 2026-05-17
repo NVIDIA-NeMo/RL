@@ -124,8 +124,10 @@ LOG_DIR="logs/${EXP_NAME}"
 
 cd "${REPO_DIR}"
 
-# Ensure branch is sj/super-v3-perf-patch
-git checkout sj/super-v3-perf-patch
+# Stay on currently-checked-out branch (per-worktree: sj/super-v3-perf-patch on main repo,
+# sj/super-v3-fuseloss-port on fuseloss worktree). Allow per-worktree override via BRANCH env.
+TARGET_BRANCH="${BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
+git checkout "${TARGET_BRANCH}"
 git pull --ff-only
 
 export OMP_NUM_THREADS=16
