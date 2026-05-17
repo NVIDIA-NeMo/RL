@@ -456,6 +456,12 @@ class BaseVllmGenerationWorker:
             vllm_kwargs.update(fp8_kwargs)
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
+        else:
+            # BF16/FP16 weights + FP8 KV cache path. init_fp8 only runs when
+            # precision == "fp8", so kv_cache_dtype must be forwarded here.
+            kv_cache_dtype = self.cfg["vllm_cfg"].get("kv_cache_dtype", "auto")
+            if kv_cache_dtype != "auto":
+                vllm_kwargs["kv_cache_dtype"] = kv_cache_dtype
 
         if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}

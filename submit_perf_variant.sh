@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Submit one of: ray_only, mxfp8, hybridep, hybridep_skiplogprob, both
+# Submit one of: ray_only, mxfp8, hybridep, hybridep_skiplogprob, hybridep_fp8kv, both
 # Usage: VARIANT=ray_only ./submit_perf_variant.sh
 set -euo pipefail
 
-: "${VARIANT:?VARIANT is required: ray_only | mxfp8 | hybridep | hybridep_skiplogprob | both}"
+: "${VARIANT:?VARIANT is required: ray_only | mxfp8 | hybridep | hybridep_skiplogprob | hybridep_fp8kv | both}"
 DRY_RUN="${DRY_RUN:-false}"
 
 REPO_DIR="/lustre/fsw/portfolios/coreai/users/sna/repos/nemo-rl-qwen-swe"
@@ -51,6 +51,21 @@ case "$VARIANT" in
   ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep \
   policy.megatron_cfg.moe_shared_expert_overlap=True \
   grpo.seq_logprob_error_threshold=null"
+    EXTRA_ENVS="  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 \
+  USE_MNNVL=False \
+  PYTHONPATH=/lustre/fsw/portfolios/coreai/users/sna/hybridep_overlay_cp312/site-packages:${PYTHONPATH:-}"
+    export TORCH_CUDA_ARCH_LIST_OVERRIDE="9.0"
+    ;;
+  hybridep_fp8kv)
+    # HybridEP + skiplogprob + FP8 KV cache (BF16 weights, dynamic per-head/per-token
+    # FP8 KV scales). Quality-safe H100 FP8 path proven on smoke 11834757.
+    # Memory benefit: ~2x KV reduction -> headroom for batch/context.
+    VARIANT_TAG="hybridep-fp8kv"
+    EXTRA_OVERRIDES="  policy.megatron_cfg.moe_token_dispatcher_type=flex \
+  ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep \
+  policy.megatron_cfg.moe_shared_expert_overlap=True \
+  grpo.seq_logprob_error_threshold=null \
+  ++policy.generation.vllm_cfg.kv_cache_dtype=fp8_e4m3"
     EXTRA_ENVS="  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 \
   USE_MNNVL=False \
   PYTHONPATH=/lustre/fsw/portfolios/coreai/users/sna/hybridep_overlay_cp312/site-packages:${PYTHONPATH:-}"
