@@ -120,6 +120,7 @@ def _apply_mxfp8_sm90_bypass():
     from vllm.model_executor.layers.quantization import modelopt
 
     if not hasattr(modelopt, "ModelOptMxFp8Config"):
+        print('[mxfp8-bypass-n9] EXIT: no ModelOptMxFp8Config attr', flush=True)
         return False  # older vllm without MXFP8 classes; nothing to bypass
 
     modelopt.ModelOptMxFp8Config.get_min_capability = classmethod(lambda cls: 80)
@@ -137,18 +138,24 @@ def _apply_mxfp8_sm90_bypass():
                 Mxfp8LinearBackend,
                 Mxfp8LinearOp,
             )
-        except ImportError:
+        except ImportError as _ie:
+            print(f'[mxfp8-bypass-n9] EXIT: Mxfp8LinearOp ImportError ({_ie}) -> backend stays default! NaN expected on H100.', flush=True)
             return True
 
         _orig_init = modelopt.ModelOptMxFp8LinearMethod.__init__
 
         def _patched_init(self, quant_config):
             _orig_init(self, quant_config)
+            _before = getattr(self, 'backend', '<unset>')
             self.backend = Mxfp8LinearBackend.EMULATION
             self.mxfp8_linear_op = Mxfp8LinearOp(backend=self.backend)
+            print(f'[mxfp8-bypass-n9] _patched_init: backend {_before!r} -> {self.backend!r}, op={type(self.mxfp8_linear_op).__name__}', flush=True)
 
         modelopt.ModelOptMxFp8LinearMethod.__init__ = _patched_init
+        print('[mxfp8-bypass-n9] _patched_init INSTALLED', flush=True)
 
+    else:
+        print('[mxfp8-bypass-n9] EXIT: no ModelOptMxFp8LinearMethod attr', flush=True)
     return True
 
 
@@ -700,7 +707,20 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
             # the weight_loader reassigns .data rather than copying in-place, so
             # weight_scale stays at the random dummy values from load_format=dummy.
             # Sync explicitly to mirror the FLASHINFER branch.
+            import os
+            _diag = os.environ.get('MXFP8_N9_DIAG') == '1'
+            if _diag:
+                _ws = layer.weight_scale.data
+                _wsc = layer.weight_scale_from_checkpoint.data
+                _w = layer.weight.data
+                print(f'[mxfp8-n9-refit] backend={self.backend!r} layer={getattr(layer, "prefix", "?")} '
+                      f'pre_ws nan={_ws.isnan().any().item()} min={_ws.float().min().item():.4g} max={_ws.float().max().item():.4g} '
+                      f'wsc nan={_wsc.isnan().any().item()} min={_wsc.float().min().item():.4g} max={_wsc.float().max().item():.4g} '
+                      f'weight nan={_w.isnan().any().item()}', flush=True)
             layer.weight_scale.data.copy_(layer.weight_scale_from_checkpoint.data)
+            if _diag:
+                _ws_post = layer.weight_scale.data
+                print(f'[mxfp8-n9-refit] POST copy ws nan={_ws_post.isnan().any().item()} min={_ws_post.float().min().item():.4g} max={_ws_post.float().max().item():.4g}', flush=True)
 
 
 def process_weights_after_loading_moe(self, layer) -> None:
