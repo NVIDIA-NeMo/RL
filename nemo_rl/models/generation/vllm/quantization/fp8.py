@@ -477,10 +477,14 @@ def load_weights(weights, model_runner):
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         mxfp8_e4m3_quantize,
     )
+    import os as _os
 
     global global_fp8_config
     weights_quantized = []
     model = model_runner.model
+    _diag = _os.environ.get("MXFP8_N10_DIAG") == "1"
+    _diag_count = 0
+    _diag_first_keys = []
 
     for k, v in weights:
         if not _is_fp8_weight(k, model):
@@ -495,6 +499,21 @@ def load_weights(weights, model_runner):
                 weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
             )
         param_scale = torch.squeeze(param_scale, dim=-1)
+        if _diag and _diag_count < 5:
+            try:
+                _v = v.float() if v.is_floating_point() else v.to("cpu").float()
+                _ps = param_scale.float() if param_scale.is_floating_point() else param_scale.to("cpu").float()
+                _plp = param_lp.float() if param_lp.is_floating_point() else param_lp.to("cpu").float()
+                print(
+                    f"[mxfp8-n10-quant] key={k} v(min={_v.min().item():.4g},max={_v.max().item():.4g},nan={_v.isnan().any().item()}) "
+                    f"param_lp(shape={tuple(param_lp.shape)},dtype={param_lp.dtype},min={_plp.min().item():.4g},max={_plp.max().item():.4g},nan={_plp.isnan().any().item()}) "
+                    f"param_scale(shape={tuple(param_scale.shape)},dtype={param_scale.dtype},min={_ps.min().item():.4g},max={_ps.max().item():.4g},nan={_ps.isnan().any().item()})",
+                    flush=True,
+                )
+            except Exception as _e:
+                print(f"[mxfp8-n10-quant] key={k} diag-error: {_e!r}", flush=True)
+            _diag_first_keys.append(k)
+            _diag_count += 1
         if global_fp8_config.is_mx:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
@@ -502,7 +521,37 @@ def load_weights(weights, model_runner):
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_inv", param_scale])
     # Finally load the weights into vllm
+    if _diag:
+        _fp8_count = sum(1 for x in weights_quantized if isinstance(x, list) and x[0].endswith("_scale_from_checkpoint"))
+        print(f"[mxfp8-n10-quant] total scale_from_checkpoint pairs queued: {_fp8_count}", flush=True)
     model.load_weights(weights_quantized)
+    if _diag:
+        # Read-back: probe a few layers post-load to confirm vllm wrote into the target params
+        try:
+            for _k in _diag_first_keys[:3]:
+                _mod_path = _k.rsplit(".", 1)[0]  # e.g. model.layers.0.self_attn.qkv_proj
+                _mod = model
+                for _part in _mod_path.split("."):
+                    _mod = getattr(_mod, _part, None)
+                    if _mod is None:
+                        break
+                if _mod is None:
+                    print(f"[mxfp8-n10-readback] key={_k} module not found at {_mod_path}", flush=True)
+                    continue
+                _ws = getattr(_mod, "weight_scale", None)
+                _wsc = getattr(_mod, "weight_scale_from_checkpoint", None)
+                if _ws is None or _wsc is None:
+                    print(f"[mxfp8-n10-readback] key={_k} ws={_ws is not None} wsc={_wsc is not None}", flush=True)
+                    continue
+                _wsf = _ws.data.float()
+                _wscf = _wsc.data.float()
+                print(
+                    f"[mxfp8-n10-readback] key={_k} ws(min={_wsf.min().item():.4g},max={_wsf.max().item():.4g},nan={_wsf.isnan().any().item()}) "
+                    f"wsc(min={_wscf.min().item():.4g},max={_wscf.max().item():.4g},nan={_wscf.isnan().any().item()})",
+                    flush=True,
+                )
+        except Exception as _e:
+            print(f"[mxfp8-n10-readback] error: {_e!r}", flush=True)
 
 
 def cast_tensor_to_fp8_blockwise(

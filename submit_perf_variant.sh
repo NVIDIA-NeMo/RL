@@ -48,7 +48,7 @@ case "$VARIANT" in
   ++policy.generation.vllm_cfg.pow2_weight_scaling_factors=true \
   ++policy.generation.vllm_cfg.pow2_activation_scaling_factors=true"
     # EMULATION backend is pure-torch, no flashinfer dependencies. MNNVL not available on H100.
-    EXTRA_ENVS="MXFP8_N9_DIAG=1"
+    EXTRA_ENVS="MXFP8_N9_DIAG=1 MXFP8_N10_DIAG=1"
     ;;
   hybridep)
     VARIANT_TAG="hybridep"
