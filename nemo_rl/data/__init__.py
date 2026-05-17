@@ -194,3 +194,12 @@ EvalDataConfigType = Union[
     MMAUEvalDataConfig,
     LocalMathEvalDataConfig,
 ]
+
+
+class RandomEvalDataConfig(TypedDict):
+    """Config for random evaluation dataset."""
+
+    max_input_seq_length: int
+    dataset_name: Literal["random"]
+    input_len_or_input_distribution: Dict[str, Any] | int
+    num_samples: int

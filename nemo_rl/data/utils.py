@@ -19,7 +19,7 @@ from typing import Any, Optional, Union
 from datasets import concatenate_datasets
 from transformers import AutoProcessor, AutoTokenizer
 
-from nemo_rl.data import DataConfig
+from nemo_rl.data import DataConfig, RandomEvalDataConfig
 from nemo_rl.data.datasets import (
     AllTaskProcessedDataset,
     RandomDataset,
@@ -327,7 +327,7 @@ def setup_preference_data(
 
 
 def setup_random_data(
-    tokenizer: AutoTokenizer, data_config: DataConfig
+    tokenizer: AutoTokenizer, data_config: RandomEvalDataConfig
 ) -> tuple[
     AllTaskProcessedDataset,
     Optional[AllTaskProcessedDataset],

@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.utils import set_seed
-from nemo_rl.data import EvalDataConfigType
+from nemo_rl.data import EvalDataConfigType, RandomEvalDataConfig
 from nemo_rl.data.collate_fn import eval_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.llm_message_utils import get_keys_from_message_log
@@ -62,7 +62,7 @@ class MasterConfig(BaseModel, extra="allow"):
     eval: EvalConfig
     generation: GenerationConfig  # Fixed: was 'generate'
     tokenizer: TokenizerConfig  # Added missing tokenizer key
-    data: EvalDataConfigType
+    data: EvalDataConfigType | RandomEvalDataConfig
     env: _PassThroughEnvConfig
     cluster: ClusterConfig
 
