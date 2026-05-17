@@ -37,6 +37,16 @@ except ImportError:
     )
 
 
+# MXFP8 sm_90 bypass: vllm v1 spawns EngineCore subprocess that re-imports vllm.modelopt fresh.
+# This module is loaded into that subprocess as worker_extension_cls, giving us a hook to install
+# the bypass at module import time, BEFORE vllm constructs MXFP8 quant methods.
+try:
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 10:
+        from nemo_rl.models.generation.vllm.quantization.fp8 import _apply_mxfp8_sm90_bypass
+        _apply_mxfp8_sm90_bypass()
+except Exception as _e:
+    pass  # non-MXFP8 jobs or missing classes: no-op
+
 class VllmInternalWorkerExtension:
     def init_collective(
         self,
