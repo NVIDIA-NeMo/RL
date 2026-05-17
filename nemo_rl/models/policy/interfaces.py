@@ -178,6 +178,10 @@ class ColocatablePolicyInterface(PolicyInterface):
     def offload_after_refit(self) -> None:
         pass
 
+    def set_fp8_param_names(self, fp8_param_names: set[str]) -> None:
+        """Cache the set of FP8-quantized param names obtained from the generation backend."""
+        pass
+
     @abstractmethod
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         pass
