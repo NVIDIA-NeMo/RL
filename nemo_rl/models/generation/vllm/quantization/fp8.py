@@ -659,13 +659,14 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
         raise ValueError(
             f"MXFP8 linear layer weight must be 2D, but got {layer.weight.ndim}D"
         )
-    # When _apply_mxfp8_sm90_bypass forces EMULATION (H100 sm_90), raw
-    # weight_scale is consumed directly by Mxfp8LinearOp.dequant; swizzling
-    # is FLASHINFER_CUTLASS-specific and unnecessary for EMULATION.
-    if self.backend != Mxfp8LinearBackend.FLASHINFER_CUTLASS:
-        return
     weight = layer.weight.data  # [N, K]
     N, K = weight.shape
+
+    # weight_scale_from_checkpoint must exist on every backend so that
+    # update_weights_from_collective (refit) can broadcast new scales into it.
+    # Swizzling is FLASHINFER_CUTLASS-specific; EMULATION (H100 sm_90 bypass)
+    # consumes raw scales via Mxfp8LinearOp.dequant and must skip the swizzle.
+    is_flashinfer = self.backend == Mxfp8LinearBackend.FLASHINFER_CUTLASS
 
     if not hasattr(layer, "weight_scale_from_checkpoint"):
         layer.weight_scale_from_checkpoint = ModelWeightParameter(
@@ -677,21 +678,21 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
         layer.register_parameter(
             "weight_scale_from_checkpoint", layer.weight_scale_from_checkpoint
         )
-        weight_scale = layer.weight_scale.data
-        # Swizzle the weight scales
-        scale_k = K // 32
-        weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
-        weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
-        layer.weight_scale = torch.nn.Parameter(
-            weight_scale_swizzled.contiguous(), requires_grad=False
-        )
+        if is_flashinfer:
+            weight_scale = layer.weight_scale.data
+            scale_k = K // 32
+            weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
+            weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
+            layer.weight_scale = torch.nn.Parameter(
+                weight_scale_swizzled.contiguous(), requires_grad=False
+            )
     else:
-        weight_scale = layer.weight_scale_from_checkpoint.data
-        # Swizzle the weight scales
-        scale_k = K // 32
-        weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
-        weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
-        layer.weight_scale.copy_(weight_scale_swizzled.contiguous())
+        if is_flashinfer:
+            weight_scale = layer.weight_scale_from_checkpoint.data
+            scale_k = K // 32
+            weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
+            weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
+            layer.weight_scale.copy_(weight_scale_swizzled.contiguous())
 
 
 def process_weights_after_loading_moe(self, layer) -> None:
