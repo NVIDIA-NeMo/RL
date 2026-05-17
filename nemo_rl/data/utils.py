@@ -25,7 +25,7 @@ from nemo_rl.data.datasets import (
     extract_necessary_env_names,
     load_preference_dataset,
     load_response_dataset,
-    merge_map_style_datasets,
+    merge_datasets,
     update_single_dataset_config,
 )
 from nemo_rl.data.processors import preference_preprocessor
@@ -207,7 +207,7 @@ def setup_response_data(
         }
     else:
         # merge datasets into a single dataset
-        merged_data = merge_map_style_datasets([data.dataset for data in data_list])
+        merged_data = merge_datasets([data.dataset for data in data_list])
         dataset = AllTaskProcessedDataset(
             merged_data,
             tokenizer,
@@ -272,7 +272,7 @@ def setup_response_data(
     # merge datasets
     val_dataset = None
     if len(val_data_list) > 0:
-        merged_val_data = merge_map_style_datasets(val_data_list)
+        merged_val_data = merge_datasets(val_data_list)
         val_dataset = AllTaskProcessedDataset(
             merged_val_data,
             tokenizer,

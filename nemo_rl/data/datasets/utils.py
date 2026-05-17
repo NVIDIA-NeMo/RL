@@ -134,7 +134,7 @@ def update_single_dataset_config(data_config: dict, default_data_config: dict) -
             data_config[key] = default_data_config[key]
 
 
-def merge_map_style_datasets(datasets: list[Any]) -> Any:
+def merge_datasets(datasets: list[Any]) -> Any:
     """Merge map-style datasets while supporting non-HF wrappers.
 
     Hugging Face's ``concatenate_datasets`` only accepts HF ``Dataset`` objects.
