@@ -6,7 +6,7 @@ set -euo pipefail
 : "${VARIANT:?VARIANT is required: ray_only | mxfp8 | hybridep | hybridep_skiplogprob | both | fuseloss | hybridep_fuseloss}"
 DRY_RUN="${DRY_RUN:-false}"
 
-REPO_DIR="/lustre/fsw/portfolios/coreai/users/sna/repos/nemo-rl-qwen-swe"
+REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 CACHE_BASE="/lustre/fsw/portfolios/coreai/users/sna/.cache/qwen3_235b_swe"
 HF_HOME_DIR="/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home"
 DATA_PATH="/lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/sdevare/repos/nano/dataset/rl/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl"
