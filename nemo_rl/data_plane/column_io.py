@@ -37,8 +37,15 @@ import torch
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data_plane.codec import materialize, pack_jagged_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
-from nemo_rl.data_plane.schema import Layout
+from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN, Layout
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def _round_up(value: int, multiple: int) -> int:
+    """Smallest ``multiple``-aligned int ≥ ``value`` (no-op when ``multiple <= 1``)."""
+    if multiple <= 1:
+        return value
+    return ((value + multiple - 1) // multiple) * multiple
 
 
 def read_columns(
@@ -51,11 +58,10 @@ def read_columns(
 ) -> BatchedDataDict[Any]:
     """``get_samples(meta.sample_ids, select_fields=...) → materialize``.
 
-    ``pad_to_multiple`` is read from ``meta.extra_info`` so the
-    materialized seq dim matches the alignment downstream backends
-    require (mcore SP / PyTorch CP). Non-tensor object fields ride as
-    ``NonTensorStack`` leaves; :func:`materialize` unwraps them to
-    ``np.ndarray(dtype=object)``.
+    Pads to ``meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN]`` (minted on
+    the driver by ``TQPolicy._stamp_pad_seqlen`` and inherited by every
+    per-rank shard via :func:`shard_meta_for_dp`) — so driver-fetched
+    and worker-returned columns land at one identical seq dim.
 
     Args:
         dp_client: Data-plane client used for the underlying fetch.
@@ -73,12 +79,12 @@ def read_columns(
         partition_id=meta.partition_id,
         select_fields=list(select_fields),
     )
-    pad_mult = int((meta.extra_info or {}).get("pad_to_multiple", 1))
+    pad_to_seqlen = int((meta.extra_info or {}).get(GLOBAL_FORWARD_PAD_SEQLEN, 0))
     data = materialize(
         td,
         layout=layout,
         pad_value_dict=pad_value_dict,
-        pad_to_multiple=pad_mult,
+        pad_to_seqlen=pad_to_seqlen,
     )
     attach_message_log_view(data)
     return data

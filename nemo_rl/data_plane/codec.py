@@ -283,7 +283,7 @@ def materialize(
     td: TensorDict,
     layout: Layout = "padded",
     pad_value_dict: dict[str, int | float] | None = None,
-    pad_to_multiple: int = 1,
+    pad_to_seqlen: int = 0,
 ) -> "BatchedDataDict[Any]":
     """Convert a wire TensorDict to a BatchedDataDict.
 
@@ -304,11 +304,12 @@ def materialize(
             through — use only when the caller knows how to consume
             them.
         pad_value_dict: Per-field pad value used when ``layout='padded'``.
-        pad_to_multiple: Round the seq dim up to the next multiple after
-            ``to_padded_tensor``. Required when downstream backends
-            impose alignment (mcore SP needs ``seq_len % TP == 0``;
-            PyTorch CP needs ``seq_len % (CP * 2) == 0``). Default 1
-            disables extra alignment.
+        pad_to_seqlen: When > 0, right-pad the seq dim up to this
+            absolute length after ``to_padded_tensor``. Worker-side
+            ``_fetch`` passes its forward-pass target here (rounded up
+            to ``sequence_length_round`` for Megatron's microbatch
+            iterator); driver-side ``read_columns`` leaves it 0 and
+            consumes the natural-padded shape. Default 0 disables.
 
     Returns:
         ``BatchedDataDict`` with rectangular tensors for padded layout,
@@ -319,8 +320,6 @@ def materialize(
 
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-    if pad_to_multiple < 1:
-        raise ValueError(f"pad_to_multiple must be >= 1, got {pad_to_multiple}")
     pads = pad_value_dict or {}
     out: dict[str, Any] = {}
     # pyrefly: inference cycle on tensordict.items() loop var.
@@ -350,13 +349,16 @@ def materialize(
         if val.is_nested and layout == "padded":
             pad = pads.get(key, 0)
             padded = torch.nested.to_padded_tensor(val, padding=pad)
-            if pad_to_multiple > 1 and padded.dim() >= 2:
-                seq_dim = padded.shape[1]
-                rem = seq_dim % pad_to_multiple
-                if rem != 0:
-                    extra = pad_to_multiple - rem
-                    pad_spec = [0, 0] * (padded.dim() - 2) + [0, extra]
-                    padded = torch.nn.functional.pad(padded, pad_spec, value=pad)
+            if (
+                pad_to_seqlen > 0
+                and padded.dim() >= 2
+                and padded.shape[1] < pad_to_seqlen
+            ):
+                pad_spec = [0, 0] * (padded.dim() - 2) + [
+                    0,
+                    pad_to_seqlen - padded.shape[1],
+                ]
+                padded = torch.nn.functional.pad(padded, pad_spec, value=pad)
             out[key] = padded
         else:
             out[key] = val

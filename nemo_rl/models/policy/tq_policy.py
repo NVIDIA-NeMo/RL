@@ -39,9 +39,13 @@ import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
-from nemo_rl.data_plane.column_io import read_columns, write_columns
+from nemo_rl.data_plane.column_io import _round_up, read_columns, write_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, LP_SEED_FIELDS
+from nemo_rl.data_plane.schema import (
+    DP_TRAIN_FIELDS,
+    GLOBAL_FORWARD_PAD_SEQLEN,
+    LP_SEED_FIELDS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
@@ -194,6 +198,23 @@ class TQPolicy(Policy):
             sample_ids=meta.sample_ids, partition_id=meta.partition_id
         )
 
+    def _stamp_pad_seqlen(self, meta: KVBatchMeta) -> None:
+        """Mint ``GLOBAL_FORWARD_PAD_SEQLEN`` onto ``meta.extra_info`` (idempotent).
+
+        Cross-DP forward pad target. Preshard shards inherit it via
+        ``dict(meta.extra_info)`` propagation.
+        """
+        if not meta.sequence_lengths:
+            return
+        if GLOBAL_FORWARD_PAD_SEQLEN in meta.extra_info:
+            return
+        _, dba = self._packing_args("train_mb_tokens")
+        seq_round = int(dba["sequence_length_round"]) if dba is not None else 1
+        pad_mult = int(meta.extra_info.get("pad_to_multiple", 1))
+        meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = _round_up(
+            max(meta.sequence_lengths), max(pad_mult, seq_round)
+        )
+
     def read_from_dataplane(
         self,
         meta: KVBatchMeta,
@@ -201,7 +222,14 @@ class TQPolicy(Policy):
         select_fields: list[str],
         pad_value_dict: Optional[dict[str, Any]] = None,
     ) -> BatchedDataDict[Any]:
-        """Fetch + materialize columns from the data plane (TQ)."""
+        """Fetch + materialize columns from the data plane (TQ).
+
+        ``read_columns`` pads to ``meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN]``
+        — the same value workers pad to in their forward pass. Driver
+        and workers thus return columns at one identical seq dim, with
+        no driver-side knowledge of ``sequence_length_round``.
+        """
+        self._stamp_pad_seqlen(meta)
         return read_columns(
             self.dp_client,
             meta,
@@ -255,6 +283,7 @@ class TQPolicy(Policy):
         field list so ``_fetch`` doesn't pull rollout-only payload (e.g.
         multimodal). The same shape is used for both prev_lp and ref_lp.
         """
+        self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("logprob_mb_tokens")
         lp_meta = replace(meta, fields=list(LP_SEED_FIELDS), task_name=task_name)
         with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
@@ -349,6 +378,7 @@ class TQPolicy(Policy):
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
 
+        self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
         # Train workers fetch the full DP_TRAIN_FIELDS schema (rollout +
         # logprob deltas + advantages + sample_mask). Caller is responsible

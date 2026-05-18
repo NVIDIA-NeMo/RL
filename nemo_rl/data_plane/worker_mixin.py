@@ -36,6 +36,7 @@ FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
+    GLOBAL_FORWARD_PAD_SEQLEN,
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
     Layout,
@@ -47,36 +48,6 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 if TYPE_CHECKING:
     from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
     from nemo_rl.data_plane.interfaces import DataPlaneClient
-
-
-def _pad_tensors_seq_dim_up_to(
-    data: "BatchedDataDict[Any]",
-    *,
-    target_seqlen: int,
-    sequence_dim: int,
-    pad_value_dict: Optional[dict[str, Any]] = None,
-) -> None:
-    """Right-pad every tensor's ``sequence_dim`` up to ``target_seqlen``.
-
-    No-op for tensors already at/above ``target_seqlen`` or with insufficient
-    rank. Uses ``pad_value_dict[k]`` (default 0) so token/id fields pad with
-    the canonical id rather than 0 for token-id columns where 0 collides
-    with a real vocab entry.
-    """
-    pads = pad_value_dict or {}
-    for k, v in list(data.items()):
-        if not torch.is_tensor(v) or v.dim() <= sequence_dim:
-            continue
-        cur = v.shape[sequence_dim]
-        if cur >= target_seqlen:
-            continue
-        # torch.nn.functional.pad expects (left, right) pairs ordered from
-        # the LAST dim backwards: index of the right-pad slot for dim `d` is
-        # 2 * (ndim - 1 - d) + 1.
-        ndim = v.dim()
-        pad_spec = [0] * (2 * ndim)
-        pad_spec[2 * (ndim - 1 - sequence_dim) + 1] = target_seqlen - cur
-        data[k] = torch.nn.functional.pad(v, tuple(pad_spec), value=pads.get(k, 0))
 
 
 def _broadcast_batched_data_dict(
@@ -201,6 +172,10 @@ class TQWorkerMixin:
             return {}
         return {"input_ids": pad_id, "prompt_ids_for_adv": pad_id}
 
+    def _forward_pad_seqlen(self, meta: "KVBatchMeta") -> int:
+        """Cross-DP forward pad target, minted by :meth:`TQPolicy._stamp_pad_seqlen`."""
+        return int((meta.extra_info or {}).get(GLOBAL_FORWARD_PAD_SEQLEN, 0))
+
     def _fetch(
         self,
         meta: "KVBatchMeta",
@@ -208,11 +183,15 @@ class TQWorkerMixin:
         layout: Layout = "padded",
         fetch_policy: FetchPolicy = "auto",
         preprocess: Optional[Any] = None,
+        dp_aligned_seq_len: bool = True,
     ) -> BatchedDataDict[Any]:
         """Fetch this rank's slice from TQ and return a BatchedDataDict.
 
         Args:
             meta: Per-rank ``KVBatchMeta`` from :func:`shard_meta_for_dp`.
+                Forward-pass pad target is read from
+                ``meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN]`` minted by
+                :meth:`TQPolicy._stamp_pad_seqlen`.
             layout: Materialization layout (``"padded"`` or ``"jagged"``).
             fetch_policy: ``"auto"`` uses leader-fetch + NCCL broadcast when
                 :meth:`_get_replica_group` returns a group, else independent
@@ -221,6 +200,9 @@ class TQWorkerMixin:
                 broadcast path and asserts a replica group exists.
             preprocess: Optional ``(worker, td) -> td`` applied between
                 materialize and return.
+            dp_aligned_seq_len: When True (default), right-pad the seq
+                dim for the forward pass. Disabled in tests that want
+                to observe per-rank local-pad behavior.
 
         Returns:
             ``BatchedDataDict`` of this rank's slice.
@@ -242,7 +224,7 @@ class TQWorkerMixin:
                 "replica group, but _get_replica_group() returned None."
             )
 
-        pad_to_multiple = int((meta.extra_info or {}).get("pad_to_multiple", 1))
+        pad_to_seqlen = self._forward_pad_seqlen(meta) if dp_aligned_seq_len else 0
 
         if replica_group is not None:
             leader = torch.distributed.get_global_rank(replica_group, 0)
@@ -257,7 +239,7 @@ class TQWorkerMixin:
                     td,
                     layout=layout,
                     pad_value_dict=pad_value_dict,
-                    pad_to_multiple=pad_to_multiple,
+                    pad_to_seqlen=pad_to_seqlen,
                 )
             else:
                 data = None
@@ -282,7 +264,7 @@ class TQWorkerMixin:
             td,
             layout=layout,
             pad_value_dict=pad_value_dict,
-            pad_to_multiple=pad_to_multiple,
+            pad_to_seqlen=pad_to_seqlen,
         )
         attach_message_log_view(data)
         if preprocess is not None:
@@ -357,27 +339,6 @@ class TQWorkerMixin:
             data.micro_batch_lengths = extra[MICRO_BATCH_LENGTHS]
             if ELEM_COUNTS_PER_GB in extra:
                 data.elem_counts_per_gb = extra[ELEM_COUNTS_PER_GB]
-            # Pad seq dim up to the planner's max micro_batch_length. The
-            # planner rounds to ``dynamic_batching_args.sequence_length_round``
-            # while ``_fetch``'s ``materialize`` pads only to
-            # ``meta.extra_info["pad_to_multiple"]``. When these differ
-            # (e.g. round=64, pad_to_multiple=1) the worker's slice can have
-            # a seq dim smaller than a planner-emitted micro_batch_length,
-            # which crashes ``torch.narrow`` inside the dynamic-shape
-            # microbatch iterator. Padding to the global max equalizes
-            # tensor shapes across DP ranks (a requirement for FSDP/TP
-            # collectives) and makes the narrow safe.
-            target_seqlen = max(
-                (max(chunk) for chunk in data.micro_batch_lengths if chunk),
-                default=0,
-            )
-            if target_seqlen > 0:
-                _pad_tensors_seq_dim_up_to(
-                    data,
-                    target_seqlen=target_seqlen,
-                    sequence_dim=1,
-                    pad_value_dict=self._pad_value_dict(),
-                )
             return data
         return self._apply_packing_prep(data)
 
