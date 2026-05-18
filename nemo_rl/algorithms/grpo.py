@@ -1770,7 +1770,9 @@ def grpo_train(
                     del extra_multimodal_data
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
-                seq_logprob_error_threshold = master_config.grpo.seq_logprob_error_threshold
+                seq_logprob_error_threshold = (
+                    master_config.grpo.seq_logprob_error_threshold
+                )
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     assert seq_logprob_error_threshold is None, (
@@ -2840,7 +2842,9 @@ def async_grpo_train(
                         )
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
-                seq_logprob_error_threshold = master_config.grpo.seq_logprob_error_threshold
+                seq_logprob_error_threshold = (
+                    master_config.grpo.seq_logprob_error_threshold
+                )
                 if skip_prev_logprobs:
                     assert seq_logprob_error_threshold is None, (
                         "seq_logprob_error_threshold requires prev_logprobs computation; "
