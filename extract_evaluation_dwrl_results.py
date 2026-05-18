@@ -17,9 +17,16 @@ def calculate_accuracy(data: list[dict]):
         score_2 = record['score_2']
         metadata = record.get('metadata')
         preference = metadata.get('preference')
+        bt_prob = record.get("bt_prob")
+        pred_ranking = record.get("ranking")
                             
         # Ensure the required keys exist
-        correct_predictions += preference == int(score_2 > score_1)
+        if bt_prob is not None:
+            correct_predictions += int((bt_prob >= 0.5 and preference == 0) or (bt_prob < 0.5 and preference == 1))
+        elif pred_ranking is not None:
+            correct_predictions += preference == (0 if pred_ranking <= 3 else 1)
+        elif score_1 is not None and score_2 is not None:
+            correct_predictions += preference == int(score_2 > score_1)
 
     # Calculate accuracy, avoiding division by zero
     if correct_predictions == total_predictions:
@@ -69,6 +76,9 @@ def calculate_step_accuracies(directory_path: str, dataset: str) -> dict:
                     if not isinstance(original_data, list):
                         print(f"    [WARNING] Content of {filename} is not a list, skipping.")
                         continue
+                    
+                    if "idx" in original_data[0]:
+                        original_data = list({x['idx']:x for x in original_data}.values())
 
                     data = []
                     data_ties = []

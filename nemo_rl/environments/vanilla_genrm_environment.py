@@ -79,19 +79,19 @@ class VanillaGenRMWorker:
                 json_str = json_match.group(0)
                 parsed = json.loads(json_str)
 
-                score_1 = float(parsed.get("score_1"))
-                score_2 = float(parsed.get("score_2"))
-                ranking = float(parsed.get("ranking"))
+                score_1 = parsed.get("score_1")
+                score_2 = parsed.get("score_2")
+                ranking = parsed.get("ranking")
 
                 # Check if any required scores are None - if so, mark as parsing failure
                 parsing_success = (
                     score_1 is not None and score_2 is not None and ranking is not None
-                )
+                ) or (score_1 is not None and score_2 is None and ranking is None)
 
                 return {
-                    "score_1": score_1,
-                    "score_2": score_2,
-                    "ranking": ranking,
+                    "score_1": float(score_1) if score_1 is not None else score_1,
+                    "score_2": float(score_2) if score_2 is not None else score_2,
+                    "ranking": float(ranking) if ranking is not None else ranking,
                     "response_1_analysis": parsed.get("response_1_analysis", ""),
                     "response_2_analysis": parsed.get("response_2_analysis", ""),
                     "parsing_success": parsing_success,

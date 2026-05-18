@@ -49,10 +49,9 @@ grpo:
     recompute_kv_cache_after_weight_updates: false
 
   dwrl:
-    bt_prompt: "Based on your evaluation, is the original response good? Answer with only a single word: yes or no"
-    score_token: "yes"
-    opposite_token: "no"
-    use_env_rewards: false
+    bt_prompt: "Based on your evaluation, which response is better? Answer with only a single character: 1 or 2"
+    score_token: "1"
+    opposite_token: "2"
 
   use_best_at_k: false
   best_at_k_k: 8
@@ -86,6 +85,7 @@ loss_fn:
   force_on_policy_ratio: false
   use_kl_in_reward: false
   ce_penalty: 0.001
+  bt_alpha: 1.0
 
 checkpointing:
   enabled: true
@@ -316,7 +316,6 @@ env:
     - "genrm_simple_agent_reasoning_off"
   genrm_compare_server_name: "genrm_compare"
   genrm_dwrl:
-    reward_design: rb0
     num_workers: 8
     score_weight: 1.0
     ranking_weight: 1.0

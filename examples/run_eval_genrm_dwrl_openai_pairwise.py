@@ -31,17 +31,21 @@ from nemo_rl.data.datasets.preference_datasets.reward_benchmarks import (
 )
 
 
-DWRL_PROMPT_TEMPLATE = """You are an expert evaluation judge specializing in the assessment of LLM responses. You are impartial, rigorous, and consistent. Given the conversation context and a single response to the user's latest query, you will follow the evaluation plan and scoring guidelines exactly as written below.
+DWRL_PROMPT_TEMPLATE = """You are an expert evaluation judge specializing in comparative assessment of LLM responses. You are impartial, rigorous, and consistent. Given the conversation context and two assistant responses to the user's latest query, you will follow the evaluation plan and scoring guidelines exactly as written below.
 
 #### Conversation Context ####
 {context}
 
-#### Response to be Scored ####
-[The Start of Response]
-{response}
-[The End of Response]
+#### Responses to be Scored ####
+[The Start of Response 1]
+{response_1}
+[The End of Response 1]
 
-Please act as an impartial judge and evaluate the quality of the response provided by an AI assistant to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistant's response, compare the assistant's response with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's response is helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when the user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user rather than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's response when needed. Finally, identify any missing important information in the assistant's response which would be beneficial to include when responding to the user prompt.
+[The Start of Response 2]
+{response_2}
+[The End of Response 2]
+
+Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's answers when needed. Finally, identify any missing important information in the assistants' answers that would be beneficial to include when responding to the user prompt.
 
 #### Scoring Guidelines ####
 Based on the evaluation plan above, assign scores using these scales:
@@ -52,18 +56,28 @@ Based on the evaluation plan above, assign scores using these scales:
 - 2: Borderline Unhelpful - Mostly doesn't capture what the user wanted
 - 1: Not Helpful - Completely missed the essence of the request
 
+**Comparative Ranking (1-6):**
+- 1: Response 1 is much better than Response 2
+- 2: Response 1 is better than Response 2
+- 3: Response 1 is slightly better than Response 2
+- 4: Response 2 is slightly better than Response 1
+- 5: Response 2 is better than Response 1
+- 6: Response 2 is much better than Response 1
+
 #### Output Format ####
 Analyze step by step following the evaluation plan, then provide your judgment as JSON:
 ```json
 {{
-    "response_analysis": "Your detailed analysis of the Response based on the evaluation plan",
-    "score": <1-5>
+    "response_1_analysis": "Your detailed analysis of Response 1 based on the evaluation plan",
+    "response_2_analysis": "Your detailed analysis of Response 2 based on the evaluation plan",
+    "score_1": <1-5>,
+    "score_2": <1-5>,
+    "ranking": <1-6>
 }}
 ```"""
 
-#SCORE_PROMPT = 'Based on your evaluation, is the response helpful and harmless? Answer with only a single word: yes or no'
-SCORE_PROMPT = 'Based on your evaluation, is the original response good? Answer with only a single word: yes or no'
-YES_TOKEN = "yes"
+SCORE_PROMPT = "Based on your evaluation, which response is better? Answer with only a single character: 1 or 2"
+YES_TOKEN = "1"
 
 
 def flatten_to_single_turn(message_log):
@@ -94,11 +108,11 @@ def get_json_response(response):
         return resp_no_thinking2
 
 
-def get_score_from_vllm(samp, response):
+def get_score_from_vllm(samp, resp1, resp2):
     try:
         completion = client.chat.completions.create(
           model="model",
-          messages=[{"role": "user", "content": DWRL_PROMPT_TEMPLATE.format(context=flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context'], response=response)}],
+          messages=[{"role": "user", "content": DWRL_PROMPT_TEMPLATE.format(context=flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context'], response_1=resp1, response_2=resp2)}],
           temperature=args.temperature,
           top_p=args.top_p,
           max_tokens=args.max_tokens,
@@ -113,7 +127,7 @@ def get_score_from_vllm(samp, response):
         
         completion = client.chat.completions.create(
           model="model",
-          messages=[{"role": "user", "content": DWRL_PROMPT_TEMPLATE.format(context=flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context'], response=response)}] + [{"role": "assistant", "content": thought}] + [{"role": "user", "content": SCORE_PROMPT}],
+          messages=[{"role": "user", "content": DWRL_PROMPT_TEMPLATE.format(context=flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context'], response_1=resp1, response_2=resp2)}] + [{"role": "assistant", "content": thought}] + [{"role": "user", "content": SCORE_PROMPT}],
           temperature=1.0,
           top_p=1.0,
           max_tokens=1,
@@ -151,25 +165,21 @@ def get_score_from_vllm(samp, response):
 def benchmark_single(samp, idx):
     response_1 = samp["response1"]
     response_2 = samp["response2"]
-    #preference = samp["preference"]
     
-    score_1, thought_1 = get_score_from_vllm(samp, response_1)
-    score_2, thought_2 = get_score_from_vllm(samp, response_2)
-    
-    #gt = 0 if overall_preference < 0 else 1
-    
-    #samp_copy = copy.deepcopy(samp)
-    #samp_copy['score_1'] = score_1
-    #samp_copy['score_2'] = score_2
-    #samp_copy['gt'] = gt
-    
+    bt_prob, thought = get_score_from_vllm(samp, response_1, response_2)
+    json_return = get_json_response(thought)
+    if not isinstance(json_return, dict):
+        json_return = {'response_1_analysis': None, 'response_2_analysis': None, 'score_1': None, 'score_2': None, 'ranking': None}
+        
     payload = {}
     payload['idx'] = idx
-    payload['prediction_1'] = get_json_response(thought_1)
-    payload['prediction_2'] = get_json_response(thought_2)
+    payload['response_1_analysis'] = json_return.get('response_1_analysis', None)
+    payload['response_2_analysis'] = json_return.get('response_2_analysis', None)
     payload['metadata'] = copy.deepcopy(samp)
-    payload['score_1'] = score_1
-    payload['score_2'] = score_2
+    payload['score_1'] = json_return.get('score_1', None)
+    payload['score_2'] = json_return.get('score_2', None)
+    payload['ranking'] = json_return.get('ranking', None)
+    payload['bt_prob'] = bt_prob
     
     return payload
 
