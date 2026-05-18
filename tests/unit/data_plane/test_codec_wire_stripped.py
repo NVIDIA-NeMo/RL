@@ -42,9 +42,14 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import numpy as np
+import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict
 
-from nemo_rl.data_plane.codec import materialize, unwrap_wire_stripped_payload
+from nemo_rl.data_plane.codec import (
+    materialize,
+    to_nested_by_length,
+    unwrap_wire_stripped_payload,
+)
 
 # ── unwrap_wire_stripped_payload — direct per-item coverage ───────────
 
@@ -107,6 +112,39 @@ def test_materialize_preserves_real_nontensor_data() -> None:
     assert arr.dtype == object
     assert arr.shape == (3,)
     assert list(arr) == ["hello", "world", "!"]
+
+
+def test_materialize_decodes_nontensor_stack_with_tensor_field() -> None:
+    """Per-field decode: tensor fields stay padded while object fields ride.
+
+    Guards the invariant that ``materialize``'s object-decode is
+    per-field, not all-or-nothing — a TensorDict can mix jagged tensor
+    leaves and ``NonTensorStack`` leaves in the same put.
+    """
+    ids_padded = torch.tensor(
+        [[10, 20, 30, 0], [40, 50, 0, 0], [60, 70, 80, 90]], dtype=torch.long
+    )
+    lens = torch.tensor([3, 2, 4], dtype=torch.long)
+    ids_nested = to_nested_by_length(ids_padded, lens)
+    msg = NonTensorStack({"id": 0}, {"id": 1}, {"id": 2})
+
+    td = TensorDict(
+        {"input_ids": ids_nested, "message_log": msg},
+        batch_size=[3],
+    )
+
+    bdd = materialize(
+        td,
+        layout="padded",
+        pad_value_dict={"input_ids": 999},
+    )
+
+    # Tensor field padded with 999 as usual.
+    assert bdd["input_ids"][1, 2].item() == 999
+    # Object field comes back as np.ndarray(object).
+    assert isinstance(bdd["message_log"], np.ndarray)
+    assert bdd["message_log"].dtype == object
+    assert [d["id"] for d in bdd["message_log"]] == [0, 1, 2]
 
 
 # Real production end-to-end coverage of object columns (put → wire →
