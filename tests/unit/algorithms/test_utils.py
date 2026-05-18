@@ -18,7 +18,7 @@ from datetime import datetime
 import pytest
 import torch
 
-from nemo_rl.algorithms.grpo import AsyncGRPOConfig, MasterConfig
+from nemo_rl.algorithms.grpo import AsyncGRPOConfig, GRPOConfig, MasterConfig
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_tokenizer,
@@ -238,7 +238,7 @@ def _base_master_config(colocated: bool):
                 },
             }
         },
-        grpo={"num_prompts_per_step": 8, "num_generations_per_prompt": 10},
+        grpo=GRPOConfig.model_construct(num_prompts_per_step=8, num_generations_per_prompt=10),
     )
 
 
