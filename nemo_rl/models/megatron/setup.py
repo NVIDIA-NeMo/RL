@@ -505,9 +505,22 @@ def setup_model_config(
     if fmt == "megatron_lm":
         model_cfg.finalize()
 
+    # When fp8_param starts from a pretrained checkpoint, model params may already
+    # be quantized before optimizer main params are initialized. Load main params
+    # from the checkpoint state dict to preserve the original checkpoint precision.
+    load_main_params_from_ckpt = (
+        bool(getattr(model_cfg, "fp8_param", False))
+        and pretrained_path is not None
+        and weights_path is None
+        and optimizer_path is None
+    )
+
     # Create checkpoint configs
     checkpoint_config = _create_checkpoint_config(
-        pretrained_path, weights_path, optimizer_path
+        pretrained_path,
+        weights_path,
+        optimizer_path,
+        load_main_params_from_ckpt,
     )
 
     # Validate training configuration
@@ -764,7 +777,10 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
 
 
 def _create_checkpoint_config(
-    pretrained_path: str, weights_path: Optional[str], optimizer_path: Optional[str]
+    pretrained_path: str,
+    weights_path: Optional[str],
+    optimizer_path: Optional[str],
+    load_main_params_from_ckpt: bool = False,
 ) -> CheckpointConfig:
     """Create checkpoint configurations."""
     return CheckpointConfig(
@@ -777,6 +793,7 @@ def _create_checkpoint_config(
         fully_parallel_save=True,
         fully_parallel_load=True,
         load_rng=False,
+        load_main_params_from_ckpt=load_main_params_from_ckpt,
     )
 
 
@@ -859,8 +876,12 @@ def _create_megatron_config(
     reuse_grad_buf_for_mxfp8_param_ag = (
         fp8_param_enabled and fp8_cfg.get("fp8_recipe") == "mxfp8"
     )
+    overlap_param_gather = config["megatron_cfg"][
+        "distributed_data_parallel_config"
+    ]["overlap_param_gather"]
     optimizer_kwargs = {
         **config["megatron_cfg"]["optimizer"],
+        "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
 
@@ -882,9 +903,7 @@ def _create_megatron_config(
             overlap_grad_reduce=config["megatron_cfg"][
                 "distributed_data_parallel_config"
             ]["overlap_grad_reduce"],
-            overlap_param_gather=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["overlap_param_gather"],
+            overlap_param_gather=overlap_param_gather,
             # we need to set average_in_collective=False with calculate_per_token_loss=T
             # otherwise, mcore throws an assertion error.
             average_in_collective=False,  # Required with calculate_per_token_loss=True
