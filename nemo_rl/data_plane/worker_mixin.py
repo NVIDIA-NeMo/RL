@@ -49,6 +49,38 @@ if TYPE_CHECKING:
     from nemo_rl.data_plane.interfaces import DataPlaneClient
 
 
+def _pad_tensors_seq_dim_up_to(
+    data: "BatchedDataDict[Any]",
+    *,
+    target_seqlen: int,
+    sequence_dim: int,
+    pad_value_dict: Optional[dict[str, Any]] = None,
+) -> None:
+    """Right-pad every tensor's ``sequence_dim`` up to ``target_seqlen``.
+
+    No-op for tensors already at/above ``target_seqlen`` or with insufficient
+    rank. Uses ``pad_value_dict[k]`` (default 0) so token/id fields pad with
+    the canonical id rather than 0 for token-id columns where 0 collides
+    with a real vocab entry.
+    """
+    pads = pad_value_dict or {}
+    for k, v in list(data.items()):
+        if not torch.is_tensor(v) or v.dim() <= sequence_dim:
+            continue
+        cur = v.shape[sequence_dim]
+        if cur >= target_seqlen:
+            continue
+        # torch.nn.functional.pad expects (left, right) pairs ordered from
+        # the LAST dim backwards: index of the right-pad slot for dim `d` is
+        # 2 * (ndim - 1 - d) + 1.
+        ndim = v.dim()
+        pad_spec = [0] * (2 * ndim)
+        pad_spec[2 * (ndim - 1 - sequence_dim) + 1] = target_seqlen - cur
+        data[k] = torch.nn.functional.pad(
+            v, tuple(pad_spec), value=pads.get(k, 0)
+        )
+
+
 def _broadcast_batched_data_dict(
     data: Optional[BatchedDataDict[Any]],
     *,
@@ -327,6 +359,27 @@ class TQWorkerMixin:
             data.micro_batch_lengths = extra[MICRO_BATCH_LENGTHS]
             if ELEM_COUNTS_PER_GB in extra:
                 data.elem_counts_per_gb = extra[ELEM_COUNTS_PER_GB]
+            # Pad seq dim up to the planner's max micro_batch_length. The
+            # planner rounds to ``dynamic_batching_args.sequence_length_round``
+            # while ``_fetch``'s ``materialize`` pads only to
+            # ``meta.extra_info["pad_to_multiple"]``. When these differ
+            # (e.g. round=64, pad_to_multiple=1) the worker's slice can have
+            # a seq dim smaller than a planner-emitted micro_batch_length,
+            # which crashes ``torch.narrow`` inside the dynamic-shape
+            # microbatch iterator. Padding to the global max equalizes
+            # tensor shapes across DP ranks (a requirement for FSDP/TP
+            # collectives) and makes the narrow safe.
+            target_seqlen = max(
+                (max(chunk) for chunk in data.micro_batch_lengths if chunk),
+                default=0,
+            )
+            if target_seqlen > 0:
+                _pad_tensors_seq_dim_up_to(
+                    data,
+                    target_seqlen=target_seqlen,
+                    sequence_dim=1,
+                    pad_value_dict=self._pad_value_dict(),
+                )
             return data
         return self._apply_packing_prep(data)
 

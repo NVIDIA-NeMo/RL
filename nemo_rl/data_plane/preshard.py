@@ -93,9 +93,23 @@ def shard_meta_for_dp(
     # input_ids (placeholder), input_lengths (real), sample_mask (ones).
     # ``meta_idx`` lets us recover which original meta index each shard row
     # corresponds to, so we can slice ``meta.keys`` per rank.
+    #
+    # ``INPUT_IDS`` seq dim sizing: the dynamic-batching microbatch planner
+    # in ``BatchedDataDict.shard_by_batch_size`` reads ``input_ids.shape[1]``
+    # as an ``unpadded_seqlen`` cap (``min(padded_seqlen, unpadded_seqlen)``).
+    # A trivial ``(n, 1)`` shape made the cap clamp every microbatch length
+    # to 1, producing bogus ``micro_batch_lengths`` that, when consumed by
+    # workers, truncated real sequences to 1 token → zero grad_norm. Size
+    # the placeholder to ``max_tokens_per_microbatch`` (the largest seqlen
+    # the planner can ever request, per its own assertion) so the cap is
+    # never the binding factor. Memory cost is small (object only — bytes
+    # never get filled with real data; just used for shape lookups).
+    input_ids_seqlen = 1
+    if dynamic_batching_args is not None:
+        input_ids_seqlen = int(dynamic_batching_args["max_tokens_per_microbatch"])
     skeleton = BatchedDataDict(
         {
-            INPUT_IDS: torch.zeros(n, 1, dtype=torch.int64),
+            INPUT_IDS: torch.zeros(n, input_ids_seqlen, dtype=torch.int64),
             INPUT_LENGTHS: torch.tensor(seq_lens, dtype=torch.int64),
             SAMPLE_MASK: torch.ones(n, dtype=torch.float32),
             META_IDX: torch.arange(n, dtype=torch.int64),
@@ -130,8 +144,12 @@ def shard_meta_for_dp(
         rank_seqlens = [seq_lens[i] for i in idx_list]
         rank_extra = dict(base_extra)
         # Per-shard packing metadata — set by ``shard_by_batch_size`` when
-        # sequence_packing/dynamic_batching is enabled. Workers' *_presharded
-        # paths look these up off ``meta.extra_info``.
+        # sequence_packing or dynamic_batching is enabled. Workers'
+        # *_presharded paths look these up off ``meta.extra_info`` to avoid
+        # re-packing locally. Propagation is critical: local re-packing on
+        # different real per-rank data produces varying microbatch counts,
+        # which desynchronizes NCCL collectives across DP ranks and trips
+        # the Watchdog timeout.
         for attr in (
             MICRO_BATCH_INDICES,
             MICRO_BATCH_LENGTHS,

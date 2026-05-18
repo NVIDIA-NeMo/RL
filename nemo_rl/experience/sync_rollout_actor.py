@@ -53,6 +53,13 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 
+# Carry keys producible by the rollout actor only when the caller opts in.
+# These are np.ndarray(object) per-row arrays from decompose_message_log; the
+# default driver_carry omits them because BatchedDataDict.select_indices on
+# the training/dynamic-sampling path only handles tensors/lists. Validation
+# requests them explicitly to print per-sample message logs.
+OPT_IN_CARRY_KEYS: tuple[str, ...] = ("turn_roles", "turn_contents")
+
 
 @ray.remote  # pragma: no cover
 class SyncRolloutActor:
@@ -308,6 +315,9 @@ class SyncRolloutActor:
         for k in get_gdpo_reward_component_keys(fb):
             driver_carry[k] = fb[k]
         if carry_keys is not None:
+            for k in OPT_IN_CARRY_KEYS:
+                if k in carry_keys:
+                    driver_carry[k] = decomposed[k]
             missing = set(carry_keys) - driver_carry.keys()
             if missing:
                 raise KeyError(

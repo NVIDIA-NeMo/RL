@@ -213,7 +213,7 @@ def validate_sync(
     across batches.
     """
     if val_dataloader is None:
-        assert master_config.grpo["val_period"] == 0, (
+        assert master_config["grpo"]["val_period"] == 0, (
             "val_dataloader is None, so grpo.val_period must be 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
@@ -229,8 +229,8 @@ def validate_sync(
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
         max_batches = (
-            master_config.grpo["max_val_samples"]
-            // master_config.grpo["val_batch_size"]
+            master_config["grpo"]["max_val_samples"]
+            // master_config["grpo"]["val_batch_size"]
         )
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
@@ -246,13 +246,11 @@ def validate_sync(
                     first_iter=False,
                     finish_generation=False,
                     task_to_env_override=val_task_to_env,
-                    carry_keys=["total_reward"],
+                    carry_keys=["total_reward", "turn_roles", "turn_contents"],
                 )
             )
-            mlog_cols = policy.read_from_dataplane(
-                meta, select_fields=["turn_roles", "turn_contents"]
-            )
-            roles, contents = mlog_cols["turn_roles"], mlog_cols["turn_contents"]
+            roles = driver_carry["turn_roles"]
+            contents = driver_carry["turn_contents"]
             total_rewards.extend(driver_carry["total_reward"].tolist())
             total_lengths.append(rollout_metrics["mean_gen_tokens_per_sample"])
             all_message_logs.extend(
@@ -279,7 +277,7 @@ def validate_sync(
                 all_message_logs,
                 total_rewards,
                 num_samples=min(
-                    master_config.logger["num_val_samples_to_print"],
+                    master_config["logger"]["num_val_samples_to_print"],
                     len(all_message_logs),
                 ),
                 step=step,
