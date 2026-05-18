@@ -79,12 +79,20 @@ def _mooncake_available() -> bool:
 
 
 def _make_tq_cfg(backend: str) -> dict:
+    # DataPlaneConfig requires the full schema (see interfaces.py); the
+    # adapter dereferences ``claim_meta_poll_interval_s`` at construction
+    # so missing it short-circuits the fixture before any test runs.
+    # ``global_segment_size`` / ``local_buffer_size`` only matter for
+    # ``mooncake_cpu`` but are required for schema conformance.
     return {
         "enabled": True,
         "impl": "transfer_queue",
         "backend": backend,
         "storage_capacity": 1024,
         "num_storage_units": 1,
+        "claim_meta_poll_interval_s": 0.5,
+        "global_segment_size": 549755813888,
+        "local_buffer_size": 68719476736,
     }
 
 
