@@ -54,10 +54,10 @@ class BaseVllmGenerationWorker:
             not isinstance(sleep_level, int)
             # bool is a subclass of int, but YAML booleans should not be valid sleep levels.
             or isinstance(sleep_level, bool)
-            or sleep_level not in (1, 2)
+            or sleep_level not in (0, 1, 2)
         ):
             raise ValueError(
-                f"vllm_cfg.sleep_level must be 1 or 2, got {sleep_level!r}"
+                f"vllm_cfg.sleep_level must be 0, 1, or 2, got {sleep_level!r}"
             )
         return sleep_level
 

@@ -32,16 +32,16 @@ def test_vllm_sleep_level_defaults_to_level_1():
     assert worker._sleep_level() == 1
 
 
-@pytest.mark.parametrize("sleep_level", [1, 2])
+@pytest.mark.parametrize("sleep_level", [0, 1, 2])
 def test_vllm_sleep_level_accepts_supported_levels(sleep_level):
     worker = _worker_with_vllm_cfg({"sleep_level": sleep_level})
 
     assert worker._sleep_level() == sleep_level
 
 
-@pytest.mark.parametrize("sleep_level", [0, 3, "2", True])
+@pytest.mark.parametrize("sleep_level", [-1, 3, "2", True])
 def test_vllm_sleep_level_rejects_unsupported_levels(sleep_level):
     worker = _worker_with_vllm_cfg({"sleep_level": sleep_level})
 
-    with pytest.raises(ValueError, match="vllm_cfg.sleep_level must be 1 or 2"):
+    with pytest.raises(ValueError, match="vllm_cfg.sleep_level must be 0, 1, or 2"):
         worker._sleep_level()

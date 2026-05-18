@@ -27,7 +27,7 @@ class VllmSpecificArgs(TypedDict):
     skip_tokenizer_init: bool
     async_engine: bool
     # vLLM sleep level used after generation. Defaults to 1 when unset.
-    sleep_level: NotRequired[Literal[1, 2]]
+    sleep_level: NotRequired[Literal[0, 1, 2]]
     load_format: NotRequired[str]
     precision: NotRequired[str]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
