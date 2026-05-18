@@ -37,8 +37,8 @@ from nemo_rl.algorithms.grpo import (
     grpo_train,
     validate,
 )
-from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
