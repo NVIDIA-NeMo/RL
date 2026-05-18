@@ -75,7 +75,10 @@ def test_kv_batch_get_after_clear_raises() -> None:
     _setup(client, n=2)
     fb = _final_batch(2)
     meta = kv_first_write(
-        fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+        fb,
+        sample_ids=_keys_from_uids(["a", "b"]),
+        dp_client=client,
+        partition_id="train",
     )
 
     client.clear_samples(sample_ids=meta.sample_ids, partition_id="train")
@@ -96,7 +99,10 @@ def test_kv_batch_get_unproduced_field_raises() -> None:
     _setup(client, n=2)
     fb = _final_batch(2)
     meta = kv_first_write(
-        fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+        fb,
+        sample_ids=_keys_from_uids(["a", "b"]),
+        dp_client=client,
+        partition_id="train",
     )
 
     # ``advantages`` has not been written yet (driver delta-write).
@@ -114,7 +120,10 @@ def test_get_data_without_select_fields_raises() -> None:
     _setup(client, n=2)
     fb = _final_batch(2)
     kv_first_write(
-        fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+        fb,
+        sample_ids=_keys_from_uids(["a", "b"]),
+        dp_client=client,
+        partition_id="train",
     )
 
     bare_meta = KVBatchMeta(
@@ -180,7 +189,10 @@ def test_kv_clear_with_none_drops_partition() -> None:
     _setup(client, n=2)
     fb = _final_batch(2)
     meta = kv_first_write(
-        fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+        fb,
+        sample_ids=_keys_from_uids(["a", "b"]),
+        dp_client=client,
+        partition_id="train",
     )
 
     client.clear_samples(sample_ids=None, partition_id="train")
@@ -217,7 +229,10 @@ def test_check_consumption_status_only_true_when_all_consumed() -> None:
     _setup(client, n=2)
     fb = _final_batch(2)
     meta = kv_first_write(
-        fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+        fb,
+        sample_ids=_keys_from_uids(["a", "b"]),
+        dp_client=client,
+        partition_id="train",
     )
     # No consumer has fetched yet.
     assert not client.check_consumption_status("train", ["train"])
@@ -369,7 +384,10 @@ def test_write_columns_accepts_batched_data_dict_input() -> None:
     _setup(client, n=2)
     fb = _final_batch(2)
     meta = kv_first_write(
-        fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+        fb,
+        sample_ids=_keys_from_uids(["a", "b"]),
+        dp_client=client,
+        partition_id="train",
     )
 
     bdd = BatchedDataDict()

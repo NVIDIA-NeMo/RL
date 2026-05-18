@@ -110,10 +110,15 @@ def test_extra_info_default_is_unique_per_instance():
 def test_tags_align_with_keys():
     """``tags`` must be exactly one dict per key, or ``None``."""
     KVBatchMeta(
-        partition_id="p", task_name="t", sample_ids=["a", "b"], tags=[{"x": 1}, {"x": 2}]
+        partition_id="p",
+        task_name="t",
+        sample_ids=["a", "b"],
+        tags=[{"x": 1}, {"x": 2}],
     )
     with pytest.raises(ValueError, match=r"align 1:1"):
-        KVBatchMeta(partition_id="p", task_name="t", sample_ids=["a", "b"], tags=[{"x": 1}])
+        KVBatchMeta(
+            partition_id="p", task_name="t", sample_ids=["a", "b"], tags=[{"x": 1}]
+        )
 
 
 def test_tags_travel_with_subset_slice_concat():

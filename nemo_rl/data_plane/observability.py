@@ -292,7 +292,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
         n_bytes = _td_bytes(fields)
         # Materialize once: ``_run`` consumes its lambda and we also need
         # to attribute bytes per sample after success.
-        sample_ids_list = sample_ids if isinstance(sample_ids, list) else list(sample_ids)
+        sample_ids_list = (
+            sample_ids if isinstance(sample_ids, list) else list(sample_ids)
+        )
         out = self._run(
             "put",
             partition_id,

@@ -65,7 +65,9 @@ def test_get_records_after_put(wrapped_client):
         partition_id="p",
         fields=TensorDict({"x": torch.ones(2)}, batch_size=[2]),
     )
-    out = client.get_samples(sample_ids=["a", "b"], partition_id="p", select_fields=["x"])
+    out = client.get_samples(
+        sample_ids=["a", "b"], partition_id="p", select_fields=["x"]
+    )
     assert torch.equal(out["x"], torch.ones(2))
 
     get_events = [e for e in events if e["op"] == "get"]

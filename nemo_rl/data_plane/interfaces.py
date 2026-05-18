@@ -215,7 +215,9 @@ class KVBatchMeta:
         )
         all_have_tags = all(m.tags is not None for m in all_m)
         tags = [t for m in all_m for t in (m.tags or [])] if all_have_tags else None
-        return self._replace(sample_ids=sample_ids, sequence_lengths=seq_lens, tags=tags)
+        return self._replace(
+            sample_ids=sample_ids, sequence_lengths=seq_lens, tags=tags
+        )
 
 
 class DataPlaneClient(ABC):

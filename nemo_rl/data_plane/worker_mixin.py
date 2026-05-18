@@ -76,9 +76,7 @@ def _pad_tensors_seq_dim_up_to(
         ndim = v.dim()
         pad_spec = [0] * (2 * ndim)
         pad_spec[2 * (ndim - 1 - sequence_dim) + 1] = target_seqlen - cur
-        data[k] = torch.nn.functional.pad(
-            v, tuple(pad_spec), value=pads.get(k, 0)
-        )
+        data[k] = torch.nn.functional.pad(v, tuple(pad_spec), value=pads.get(k, 0))
 
 
 def _broadcast_batched_data_dict(

@@ -190,7 +190,9 @@ class TQPolicy(Policy):
 
     def finish_step(self, meta: KVBatchMeta) -> None:
         """Drop this step's bulk from TQ. Mirror of :meth:`prepare_step`."""
-        self.dp_client.clear_samples(sample_ids=meta.sample_ids, partition_id=meta.partition_id)
+        self.dp_client.clear_samples(
+            sample_ids=meta.sample_ids, partition_id=meta.partition_id
+        )
 
     def read_from_dataplane(
         self,
