@@ -27,6 +27,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
+    AdvEstimatorConfig,
     AsyncGRPOConfig,
     GRPOConfig,
     MasterConfig,
@@ -288,11 +289,11 @@ def mock_grpo_components():
                     max_trajectory_age_steps=1,
                 ),
                 seq_logprob_error_threshold=None,
-                adv_estimator={
-                    "name": "grpo",
-                    "use_leave_one_out_baseline": False,
-                    "normalize_rewards": True,
-                },
+                adv_estimator=AdvEstimatorConfig.model_construct(
+                    name="grpo",
+                    use_leave_one_out_baseline=False,
+                    normalize_rewards=True,
+                ),
             ),
             "policy": {
                 "train_global_batch_size": 1,
