@@ -335,6 +335,27 @@ jobs:
           docker rmi "${SRC}" "${DST}" 2>/dev/null || true
           rm -rf /tmp/uv-cache /tmp/Dockerfile.uv-cache
 
+  build-container-azure:
+    if: >-
+      ${{
+        github.ref == 'refs/heads/main' &&
+        needs.pre-flight.outputs.test_level != 'none' &&
+        needs.pre-flight.outputs.image_tag == ''
+      }}
+    needs: [pre-flight, org-member-pre-flight]
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.78.0
+    with:
+      build-ref: ${{ needs.pre-flight.outputs.test_sha }}
+      image-name: ${{ vars.CI_CONTAINER_NAME }}
+      dockerfile: docker/Dockerfile
+      runner: ${{ format('{0}-gpu-x2', vars.NON_NVIDIA_RUNNER_PREFIX) }}
+      image-label: ${{ vars.CI_CONTAINER_NAME }}
+      target: release
+      registry: ${{ vars.NON_NVIDIA_CONTAINER_REGISTRY }}
+      build-args: |
+        MAX_JOBS=4
+        NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
+
   cicd-doc-tests:
     strategy:
       fail-fast: false
