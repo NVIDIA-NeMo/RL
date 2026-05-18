@@ -251,7 +251,7 @@ class TQWorkerMixin:
             is_leader = torch.distributed.get_rank() == leader
             if is_leader:
                 td = self._require_dp_client().kv_batch_get(
-                    keys=meta.sample_ids,
+                    sample_ids=meta.sample_ids,
                     partition_id=meta.partition_id,
                     select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
                 )
@@ -276,7 +276,7 @@ class TQWorkerMixin:
             return data
 
         td = self._require_dp_client().kv_batch_get(
-            keys=meta.sample_ids,
+            sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
             select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
         )

@@ -161,7 +161,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
 
     def kv_batch_put(
         self,
-        keys: list[str],
+        sample_ids: list[str],
         partition_id: str,
         fields: TensorDict | None = None,
         tags: list[dict[str, Any]] | None = None,
@@ -169,8 +169,8 @@ class NoOpDataPlaneClient(DataPlaneClient):
         rec = self._partitions[partition_id]
         if fields is not None:
             _reject_non_tensor_leaves(fields)
-            for i, key in enumerate(keys):
-                row = rec.rows.setdefault(key, {})
+            for i, sid in enumerate(sample_ids):
+                row = rec.rows.setdefault(sid, {})
                 for fname in fields.keys():
                     val = fields[fname][i]
                     # Defense in depth — _reject_non_tensor_leaves can
@@ -186,56 +186,56 @@ class NoOpDataPlaneClient(DataPlaneClient):
                         )
                     row[fname] = val.detach().clone()
         if tags is not None:
-            for key, tag in zip(keys, tags):
-                rec.tags.setdefault(key, {}).update(tag)
+            for sid, tag in zip(sample_ids, tags):
+                rec.tags.setdefault(sid, {}).update(tag)
         return KVBatchMeta(
             partition_id=partition_id,
             task_name=None,
-            sample_ids=list(keys),
+            sample_ids=list(sample_ids),
             fields=list(fields.keys()) if fields is not None else None,
             tags=[dict(t) for t in tags] if tags is not None else None,
         )
 
     def kv_batch_get(
         self,
-        keys: list[str],
+        sample_ids: list[str],
         partition_id: str,
         select_fields: list[str],
     ) -> TensorDict:
         rec = self._partitions[partition_id]
-        if not keys:
+        if not sample_ids:
             return TensorDict({}, batch_size=(0,))
 
         out: dict[str, list[torch.Tensor]] = {f: [] for f in select_fields}
-        for key in keys:
-            row = rec.rows[key]
+        for sid in sample_ids:
+            row = rec.rows[sid]
             for f in select_fields:
                 if f not in row:
                     raise KeyError(
-                        f"field {f!r} not yet produced for key {key!r} "
+                        f"field {f!r} not yet produced for sample_id {sid!r} "
                         f"in partition {partition_id!r}"
                     )
                 out[f].append(row[f])
 
         stacked = {f: _stack_or_nest(out[f]) for f in select_fields}
-        return TensorDict(stacked, batch_size=(len(keys),))
+        return TensorDict(stacked, batch_size=(len(sample_ids),))
 
-    def kv_clear(self, keys: list[str] | None, partition_id: str) -> None:
+    def kv_clear(self, sample_ids: list[str] | None, partition_id: str) -> None:
         rec = self._partitions.get(partition_id)
         if rec is None:
             return
-        if keys is None:
+        if sample_ids is None:
             rec.rows.clear()
             rec.tags.clear()
             for s in rec.consumed.values():
                 s.clear()
             self._partitions.pop(partition_id, None)
             return
-        for key in keys:
-            rec.rows.pop(key, None)
-            rec.tags.pop(key, None)
+        for sid in sample_ids:
+            rec.rows.pop(sid, None)
+            rec.tags.pop(sid, None)
             for s in rec.consumed.values():
-                s.discard(key)
+                s.discard(sid)
 
     def close(self) -> None:
         if self._closed:

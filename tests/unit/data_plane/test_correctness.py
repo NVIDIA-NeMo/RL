@@ -75,15 +75,15 @@ def test_kv_batch_get_after_clear_raises() -> None:
     _setup(client, n=2)
     fb = _final_batch(2)
     meta = kv_first_write(
-        fb, keys=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
     )
 
-    client.kv_clear(keys=meta.sample_ids, partition_id="train")
+    client.kv_clear(sample_ids=meta.sample_ids, partition_id="train")
 
     with pytest.raises(KeyError):
         # NoOp raises KeyError when the partition entry is gone.
         client.kv_batch_get(
-            keys=meta.sample_ids,
+            sample_ids=meta.sample_ids,
             partition_id="train",
             select_fields=["input_ids"],
         )
@@ -96,13 +96,13 @@ def test_kv_batch_get_unproduced_field_raises() -> None:
     _setup(client, n=2)
     fb = _final_batch(2)
     meta = kv_first_write(
-        fb, keys=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
     )
 
     # ``advantages`` has not been written yet (driver delta-write).
     with pytest.raises(KeyError):
         client.kv_batch_get(
-            keys=meta.sample_ids,
+            sample_ids=meta.sample_ids,
             partition_id="train",
             select_fields=["advantages"],
         )
@@ -114,7 +114,7 @@ def test_get_data_without_select_fields_raises() -> None:
     _setup(client, n=2)
     fb = _final_batch(2)
     kv_first_write(
-        fb, keys=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
     )
 
     bare_meta = KVBatchMeta(
@@ -146,7 +146,7 @@ def test_kv_batch_put_rejects_non_tensor_leaves() -> None:
     )
     with pytest.raises(TypeError, match=r"non-tensor"):
         client.kv_batch_put(
-            keys=["x_g0", "y_g0"],
+            sample_ids=["x_g0", "y_g0"],
             partition_id="train",
             fields=bad_td,
         )
@@ -180,10 +180,10 @@ def test_kv_clear_with_none_drops_partition() -> None:
     _setup(client, n=2)
     fb = _final_batch(2)
     meta = kv_first_write(
-        fb, keys=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
     )
 
-    client.kv_clear(keys=None, partition_id="train")
+    client.kv_clear(sample_ids=None, partition_id="train")
 
     # Partition is gone — re-registering must succeed.
     _setup(client, n=2)
@@ -217,7 +217,7 @@ def test_check_consumption_status_only_true_when_all_consumed() -> None:
     _setup(client, n=2)
     fb = _final_batch(2)
     meta = kv_first_write(
-        fb, keys=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
     )
     # No consumer has fetched yet.
     assert not client.check_consumption_status("train", ["train"])
@@ -246,7 +246,7 @@ def test_shard_meta_for_dp_partitions_keys_disjointly() -> None:
     fb = _final_batch(8)
     meta = kv_first_write(
         fb,
-        keys=_keys_from_uids([f"u{i}" for i in range(8)]),
+        sample_ids=_keys_from_uids([f"u{i}" for i in range(8)]),
         dp_client=client,
         partition_id="train",
     )
@@ -268,7 +268,7 @@ def test_shard_meta_for_dp_keeps_partition_id() -> None:
     fb = _final_batch(4)
     meta = kv_first_write(
         fb,
-        keys=_keys_from_uids([f"u{i}" for i in range(4)]),
+        sample_ids=_keys_from_uids([f"u{i}" for i in range(4)]),
         dp_client=client,
         partition_id="train",
     )
@@ -297,7 +297,7 @@ def test_kv_first_write_carries_multimodal_extras_through_tq() -> None:
 
     meta = kv_first_write(
         fb,
-        keys=_keys_from_uids([f"u{i}" for i in range(4)]),
+        sample_ids=_keys_from_uids([f"u{i}" for i in range(4)]),
         dp_client=client,
         partition_id="train",
     )
@@ -326,10 +326,10 @@ def test_kv_batch_put_preserves_bf16_dtype() -> None:
     )
     x = torch.randn((2, 4), dtype=torch.bfloat16)
     td = TensorDict({"x": x}, batch_size=[2])
-    client.kv_batch_put(keys=["a", "b"], partition_id="train", fields=td)
+    client.kv_batch_put(sample_ids=["a", "b"], partition_id="train", fields=td)
 
     out = client.kv_batch_get(
-        keys=["a", "b"], partition_id="train", select_fields=["x"]
+        sample_ids=["a", "b"], partition_id="train", select_fields=["x"]
     )
     assert out["x"].dtype == torch.bfloat16
 
@@ -345,10 +345,10 @@ def test_kv_batch_put_preserves_int64_dtype() -> None:
     )
     x = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)
     td = TensorDict({"input_ids": x}, batch_size=[2])
-    client.kv_batch_put(keys=["a", "b"], partition_id="train", fields=td)
+    client.kv_batch_put(sample_ids=["a", "b"], partition_id="train", fields=td)
 
     out = client.kv_batch_get(
-        keys=["a", "b"],
+        sample_ids=["a", "b"],
         partition_id="train",
         select_fields=["input_ids"],
     )
@@ -369,7 +369,7 @@ def test_write_columns_accepts_batched_data_dict_input() -> None:
     _setup(client, n=2)
     fb = _final_batch(2)
     meta = kv_first_write(
-        fb, keys=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
     )
 
     bdd = BatchedDataDict()
@@ -396,7 +396,7 @@ def test_kv_first_write_rejects_key_count_mismatch() -> None:
     with pytest.raises(ValueError, match=r"must match batch size"):
         kv_first_write(
             fb,
-            keys=["a_g0", "b_g0"],  # 2 keys for a 5-sample batch
+            sample_ids=["a_g0", "b_g0"],  # 2 keys for a 5-sample batch
             dp_client=client,
             partition_id="train",
         )
@@ -412,7 +412,7 @@ def test_kv_first_write_meta_sequence_lengths_match_input_lengths() -> None:
 
     meta = kv_first_write(
         fb,
-        keys=_keys_from_uids([f"u{i}" for i in range(4)]),
+        sample_ids=_keys_from_uids([f"u{i}" for i in range(4)]),
         dp_client=client,
         partition_id="train",
     )

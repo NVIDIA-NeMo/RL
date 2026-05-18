@@ -44,7 +44,7 @@ def test_put_records_bytes_and_count(wrapped_client):
         partition_id="p", fields=["x"], num_samples=4, consumer_tasks=["read"]
     )
     fields = TensorDict({"x": torch.zeros(4, dtype=torch.float32)}, batch_size=[4])
-    client.kv_batch_put(keys=["a", "b", "c", "d"], partition_id="p", fields=fields)
+    client.kv_batch_put(sample_ids=["a", "b", "c", "d"], partition_id="p", fields=fields)
 
     put_events = [e for e in events if e["op"] == "put"]
     assert len(put_events) == 1
@@ -61,11 +61,11 @@ def test_get_records_after_put(wrapped_client):
         partition_id="p", fields=["x"], num_samples=2, consumer_tasks=["read"]
     )
     client.kv_batch_put(
-        keys=["a", "b"],
+        sample_ids=["a", "b"],
         partition_id="p",
         fields=TensorDict({"x": torch.ones(2)}, batch_size=[2]),
     )
-    out = client.kv_batch_get(keys=["a", "b"], partition_id="p", select_fields=["x"])
+    out = client.kv_batch_get(sample_ids=["a", "b"], partition_id="p", select_fields=["x"])
     assert torch.equal(out["x"], torch.ones(2))
 
     get_events = [e for e in events if e["op"] == "get"]
@@ -78,7 +78,7 @@ def test_register_and_clear_recorded(wrapped_client):
     client.register_partition(
         partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["r"]
     )
-    client.kv_clear(keys=None, partition_id="p")
+    client.kv_clear(sample_ids=None, partition_id="p")
 
     ops = [e["op"] for e in events]
     assert ops.count("register") == 1
@@ -89,7 +89,7 @@ def test_error_status_recorded_and_reraised(wrapped_client):
     """Decorator does NOT swallow errors — re-raise after recording."""
     client, events = wrapped_client
     with pytest.raises(KeyError):
-        client.kv_batch_get(keys=["a"], partition_id="nope", select_fields=["x"])
+        client.kv_batch_get(sample_ids=["a"], partition_id="nope", select_fields=["x"])
 
     err = [e for e in events if e["op"] == "get" and e["status"] == "error"]
     assert len(err) == 1
@@ -101,7 +101,7 @@ def test_snapshot_accumulates_successful_ops(wrapped_client):
         partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["r"]
     )
     client.kv_batch_put(
-        keys=["a"],
+        sample_ids=["a"],
         partition_id="p",
         fields=TensorDict({"x": torch.zeros(1)}, batch_size=[1]),
     )

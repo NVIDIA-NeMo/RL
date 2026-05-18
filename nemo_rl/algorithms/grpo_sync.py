@@ -148,7 +148,7 @@ def _apply_dynamic_sampling(
     keep_idx = [i for i, t in enumerate(meta.tags) if t["std"] != 0.0]
     drop_keys = [k for k, t in zip(meta.sample_ids, meta.tags) if t["std"] == 0.0]
     if drop_keys:
-        dp_client.kv_clear(keys=drop_keys, partition_id=meta.partition_id)
+        dp_client.kv_clear(sample_ids=drop_keys, partition_id=meta.partition_id)
 
     # Subset survivors and merge into the running cache.
     if keep_idx:
@@ -178,7 +178,7 @@ def _apply_dynamic_sampling(
     assert pending_meta is not None and pending_carry is not None
     if n > train_prompts_size:
         dp_client.kv_clear(
-            keys=list(pending_meta.sample_ids[train_prompts_size:]),
+            sample_ids=list(pending_meta.sample_ids[train_prompts_size:]),
             partition_id=pending_meta.partition_id,
         )
         pending_meta = pending_meta.slice(0, train_prompts_size)

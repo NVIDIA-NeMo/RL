@@ -336,12 +336,12 @@ class DataPlaneClient(ABC):
     @abstractmethod
     def kv_batch_put(
         self,
-        keys: list[str],
+        sample_ids: list[str],
         partition_id: str,
         fields: TensorDict | None = None,
         tags: list[dict[str, Any]] | None = None,
     ) -> KVBatchMeta:
-        """Write fields for ``keys`` — the producer entrypoint.
+        """Write fields for ``sample_ids`` — the producer entrypoint.
 
         Writing a field flips the controller's ``production_status`` bit
         for ``(sample, field)``; that flip is the "stage finished" signal
@@ -349,19 +349,19 @@ class DataPlaneClient(ABC):
         both pass through to TQ; non-tensor encoding is per-backend.
 
         Args:
-            keys: Per-sample uids being written.
-            partition_id: Partition these keys belong to.
+            sample_ids: Per-sample uids being written.
+            partition_id: Partition these samples belong to.
             fields: Tensor / ``NonTensorStack`` leaves to write.
             tags: Optional per-sample primitive metadata.
 
         Returns:
-            ``KVBatchMeta`` covering ``keys`` — usable for direct :meth:`kv_batch_get`.
+            ``KVBatchMeta`` covering ``sample_ids`` — usable for direct :meth:`kv_batch_get`.
         """
 
     @abstractmethod
     def kv_batch_get(
         self,
-        keys: list[str],
+        sample_ids: list[str],
         partition_id: str,
         select_fields: list[str],
     ) -> TensorDict:
@@ -376,25 +376,25 @@ class DataPlaneClient(ABC):
         they read.
 
         Args:
-            keys: Uids to fetch.
-            partition_id: Partition the keys live in.
+            sample_ids: Uids to fetch.
+            partition_id: Partition the samples live in.
             select_fields: Subset of fields to fetch.
 
         Returns:
-            ``TensorDict`` keyed by field name, batched along ``keys``.
+            ``TensorDict`` keyed by field name, batched along ``sample_ids``.
         """
 
     @abstractmethod
     def kv_clear(
         self,
-        keys: list[str] | None,
+        sample_ids: list[str] | None,
         partition_id: str,
     ) -> None:
         """Drop key-value pairs.
 
         Args:
-            keys: Uids to drop; ``None`` clears the whole partition.
-            partition_id: Partition the keys live in.
+            sample_ids: Uids to drop; ``None`` clears the whole partition.
+            partition_id: Partition the samples live in.
         """
 
     # ── (C) lifecycle ──────────────────────────────────────────────────

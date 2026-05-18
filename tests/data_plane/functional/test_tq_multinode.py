@@ -72,7 +72,7 @@ def test_multinode_round_trip() -> None:
             )
             try:
                 actor_client.kv_batch_put(
-                    keys=keys,
+                    sample_ids=keys,
                     partition_id="mn",
                     fields=TensorDict(
                         {"x": torch.arange(len(keys))}, batch_size=[len(keys)]
@@ -94,5 +94,5 @@ def test_multinode_round_trip() -> None:
         data = driver.get_data(meta)
         assert int(data["x"].sum()) == 0 + 1 + 2 + 3
     finally:
-        driver.kv_clear(keys=None, partition_id="mn")
+        driver.kv_clear(sample_ids=None, partition_id="mn")
         driver.close()

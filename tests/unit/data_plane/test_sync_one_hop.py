@@ -73,7 +73,7 @@ def test_write_columns_lands_in_tq():
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
     meta = kv_first_write(
-        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
     )
 
     # Driver delta-write: simulates advantage compute on the trainer.
@@ -81,7 +81,7 @@ def test_write_columns_lands_in_tq():
     write_columns(client, meta, delta)
 
     fetched = client.kv_batch_get(
-        keys=meta.sample_ids,
+        sample_ids=meta.sample_ids,
         partition_id="train",
         select_fields=["advantages"],
     )
@@ -94,7 +94,7 @@ def test_read_columns_returns_only_requested_fields():
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
     meta = kv_first_write(
-        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
     )
 
     bdd = read_columns(client, meta, ["input_ids", "input_lengths"])
@@ -111,7 +111,7 @@ def test_write_then_read_roundtrip_after_train_window():
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
     meta = kv_first_write(
-        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
     )
 
     # Simulate the full sync 1-hop trainer-step writes:
@@ -153,11 +153,11 @@ def test_meta_keys_identity_across_dp_shards():
     fb = _final_batch(8)
     uids = [f"u{i}" for i in range(8)]
     meta = kv_first_write(
-        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
     )
 
     rank_metas, _ = shard_meta_for_dp(meta, dp_world=4, batch_size=8)
-    flat = {k for m in rank_metas for k in m.keys}
+    flat = {k for m in rank_metas for k in m.sample_ids}
     assert flat == set(meta.sample_ids), (
         "shard_meta_for_dp introduced or dropped keys — should be a "
         "pure permutation of the original meta.sample_ids."
@@ -174,7 +174,7 @@ def test_kv_clear_uses_meta_keys_minted_at_rollout():
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
     meta = kv_first_write(
-        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
     )
     rollout_keys = list(meta.sample_ids)
 
@@ -182,18 +182,18 @@ def test_kv_clear_uses_meta_keys_minted_at_rollout():
     write_columns(client, meta, {"advantages": torch.zeros(4)})
     rank_metas, _ = shard_meta_for_dp(meta, dp_world=2, batch_size=4)
     for rm in rank_metas:
-        for k in rm.keys:
+        for k in rm.sample_ids:
             assert k in set(rollout_keys), (
                 "Rank meta references a key not in the original rollout set"
             )
 
-    client.kv_clear(keys=meta.sample_ids, partition_id="train")
+    client.kv_clear(sample_ids=meta.sample_ids, partition_id="train")
     # Cleared keys should no longer fetch.
     import pytest
 
     with pytest.raises(KeyError):
         client.kv_batch_get(
-            keys=meta.sample_ids,
+            sample_ids=meta.sample_ids,
             partition_id="train",
             select_fields=["input_ids"],
         )
@@ -227,7 +227,7 @@ def _seed_meta(client: NoOpDataPlaneClient, prefix: str, n: int) -> KVBatchMeta:
     fb = _final_batch(n)
     uids = [f"{prefix}{i}" for i in range(n)]
     return kv_first_write(
-        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
     )
 
 
@@ -261,7 +261,7 @@ def test_apply_dynamic_sampling_filters_zero_std():
     )
     # Only 2 survivors → not complete (need 4).
     assert complete is False
-    assert pm is not None and len(pm.keys) == 2
+    assert pm is not None and len(pm.sample_ids) == 2
     # Surviving uids' total_reward is 1.0 and 3.0 (kept indices [0, 2]).
     assert torch.equal(ps["total_reward"], torch.tensor([1.0, 3.0]))
     assert ps["filtered_reward"] is ps["total_reward"] or torch.equal(
@@ -273,13 +273,13 @@ def test_apply_dynamic_sampling_filters_zero_std():
 
     with pytest.raises(KeyError):
         client.kv_batch_get(
-            keys=[meta.sample_ids[1]],
+            sample_ids=[meta.sample_ids[1]],
             partition_id="train",
             select_fields=["input_ids"],
         )
     # Surviving uids' payload is still alive.
     survivors = client.kv_batch_get(
-        keys=[meta.sample_ids[0], meta.sample_ids[2]],
+        sample_ids=[meta.sample_ids[0], meta.sample_ids[2]],
         partition_id="train",
         select_fields=["input_ids"],
     )
@@ -307,7 +307,7 @@ def test_apply_dynamic_sampling_completes_when_train_size_reached():
         dp_client=client,
     )
     assert complete is True
-    assert pm is not None and len(pm.keys) == 4
+    assert pm is not None and len(pm.sample_ids) == 4
     assert ds_metrics["dynamic_sampling_num_gen_batches"] == 1
     # Unfiltered rewards mirror the input (no filtering happened).
     assert torch.equal(unfiltered, torch.tensor([1.0, 2.0, 3.0, 4.0]))
@@ -334,14 +334,14 @@ def test_apply_dynamic_sampling_overflow_slices_and_clears():
         dp_client=client,
     )
     assert complete is True
-    assert len(pm.keys) == 4
+    assert len(pm.sample_ids) == 4
     assert ds_metrics.get("dynamic_sampling_num_discarded_valid_samples") == 2
     # Discarded uids (last 2) cleared from TQ.
     import pytest
 
     with pytest.raises(KeyError):
         client.kv_batch_get(
-            keys=[meta.sample_ids[4]],
+            sample_ids=[meta.sample_ids[4]],
             partition_id="train",
             select_fields=["input_ids"],
         )

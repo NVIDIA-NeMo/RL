@@ -344,10 +344,10 @@ class SyncRolloutActor:
             )
         n_per_prompt = n_samples // n_prompts
         uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
-        keys = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
+        sample_ids = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
         meta = kv_first_write(
             bulk_batch,
-            keys=keys,
+            sample_ids=sample_ids,
             dp_client=self._dp_client,
             partition_id=partition_id,
             extra_info={"rollout_metrics": rollout_metrics},

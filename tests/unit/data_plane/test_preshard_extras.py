@@ -71,12 +71,12 @@ def test_kv_first_write_writes_seed_fields():
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
     meta = kv_first_write(
-        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
     )
     # Every tensor field in the input lands in TQ under f"{uid}_g0".
     assert meta.sample_ids == [f"u{i}_g0" for i in range(4)]
     fetched = client.kv_batch_get(
-        keys=meta.sample_ids,
+        sample_ids=meta.sample_ids,
         partition_id="train",
         select_fields=["input_ids", "input_lengths", "token_mask", "sample_mask"],
     )
@@ -90,11 +90,11 @@ def test_kv_first_write_carries_multimodal_extras():
     fb = _final_batch(4, with_extras=True)
     uids = [f"u{i}" for i in range(4)]
     meta = kv_first_write(
-        fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
     )
     assert "pixel_values" in (meta.fields or [])
     fetched = client.kv_batch_get(
-        keys=meta.sample_ids,
+        sample_ids=meta.sample_ids,
         partition_id="train",
         select_fields=["pixel_values"],
     )
@@ -109,7 +109,7 @@ def test_kv_first_write_keys_match_uids_x_ngen():
     fb = _final_batch(6)  # 3 prompts × 2 generations
     uids = ["a", "b", "c"]
     keys = _keys_from_uids(uids, n_gen=2)
-    meta = kv_first_write(fb, keys=keys, dp_client=client, partition_id="train")
+    meta = kv_first_write(fb, sample_ids=keys, dp_client=client, partition_id="train")
     assert meta.sample_ids == ["a_g0", "a_g1", "b_g0", "b_g1", "c_g0", "c_g1"]
 
 
@@ -169,14 +169,14 @@ def test_kvbatchmeta_concat_joins_keys_and_seqlens():
     m1 = _meta(3)
     m2 = _meta(6).subset([3, 4, 5])
     j = m1.concat(m2)
-    assert j.keys == ["k0", "k1", "k2", "k3", "k4", "k5"]
+    assert j.sample_ids == ["k0", "k1", "k2", "k3", "k4", "k5"]
     assert j.sequence_lengths == [10, 11, 12, 13, 14, 15]
 
 
 def test_kvbatchmeta_slice_takes_range():
     m = _meta(5)
     s = m.slice(1, 4)
-    assert s.keys == ["k1", "k2", "k3"]
+    assert s.sample_ids == ["k1", "k2", "k3"]
     assert s.sequence_lengths == [11, 12, 13]
 
 
@@ -187,7 +187,7 @@ def test_kvbatchmeta_concat_rejects_partition_mismatch():
     m2 = KVBatchMeta(
         partition_id="other",
         task_name="train",
-        keys=["x", "y"],
+        sample_ids=["x", "y"],
         fields=None,
         sequence_lengths=[1, 2],
     )

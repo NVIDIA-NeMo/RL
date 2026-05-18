@@ -548,17 +548,17 @@ class TQDataPlaneClient(DataPlaneClient):
 
     def kv_batch_put(
         self,
-        keys: list[str],
+        sample_ids: list[str],
         partition_id: str,
         fields: TensorDict | None = None,
         tags: list[dict[str, Any]] | None = None,
     ) -> KVBatchMeta:
-        if not keys:
+        if not sample_ids:
             return KVBatchMeta(
                 partition_id=partition_id, task_name=None, sample_ids=[], fields=None
             )
         if tags is None:
-            tags = [{} for _ in keys]
+            tags = [{} for _ in sample_ids]
 
         wire_fields: TensorDict | None = None
         field_names: list[str] | None = None
@@ -573,8 +573,9 @@ class TQDataPlaneClient(DataPlaneClient):
                 wire_fields = _promote_1d_leaves(wire_fields)  # type: ignore[bad-argument-type]
             field_names = list(wire_fields.keys())
 
+        # TQ's wire vocabulary is `keys=` — translation point.
         tq.kv_batch_put(
-            keys=list(keys),
+            keys=list(sample_ids),
             partition_id=partition_id,
             fields=wire_fields,
             tags=tags,
@@ -582,26 +583,27 @@ class TQDataPlaneClient(DataPlaneClient):
 
         rec = self._partitions.get(partition_id)
         if rec is not None:
-            rec.seen_keys.update(keys)
+            rec.seen_keys.update(sample_ids)
 
         return KVBatchMeta(
             partition_id=partition_id,
             task_name=None,
-            sample_ids=list(keys),
+            sample_ids=list(sample_ids),
             fields=field_names,
             tags=[dict(t) for t in tags] if tags else None,
         )
 
     def kv_batch_get(
         self,
-        keys: list[str],
+        sample_ids: list[str],
         partition_id: str,
         select_fields: list[str],
     ) -> TensorDict:
-        if not keys:
+        if not sample_ids:
             return TensorDict({}, batch_size=(0,))
+        # TQ's wire vocabulary is `keys=` — translation point.
         td = tq.kv_batch_get(
-            keys=list(keys),
+            keys=list(sample_ids),
             partition_id=partition_id,
             select_fields=select_fields,
         )
@@ -609,20 +611,21 @@ class TQDataPlaneClient(DataPlaneClient):
             td = _from_wire(td)
         return td
 
-    def kv_clear(self, keys: list[str] | None, partition_id: str) -> None:
-        if keys is None:
+    def kv_clear(self, sample_ids: list[str] | None, partition_id: str) -> None:
+        if sample_ids is None:
             rec = self._partitions.pop(partition_id, None)
-            keys = list(rec.seen_keys) if rec is not None else []
-            if not keys:
+            sample_ids = list(rec.seen_keys) if rec is not None else []
+            if not sample_ids:
                 try:
                     listing = tq.kv_list(partition_id=partition_id)
-                    keys = list(listing.get(partition_id, {}).keys())
+                    sample_ids = list(listing.get(partition_id, {}).keys())
                 except Exception:
-                    keys = []
+                    sample_ids = []
         else:
             self._partitions.pop(partition_id, None)
-        if keys:
-            tq.kv_clear(keys=list(keys), partition_id=partition_id)
+        if sample_ids:
+            # TQ's wire vocabulary is `keys=` — translation point.
+            tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
 

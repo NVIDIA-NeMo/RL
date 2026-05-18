@@ -61,14 +61,14 @@ def test_register_put_get_clear(client: DataPlaneClient):
     )
     keys = ["a", "b", "c", "d"]
     fields = TensorDict({"x": torch.arange(4)}, batch_size=[4])
-    client.kv_batch_put(keys=keys, partition_id="p", fields=fields)
+    client.kv_batch_put(sample_ids=keys, partition_id="p", fields=fields)
 
-    out = client.kv_batch_get(keys=keys, partition_id="p", select_fields=["x"])
+    out = client.kv_batch_get(sample_ids=keys, partition_id="p", select_fields=["x"])
     assert torch.equal(out["x"], torch.arange(4))
 
-    client.kv_clear(keys=None, partition_id="p")
+    client.kv_clear(sample_ids=None, partition_id="p")
     with pytest.raises(KeyError):
-        client.kv_batch_get(keys=keys, partition_id="p", select_fields=["x"])
+        client.kv_batch_get(sample_ids=keys, partition_id="p", select_fields=["x"])
 
 
 def test_claim_meta_advances_consumption(client: DataPlaneClient):
@@ -79,7 +79,7 @@ def test_claim_meta_advances_consumption(client: DataPlaneClient):
         consumer_tasks=["read"],
     )
     fields = TensorDict({"x": torch.tensor([10, 20])}, batch_size=[2])
-    client.kv_batch_put(keys=["a", "b"], partition_id="p", fields=fields)
+    client.kv_batch_put(sample_ids=["a", "b"], partition_id="p", fields=fields)
 
     meta = client.claim_meta(
         partition_id="p", task_name="read", required_fields=["x"], batch_size=2
@@ -95,7 +95,7 @@ def test_get_data_requires_field_selection(client: DataPlaneClient):
         partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["read"]
     )
     client.kv_batch_put(
-        keys=["a"],
+        sample_ids=["a"],
         partition_id="p",
         fields=TensorDict({"x": torch.tensor([1])}, batch_size=[1]),
     )
@@ -118,7 +118,7 @@ def test_kv_batch_put_rejects_non_tensor_leaves(client: DataPlaneClient):
     )
     bad = TensorDict({"x": NonTensorData("hello")}, batch_size=[1])
     with pytest.raises(TypeError, match=r"non-tensor"):
-        client.kv_batch_put(keys=["a"], partition_id="p", fields=bad)
+        client.kv_batch_put(sample_ids=["a"], partition_id="p", fields=bad)
 
 
 def test_close_is_idempotent(client: DataPlaneClient):

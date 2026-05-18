@@ -69,7 +69,7 @@ def read_columns(
         ``BatchedDataDict`` with the requested fields, materialized.
     """
     td = dp_client.kv_batch_get(
-        keys=meta.sample_ids,
+        sample_ids=meta.sample_ids,
         partition_id=meta.partition_id,
         select_fields=list(select_fields),
     )
@@ -108,7 +108,7 @@ def write_columns(
     lengths = torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
     td = pack_jagged_fields(fields, lengths=lengths)
     dp_client.kv_batch_put(
-        keys=meta.sample_ids,
+        sample_ids=meta.sample_ids,
         partition_id=meta.partition_id,
         fields=td,
     )
@@ -117,7 +117,7 @@ def write_columns(
 def kv_first_write(
     final_batch_cpu: BatchedDataDict[Any],
     *,
-    keys: Sequence[str],
+    sample_ids: Sequence[str],
     dp_client: DataPlaneClient,
     partition_id: str,
     extra_info: dict[str, Any] | None = None,
@@ -128,7 +128,7 @@ def kv_first_write(
     """Single flat ``kv_batch_put`` of every tensor field in ``final_batch_cpu``.
 
     The rollout actor's first put of a partition. Caller mints
-    ``keys`` (verl-style) — the helper is rollout-shape-agnostic.
+    ``sample_ids`` (verl-style) — the helper is rollout-shape-agnostic.
 
     Args:
         final_batch_cpu: Rollout output already on CPU. Must contain
@@ -137,7 +137,7 @@ def kv_first_write(
             pack). Tensor fields are packed jagged via
             :func:`pack_jagged_fields`; ``np.ndarray(dtype=object)``
             leaves pass through.
-        keys: Pre-minted per-sample keys, one per row of
+        sample_ids: Pre-minted per-sample ids, one per row of
             ``final_batch_cpu``.
         dp_client: Data-plane client used for the put.
         partition_id: TQ partition to write into.
@@ -146,18 +146,18 @@ def kv_first_write(
         pad_to_multiple: Seq-dim alignment recorded in ``extra_info`` so
             readers pad to a multiple compatible with downstream backends
             (mcore SP, PyTorch CP).
-        tags: Optional per-key primitive metadata (one dict per row).
-            Stored on the TQ controller alongside keys; travels with
-            ``KVBatchMeta`` through ``subset`` / ``concat`` / ``slice``
+        tags: Optional per-sample primitive metadata (one dict per row).
+            Stored on the TQ controller alongside the samples; travels
+            with ``KVBatchMeta`` through ``subset`` / ``concat`` / ``slice``
             so consumers can filter on it without fetching tensor data.
 
     Returns:
-        ``KVBatchMeta`` covering the written keys.
+        ``KVBatchMeta`` covering the written samples.
     """
     n = int(final_batch_cpu["sample_mask"].shape[0])
-    if n == 0 or len(keys) != n:
+    if n == 0 or len(sample_ids) != n:
         raise ValueError(
-            f"kv_first_write: keys ({len(keys)}) must match batch size ({n})"
+            f"kv_first_write: sample_ids ({len(sample_ids)}) must match batch size ({n})"
         )
     if tags is not None and len(tags) != n:
         raise ValueError(
@@ -172,7 +172,7 @@ def kv_first_write(
     }
     td = pack_jagged_fields(fields, lengths=lengths)
     dp_client.kv_batch_put(
-        keys=list(keys),
+        sample_ids=list(sample_ids),
         partition_id=partition_id,
         fields=td,
         tags=tags,
@@ -184,7 +184,7 @@ def kv_first_write(
     return KVBatchMeta(
         partition_id=partition_id,
         task_name=task_name,
-        keys=list(keys),
+        sample_ids=list(sample_ids),
         fields=list(td.keys()),
         sequence_lengths=[int(s) for s in lengths.tolist()],
         extra_info=extras,

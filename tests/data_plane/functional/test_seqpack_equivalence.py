@@ -176,12 +176,12 @@ def _round_trip_shards_through_tq(
             batch_size=[n],
         )
         tq_client.kv_batch_put(
-            keys=keys,
+            sample_ids=keys,
             partition_id=partition_id,
             fields=fields,
         )
         td_back = tq_client.kv_batch_get(
-            keys=keys,
+            sample_ids=keys,
             partition_id=partition_id,
             select_fields=list(names),
         )

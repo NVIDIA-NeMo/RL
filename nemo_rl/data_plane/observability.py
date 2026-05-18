@@ -173,7 +173,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             partition_id: Partition the op targets.
             fn: Zero-arg callable that invokes the inner client.
             n_keys: Key count if known up front; otherwise inferred from
-                the return value (``KVBatchMeta.keys``).
+                the return value (``KVBatchMeta.sample_ids``).
             n_bytes: Byte estimate; overridden by ``_td_bytes`` when the
                 return is a ``TensorDict``.
 
@@ -194,7 +194,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         if isinstance(out, TensorDict):
             n_bytes = _td_bytes(out)
         elif isinstance(out, KVBatchMeta) and not n_keys:
-            n_keys = len(out.keys)
+            n_keys = len(out.sample_ids)
         self._emit(op, partition_id, n_keys, n_bytes, t0, "ok")
         return out
 
@@ -288,48 +288,52 @@ class MetricsDataPlaneClient(DataPlaneClient):
             lambda: self._inner.check_consumption_status(partition_id, task_names),
         )
 
-    def kv_batch_put(self, keys, partition_id, fields=None, tags=None):
+    def kv_batch_put(self, sample_ids, partition_id, fields=None, tags=None):
         n_bytes = _td_bytes(fields)
-        # Materialize keys once: ``_run`` consumes its lambda and we
-        # also need to attribute bytes per key after success.
-        keys_list = keys if isinstance(keys, list) else list(keys)
+        # Materialize once: ``_run`` consumes its lambda and we also need
+        # to attribute bytes per sample after success.
+        sample_ids_list = sample_ids if isinstance(sample_ids, list) else list(sample_ids)
         out = self._run(
             "put",
             partition_id,
             lambda: self._inner.kv_batch_put(
-                keys_list,
+                sample_ids_list,
                 partition_id,
                 fields=fields,
                 tags=tags,
             ),
-            n_keys=len(keys_list),
+            n_keys=len(sample_ids_list),
             n_bytes=n_bytes,
         )
-        self._record_put(partition_id, keys_list, n_bytes)
+        self._record_put(partition_id, sample_ids_list, n_bytes)
         return out
 
-    def kv_batch_get(self, keys, partition_id, select_fields):
+    def kv_batch_get(self, sample_ids, partition_id, select_fields):
         return self._run(
             "get",
             partition_id,
             lambda: self._inner.kv_batch_get(
-                keys,
+                sample_ids,
                 partition_id,
                 select_fields=select_fields,
             ),
-            n_keys=len(keys),
+            n_keys=len(sample_ids),
         )
 
-    def kv_clear(self, keys, partition_id):
-        keys_list = keys if (keys is None or isinstance(keys, list)) else list(keys)
-        n_keys = len(keys_list) if keys_list is not None else 0
+    def kv_clear(self, sample_ids, partition_id):
+        sample_ids_list = (
+            sample_ids
+            if (sample_ids is None or isinstance(sample_ids, list))
+            else list(sample_ids)
+        )
+        n_keys = len(sample_ids_list) if sample_ids_list is not None else 0
         self._run(
             "clear",
             partition_id,
-            lambda: self._inner.kv_clear(keys_list, partition_id),
+            lambda: self._inner.kv_clear(sample_ids_list, partition_id),
             n_keys=n_keys,
         )
-        self._record_clear(partition_id, keys_list)
+        self._record_clear(partition_id, sample_ids_list)
 
     def close(self) -> None:
         self._run(
