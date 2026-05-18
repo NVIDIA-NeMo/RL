@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import gc
 import json
 import tempfile
@@ -36,10 +37,12 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
+from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
+    run_async_nemo_gym_rollout_by_prompt,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation import configure_generation_config
@@ -970,3 +973,277 @@ def test_run_async_nemo_gym_rollout(
     1. In nemo_rl/experience/rollouts.py::run_async_nemo_gym_rollout, the sampling params are passed appropriately
     2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """
+
+
+@pytest.fixture(scope="function")
+def single_multi_step_calculator_input_sample(rollout_tokenizer):
+    """Returns a single DatumSpec prompt dict (problem 0) for _by_prompt tests."""
+    problem_text = "(5 + 3) * 2"
+    expected_answer = 16.0
+    max_steps = 5
+
+    tool_instructions = (
+        "You have a calculator tool. To use it, respond with:\n"
+        "'[operand1, operand2, operation_name]<call: calculator>'\n"
+        "The valid 'operation_name' values are exactly: 'sum', 'diff', 'prod', 'div'.\n"
+        "Example: [5, 3, sum]<call: calculator>\n"
+        "You will receive the result of your calculation as <result>...</result>\n"
+        "Use this result to make the next calculation if needed.\n"
+        "IMPORTANT: Only perform one calculation step (one tool call) before waiting for a result and making a new tool call.\n"
+        "IMPORTANT: Do not perform any other calculations or operations aside from the tool call and result. Doing so will result in failure.\n"
+        "To give the final answer, just output the number. numbers inside of <result> don't count, so output just the final number yourself outside of this.\n"
+        "Example full output: [2, 4, sum]<call: calculator>\n<result>6.0</result>\n[6, 6, diff]<call: calculator>\n<result>0.0</result> 0\n(note how you have to output the final 0 outside of the tags)"
+        "------\n"
+        f"Solve: {problem_text}"
+    )
+
+    initial_prompt_content = rollout_tokenizer.apply_chat_template(
+        [{"role": "user", "content": tool_instructions}],
+        tokenize=False,
+        add_system_prompt=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    tokenized_prompt = rollout_tokenizer(
+        initial_prompt_content, return_tensors="pt", add_special_tokens=False
+    )["input_ids"][0]
+    message_log = [
+        {
+            "role": "user",
+            "content": initial_prompt_content,
+            "token_ids": tokenized_prompt,
+        }
+    ]
+    metadata = MultiStepCalcMetadata(
+        problem=problem_text,
+        expected_final_answer=expected_answer,
+        max_steps=max_steps,
+        current_step=0,
+    )
+    return {
+        "message_log": message_log,
+        "extra_env_info": metadata,
+        "task_name": "multi_step_calculator_game",
+        "stop_strings": ["<call: calculator>"],
+        "idx": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tests for run_async_nemo_gym_rollout_by_prompt
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.nemo_gym
+def test_run_async_nemo_gym_rollout_by_prompt(
+    nemo_gym,  # noqa: F811
+    nemo_gym_vllm_generation,  # noqa: F811
+    nemo_gym_sanity_test_data,  # noqa: F811
+    nemo_gym_tokenizer,  # noqa: F811
+):
+    """Standalone test for run_async_nemo_gym_rollout_by_prompt.
+
+    Given 1 prompt with num_generations_per_prompt=N, asserts:
+    - output is a PromptGroupRecord with N Completion objects
+    - each Completion has a reward (float) and a non-empty message_log
+    - completions hold independent message_log objects
+    """
+    import tempfile
+
+    from nemo_rl.data.collate_fn import rl_collate_fn
+    from nemo_rl.data.datasets.response_datasets import NemoGymDataset
+    from nemo_rl.data.processors import nemo_gym_data_processor
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        for data in nemo_gym_sanity_test_data["input"]:
+            f.write(json.dumps(data) + "\n")
+        data_path = f.name
+
+    dataset = NemoGymDataset(data_path)
+    examples = [
+        nemo_gym_data_processor(dataset.dataset[idx], None, None, None, idx)
+        for idx in range(len(dataset.dataset))
+    ]
+    input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(examples)
+
+    # Use only the first prompt
+    single_prompt = {
+        "message_log": input_batch["message_log"][0],
+        "extra_env_info": input_batch["extra_env_info"][0],
+        "task_name": "nemo_gym",
+        "idx": 0,
+        "loss_multiplier": float(input_batch["loss_multiplier"][0]),
+    }
+    num_generations = 2
+
+    record = asyncio.run(
+        run_async_nemo_gym_rollout_by_prompt(
+            policy_generation=nemo_gym_vllm_generation,
+            input_sample=single_prompt,
+            tokenizer=nemo_gym_tokenizer,
+            task_to_env={"nemo_gym": nemo_gym},
+            generation_config=nemo_gym_vllm_generation.cfg,
+            num_generations_per_prompt=num_generations,
+            max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
+            max_rollout_turns=None,
+        )
+    )
+
+    assert isinstance(record, PromptGroupRecord)
+    assert len(record.completions) == num_generations, (
+        f"Expected {num_generations} completions, got {len(record.completions)}"
+    )
+    assert record.prompt_idx == 0
+
+    for i, completion in enumerate(record.completions):
+        assert isinstance(completion, Completion)
+
+        # 1. message_log length
+        assert len(completion.message_log) == 2, (
+            f"Completion {i}: expected 2 messages, got {len(completion.message_log)}"
+        )
+
+        # 2. last assistant token_ids
+        last_assistant = next(
+            (m for m in reversed(completion.message_log) if m["role"] == "assistant"),
+            None,
+        )
+        assert last_assistant is not None, f"Completion {i}: no assistant message found"
+        assert torch.equal(
+            last_assistant["token_ids"],
+            torch.tensor([151667, 198, 32313, 11, 1077]),
+        ), (
+            f"Completion {i}: last assistant token_ids {last_assistant['token_ids'].tolist()} "
+            f"!= [151667, 198, 32313, 11, 1077]"
+        )
+
+        # 3. reward
+        assert completion.reward == 0.0, (
+            f"Completion {i}: reward {completion.reward} != 0.0"
+        )
+
+    # completions must be independent objects
+    assert record.completions[0].message_log is not record.completions[1].message_log
+
+
+@pytest.mark.nemo_gym
+def test_run_async_nemo_gym_rollout_by_prompt_matches_original(
+    nemo_gym,  # noqa: F811
+    nemo_gym_vllm_generation,  # noqa: F811
+    nemo_gym_sanity_test_data,  # noqa: F811
+    nemo_gym_tokenizer,  # noqa: F811
+):
+    """Comparison test: _by_prompt output is structurally equivalent to the original.
+
+    Calls run_async_nemo_gym_rollout with a batch of N identical rows,
+    then calls run_async_nemo_gym_rollout_by_prompt with 1 prompt, N generations.
+    Asserts that both produce N results and rewards are in the same numeric domain.
+    """
+    import tempfile
+
+    from nemo_rl.data.collate_fn import rl_collate_fn
+    from nemo_rl.data.datasets.response_datasets import NemoGymDataset
+    from nemo_rl.data.processors import nemo_gym_data_processor
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        for data in nemo_gym_sanity_test_data["input"]:
+            f.write(json.dumps(data) + "\n")
+        data_path = f.name
+
+    dataset = NemoGymDataset(data_path)
+    examples = [
+        nemo_gym_data_processor(dataset.dataset[idx], None, None, None, idx)
+        for idx in range(len(dataset.dataset))
+    ]
+    input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(examples)
+
+    num_generations = 2
+    single_prompt = {
+        "message_log": input_batch["message_log"][0],
+        "extra_env_info": input_batch["extra_env_info"][0],
+        "task_name": "nemo_gym",
+        "idx": 0,
+        "loss_multiplier": float(input_batch["loss_multiplier"][0]),
+    }
+
+    # Build a batch of N identical rows for the original function
+    repeated_batch = BatchedDataDict(
+        {
+            "message_log": [
+                deepcopy(input_batch["message_log"][0]) for _ in range(num_generations)
+            ],
+            "extra_env_info": [
+                deepcopy(input_batch["extra_env_info"][0])
+                for _ in range(num_generations)
+            ],
+            "loss_multiplier": input_batch["loss_multiplier"][0:1].repeat(
+                num_generations
+            ),
+            "idx": list(range(num_generations)),
+            "task_name": ["nemo_gym"] * num_generations,
+        }
+    )
+
+    original_result = run_async_nemo_gym_rollout(
+        policy_generation=nemo_gym_vllm_generation,
+        input_batch=repeated_batch,
+        tokenizer=nemo_gym_tokenizer,
+        task_to_env={"nemo_gym": nemo_gym},
+        generation_config=nemo_gym_vllm_generation.cfg,
+        max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
+        max_rollout_turns=None,
+    )
+
+    record = asyncio.run(
+        run_async_nemo_gym_rollout_by_prompt(
+            policy_generation=nemo_gym_vllm_generation,
+            input_sample=single_prompt,
+            tokenizer=nemo_gym_tokenizer,
+            task_to_env={"nemo_gym": nemo_gym},
+            generation_config=nemo_gym_vllm_generation.cfg,
+            num_generations_per_prompt=num_generations,
+            max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
+            max_rollout_turns=None,
+        )
+    )
+
+    # Both should produce N completions
+    assert len(original_result.final_batch["message_log"]) == num_generations
+    assert len(record.completions) == num_generations
+
+    for i in range(num_generations):
+        orig_msg_log = original_result.final_batch["message_log"][i]
+        new_msg_log = record.completions[i].message_log
+
+        # 1. message_log length matches
+        assert len(orig_msg_log) == len(new_msg_log), (
+            f"Completion {i}: message_log length {len(new_msg_log)} != original {len(orig_msg_log)}"
+        )
+
+        # 2. last assistant token_ids match
+        def _last_assistant_token_ids(msg_log):
+            for m in reversed(msg_log):
+                if m["role"] == "assistant":
+                    return m.get("token_ids")
+            return None
+
+        orig_token_ids = _last_assistant_token_ids(orig_msg_log)
+        new_token_ids = _last_assistant_token_ids(new_msg_log)
+        assert orig_token_ids is not None, (
+            f"Completion {i}: no assistant message in original"
+        )
+        assert new_token_ids is not None, (
+            f"Completion {i}: no assistant message in by_prompt"
+        )
+        assert torch.equal(orig_token_ids, new_token_ids), (
+            f"Completion {i}: last assistant token_ids mismatch\n"
+            f"  original:  {orig_token_ids.tolist()}\n"
+            f"  by_prompt: {new_token_ids.tolist()}"
+        )
+
+        # 3. reward matches
+        orig_reward = original_result.final_batch["total_reward"][i].item()
+        new_reward = record.completions[i].reward
+        assert orig_reward == new_reward, (
+            f"Completion {i}: reward mismatch — original {orig_reward}, by_prompt {new_reward}"
+        )
