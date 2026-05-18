@@ -282,6 +282,9 @@ class MegatronPolicyWorkerImpl(
         if cuda_graph_impl == "full_iteration" or (
             cuda_graph_impl == "local" and scope_has_full_iteration
         ):
+            warnings.warn(
+                "Disabling check_for_nan_in_loss: full-iteration CUDA graph cannot be interrupted."
+            )
             self.megatron_cfg.rerun_state_machine.check_for_nan_in_loss = False
 
         # Validate configuration

@@ -1247,7 +1247,11 @@ def refit_policy_generation(
     """
     if colocated_inference:
         policy.offload_before_refit()
-    policy_generation.prepare_for_generation(tags=["weights"])
+    # Colocated inference needs to prepare for generation.
+    # Megatron non-colocated inference needs to prepare a different way:
+    # enter inference mode after refit.
+    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
+        policy_generation.prepare_for_generation(tags=["weights"])
 
     # Create a context manager that does nothing when timer is None
     timer_context = (
@@ -1320,7 +1324,11 @@ def refit_policy_generation(
 
     if colocated_inference:
         policy.offload_after_refit()
-    policy_generation.prepare_for_generation(tags=["kv_cache"])
+    # Colocated inference needs to prepare for generation.
+    # Megatron non-colocated inference needs to prepare a different way:
+    # enter inference mode after refit.
+    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
+        policy_generation.prepare_for_generation(tags=["kv_cache"])
 
 
 def _log_mixed_rewards_and_advantages_information(
@@ -2699,6 +2707,10 @@ def async_grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    # Megatron generation backend needs explicit suspend/resume around refits.
+    is_megatron_generation = (
+        master_config.policy["generation"]["backend"] == "megatron"
+    )
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -2809,13 +2821,10 @@ def async_grpo_train(
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
-            is_megatron = (
-                master_config.policy["generation"]["backend"] == "megatron"
-            )
-            if is_megatron:
+            if is_megatron_generation:
                 policy_generation.suspend_for_refit(recompute_kv_cache=False)
             refit_policy_generation(policy, policy_generation, colocated_inference)
-            if is_megatron:
+            if is_megatron_generation:
                 policy_generation.resume_after_refit(recompute_kv_cache=False)
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
@@ -3175,15 +3184,12 @@ def async_grpo_train(
                     # Pause the megatron engine loop before weight transfer.
                     # Without this, swap_weights_via_reshard races with in-flight
                     # CUDA-graph replays and corrupts state.
-                    is_megatron = (
-                        master_config.policy["generation"]["backend"] == "megatron"
-                    )
                     recompute_kv_cache = (
                         master_config.grpo
                         .get("async_grpo", {})
                         .get("recompute_kv_cache_after_weight_updates", False)
                     )
-                    if is_megatron:
+                    if is_megatron_generation:
                         policy_generation.suspend_for_refit(
                             recompute_kv_cache=recompute_kv_cache
                         )
@@ -3196,7 +3202,7 @@ def async_grpo_train(
                         )
                         POLICY_GENERATION_STALE = False
 
-                    if is_megatron:
+                    if is_megatron_generation:
                         policy_generation.resume_after_refit(
                             recompute_kv_cache=recompute_kv_cache
                         )
