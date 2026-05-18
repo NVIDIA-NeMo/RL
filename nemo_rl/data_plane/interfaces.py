@@ -392,8 +392,24 @@ class DataPlaneClient(ABC):
     ) -> None:
         """Drop key-value pairs.
 
+        Explicit form (``sample_ids=[...]``) drops exactly those uids and
+        is the form callers should use whenever they have the meta in
+        hand — both sync GRPO callers (driver passes ``meta.sample_ids``)
+        and future async-RL data-loader actors that don't share a
+        process-local registry with the producer.
+
+        Convenience form (``sample_ids=None``) drops "everything this
+        process knows produced in this partition". Adapters implement
+        this via a local registry populated by :meth:`put_samples`, with
+        a fallback query to the underlying store. Useful for step-end
+        teardown when the caller is the producer (driver in sync GRPO).
+        Workers / loader actors that didn't produce the samples should
+        pass explicit IDs — the ``None`` form may silently no-op for
+        them, and adapters are expected to warn when that happens.
+
         Args:
-            sample_ids: Uids to drop; ``None`` clears the whole partition.
+            sample_ids: Uids to drop; ``None`` clears every uid this
+                process produced in the partition.
             partition_id: Partition the samples live in.
         """
 

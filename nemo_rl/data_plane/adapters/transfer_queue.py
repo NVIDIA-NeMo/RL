@@ -612,20 +612,37 @@ class TQDataPlaneClient(DataPlaneClient):
         return td
 
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
+        cleared_via_none = sample_ids is None
         if sample_ids is None:
             rec = self._partitions.pop(partition_id, None)
             sample_ids = list(rec.seen_keys) if rec is not None else []
             if not sample_ids:
-                try:
-                    listing = tq.kv_list(partition_id=partition_id)
-                    sample_ids = list(listing.get(partition_id, {}).keys())
-                except Exception:
-                    sample_ids = []
+                # Fallback for the worker / future loader-actor case where
+                # the local registry is empty: ask TQ's controller what
+                # currently lives in this partition. `kv_list` errors
+                # propagate — we don't want a network blip to silently
+                # turn into "cleared nothing".
+                listing = tq.kv_list(partition_id=partition_id)
+                sample_ids = list(listing.get(partition_id, {}).keys())
         else:
             self._partitions.pop(partition_id, None)
-        if sample_ids:
-            # TQ's wire vocabulary is `keys=` — translation point.
-            tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
+        if not sample_ids:
+            if cleared_via_none:
+                import warnings
+
+                warnings.warn(
+                    f"clear_samples(sample_ids=None, partition_id={partition_id!r}) "
+                    "found nothing to clear — local partition registry is empty "
+                    "and TQ's kv_list returned no keys. If you're calling from a "
+                    "process that did not produce the samples (worker / loader "
+                    "actor), pass explicit sample_ids from the meta you received "
+                    "from put_samples.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            return
+        # TQ's wire vocabulary is `keys=` — translation point.
+        tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
 
