@@ -17,6 +17,8 @@ import os
 import re
 import time
 import warnings
+
+import requests
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Iterator, Optional, TypeVar, cast, AsyncGenerator
@@ -353,7 +355,7 @@ class MegatronPolicyWorkerImpl(
         self.inference_wrapped_model = None
         self.base_url = None
         self._inference_engine_initialized = False
-        self._inference_engine_alseep = True  # Start paused since we begin with training
+        self._inference_engine_asleep = True  # Start paused since we begin with training
         self._inference_loop = None  # Event loop for inference operations
         self._inference_thread = None  # Thread running the event loop
 
@@ -1008,7 +1010,7 @@ class MegatronPolicyWorkerImpl(
         )
 
         self._inference_engine_initialized = True
-        self._inference_engine_alseep = True  # Engine starts in paused state
+        self._inference_engine_asleep = True  # Engine starts in paused state
         print(f"[Rank {self.rank}] Initialized persistent inference engine")
 
     @staticmethod
@@ -1045,7 +1047,7 @@ class MegatronPolicyWorkerImpl(
             if result is not None:
                 await result
 
-        self._inference_engine_alseep = False
+        self._inference_engine_asleep = False
 
     def _sleep(self):
         """Pause the inference engine to free GPU memory for training.
@@ -1066,7 +1068,7 @@ class MegatronPolicyWorkerImpl(
         # Synchronize all ranks
         torch.distributed.barrier()
 
-        self._inference_engine_alseep = True
+        self._inference_engine_asleep = True
         print(f"[Rank {self.rank}] paused inference engine")
 
     async def _sleep_engine(self):
@@ -1105,7 +1107,7 @@ class MegatronPolicyWorkerImpl(
         # Synchronize all ranks
         torch.distributed.barrier()
 
-        self._inference_engine_alseep = False
+        self._inference_engine_asleep = False
 
     async def _wake_engine(self):
         """Send resume + unpause signals via the coordinator and wait for acknowledgment.
@@ -1151,7 +1153,7 @@ class MegatronPolicyWorkerImpl(
         torch.cuda.synchronize()
 
         if recompute_kv_cache:
-            self._inference_engine_alseep = True
+            self._inference_engine_asleep = True
 
     async def _pause_engine_for_refit(self):
         from megatron.core.inference.engines.dynamic_engine import EngineState
@@ -1184,7 +1186,7 @@ class MegatronPolicyWorkerImpl(
             )
         future.result()
         if recompute_kv_cache:
-            self._inference_engine_alseep = False
+            self._inference_engine_asleep = False
 
     async def _unpause_engine_after_refit(self):
         from megatron.core.inference.engines.dynamic_engine import EngineState
@@ -1404,7 +1406,6 @@ class MegatronPolicyWorkerImpl(
             )
 
         output = self._parse_result_to_batched_data_dict(data, result)
-        #self._log_sample_generations(data, output)
         return output
 
     def _start_inference_loop_thread(self):
@@ -1448,8 +1449,24 @@ class MegatronPolicyWorkerImpl(
             verbose=False,
         )
 
-        time.sleep(10)
-        return f"http://{ip}:{free_port}/v1"
+        base_url = f"http://{ip}:{free_port}/v1"
+        max_wait_time = 300
+        start_time = time.time()
+        with requests.Session() as session:
+            while True:
+                if time.time() - start_time > max_wait_time:
+                    raise TimeoutError(
+                        f"[Megatron HTTP] Rank {self.rank} OpenAI server failed "
+                        f"to start within {max_wait_time}s"
+                    )
+                try:
+                    response = session.get(f"{base_url}/health", timeout=10)
+                    if response.status_code == 200:
+                        break
+                except requests.RequestException:
+                    pass
+                time.sleep(2)
+        return base_url
 
     def _run_async_coordinator_start(self, coordinator_port: int):
         """Start the coordinator and engine loop in the background thread.
@@ -1946,7 +1963,7 @@ class MegatronPolicyWorkerImpl(
         # here, or NVSHMEM init/weight transfer can race with CUDA graph replay and
         # corrupt TE FP8 state, causing high log-prob error for the first 1-2 steps.
         if tags is None or "weights" not in tags:
-            if self._inference_engine_alseep:
+            if self._inference_engine_asleep:
                 self._wake()
         self._log_gpu_memory("prepare_for_generation END")
 
@@ -1969,7 +1986,7 @@ class MegatronPolicyWorkerImpl(
 
         # 1. pause the inference engine (skip in non-colocated mode to
         #    avoid deleting and recreating CUDA graphs unnecessarily)
-        if needs_suspend_resume and self._inference_engine_initialized and not self._inference_engine_alseep:
+        if needs_suspend_resume and self._inference_engine_initialized and not self._inference_engine_asleep:
             self._sleep()
 
         # 2. Toggle CUDA graphs OFF (skip in non-colocated mode to keep them alive)
@@ -1982,12 +1999,7 @@ class MegatronPolicyWorkerImpl(
         if has_lru_cache:
             rotary_module.forward.cache_clear()
 
-        # RKIRBY - Remove, it's covered in prepare_for_training
-        # 4. Restore training state (skip in non-colocated mode - model stays in eval)
-        # if needs_suspend_resume and was_training:
-        #     lang_module.train()
-
-        # 5. Force garbage collection and CUDA memory cleanup
+        # 4. Force garbage collection and CUDA memory cleanup.
         if needs_suspend_resume:
             gc.collect()
             torch.cuda.empty_cache()
