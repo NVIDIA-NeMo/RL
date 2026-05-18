@@ -40,8 +40,8 @@ class GRPOAdvantageEstimator:
     """
 
     def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
-        self.normalize_rewards = estimator_config["normalize_rewards"]
+        self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
+        self.normalize_rewards = estimator_config.normalize_rewards
 
     def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
         """Compute GRPO advantages.
@@ -82,8 +82,8 @@ class GDPOAdvantageEstimator:
     """
 
     def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
-        self.normalize_rewards = estimator_config["normalize_rewards"]
+        self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
+        self.normalize_rewards = estimator_config.normalize_rewards
 
     def compute_advantage(
         self,
@@ -157,7 +157,7 @@ class ReinforcePlusPlusAdvantageEstimator:
     """
 
     def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.minus_baseline = estimator_config["minus_baseline"]
+        self.minus_baseline = estimator_config.minus_baseline
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty
         self.kl_type = loss_config.reference_policy_kl_type
