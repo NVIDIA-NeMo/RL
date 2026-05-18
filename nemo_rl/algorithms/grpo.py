@@ -174,8 +174,12 @@ class GRPOSaveState(BaseModel, extra="allow"):
     current_step: int = 0
     current_epoch: int = 0
     total_steps: int = 0
-    total_valid_tokens: int = 0  # Track total number of non-padding tokens during training
-    val_reward: float = -99999999.0  # Optional field - may not be present during training
+    total_valid_tokens: int = (
+        0  # Track total number of non-padding tokens during training
+    )
+    val_reward: float = (
+        -99999999.0
+    )  # Optional field - may not be present during training
 
 
 def _default_grpo_save_state() -> GRPOSaveState:
@@ -346,11 +350,7 @@ def setup(
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
     # If validation is enabled, load the validation dataloader
-    if (
-        grpo_config.val_period > 0
-        or grpo_config.val_at_start
-        or grpo_config.val_at_end
-    ):
+    if grpo_config.val_period > 0 or grpo_config.val_at_start or grpo_config.val_at_end:
         assert val_dataset is not None, (
             "Validation dataset is required if validation is enabled"
         )
@@ -374,8 +374,7 @@ def setup(
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
         assert (
-            grpo_config.num_prompts_per_step
-            * grpo_config.num_generations_per_prompt
+            grpo_config.num_prompts_per_step * grpo_config.num_generations_per_prompt
             == policy_config["train_global_batch_size"]
         ), (
             "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
@@ -561,7 +560,10 @@ def setup(
     init_reference_model = loss_config.reference_policy_kl_penalty > 0
 
     # Auto-enable skip_reference_policy_logprobs_calculation when the reference model is not loaded.
-    if not init_reference_model and not grpo_config.skip_reference_policy_logprobs_calculation:
+    if (
+        not init_reference_model
+        and not grpo_config.skip_reference_policy_logprobs_calculation
+    ):
         grpo_config.skip_reference_policy_logprobs_calculation = True
         print(
             "Auto-enabling `grpo.skip_reference_policy_logprobs_calculation=True` "
@@ -911,7 +913,9 @@ def dynamic_sampling(
 
             # If the generation samples size is smaller than a fixed threshold (train_prompts_size), keep generating by processing the next batch
             if filtered_prompts_size < train_prompts_size:
-                dynamic_sampling_max_gen_batches = master_config.grpo.dynamic_sampling_max_gen_batches
+                dynamic_sampling_max_gen_batches = (
+                    master_config.grpo.dynamic_sampling_max_gen_batches
+                )
                 assert dynamic_sampling_max_gen_batches > 0, (
                     "When using grpo.use_dynamic_sampling, grpo.dynamic_sampling_max_gen_batches must be > 0"
                 )
@@ -1356,8 +1360,12 @@ def grpo_train(
     total_steps = grpo_save_state.total_steps  # total steps across all epochs
     max_num_steps = master_config.grpo.max_num_steps  # max number of steps to train for
     current_epoch = grpo_save_state.current_epoch  # current epoch
-    max_num_epochs = master_config.grpo.max_num_epochs  # max number of epochs to train for
-    consumed_samples = grpo_save_state.consumed_samples  # total samples consumed across all epochs
+    max_num_epochs = (
+        master_config.grpo.max_num_epochs
+    )  # max number of epochs to train for
+    consumed_samples = (
+        grpo_save_state.consumed_samples
+    )  # total samples consumed across all epochs
     total_valid_tokens = getattr(
         grpo_save_state, "total_valid_tokens", 0
     )  # total valid tokens processed across all epochs; default to 0 for backward compatibility with older checkpoints
@@ -2018,9 +2026,11 @@ def grpo_train(
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            setattr(grpo_save_state, full_metric_name, metrics_source[
-                                metric_name
-                            ])
+                            setattr(
+                                grpo_save_state,
+                                full_metric_name,
+                                metrics_source[metric_name],
+                            )
 
                     with timer.time("checkpointing"):
                         print(
@@ -2259,8 +2269,7 @@ def validate(
         all_message_logs = []  # Collect all message logs
 
         max_batches = (
-            master_config.grpo.max_val_samples
-            // master_config.grpo.val_batch_size
+            master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
         )
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
@@ -2426,7 +2435,10 @@ def async_grpo_train(
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
 
-    if master_config.grpo.async_grpo is not None and master_config.grpo.async_grpo.max_trajectory_age_steps > 1:
+    if (
+        master_config.grpo.async_grpo is not None
+        and master_config.grpo.async_grpo.max_trajectory_age_steps > 1
+    ):
         if not master_config.grpo.async_grpo.in_flight_weight_updates:
             print(
                 "⚠️ WARNING: In-flight weight updates must be enabled for async GRPO with max_trajectory_age_steps > 1. "
@@ -3092,9 +3104,11 @@ def async_grpo_train(
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            setattr(grpo_save_state, full_metric_name, metrics_source[
-                                metric_name
-                            ])
+                            setattr(
+                                grpo_save_state,
+                                full_metric_name,
+                                metrics_source[metric_name],
+                            )
 
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {step + 1}...")

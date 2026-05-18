@@ -206,7 +206,9 @@ class AsyncTrajectoryCollector:
                 if self._should_pause_for_generation_limits() and self.running:
                     # Only log warning once per weight version
                     if self._last_limit_warning_version != self.current_weight_version:
-                        max_trajectory_age = self.master_config.grpo.async_grpo.max_trajectory_age_steps
+                        max_trajectory_age = (
+                            self.master_config.grpo.async_grpo.max_trajectory_age_steps
+                        )
                         target_weights = [
                             self.current_weight_version + i
                             for i in range(max_trajectory_age)
