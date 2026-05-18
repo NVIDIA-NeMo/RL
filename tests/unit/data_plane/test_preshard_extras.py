@@ -74,9 +74,9 @@ def test_kv_first_write_writes_seed_fields():
         fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
     )
     # Every tensor field in the input lands in TQ under f"{uid}_g0".
-    assert meta.keys == [f"u{i}_g0" for i in range(4)]
+    assert meta.sample_ids == [f"u{i}_g0" for i in range(4)]
     fetched = client.kv_batch_get(
-        keys=meta.keys,
+        keys=meta.sample_ids,
         partition_id="train",
         select_fields=["input_ids", "input_lengths", "token_mask", "sample_mask"],
     )
@@ -94,7 +94,7 @@ def test_kv_first_write_carries_multimodal_extras():
     )
     assert "pixel_values" in (meta.fields or [])
     fetched = client.kv_batch_get(
-        keys=meta.keys,
+        keys=meta.sample_ids,
         partition_id="train",
         select_fields=["pixel_values"],
     )
@@ -103,14 +103,14 @@ def test_kv_first_write_carries_multimodal_extras():
 
 def test_kv_first_write_keys_match_uids_x_ngen():
     """Keys round-trip: caller mints ``f"{uid}_g{i}"``, helper preserves them
-    in ``meta.keys`` byte-for-byte."""
+    in ``meta.sample_ids`` byte-for-byte."""
     client = NoOpDataPlaneClient()
     _setup_partition(client, num_samples=6)
     fb = _final_batch(6)  # 3 prompts × 2 generations
     uids = ["a", "b", "c"]
     keys = _keys_from_uids(uids, n_gen=2)
     meta = kv_first_write(fb, keys=keys, dp_client=client, partition_id="train")
-    assert meta.keys == ["a_g0", "a_g1", "b_g0", "b_g1", "c_g0", "c_g1"]
+    assert meta.sample_ids == ["a_g0", "a_g1", "b_g0", "b_g1", "c_g0", "c_g1"]
 
 
 # ── shard_meta_for_dp invariants ──────────────────────────────────────
@@ -120,7 +120,7 @@ def _meta(n: int) -> KVBatchMeta:
     return KVBatchMeta(
         partition_id="train",
         task_name="train",
-        keys=[f"k{i}" for i in range(n)],
+        sample_ids=[f"k{i}" for i in range(n)],
         fields=list(DP_TRAIN_FIELDS),
         sequence_lengths=[10 + i for i in range(n)],
         extra_info={},
@@ -131,8 +131,8 @@ def test_shard_meta_for_dp_partitions_keys_disjointly():
     n, dp = 8, 4
     metas, _ = shard_meta_for_dp(_meta(n), dp_world=dp, batch_size=n)
     assert len(metas) == dp
-    flat = [k for m in metas for k in m.keys]
-    assert sorted(flat) == sorted(_meta(n).keys)  # same set, no dups, no minting
+    flat = [k for m in metas for k in m.sample_ids]
+    assert sorted(flat) == sorted(_meta(n).sample_ids)  # same set, no dups, no minting
 
 
 def test_shard_meta_for_dp_preserves_partition_id():
@@ -148,8 +148,8 @@ def test_shard_meta_for_dp_unsorted_round_trip():
         # No reorder happened — DP-rank concat IS the original order.
         return
     # Build a tensor whose row i is i; permute via dispatch order; reorder back.
-    flat = [k for m in metas for k in m.keys]
-    aggregated = torch.tensor([_meta(n).keys.index(k) for k in flat])
+    flat = [k for m in metas for k in m.sample_ids]
+    aggregated = torch.tensor([_meta(n).sample_ids.index(k) for k in flat])
     restored = aggregated[torch.tensor(unsorted)]
     assert restored.tolist() == list(range(n))
 
@@ -160,7 +160,7 @@ def test_shard_meta_for_dp_unsorted_round_trip():
 def test_kvbatchmeta_subset_filters_keys_and_seqlens():
     m = _meta(6)
     sub = m.subset([1, 3, 5])
-    assert sub.keys == ["k1", "k3", "k5"]
+    assert sub.sample_ids == ["k1", "k3", "k5"]
     assert sub.sequence_lengths == [11, 13, 15]
     assert sub.partition_id == m.partition_id
 

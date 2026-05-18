@@ -48,7 +48,7 @@ def shard_meta_for_dp(
     sequence_packing_args: Optional[dict[str, Any]] = None,
     dynamic_batching_args: Optional[dict[str, Any]] = None,
 ) -> tuple[list[KVBatchMeta], Optional[list[int]]]:
-    """Pure key-list split: assign ``meta.keys`` to ``dp_world`` ranks.
+    """Pure key-list split: assign ``meta.sample_ids`` to ``dp_world`` ranks.
 
     Seq-len-aware on top of ``shard_by_batch_size``. No I/O, no key
     minting. Used for every dispatch after rollout (logprob, ref-logprob,
@@ -70,11 +70,11 @@ def shard_meta_for_dp(
     Returns:
         ``(per_rank_metas, unsorted_indices)``. ``unsorted_indices`` is
         the inverse permutation that maps DP-rank-order outputs back to
-        original ``meta.keys`` order (feed to
+        original ``meta.sample_ids`` order (feed to
         ``BatchedDataDict.reorder_data`` post-aggregation); ``None`` if
         no reorder occurred.
     """
-    n = len(meta.keys)
+    n = len(meta.sample_ids)
     if n == 0:
         raise ValueError("shard_meta_for_dp: empty meta — nothing to shard")
     if meta.sequence_lengths is None or len(meta.sequence_lengths) != n:
@@ -92,7 +92,7 @@ def shard_meta_for_dp(
     # Skeleton BatchedDataDict — `shard_by_batch_size` only needs
     # input_ids (placeholder), input_lengths (real), sample_mask (ones).
     # ``meta_idx`` lets us recover which original meta index each shard row
-    # corresponds to, so we can slice ``meta.keys`` per rank.
+    # corresponds to, so we can slice ``meta.sample_ids`` per rank.
     #
     # ``INPUT_IDS`` seq dim sizing: the dynamic-batching microbatch planner
     # in ``BatchedDataDict.shard_by_batch_size`` reads ``input_ids.shape[1]``
@@ -140,7 +140,7 @@ def shard_meta_for_dp(
         # pyrefly: ignore  # no-matching-overload
         idx_list: list[int] = shard[META_IDX].tolist()
         flat_idx.extend(idx_list)
-        rank_keys = [meta.keys[i] for i in idx_list]
+        rank_sample_ids = [meta.sample_ids[i] for i in idx_list]
         rank_seqlens = [seq_lens[i] for i in idx_list]
         rank_extra = dict(base_extra)
         # Per-shard packing metadata — set by ``shard_by_batch_size`` when
@@ -162,7 +162,7 @@ def shard_meta_for_dp(
             KVBatchMeta(
                 partition_id=meta.partition_id,
                 task_name=meta.task_name,
-                keys=rank_keys,
+                sample_ids=rank_sample_ids,
                 fields=meta.fields,
                 sequence_lengths=rank_seqlens,
                 extra_info=rank_extra,
@@ -172,7 +172,7 @@ def shard_meta_for_dp(
     # Build inverse permutation: unsorted[orig_idx] = position_in_aggregated.
     # When workers' results are concatenated in DP-rank order, row `j` of
     # the aggregate corresponds to original index `flat_idx[j]`. To restore
-    # original meta.keys order, the caller does aggregated.reorder_data(
+    # original meta.sample_ids order, the caller does aggregated.reorder_data(
     # unsorted_indices) — same contract as `_shard_for_logprob`.
     unsorted: Optional[list[int]] = None
     if flat_idx != list(range(n)):

@@ -278,7 +278,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             "get_data",
             meta.partition_id,
             lambda: self._inner.get_data(meta, select_fields=select_fields),
-            n_keys=len(meta.keys),
+            n_keys=len(meta.sample_ids),
         )
 
     def check_consumption_status(self, partition_id, task_names):

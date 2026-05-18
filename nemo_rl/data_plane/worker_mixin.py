@@ -251,7 +251,7 @@ class TQWorkerMixin:
             is_leader = torch.distributed.get_rank() == leader
             if is_leader:
                 td = self._require_dp_client().kv_batch_get(
-                    keys=meta.keys,
+                    keys=meta.sample_ids,
                     partition_id=meta.partition_id,
                     select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
                 )
@@ -276,7 +276,7 @@ class TQWorkerMixin:
             return data
 
         td = self._require_dp_client().kv_batch_get(
-            keys=meta.keys,
+            keys=meta.sample_ids,
             partition_id=meta.partition_id,
             select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
         )
@@ -414,7 +414,7 @@ class TQWorkerMixin:
         meta: "KVBatchMeta",
         fields: dict[str, torch.Tensor],
     ) -> None:
-        """Leader-only ``kv_batch_put(meta.keys, fields=...)``.
+        """Leader-only ``kv_batch_put(meta.sample_ids, fields=...)``.
 
         Per-token fields are jagged-packed via :func:`maybe_pack_jagged`
         so they land with the same row lengths as the initial put;
@@ -465,11 +465,11 @@ class TQWorkerMixin:
                 f"_write_back_result_field: result[{result_key!r}] is "
                 f"{type(val).__name__}, expected torch.Tensor."
             )
-        if val.shape[0] != len(meta.keys):
+        if val.shape[0] != len(meta.sample_ids):
             raise ValueError(
                 f"_write_back_result_field: shape mismatch — "
                 f"result[{result_key!r}] has batch dim {val.shape[0]} "
-                f"but meta.keys has {len(meta.keys)}."
+                f"but meta.sample_ids has {len(meta.sample_ids)}."
             )
         self._write_back(meta, {tq_field: val.detach().to("cpu")})
 

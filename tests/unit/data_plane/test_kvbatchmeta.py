@@ -33,17 +33,17 @@ def test_size_matches_keys():
     meta = KVBatchMeta(
         partition_id="p",
         task_name="t",
-        keys=["a", "b", "c"],
+        sample_ids=["a", "b", "c"],
         sequence_lengths=[1, 2, 3],
     )
     assert meta.size == 3
-    assert meta.size == len(meta.keys)
+    assert meta.size == len(meta.sample_ids)
 
 
 def test_default_fields_and_extra_info_optional():
     """``fields`` and ``sequence_lengths`` default to None;
     ``extra_info`` defaults to an empty dict."""
-    meta = KVBatchMeta(partition_id="p", task_name="t", keys=[])
+    meta = KVBatchMeta(partition_id="p", task_name="t", sample_ids=[])
     assert meta.fields is None
     assert meta.sequence_lengths is None
     assert meta.extra_info == {}
@@ -56,7 +56,7 @@ def test_pickle_roundtrip_structural_equality():
     meta = KVBatchMeta(
         partition_id="train",
         task_name="train",
-        keys=["k0", "k1", "k2"],
+        sample_ids=["k0", "k1", "k2"],
         fields=["input_ids", "advantages"],
         sequence_lengths=[10, 20, 30],
         extra_info={"step": 5},
@@ -64,7 +64,7 @@ def test_pickle_roundtrip_structural_equality():
     rt = pickle.loads(pickle.dumps(meta))
     assert rt.partition_id == meta.partition_id
     assert rt.task_name == meta.task_name
-    assert rt.keys == meta.keys
+    assert rt.sample_ids == meta.sample_ids
     assert rt.fields == meta.fields
     assert rt.sequence_lengths == meta.sequence_lengths
     assert rt.extra_info == meta.extra_info
@@ -78,14 +78,14 @@ def test_keys_with_duplicates_allowed_or_warned():
     This test pins the current behavior: meta accepts any list; dupe
     detection is downstream.
     """
-    meta = KVBatchMeta(partition_id="p", task_name="t", keys=["a", "a"])
+    meta = KVBatchMeta(partition_id="p", task_name="t", sample_ids=["a", "a"])
     assert meta.size == 2  # no dedup at meta level
 
 
 def test_empty_meta_is_valid():
     """T1-shard-empty-input — an empty meta is a valid value (e.g. a DP
     rank with no work after sharding)."""
-    meta = KVBatchMeta(partition_id="p", task_name="t", keys=[])
+    meta = KVBatchMeta(partition_id="p", task_name="t", sample_ids=[])
     assert meta.size == 0
     # Cloud-pickle survives empty too.
     rt = pickle.loads(pickle.dumps(meta))
@@ -95,14 +95,14 @@ def test_empty_meta_is_valid():
 def test_partition_id_is_required():
     """``partition_id`` is positional and required — plan R-M3."""
     with pytest.raises(TypeError):
-        KVBatchMeta(task_name="t", keys=[])  # type: ignore[call-arg]
+        KVBatchMeta(task_name="t", sample_ids=[])  # type: ignore[call-arg]
 
 
 def test_extra_info_default_is_unique_per_instance():
     """Mutable default trap — two metas should not share the same
     ``extra_info`` dict object."""
-    a = KVBatchMeta(partition_id="p", task_name="t", keys=[])
-    b = KVBatchMeta(partition_id="p", task_name="t", keys=[])
+    a = KVBatchMeta(partition_id="p", task_name="t", sample_ids=[])
+    b = KVBatchMeta(partition_id="p", task_name="t", sample_ids=[])
     a.extra_info["x"] = 1
     assert "x" not in b.extra_info
 
@@ -110,10 +110,10 @@ def test_extra_info_default_is_unique_per_instance():
 def test_tags_align_with_keys():
     """``tags`` must be exactly one dict per key, or ``None``."""
     KVBatchMeta(
-        partition_id="p", task_name="t", keys=["a", "b"], tags=[{"x": 1}, {"x": 2}]
+        partition_id="p", task_name="t", sample_ids=["a", "b"], tags=[{"x": 1}, {"x": 2}]
     )
     with pytest.raises(ValueError, match=r"align 1:1"):
-        KVBatchMeta(partition_id="p", task_name="t", keys=["a", "b"], tags=[{"x": 1}])
+        KVBatchMeta(partition_id="p", task_name="t", sample_ids=["a", "b"], tags=[{"x": 1}])
 
 
 def test_tags_travel_with_subset_slice_concat():
@@ -122,13 +122,13 @@ def test_tags_travel_with_subset_slice_concat():
     m = KVBatchMeta(
         partition_id="p",
         task_name="t",
-        keys=["a", "b", "c", "d"],
+        sample_ids=["a", "b", "c", "d"],
         sequence_lengths=[1, 2, 3, 4],
         tags=[{"std": 0.1}, {"std": 0.0}, {"std": 0.3}, {"std": 0.0}],
     )
 
     survivors = m.subset([0, 2])
-    assert survivors.keys == ["a", "c"]
+    assert survivors.sample_ids == ["a", "c"]
     assert survivors.tags == [{"std": 0.1}, {"std": 0.3}]
     assert survivors.sequence_lengths == [1, 3]
 
@@ -136,7 +136,7 @@ def test_tags_travel_with_subset_slice_concat():
     assert front.tags == [{"std": 0.1}, {"std": 0.0}]
 
     joined = front.concat(m.slice(2, 4))
-    assert joined.keys == m.keys
+    assert joined.sample_ids == m.sample_ids
     assert joined.tags == m.tags
 
 
@@ -144,7 +144,7 @@ def test_tags_none_when_either_side_missing_in_concat():
     """``concat`` drops tags if either side has none — symmetric with
     the ``sequence_lengths`` behavior."""
     with_tags = KVBatchMeta(
-        partition_id="p", task_name="t", keys=["a"], tags=[{"x": 1}]
+        partition_id="p", task_name="t", sample_ids=["a"], tags=[{"x": 1}]
     )
-    without = KVBatchMeta(partition_id="p", task_name="t", keys=["b"])
+    without = KVBatchMeta(partition_id="p", task_name="t", sample_ids=["b"])
     assert with_tags.concat(without).tags is None

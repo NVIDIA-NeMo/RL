@@ -78,12 +78,12 @@ def test_kv_batch_get_after_clear_raises() -> None:
         fb, keys=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
     )
 
-    client.kv_clear(keys=meta.keys, partition_id="train")
+    client.kv_clear(keys=meta.sample_ids, partition_id="train")
 
     with pytest.raises(KeyError):
         # NoOp raises KeyError when the partition entry is gone.
         client.kv_batch_get(
-            keys=meta.keys,
+            keys=meta.sample_ids,
             partition_id="train",
             select_fields=["input_ids"],
         )
@@ -102,7 +102,7 @@ def test_kv_batch_get_unproduced_field_raises() -> None:
     # ``advantages`` has not been written yet (driver delta-write).
     with pytest.raises(KeyError):
         client.kv_batch_get(
-            keys=meta.keys,
+            keys=meta.sample_ids,
             partition_id="train",
             select_fields=["advantages"],
         )
@@ -120,7 +120,7 @@ def test_get_data_without_select_fields_raises() -> None:
     bare_meta = KVBatchMeta(
         partition_id="train",
         task_name="train",
-        keys=["a_g0", "b_g0"],
+        sample_ids=["a_g0", "b_g0"],
         fields=None,  # no fields on meta
     )
     with pytest.raises(ValueError, match=r"select_fields|fields"):
@@ -253,13 +253,13 @@ def test_shard_meta_for_dp_partitions_keys_disjointly() -> None:
 
     shards, _ = shard_meta_for_dp(meta, dp_world=4, batch_size=8)
     assert len(shards) == 4
-    assert sum(len(s.keys) for s in shards) == len(meta.keys)
+    assert sum(len(s.sample_ids) for s in shards) == len(meta.sample_ids)
     seen: set[str] = set()
     for s in shards:
-        for k in s.keys:
+        for k in s.sample_ids:
             assert k not in seen, f"duplicate key {k!r} across DP shards"
             seen.add(k)
-    assert seen == set(meta.keys)
+    assert seen == set(meta.sample_ids)
 
 
 def test_shard_meta_for_dp_keeps_partition_id() -> None:

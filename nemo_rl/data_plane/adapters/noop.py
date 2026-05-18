@@ -130,7 +130,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
         return KVBatchMeta(
             partition_id=partition_id,
             task_name=task_name,
-            keys=ready,
+            sample_ids=ready,
             fields=list(required_fields),
             sequence_lengths=seqs if any(seqs) else None,
         )
@@ -146,7 +146,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
                 "get_data requires either select_fields or meta.fields; "
                 "fetching all fields silently is forbidden."
             )
-        return self.kv_batch_get(meta.keys, meta.partition_id, list(fields))
+        return self.kv_batch_get(meta.sample_ids, meta.partition_id, list(fields))
 
     def check_consumption_status(
         self, partition_id: str, task_names: list[str]
@@ -191,7 +191,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
         return KVBatchMeta(
             partition_id=partition_id,
             task_name=None,
-            keys=list(keys),
+            sample_ids=list(keys),
             fields=list(fields.keys()) if fields is not None else None,
             tags=[dict(t) for t in tags] if tags is not None else None,
         )

@@ -135,7 +135,7 @@ def test_smoke_round_trip(tq_client) -> None:
 
     data = tq_client.get_data(meta)
     # Order may differ from input — match against the meta's keys.
-    expected = torch.tensor([keys.index(k) for k in meta.keys])
+    expected = torch.tensor([keys.index(k) for k in meta.sample_ids])
     assert torch.equal(data["x"], expected)
 
     assert tq_client.check_consumption_status("smoke", ["read"])
@@ -173,7 +173,7 @@ def test_smoke_round_trip_backends(tq_client_backends) -> None:
     assert meta.size == 4
 
     data = client.get_data(meta)
-    expected = torch.tensor([keys.index(k) for k in meta.keys])
+    expected = torch.tensor([keys.index(k) for k in meta.sample_ids])
     assert torch.equal(data["x"], expected)
 
     client.kv_clear(keys=None, partition_id="smoke-backend")
@@ -276,7 +276,7 @@ def test_object_round_trip_backends(tq_client_backends) -> None:
     meta = KVBatchMeta(
         partition_id="obj-backend",
         task_name="read",
-        keys=keys,
+        sample_ids=keys,
         fields=[field_name],
     )
 
@@ -328,7 +328,7 @@ def test_object_and_tensor_mixed_round_trip_backends(tq_client_backends) -> None
     meta = KVBatchMeta(
         partition_id="mix-backend",
         task_name="read",
-        keys=keys,
+        sample_ids=keys,
         fields=["ids", "lens", "msg"],
         sequence_lengths=[4] * n,
     )

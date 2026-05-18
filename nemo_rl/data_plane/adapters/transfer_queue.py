@@ -486,7 +486,7 @@ class TQDataPlaneClient(DataPlaneClient):
                 return KVBatchMeta(
                     partition_id=partition_id,
                     task_name=task_name,
-                    keys=[],
+                    sample_ids=[],
                     fields=list(required_fields),
                 )
             if time.time() >= deadline:
@@ -514,7 +514,7 @@ class TQDataPlaneClient(DataPlaneClient):
         return KVBatchMeta(
             partition_id=partition_id,
             task_name=task_name,
-            keys=keys,
+            sample_ids=keys,
             fields=list(required_fields),
             sequence_lengths=seqlens,
             tags=tags if tags else None,
@@ -531,7 +531,7 @@ class TQDataPlaneClient(DataPlaneClient):
                 "get_data requires either select_fields or meta.fields; "
                 "silently fetching all fields is forbidden."
             )
-        return self.kv_batch_get(meta.keys, meta.partition_id, list(fields))
+        return self.kv_batch_get(meta.sample_ids, meta.partition_id, list(fields))
 
     def check_consumption_status(
         self, partition_id: str, task_names: list[str]
@@ -555,7 +555,7 @@ class TQDataPlaneClient(DataPlaneClient):
     ) -> KVBatchMeta:
         if not keys:
             return KVBatchMeta(
-                partition_id=partition_id, task_name=None, keys=[], fields=None
+                partition_id=partition_id, task_name=None, sample_ids=[], fields=None
             )
         if tags is None:
             tags = [{} for _ in keys]
@@ -587,7 +587,7 @@ class TQDataPlaneClient(DataPlaneClient):
         return KVBatchMeta(
             partition_id=partition_id,
             task_name=None,
-            keys=list(keys),
+            sample_ids=list(keys),
             fields=field_names,
             tags=[dict(t) for t in tags] if tags else None,
         )

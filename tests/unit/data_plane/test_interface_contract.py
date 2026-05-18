@@ -99,7 +99,7 @@ def test_get_data_requires_field_selection(client: DataPlaneClient):
         partition_id="p",
         fields=TensorDict({"x": torch.tensor([1])}, batch_size=[1]),
     )
-    bare = KVBatchMeta(partition_id="p", task_name=None, keys=["a"], fields=None)
+    bare = KVBatchMeta(partition_id="p", task_name=None, sample_ids=["a"], fields=None)
     with pytest.raises(ValueError):
         client.get_data(bare)
 

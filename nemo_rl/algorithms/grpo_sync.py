@@ -146,7 +146,7 @@ def _apply_dynamic_sampling(
             "stamp 'std' into meta.tags before this call."
         )
     keep_idx = [i for i, t in enumerate(meta.tags) if t["std"] != 0.0]
-    drop_keys = [k for k, t in zip(meta.keys, meta.tags) if t["std"] == 0.0]
+    drop_keys = [k for k, t in zip(meta.sample_ids, meta.tags) if t["std"] == 0.0]
     if drop_keys:
         dp_client.kv_clear(keys=drop_keys, partition_id=meta.partition_id)
 
@@ -164,7 +164,7 @@ def _apply_dynamic_sampling(
                 [pending_carry, survivors_carry]
             )
 
-    n = len(pending_meta.keys) if pending_meta is not None else 0
+    n = len(pending_meta.sample_ids) if pending_meta is not None else 0
     if n < train_prompts_size:
         if num_gen_batches > max_gen_batches:
             raise ValueError(
@@ -178,7 +178,7 @@ def _apply_dynamic_sampling(
     assert pending_meta is not None and pending_carry is not None
     if n > train_prompts_size:
         dp_client.kv_clear(
-            keys=list(pending_meta.keys[train_prompts_size:]),
+            keys=list(pending_meta.sample_ids[train_prompts_size:]),
             partition_id=pending_meta.partition_id,
         )
         pending_meta = pending_meta.slice(0, train_prompts_size)
@@ -670,7 +670,7 @@ def grpo_train_sync(
                         )
                         if not is_complete:
                             current_size = (
-                                len(pending_meta.keys)
+                                len(pending_meta.sample_ids)
                                 if pending_meta is not None
                                 else 0
                             )
@@ -725,7 +725,7 @@ def grpo_train_sync(
                     # slice from TQ; logprob result is also written back
                     # to TQ as ``prev_logprobs`` /
                     # ``reference_policy_logprobs`` columns under
-                    # ``meta.keys`` AND returned to the driver via Ray
+                    # ``meta.sample_ids`` AND returned to the driver via Ray
                     # for the next compute.
                     _prev_lp = policy.get_logprobs_from_meta(meta, timer=timer)
                     prev_logprobs = _prev_lp["logprobs"]
@@ -818,7 +818,7 @@ def grpo_train_sync(
                     del baseline_for_log
 
                 # ── Driver delta-write: advantages + (post-masking)
-                # sample_mask under the same meta.keys so workers fetch
+                # sample_mask under the same meta.sample_ids so workers fetch
                 # the union via train_presharded.
                 policy.write_to_dataplane(
                     meta,
@@ -870,7 +870,7 @@ def grpo_train_sync(
 
                 # Stash input_ids and content before kv_clear so the
                 # late log_data jsonl block can use them. The clear below
-                # removes meta.keys from TQ, so any post-clear
+                # removes meta.sample_ids from TQ, so any post-clear
                 # read_columns on this meta would fail. ``content`` is a
                 # decoded object array (list[str]); read_columns decodes
                 # the NonTensorStack wire field via materialize.

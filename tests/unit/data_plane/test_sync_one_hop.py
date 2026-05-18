@@ -21,7 +21,7 @@ Coverage:
     subsequent ``shard_meta_for_dp`` slice references the SAME key set
     (verl pattern, no re-minting).
   * Slice-only dynamic sampling — filter / cache-merge / overflow-slice
-    on per-sample tensors plus ``meta.keys``.
+    on per-sample tensors plus ``meta.sample_ids``.
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ def test_write_columns_lands_in_tq():
     write_columns(client, meta, delta)
 
     fetched = client.kv_batch_get(
-        keys=meta.keys,
+        keys=meta.sample_ids,
         partition_id="train",
         select_fields=["advantages"],
     )
@@ -147,7 +147,7 @@ def test_write_then_read_roundtrip_after_train_window():
 
 def test_meta_keys_identity_across_dp_shards():
     """``shard_meta_for_dp`` must NOT mint new keys — every per-rank
-    slice references a subset of the original ``meta.keys``."""
+    slice references a subset of the original ``meta.sample_ids``."""
     client = NoOpDataPlaneClient()
     _setup(client, n=8)
     fb = _final_batch(8)
@@ -158,9 +158,9 @@ def test_meta_keys_identity_across_dp_shards():
 
     rank_metas, _ = shard_meta_for_dp(meta, dp_world=4, batch_size=8)
     flat = {k for m in rank_metas for k in m.keys}
-    assert flat == set(meta.keys), (
+    assert flat == set(meta.sample_ids), (
         "shard_meta_for_dp introduced or dropped keys — should be a "
-        "pure permutation of the original meta.keys."
+        "pure permutation of the original meta.sample_ids."
     )
     # Every rank slice points at the same partition.
     assert all(m.partition_id == meta.partition_id for m in rank_metas)
@@ -176,9 +176,9 @@ def test_kv_clear_uses_meta_keys_minted_at_rollout():
     meta = kv_first_write(
         fb, keys=_keys_from_uids(uids), dp_client=client, partition_id="train"
     )
-    rollout_keys = list(meta.keys)
+    rollout_keys = list(meta.sample_ids)
 
-    # Workers / driver write deltas — keys still meta.keys.
+    # Workers / driver write deltas — keys still meta.sample_ids.
     write_columns(client, meta, {"advantages": torch.zeros(4)})
     rank_metas, _ = shard_meta_for_dp(meta, dp_world=2, batch_size=4)
     for rm in rank_metas:
@@ -187,13 +187,13 @@ def test_kv_clear_uses_meta_keys_minted_at_rollout():
                 "Rank meta references a key not in the original rollout set"
             )
 
-    client.kv_clear(keys=meta.keys, partition_id="train")
+    client.kv_clear(keys=meta.sample_ids, partition_id="train")
     # Cleared keys should no longer fetch.
     import pytest
 
     with pytest.raises(KeyError):
         client.kv_batch_get(
-            keys=meta.keys,
+            keys=meta.sample_ids,
             partition_id="train",
             select_fields=["input_ids"],
         )
@@ -273,13 +273,13 @@ def test_apply_dynamic_sampling_filters_zero_std():
 
     with pytest.raises(KeyError):
         client.kv_batch_get(
-            keys=[meta.keys[1]],
+            keys=[meta.sample_ids[1]],
             partition_id="train",
             select_fields=["input_ids"],
         )
     # Surviving uids' payload is still alive.
     survivors = client.kv_batch_get(
-        keys=[meta.keys[0], meta.keys[2]],
+        keys=[meta.sample_ids[0], meta.sample_ids[2]],
         partition_id="train",
         select_fields=["input_ids"],
     )
@@ -341,7 +341,7 @@ def test_apply_dynamic_sampling_overflow_slices_and_clears():
 
     with pytest.raises(KeyError):
         client.kv_batch_get(
-            keys=[meta.keys[4]],
+            keys=[meta.sample_ids[4]],
             partition_id="train",
             select_fields=["input_ids"],
         )

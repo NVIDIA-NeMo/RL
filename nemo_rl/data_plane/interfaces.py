@@ -90,15 +90,17 @@ class ObservabilityConfig(TypedDict):
 
 @dataclass
 class KVBatchMeta:
-    """1:1 mirror of ``transfer_queue.metadata.KVBatchMeta``.
+    """Per-batch metadata for data-plane KV operations.
 
-    Attribute names match TransferQueue exactly so the adapter does not need
-    a rename layer and TQ's own ``select_fields`` validation works against
-    our object unmodified.
+    Carries the per-sample IDs (``sample_ids``) that address rows in the
+    KV store plus per-row metadata (``fields``, ``sequence_lengths``,
+    ``tags``) needed for downstream routing without fetching tensor data.
+    Vocabulary is intentionally NeMo-RL-native rather than 1:1 with any
+    specific backend — the adapter translates at the boundary.
 
     Two roles:
       * Result type returned by :meth:`DataPlaneClient.claim_meta` — callers
-        extract ``.keys`` / ``.partition_id`` and pass them to
+        extract ``.sample_ids`` / ``.partition_id`` and pass them to
         :meth:`kv_batch_get` / :meth:`get_data`.
       * Argument type for the per-DP-rank fetch entrypoints.
         ``sequence_lengths`` lets the driver compute a balanced per-rank
@@ -108,11 +110,11 @@ class KVBatchMeta:
 
     partition_id: str
     task_name: str | None
-    keys: list[str]
+    sample_ids: list[str]
     fields: list[str] | None = None
     sequence_lengths: list[int] | None = None
     extra_info: dict[str, Any] = field(default_factory=dict)
-    # Per-key primitive sidecar. Aligned 1:1 with ``keys`` when
+    # Per-sample primitive sidecar. Aligned 1:1 with ``sample_ids`` when
     # populated. Producers stamp filter scalars (std, total_reward,
     # weight_version, …) here at ``kv_batch_put`` time so consumers
     # can filter without fetching tensor data. Mirrors verl's pattern
@@ -120,15 +122,15 @@ class KVBatchMeta:
     tags: list[dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
-        if self.tags is not None and len(self.tags) != len(self.keys):
+        if self.tags is not None and len(self.tags) != len(self.sample_ids):
             raise ValueError(
                 f"KVBatchMeta: tags ({len(self.tags)}) must align 1:1 with "
-                f"keys ({len(self.keys)})"
+                f"sample_ids ({len(self.sample_ids)})"
             )
 
     @property
     def size(self) -> int:
-        return len(self.keys)
+        return len(self.sample_ids)
 
     def stamp_tags(self, scalars: dict[str, "Sequence[Any]"]) -> None:
         """Mirror per-row scalar columns onto :attr:`tags`.
@@ -158,15 +160,15 @@ class KVBatchMeta:
     def _replace(
         self,
         *,
-        keys: list[str],
+        sample_ids: list[str],
         sequence_lengths: list[int] | None,
         tags: list[dict[str, Any]] | None = None,
     ) -> "KVBatchMeta":
-        """Return a copy with new keys/sequence_lengths/tags, same metadata otherwise."""
+        """Return a copy with new sample_ids/sequence_lengths/tags, same metadata otherwise."""
         return KVBatchMeta(
             partition_id=self.partition_id,
             task_name=self.task_name,
-            keys=list(keys),
+            sample_ids=list(sample_ids),
             fields=self.fields,
             sequence_lengths=list(sequence_lengths)
             if sequence_lengths is not None
@@ -178,7 +180,7 @@ class KVBatchMeta:
     def subset(self, indices: "Sequence[int]") -> "KVBatchMeta":
         """Return a new meta with only the rows at ``indices`` (any order)."""
         return self._replace(
-            keys=[self.keys[i] for i in indices],
+            sample_ids=[self.sample_ids[i] for i in indices],
             sequence_lengths=(
                 [self.sequence_lengths[i] for i in indices]
                 if self.sequence_lengths is not None
@@ -190,7 +192,7 @@ class KVBatchMeta:
     def slice(self, start: int, stop: int) -> "KVBatchMeta":
         """Return a new meta with rows in the contiguous range ``[start, stop)``."""
         return self._replace(
-            keys=self.keys[start:stop],
+            sample_ids=self.sample_ids[start:stop],
             sequence_lengths=(
                 self.sequence_lengths[start:stop]
                 if self.sequence_lengths is not None
@@ -204,7 +206,7 @@ class KVBatchMeta:
         if any(o.partition_id != self.partition_id for o in others):
             raise ValueError("KVBatchMeta.concat: partition_ids must match")
         all_m = (self, *others)
-        keys = [k for m in all_m for k in m.keys]
+        sample_ids = [k for m in all_m for k in m.sample_ids]
         all_have_lens = all(m.sequence_lengths is not None for m in all_m)
         seq_lens = (
             [s for m in all_m for s in (m.sequence_lengths or [])]
@@ -213,7 +215,7 @@ class KVBatchMeta:
         )
         all_have_tags = all(m.tags is not None for m in all_m)
         tags = [t for m in all_m for t in (m.tags or [])] if all_have_tags else None
-        return self._replace(keys=keys, sequence_lengths=seq_lens, tags=tags)
+        return self._replace(sample_ids=sample_ids, sequence_lengths=seq_lens, tags=tags)
 
 
 class DataPlaneClient(ABC):
@@ -309,7 +311,7 @@ class DataPlaneClient(ABC):
             select_fields: Subset of fields to fetch.
 
         Returns:
-            ``TensorDict`` keyed by field name, batched along ``meta.keys``.
+            ``TensorDict`` keyed by field name, batched along ``meta.sample_ids``.
         """
 
     @abstractmethod

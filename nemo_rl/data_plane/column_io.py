@@ -49,7 +49,7 @@ def read_columns(
     layout: Layout = "padded",
     pad_value_dict: dict[str, Any] | None = None,
 ) -> BatchedDataDict[Any]:
-    """``kv_batch_get(meta.keys, select_fields=...) → materialize``.
+    """``kv_batch_get(meta.sample_ids, select_fields=...) → materialize``.
 
     ``pad_to_multiple`` is read from ``meta.extra_info`` so the
     materialized seq dim matches the alignment downstream backends
@@ -69,7 +69,7 @@ def read_columns(
         ``BatchedDataDict`` with the requested fields, materialized.
     """
     td = dp_client.kv_batch_get(
-        keys=meta.keys,
+        keys=meta.sample_ids,
         partition_id=meta.partition_id,
         select_fields=list(select_fields),
     )
@@ -89,7 +89,7 @@ def write_columns(
     meta: KVBatchMeta,
     fields: "dict[str, torch.Tensor | np.ndarray]",
 ) -> None:
-    """``kv_batch_put(meta.keys, fields=...)``.
+    """``kv_batch_put(meta.sample_ids, fields=...)``.
 
     Per-token tensor fields are converted to jagged via
     :func:`pack_jagged_fields` so they land in TQ with the same row
@@ -108,7 +108,7 @@ def write_columns(
     lengths = torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
     td = pack_jagged_fields(fields, lengths=lengths)
     dp_client.kv_batch_put(
-        keys=meta.keys,
+        keys=meta.sample_ids,
         partition_id=meta.partition_id,
         fields=td,
     )
