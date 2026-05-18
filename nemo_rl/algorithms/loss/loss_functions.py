@@ -862,7 +862,9 @@ class DPOLossFn(PreferenceLossFn):
     loss_type = LossType.SEQUENCE_LEVEL
     input_type = LossInputType.LOGPROB
 
-    def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False):
+    def __init__(self, cfg: DPOLossConfig | dict, use_linear_ce_fusion: bool = False):
+        if isinstance(cfg, dict):
+            cfg = DPOLossConfig(**cfg)
         self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
         self.preference_loss_weight = cfg.preference_loss_weight
         self.sft_loss_weight = cfg.sft_loss_weight
@@ -967,7 +969,9 @@ class DistillationLossFn(LossFunction):
     loss_type = LossType.TOKEN_LEVEL
     input_type = LossInputType.DISTILLATION
 
-    def __init__(self, cfg: DistillationLossConfig):
+    def __init__(self, cfg: DistillationLossConfig | dict):
+        if isinstance(cfg, dict):
+            cfg = DistillationLossConfig(**cfg)
         self.kl_type = cfg.kl_type
         self.mixed_kl_weight = cfg.mixed_kl_weight
         self.zero_outside_topk = cfg.zero_outside_topk
