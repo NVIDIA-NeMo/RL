@@ -25,8 +25,9 @@ from nemo_rl.distributed.model_utils import DistributedCrossEntropy
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
-class DraftCrossEntropyLossConfig(TypedDict):
-    vocab_parallel_group: Optional[torch.distributed.ProcessGroup]
+class DraftCrossEntropyLossConfig(BaseModel, extra="allow"):
+    model_config = {"arbitrary_types_allowed": True}
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None
 
 
 class DraftCrossEntropyLossDataDict(TypedDict):
@@ -785,7 +786,7 @@ class PreferenceLossFn(LossFunction):
         }
 
 
-class DPOLossConfig(TypedDict):
+class DPOLossConfig(BaseModel, extra="allow"):
     reference_policy_kl_penalty: float
     preference_loss_weight: float
     sft_loss_weight: float
@@ -862,11 +863,11 @@ class DPOLossFn(PreferenceLossFn):
     input_type = LossInputType.LOGPROB
 
     def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False):
-        self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
-        self.preference_loss_weight = cfg["preference_loss_weight"]
-        self.sft_loss_weight = cfg["sft_loss_weight"]
-        self.preference_average_log_probs = cfg["preference_average_log_probs"]
-        self.sft_average_log_probs = cfg["sft_average_log_probs"]
+        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
+        self.preference_loss_weight = cfg.preference_loss_weight
+        self.sft_loss_weight = cfg.sft_loss_weight
+        self.preference_average_log_probs = cfg.preference_average_log_probs
+        self.sft_average_log_probs = cfg.sft_average_log_probs
         self.use_linear_ce_fusion = use_linear_ce_fusion
         self.sft_loss = NLLLossFn(use_linear_ce_fusion=use_linear_ce_fusion)
 
@@ -945,7 +946,7 @@ class DPOLossFn(PreferenceLossFn):
         }
 
 
-class DistillationLossConfig(TypedDict):
+class DistillationLossConfig(BaseModel, extra="allow"):
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
@@ -967,9 +968,9 @@ class DistillationLossFn(LossFunction):
     input_type = LossInputType.DISTILLATION
 
     def __init__(self, cfg: DistillationLossConfig):
-        self.kl_type = cfg["kl_type"]
-        self.mixed_kl_weight = cfg["mixed_kl_weight"]
-        self.zero_outside_topk = cfg["zero_outside_topk"]
+        self.kl_type = cfg.kl_type
+        self.mixed_kl_weight = cfg.mixed_kl_weight
+        self.zero_outside_topk = cfg.zero_outside_topk
         self.log_infinitesimal = -100
 
         assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
