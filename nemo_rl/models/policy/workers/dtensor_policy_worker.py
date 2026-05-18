@@ -1901,14 +1901,18 @@ class DTensorPolicyWorkerImpl(
                 device_id=self.local_device_index
                 if hasattr(self, "local_device_index")
                 else self.rank,
-                fsdp_world_size=self.world_size,
+                fsdp_world_size=self.dp_size,
                 tp_world_size=tp_size,
                 pp_world_size=pp_size,
                 ep_world_size=ep_size,
                 mx_config=mx_config,
             )
             self._mx_publisher.initialize(
-                model_name=getattr(self, "model_name", "unknown"),
+                # self.model_name isn't an attribute on DTensorPolicyWorker;
+                # the config is the source of truth. Receiver-side polling
+                # matches on this exact string, so it has to be the HF id
+                # (or whatever string the DGD worker queries with).
+                model_name=self.cfg["model_name"],
                 dtype=str(self.dtype).removeprefix("torch."),
             )
             # Detect MoE layout once (state_dict shape is invariant across steps).

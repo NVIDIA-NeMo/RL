@@ -43,6 +43,14 @@ class DynamoCfg(TypedDict, total=False):
     tool_call_parser: NotRequired[str]
     reasoning_parser: NotRequired[str]
 
+    # ModelExpress v2 weight-refit endpoint resolution. The dynamo runtime
+    # addresses the workers as ``<dynamo_namespace>.<worker_component>.<endpoint>``
+    # over NATS/etcd. Defaults mirror dynamo.vllm's `--endpoint` defaults
+    # (namespace=DYN_NAMESPACE or "dynamo", component="backend"). Override
+    # per-recipe when the DGD passes a non-default ``--endpoint``.
+    dynamo_namespace: NotRequired[str]
+    worker_component: NotRequired[str]
+
 
 class DynamoConfig(GenerationConfig):
     """GenerationConfig for the Dynamo k8s backend.

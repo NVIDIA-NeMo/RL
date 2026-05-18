@@ -162,16 +162,50 @@ class DynamoGeneration(GenerationInterface):
         )
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        raise NotImplementedError(
-            "DynamoGeneration does not support weight refit in this phase."
-        )
+        """No-op on the trainer side.
+
+        With the receiver-side polling architecture, every DGD worker watches
+        the MX server for new versions and refits itself — there's no
+        trainer→worker RPC to forward state_dict_info on. If FP8 / assertion
+        checks ever need this info, the worker can read it from the MX
+        publisher's tensor descriptors at receive time.
+        """
+        return
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         raise NotImplementedError(
-            "DynamoGeneration does not support weight refit in this phase."
+            "DynamoGeneration does not support IPC ZMQ weight sync — use "
+            "weight_sync.method='mx' for non-colocated refit."
         )
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         raise NotImplementedError(
-            "DynamoGeneration does not support weight refit in this phase."
+            "DynamoGeneration does not support NCCL collective weight sync — "
+            "use weight_sync.method='mx' for non-colocated refit."
         )
+
+    # ------------------------------------------------------------------
+    # ModelExpress v2 mid-training refit (cluster.weight_sync.method='mx')
+    # ------------------------------------------------------------------
+
+    def update_weights_via_mx(
+        self,
+        *,
+        version: int,
+        mx_config: Any,
+    ) -> list[ray.ObjectRef]:
+        """No-op on the trainer side; the DGD workers poll MX for new versions.
+
+        The refit_policy_generation mx branch in nemo_rl/algorithms/grpo.py
+        publishes via ``policy.stream_weights_via_mx`` and then calls this
+        method on the generation interface. With the receiver-side polling
+        architecture, the DGD's ``MxRefitWorkerExtension`` runs a background
+        loop that watches the MX server for new versions matching its
+        model_name and triggers a refit automatically when one appears —
+        so no trainer→worker RPC is needed.
+
+        Returns an empty list of ObjectRefs to satisfy the abstract method
+        signature; ``ray.get([])`` is a no-op.
+        """
+        del version, mx_config  # unused — receiver polls
+        return []
