@@ -24,6 +24,7 @@ nemo_rl.models.megatron.setup, focusing on:
 - Model path validation
 """
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -618,6 +619,163 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_enable_deepep is False
         assert model_cfg.moe_token_dispatcher_type == "alltoall"
         assert model_cfg.moe_shared_expert_overlap is True
+
+    @staticmethod
+    def _base_moe_cfg(**overrides):
+        cfg = {
+            "expert_tensor_parallel_size": 1,
+            "expert_model_parallel_size": 8,
+            "moe_router_dtype": "float32",
+            "moe_router_load_balancing_type": "none",
+            "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": True,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "flex",
+            "moe_shared_expert_overlap": True,
+        }
+        cfg.update(overrides)
+        return {"megatron_cfg": cfg}
+
+    def test_hybridep_env_vars_auto_set_with_warning(self, monkeypatch):
+        """HybridEP backend with no env config: auto-set env vars and emit warnings."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        model_cfg = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_num_sms=32,
+        )
+
+        with pytest.warns(UserWarning) as warn_records:
+            _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_flex_dispatcher_backend == "hybridep"
+        assert model_cfg.moe_hybridep_num_sms == 32
+        # min(ep_size=8, 64) == 8
+        assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "8"
+        # int(ep_size=8 > 4) == 1
+        assert os.environ["USE_MNNVL"] == "1"
+        warn_messages = [str(w.message) for w in warn_records]
+        assert any(
+            "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN not configured" in m
+            for m in warn_messages
+        )
+        assert any("USE_MNNVL not configured" in m for m in warn_messages)
+
+    def test_hybridep_env_vars_from_explicit_config(self, monkeypatch):
+        """Explicit hybridep_* config keys override defaults without warnings."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        model_cfg = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=128,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_num_sms=24,
+            hybridep_num_ranks_per_nvlink_domain=72,
+            hybridep_use_mnnvl=True,
+        )
+
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            _apply_moe_config(model_cfg, config)
+
+        assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "72"
+        assert os.environ["USE_MNNVL"] == "1"
+        # Bool False path also tested in dedicated test below; here ensure no auto warning fired.
+        hybridep_warns = [w for w in caught if "HybridEP" in str(w.message)]
+        assert hybridep_warns == []
+
+    def test_hybridep_use_mnnvl_explicit_false(self, monkeypatch):
+        """hybridep_use_mnnvl=False → USE_MNNVL='0'."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        model_cfg = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=4,
+            moe_flex_dispatcher_backend="hybridep",
+            hybridep_num_ranks_per_nvlink_domain=4,
+            hybridep_use_mnnvl=False,
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert os.environ["USE_MNNVL"] == "0"
+
+    def test_hybridep_preserves_preexisting_env(self, monkeypatch):
+        """Pre-existing env vars must not be overwritten when config is absent."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "16")
+        monkeypatch.setenv("USE_MNNVL", "1")
+
+        model_cfg = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=64,
+            moe_flex_dispatcher_backend="hybridep",
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "16"
+        assert os.environ["USE_MNNVL"] == "1"
+
+    def test_hybridep_skipped_when_backend_not_hybridep(self, monkeypatch):
+        """Non-hybridep backend leaves env vars untouched and skips num_sms gate."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        model_cfg = MagicMock()
+        # backend present but not "hybridep"
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="alltoall",
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_flex_dispatcher_backend == "alltoall"
+        assert "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" not in os.environ
+        assert "USE_MNNVL" not in os.environ
+
+    def test_hybridep_keys_absent_no_setattr(self, monkeypatch):
+        """When neither moe_flex_dispatcher_backend nor moe_hybridep_num_sms is in cfg,
+        the corresponding model_cfg attributes must not be set."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        # Use a SimpleNamespace-like object (not MagicMock) so we can detect
+        # missing attribute access cleanly.
+        class _Cfg:
+            expert_model_parallel_size = 4
+
+        model_cfg = _Cfg()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=4,
+            moe_token_dispatcher_type="alltoall",
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert not hasattr(model_cfg, "moe_flex_dispatcher_backend")
+        assert not hasattr(model_cfg, "moe_hybridep_num_sms")
+        assert "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" not in os.environ
+        assert "USE_MNNVL" not in os.environ
 
 
 @pytest.mark.mcore
