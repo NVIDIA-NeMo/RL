@@ -484,7 +484,9 @@ class BaseVllmGenerationWorker:
                 vllm_kwargs["data_parallel_rank"] = int(os.environ["VLLM_DP_RANK"])
                 vllm_kwargs["data_parallel_external_lb"] = True
                 vllm_kwargs["data_parallel_address"] = os.environ["VLLM_DP_MASTER_IP"]
-                vllm_kwargs["data_parallel_rpc_port"] = int(os.environ["VLLM_DP_MASTER_PORT"])
+                vllm_kwargs["data_parallel_rpc_port"] = int(
+                    os.environ["VLLM_DP_MASTER_PORT"]
+                )
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
