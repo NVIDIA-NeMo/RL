@@ -32,6 +32,7 @@ from importlib import resources
 from typing import Any
 
 import torch
+import transfer_queue as tq
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.interfaces import (
@@ -39,24 +40,6 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneConfig,
     KVBatchMeta,
 )
-
-# ──────────────────────────────────────────────────────────────────────────
-# Lazy import of transfer_queue — keeps NeMo-RL importable without TQ
-# installed; failure is deferred to construction time.
-# ──────────────────────────────────────────────────────────────────────────
-
-
-def _tq():  # pragma: no cover - trivially exercised by smoke tests
-    try:
-        import transfer_queue as tq
-    except ImportError as e:  # noqa: F841
-        raise ImportError(
-            "transfer_queue is not installed. It is a base dependency of "
-            "nemo-rl — try `uv sync` to refresh. The exact pin lives in "
-            "pyproject.toml under the ``TransferQueue`` dependency."
-        ) from e
-    return tq
-
 
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init — lifted from rl-arena/arena/backends.py.
@@ -121,7 +104,7 @@ def _connect_existing() -> None:
     Connects to the already-running named controller actor. Mirrors
     rl-arena/arena/dataplane_client.py's `tq.init()` (no args) call.
     """
-    _tq().init()
+    tq.init()
 
 
 _TQ_RUNTIME_ENV_PATCHED = False
@@ -223,7 +206,6 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
     """Driver-process path: bootstrap the TQ controller for the chosen backend."""
     from omegaconf import OmegaConf
 
-    tq = _tq()
     base = OmegaConf.load(str(resources.files("transfer_queue") / "config.yaml"))
 
     backend = cfg["backend"]
@@ -447,10 +429,6 @@ class TQDataPlaneClient(DataPlaneClient):
             _init_tq(cfg)
         else:
             _connect_existing()
-        # `self._tq` is the transfer_queue module: KV ops (`kv_batch_*`,
-        # `kv_clear`) are module-level helpers; metadata ops (`claim_meta`,
-        # `check_consumption_status`) go through `self._tq.get_client()`.
-        self._tq = _tq()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._partitions: dict[str, _PartitionRecord] = {}
         self._closed = False
@@ -487,7 +465,7 @@ class TQDataPlaneClient(DataPlaneClient):
         blocking: bool = True,
         timeout_s: float = 60.0,
     ) -> KVBatchMeta:
-        client = self._tq.get_client()
+        client = tq.get_client()
         deadline = time.time() + max(0.0, timeout_s)
         sampling_config: dict[str, Any] = {}
         if dp_rank is not None:
@@ -558,15 +536,11 @@ class TQDataPlaneClient(DataPlaneClient):
     def check_consumption_status(
         self, partition_id: str, task_names: list[str]
     ) -> bool:
-        client = self._tq.get_client()
+        client = tq.get_client()
         for t in task_names:
-            try:
-                ok = client.check_consumption_status(
-                    task_name=t, partition_id=partition_id
-                )
-            except Exception:
-                return False
-            if not ok:
+            if not client.check_consumption_status(
+                task_name=t, partition_id=partition_id
+            ):
                 return False
         return True
 
@@ -599,7 +573,7 @@ class TQDataPlaneClient(DataPlaneClient):
                 wire_fields = _promote_1d_leaves(wire_fields)  # type: ignore[bad-argument-type]
             field_names = list(wire_fields.keys())
 
-        self._tq.kv_batch_put(
+        tq.kv_batch_put(
             keys=list(keys),
             partition_id=partition_id,
             fields=wire_fields,
@@ -626,7 +600,7 @@ class TQDataPlaneClient(DataPlaneClient):
     ) -> TensorDict:
         if not keys:
             return TensorDict({}, batch_size=(0,))
-        td = self._tq.kv_batch_get(
+        td = tq.kv_batch_get(
             keys=list(keys),
             partition_id=partition_id,
             select_fields=select_fields,
@@ -641,14 +615,14 @@ class TQDataPlaneClient(DataPlaneClient):
             keys = list(rec.seen_keys) if rec is not None else []
             if not keys:
                 try:
-                    listing = self._tq.kv_list(partition_id=partition_id)
+                    listing = tq.kv_list(partition_id=partition_id)
                     keys = list(listing.get(partition_id, {}).keys())
                 except Exception:
                     keys = []
         else:
             self._partitions.pop(partition_id, None)
         if keys:
-            self._tq.kv_clear(keys=list(keys), partition_id=partition_id)
+            tq.kv_clear(keys=list(keys), partition_id=partition_id)
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
 
@@ -657,6 +631,6 @@ class TQDataPlaneClient(DataPlaneClient):
             return
         self._closed = True
         try:
-            self._tq.close()
+            tq.close()
         except Exception:
             pass

@@ -22,13 +22,15 @@ Covers:
 These tests run in < 1 s with no Ray, no GPU, no real TQ controller.
 
 Design note:
-  transfer_queue is lazily imported inside TQDataPlaneClient.__init__, so
-  importing nemo_rl.algorithms.grpo_sync itself does NOT require TQ to be
-  installed. The import contract here is that grpo.py has zero references to
-  the data plane, and grpo_sync.py wires the data plane through a runtime
-  guard (not at import time). This differs from the test plan §4.7 v2 draft
-  which assumed a stricter import-time error; see adaptation note in the
-  final report.
+  The TQ adapter module (nemo_rl.data_plane.adapters.transfer_queue) imports
+  transfer_queue at module level, but the adapter module itself is imported
+  lazily inside factory.build_data_plane_client (called at runtime, not at
+  grpo_sync import time). So importing nemo_rl.algorithms.grpo_sync does NOT
+  require TQ to be installed. The import contract here is that grpo.py has
+  zero references to the data plane, and grpo_sync.py wires the data plane
+  through a runtime guard (not at import time). This differs from the test
+  plan §4.7 v2 draft which assumed a stricter import-time error; see
+  adaptation note in the final report.
 """
 
 from __future__ import annotations
@@ -87,8 +89,10 @@ def test_grpo_sync_import_without_tq_succeeds(monkeypatch) -> None:
     """nemo_rl.algorithms.grpo_sync can be imported even when transfer_queue
     is unavailable.
 
-    The TQ import is lazy — it happens inside TQDataPlaneClient.__init__, not
-    at module level. This test verifies the import boundary is correct.
+    The TQ adapter module imports transfer_queue at module level, but the
+    adapter itself is loaded lazily inside factory.build_data_plane_client.
+    grpo_sync does not call that factory at import time, so importing
+    grpo_sync does not trigger any transfer_queue import.
 
     Calling grpo_train_sync without data_plane.enabled=True raises ValueError
     (tested separately in test_grpo_sync_requires_data_plane_enabled).
