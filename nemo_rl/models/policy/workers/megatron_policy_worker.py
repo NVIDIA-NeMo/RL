@@ -43,10 +43,6 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.config import InferenceConfig, KVCacheManagementMode, PrefixCachingCoordinatorPolicy
 from megatron.core.optimizer import ChainedOptimizer
-from megatron.core.parallel_state import (
-    get_pipeline_model_parallel_group,
-    is_pipeline_last_stage,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
@@ -525,11 +521,6 @@ class MegatronPolicyWorkerImpl(
                 num_zeros_in_grad: float = reduce_max_stat_across_model_parallel_group(
                     num_zeros_in_grad, mp_group=pg_collection.mp
                 )
-                if update_successful:
-                    skipped_iter = 0
-                else:
-                    skipped_iter = 1
-
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
                     torch.cuda.empty_cache()
@@ -632,8 +623,6 @@ class MegatronPolicyWorkerImpl(
 
         self.model.eval()
 
-        pp_grp = get_pipeline_model_parallel_group()
-
         (
             mb_iterator,
             num_microbatches,
@@ -670,7 +659,7 @@ class MegatronPolicyWorkerImpl(
             use_linear_ce_fusion_loss=use_linear_ce_fusion,
         )
 
-        if is_pipeline_last_stage(ignore_virtual=True):
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             all_log_probs_padded = []
             all_logprobs = [l["logprobs"] for l in list_of_logprobs]
             for lp in all_logprobs:
@@ -753,71 +742,65 @@ class MegatronPolicyWorkerImpl(
                   is different from the current policy, making filtered logprobs incompatible.
         On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
-        self.timer.start("use_reference_model")
         ## disable overlap param gather when swapping weights
         if self.should_disable_forward_pre_hook:
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
-            try:
-                # Save original references
-                model_state_dict = {}
-                for name, item in self.model.state_dict().items():
-                    if isinstance(item, torch.Tensor):
-                        item = item.detach().to(
-                            device="cpu", non_blocking=True, copy=True
-                        )
-                    model_state_dict[name] = item
+            # Save original references
+            model_state_dict = {}
+            for name, item in self.model.state_dict().items():
+                if isinstance(item, torch.Tensor):
+                    item = item.detach().to(device="cpu", non_blocking=True, copy=True)
+                model_state_dict[name] = item
 
-                # Swap reference state into self.model. Use _apply_state_dict_to_model
-                # (rather than load_state_dict) so FP8 _extra_state with mismatched
-                # shape is routed through set_extra_state() correctly.
-                self._apply_state_dict_to_model(
-                    self.reference_state_dict,
-                    raise_if_key_missing=True,
+            # Swap reference state into self.model. Use _apply_state_dict_to_model
+            # (rather than load_state_dict) so FP8 _extra_state with mismatched
+            # shape is routed through set_extra_state() correctly.
+            self._apply_state_dict_to_model(
+                self.reference_state_dict,
+                raise_if_key_missing=True,
+            )
+
+            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # Temporarily disable top-k/top-p filtering for reference policy logprobs.
+            # The reference policy has different weights, so its top-k/top-p set is
+            # inherently different from the current policy. Using filtered logprobs
+            # would cause -inf mismatches that cannot be resolved by masking.
+            # Note: We keep temperature scaling since it was applied to prev_logprobs.
+            saved_sampling_params = self.sampling_params
+            if saved_sampling_params is not None:
+                self.sampling_params = TrainingSamplingParams(
+                    top_k=None,
+                    top_p=1.0,
+                    temperature=saved_sampling_params.temperature,
                 )
+            else:
+                self.sampling_params = None
 
-                if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
-                    gc.collect()
-                    torch.cuda.empty_cache()
+            # - self.model is the original reference_model, now on CUDA
+            # - self.reference_model is the original model, now on CPU
+            yield
 
-                # Temporarily disable top-k/top-p filtering for reference policy logprobs.
-                # The reference policy has different weights, so its top-k/top-p set is
-                # inherently different from the current policy. Using filtered logprobs
-                # would cause -inf mismatches that cannot be resolved by masking.
-                # Note: We keep temperature scaling since it was applied to prev_logprobs.
-                saved_sampling_params = self.sampling_params
-                if saved_sampling_params is not None:
-                    self.sampling_params = TrainingSamplingParams(
-                        top_k=None,
-                        top_p=1.0,
-                        temperature=saved_sampling_params.temperature,
-                    )
-                else:
-                    self.sampling_params = None
+            # Restore sampling_params
+            self.sampling_params = saved_sampling_params
 
-                # - self.model is the original reference_model, now on CUDA
-                # - self.reference_model is the original model, now on CPU
-                yield
+            # Restore original policy state (weights + FP8 extra_state) from saved model_state_dict
+            self._apply_state_dict_to_model(
+                model_state_dict,
+                raise_if_key_missing=True,
+            )
 
-                # Restore sampling_params
-                self.sampling_params = saved_sampling_params
+            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                gc.collect()
+                torch.cuda.empty_cache()
 
-            finally:
-                # Restore original policy state (weights + FP8 extra_state) from saved model_state_dict
-                self._apply_state_dict_to_model(
-                    model_state_dict,
-                    raise_if_key_missing=True,
-                )
-
-                if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
-                ## re-enable overlap param gather after weight swap
-                if self.should_disable_forward_pre_hook:
-                    self.enable_forward_pre_hook()
-                self.timer.stop("use_reference_model")
+            ## re-enable overlap param gather after weight swap
+            if self.should_disable_forward_pre_hook:
+                self.enable_forward_pre_hook()
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
     def get_topk_logits(
@@ -848,8 +831,6 @@ class MegatronPolicyWorkerImpl(
 
         self.model.eval()
 
-        pp_grp = get_pipeline_model_parallel_group()
-
         (
             mb_iterator,
             num_microbatches,
@@ -875,7 +856,7 @@ class MegatronPolicyWorkerImpl(
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
-        if is_pipeline_last_stage(ignore_virtual=True):
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             logits_chunks = []
             indices_chunks = []
             for out in list_of_outputs:
