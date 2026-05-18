@@ -43,5 +43,5 @@ def test_vllm_sleep_level_accepts_supported_levels(sleep_level):
 def test_vllm_sleep_level_rejects_unsupported_levels(sleep_level):
     worker = _worker_with_vllm_cfg({"sleep_level": sleep_level})
 
-    with pytest.raises(ValueError, match="vllm_cfg.sleep_level must be 0, 1, or 2"):
+    with pytest.raises(ValueError, match=r"vllm_cfg\.sleep_level must be 0, 1, or 2"):
         worker._sleep_level()
