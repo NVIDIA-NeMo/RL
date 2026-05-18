@@ -62,7 +62,7 @@ def test_kvbatchmeta_schema_unchanged() -> None:
     expected_fields = {
         "partition_id",
         "task_name",
-        "keys",
+        "sample_ids",
         "fields",
         "sequence_lengths",
         "extra_info",
