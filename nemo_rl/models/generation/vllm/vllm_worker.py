@@ -39,12 +39,27 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
+    cfg: VllmConfig
+
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
         This makes it easier to identify which worker is producing specific log messages.
         """
         return f"{self.__class__.__name__}"
+
+    def _sleep_level(self) -> int:
+        sleep_level = self.cfg["vllm_cfg"].get("sleep_level", 1)
+        if (
+            not isinstance(sleep_level, int)
+            # bool is a subclass of int, but YAML booleans should not be valid sleep levels.
+            or isinstance(sleep_level, bool)
+            or sleep_level not in (1, 2)
+        ):
+            raise ValueError(
+                f"vllm_cfg.sleep_level must be 1 or 2, got {sleep_level!r}"
+            )
+        return sleep_level
 
     @staticmethod
     def configure_worker(
@@ -1003,13 +1018,13 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         # stays in sync with the receiver cache that vLLM clears internally
         # during sleep.  Without this, the sender thinks images are already
         # cached on the receiver and sends data=None, causing an assertion
-        # error.  We only clear the renderer (sender) cache here — the
+        # error.  We only clear the renderer (sender) cache here; the
         # receiver and worker-level caches are reset by sleep() internally.
         if hasattr(self.llm, "renderer") and hasattr(
             self.llm.renderer, "clear_mm_cache"
         ):
             self.llm.renderer.clear_mm_cache()
-        self.llm.sleep(level=1)
+        self.llm.sleep(level=self._sleep_level())
 
         gc.collect()
         torch.cuda.empty_cache()
