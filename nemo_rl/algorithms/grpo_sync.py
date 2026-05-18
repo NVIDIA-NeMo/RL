@@ -446,8 +446,8 @@ def grpo_train_sync(
     val_period = master_config.grpo["val_period"]
     val_start_at = master_config.grpo["val_start_at"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
-    stop_at_validation_threshold = master_config.grpo["stop_at_validation_threshold"]
-    stop_at_validation_metric = master_config.grpo["stop_at_validation_metric"]
+    stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
+    stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
 
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
     # Sync trainer requires a TQ-mediated policy. The TQPolicy actor
