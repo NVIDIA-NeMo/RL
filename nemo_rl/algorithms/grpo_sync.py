@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import gc
 import os
-import uuid
 import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -236,12 +235,10 @@ def validate_sync(
             if batch_idx >= max_batches:
                 break
             n_prompts = int(val_batch.size)
-            uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
             policy.prepare_val_partition(n_prompts, partition_id=partition_id)
             meta, driver_carry, rollout_metrics, _ = ray.get(
                 rollout_actor.rollout_to_tq.remote(
                     val_batch,
-                    uids=uids,
                     partition_id=partition_id,
                     first_iter=False,
                     finish_generation=False,
@@ -569,9 +566,6 @@ def grpo_train_sync(
                 # only meta + small slice. Bulk never visits the driver.
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
-                    n_prompts = int(repeated_batch.size)
-                    uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
-
                     # Single Ray RPC: rollout + flatten + mask + prompt
                     # extraction + baseline/std + kv_batch_put + finish
                     # generation + logger metrics — all bundled into one
@@ -589,8 +583,10 @@ def grpo_train_sync(
                     ) = ray.get(
                         rollout_actor.rollout_to_tq.remote(
                             repeated_batch,
-                            uids=uids,
                             partition_id=policy.tq_partition_id,
+                            group_size=master_config["grpo"][
+                                "num_generations_per_prompt"
+                            ],
                             first_iter=(dynamic_sampling_num_gen_batches == 1),
                         )
                     )

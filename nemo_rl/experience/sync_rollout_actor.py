@@ -36,6 +36,7 @@ step batch in one call.
 
 from __future__ import annotations
 
+import uuid
 from typing import Any, Optional
 
 import numpy as np
@@ -96,8 +97,8 @@ class SyncRolloutActor:
         self,
         input_batch: BatchedDataDict[Any],
         *,
-        uids: list[str],
         partition_id: str,
+        group_size: int = 1,
         first_iter: bool = True,
         finish_generation: bool = True,
         task_to_env_override: Optional[dict[str, EnvironmentInterface]] = None,
@@ -136,8 +137,12 @@ class SyncRolloutActor:
 
         Args:
             input_batch: Per-step prompt batch (already repeat-interleaved).
-            uids: One uid per prompt; bulk keys are ``f"{uid}_g{i}"``.
             partition_id: TQ partition target.
+            group_size: Rollouts per original prompt. One uid is minted
+                per prompt; bulk keys are ``f"{uid}_g{i}"`` where ``i``
+                ranges over the per-prompt expansion (group × rollout
+                turns). Train passes ``num_generations_per_prompt``; val
+                passes ``1``.
             first_iter: True on the first DS iteration of a step; drives
                 ``policy_generation.snapshot_step_metrics()`` so per-step
                 metrics align with the legacy ``grpo.grpo_train`` path.
@@ -327,12 +332,19 @@ class SyncRolloutActor:
             driver_carry = {k: driver_carry[k] for k in carry_keys}
 
         n_samples = int(bulk_batch["sample_mask"].shape[0])
-        if len(uids) == 0 or n_samples % len(uids) != 0:
+        input_size = int(input_batch.size)
+        if group_size <= 0 or input_size % group_size != 0:
             raise ValueError(
-                f"bulk_batch has {n_samples} samples; not divisible by len(uids)={len(uids)}"
+                f"input_batch.size={input_size} is not divisible by group_size={group_size}"
             )
-        n_gen = n_samples // len(uids)
-        keys = [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]
+        n_prompts = input_size // group_size
+        if n_prompts == 0 or n_samples % n_prompts != 0:
+            raise ValueError(
+                f"bulk_batch has {n_samples} samples; not divisible by n_prompts={n_prompts}"
+            )
+        n_per_prompt = n_samples // n_prompts
+        uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
+        keys = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
         meta = kv_first_write(
             bulk_batch,
             keys=keys,
