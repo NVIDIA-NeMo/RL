@@ -227,7 +227,7 @@ def main():
 
     init_ray()
 
-    set_seed(config.grpo["seed"])
+    set_seed(config.grpo.seed)
 
     # setup tokenizer
     tokenizer = get_tokenizer(config.policy["tokenizer"])
@@ -237,16 +237,16 @@ def main():
 
     # setup data & env map
     ds_length = (
-        config.grpo["num_prompts_per_step"]
-        * config.grpo["num_generations_per_prompt"]
-        * config.grpo["max_num_steps"]
+        config.grpo.num_prompts_per_step
+        * config.grpo.num_generations_per_prompt
+        * config.grpo.max_num_steps
     )
     dataset, val_dataset, task_to_env, val_task_to_env = setup_puzzle_data(
         tokenizer=tokenizer,
         env_cfg=config.env,
         task_name="sliding_puzzle_game",
         length=ds_length,
-        val_length=config.grpo["max_val_samples"],
+        val_length=config.grpo.max_val_samples,
         add_system_prompt=config.data["add_system_prompt"],
     )
 
