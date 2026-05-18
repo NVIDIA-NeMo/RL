@@ -27,7 +27,6 @@ import os
 import socket
 import subprocess
 import time
-from dataclasses import dataclass, field
 from importlib import resources
 from typing import Any
 
@@ -359,24 +358,6 @@ def _from_wire(td: TensorDict) -> TensorDict:
     return TensorDict(new_dict, batch_size=td.batch_size)
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Per-partition record kept client-side for register_partition semantics
-# (TQ creates partitions implicitly on first put — this is bookkeeping
-# that lets `clear_samples(keys=None)` and the consumer-task list survive
-# without a controller round-trip).
-# ──────────────────────────────────────────────────────────────────────────
-
-
-@dataclass
-class _PartitionRecord:
-    fields: list[str]
-    num_samples: int
-    consumer_tasks: list[str]
-    grpo_group_size: int | None
-    enums: dict[str, list[str]]
-    seen_keys: set[str] = field(default_factory=set)
-
-
 class TQDataPlaneClient(DataPlaneClient):
     """Adapter façade — maps NeMo-RL calls onto TransferQueue's public API."""
 
@@ -430,7 +411,6 @@ class TQDataPlaneClient(DataPlaneClient):
         else:
             _connect_existing()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
-        self._partitions: dict[str, _PartitionRecord] = {}
         self._closed = False
 
     # ── (A) task-mediated ───────────────────────────────────────────────
@@ -444,16 +424,14 @@ class TQDataPlaneClient(DataPlaneClient):
         grpo_group_size: int | None = None,
         enums: dict[str, list[str]] | None = None,
     ) -> None:
-        # Client-side bookkeeping. TQ creates partitions implicitly on
-        # first put_samples; pre-registration is for our own validation
-        # and the clear_samples(keys=None) recovery path.
-        self._partitions[partition_id] = _PartitionRecord(
-            fields=list(fields),
-            num_samples=int(num_samples),
-            consumer_tasks=list(consumer_tasks),
-            grpo_group_size=grpo_group_size,
-            enums=dict(enums) if enums else {},
-        )
+        # No-op. Kept for ABC conformance. The client is intentionally
+        # stateless: TQ's controller is the single source of truth for
+        # partition membership, and replicating that state per-client
+        # creates an inconsistent local view (the SyncRolloutActor and
+        # the driver each see their own write history, not each other's).
+        # ``clear_samples(sample_ids=None)`` queries the controller via
+        # ``tq.kv_list`` instead of relying on local accumulation.
+        return
 
     def claim_meta(
         self,
@@ -581,10 +559,6 @@ class TQDataPlaneClient(DataPlaneClient):
             tags=tags,
         )
 
-        rec = self._partitions.get(partition_id)
-        if rec is not None:
-            rec.seen_keys.update(sample_ids)
-
         return KVBatchMeta(
             partition_id=partition_id,
             task_name=None,
@@ -614,29 +588,23 @@ class TQDataPlaneClient(DataPlaneClient):
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         cleared_via_none = sample_ids is None
         if sample_ids is None:
-            rec = self._partitions.pop(partition_id, None)
-            sample_ids = list(rec.seen_keys) if rec is not None else []
-            if not sample_ids:
-                # Fallback for the worker / future loader-actor case where
-                # the local registry is empty: ask TQ's controller what
-                # currently lives in this partition. `kv_list` errors
-                # propagate — we don't want a network blip to silently
-                # turn into "cleared nothing".
-                listing = tq.kv_list(partition_id=partition_id)
-                sample_ids = list(listing.get(partition_id, {}).keys())
-        else:
-            self._partitions.pop(partition_id, None)
+            # No local state — ask TQ's controller for the current key
+            # set in this partition. ``kv_list`` errors propagate; we
+            # don't want a network blip to silently turn into "cleared
+            # nothing".
+            listing = tq.kv_list(partition_id=partition_id)
+            sample_ids = list(listing.get(partition_id, {}).keys())
         if not sample_ids:
             if cleared_via_none:
                 import warnings
 
                 warnings.warn(
                     f"clear_samples(sample_ids=None, partition_id={partition_id!r}) "
-                    "found nothing to clear — local partition registry is empty "
-                    "and TQ's kv_list returned no keys. If you're calling from a "
-                    "process that did not produce the samples (worker / loader "
-                    "actor), pass explicit sample_ids from the meta you received "
-                    "from put_samples.",
+                    "found nothing to clear — TQ's kv_list returned no keys for "
+                    "this partition. The partition may already be empty, never "
+                    "have been written to, or be unknown to the controller. "
+                    "Callers that hold a ``KVBatchMeta`` should pass its "
+                    "``sample_ids`` explicitly for a deterministic clear.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
