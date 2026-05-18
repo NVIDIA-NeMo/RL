@@ -238,7 +238,9 @@ def _base_master_config(colocated: bool):
                 },
             }
         },
-        grpo=GRPOConfig.model_construct(num_prompts_per_step=8, num_generations_per_prompt=10),
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=8, num_generations_per_prompt=10
+        ),
     )
 
 
@@ -313,7 +315,9 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
 
 def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     master_config = _base_master_config(colocated=False)
-    master_config.grpo.async_grpo = AsyncGRPOConfig(enabled=True, max_trajectory_age_steps=1)
+    master_config.grpo.async_grpo = AsyncGRPOConfig(
+        enabled=True, max_trajectory_age_steps=1
+    )
 
     timing_metrics = {
         "policy_and_reference_logprobs": 2.0,

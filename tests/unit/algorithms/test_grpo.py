@@ -2333,7 +2333,9 @@ class TestValidateFunction:
 
         mock_config = MasterConfig.model_construct(
             **{
-                "grpo": GRPOConfig.model_construct(val_period=0),  # Required for the assertion
+                "grpo": GRPOConfig.model_construct(
+                    val_period=0
+                ),  # Required for the assertion
             }
         )
 
