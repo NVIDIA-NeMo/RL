@@ -362,7 +362,7 @@ def _from_wire(td: TensorDict) -> TensorDict:
 # ──────────────────────────────────────────────────────────────────────────
 # Per-partition record kept client-side for register_partition semantics
 # (TQ creates partitions implicitly on first put — this is bookkeeping
-# that lets `kv_clear(keys=None)` and the consumer-task list survive
+# that lets `clear_samples(keys=None)` and the consumer-task list survive
 # without a controller round-trip).
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -445,8 +445,8 @@ class TQDataPlaneClient(DataPlaneClient):
         enums: dict[str, list[str]] | None = None,
     ) -> None:
         # Client-side bookkeeping. TQ creates partitions implicitly on
-        # first kv_batch_put; pre-registration is for our own validation
-        # and the kv_clear(keys=None) recovery path.
+        # first put_samples; pre-registration is for our own validation
+        # and the clear_samples(keys=None) recovery path.
         self._partitions[partition_id] = _PartitionRecord(
             fields=list(fields),
             num_samples=int(num_samples),
@@ -531,7 +531,7 @@ class TQDataPlaneClient(DataPlaneClient):
                 "get_data requires either select_fields or meta.fields; "
                 "silently fetching all fields is forbidden."
             )
-        return self.kv_batch_get(meta.sample_ids, meta.partition_id, list(fields))
+        return self.get_samples(meta.sample_ids, meta.partition_id, list(fields))
 
     def check_consumption_status(
         self, partition_id: str, task_names: list[str]
@@ -546,7 +546,7 @@ class TQDataPlaneClient(DataPlaneClient):
 
     # ── (B) direct-by-key ──────────────────────────────────────────────
 
-    def kv_batch_put(
+    def put_samples(
         self,
         sample_ids: list[str],
         partition_id: str,
@@ -593,7 +593,7 @@ class TQDataPlaneClient(DataPlaneClient):
             tags=[dict(t) for t in tags] if tags else None,
         )
 
-    def kv_batch_get(
+    def get_samples(
         self,
         sample_ids: list[str],
         partition_id: str,
@@ -611,7 +611,7 @@ class TQDataPlaneClient(DataPlaneClient):
             td = _from_wire(td)
         return td
 
-    def kv_clear(self, sample_ids: list[str] | None, partition_id: str) -> None:
+    def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         if sample_ids is None:
             rec = self._partitions.pop(partition_id, None)
             sample_ids = list(rec.seen_keys) if rec is not None else []

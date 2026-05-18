@@ -77,7 +77,7 @@ def test_kvbatchmeta_schema_unchanged() -> None:
 
 def test_dataplane_client_abc_surface() -> None:
     """Catches accidental ABC method removal / rename — e.g. dropping
-    ``kv_clear`` would break step-end teardown silently."""
+    ``clear_samples`` would break step-end teardown silently."""
     from nemo_rl.data_plane.interfaces import DataPlaneClient
 
     expected_methods = {
@@ -87,9 +87,9 @@ def test_dataplane_client_abc_surface() -> None:
         "get_data",
         "check_consumption_status",
         # direct-by-key
-        "kv_batch_put",
-        "kv_batch_get",
-        "kv_clear",
+        "put_samples",
+        "get_samples",
+        "clear_samples",
         # lifecycle
         "close",
     }

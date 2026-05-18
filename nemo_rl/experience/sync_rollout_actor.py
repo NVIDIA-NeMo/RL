@@ -24,7 +24,7 @@ baseline/std, prompt_ids_for_adv) cross back to the driver via Ray.
 
 **Goal — rollout 1-hop put**: bulk tensors (input_ids, output_ids,
 attention_mask, position_ids, multi_modal_inputs, generation_logprobs,
-token_mask) stay actor-side until ``kv_batch_put``, then live only in
+token_mask) stay actor-side until ``put_samples``, then live only in
 TQ. Driver never holds these bytes between rollout finish and train
 fan-out.
 
@@ -122,7 +122,7 @@ class SyncRolloutActor:
            ``message_log`` layout to flat tensors; builds token mask,
            sample mask, prompt-only ids, baseline/std.
         4. **Write bulk to TQ** — ``kv_first_write`` puts every tensor
-           field in one flat ``kv_batch_put``; the driver never touches
+           field in one flat ``put_samples``; the driver never touches
            bulk bytes.
         5. **Release GPU** — ``policy_generation.finish_generation()``
            frees KV cache and inference state so the trainer can use the

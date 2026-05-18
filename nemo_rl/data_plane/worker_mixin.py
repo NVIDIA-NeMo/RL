@@ -250,7 +250,7 @@ class TQWorkerMixin:
             leader = torch.distributed.get_global_rank(replica_group, 0)
             is_leader = torch.distributed.get_rank() == leader
             if is_leader:
-                td = self._require_dp_client().kv_batch_get(
+                td = self._require_dp_client().get_samples(
                     sample_ids=meta.sample_ids,
                     partition_id=meta.partition_id,
                     select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
@@ -275,7 +275,7 @@ class TQWorkerMixin:
                 data = preprocess(self, data)
             return data
 
-        td = self._require_dp_client().kv_batch_get(
+        td = self._require_dp_client().get_samples(
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
             select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
@@ -414,7 +414,7 @@ class TQWorkerMixin:
         meta: "KVBatchMeta",
         fields: dict[str, torch.Tensor],
     ) -> None:
-        """Leader-only ``kv_batch_put(meta.sample_ids, fields=...)``.
+        """Leader-only ``put_samples(meta.sample_ids, fields=...)``.
 
         Per-token fields are jagged-packed via :func:`maybe_pack_jagged`
         so they land with the same row lengths as the initial put;

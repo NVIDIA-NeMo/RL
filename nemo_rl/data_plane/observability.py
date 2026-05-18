@@ -95,7 +95,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._on_event = on_event or (lambda _: None)
         self._stats = DataPlaneStats()
         # Nested per-partition / per-key live byte counts. Populated on
-        # successful ``kv_batch_put``; popped on successful ``kv_clear``.
+        # successful ``put_samples``; popped on successful ``clear_samples``.
         # Bounded by the live key population, not cumulative traffic.
         self._bytes_by_partition: dict[str, dict[str, int]] = {}
 
@@ -112,7 +112,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         return {p: sum(d.values()) for p, d in self._bytes_by_partition.items()}
 
     def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:
-        """Attribute put bytes per key so a later ``kv_clear`` can subtract.
+        """Attribute put bytes per key so a later ``clear_samples`` can subtract.
 
         Called after the underlying RPC succeeds so a failed put never
         leaves the accounting inflated.
@@ -288,7 +288,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             lambda: self._inner.check_consumption_status(partition_id, task_names),
         )
 
-    def kv_batch_put(self, sample_ids, partition_id, fields=None, tags=None):
+    def put_samples(self, sample_ids, partition_id, fields=None, tags=None):
         n_bytes = _td_bytes(fields)
         # Materialize once: ``_run`` consumes its lambda and we also need
         # to attribute bytes per sample after success.
@@ -296,7 +296,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         out = self._run(
             "put",
             partition_id,
-            lambda: self._inner.kv_batch_put(
+            lambda: self._inner.put_samples(
                 sample_ids_list,
                 partition_id,
                 fields=fields,
@@ -308,11 +308,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._record_put(partition_id, sample_ids_list, n_bytes)
         return out
 
-    def kv_batch_get(self, sample_ids, partition_id, select_fields):
+    def get_samples(self, sample_ids, partition_id, select_fields):
         return self._run(
             "get",
             partition_id,
-            lambda: self._inner.kv_batch_get(
+            lambda: self._inner.get_samples(
                 sample_ids,
                 partition_id,
                 select_fields=select_fields,
@@ -320,7 +320,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             n_keys=len(sample_ids),
         )
 
-    def kv_clear(self, sample_ids, partition_id):
+    def clear_samples(self, sample_ids, partition_id):
         sample_ids_list = (
             sample_ids
             if (sample_ids is None or isinstance(sample_ids, list))
@@ -330,7 +330,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._run(
             "clear",
             partition_id,
-            lambda: self._inner.kv_clear(sample_ids_list, partition_id),
+            lambda: self._inner.clear_samples(sample_ids_list, partition_id),
             n_keys=n_keys,
         )
         self._record_clear(partition_id, sample_ids_list)

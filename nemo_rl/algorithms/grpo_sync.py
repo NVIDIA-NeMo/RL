@@ -86,7 +86,7 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 # ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
 # Slice-only formulation of nemo_rl.algorithms.grpo.dynamic_sampling: filter
 # on std != 0, accumulate survivors across iterations, slice on overflow.
-# Bulk in TQ untouched except for kv_clear of dropped/discarded uids.
+# Bulk in TQ untouched except for clear_samples of dropped/discarded uids.
 
 
 def _apply_dynamic_sampling(
@@ -148,7 +148,7 @@ def _apply_dynamic_sampling(
     keep_idx = [i for i, t in enumerate(meta.tags) if t["std"] != 0.0]
     drop_keys = [k for k, t in zip(meta.sample_ids, meta.tags) if t["std"] == 0.0]
     if drop_keys:
-        dp_client.kv_clear(sample_ids=drop_keys, partition_id=meta.partition_id)
+        dp_client.clear_samples(sample_ids=drop_keys, partition_id=meta.partition_id)
 
     # Subset survivors and merge into the running cache.
     if keep_idx:
@@ -177,7 +177,7 @@ def _apply_dynamic_sampling(
     ds_metrics: dict[str, Any] = {"dynamic_sampling_num_gen_batches": num_gen_batches}
     assert pending_meta is not None and pending_carry is not None
     if n > train_prompts_size:
-        dp_client.kv_clear(
+        dp_client.clear_samples(
             sample_ids=list(pending_meta.sample_ids[train_prompts_size:]),
             partition_id=pending_meta.partition_id,
         )
@@ -413,7 +413,7 @@ def grpo_train_sync(
     # ── Sync rollout actor (rollout 1-hop put) ──────────────────────
     # The actor owns the multi-turn rollout loop AND post-rollout
     # flatten / mask construction / prompt extraction / baseline-std /
-    # TQ first-write. Bulk tensors stay actor-side until kv_batch_put;
+    # TQ first-write. Bulk tensors stay actor-side until put_samples;
     # driver receives only KVBatchMeta + small slice via Ray.
     rollout_actor = SyncRolloutActor.options(
         runtime_env=make_actor_runtime_env(
@@ -462,7 +462,7 @@ def grpo_train_sync(
         # multiple inner iterations we accumulate non-zero-std prompts
         # until we have enough for a full training batch. The TQ
         # payload of pending uids remains alive until either consumed
-        # by training (kv_clear at step end) or evicted on overflow.
+        # by training (clear_samples at step end) or evicted on overflow.
         # ``pending_unfiltered_rewards`` is logging-only — preserves
         # legacy ``metrics["reward"]`` semantics (cumulative unfiltered
         # total_reward across all contributing iterations).
@@ -553,7 +553,7 @@ def grpo_train_sync(
                         policy_generation.prepare_for_generation()
 
                 # ── Per-step TQ partition register ─────────────────────
-                # Done before the rollout actor's kv_batch_put so the
+                # Done before the rollout actor's put_samples so the
                 # partition exists with the expected schema.
                 policy.prepare_step(
                     num_samples=int(repeated_batch.size),
@@ -562,12 +562,12 @@ def grpo_train_sync(
 
                 # ── Rollout 1-hop put: actor runs rollout + flatten +
                 # mask construction + prompt extraction + baseline/std,
-                # writes bulk to TQ in one flat kv_batch_put, returns
+                # writes bulk to TQ in one flat put_samples, returns
                 # only meta + small slice. Bulk never visits the driver.
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
                     # Single Ray RPC: rollout + flatten + mask + prompt
-                    # extraction + baseline/std + kv_batch_put + finish
+                    # extraction + baseline/std + put_samples + finish
                     # generation + logger metrics — all bundled into one
                     # round-trip.
                     # ``first_iter`` is the actor's signal to call
@@ -638,7 +638,7 @@ def grpo_train_sync(
                     )
 
                 # ── Dynamic sampling (DAPO non-zero-std filter) ────────
-                # Slice-only; bulk in TQ untouched except for kv_clear
+                # Slice-only; bulk in TQ untouched except for clear_samples
                 # of dropped / overflow-discarded uids.
                 ds_metrics: dict = {}
                 unfiltered_rewards_for_logging: Optional[torch.Tensor] = None
@@ -868,7 +868,7 @@ def grpo_train_sync(
                         )["layers"]
                         POLICY_GENERATION_STALE = True
 
-                # Stash input_ids and content before kv_clear so the
+                # Stash input_ids and content before clear_samples so the
                 # late log_data jsonl block can use them. The clear below
                 # removes meta.sample_ids from TQ, so any post-clear
                 # read_columns on this meta would fail. ``content`` is a
@@ -1124,14 +1124,14 @@ def grpo_train_sync(
                 log_data["advantages"] = advantages.tolist()
                 log_data["generation_logprobs"] = generation_logprobs.tolist()
                 log_data["prev_logprobs"] = prev_logprobs.tolist()
-                # input_ids was stashed before the step-end kv_clear (the
+                # input_ids was stashed before the step-end clear_samples (the
                 # keys are no longer in TQ at this point); ``_log_input_ids``
                 # is None when nemo_gym-responses logging path skipped the
                 # outer ``if not _should_log_nemo_gym_responses`` branch.
                 if _log_input_ids is not None:
                     log_data["token_ids"] = _log_input_ids.tolist()
                 # ``content`` (raw assistant text) is fetched from TQ as
-                # an object-array column above (stashed before kv_clear).
+                # an object-array column above (stashed before clear_samples).
                 if _log_content is not None:
                     log_data["content"] = _log_content.tolist()
                 logger.log_batched_dict_as_jsonl(

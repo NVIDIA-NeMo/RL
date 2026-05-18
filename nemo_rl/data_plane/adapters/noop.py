@@ -51,7 +51,7 @@ def _reject_non_tensor_leaves(td: TensorDict) -> None:
             bad.append(k)
     if bad:
         raise TypeError(
-            f"kv_batch_put received non-tensor leaves: {bad}. "
+            f"put_samples received non-tensor leaves: {bad}. "
             "Tensorize via codec helpers, use `tags=` for primitives, "
             "or use the Ray object store for arbitrary Python objects."
         )
@@ -146,7 +146,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
                 "get_data requires either select_fields or meta.fields; "
                 "fetching all fields silently is forbidden."
             )
-        return self.kv_batch_get(meta.sample_ids, meta.partition_id, list(fields))
+        return self.get_samples(meta.sample_ids, meta.partition_id, list(fields))
 
     def check_consumption_status(
         self, partition_id: str, task_names: list[str]
@@ -159,7 +159,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
                 return False
         return True
 
-    def kv_batch_put(
+    def put_samples(
         self,
         sample_ids: list[str],
         partition_id: str,
@@ -178,7 +178,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
                     # tensordict version's iteration semantics.
                     if not isinstance(val, torch.Tensor):
                         raise TypeError(
-                            f"kv_batch_put received non-tensor leaf "
+                            f"put_samples received non-tensor leaf "
                             f"{fname!r}: {type(val).__name__}. "
                             "Tensorize via codec helpers, use `tags=` "
                             "for primitives, or use the Ray object store "
@@ -196,7 +196,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
             tags=[dict(t) for t in tags] if tags is not None else None,
         )
 
-    def kv_batch_get(
+    def get_samples(
         self,
         sample_ids: list[str],
         partition_id: str,
@@ -220,7 +220,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
         stacked = {f: _stack_or_nest(out[f]) for f in select_fields}
         return TensorDict(stacked, batch_size=(len(sample_ids),))
 
-    def kv_clear(self, sample_ids: list[str] | None, partition_id: str) -> None:
+    def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         rec = self._partitions.get(partition_id)
         if rec is None:
             return

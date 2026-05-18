@@ -15,7 +15,7 @@
 
 * Writer side: variable-length fields are encoded as
 ``torch.nested.nested_tensor`` with ``layout=torch.jagged`` before
-``kv_batch_put``. Padding tax is paid only when a consumer needs a
+``put_samples``. Padding tax is paid only when a consumer needs a
 rectangular tensor.
 
 * Reader side: :func:`materialize` accepts the wire TensorDict and,
@@ -60,7 +60,7 @@ def to_nested_by_length(
 
     Used by the producer side: convert
     :func:`batched_message_log_to_flat_message` output (already padded)
-    into the wire format before ``kv_batch_put``.
+    into the wire format before ``put_samples``.
 
     Args:
         padded: Rectangular tensor of shape ``(N, S, ...)``.
@@ -166,7 +166,7 @@ def pack_jagged_fields(
     *,
     lengths: torch.Tensor | None,
 ) -> TensorDict:
-    """Pack a column dict into the wire layout expected by ``kv_batch_put``.
+    """Pack a column dict into the wire layout expected by ``put_samples``.
 
     Zero-copy where possible: per-token tensors that match
     ``(N, max(lengths), ...)`` become ``torch.jagged`` views via
@@ -187,7 +187,7 @@ def pack_jagged_fields(
 
     Returns:
         ``TensorDict`` with ``batch_size=[N]`` (N from ``lengths`` if
-        given, else 0) ready for ``kv_batch_put``.
+        given, else 0) ready for ``put_samples``.
     """
     n = int(lengths.shape[0]) if lengths is not None else 0
     packed: dict[str, Any] = {}

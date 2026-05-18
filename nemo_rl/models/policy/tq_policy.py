@@ -96,7 +96,7 @@ class TQPolicy(Policy):
     the driver and forwards ``setup_data_plane(dp_cfg)`` to every worker
     so they can attach as clients (``bootstrap=False``).
 
-    The partition lifecycle (``register_partition`` / ``kv_clear``) is
+    The partition lifecycle (``register_partition`` / ``clear_samples``) is
     the trainer's responsibility — this class assumes the partition
     named ``self.tq_partition_id`` (default ``"train"``) is open with a
     schema covering ``DP_TRAIN_FIELDS`` (the bulk schema written by the
@@ -190,7 +190,7 @@ class TQPolicy(Policy):
 
     def finish_step(self, meta: KVBatchMeta) -> None:
         """Drop this step's bulk from TQ. Mirror of :meth:`prepare_step`."""
-        self.dp_client.kv_clear(sample_ids=meta.sample_ids, partition_id=meta.partition_id)
+        self.dp_client.clear_samples(sample_ids=meta.sample_ids, partition_id=meta.partition_id)
 
     def read_from_dataplane(
         self,
@@ -332,7 +332,7 @@ class TQPolicy(Policy):
         actor + worker logprob deltas + driver-side advantage delta have
         all landed under the same keys at this point. Workers fetch the
         union via ``train_presharded`` → ``self._fetch(meta)``. No
-        partition drain here — sync 1-hop's trainer calls ``kv_clear``
+        partition drain here — sync 1-hop's trainer calls ``clear_samples``
         once at end of step.
 
         Args:

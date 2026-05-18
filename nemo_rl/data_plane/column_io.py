@@ -13,18 +13,18 @@
 # limitations under the License.
 """Column-level helpers above :class:`DataPlaneClient`.
 
-These are thin wrappers around :meth:`kv_batch_get` / :meth:`kv_batch_put`
+These are thin wrappers around :meth:`get_samples` / :meth:`put_samples`
 that operate on **columns** (named fields) of a partition — not on the
 driver process specifically. The driver uses them to fetch a slice and
 materialize / write deltas back; worker-side dispatches use the
 equivalents on ``AbstractPolicyWorker`` (``self._fetch(meta)`` /
 ``self._write_back``).
 
-  * :func:`read_columns` — ``kv_batch_get + materialize`` (decode jagged
+  * :func:`read_columns` — ``get_samples + materialize`` (decode jagged
     + object-array fields into a :class:`BatchedDataDict`).
-  * :func:`write_columns` — pack-to-wire + ``kv_batch_put`` for deltas
+  * :func:`write_columns` — pack-to-wire + ``put_samples`` for deltas
     against an existing :class:`KVBatchMeta`.
-  * :func:`kv_first_write` — pack-to-wire + ``kv_batch_put`` for the
+  * :func:`kv_first_write` — pack-to-wire + ``put_samples`` for the
     rollout-actor's first put of a partition. Returns a new
     :class:`KVBatchMeta`.
 """
@@ -49,7 +49,7 @@ def read_columns(
     layout: Layout = "padded",
     pad_value_dict: dict[str, Any] | None = None,
 ) -> BatchedDataDict[Any]:
-    """``kv_batch_get(meta.sample_ids, select_fields=...) → materialize``.
+    """``get_samples(meta.sample_ids, select_fields=...) → materialize``.
 
     ``pad_to_multiple`` is read from ``meta.extra_info`` so the
     materialized seq dim matches the alignment downstream backends
@@ -68,7 +68,7 @@ def read_columns(
     Returns:
         ``BatchedDataDict`` with the requested fields, materialized.
     """
-    td = dp_client.kv_batch_get(
+    td = dp_client.get_samples(
         sample_ids=meta.sample_ids,
         partition_id=meta.partition_id,
         select_fields=list(select_fields),
@@ -89,7 +89,7 @@ def write_columns(
     meta: KVBatchMeta,
     fields: "dict[str, torch.Tensor | np.ndarray]",
 ) -> None:
-    """``kv_batch_put(meta.sample_ids, fields=...)``.
+    """``put_samples(meta.sample_ids, fields=...)``.
 
     Per-token tensor fields are converted to jagged via
     :func:`pack_jagged_fields` so they land in TQ with the same row
@@ -107,7 +107,7 @@ def write_columns(
     seq_lens = meta.sequence_lengths
     lengths = torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
     td = pack_jagged_fields(fields, lengths=lengths)
-    dp_client.kv_batch_put(
+    dp_client.put_samples(
         sample_ids=meta.sample_ids,
         partition_id=meta.partition_id,
         fields=td,
@@ -125,7 +125,7 @@ def kv_first_write(
     pad_to_multiple: int = 1,
     tags: list[dict[str, Any]] | None = None,
 ) -> KVBatchMeta:
-    """Single flat ``kv_batch_put`` of every tensor field in ``final_batch_cpu``.
+    """Single flat ``put_samples`` of every tensor field in ``final_batch_cpu``.
 
     The rollout actor's first put of a partition. Caller mints
     ``sample_ids`` (verl-style) — the helper is rollout-shape-agnostic.
@@ -171,7 +171,7 @@ def kv_first_write(
         or (isinstance(v, np.ndarray) and v.dtype == object)
     }
     td = pack_jagged_fields(fields, lengths=lengths)
-    dp_client.kv_batch_put(
+    dp_client.put_samples(
         sample_ids=list(sample_ids),
         partition_id=partition_id,
         fields=td,

@@ -101,7 +101,7 @@ class KVBatchMeta:
     Two roles:
       * Result type returned by :meth:`DataPlaneClient.claim_meta` — callers
         extract ``.sample_ids`` / ``.partition_id`` and pass them to
-        :meth:`kv_batch_get` / :meth:`get_data`.
+        :meth:`get_samples` / :meth:`get_data`.
       * Argument type for the per-DP-rank fetch entrypoints.
         ``sequence_lengths`` lets the driver compute a balanced per-rank
         shard from metadata only (control plane), without ever
@@ -116,7 +116,7 @@ class KVBatchMeta:
     extra_info: dict[str, Any] = field(default_factory=dict)
     # Per-sample primitive sidecar. Aligned 1:1 with ``sample_ids`` when
     # populated. Producers stamp filter scalars (std, total_reward,
-    # weight_version, …) here at ``kv_batch_put`` time so consumers
+    # weight_version, …) here at ``put_samples`` time so consumers
     # can filter without fetching tensor data. Mirrors verl's pattern
     # and TQ's underlying ``KVBatchMeta.tags``.
     tags: list[dict[str, Any]] | None = None
@@ -154,7 +154,7 @@ class KVBatchMeta:
     # Used by dynamic_sampling on the meta path: filter zero-std rows
     # (subset), accumulate survivors across iterations (concat), trim
     # an over-full cache to the training batch size (slice). Each
-    # returns a fresh KVBatchMeta — caller is responsible for kv_clear-
+    # returns a fresh KVBatchMeta — caller is responsible for clear_samples-
     # ing any uids dropped from the working set.
 
     def _replace(
@@ -231,12 +231,12 @@ class DataPlaneClient(ABC):
        :meth:`check_consumption_status`.
     B. *Direct-by-key* — used by stages that already know the exact uids
        (e.g. driver-side fan-out to DP ranks):
-       :meth:`kv_batch_put`, :meth:`kv_batch_get`, :meth:`kv_clear`.
+       :meth:`put_samples`, :meth:`get_samples`, :meth:`clear_samples`.
     C. *Lifecycle* — :meth:`close`.
 
     Stage-completion signal: there is intentionally no ``mark_consumed``.
     The authoritative signal in TransferQueue is *field production* —
-    when a stage calls :meth:`kv_batch_put` for a new field, the controller
+    when a stage calls :meth:`put_samples` for a new field, the controller
     flips ``production_status[sample, field] = 1``. Downstream consumers
     waiting on that field only see those samples once produced.
     """
@@ -279,7 +279,7 @@ class DataPlaneClient(ABC):
 
         Advances ``task_name``'s per-sample consumption cursor (TQ's
         ``mode='fetch'``); claimed uids won't be returned again. Samples
-        stay readable via :meth:`kv_batch_get` until :meth:`kv_clear`.
+        stay readable via :meth:`get_samples` until :meth:`clear_samples`.
 
         Args:
             partition_id: Partition to claim from.
@@ -334,7 +334,7 @@ class DataPlaneClient(ABC):
     # ── (B) direct-by-key (TQ-aligned signatures) ──────────────────────
 
     @abstractmethod
-    def kv_batch_put(
+    def put_samples(
         self,
         sample_ids: list[str],
         partition_id: str,
@@ -355,11 +355,11 @@ class DataPlaneClient(ABC):
             tags: Optional per-sample primitive metadata.
 
         Returns:
-            ``KVBatchMeta`` covering ``sample_ids`` — usable for direct :meth:`kv_batch_get`.
+            ``KVBatchMeta`` covering ``sample_ids`` — usable for direct :meth:`get_samples`.
         """
 
     @abstractmethod
-    def kv_batch_get(
+    def get_samples(
         self,
         sample_ids: list[str],
         partition_id: str,
@@ -385,7 +385,7 @@ class DataPlaneClient(ABC):
         """
 
     @abstractmethod
-    def kv_clear(
+    def clear_samples(
         self,
         sample_ids: list[str] | None,
         partition_id: str,

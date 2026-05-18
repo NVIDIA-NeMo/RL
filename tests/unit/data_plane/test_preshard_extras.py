@@ -16,7 +16,7 @@
 After the sync 1-hop refactor, ``fan_out_per_rank_metas`` was retired in
 favor of:
 
-  * ``kv_first_write`` — single flat ``kv_batch_put`` of every tensor
+  * ``kv_first_write`` — single flat ``put_samples`` of every tensor
     field in the rollout output (multimodal extras ride along).
   * ``shard_meta_for_dp`` — pure key-list split per DP rank, no I/O.
 
@@ -75,7 +75,7 @@ def test_kv_first_write_writes_seed_fields():
     )
     # Every tensor field in the input lands in TQ under f"{uid}_g0".
     assert meta.sample_ids == [f"u{i}_g0" for i in range(4)]
-    fetched = client.kv_batch_get(
+    fetched = client.get_samples(
         sample_ids=meta.sample_ids,
         partition_id="train",
         select_fields=["input_ids", "input_lengths", "token_mask", "sample_mask"],
@@ -93,7 +93,7 @@ def test_kv_first_write_carries_multimodal_extras():
         fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
     )
     assert "pixel_values" in (meta.fields or [])
-    fetched = client.kv_batch_get(
+    fetched = client.get_samples(
         sample_ids=meta.sample_ids,
         partition_id="train",
         select_fields=["pixel_values"],

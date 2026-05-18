@@ -15,7 +15,7 @@
 
 Coverage:
   * write_columns / read_columns roundtrip — catches async-without-await
-    bugs (kv_batch_put returning a coroutine instead of running). The
+    bugs (put_samples returning a coroutine instead of running). The
     test that didn't exist when the bug was introduced.
   * Per-sample key lifecycle — ``kv_first_write`` mints keys, every
     subsequent ``shard_meta_for_dp`` slice references the SAME key set
@@ -62,7 +62,7 @@ def _setup(client: NoOpDataPlaneClient, n: int) -> None:
 # ── write_columns / read_columns roundtrip ─────────────────────────────
 #
 # These tests would have caught the asyncio-without-await bug:
-# kv_batch_put used to be an async def; calling it without await
+# put_samples used to be an async def; calling it without await
 # silently dropped the coroutine. The roundtrip below would have
 # returned an empty / stale tensor in that case.
 
@@ -80,7 +80,7 @@ def test_write_columns_lands_in_tq():
     delta = {"advantages": torch.full((4,), 7.5)}
     write_columns(client, meta, delta)
 
-    fetched = client.kv_batch_get(
+    fetched = client.get_samples(
         sample_ids=meta.sample_ids,
         partition_id="train",
         select_fields=["advantages"],
@@ -187,12 +187,12 @@ def test_kv_clear_uses_meta_keys_minted_at_rollout():
                 "Rank meta references a key not in the original rollout set"
             )
 
-    client.kv_clear(sample_ids=meta.sample_ids, partition_id="train")
+    client.clear_samples(sample_ids=meta.sample_ids, partition_id="train")
     # Cleared keys should no longer fetch.
     import pytest
 
     with pytest.raises(KeyError):
-        client.kv_batch_get(
+        client.get_samples(
             sample_ids=meta.sample_ids,
             partition_id="train",
             select_fields=["input_ids"],
@@ -222,7 +222,7 @@ def _make_driver_carry(rewards: list[float], stds: list[float]) -> BatchedDataDi
 
 
 def _seed_meta(client: NoOpDataPlaneClient, prefix: str, n: int) -> KVBatchMeta:
-    """Stage n keys in TQ so kv_clear has something to remove."""
+    """Stage n keys in TQ so clear_samples has something to remove."""
     _setup(client, n=n)
     fb = _final_batch(n)
     uids = [f"{prefix}{i}" for i in range(n)]
@@ -272,13 +272,13 @@ def test_apply_dynamic_sampling_filters_zero_std():
     import pytest
 
     with pytest.raises(KeyError):
-        client.kv_batch_get(
+        client.get_samples(
             sample_ids=[meta.sample_ids[1]],
             partition_id="train",
             select_fields=["input_ids"],
         )
     # Surviving uids' payload is still alive.
-    survivors = client.kv_batch_get(
+    survivors = client.get_samples(
         sample_ids=[meta.sample_ids[0], meta.sample_ids[2]],
         partition_id="train",
         select_fields=["input_ids"],
@@ -314,7 +314,7 @@ def test_apply_dynamic_sampling_completes_when_train_size_reached():
 
 
 def test_apply_dynamic_sampling_overflow_slices_and_clears():
-    """When the cache exceeds train_prompts_size, slice + kv_clear discards."""
+    """When the cache exceeds train_prompts_size, slice + clear_samples discards."""
     from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
 
     client = NoOpDataPlaneClient()
@@ -340,7 +340,7 @@ def test_apply_dynamic_sampling_overflow_slices_and_clears():
     import pytest
 
     with pytest.raises(KeyError):
-        client.kv_batch_get(
+        client.get_samples(
             sample_ids=[meta.sample_ids[4]],
             partition_id="train",
             select_fields=["input_ids"],

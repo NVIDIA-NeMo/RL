@@ -27,8 +27,8 @@ Spec:
   1. Build a deterministic ``train_data`` with variable input lengths.
   2. Run ``shard_by_batch_size`` on the driver — this is the *one* call
      both paths share. Save its output as the legacy reference.
-  3. Round-trip each shard through TQ (``kv_batch_put`` →
-     ``kv_batch_get`` → ``materialize``) and re-attach the per-shard
+  3. Round-trip each shard through TQ (``put_samples`` →
+     ``get_samples`` → ``materialize``) and re-attach the per-shard
      packing metadata from ``extra_info`` (what
      ``train_presharded`` does in production).
   4. Assert each rank's tensors and packing metadata are byte-identical
@@ -175,12 +175,12 @@ def _round_trip_shards_through_tq(
             {f: shard[f].detach().contiguous() for f in names},
             batch_size=[n],
         )
-        tq_client.kv_batch_put(
+        tq_client.put_samples(
             sample_ids=keys,
             partition_id=partition_id,
             fields=fields,
         )
-        td_back = tq_client.kv_batch_get(
+        td_back = tq_client.get_samples(
             sample_ids=keys,
             partition_id=partition_id,
             select_fields=list(names),

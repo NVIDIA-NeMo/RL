@@ -14,7 +14,7 @@
 """Correctness invariants for the sync 1-hop data-plane.
 
 Each test guards a real bug we either hit (Mapping check, tensordict
-import, kv_clear ordering) or could silently introduce. Tests target
+import, clear_samples ordering) or could silently introduce. Tests target
 the ABC contract through ``NoOpDataPlaneClient``, so they run without
 TQ installed.
 """
@@ -68,7 +68,7 @@ def _setup(client: NoOpDataPlaneClient, n: int, *, fields=None) -> None:
 
 def test_kv_batch_get_after_clear_raises() -> None:
     """Real bug guard: v3 driver tried to read input_ids for log_data
-    AFTER kv_clear, hit ``ValueError: keys not found``. We now stash
+    AFTER clear_samples, hit ``ValueError: keys not found``. We now stash
     before clear — this test pins the contract that get-after-clear
     must fail loud, not silently return empty."""
     client = NoOpDataPlaneClient()
@@ -78,11 +78,11 @@ def test_kv_batch_get_after_clear_raises() -> None:
         fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
     )
 
-    client.kv_clear(sample_ids=meta.sample_ids, partition_id="train")
+    client.clear_samples(sample_ids=meta.sample_ids, partition_id="train")
 
     with pytest.raises(KeyError):
         # NoOp raises KeyError when the partition entry is gone.
-        client.kv_batch_get(
+        client.get_samples(
             sample_ids=meta.sample_ids,
             partition_id="train",
             select_fields=["input_ids"],
@@ -101,7 +101,7 @@ def test_kv_batch_get_unproduced_field_raises() -> None:
 
     # ``advantages`` has not been written yet (driver delta-write).
     with pytest.raises(KeyError):
-        client.kv_batch_get(
+        client.get_samples(
             sample_ids=meta.sample_ids,
             partition_id="train",
             select_fields=["advantages"],
@@ -145,7 +145,7 @@ def test_kv_batch_put_rejects_non_tensor_leaves() -> None:
         batch_size=[2],
     )
     with pytest.raises(TypeError, match=r"non-tensor"):
-        client.kv_batch_put(
+        client.put_samples(
             sample_ids=["x_g0", "y_g0"],
             partition_id="train",
             fields=bad_td,
@@ -183,7 +183,7 @@ def test_kv_clear_with_none_drops_partition() -> None:
         fb, sample_ids=_keys_from_uids(["a", "b"]), dp_client=client, partition_id="train"
     )
 
-    client.kv_clear(sample_ids=None, partition_id="train")
+    client.clear_samples(sample_ids=None, partition_id="train")
 
     # Partition is gone — re-registering must succeed.
     _setup(client, n=2)
@@ -326,9 +326,9 @@ def test_kv_batch_put_preserves_bf16_dtype() -> None:
     )
     x = torch.randn((2, 4), dtype=torch.bfloat16)
     td = TensorDict({"x": x}, batch_size=[2])
-    client.kv_batch_put(sample_ids=["a", "b"], partition_id="train", fields=td)
+    client.put_samples(sample_ids=["a", "b"], partition_id="train", fields=td)
 
-    out = client.kv_batch_get(
+    out = client.get_samples(
         sample_ids=["a", "b"], partition_id="train", select_fields=["x"]
     )
     assert out["x"].dtype == torch.bfloat16
@@ -345,9 +345,9 @@ def test_kv_batch_put_preserves_int64_dtype() -> None:
     )
     x = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)
     td = TensorDict({"input_ids": x}, batch_size=[2])
-    client.kv_batch_put(sample_ids=["a", "b"], partition_id="train", fields=td)
+    client.put_samples(sample_ids=["a", "b"], partition_id="train", fields=td)
 
-    out = client.kv_batch_get(
+    out = client.get_samples(
         sample_ids=["a", "b"],
         partition_id="train",
         select_fields=["input_ids"],

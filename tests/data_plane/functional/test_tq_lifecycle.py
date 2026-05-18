@@ -118,7 +118,7 @@ def test_smoke_round_trip(tq_client) -> None:
         consumer_tasks=["read"],
     )
     keys = ["a", "b", "c", "d"]
-    tq_client.kv_batch_put(
+    tq_client.put_samples(
         sample_ids=keys,
         partition_id="smoke",
         fields=TensorDict({"x": torch.arange(4)}, batch_size=[4]),
@@ -140,7 +140,7 @@ def test_smoke_round_trip(tq_client) -> None:
 
     assert tq_client.check_consumption_status("smoke", ["read"])
 
-    tq_client.kv_clear(sample_ids=None, partition_id="smoke")
+    tq_client.clear_samples(sample_ids=None, partition_id="smoke")
 
 
 def test_smoke_round_trip_backends(tq_client_backends) -> None:
@@ -157,7 +157,7 @@ def test_smoke_round_trip_backends(tq_client_backends) -> None:
         consumer_tasks=["read"],
     )
     keys = ["a", "b", "c", "d"]
-    client.kv_batch_put(
+    client.put_samples(
         sample_ids=keys,
         partition_id="smoke-backend",
         fields=TensorDict({"x": torch.arange(4)}, batch_size=[4]),
@@ -176,7 +176,7 @@ def test_smoke_round_trip_backends(tq_client_backends) -> None:
     expected = torch.tensor([keys.index(k) for k in meta.sample_ids])
     assert torch.equal(data["x"], expected)
 
-    client.kv_clear(sample_ids=None, partition_id="smoke-backend")
+    client.clear_samples(sample_ids=None, partition_id="smoke-backend")
 
 
 def test_smoke_round_trip_1d_fields(tq_client) -> None:
@@ -197,7 +197,7 @@ def test_smoke_round_trip_1d_fields(tq_client) -> None:
         consumer_tasks=["read"],
     )
     keys = [f"k{i}" for i in range(n)]
-    tq_client.kv_batch_put(
+    tq_client.put_samples(
         sample_ids=keys,
         partition_id="smoke-1d",
         fields=TensorDict({"reward": reward}, batch_size=[n]),
@@ -218,7 +218,7 @@ def test_smoke_round_trip_1d_fields(tq_client) -> None:
         "TQ must not unsqueeze 1D tensors silently (R-C2)."
     )
 
-    tq_client.kv_clear(sample_ids=None, partition_id="smoke-1d")
+    tq_client.clear_samples(sample_ids=None, partition_id="smoke-1d")
 
 
 # ── Object-field round-trip across backends ───────────────────────────────────
@@ -265,7 +265,7 @@ def test_object_round_trip_backends(tq_client_backends) -> None:
         num_samples=n,
         consumer_tasks=["read"],
     )
-    client.kv_batch_put(
+    client.put_samples(
         sample_ids=keys,
         partition_id="obj-backend",
         fields=TensorDict(
@@ -291,7 +291,7 @@ def test_object_round_trip_backends(tq_client_backends) -> None:
             f"row {i} mismatch: got {bdd[field_name][i]!r}, expected {expected[i]!r}"
         )
 
-    client.kv_clear(sample_ids=None, partition_id="obj-backend")
+    client.clear_samples(sample_ids=None, partition_id="obj-backend")
 
 
 def test_object_and_tensor_mixed_round_trip_backends(tq_client_backends) -> None:
@@ -316,7 +316,7 @@ def test_object_and_tensor_mixed_round_trip_backends(tq_client_backends) -> None
     lens = torch.full((n,), 4, dtype=torch.long)
     msg = NonTensorStack(*_object_payload(n).tolist())
 
-    client.kv_batch_put(
+    client.put_samples(
         sample_ids=keys,
         partition_id="mix-backend",
         fields=TensorDict(
@@ -352,4 +352,4 @@ def test_object_and_tensor_mixed_round_trip_backends(tq_client_backends) -> None
     assert isinstance(only_msg["msg"], np.ndarray)
     assert "ids" not in only_msg
 
-    client.kv_clear(sample_ids=None, partition_id="mix-backend")
+    client.clear_samples(sample_ids=None, partition_id="mix-backend")

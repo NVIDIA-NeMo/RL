@@ -71,7 +71,7 @@ def test_multinode_round_trip() -> None:
                 {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
             )
             try:
-                actor_client.kv_batch_put(
+                actor_client.put_samples(
                     sample_ids=keys,
                     partition_id="mn",
                     fields=TensorDict(
@@ -94,5 +94,5 @@ def test_multinode_round_trip() -> None:
         data = driver.get_data(meta)
         assert int(data["x"].sum()) == 0 + 1 + 2 + 3
     finally:
-        driver.kv_clear(sample_ids=None, partition_id="mn")
+        driver.clear_samples(sample_ids=None, partition_id="mn")
         driver.close()
