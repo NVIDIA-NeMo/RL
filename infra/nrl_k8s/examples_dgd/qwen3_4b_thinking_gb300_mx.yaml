@@ -1,0 +1,173 @@
+# DynamoGraphDeployment for Qwen3-4B-Thinking on a GB300 cluster, **MX-enabled**.
+#
+# Sibling of qwen3_4b_thinking_gb300.yaml — identical model + parsers, but with
+# ModelExpress v2 mid-training weight refit wired into the VllmDecodeWorker:
+#
+#   1. DYN_MX_REFIT_ENABLED=1                 → dynamo's main.py sets
+#                                              parallel_config.worker_extension_cls
+#                                              to MxRefitWorkerExtension.
+#   2. MODEL_EXPRESS_URL=modelexpress-server.<ns>.svc.cluster.local:8001
+#                                            → MxV2RefitReceiver knows where to
+#                                              discover the trainer's published
+#                                              weight metadata.
+#   3. RoCE DRA claim                        → each worker pod gets a RoCE NIC
+#                                              for NIXL RDMA pulls.
+#   4. PYTHONPATH=/mnt/rl-workspace/$USER/dynamo-dev:$PYTHONPATH
+#                                            → dev override so Python-only edits
+#                                              to dynamo.vllm.mx_refit.* on the
+#                                              dev pod take effect after a pod
+#                                              restart, no image rebuild.
+#                                              See infra/nrl_k8s/dynamo_mx/README.md.
+#
+# Frontend is unchanged from the non-MX variant.
+#
+# Apply manually for ad-hoc testing, or reference it from an infra YAML's
+# `dynamo:` block.
+#
+# Image expectations: the worker image must include the `modelexpress` Python
+# client (Kavin's `kavink/nemo_rl_moe` branch on ai-dynamo/modelexpress, head
+# 1d8049d5) and NIXL userspace libs. Until we have a stable tag, use the
+# overlay built from infra/nrl_k8s/dynamo_mx/Dockerfile.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: qwen3-4b-thinking-gb300-mx
+  annotations:
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          # Pin to arm64 — the dynamo image is arm64-only and the customer-cpu
+          # pool has mixed arches.
+          kubernetes.io/arch: arm64
+        mainContainer:
+          # Frontend doesn't need MX — same image as the non-MX variant works.
+          image: jwillthomson/dynamo-arm-rl-tokenize-endpoint-91cdc71:latest
+          workingDir: /workspace
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-reset-states
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 1
+      envFromSecret: jothomson-secrets
+      resources:
+        requests:
+          gpu: "1"
+          memory: "64Gi"
+        limits:
+          gpu: "1"
+          memory: "128Gi"
+      extraPodSpec:
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB300
+        # RoCE DRA claim — required for NIXL RDMA. The nrl-k8s CLI will
+        # auto-create the matching ResourceClaimTemplate (named "roce-mx-qwen3-4b")
+        # at apply time based on this reference. Same mechanism as the
+        # training-pod RoCE claims in
+        # infra/nrl_k8s/examples/grpo_mini_swe_nemotron_v3.gb300.infra.yaml.
+        resourceClaims:
+          - name: roce-channel
+            resourceClaimTemplateName: roce-mx-qwen3-4b
+        # Lustre mount: bootstrap_mx.sh sources from
+        # /mnt/rl-workspace/jothomson/nemo-rl/.../bootstrap_mx.sh, the
+        # local-dev dynamo Python tree lives under /mnt/rl-workspace/.../dynamo-dev,
+        # and modelexpress is checked out at /mnt/rl-workspace/.../modelexpress.
+        # Match the volume pattern used by examples_dgd/nemotron_nano_v3_gb300.yaml.
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          # UCX 1.21.x + NIXL 1.1.0 image variant — the stock smoke image
+          # ships a UCX with broken libucm_cuda plugin (libucm_cuda.so fails
+          # to dlopen, breaks UCX-CUDA memory hooks). NIXL team recommended
+          # UCX 1.21.x. Bootstrap script also overrides NIXL_PLUGIN_DIR so
+          # the wheel-bundled UCX backend plugin actually loads. See
+          # infra/nrl_k8s/dynamo_mx/bootstrap_mx.sh.
+          image: jwillthomson/dynamo-arm-rl-tokenize-endpoint-7f964a:latest
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          # bash -c so we can source bootstrap_mx.sh (which exports PYTHONPATH
+          # for modelexpress + our local dynamo edits) before exec'ing the
+          # actual worker. MX_BOOTSTRAP_SKIP_NIXL=1: the dynamo image already
+          # has nixl baked in; skipping the import-detected pip-install avoids
+          # a slow no-op on every cold start.
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              # bootstrap_mx.sh only does PYTHONPATH overrides now —
+              # all heavy deps (nixl, modelexpress) are baked into the
+              # image. The override picks up our local dynamo.vllm.*
+              # edits (dynamo.vllm.mx_refit module, handlers.py changes)
+              # from /mnt/rl-workspace/jothomson/dynamo-dev/ via PEP 420
+              # namespace package shadowing, with no install step.
+              export MX_DEV_USER=jothomson
+              source /mnt/rl-workspace/jothomson/nemo-rl/infra/nrl_k8s/dynamo_mx/bootstrap_mx.sh
+              exec python3 -m dynamo.vllm "$@"
+            - --
+          args:
+            - --model
+            - Qwen/Qwen3-4B-Thinking-2507
+            - --tensor-parallel-size
+            - "1"
+            - --gpu-memory-utilization
+            - "0.85"
+            - --max-model-len
+            - "16384"
+            - --enforce-eager
+            - --dyn-tool-call-parser
+            - hermes
+            - --dyn-reasoning-parser
+            - qwen3
+          # RoCE NIC visible to the user-space NIXL agent.
+          resources:
+            claims:
+              - name: roce-channel
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
+            - name: HF_HOME
+              value: /tmp/hf-cache
+            # ModelExpress v2 refit gating + discovery.
+            - name: DYN_MX_REFIT_ENABLED
+              value: "1"
+            - name: MODEL_EXPRESS_URL
+              # The trainer side sets the same URL in its MxConfig; both halves
+              # must agree for the picker to match same-rank pairs. Replace
+              # "default" with the namespace where modelexpress-server was
+              # applied if it lives elsewhere.
+              value: "modelexpress-server.default.svc.cluster.local:8001"
+            # Force UCX to use GPU-capable transports for NIXL refit.
+            # Without an explicit list, the dynamo image's UCX auto-detects
+            # and may select host-only transports, which surfaces as
+            # "memory is detected as host" warnings + NIXL_ERR_NOT_FOUND
+            # from prep_xfer_dlist (no usable path for cuda-typed descriptors).
+            - name: UCX_TLS
+              value: "cuda_copy,cuda_ipc,rc,sm,self"
+            - name: UCX_LOG_LEVEL
+              value: "info"
+            # PYTHONPATH is exported by the bootstrap script (sourced in the
+            # worker command above), so we don't set it here — that way the
+            # bootstrap's checked-out modelexpress + dynamo-dev paths win even
+            # against an explicit env override.

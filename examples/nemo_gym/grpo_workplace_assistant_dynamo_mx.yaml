@@ -1,0 +1,81 @@
+# Workplace-assistant + Dynamo + **ModelExpress v2 mid-training refit** smoke.
+#
+# Inherits from the non-MX smoke (grpo_workplace_assistant_dynamo_smoke.yaml)
+# and adds:
+#   * cluster.weight_sync.method = "mx"  — selects the MX v2 path in
+#     refit_policy_generation (nemo_rl/algorithms/grpo.py:1170).
+#   * mx_config — knobs forwarded to the DGD workers' MxV2RefitReceiver via
+#     the Dynamo Endpoint RPC. Names mirror nemo_rl.distributed.mx_helpers.MxConfig.
+#   * 2 training steps (vs the smoke's 1) so we exercise at least one refit
+#     cycle. With method="mx" + a real receiver on the DGD side, step 2's
+#     rollouts should reflect the policy update from step 1.
+#
+# Run against the MX-enabled DGD: qwen3_4b_thinking_gb300_mx.yaml (NOT the
+# stock smoke DGD). The paired infra YAML below points at it.
+
+defaults: grpo_workplace_assistant_dynamo_smoke.yaml
+
+grpo:
+  # One refit cycle to validate. Bumping later once the e2e works.
+  max_num_steps: 2
+
+policy:
+  # Kavin's MX commit (d58dca07) only adds stream_weights_via_mx to
+  # DTensorPolicyWorker. The parent smoke recipe enables Megatron; flip to
+  # DTensor here so refit can dispatch via MX. Megatron MX support is a
+  # follow-up (see /mnt/rl-workspace/jothomson/.claude/plans/typed-swimming-ladybug.md).
+  megatron_cfg:
+    enabled: false
+  dtensor_cfg:
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  # DTensor worker reads policy.optimizer.* directly (Megatron worker reads
+  # policy.megatron_cfg.optimizer instead). The parent smoke recipe sets
+  # policy.optimizer=null because it's Megatron-based; re-populate it for
+  # DTensor here. Matches the AdamW defaults from examples/configs/grpo_math_1B.yaml.
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-7
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: []
+
+  # Receiver-side polling: the DGD workers watch the MX server for new
+  # versions and self-refit, so the trainer doesn't need to know the
+  # dynamo endpoint topology at all. The dynamo_namespace / worker_component
+  # fields are no longer required and have been dropped from the config.
+
+cluster:
+  weight_sync:
+    method: "mx"
+    # The trainer + DGD workers must agree on this URL and on most of the
+    # MX flags; they encode the picker contract (same-rank pairing, MoE
+    # filtering). Defaults below match nemo_rl.distributed.mx_helpers.MxConfig.
+    mx_config:
+      enabled: true
+      mx_server_url: "modelexpress-server.default.svc.cluster.local:8001"
+      timeout_seconds: 300.0
+      # Required on multi-subnet RDMA fabrics (GB200/EFA). Safe on single-subnet
+      # because the trainer also publishes for its own rank.
+      same_rank_only: true
+      # Disable for the smoke — only one inference replica, no second receiver
+      # to fan out to.
+      tree_scale_out: false
+      # Qwen3-4B is dense; the filter is a no-op but harmless.
+      moe_expert_filter: false
+      nic_pin: "auto"
+      retain_latest_k: 1
