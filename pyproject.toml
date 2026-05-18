@@ -51,7 +51,8 @@ dependencies = [
   "pillow>=12.1.1",
   "torchvision==0.26.0",
   # Keep the base range broad enough while allowing backend extras to tighten as needed.
-  "transformers>=5.3.0,<5.9.0",
+  # Floor raised to 5.5.0 for Gemma 4 support.
+  "transformers>=5.5.0,<5.9.0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "mlflow>=3.13.0",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
@@ -118,7 +119,8 @@ automodel = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  "transformers>=5.3.0,<5.4.0",
+  "transformers>=5.5.0,<5.9.0",
+  "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
@@ -563,7 +565,7 @@ exclude = '''
 '''
 
 [tool.pytest.ini_options]
-addopts = "--durations=100 -s -rA -x"
+addopts = "--durations=100 -s -rA"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
