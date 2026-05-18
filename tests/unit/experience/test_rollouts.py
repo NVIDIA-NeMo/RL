@@ -38,11 +38,11 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutManager
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
-    run_async_nemo_gym_rollout_by_prompt,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation import configure_generation_config
@@ -1035,13 +1035,13 @@ def single_multi_step_calculator_input_sample(rollout_tokenizer):
 
 
 @pytest.mark.nemo_gym
-def test_run_async_nemo_gym_rollout_by_prompt(
+def test_async_nemo_gym_rollout_manager(
     nemo_gym,  # noqa: F811
     nemo_gym_vllm_generation,  # noqa: F811
     nemo_gym_sanity_test_data,  # noqa: F811
     nemo_gym_tokenizer,  # noqa: F811
 ):
-    """Standalone test for run_async_nemo_gym_rollout_by_prompt.
+    """Standalone test for AsyncNemoGymRolloutManager.
 
     Given 1 prompt with num_generations_per_prompt=N, asserts:
     - output is a PromptGroupRecord with N Completion objects
@@ -1076,18 +1076,14 @@ def test_run_async_nemo_gym_rollout_by_prompt(
     }
     num_generations = 2
 
-    record = asyncio.run(
-        run_async_nemo_gym_rollout_by_prompt(
-            policy_generation=nemo_gym_vllm_generation,
-            input_sample=single_prompt,
-            tokenizer=nemo_gym_tokenizer,
-            task_to_env={"nemo_gym": nemo_gym},
-            generation_config=nemo_gym_vllm_generation.cfg,
-            num_generations_per_prompt=num_generations,
-            max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
-            max_rollout_turns=None,
-        )
+    manager = AsyncNemoGymRolloutManager(
+        tokenizer=nemo_gym_tokenizer,
+        task_to_env={"nemo_gym": nemo_gym},
+        generation_config=nemo_gym_vllm_generation.cfg,
+        num_generations_per_prompt=num_generations,
+        max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
     )
+    record = asyncio.run(manager(single_prompt))
 
     assert isinstance(record, PromptGroupRecord)
     assert len(record.completions) == num_generations, (
@@ -1127,16 +1123,16 @@ def test_run_async_nemo_gym_rollout_by_prompt(
 
 
 @pytest.mark.nemo_gym
-def test_run_async_nemo_gym_rollout_by_prompt_matches_original(
+def test_async_nemo_gym_rollout_manager_matches_original(
     nemo_gym,  # noqa: F811
     nemo_gym_vllm_generation,  # noqa: F811
     nemo_gym_sanity_test_data,  # noqa: F811
     nemo_gym_tokenizer,  # noqa: F811
 ):
-    """Comparison test: _by_prompt output is structurally equivalent to the original.
+    """Comparison test: AsyncNemoGymRolloutManager output is structurally equivalent to the original.
 
     Calls run_async_nemo_gym_rollout with a batch of N identical rows,
-    then calls run_async_nemo_gym_rollout_by_prompt with 1 prompt, N generations.
+    then calls AsyncNemoGymRolloutManager with 1 prompt, N generations.
     Asserts that both produce N results and rewards are in the same numeric domain.
     """
     import tempfile
@@ -1194,18 +1190,14 @@ def test_run_async_nemo_gym_rollout_by_prompt_matches_original(
         max_rollout_turns=None,
     )
 
-    record = asyncio.run(
-        run_async_nemo_gym_rollout_by_prompt(
-            policy_generation=nemo_gym_vllm_generation,
-            input_sample=single_prompt,
-            tokenizer=nemo_gym_tokenizer,
-            task_to_env={"nemo_gym": nemo_gym},
-            generation_config=nemo_gym_vllm_generation.cfg,
-            num_generations_per_prompt=num_generations,
-            max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
-            max_rollout_turns=None,
-        )
+    manager = AsyncNemoGymRolloutManager(
+        tokenizer=nemo_gym_tokenizer,
+        task_to_env={"nemo_gym": nemo_gym},
+        generation_config=nemo_gym_vllm_generation.cfg,
+        num_generations_per_prompt=num_generations,
+        max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
     )
+    record = asyncio.run(manager(single_prompt))
 
     # Both should produce N completions
     assert len(original_result.final_batch["message_log"]) == num_generations

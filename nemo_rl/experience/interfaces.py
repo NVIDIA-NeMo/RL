@@ -37,3 +37,4 @@ class PromptGroupRecord:
     extra_env_info: Optional[dict[str, Any]]
     metadata: dict[str, Any]
     completions: list["Completion"]
+    rollout_metrics: dict[str, Any]
