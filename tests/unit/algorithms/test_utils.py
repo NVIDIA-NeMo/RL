@@ -18,7 +18,7 @@ from datetime import datetime
 import pytest
 import torch
 
-from nemo_rl.algorithms.grpo import MasterConfig
+from nemo_rl.algorithms.grpo import AsyncGRPOConfig, MasterConfig
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_tokenizer,
@@ -313,7 +313,7 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
 
 def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     master_config = _base_master_config(colocated=False)
-    master_config.grpo["async_grpo"] = {"enabled": True}
+    master_config.grpo.async_grpo = AsyncGRPOConfig(enabled=True, max_trajectory_age_steps=1)
 
     timing_metrics = {
         "policy_and_reference_logprobs": 2.0,

@@ -1376,11 +1376,11 @@ def test_grpo_train_collects_generation_logger_metrics(
     )
 
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo["max_num_steps"] = 1
-    master_config.grpo["max_num_epochs"] = 1
-    master_config.grpo["val_period"] = 0
-    master_config.grpo["val_at_start"] = False
-    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.use_dynamic_sampling = False
 
     grpo_mod.grpo_train(
         mock_grpo_components["policy"],
@@ -1419,12 +1419,12 @@ def test_grpo_train_skips_reference_policy_logprobs_when_configured(
     """
     master_config = mock_grpo_components["master_config"]
     master_config.loss_fn.reference_policy_kl_penalty = 0
-    master_config.grpo["skip_reference_policy_logprobs_calculation"] = True
-    master_config.grpo["max_num_steps"] = 1
-    master_config.grpo["max_num_epochs"] = 1
-    master_config.grpo["val_period"] = 0
-    master_config.grpo["val_at_start"] = False
-    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.grpo.skip_reference_policy_logprobs_calculation = True
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.use_dynamic_sampling = False
 
     if train_func == async_grpo_train:
         master_config.policy["generation"]["colocated"]["enabled"] = False
@@ -1508,12 +1508,12 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
     """
     master_config = mock_grpo_components["master_config"]
     master_config.loss_fn.force_on_policy_ratio = True
-    master_config.grpo["seq_logprob_error_threshold"] = None
-    master_config.grpo["max_num_steps"] = 1
-    master_config.grpo["max_num_epochs"] = 1
-    master_config.grpo["val_period"] = 0
-    master_config.grpo["val_at_start"] = False
-    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.grpo.seq_logprob_error_threshold = None
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.use_dynamic_sampling = False
 
     if train_func == async_grpo_train:
         master_config.policy["generation"]["colocated"]["enabled"] = False
@@ -1588,7 +1588,7 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
     """Test that GRPO training loop exits when max_num_steps is reached"""
     # Set max steps to 12
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo["max_num_steps"] = 12
+    master_config.grpo.max_num_steps = 12
 
     grpo_save_state = _default_grpo_save_state()
 
@@ -1661,8 +1661,8 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
     """Test that GRPO training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo["max_num_epochs"] = 2
-    master_config.grpo["max_num_steps"] = 100
+    master_config.grpo.max_num_epochs = 2
+    master_config.grpo.max_num_steps = 100
 
     grpo_save_state = _default_grpo_save_state()
 
@@ -1713,8 +1713,8 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
     """Test that GRPO training loop exits when timeout is reached"""
     # Set max steps and epochs to large numbers
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo["max_num_steps"] = 100
-    master_config.grpo["max_num_epochs"] = 10
+    master_config.grpo.max_num_steps = 100
+    master_config.grpo.max_num_epochs = 10
 
     grpo_save_state = _default_grpo_save_state()
 
