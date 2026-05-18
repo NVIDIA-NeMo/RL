@@ -78,13 +78,6 @@ class VllmGeneration(GenerationInterface):
                 "When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP. "
                 "Please update your configuration to set expert_parallel_size to a multiple of tensor_parallel_size."
             )
-            if self.ep_size != self.tp_size:
-                # vLLM's EP = DP * TP, so here we need to use DP inside vLLM.
-                assert not self.cfg["vllm_cfg"]["async_engine"], (
-                    "vLLM async_engine has some issues when using DP inside vLLM. "
-                    "Please update your configuration to set `policy.generation.vllm_cfg.async_engine=false`. "
-                    "See https://github.com/NVIDIA-NeMo/RL/issues/1101 for more details."
-                )
 
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
         top_k: int | None = self.cfg["top_k"]
@@ -439,14 +432,15 @@ class VllmGeneration(GenerationInterface):
             else "init_collective"
         )
 
-        # Prepare rank
+        # Prepare rank. When using vLLM DP, workers in same vLLM instance but different vLLM DP
+        # ranks have unique ranks, so the rank prefix for same vLLM instance are made the same.
         total_workers = len(self.worker_group.workers)
-        if self.dp_size == 0:
-            raise RuntimeError(
-                "Data parallel size is zero, cannot initialize collective."
-            )
-        workers_per_group = total_workers // self.dp_size
-        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+        workers_per_dp_rank = total_workers // self.dp_size
+        workers_per_vllm_instance = workers_per_dp_rank * self.vllm_dp_size
+        rank_prefix_list = []
+        for dp_rank in range(self.dp_size):
+            vllm_instance_idx = dp_rank // self.vllm_dp_size
+            rank_prefix_list.append(vllm_instance_idx * workers_per_vllm_instance)
 
         # Send world_size and rank for init collective to all workers
         futures = self.worker_group.run_all_workers_multiple_data(

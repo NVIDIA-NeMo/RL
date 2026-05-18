@@ -473,6 +473,18 @@ class BaseVllmGenerationWorker:
             port_list = eval(os.environ["AVAILABLE_PORT_LIST"])
             os.environ["VLLM_DP_MASTER_IP"] = addr_list[leader_rank]
             os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[leader_rank])
+            # Each Ray actor owns exactly one DP rank, so force external LB.
+            # Otherwise vLLM's AsyncLLM picks DPLBAsyncMPClient (expects a
+            # coordinator → trips `assert stats_update_address is not None`).
+            # Pass DP size/rank in args so vLLM skips the offline-SPMD env-var
+            # path that sets data_parallel_rank_local and breaks the external-LB
+            # handshake (`assert not handshake_local_only`).
+            if self.cfg["vllm_cfg"].get("async_engine", False):
+                vllm_kwargs["data_parallel_size"] = int(os.environ["VLLM_DP_SIZE"])
+                vllm_kwargs["data_parallel_rank"] = int(os.environ["VLLM_DP_RANK"])
+                vllm_kwargs["data_parallel_external_lb"] = True
+                vllm_kwargs["data_parallel_address"] = os.environ["VLLM_DP_MASTER_IP"]
+                vllm_kwargs["data_parallel_rpc_port"] = int(os.environ["VLLM_DP_MASTER_PORT"])
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
