@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# Re-submit qwen3-235b-swe-perf-rayonly variant (Ray-opt PR #1944 only — NO HybridEP,
-# NO FP8, NO skip_logprob, BF16 KV, alltoall dispatcher) for n=19 post-warmup completion.
-# Original 11772327 (Iteration 0 baseline) timed out at 4h with n=18 post-warmup steps;
-# this rerun gives matching n=19 coverage for the 3-way fair comparison vs:
-#   - Track A: 11835558 (FP8 KV + FA3 + HybridEP) — 23 clean steps captured
-#   - HybridEP-only: 11847579 (BF16 KV + HybridEP) — IN FLIGHT n=19 rerun
+# Re-submit qwen3-235b-swe-perf-hybridep variant (BF16 KV, HybridEP, NO FP8, NO skip_logprob)
+# for n=19 post-warmup completion. Original 11795544 killed by OccupiedIdleGPUsJobReaper
+# at 2:46h with only 17 steps started. Pivot: batch_long partition, 6h time limit, new
+# EXP_NAME suffix to avoid CKPT_DIR / log overwrite with original 11795544.
 #
 # Tokens must be exported in the calling shell (WANDB_API_KEY, HF_TOKEN). No fallback values.
 set -euo pipefail
@@ -12,7 +10,7 @@ set -euo pipefail
 : "${WANDB_API_KEY:?WANDB_API_KEY must be exported in the environment}"
 : "${HF_TOKEN:?HF_TOKEN must be exported in the environment}"
 
-VARIANT=ray_only
+VARIANT=hybridep
 DRY_RUN="${DRY_RUN:-false}"
 
 REPO_DIR="/lustre/fsw/portfolios/coreai/users/sna/repos/nemo-rl-qwen-swe"
@@ -22,10 +20,15 @@ DATA_PATH="/lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_
 CONFIG_PATH="${REPO_DIR}/grpo_qwen3_235b_swe.yaml"
 CONTAINER="/lustre/fsw/portfolios/coreai/users/yukih/enroot-images/nvcr.io/nvidian/nemo-rl:7684dc2-45115915.squashfs"
 
-# ray_only variant: empty overrides (matches submit_perf_variant.sh case ray_only)
-VARIANT_TAG="rayonly-n19rerun-v2"
-EXTRA_OVERRIDES=""
-EXTRA_ENVS=""
+# hybridep variant overrides (matches submit_perf_variant.sh case hybridep)
+VARIANT_TAG="hybridep-n19rerun-v2"
+EXTRA_OVERRIDES="  policy.megatron_cfg.moe_token_dispatcher_type=flex \
+  ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep \
+  policy.megatron_cfg.moe_shared_expert_overlap=True"
+EXTRA_ENVS="  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 \
+  USE_MNNVL=False \
+  PYTHONPATH=/lustre/fsw/portfolios/coreai/users/sna/hybridep_overlay_cp312/site-packages:${PYTHONPATH:-}"
+export TORCH_CUDA_ARCH_LIST_OVERRIDE="9.0"
 
 EXP_NAME="qwen3-235b-swe-perf-${VARIANT_TAG}"
 CKPT_DIR="${REPO_DIR}/results/${EXP_NAME}"
