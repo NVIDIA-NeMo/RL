@@ -119,7 +119,7 @@ def main():
     # But for the random dataset case, we don't need real model weights — vLLM can use dummy
     # weights since outputs are not validated against any ground truth.
     if is_random_dataset:
-        config["generation"]["vllm_cfg"]["load_format"] = "dummy"
+        config.generation["vllm_cfg"]["load_format"] = "dummy"
 
     # Setup data
     if is_random_dataset:
