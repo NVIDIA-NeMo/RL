@@ -157,7 +157,7 @@ put, not the partition-wide schema. See `interfaces.py` for the ABC.
 | `fields` | Fields written by the put that minted this meta |
 | `sequence_lengths` | Per-row valid (unpadded) lengths — drives length-balanced sharding |
 | `tags` | `list[dict]` 1:1 with `keys` — per-row primitive sidecar for filter-without-fetch |
-| `extra_info` | Batch-level bag (`rollout_metrics`, `pad_to_multiple`, packing metadata) |
+| `extra_info` | Batch-level bag (`rollout_metrics`, `pad_to_multiple`, `global_forward_pad_seqlen`, packing metadata) |
 | `task_name` | Optional consumer tag, carried through |
 
 **Hard rules** — `kv_batch_put` fields must be `TensorDict` of tensors
@@ -373,6 +373,35 @@ balances on actual lengths; padding is reapplied per shard.
 input_ids:             [t0, t1, …, t1203,  0, 0, 0, 0]   # 1208 elems
 input_lengths:                                   1204     # actual
 meta.sequence_lengths:                           1204     # what seqpack uses ✓
+```
+
+**Gotcha — DP-rank seq-dim alignment (`global_forward_pad_seqlen`)**:
+Each DP rank's `_fetch` would otherwise pad to its slice's local max,
+so two ranks in the same step could forward at different seq dims.
+That breaks any collective that assumes cross-rank shape uniformity
+(mcore MoE all-to-all, CP, etc.). The data plane handles this with a
+single per-batch cap minted on the driver:
+
+* `TQPolicy._stamp_pad_seqlen(meta)` runs before every fan-out
+  (`train_from_meta`, `_logprob_dispatch`, `read_from_dataplane`).
+  Idempotent — sets `meta.extra_info["global_forward_pad_seqlen"]`
+  to `round_up(max(meta.sequence_lengths), max(pad_to_multiple,
+  sequence_length_round))` on first call, no-op on subsequent calls.
+* `shard_meta_for_dp` propagates `extra_info` to every per-rank meta
+  via `dict(meta.extra_info)` — so all ranks see the same target.
+* Worker `_fetch` and driver `read_columns` both pass
+  `pad_to_seqlen = meta.extra_info["global_forward_pad_seqlen"]`
+  into `codec.materialize`, which right-pads the seq dim to that
+  absolute target. All DP ranks within a step therefore return
+  columns at one identical seq dim.
+
+Opt out in tests with `_fetch(..., dp_aligned_seq_len=False)` to
+observe per-rank local-pad behavior.
+
+```
+# 4 DP ranks, slice maxes: [1208, 1320, 944, 1080]; sequence_length_round=64
+global_forward_pad_seqlen = round_up(1320, 64) = 1344
+# All 4 ranks pad their materialized tensors to seq_dim=1344.
 ```
 
 ---
