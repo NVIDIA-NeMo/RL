@@ -72,20 +72,20 @@ TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 class DistillationConfig(BaseModel, extra="allow"):
     # Training configuration
-    num_prompts_per_step: int
-    num_generations_per_prompt: int
-    max_rollout_turns: int  # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
-    max_num_steps: int  # maximum number of steps to train for
-    max_num_epochs: int  # maximum number of epochs to train for
-    val_batch_size: int
-    val_period: int
-    val_at_start: bool
+    num_prompts_per_step: int = 128
+    num_generations_per_prompt: int = 1
+    max_rollout_turns: int = 1  # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+    max_num_steps: int = 1000  # maximum number of steps to train for
+    max_num_epochs: int = 10  # maximum number of epochs to train for
+    val_batch_size: int = 64
+    val_period: int = 20
+    val_at_start: bool = False
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
-    val_at_end: bool
-    max_val_samples: int
-    topk_logits_k: int
-    seed: int
+    val_at_end: bool = False
+    max_val_samples: int = 512
+    topk_logits_k: int = 64
+    seed: int = 42
 
 
 class DistillationSaveState(BaseModel, extra="allow"):
