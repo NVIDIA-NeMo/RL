@@ -58,6 +58,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -160,9 +161,6 @@ def get_cpu_state_dict(
 
     torch.cuda.synchronize()
     return new_state_dict
-
-
-from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.

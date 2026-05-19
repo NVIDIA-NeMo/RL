@@ -37,6 +37,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.data import (
@@ -186,9 +187,6 @@ def get_train_context(
         if autocast_enabled:
             stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
         yield
-
-
-from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.

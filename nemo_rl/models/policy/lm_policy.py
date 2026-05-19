@@ -368,12 +368,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return futures
 
     # ── DP-shard helpers ────────────────────────────────────────────────
-    # Shared between this Policy class (in-memory dispatch) and the
-    # planned ``TQPolicy(Policy)`` subclass (TQ-mediated dispatch). Each
-    # sharder mutates ``self.dynamic_batching_args`` /
-    # ``self.sequence_packing_args`` to set the appropriate
-    # ``max_tokens_per_microbatch`` (logprob_mb_tokens vs train_mb_tokens),
-    # exactly as the legacy bodies do today.
+    # DRY for Policy's logprob/train methods only. The data-plane sibling
+    # TQPolicy shards KVBatchMeta via ``shard_meta_for_dp``; the
+    # driver-on-data vs driver-on-meta split is by design.
     def _shard_for_logprob(
         self,
         data: BatchedDataDict[Any],

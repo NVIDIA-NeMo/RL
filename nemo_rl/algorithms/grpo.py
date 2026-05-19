@@ -208,7 +208,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
-    data_plane: NotRequired[DataPlaneConfig]
+    data_plane: Optional[DataPlaneConfig] = None
 
 
 # ===============================================================================
@@ -2608,7 +2608,7 @@ def async_grpo_train(
     )
 
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
-        max_size=optimal_buffer_size,
+        max_size=optimal_buffer_size
     )
 
     _tc_py_exec = get_actor_python_env(

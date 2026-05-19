@@ -707,9 +707,6 @@ def remap_dataset_keys(
 # Fields ridden by `bulk_batch` and consumed by
 # :func:`reconstruct_message_log` to rebuild the list-of-dicts view.
 MESSAGE_LOG_BULK_FIELDS = ("turn_lengths", "turn_roles", "turn_contents")
-# Slim per-sample field carried alongside the slice (not the bulk wire);
-# consumed by :func:`apply_reward_shaping` on the driver.
-MESSAGE_LOG_SLICE_FIELD = "response_token_lengths"
 
 
 def decompose_message_log(
