@@ -28,7 +28,7 @@ class RewardShapingConfig(BaseModel, extra="allow"):
     penalties for responses that exceed the maximum response length threshold.
     """
 
-    enabled: bool
+    enabled: bool = False
 
     # The length of the buffer to penalize responses that exceed the maximum response length threshold.
     # Responses of length greater than overlong_buffer_length + max_response_length will
