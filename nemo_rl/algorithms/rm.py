@@ -54,17 +54,17 @@ def _default_rm_save_state() -> RMSaveState:
 
 
 class RMConfig(BaseModel, extra="allow"):
-    max_num_steps: int
-    max_num_epochs: int
-    val_period: int
-    val_batches: int
-    val_global_batch_size: int
-    val_micro_batch_size: int
-    val_at_start: bool
+    max_num_steps: int = -1
+    max_num_epochs: int = 1
+    val_period: int = 16
+    val_batches: int = -1
+    val_global_batch_size: int = 32
+    val_micro_batch_size: int = 1
+    val_at_start: bool = False
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
-    val_at_end: bool
-    seed: int
+    val_at_end: bool = False
+    seed: int = 42
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -77,11 +77,11 @@ class MasterConfig(BaseModel, extra="allow"):
 
 
 class RMValMetrics(BaseModel, extra="allow"):
-    loss: float
-    accuracy: float
-    rewards_chosen_mean: float
-    rewards_rejected_mean: float
-    num_valid_samples: float
+    loss: float = 0.0
+    accuracy: float = 0.0
+    rewards_chosen_mean: float = 0.0
+    rewards_rejected_mean: float = 0.0
+    num_valid_samples: float = 0.0
 
 
 # =======================================================
