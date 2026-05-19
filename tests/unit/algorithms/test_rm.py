@@ -19,7 +19,13 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.loss import PreferenceLossFn
-from nemo_rl.algorithms.rm import MasterConfig, _default_rm_save_state, rm_train, setup
+from nemo_rl.algorithms.rm import (
+    MasterConfig,
+    RMConfig,
+    _default_rm_save_state,
+    rm_train,
+    setup,
+)
 
 
 @pytest.fixture
@@ -82,16 +88,16 @@ def mock_components():
     # Create mock master config
     master_config = MasterConfig.model_construct(
         **{
-            "rm": {
-                "max_num_steps": 5,
-                "max_num_epochs": 2,
-                "val_period": 100,
-                "val_batches": 1,
-                "val_global_batch_size": 1,
-                "val_micro_batch_size": 1,
-                "val_at_start": False,
-                "val_at_end": False,
-            },
+            "rm": RMConfig.model_construct(
+                max_num_steps=5,
+                max_num_epochs=2,
+                val_period=100,
+                val_batches=1,
+                val_global_batch_size=1,
+                val_micro_batch_size=1,
+                val_at_start=False,
+                val_at_end=False,
+            ),
             "policy": {
                 "train_global_batch_size": 1,
                 "make_sequence_length_divisible_by": 1,
@@ -142,7 +148,7 @@ def test_context_parallel_rejected_for_dtensor_rm():
                     "cpu_offload": False,
                 },
             },
-            "rm": {"seed": 42},
+            "rm": RMConfig.model_construct(seed=42),
             "data": {},
             "logger": {},
             "cluster": {},
@@ -176,7 +182,7 @@ def test_context_parallel_allowed_when_one():
                     "cpu_offload": False,
                 },
             },
-            "rm": {"seed": 42},
+            "rm": RMConfig.model_construct(seed=42),
             "data": {},
             "logger": {},
             "cluster": {},
@@ -191,7 +197,7 @@ def test_context_parallel_allowed_when_one():
 def test_exit_on_max_steps(mock_components):
     """Test that training loop exits when max_num_steps is reached"""
     # Set max steps to 12, which is less than len(train_dataloader) * max_num_epochs
-    mock_components["master_config"].rm["max_num_steps"] = 12
+    mock_components["master_config"].rm.max_num_steps = 12
 
     rm_save_state = _default_rm_save_state()
 
@@ -215,8 +221,8 @@ def test_exit_on_max_steps(mock_components):
 def test_exit_on_max_epochs(mock_components):
     """Test that training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number
-    mock_components["master_config"].rm["max_num_epochs"] = 2
-    mock_components["master_config"].rm["max_num_steps"] = 100
+    mock_components["master_config"].rm.max_num_epochs = 2
+    mock_components["master_config"].rm.max_num_steps = 100
 
     rm_save_state = _default_rm_save_state()
 
@@ -240,8 +246,8 @@ def test_exit_on_max_epochs(mock_components):
 def test_exit_on_timeout(mock_components, capsys):
     """Test that training loop exits when timeout is reached"""
     # Set max steps and epochs to large numbers
-    mock_components["master_config"].rm["max_num_steps"] = 100
-    mock_components["master_config"].rm["max_num_epochs"] = 10
+    mock_components["master_config"].rm.max_num_steps = 100
+    mock_components["master_config"].rm.max_num_epochs = 10
 
     rm_save_state = _default_rm_save_state()
 
