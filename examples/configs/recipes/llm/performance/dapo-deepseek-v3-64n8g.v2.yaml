@@ -36,6 +36,8 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 1536
+  sequence_packing:
+    fuse_loss: true
   dtensor_cfg:
     enabled: false
   make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
