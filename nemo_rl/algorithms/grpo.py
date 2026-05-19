@@ -163,7 +163,7 @@ class RewardScalingConfig(BaseModel, extra="allow"):
     [target_min, target_max]. Refer to the scale_rewards function for the implementation.
     """
 
-    enabled: bool
+    enabled: bool = False
     source_min: float = 0.0
     source_max: float = 1.0
     target_min: float = 0.0
@@ -171,11 +171,11 @@ class RewardScalingConfig(BaseModel, extra="allow"):
 
 
 class AsyncGRPOConfig(BaseModel, extra="allow"):
-    enabled: bool
+    enabled: bool = False
     # Maximum trajectory age in training steps for samples drawn from the
     # async replay buffer. Trajectories older than this are excluded during
     # sampling; buffer sizing also scales with this value.
-    max_trajectory_age_steps: int
+    max_trajectory_age_steps: int = 1
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: bool = False
@@ -186,7 +186,7 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
 class AdvEstimatorConfig(BaseModel, extra="allow"):
     """Configuration for advantage estimator (GRPO, GDPO, or Reinforce++)."""
 
-    name: str  # "grpo", "gdpo", or "reinforce_plus_plus"
+    name: str = "grpo"  # "grpo", "gdpo", or "reinforce_plus_plus"
     # GRPO specific
     normalize_rewards: Optional[bool] = None
     use_leave_one_out_baseline: Optional[bool] = None
@@ -239,27 +239,27 @@ _REWARD_PENALTY_FLAGS = (
 
 
 class GRPOConfig(BaseModel, extra="allow"):
-    num_prompts_per_step: int
-    num_generations_per_prompt: int
-    max_num_epochs: int
-    max_num_steps: int
-    max_rollout_turns: int
-    normalize_rewards: bool
+    num_prompts_per_step: int = 32
+    num_generations_per_prompt: int = 16
+    max_num_epochs: int = 1
+    max_num_steps: int = 1000000
+    max_rollout_turns: int = 1
+    normalize_rewards: bool = True
     # Clipping bounds for normalized advantages to prevent extreme values
     # When set, advantages are clipped to [advantage_clip_low, advantage_clip_high] after normalization
     # Default: null (no clipping)
     advantage_clip_low: float | None = None
     advantage_clip_high: float | None = None
-    use_leave_one_out_baseline: bool
-    val_period: int
+    use_leave_one_out_baseline: bool = True
+    val_period: int = 10
     # First training step eligible for periodic validation; -1 disables the delay.
-    val_start_at: int
-    val_batch_size: int | None  # None for NeMo-Gym compatibility
-    val_at_start: bool
+    val_start_at: int = -1
+    val_batch_size: int | None = 256  # None for NeMo-Gym compatibility
+    val_at_start: bool = False
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
-    val_at_end: bool
-    max_val_samples: int | None  # None for NeMo-Gym compatibility
+    val_at_end: bool = False
+    max_val_samples: int | None = 256  # None for NeMo-Gym compatibility
     # Early stop: end training once this validation metric (e.g. accuracy,
     # always reported, or pass_k with grouped validation) reaches
     # stop_at_validation_threshold; null disables early stopping.
@@ -268,25 +268,25 @@ class GRPOConfig(BaseModel, extra="allow"):
     # is set.
     stop_at_validation_threshold: float | None = None
     skip_reference_policy_logprobs_calculation: bool = False
-    seed: int
+    seed: int = 42
     async_grpo: Optional[AsyncGRPOConfig] = None
     overlong_filtering: bool = False
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
-    use_dynamic_sampling: bool
+    use_dynamic_sampling: bool = False
     # When using dynamic sampling, the maximum number of batches to generate
     # before throwing an error
     dynamic_sampling_max_gen_batches: int = 5
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: float = 1.0
-    reward_shaping: RewardShapingConfig
-    reward_scaling: RewardScalingConfig
+    reward_shaping: RewardShapingConfig = RewardShapingConfig()
+    reward_scaling: RewardScalingConfig = RewardScalingConfig()
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: bool = False
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
     # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
-    seq_logprob_error_threshold: float | None
+    seq_logprob_error_threshold: float | None = None
     # Advantage value to assign to invalid tool call tokens. When set (e.g. -5.0), overwrites the
     # computed advantage for those tokens to penalize them; absent/None disables the penalty.
     invalid_tool_call_advantage: float | None = None
