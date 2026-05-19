@@ -47,7 +47,9 @@ class DPOSaveState(BaseModel, extra="allow"):
     step: int = 0  # Track step within current epoch
     total_steps: int = 0  # Track total number of steps across all epochs
     consumed_samples: int = 0
-    total_valid_tokens: int = 0  # Track total number of non-padding tokens during training
+    total_valid_tokens: int = (
+        0  # Track total number of non-padding tokens during training
+    )
 
 
 def _default_dpo_save_state() -> DPOSaveState:
@@ -680,7 +682,7 @@ def dpo_train(
                             if hasattr(dpo_save_state, key):
                                 delattr(dpo_save_state, key)
                     if val_metrics is not None:
-                        for key, val in val_metrics.model_dump().items():
+                        for key, val in val_metrics.items():
                             setattr(dpo_save_state, key, val)
 
                     full_metric_name = master_config.checkpointing["metric_name"]
