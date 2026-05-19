@@ -1,0 +1,77 @@
+# A/B baseline arm: vanilla GRPO with the standard hard PPO clip.
+#
+# This recipe is the *control* arm in a back-to-back A/B comparison meant to
+# isolate the effect of swapping the hard PPO clip for CISPO's clipped IS-
+# weight surrogate (arXiv:2506.13585). Pair with:
+#   examples/configs/recipes/llm/cispo-ab-qwen2.5-math-1.5b-instruct-1n8g-cispo.yaml
+# Everything except the loss-fn block is identical between the two arms.
+#
+# Off-policy regime (where CISPO and the hard PPO clip diverge most):
+#   * 32 prompts x 16 generations = 512 trajectories per step
+#   * train_global_batch_size = 128 -> 4 gradient updates per rollout
+#     (matches the GSPO Sec 5.1 reference setting, arXiv:2507.18071)
+#   * KL beta = 0 (CISPO paper Sec 5.1; kept identical in both arms so the
+#     KL regularizer is not a confounder)
+#   * token-level loss, sampling temperature inherited from base
+#
+# NOT in the CISPO PR - this is a local research-validation artifact.
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  max_num_steps: 100
+  val_period: 10
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 256
+  val_batch_size: 256
+  seed: 42
+
+policy:
+  model_name: Qwen/Qwen2.5-Math-1.5B-Instruct
+  tokenizer:
+    name: Qwen/Qwen2.5-Math-1.5B-Instruct
+  train_global_batch_size: 128         # off-policy: 4 grad updates / rollout
+  train_micro_batch_size: 4
+  logprob_batch_size: 4
+  max_total_sequence_length: 1024
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  generation:
+    max_new_tokens: 512
+    vllm_cfg:
+      max_model_len: 1024
+
+data:
+  max_input_seq_length: 512
+
+loss_fn:
+  # GRPO control arm: standard hard PPO clip at +/- 0.2.
+  use_cispo: false
+  reference_policy_kl_penalty: 0.0     # matched to the CISPO arm for fairness
+  reference_policy_kl_type: k3
+  ratio_clip_min: 0.2                  # PPO clip lower bound = 1 - 0.2 = 0.8
+  ratio_clip_max: 0.2                  # PPO clip upper bound = 1 + 0.2 = 1.2
+  ratio_clip_c: null
+  token_level_loss: true
+  use_importance_sampling_correction: false
+  sequence_level_importance_ratios: false
+  force_on_policy_ratio: false
+
+checkpointing:
+  enabled: false                       # research run; skip checkpoint I/O
+
+logger:
+  log_dir: logs/cispo-ab-qwen2.5-math-1.5b-instruct-1n8g-grpo
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: nemo-rl
+    name: cispo-ab-qwen2.5-math-1.5b-instruct-1n8g-grpo
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

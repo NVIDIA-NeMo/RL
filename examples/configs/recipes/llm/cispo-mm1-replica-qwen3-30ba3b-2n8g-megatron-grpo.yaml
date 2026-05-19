@@ -1,0 +1,98 @@
+# MiniMax-M1 replication study (https://arxiv.org/abs/2506.13585), GRPO arm.
+# Minimal-diff copy of workspace-4's proven 2n8g SAPO recipe:
+#   grpo-qwen3-30ba3b-2n8g-megatron-sapo-asym.yaml
+# Only the loss_fn block (and logger names) differs.
+#
+# Three-way A/B/C: this is the GRPO baseline; DAPO and CISPO are at
+#   cispo-mm1-replica-qwen3-30ba3b-2n8g-megatron-dapo.yaml
+#   cispo-mm1-replica-qwen3-30ba3b-2n8g-megatron-cispo.yaml
+# Submit via cispo_mm1_replica.slurm with ARM=grpo|dapo|cispo.
+#
+# Off-policy regime: 32 x 16 = 512 trajectories, train_global_batch_size=128
+# -> 4 gradient updates per rollout (SAPO/GSPO Sec 5.1 setting). KL beta=0,
+# token-level loss, sampling temperature 1.0.
+# NOT in the PR; local research artifact.
+defaults: ../../grpo_math_qwen30ba3b_megatron.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_num_steps: 200
+  val_period: 20
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 128
+  val_batch_size: 128
+
+policy:
+  model_name: Qwen/Qwen3-30B-A3B
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  sequence_packing:
+    enabled: true
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+  megatron_cfg:
+    enabled: true
+    converter_type: LlamaForCausalLM
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    empty_unused_memory_level: 1
+    freeze_moe_router: true
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    optimizer:
+      lr: 3.0e-7
+      min_lr: 3.0e-8
+    scheduler:
+      lr_decay_iters: 500
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-8
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.7
+      enforce_eager: false
+    colocated:
+      enabled: true
+
+loss_fn:
+  # ---- GRPO baseline arm ---- (only the loss_fn block differs across arms)
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: k3
+  ratio_clip_min: 0.2                  # standard PPO/GRPO epsilon
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  token_level_loss: true
+  use_importance_sampling_correction: false
+  sequence_level_importance_ratios: false
+  force_on_policy_ratio: false
+  use_cispo: false
+  # Shared CISPO-style diagnostics across all 3 arms so the GRPO baseline
+  # also reports grpo_would_clip_frac (the gap CISPO claims to close).
+  cispo_diagnostics: true
+  cispo_diag_grpo_eps: 0.2
+  cispo_diag_low_prob_threshold: 0.05
+
+checkpointing:
+  enabled: false
+
+logger:
+  log_dir: logs/cispo-mm1-replica-qwen3-30ba3b-2n8g-megatron-grpo
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb:
+    project: nemo-rl
+    name: cispo-mm1-replica-qwen3-30ba3b-2n8g-megatron-grpo
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2

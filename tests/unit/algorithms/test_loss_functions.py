@@ -679,6 +679,30 @@ def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
     assert metrics_1["probs_ratio"] == metrics_2["probs_ratio"] == 1.0
 
 
+@pytest.mark.parametrize(
+    "incompatible_flag,value",
+    [
+        ("disable_ppo_ratio", True),
+        ("ratio_clip_c", 3.0),
+    ],
+)
+def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_flag, value):
+    """CISPO must reject configs that conflict with its semantics.
+
+    - disable_ppo_ratio removes the pi_theta / pi_theta_old ratio that CISPO
+      uses as the importance weight, so they are mutually exclusive.
+    - ratio_clip_c (dual clipping) runs after the CISPO loss assembly inside
+      ClippedPGLossFn and would silently overwrite it.
+    """
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_cispo=True,
+        **{incompatible_flag: value},
+    )
+    with pytest.raises(AssertionError):
+        ClippedPGLossFn(cfg)
+
+
 def test_clipped_pg_loss_cispo():
     """Tests CISPO (Clipped IS-weight Policy Optimization) path in ClippedPGLossFn.
 
@@ -696,8 +720,7 @@ def test_clipped_pg_loss_cispo():
     device = "cuda"
     data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
 
-    cfg = deepcopy(basic_pg_loss_test_config)
-    cfg["use_cispo"] = True
+    cfg = ClippedPGLossConfig(reference_policy_kl_penalty=0.0, use_cispo=True)
     loss_fn = ClippedPGLossFn(cfg)
 
     adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
@@ -713,7 +736,7 @@ def test_clipped_pg_loss_cispo():
     # --- Hand calculation: CISPO loss = -A * clip(r, 1-ε, 1+ε) * curr_lp (ratio stop-grad) ---
     ratios = torch.exp(curr_lp_masked - prev_lp_masked)  # [0.5, 1.0, 1.5]
     ratios_clamped = torch.clamp(
-        ratios, 1.0 - cfg["ratio_clip_min"], 1.0 + cfg["ratio_clip_max"]
+        ratios, 1.0 - cfg.ratio_clip_min, 1.0 + cfg.ratio_clip_max
     )  # [0.8, 1.0, 1.2]
     cispo_loss_per_token = -adv_masked * ratios_clamped * curr_lp_masked
     expected_loss = torch.mean(cispo_loss_per_token)

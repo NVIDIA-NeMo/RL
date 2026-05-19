@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
@@ -128,10 +129,28 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
-    # If True, add KL penalty to reward instead of loss (used by Reinforce++)
-    use_kl_in_reward: NotRequired[bool]
     # If True, use CISPO (Clipped IS-weight Policy Optimization) from MiniMax-M1.
-    use_cispo: NotRequired[bool]
+    use_cispo: bool = False
+    # If True, log per-step CISPO diagnostic metrics that quantify *why*
+    # CISPO is (or isn't) helping vs hard-clipped GRPO/DAPO. Off by default
+    # because the percentile / boolean-mask reductions add a small amount
+    # of per-step overhead. See ClippedPGLossFn.__call__ for the full list.
+    # Useful in any arm (GRPO / DAPO / CISPO) - the same metrics let the
+    # GRPO baseline tell you how much gradient signal it's losing to its
+    # own hard clip, which is precisely the gap CISPO claims to close.
+    cispo_diagnostics: bool = False
+    # The hard-clip epsilon to use when computing the "what fraction of
+    # tokens would standard GRPO have zeroed the gradient on?" diagnostic.
+    # Defaults to 0.2 (the original PPO/GRPO value). Independent from
+    # ratio_clip_min/ratio_clip_max so we can probe the GRPO-equivalent
+    # behaviour even on a CISPO run with epsilon_high=5.0.
+    cispo_diag_grpo_eps: float = 0.2
+    # Probability threshold under which a token is counted as "low-prob"
+    # (a coarse, tokenizer-free proxy for rare reflective tokens like
+    # "However", "Wait", "Recheck" - see MiniMax-M1 paper §3.1).
+    # Defaults to 0.05; we log the fraction of generated tokens whose
+    # behaviour-policy probability is below this.
+    cispo_diag_low_prob_threshold: float = 0.05
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -227,18 +246,28 @@ class ClippedPGLossFn(LossFunction):
                 "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
             )
 
-        self.use_cispo = cfg.get("use_cispo", False)
+        self.use_cispo = cfg.use_cispo
         if self.use_cispo:
             assert not self.disable_ppo_ratio, (
                 "use_cispo is incompatible with disable_ppo_ratio; "
-            )
-            assert not self.sequence_level_importance_ratios, (
-                "use_cispo is incompatible with sequence_level_importance_ratios; "
-                "CISPO is a token-level loss function"
+                "CISPO needs the pi_theta/pi_theta_old ratio but disable_ppo_ratio removes it"
             )
             assert self.ratio_clip_c is None, (
-                "use_cispo is incompatible with ratio_clip_c; "
-                "ratio_clip_c is not supported when use_cispo=True"
+                "use_cispo is incompatible with dual clipping (ratio_clip_c); "
+                "the dual-clip block runs after the CISPO loss assembly and would "
+                "silently overwrite it. Set ratio_clip_c=null when use_cispo=True."
+            )
+        # CISPO-style diagnostics. Off by default to avoid extra reductions.
+        self.cispo_diagnostics = cfg.cispo_diagnostics
+        self.cispo_diag_grpo_eps = cfg.cispo_diag_grpo_eps
+        self.cispo_diag_low_prob_threshold = cfg.cispo_diag_low_prob_threshold
+        assert self.cispo_diag_grpo_eps > 0, (
+            f"cispo_diag_grpo_eps must be positive, got {self.cispo_diag_grpo_eps}"
+        )
+        assert 0.0 < self.cispo_diag_low_prob_threshold < 1.0, (
+            "cispo_diag_low_prob_threshold must be a probability in (0, 1), "
+            f"got {self.cispo_diag_low_prob_threshold}"
+        )
         if self.truncated_importance_sampling_ratio is not None:
             assert self.use_importance_sampling_correction, (
                 "truncated_importance_sampling_ratio is only supported when use_importance_sampling_correction is True"
@@ -637,6 +666,78 @@ class ClippedPGLossFn(LossFunction):
                 probs_ratio_clamped_min = float("inf")
                 probs_ratio_clamped_max = float("-inf")
 
+        # CISPO-style diagnostics. Designed to be tokenizer-free and cheap:
+        # all reductions are over the same (mask) we already build above. We
+        # log even on GRPO/DAPO arms so the gap CISPO claims to close can be
+        # *measured directly* on the baseline (the would_clip_frac).
+        cispo_diag_metrics: dict[str, float] = {}
+        if self.cispo_diagnostics:
+            with torch.no_grad():
+                eps = self.cispo_diag_grpo_eps
+                detached_ratios = ratios.detach()
+                # "Would standard GRPO have zeroed this token's gradient?"
+                # - positive-advantage tokens lose their gradient when r > 1+eps
+                # - negative-advantage tokens lose their gradient when r < 1-eps
+                adv_pos = (advantages > 0).float()
+                adv_neg = (advantages < 0).float()
+                would_clip_pos = adv_pos * (detached_ratios > 1.0 + eps).float()
+                would_clip_neg = adv_neg * (detached_ratios < 1.0 - eps).float()
+                grpo_would_clip_frac = masked_mean(
+                    would_clip_pos + would_clip_neg,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+                grpo_would_clip_pos_frac = masked_mean(
+                    would_clip_pos,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+                grpo_would_clip_neg_frac = masked_mean(
+                    would_clip_neg,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+
+                if masked_ratios.numel() > 0:
+                    r_t_p50 = torch.quantile(masked_ratios, 0.50).item()
+                    r_t_p95 = torch.quantile(masked_ratios, 0.95).item()
+                    r_t_p99 = torch.quantile(masked_ratios, 0.99).item()
+                else:
+                    r_t_p50 = r_t_p95 = r_t_p99 = float("nan")
+
+                # Coarse, tokenizer-free proxy for "rare reflective tokens":
+                # tokens whose behaviour-policy probability was below the
+                # threshold. CISPO's central claim is that these are exactly
+                # the tokens GRPO's hard clip throws away.
+                low_thr = math.log(self.cispo_diag_low_prob_threshold)
+                low_prob_token = (prev_logprobs < low_thr).float()
+                low_prob_token_frac = masked_mean(
+                    low_prob_token,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+                # Of the would-be-clipped tokens, what fraction are also
+                # "low-prob"? A high number here is the smoking-gun
+                # confirmation of the paper's diagnosis.
+                would_clip_and_low_prob = masked_mean(
+                    (would_clip_pos + would_clip_neg) * low_prob_token,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+
+                cispo_diag_metrics = {
+                    "cispo_diag/grpo_would_clip_frac": grpo_would_clip_frac,
+                    "cispo_diag/grpo_would_clip_pos_frac": grpo_would_clip_pos_frac,
+                    "cispo_diag/grpo_would_clip_neg_frac": grpo_would_clip_neg_frac,
+                    "cispo_diag/r_t_p50": r_t_p50,
+                    "cispo_diag/r_t_p95": r_t_p95,
+                    "cispo_diag/r_t_p99": r_t_p99,
+                    "cispo_diag/low_prob_token_frac": low_prob_token_frac,
+                    "cispo_diag/would_clip_and_low_prob_frac": would_clip_and_low_prob,
+                    "cispo_diag/grpo_eps": eps,
+                    "cispo_diag/low_prob_threshold": self.cispo_diag_low_prob_threshold,
+                }
+
         # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
         # by either sequence or token count, depending on particular metric.
         # To get the true metric, you'll need to sum over the microbatch.
@@ -659,6 +760,7 @@ class ClippedPGLossFn(LossFunction):
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
+                **cispo_diag_metrics,
             },
         )
 
