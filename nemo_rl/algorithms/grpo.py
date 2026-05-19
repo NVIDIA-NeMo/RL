@@ -265,10 +265,14 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    grpo_save_state: Optional[GRPOSaveState] = cast(
-        Optional[GRPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
-    )
-    if grpo_save_state is None:
+    loaded_state = checkpointer.load_training_info(last_checkpoint_path)
+    if loaded_state is not None:
+        grpo_save_state = (
+            GRPOSaveState(**loaded_state)
+            if isinstance(loaded_state, dict)
+            else loaded_state
+        )
+    else:
         grpo_save_state = _default_grpo_save_state()
 
     # ==========================
