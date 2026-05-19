@@ -54,6 +54,7 @@ dependencies = [
   "mlflow>=3.11.1",
   "nvidia-nvshmem-cu13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
+  "comet-ml>=3.50.0",
   "pyzmq",
   "decord2",
   "soundfile>=0.13.1",

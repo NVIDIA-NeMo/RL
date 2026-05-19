@@ -245,6 +245,7 @@ logger:
     tensorboard_enabled: true
     mlflow_enabled: false
     swanlab_enabled: false
+    comet_enabled: false
     monitor_gpus: true
     wandb:
         project: "nemo-distillation"
@@ -258,6 +259,12 @@ logger:
         experiment_name: "distillation-dev"
         run_name: "distillation-math-cl-logger"
         tracking_uri: "http://localhost:5000"
+    comet:
+        workspace: "nemo-rl"
+        project_name: "nemo-distillation"
+        experiment_name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        tags: []
+        online: true
     gpu_monitoring:
         collection_interval: 10
         flush_interval: 10

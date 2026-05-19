@@ -43,6 +43,14 @@ from torch.utils.tensorboard import SummaryWriter
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
+# Comet's SDK monkey-patches several libraries on import to capture extra
+# information; we filter the resulting warning since we disable that behavior
+# explicitly via Experiment.disable_mp() in CometLogger.
+logging.getLogger("comet_ml.experiment").addFilter(
+    lambda record: "import comet_ml before" not in record.getMessage()
+)
+import comet_ml  # noqa: E402
+
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
 
@@ -70,6 +78,14 @@ class MLflowConfig(TypedDict):
     artifact_location: NotRequired[str | None]
 
 
+class CometConfig(TypedDict):
+    workspace: str
+    project_name: str
+    experiment_name: NotRequired[str]
+    tags: NotRequired[list[str]]
+    online: NotRequired[bool]
+
+
 class GPUMonitoringConfig(TypedDict):
     collection_interval: int | float
     flush_interval: int | float
@@ -81,10 +97,12 @@ class LoggerConfig(TypedDict):
     swanlab_enabled: bool
     tensorboard_enabled: bool
     mlflow_enabled: bool
+    comet_enabled: bool
     wandb: WandbConfig
     tensorboard: NotRequired[TensorboardConfig]
     swanlab: NotRequired[SwanlabConfig]
     mlflow: NotRequired[MLflowConfig]
+    comet: NotRequired[CometConfig]
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
     num_val_samples_to_print: NotRequired[int]
@@ -128,23 +146,6 @@ class TensorboardLogger(LoggerInterface):
         self.writer = SummaryWriter(log_dir=log_dir)
         print(f"Initialized TensorboardLogger at {log_dir}")
 
-    @staticmethod
-    def _coerce_to_scalar(value: Any) -> int | float | bool | str | None:
-        """Coerce a value to a Python scalar for TensorBoard logging.
-
-        Returns the coerced value, or None if it can't be converted to a scalar.
-        """
-        if isinstance(value, (int, float, bool, str)):
-            return value
-        if isinstance(value, (np.floating, np.integer, np.bool_)):
-            return value.item()
-        if isinstance(value, np.ndarray) and (value.ndim == 0 or value.size == 1):
-            return value.item()
-        if isinstance(value, torch.Tensor) and (value.ndim == 0 or value.numel() == 1):
-            return value.item()
-        # dict, list, multi-element arrays/tensors, or incompatible types
-        return None
-
     def log_metrics(
         self,
         metrics: dict[str, Any],
@@ -165,7 +166,7 @@ class TensorboardLogger(LoggerInterface):
             if prefix:
                 name = f"{prefix}/{name}"
 
-            scalar = self._coerce_to_scalar(value)
+            scalar = _coerce_to_scalar(value)
             if scalar is None:
                 print(
                     f"Warning: Skipping metric '{name}' for TensorBoard logging "
@@ -886,6 +887,108 @@ class MLflowLogger(LoggerInterface):
             pass
 
 
+class CometLogger(LoggerInterface):
+    """Comet ML logger backend."""
+
+    def __init__(self, cfg: CometConfig, log_dir: Optional[str] = None):
+        """Initialize the CometLogger.
+
+        Args:
+            cfg: Comet configuration. Must include workspace and project_name.
+            log_dir: Optional directory used as Comet's offline_directory; only
+                read when running offline.
+        """
+        experiment_config = comet_ml.ExperimentConfig(
+            name=cfg.get("experiment_name"),
+            tags=list(cfg.get("tags", ())),
+            log_code=True,
+            log_git_metadata=True,
+            log_git_patch=True,
+            log_env_details=True,
+            offline_directory=log_dir,
+        )
+        self.experiment = comet_ml.start(
+            workspace=cfg["workspace"],
+            project_name=cfg["project_name"],
+            experiment_config=experiment_config,
+            online=cfg.get("online", True),
+        )
+
+        # Disable Comet's runtime monkey-patching to keep logging explicit.
+        self.experiment.disable_mp()
+        print(
+            f"Initialized CometLogger for {cfg['workspace']}/{cfg['project_name']} "
+            f"at {self.experiment.url}"
+        )
+
+    def log_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: Optional[str] = "",
+        step_metric: Optional[str] = None,
+        step_finished: bool = False,
+    ) -> None:
+        """Log metrics to Comet.
+
+        Args:
+            metrics: Dict of metrics to log.
+            step: Global step value.
+            prefix: Optional prefix for metric names; the field equal to
+                ``step_metric`` is left unprefixed.
+            step_metric: Optional name of a field excluded from prefixing
+                (mirrors Wandb / Swanlab behavior).
+            step_finished: Ignored; Comet does not have a per-step commit hook.
+        """
+        if prefix:
+            metrics = {
+                f"{prefix}/{k}" if k != step_metric else k: v
+                for k, v in metrics.items()
+            }
+
+        for name, value in flatten_dict(metrics, sep="/").items():
+            scalar = _coerce_to_scalar(value)
+            if scalar is not None:
+                self.experiment.log_metric(name, scalar, step=step)
+
+    def log_hyperparams(self, params: Mapping[str, Any]) -> None:
+        """Log hyperparameters to Comet.
+
+        Args:
+            params: Dictionary of hyperparameters to log.
+        """
+        self.experiment.log_parameters(flatten_dict(params, sep="/"))
+
+    def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
+        """Log a 3D histogram to Comet.
+
+        Args:
+            histogram: Values to bin.
+            step: Global step value.
+            name: Metric name.
+        """
+        self.experiment.log_histogram_3d(histogram, name=name, step=step)
+
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a matplotlib figure to Comet.
+
+        Args:
+            figure: Matplotlib figure to log.
+            step: Global step value.
+            name: Figure name.
+        """
+        self.experiment.log_figure(figure_name=name, figure=figure, step=step)
+
+    def __del__(self) -> None:
+        """Clean up resources when the logger is destroyed."""
+        try:
+            if hasattr(self, "experiment"):
+                self.experiment.end()
+        except Exception:
+            # Ignore errors during cleanup
+            pass
+
+
 class Logger(LoggerInterface):
     """Main logger class that delegates to multiple backend loggers."""
 
@@ -934,6 +1037,11 @@ class Logger(LoggerInterface):
                 os.makedirs(mlflow_log_dir, exist_ok=True)
             mlflow_logger = MLflowLogger(cfg["mlflow"], log_dir=mlflow_log_dir)
             self.loggers.append(mlflow_logger)
+
+        if cfg["comet_enabled"]:
+            comet_log_dir = os.path.join(self.base_log_dir, "comet")
+            os.makedirs(comet_log_dir, exist_ok=True)
+            self.loggers.append(CometLogger(cfg["comet"], log_dir=comet_log_dir))
 
         # Initialize GPU monitoring if requested
         self.gpu_monitor = None
@@ -1237,6 +1345,23 @@ class Logger(LoggerInterface):
         """Clean up resources when the logger is destroyed."""
         if self.gpu_monitor:
             self.gpu_monitor.stop()
+
+
+def _coerce_to_scalar(value: Any) -> int | float | bool | str | None:
+    """Coerce a value to a Python scalar for scalar-only logging backends.
+
+    Returns the coerced value, or None if it can't be converted to a scalar.
+    """
+    if isinstance(value, (int, float, bool, str)):
+        return value
+    if isinstance(value, (np.floating, np.integer, np.bool_)):
+        return value.item()
+    if isinstance(value, np.ndarray) and (value.ndim == 0 or value.size == 1):
+        return value.item()
+    if isinstance(value, torch.Tensor) and (value.ndim == 0 or value.numel() == 1):
+        return value.item()
+    # dict, list, multi-element arrays/tensors, or incompatible types
+    return None
 
 
 def flatten_dict(d: Mapping[str, Any], sep: str = ".") -> dict[str, Any]:
