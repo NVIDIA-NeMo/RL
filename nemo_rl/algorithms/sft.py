@@ -13,7 +13,7 @@
 # limitations under the License.
 import os
 import warnings
-from typing import Optional, cast
+from typing import Optional
 
 import numpy as np
 import torch
@@ -130,8 +130,9 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    sft_save_state: Optional[SFTSaveState] = cast(
-        Optional[SFTSaveState], checkpointer.load_training_info(last_checkpoint_path)
+    loaded_state = checkpointer.load_training_info(last_checkpoint_path)
+    sft_save_state: Optional[SFTSaveState] = (
+        SFTSaveState(**loaded_state) if isinstance(loaded_state, dict) else loaded_state
     )
 
     # ==========================
