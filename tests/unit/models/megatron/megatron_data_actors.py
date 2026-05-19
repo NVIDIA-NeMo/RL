@@ -925,3 +925,198 @@ class GetPackSequenceParametersTestActor:
             }
 
         return {"success": True, "error": None}
+
+    def run_all_get_pack_sequence_parameters_for_megatron_hybridep_tests(self):
+        """Test _get_pack_sequence_parameters_for_megatron with HybridEP flex dispatcher.
+
+        HybridEP+flex requires pack divisor of 128 (NUM_OF_TOKENS_PER_CHUNK in
+        DeepEP JIT kernels). Cases below cover:
+          - HybridEP without FP8: divisor must come from HybridEP path (128)
+          - HybridEP + each FP8 recipe: divisor=max(fp8_divisor, 128)=128
+          - flex dispatcher without hybridep backend: HybridEP path skipped
+          - HybridEP + parallelism (CP, TP+SP, PP)
+        """
+        from nemo_rl.models.megatron.data import (
+            _get_pack_sequence_parameters_for_megatron,
+        )
+
+        max_seq_len = 1023
+
+        def _round_up_to_multiple_of(x, y):
+            return (x + y - 1) // y * y
+
+        # Test 11: HybridEP without FP8 → divisor 128
+        megatron_cfg = {
+            "tensor_model_parallel_size": 1,
+            "sequence_parallel": False,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+        }
+
+        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+            megatron_cfg, 1, max_seq_len
+        )
+
+        if pad_individual != 1 or pad_packed != 128 or pad_to is not None:
+            return {
+                "success": False,
+                "error": f"Test 11 (hybridep no-fp8): expected pad_individual=1, pad_packed=128, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
+            }
+
+        # Test 12: HybridEP + blockwise FP8 → divisor max(128, 128) = 128
+        megatron_cfg = {
+            "tensor_model_parallel_size": 1,
+            "sequence_parallel": False,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "blockwise",
+                "fp8_param": False,
+            },
+        }
+
+        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+            megatron_cfg, 1, max_seq_len
+        )
+
+        if pad_individual != 1 or pad_packed != 128 or pad_to is not None:
+            return {
+                "success": False,
+                "error": f"Test 12 (hybridep+blockwise): expected pad_individual=1, pad_packed=128, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
+            }
+
+        # Test 13: HybridEP + mxfp8 FP8 → divisor max(128, 32) = 128
+        megatron_cfg = {
+            "tensor_model_parallel_size": 1,
+            "sequence_parallel": False,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+                "fp8_param": False,
+            },
+        }
+
+        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+            megatron_cfg, 1, max_seq_len
+        )
+
+        if pad_individual != 1 or pad_packed != 128 or pad_to is not None:
+            return {
+                "success": False,
+                "error": f"Test 13 (hybridep+mxfp8): expected pad_individual=1, pad_packed=128, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
+            }
+
+        # Test 14: HybridEP + tensorwise FP8 → divisor max(128, 16) = 128
+        megatron_cfg = {
+            "tensor_model_parallel_size": 1,
+            "sequence_parallel": False,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "hybrid",
+                "fp8_recipe": "tensorwise",
+                "fp8_param": False,
+            },
+        }
+
+        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+            megatron_cfg, 1, max_seq_len
+        )
+
+        if pad_individual != 1 or pad_packed != 128 or pad_to is not None:
+            return {
+                "success": False,
+                "error": f"Test 14 (hybridep+tensorwise): expected pad_individual=1, pad_packed=128, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
+            }
+
+        # Test 15: flex dispatcher with NON-hybridep backend → HybridEP path skipped,
+        # divisor falls back to 1 (no FP8) or FP8 divisor.
+        megatron_cfg = {
+            "tensor_model_parallel_size": 1,
+            "sequence_parallel": False,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "deepep",
+        }
+
+        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+            megatron_cfg, 1, max_seq_len
+        )
+
+        if pad_individual != 1 or pad_packed != 1 or pad_to is not None:
+            return {
+                "success": False,
+                "error": f"Test 15 (flex+non-hybridep): expected pad_individual=1, pad_packed=1, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
+            }
+
+        # Test 16: HybridEP with CP and TP+SP (no FP8) → divisor 128, scaled by cp*2*tp.
+        megatron_cfg = {
+            "tensor_model_parallel_size": 2,
+            "sequence_parallel": True,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 4,
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+        }
+
+        expected_individual = 4 * 2 * 2  # cp_size * 2 * tp_size
+        expected_packed = 128 * 4 * 2 * 2  # divisor * cp_size * 2 * tp_size
+
+        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+            megatron_cfg, expected_individual, max_seq_len
+        )
+
+        if (
+            pad_individual != expected_individual
+            or pad_packed != expected_packed
+            or pad_to is not None
+        ):
+            return {
+                "success": False,
+                "error": f"Test 16 (hybridep+cp+tpsp): expected pad_individual={expected_individual}, pad_packed={expected_packed}, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
+            }
+
+        # Test 17: HybridEP with PP → pad_to is set (max_seq_len rounded up to packed).
+        megatron_cfg = {
+            "tensor_model_parallel_size": 1,
+            "sequence_parallel": False,
+            "pipeline_model_parallel_size": 4,
+            "context_parallel_size": 1,
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+        }
+
+        expected_individual = 1
+        expected_packed = 128
+        expected_pad_to = _round_up_to_multiple_of(max_seq_len, expected_packed)
+
+        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
+            megatron_cfg, expected_individual, max_seq_len
+        )
+
+        if (
+            pad_individual != expected_individual
+            or pad_packed != expected_packed
+            or pad_to != expected_pad_to
+        ):
+            return {
+                "success": False,
+                "error": f"Test 17 (hybridep+pp): expected pad_individual={expected_individual}, pad_packed={expected_packed}, pad_to={expected_pad_to}, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
+            }
+
+        return {"success": True, "error": None}

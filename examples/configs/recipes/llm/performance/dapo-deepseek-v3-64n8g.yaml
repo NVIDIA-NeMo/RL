@@ -44,6 +44,7 @@ policy:
     empty_unused_memory_level: 2
     enabled: true
     activation_checkpointing: true
+    moe_grouped_gemm: true
     tensor_model_parallel_size: 8
     expert_model_parallel_size: 32
     pipeline_model_parallel_size: 8
