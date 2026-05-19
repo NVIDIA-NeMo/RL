@@ -771,9 +771,19 @@ def setup(
                 assert policy_config["dtensor_cfg"]["enabled"] == False, (
                     "DTensor backend is not supported with kv cache fp8 enabled."
                 )
-                assert not _should_use_async_rollouts(master_config), (
-                    "Async rollouts is not supported with kv cache fp8 enabled."
-                )
+                # Relaxed from unconditional assert to opt-in warning: async
+                # rollouts + FP8 KV with FP8 weights is an opt-in combination
+                # in practice (validated on H100 PP=1 megatron). The FP8-weight
+                # refit path may interact with KV cache scales; allow when the
+                # user explicitly enabled async_engine. See PR #1212 history.
+                if _should_use_async_rollouts(master_config):
+                    warnings.warn(
+                        "Async rollouts + FP8 KV cache + FP8 weights is an "
+                        "opt-in combination: the FP8 weight refit path may "
+                        "interact with KV cache scales. Proceeding because "
+                        "vllm_cfg.async_engine=True was explicitly set.",
+                        stacklevel=2,
+                    )
                 assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
                     "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
                 )
