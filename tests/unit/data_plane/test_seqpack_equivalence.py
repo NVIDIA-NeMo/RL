@@ -43,10 +43,17 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+pytest.importorskip("ray")
 transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
-from nemo_rl.data_plane import build_data_plane_client, materialize
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.data_plane import build_data_plane_client, materialize  # noqa: E402
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
+
+# Ray is initialized once by the parent autouse fixture
+# ``tests/unit/conftest.py::init_ray_cluster`` (mirrors production: NeMo-RL
+# inits Ray at startup; the data plane attaches on top). Each test just
+# builds a TQ client on the shared Ray and closes it on teardown.
+
 
 # Mirror of the seed-field set in nemo_rl/algorithms/grpo_sync.py.
 _DP_SEED_FIELDS = (
@@ -100,13 +107,13 @@ def _make_tq_cfg(backend: str) -> dict:
     params=["simple", "mooncake_cpu"],
     ids=["simple", "mooncake_cpu"],
 )
-def tq_client(request, ray_session):
+def tq_client(request):
     """Parametrized fixture over simple and mooncake_cpu backends.
 
     mooncake_cpu is skipped when the mooncake wheel is not installed.
     Set NEMO_RL_REQUIRE_MOONCAKE=1 to promote the skip to a loud failure.
 
-    ray_session comes from tests/data_plane/functional/conftest.py.
+    Relies on parent autouse ``init_ray_cluster`` for the Ray runtime.
     """
     backend = request.param
     if backend == "mooncake_cpu" and not _mooncake_available():
