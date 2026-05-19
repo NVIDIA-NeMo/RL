@@ -28,7 +28,7 @@ VARIANT_TAG="hybridep-fuseloss-timeout60"
 EXTRA_OVERRIDES="  policy.megatron_cfg.moe_token_dispatcher_type=flex \
   ++policy.megatron_cfg.moe_flex_dispatcher_backend=hybridep \
   policy.megatron_cfg.moe_shared_expert_overlap=True \
-  policy.sequence_packing.fuse_loss=true"
+  ++policy.sequence_packing.fuse_loss=true"
 EXTRA_ENVS="  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 \
   USE_MNNVL=False \
   PYTHONPATH=/lustre/fsw/portfolios/coreai/users/sna/hybridep_overlay_cp312/site-packages:${PYTHONPATH:-}"
