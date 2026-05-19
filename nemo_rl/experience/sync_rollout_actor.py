@@ -211,7 +211,7 @@ class SyncRolloutActor:
                 **common,
                 max_seq_len=None,
                 max_rollout_turns=None,
-                generation_config=cfg["policy"]["generation"],
+                generation_config=cfg.policy["generation"],
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
         else:
@@ -222,8 +222,8 @@ class SyncRolloutActor:
             )
             final_batch, rollout_metrics = runner(
                 **common,
-                max_seq_len=cfg["policy"]["max_total_sequence_length"],
-                max_rollout_turns=cfg["grpo"]["max_rollout_turns"],
+                max_seq_len=cfg.policy["max_total_sequence_length"],
+                max_rollout_turns=cfg.grpo["max_rollout_turns"],
             )
         fb = final_batch.to("cpu")
         del final_batch
@@ -244,7 +244,7 @@ class SyncRolloutActor:
         flat, input_lengths = batched_message_log_to_flat_message(
             fb["message_log"],
             **pad,
-            make_sequence_length_divisible_by=cfg["policy"][
+            make_sequence_length_divisible_by=cfg.policy[
                 "make_sequence_length_divisible_by"
             ],
         )
@@ -353,7 +353,7 @@ class SyncRolloutActor:
             extra_info={"rollout_metrics": rollout_metrics},
             task_name=partition_id,
             pad_to_multiple=int(
-                cfg["policy"].get("make_sequence_length_divisible_by") or 1
+                cfg.policy.get("make_sequence_length_divisible_by") or 1
             ),
         )
 

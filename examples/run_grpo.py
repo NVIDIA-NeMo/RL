@@ -103,7 +103,7 @@ def main() -> None:
     # Pick the policy factory at the launcher level so the legacy trainer
     # stays data-plane-agnostic (architectural invariant — see
     # tests/data_plane/unit/test_architecture_invariants.py).
-    _dp_cfg = config.get("data_plane") or {}
+    _dp_cfg = config.data_plane or {}
     if _dp_cfg.get("enabled", False):
         from nemo_rl.models.policy.tq_policy import TQPolicy
 
@@ -190,7 +190,7 @@ def main() -> None:
         # the legacy in-memory path or the TransferQueue-mediated fork.
         # Same model, same data, same seed → diff the wandb runs to
         # validate parity.
-        dp_cfg = master_config.get("data_plane", {})
+        dp_cfg = master_config.data_plane or {}
         if dp_cfg.get("enabled", False):
             from nemo_rl.algorithms.grpo_sync import grpo_train_sync
 
