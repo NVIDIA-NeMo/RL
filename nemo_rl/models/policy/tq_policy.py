@@ -197,9 +197,7 @@ class TQPolicy(Policy):
         Used both for step-end teardown (via :meth:`finish_step`) and
         mid-step filtering (e.g. dynamic sampling).
         """
-        self.dp_client.clear_samples(
-            sample_ids=sample_ids, partition_id=partition_id
-        )
+        self.dp_client.clear_samples(sample_ids=sample_ids, partition_id=partition_id)
 
     def finish_step(self, meta: KVBatchMeta) -> None:
         """Drop this step's bulk from TQ. Mirror of :meth:`prepare_step`."""
