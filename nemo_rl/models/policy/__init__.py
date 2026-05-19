@@ -237,6 +237,10 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
+    # gain when multiple experts are assigned per rank (num_local_experts > 1).
+    # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
+    moe_grouped_gemm: NotRequired[bool]
     # HybridEP settings for MoE expert parallelism (requires moe_token_dispatcher_type='flex')
     # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
     moe_flex_dispatcher_backend: NotRequired[str]
