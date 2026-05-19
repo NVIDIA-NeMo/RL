@@ -96,7 +96,7 @@ class AsyncTrajectoryCollector:
         self._failure_count: int = 0
         self._fatal_error: Optional[BaseException] = None
         self._max_generation_failures: int = int(
-            self.master_config["grpo"]["async_grpo"]["max_generation_failures"]
+            self.master_config.grpo["async_grpo"]["max_generation_failures"]
         )
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
@@ -147,7 +147,7 @@ class AsyncTrajectoryCollector:
         assertion in ``ReplayBuffer.sample`` a few steps later.
         """
         target_weights = self._calculate_target_weights(generation_weight_version)
-        required_groups = int(self.master_config["grpo"]["num_prompts_per_step"])
+        required_groups = int(self.master_config.grpo["num_prompts_per_step"])
 
         with self._generation_check_lock:
             target_weight_counts = ray.get(
@@ -184,7 +184,7 @@ class AsyncTrajectoryCollector:
         """Check if collection should be paused due to generation limits."""
         try:
             target_weights = self._calculate_target_weights(self.current_weight_version)
-            required_groups = int(self.master_config["grpo"]["num_prompts_per_step"])
+            required_groups = int(self.master_config.grpo["num_prompts_per_step"])
 
             # Read the buffer count inside the lock for the same reason as in
             # _get_next_target_for_generation: keeps the buffered/in-flight

@@ -51,6 +51,10 @@ grpo:
     max_trajectory_age_steps: 1
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
     recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
+    # Number of generation-worker failures tolerated before aborting.
+    # 0 (default) = fail on the first worker exception. Increase only
+    # when transient generation errors are expected and acceptable to drop.
+    max_generation_failures: 0
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
