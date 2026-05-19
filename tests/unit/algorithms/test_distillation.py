@@ -27,7 +27,7 @@ from nemo_rl.algorithms.distillation import (
     distillation_train,
     validate,
 )
-from nemo_rl.algorithms.loss import DistillationLossConfig, DistillationLossFn
+from nemo_rl.algorithms.loss import DistillationLossFn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -155,11 +155,11 @@ def mock_components():
             "teacher": {
                 "model_name": "test-teacher",
             },
-            "loss_fn": DistillationLossConfig.model_construct(
-                kl_type="forward",
-                mixed_kl_weight=0.5,
-                zero_outside_topk=False,
-            ),
+            "loss_fn": {
+                "kl_type": "forward",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": False,
+            },
             "data": {
                 "dataset_name": "test_dataset",
             },
@@ -449,7 +449,11 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
                     "enabled": False,
                 },
             },
-            "loss_fn": DistillationLossConfig.model_construct(),
+            "loss_fn": {
+                "kl_type": "forward",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": False,
+            },
             "distillation": DistillationConfig.model_construct(
                 seed=42,
                 topk_logits_k=64,
@@ -521,11 +525,11 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
                     "enabled": False,
                 },
             },
-            "loss_fn": DistillationLossConfig.model_construct(
-                kl_type="forward",
-                mixed_kl_weight=0.5,
-                zero_outside_topk=False,
-            ),
+            "loss_fn": {
+                "kl_type": "forward",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": False,
+            },
             "distillation": DistillationConfig.model_construct(
                 seed=42,
                 topk_logits_k=64,
@@ -640,7 +644,11 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
                     "enabled": False,
                 },
             },
-            "loss_fn": DistillationLossConfig.model_construct(),
+            "loss_fn": {
+                "kl_type": "forward",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": False,
+            },
             "distillation": DistillationConfig.model_construct(
                 seed=42,
                 topk_logits_k=64,
