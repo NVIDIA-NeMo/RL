@@ -1398,6 +1398,7 @@ def test_grpo_train_collects_generation_logger_metrics(
     )
 
     assert policy_generation.clear_logger_metrics.called
+    policy_generation.finish_generation.assert_called_once_with(discard_weights=True)
     assert policy_generation.get_logger_metrics.called
     assert any(
         "generation_logger_metrics" in call.args[0]
