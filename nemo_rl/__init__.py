@@ -28,10 +28,15 @@ that's officially installed is megatron.core. So we add the whole repo into
 the path so we can access megatron.{training,legacy,inference,...}
 
 Since users may pip install NeMo RL, this is a convenience so they do not
-have to manually run with PYTHONPATH=3rdparty/Megatron-LM-workspace/Megatron-LM.
+have to manually run with PYTHONPATH=3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM.
 """
 megatron_path = (
-    Path(__file__).parent.parent / "3rdparty" / "Megatron-LM-workspace" / "Megatron-LM"
+    Path(__file__).parent.parent
+    / "3rdparty"
+    / "Megatron-Bridge-workspace"
+    / "Megatron-Bridge"
+    / "3rdparty"
+    / "Megatron-LM"
 )
 if megatron_path.exists() and str(megatron_path) not in sys.path:
     sys.path.append(str(megatron_path))
