@@ -20,6 +20,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.dpo import (
+    DPOConfig,
     MasterConfig,
     _default_dpo_save_state,
     add_ref_logprobs_to_data,
@@ -179,16 +180,16 @@ def mock_dpo_components():
     # Create mock master config
     master_config = MasterConfig.model_construct(
         **{
-            "dpo": {
-                "max_num_steps": 5,
-                "max_num_epochs": 2,
-                "val_period": 100,
-                "val_batches": 1,
-                "val_global_batch_size": 1,
-                "val_micro_batch_size": 1,
-                "val_at_start": False,
-                "val_at_end": False,
-            },
+            "dpo": DPOConfig.model_construct(
+                max_num_steps=5,
+                max_num_epochs=2,
+                val_period=100,
+                val_batches=1,
+                val_global_batch_size=1,
+                val_micro_batch_size=1,
+                val_at_start=False,
+                val_at_end=False,
+            ),
             "policy": {
                 "train_global_batch_size": 2,
                 "make_sequence_length_divisible_by": 1,
@@ -225,7 +226,7 @@ def mock_dpo_components():
 def test_exit_on_max_steps(mock_dpo_components):
     """Test that training loop exits when max_num_steps is reached"""
     # Set max steps to 12, which is less than len(train_dataloader) * max_num_epochs
-    mock_dpo_components["master_config"].dpo["max_num_steps"] = 12
+    mock_dpo_components["master_config"].dpo.max_num_steps = 12
 
     dpo_save_state = _default_dpo_save_state()
 
@@ -249,8 +250,8 @@ def test_exit_on_max_steps(mock_dpo_components):
 def test_exit_on_max_epochs(mock_dpo_components):
     """Test that training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number
-    mock_dpo_components["master_config"].dpo["max_num_epochs"] = 2
-    mock_dpo_components["master_config"].dpo["max_num_steps"] = 100
+    mock_dpo_components["master_config"].dpo.max_num_epochs = 2
+    mock_dpo_components["master_config"].dpo.max_num_steps = 100
 
     dpo_save_state = _default_dpo_save_state()
 
@@ -274,8 +275,8 @@ def test_exit_on_max_epochs(mock_dpo_components):
 def test_exit_on_timeout(mock_dpo_components, capsys):
     """Test that training loop exits when timeout is reached"""
     # Set max steps and epochs to large numbers
-    mock_dpo_components["master_config"].dpo["max_num_steps"] = 100
-    mock_dpo_components["master_config"].dpo["max_num_epochs"] = 10
+    mock_dpo_components["master_config"].dpo.max_num_steps = 100
+    mock_dpo_components["master_config"].dpo.max_num_epochs = 10
 
     dpo_save_state = _default_dpo_save_state()
 
