@@ -98,8 +98,8 @@ def _make_tq_cfg(backend: str) -> dict:
         "storage_capacity": 1024,
         "num_storage_units": 1,
         "claim_meta_poll_interval_s": 0.5,
-        "global_segment_size": 549755813888,
-        "local_buffer_size": 68719476736,
+        "global_segment_size": 8589934592,  # 8 GiB — sized for CI host RAM, not prod
+        "local_buffer_size": 1073741824,  # 1 GiB
     }
 
 
