@@ -33,7 +33,7 @@ TokenizerType = PreTrainedTokenizerBase
 class AsyncNemoGymRolloutManager:
     """Manages per-prompt NeMo-Gym rollouts, producing a PromptGroupRecord per call.
 
-    Each __call__ takes one prompt and returns num_generations_per_prompt completions
+    Each run_rollout takes one prompt and returns num_generations_per_prompt completions
     batched through a single NeMo-Gym run_rollouts call.
     """
 
@@ -56,7 +56,7 @@ class AsyncNemoGymRolloutManager:
 
         self._validate_init_params()
 
-    async def __call__(self, input_sample: DatumSpec) -> PromptGroupRecord:
+    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
         Args:

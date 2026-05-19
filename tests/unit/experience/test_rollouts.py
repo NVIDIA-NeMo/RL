@@ -1083,7 +1083,7 @@ def test_async_nemo_gym_rollout_manager(
         num_generations_per_prompt=num_generations,
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
     )
-    record = asyncio.run(manager(single_prompt))
+    record = asyncio.run(manager.run_rollout(single_prompt))
 
     assert isinstance(record, PromptGroupRecord)
     assert len(record.completions) == num_generations, (
@@ -1197,7 +1197,7 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         num_generations_per_prompt=num_generations,
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
     )
-    record = asyncio.run(manager(single_prompt))
+    record = asyncio.run(manager.run_rollout(single_prompt))
 
     # Both should produce N completions
     assert len(original_result.final_batch["message_log"]) == num_generations
@@ -1238,4 +1238,30 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         new_reward = record.completions[i].reward
         assert orig_reward == new_reward, (
             f"Completion {i}: reward mismatch — original {orig_reward}, by_prompt {new_reward}"
+        )
+
+    # 4. rollout_metrics numeric values match (timing and Table fields are excluded)
+    orig_metrics = original_result.rollout_metrics
+    new_metrics = record.rollout_metrics
+    for key in orig_metrics.keys():
+        # Skip timing and full_result fields
+        if key.startswith("timing/") or key.endswith("/full_result"):
+            continue
+
+        # Check that the key is present in the new metrics
+        assert key in new_metrics, f"rollout_metrics[{key!r}] missing in original"
+
+        orig_val = orig_metrics[key]
+        new_val = new_metrics[key]
+
+        # Skip non-numeric fields
+        assert type(orig_val) == type(new_val), (
+            f"rollout_metrics[{key!r}] type mismatch: {type(orig_val)} != {type(new_val)}"
+        )
+        if not isinstance(orig_val, (bool, int, float)):
+            continue
+
+        # Check equal
+        assert orig_val == pytest.approx(new_val), (
+            f"rollout_metrics[{key!r}] mismatch — original {orig_val}, by_prompt {new_val}"
         )
