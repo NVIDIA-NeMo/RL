@@ -765,9 +765,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             data: BatchedDataDict containing input_ids and input_lengths tensors
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
-                - output_ids: input + generated token IDs
-                - logprobs: Log probabilities for each token
-                - generation_lengths: Lengths of each response
+                - ``output_ids``: input + generated token IDs
+                - ``logprobs``: Log probabilities for each token
+                - ``generation_lengths``: Lengths of each response
         """
         # 512 bATCH SIZE (200 tokens)
         no_grad = torch.no_grad()
