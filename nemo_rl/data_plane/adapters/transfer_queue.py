@@ -424,14 +424,28 @@ class TQDataPlaneClient(DataPlaneClient):
         grpo_group_size: int | None = None,
         enums: dict[str, list[str]] | None = None,
     ) -> None:
-        # No-op. Kept for ABC conformance. The client is intentionally
-        # stateless: TQ's controller is the single source of truth for
-        # partition membership, and replicating that state per-client
-        # creates an inconsistent local view (the SyncRolloutActor and
-        # the driver each see their own write history, not each other's).
-        # ``clear_samples(sample_ids=None)`` queries the controller via
-        # ``tq.kv_list`` instead of relying on local accumulation.
-        return
+        # Pre-populate ``Partition.field_name_mapping`` with the full
+        # field schema by doing a single synchronous placeholder put on
+        # the driver before any worker producer/consumer is live for
+        # this partition.
+        #
+        # Why: TQ's controller registers new field names lazily inside
+        # ``update_production_status`` (controller.py:538) without a lock,
+        # while ``kv_retrieve_meta`` (controller.py:1645) iterates the
+        # same dict — interleaved threads raise ``RuntimeError: dictionary
+        # changed size during iteration`` and kill the controller's
+        # ProcessRequestThread (no try/except around the while-loop).
+        # Registering everything from a single driver thread before any
+        # client request races with a put removes the trigger entirely.
+        if not fields:
+            return
+        client = tq.get_client()
+        dummy_td = TensorDict(
+            {f: torch.zeros(1) for f in fields},
+            batch_size=[1],
+        )
+        meta = client.put(data=dummy_td, partition_id=partition_id)
+        client.clear_samples(metadata=meta)
 
     def claim_meta(
         self,
