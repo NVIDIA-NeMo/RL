@@ -600,7 +600,7 @@ def rm_train(
                         ):
                             delattr(rm_save_state, key)
                     if val_metrics is not None:
-                        for k, v in val_metrics.model_dump().items():
+                        for k, v in val_metrics.items():
                             setattr(rm_save_state, k, v)
 
                     full_metric_name = master_config.checkpointing["metric_name"]
