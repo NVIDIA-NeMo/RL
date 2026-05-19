@@ -26,6 +26,8 @@ Coverage:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
@@ -34,6 +36,19 @@ from nemo_rl.data_plane.column_io import kv_first_write, read_columns, write_col
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def _fake_policy(client):
+    """Minimal stand-in for ``TQPolicy`` exposing only ``discard_samples``.
+
+    ``_apply_dynamic_sampling`` calls ``policy.discard_samples(uids, partition)``
+    to drop filtered rows; we delegate to the noop client's ``clear_samples``.
+    """
+    return SimpleNamespace(
+        discard_samples=lambda sample_ids, partition_id: client.clear_samples(
+            sample_ids=sample_ids, partition_id=partition_id
+        )
+    )
 
 
 def _keys_from_uids(uids: list[str], n_gen: int = 1) -> list[str]:
@@ -257,7 +272,7 @@ def test_apply_dynamic_sampling_filters_zero_std():
         train_prompts_size=4,
         num_gen_batches=1,
         max_gen_batches=10,
-        dp_client=client,
+        policy=_fake_policy(client),
     )
     # Only 2 survivors → not complete (need 4).
     assert complete is False
@@ -304,7 +319,7 @@ def test_apply_dynamic_sampling_completes_when_train_size_reached():
         train_prompts_size=4,
         num_gen_batches=1,
         max_gen_batches=10,
-        dp_client=client,
+        policy=_fake_policy(client),
     )
     assert complete is True
     assert pm is not None and len(pm.sample_ids) == 4
@@ -331,7 +346,7 @@ def test_apply_dynamic_sampling_overflow_slices_and_clears():
         train_prompts_size=4,  # only need 4; 2 should be discarded
         num_gen_batches=1,
         max_gen_batches=10,
-        dp_client=client,
+        policy=_fake_policy(client),
     )
     assert complete is True
     assert len(pm.sample_ids) == 4
@@ -368,5 +383,5 @@ def test_apply_dynamic_sampling_raises_on_max_gen_batches():
             train_prompts_size=4,
             num_gen_batches=11,
             max_gen_batches=10,  # exceeded
-            dp_client=client,
+            policy=_fake_policy(client),
         )
