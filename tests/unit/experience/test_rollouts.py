@@ -1048,12 +1048,6 @@ def test_async_nemo_gym_rollout_manager(
     - each Completion has a reward (float) and a non-empty message_log
     - completions hold independent message_log objects
     """
-    import tempfile
-
-    from nemo_rl.data.collate_fn import rl_collate_fn
-    from nemo_rl.data.datasets.response_datasets import NemoGymDataset
-    from nemo_rl.data.processors import nemo_gym_data_processor
-
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
         for data in nemo_gym_sanity_test_data["input"]:
             f.write(json.dumps(data) + "\n")
@@ -1135,12 +1129,6 @@ def test_async_nemo_gym_rollout_manager_matches_original(
     then calls AsyncNemoGymRolloutManager with 1 prompt, N generations.
     Asserts that both produce N results and rewards are in the same numeric domain.
     """
-    import tempfile
-
-    from nemo_rl.data.collate_fn import rl_collate_fn
-    from nemo_rl.data.datasets.response_datasets import NemoGymDataset
-    from nemo_rl.data.processors import nemo_gym_data_processor
-
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
         for data in nemo_gym_sanity_test_data["input"]:
             f.write(json.dumps(data) + "\n")
