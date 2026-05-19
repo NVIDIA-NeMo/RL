@@ -43,11 +43,11 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
 class DPOSaveState(BaseModel, extra="allow"):
-    epoch: int  # Track current epoch
-    step: int  # Track step within current epoch
-    total_steps: int  # Track total number of steps across all epochs
-    consumed_samples: int
-    total_valid_tokens: int  # Track total number of non-padding tokens during training
+    epoch: int = 0  # Track current epoch
+    step: int = 0  # Track step within current epoch
+    total_steps: int = 0  # Track total number of steps across all epochs
+    consumed_samples: int = 0
+    total_valid_tokens: int = 0  # Track total number of non-padding tokens during training
 
 
 def _default_dpo_save_state() -> DPOSaveState:
@@ -61,27 +61,27 @@ def _default_dpo_save_state() -> DPOSaveState:
 
 
 class DPOConfig(BaseModel, extra="allow"):
-    max_num_epochs: int
-    max_num_steps: int
-    val_period: int
-    val_batches: int
-    val_global_batch_size: int
-    val_micro_batch_size: int
-    val_at_start: bool
+    max_num_epochs: int = 1
+    max_num_steps: int = 150
+    val_period: int = 25
+    val_batches: int = 8
+    val_global_batch_size: int = 8
+    val_micro_batch_size: int = 1
+    val_at_start: bool = True
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
-    val_at_end: bool
-    seed: int
+    val_at_end: bool = False
+    seed: int = 42
 
-    reference_policy_kl_penalty: float
-    preference_average_log_probs: bool
-    sft_average_log_probs: bool
+    reference_policy_kl_penalty: float = 0.05
+    preference_average_log_probs: bool = False
+    sft_average_log_probs: bool = False
     ## TODO(@ashors) support other loss functions
     ## https://github.com/NVIDIA-NeMo/RL/issues/193
     # preference_loss: str
     # gt_reward_scale: float
-    preference_loss_weight: float
-    sft_loss_weight: float
+    preference_loss_weight: float = 1.0
+    sft_loss_weight: float = 0.0
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -94,15 +94,15 @@ class MasterConfig(BaseModel, extra="allow"):
 
 
 class DPOValMetrics(BaseModel, extra="allow"):
-    loss: float
-    sft_loss: float
-    preference_loss: float
-    accuracy: float
-    rewards_chosen_mean: float
-    rewards_rejected_mean: float
-    num_valid_samples: float
-    global_valid_seqs: float
-    global_valid_toks: float
+    loss: float = 0.0
+    sft_loss: float = 0.0
+    preference_loss: float = 0.0
+    accuracy: float = 0.0
+    rewards_chosen_mean: float = 0.0
+    rewards_rejected_mean: float = 0.0
+    num_valid_samples: float = 0.0
+    global_valid_seqs: float = 0.0
+    global_valid_toks: float = 0.0
 
 
 # =======================================================
