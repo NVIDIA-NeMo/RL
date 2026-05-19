@@ -241,6 +241,14 @@ class MegatronConfig(TypedDict):
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
     moe_grouped_gemm: NotRequired[bool]
+    # HybridEP settings for MoE expert parallelism (requires moe_token_dispatcher_type='flex')
+    # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
+    moe_flex_dispatcher_backend: NotRequired[str]
+    moe_hybridep_num_sms: NotRequired[int]
+    # Number of HybridEP ranks per NVLink domain (default: min(expert_model_parallel_size, 64))
+    hybridep_num_ranks_per_nvlink_domain: NotRequired[int]
+    # Enable multi-node NVLink support (default: expert_model_parallel_size > 4)
+    hybridep_use_mnnvl: NotRequired[bool]
     peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
