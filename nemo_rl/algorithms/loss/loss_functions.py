@@ -787,11 +787,11 @@ class PreferenceLossFn(LossFunction):
 
 
 class DPOLossConfig(BaseModel, extra="allow"):
-    reference_policy_kl_penalty: float
-    preference_loss_weight: float
-    sft_loss_weight: float
-    preference_average_log_probs: bool
-    sft_average_log_probs: bool
+    reference_policy_kl_penalty: float = 0.05
+    preference_loss_weight: float = 1.0
+    sft_loss_weight: float = 0.0
+    preference_average_log_probs: bool = False
+    sft_average_log_probs: bool = False
 
 
 class DPOLossDataDict(TypedDict):
@@ -949,9 +949,9 @@ class DPOLossFn(PreferenceLossFn):
 
 
 class DistillationLossConfig(BaseModel, extra="allow"):
-    kl_type: str
-    mixed_kl_weight: float
-    zero_outside_topk: bool
+    kl_type: str = "mixed"
+    mixed_kl_weight: float = 0.5
+    zero_outside_topk: bool = False
 
 
 class DistillationLossDataDict(TypedDict):
