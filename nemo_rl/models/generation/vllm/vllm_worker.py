@@ -39,27 +39,12 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
-    cfg: VllmConfig
-
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
         This makes it easier to identify which worker is producing specific log messages.
         """
         return f"{self.__class__.__name__}"
-
-    def _sleep_level(self) -> int:
-        sleep_level = self.cfg["vllm_cfg"].get("sleep_level", 1)
-        if (
-            not isinstance(sleep_level, int)
-            # bool is a subclass of int, but YAML booleans should not be valid sleep levels.
-            or isinstance(sleep_level, bool)
-            or sleep_level not in (0, 1, 2)
-        ):
-            raise ValueError(
-                f"vllm_cfg.sleep_level must be 0, 1, or 2, got {sleep_level!r}"
-            )
-        return sleep_level
 
     @staticmethod
     def configure_worker(
@@ -150,6 +135,17 @@ class BaseVllmGenerationWorker:
                           the vLLM worker subprocess (e.g. for quantization configs).
         """
         self.cfg = config
+        sleep_level = self.cfg["vllm_cfg"].get("sleep_level", 1)
+        if (
+            not isinstance(sleep_level, int)
+            # bool is a subclass of int, but YAML booleans should not be valid sleep levels.
+            or isinstance(sleep_level, bool)
+            or sleep_level not in (0, 1, 2)
+        ):
+            raise ValueError(
+                f"vllm_cfg.sleep_level must be 0, 1, or 2, got {sleep_level!r}"
+            )
+        self.sleep_level = sleep_level
         self.model_name = self.cfg["model_name"]
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
@@ -1024,7 +1020,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm.renderer, "clear_mm_cache"
         ):
             self.llm.renderer.clear_mm_cache()
-        self.llm.sleep(level=self._sleep_level())
+        self.llm.sleep(level=self.sleep_level)
 
         gc.collect()
         torch.cuda.empty_cache()

@@ -21,27 +21,38 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 
 def _worker_with_vllm_cfg(vllm_cfg: dict[str, Any]) -> BaseVllmGenerationWorker:
-    worker = object.__new__(BaseVllmGenerationWorker)
-    worker.cfg = cast(VllmConfig, {"vllm_cfg": vllm_cfg})
-    return worker
+    config = {
+        "model_name": "dummy-model",
+        "vllm_cfg": {
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "expert_parallel_size": 1,
+            "gpu_memory_utilization": 0.5,
+            "max_model_len": 128,
+            "skip_tokenizer_init": True,
+            "async_engine": False,
+            "precision": "bfloat16",
+            "kv_cache_dtype": "auto",
+            **vllm_cfg,
+        },
+    }
+    return BaseVllmGenerationWorker(cast(VllmConfig, config), bundle_indices=None)
 
 
 def test_vllm_sleep_level_defaults_to_level_1():
     worker = _worker_with_vllm_cfg({})
 
-    assert worker._sleep_level() == 1
+    assert worker.sleep_level == 1
 
 
 @pytest.mark.parametrize("sleep_level", [0, 1, 2])
 def test_vllm_sleep_level_accepts_supported_levels(sleep_level):
     worker = _worker_with_vllm_cfg({"sleep_level": sleep_level})
 
-    assert worker._sleep_level() == sleep_level
+    assert worker.sleep_level == sleep_level
 
 
 @pytest.mark.parametrize("sleep_level", [-1, 3, "2", True])
 def test_vllm_sleep_level_rejects_unsupported_levels(sleep_level):
-    worker = _worker_with_vllm_cfg({"sleep_level": sleep_level})
-
     with pytest.raises(ValueError, match=r"vllm_cfg\.sleep_level must be 0, 1, or 2"):
-        worker._sleep_level()
+        _worker_with_vllm_cfg({"sleep_level": sleep_level})
