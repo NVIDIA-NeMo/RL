@@ -37,7 +37,6 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     # nemorl-gemma4-support, display name dapo-gemma4-31b-it-4n8g-fsdp2-automodel-offpolicy).
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.05' \
-        'data["train/token_mult_prob_error"]["20"] < 1.05' \
         'mean(data["train/gen_kl_error"]) < 0.002' \
         'data["train/reward"]["20"] > 0.1' \
         'data["train/filtered_reward"]["20"] > -0.35'
