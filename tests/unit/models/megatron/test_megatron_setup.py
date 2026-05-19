@@ -1075,7 +1075,7 @@ class TestApplyPerformanceConfig:
         with pytest.raises(
             ValueError, match="offload_modules must be a non-empty list"
         ):
-        """When enabled but offload_modules key is absent, defaults to None → raises."""
+            _apply_performance_config(model_cfg, config)
 
     def test_fine_grained_activation_offloading_missing_modules_raises(self):
         """When enabled but offload_modules key is absent, defaults to [] → raises."""
