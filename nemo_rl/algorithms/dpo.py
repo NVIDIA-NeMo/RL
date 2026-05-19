@@ -15,7 +15,7 @@ import os
 import warnings
 from collections import defaultdict
 from functools import partial
-from typing import Optional, cast
+from typing import Optional
 
 import numpy as np
 import torch
@@ -176,8 +176,9 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    dpo_save_state: Optional[DPOSaveState] = cast(
-        Optional[DPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
+    loaded_state = checkpointer.load_training_info(last_checkpoint_path)
+    dpo_save_state: Optional[DPOSaveState] = (
+        DPOSaveState(**loaded_state) if isinstance(loaded_state, dict) else loaded_state
     )
 
     # ==========================
@@ -270,7 +271,7 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     loss_fn = DPOLossFn(
-        master_config.dpo,
+        master_config.dpo.model_dump(),
         use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
         and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"],
     )
