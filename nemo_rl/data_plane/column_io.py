@@ -41,7 +41,7 @@ from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN, Layout
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
-def _round_up(value: int, multiple: int) -> int:
+def round_up(value: int, multiple: int) -> int:
     """Smallest ``multiple``-aligned int ≥ ``value`` (no-op when ``multiple <= 1``)."""
     if multiple <= 1:
         return value

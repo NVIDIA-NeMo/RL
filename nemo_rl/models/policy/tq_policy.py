@@ -39,7 +39,7 @@ import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
-from nemo_rl.data_plane.column_io import _round_up, read_columns, write_columns
+from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
@@ -135,10 +135,9 @@ class TQPolicy(Policy):
         # attach into construction so the trainer just instantiates
         # ``TQPolicy(...)`` and is done).
         ray.get(
-            [
-                getattr(w, "setup_data_plane").remote(cfg=dp_cfg)
-                for w in self.worker_group._workers
-            ]
+            self.worker_group.run_all_workers_single_data(
+                "setup_data_plane", cfg=dp_cfg
+            )
         )
 
     # ── lifecycle ──────────────────────────────────────────────────────
@@ -192,11 +191,19 @@ class TQPolicy(Policy):
             grpo_group_size=None,
         )
 
+    def discard_samples(self, sample_ids: list[str], partition_id: str) -> None:
+        """Drop a set of uids from TQ.
+
+        Used both for step-end teardown (via :meth:`finish_step`) and
+        mid-step filtering (e.g. dynamic sampling).
+        """
+        self.dp_client.clear_samples(
+            sample_ids=sample_ids, partition_id=partition_id
+        )
+
     def finish_step(self, meta: KVBatchMeta) -> None:
         """Drop this step's bulk from TQ. Mirror of :meth:`prepare_step`."""
-        self.dp_client.clear_samples(
-            sample_ids=meta.sample_ids, partition_id=meta.partition_id
-        )
+        self.discard_samples(meta.sample_ids, meta.partition_id)
 
     def _stamp_pad_seqlen(self, meta: KVBatchMeta) -> None:
         """Mint ``GLOBAL_FORWARD_PAD_SEQLEN`` onto ``meta.extra_info`` (idempotent).
@@ -211,7 +218,7 @@ class TQPolicy(Policy):
         _, dba = self._packing_args("train_mb_tokens")
         seq_round = int(dba["sequence_length_round"]) if dba is not None else 1
         pad_mult = int(meta.extra_info.get("pad_to_multiple", 1))
-        meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = _round_up(
+        meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = round_up(
             max(meta.sequence_lengths), max(pad_mult, seq_round)
         )
 

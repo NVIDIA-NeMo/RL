@@ -69,7 +69,7 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
+from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_EXCLUDED_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -99,7 +99,7 @@ def _apply_dynamic_sampling(
     train_prompts_size: int,
     num_gen_batches: int,
     max_gen_batches: int,
-    dp_client: DataPlaneClient,
+    policy: "TQPolicy",
 ) -> tuple[
     Optional[KVBatchMeta],
     Optional[BatchedDataDict],
@@ -126,7 +126,7 @@ def _apply_dynamic_sampling(
         train_prompts_size: Target batch size.
         num_gen_batches: Iteration counter (1-based).
         max_gen_batches: Upper bound on iterations before raising.
-        dp_client: Data-plane client used to clear filtered keys.
+        policy: TQPolicy whose ``discard_samples`` is used to drop filtered keys.
 
     Returns:
         ``(pending_meta, pending_carry, pending_rewards, is_complete,
@@ -148,7 +148,7 @@ def _apply_dynamic_sampling(
     keep_idx = [i for i, t in enumerate(meta.tags) if t["std"] != 0.0]
     drop_keys = [k for k, t in zip(meta.sample_ids, meta.tags) if t["std"] == 0.0]
     if drop_keys:
-        dp_client.clear_samples(sample_ids=drop_keys, partition_id=meta.partition_id)
+        policy.discard_samples(drop_keys, meta.partition_id)
 
     # Subset survivors and merge into the running cache.
     if keep_idx:
@@ -177,9 +177,9 @@ def _apply_dynamic_sampling(
     ds_metrics: dict[str, Any] = {"dynamic_sampling_num_gen_batches": num_gen_batches}
     assert pending_meta is not None and pending_carry is not None
     if n > train_prompts_size:
-        dp_client.clear_samples(
-            sample_ids=list(pending_meta.sample_ids[train_prompts_size:]),
-            partition_id=pending_meta.partition_id,
+        policy.discard_samples(
+            list(pending_meta.sample_ids[train_prompts_size:]),
+            pending_meta.partition_id,
         )
         pending_meta = pending_meta.slice(0, train_prompts_size)
         pending_carry = pending_carry.slice(0, train_prompts_size)
@@ -664,7 +664,7 @@ def grpo_train_sync(
                             max_gen_batches=master_config.grpo[
                                 "dynamic_sampling_max_gen_batches"
                             ],
-                            dp_client=policy.dp_client,
+                            policy=policy,
                         )
                         if not is_complete:
                             current_size = (

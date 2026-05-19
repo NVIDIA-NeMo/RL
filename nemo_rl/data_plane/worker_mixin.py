@@ -42,7 +42,6 @@ from nemo_rl.data_plane.schema import (
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 if TYPE_CHECKING:
@@ -480,15 +479,13 @@ class TQWorkerMixin:
         self,
         meta: "KVBatchMeta",
         micro_batch_size: Optional[int] = None,
-    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
+    ) -> BatchedDataDict[Any]:
         """Per-rank reference-policy logprob entrypoint."""
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
-        result: BatchedDataDict[ReferenceLogprobOutputSpec] = (
-            self.get_reference_policy_logprobs(  # type: ignore[attr-defined]
-                data=data,
-                micro_batch_size=micro_batch_size,
-            )
+        result: BatchedDataDict[Any] = self.get_reference_policy_logprobs(  # type: ignore[attr-defined]
+            data=data,
+            micro_batch_size=micro_batch_size,
         )
         self._write_back_result_field(
             meta,
