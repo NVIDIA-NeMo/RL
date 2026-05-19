@@ -148,8 +148,9 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    rm_save_state: Optional[RMSaveState] = checkpointer.load_training_info(
-        last_checkpoint_path
+    loaded_state = checkpointer.load_training_info(last_checkpoint_path)
+    rm_save_state: Optional[RMSaveState] = (
+        RMSaveState(**loaded_state) if isinstance(loaded_state, dict) else loaded_state
     )
 
     # ==========================
