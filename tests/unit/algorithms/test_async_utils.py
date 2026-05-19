@@ -739,7 +739,7 @@ class TestAsyncTrajectoryCollector:
         mock_env = MockEnvironment.remote(rewards=[1.0])
         task_to_env = {"test": mock_env}
         master_config = self.create_mock_config()
-        master_config["grpo"]["async_grpo"]["max_generation_failures"] = (
+        master_config.grpo["async_grpo"]["max_generation_failures"] = (
             max_generation_failures
         )
 
