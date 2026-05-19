@@ -248,6 +248,18 @@ class MegatronConfig(TypedDict):
     # "expert_fc1", "moe_act". Note: "attn_proj" requires "core_attn".
     # See: https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L1440-L1448
     offload_modules: NotRequired[list[str]]
+    # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
+    # gain when multiple experts are assigned per rank (num_local_experts > 1).
+    # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
+    moe_grouped_gemm: NotRequired[bool]
+    # HybridEP settings for MoE expert parallelism (requires moe_token_dispatcher_type='flex')
+    # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
+    moe_flex_dispatcher_backend: NotRequired[str]
+    moe_hybridep_num_sms: NotRequired[int]
+    # Number of HybridEP ranks per NVLink domain (default: min(expert_model_parallel_size, 64))
+    hybridep_num_ranks_per_nvlink_domain: NotRequired[int]
+    # Enable multi-node NVLink support (default: expert_model_parallel_size > 4)
+    hybridep_use_mnnvl: NotRequired[bool]
     peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
