@@ -11,6 +11,7 @@ grpo:
 loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "tis"
   truncated_importance_sampling_ratio: 2
   truncated_importance_sampling_type: tis
   ratio_clip_max: 0.28
