@@ -31,6 +31,22 @@ from nemo_rl.utils.config import (
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 
+def _select_trainer(master_config: MasterConfig):
+    """Pick the synchronous trainer based on ``data_plane.enabled``.
+
+    Factored out so test_architecture_invariants can verify dispatch
+    without the full setup() path.
+    """
+    dp_cfg = master_config.data_plane or {}
+    if dp_cfg.get("enabled", False):
+        from nemo_rl.algorithms.grpo_sync import grpo_train_sync
+
+        print("🚀 Running synchronous GRPO training (TransferQueue)")
+        return grpo_train_sync
+    print("🚀 Running synchronous GRPO training (legacy)")
+    return grpo_train
+
+
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run GRPO training with configuration")
@@ -186,20 +202,8 @@ def main() -> None:
         )
     else:
         # Two parallel synchronous trainers (verl-style — main_ppo.py vs
-        # main_ppo_sync.py). data_plane.enabled selects which one runs:
-        # the legacy in-memory path or the TransferQueue-mediated fork.
-        # Same model, same data, same seed → diff the wandb runs to
-        # validate parity.
-        dp_cfg = master_config.data_plane or {}
-        if dp_cfg.get("enabled", False):
-            from nemo_rl.algorithms.grpo_sync import grpo_train_sync
-
-            print("🚀 Running synchronous GRPO training (TransferQueue)")
-            trainer = grpo_train_sync
-        else:
-            print("🚀 Running synchronous GRPO training (legacy)")
-            trainer = grpo_train
-
+        # main_ppo_sync.py). data_plane.enabled selects which one runs.
+        trainer = _select_trainer(master_config)
         trainer(
             policy,
             policy_generation,

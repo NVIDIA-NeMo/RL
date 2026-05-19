@@ -178,23 +178,24 @@ def test_factory_rejects_disabled_impl():
 
 
 def test_run_grpo_dispatches_both_trainers():
-    """The example script must explicitly route between the two
-    trainers based on ``data_plane.enabled``."""
-    src = _read("examples/run_grpo.py")
-    cleaned = _strip_comments_and_docstrings(src)
-    assert "grpo_train" in cleaned, "run_grpo.py must reference legacy grpo_train"
-    assert "grpo_train_sync" in cleaned, (
-        "run_grpo.py must reference grpo_train_sync (the TQ-mediated trainer)"
-    )
-    # Routing must read the data_plane config block somewhere — covers
-    # dict-style (`master_config["data_plane"]` / `.get("data_plane")`)
-    # and pydantic attribute-style (`config.data_plane`) access.
-    assert "data_plane" in cleaned, (
-        "run_grpo.py should reference the data_plane config block to dispatch."
-    )
-    assert re.search(r"\.get\(\s*[\"']enabled[\"']", cleaned), (
-        "run_grpo.py should branch on the data-plane `enabled` flag."
-    )
+    """``examples/run_grpo.py._select_trainer`` must return the
+    TQ-mediated ``grpo_train_sync`` iff ``data_plane.enabled`` is true,
+    and the legacy ``grpo_train`` otherwise."""
+    import sys
+
+    sys.path.insert(0, str(REPO / "examples"))
+    try:
+        from run_grpo import _select_trainer
+    finally:
+        sys.path.pop(0)
+    from nemo_rl.algorithms.grpo import MasterConfig, grpo_train
+    from nemo_rl.algorithms.grpo_sync import grpo_train_sync
+
+    cfg_legacy = MasterConfig.model_construct(data_plane=None)
+    assert _select_trainer(cfg_legacy) is grpo_train
+
+    cfg_sync = MasterConfig.model_construct(data_plane={"enabled": True})
+    assert _select_trainer(cfg_sync) is grpo_train_sync
 
 
 # ─── Legacy trainer must not import grpo_sync (one-way dependency) ───────
