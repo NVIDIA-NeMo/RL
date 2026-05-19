@@ -186,11 +186,11 @@ def test_run_grpo_dispatches_both_trainers():
     assert "grpo_train_sync" in cleaned, (
         "run_grpo.py must reference grpo_train_sync (the TQ-mediated trainer)"
     )
-    # Routing must read the data_plane config block somewhere — check
-    # against the original (un-stripped) source so we cover both inline
-    # access (`master_config["data_plane"]`) and `.get("data_plane")`.
-    assert '"data_plane"' in src or "'data_plane'" in src, (
-        'run_grpo.py should read master_config["data_plane"] to dispatch.'
+    # Routing must read the data_plane config block somewhere — covers
+    # dict-style (`master_config["data_plane"]` / `.get("data_plane")`)
+    # and pydantic attribute-style (`config.data_plane`) access.
+    assert "data_plane" in cleaned, (
+        "run_grpo.py should reference the data_plane config block to dispatch."
     )
     assert re.search(r"\.get\(\s*[\"']enabled[\"']", cleaned), (
         "run_grpo.py should branch on the data-plane `enabled` flag."
