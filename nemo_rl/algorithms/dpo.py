@@ -360,7 +360,7 @@ def validate(
         )
         prefix = f"validation-{val_dataset_name}"
 
-        logger.log_metrics(k_val_metrics, step, prefix=prefix)
+        logger.log_metrics(k_val_metrics.model_dump(), step, prefix=prefix)
         logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
 
         for metric_name in DPOValMetrics.__annotations__.keys():
