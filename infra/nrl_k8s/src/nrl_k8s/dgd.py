@@ -438,6 +438,13 @@ def _frontend_http_ready(name: str, namespace: str) -> bool:
         )
         return True
     except ApiException as e:
+        # Some clusters allow DGD/pod inspection but deny the API-server
+        # service proxy connect verb. In that RBAC shape we cannot prove
+        # frontend HTTP readiness from the laptop; rely on the DGD state and
+        # pod readiness gates instead. Users can still curl the ClusterIP from
+        # an in-cluster pod when debugging.
+        if e.status == 403:
+            return True
         # 503 (no upstream yet), 502 (proxy can't reach pod), connection
         # refused — all "not ready". A 404 from the OpenAI endpoint
         # itself means the listener IS up and answering, just doesn't

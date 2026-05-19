@@ -42,6 +42,7 @@ class DynamoCfg(TypedDict, total=False):
     frontend_port: NotRequired[int]
     tool_call_parser: NotRequired[str]
     reasoning_parser: NotRequired[str]
+    prometheus_metrics: NotRequired[dict[str, Any]]
 
 
 class DynamoConfig(GenerationConfig):

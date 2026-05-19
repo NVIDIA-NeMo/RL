@@ -1,0 +1,122 @@
+# Rollout-only smoke base: mini_swe_agent + Qwen3-30B-A3B-Instruct-2507 via Dynamo.
+#
+# The model's official native context length is 262144 tokens. Keep
+# policy.max_total_sequence_length aligned with the Dynamo/vLLM max-model-len.
+# max_new_tokens stays lower to keep one-sample rollout cost bounded.
+
+defaults: grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+
+grpo:
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 1
+  max_rollout_turns: 1
+  max_num_steps: 1
+  val_period: 999999
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  model_name: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 262144
+  precision: "bfloat16"
+  make_sequence_length_divisible_by: 8
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    converter_type: Qwen3MoeForCausalLM
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    empty_unused_memory_level: 2
+    defer_fp32_logits: true
+    freeze_moe_router: false
+    moe_router_dtype: null
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: false
+    moe_per_layer_logging: false
+    track_moe_metrics: false
+    moe_router_enable_expert_bias: false
+    moe_aux_loss_coeff: 0.0
+    optimizer:
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+  generation:
+    backend: "dynamo"
+    max_new_tokens: 8192
+    dynamo_cfg:
+      tool_call_parser: "hermes"
+      prometheus_metrics:
+        enabled: true
+        wandb_run: "separate"
+        service_names: ["vllmdecodeworker"]
+        collection_interval: 10
+        timeout: 5
+        metric_prefixes: ["dynamo_"]
+    colocated:
+      enabled: false
+
+env:
+  nemo_gym:
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/mini_swe_agent/configs/mini_swe_agent.yaml
+    is_trajectory_collection: true
+    mini_swe_simple_agent:
+      responses_api_agents:
+        mini_swe_agent:
+          step_limit: 1
+          concurrency: 1
+          cache_dir_template: "/mnt/rl-workspace/jothomson/swebench_containers/swebench_sweb.eval.arm64.{instance_id}.sif"
+          run_golden: false
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          extra_body:
+            temperature: 0.7
+            top_p: 0.8
+
+data:
+  train:
+    data_path: /mnt/rl-workspace/jothomson/swebench_containers/swebench_verified_arm64_mini_swe.jsonl
+  validation:
+    data_path: /mnt/rl-workspace/jothomson/swebench_containers/swebench_verified_arm64_mini_swe.jsonl
+
+checkpointing:
+  enabled: false
+
+logger:
+  log_dir: "logs/grpo-mini-swe-qwen3-30b-a3b-instruct-2507-rollout"
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  wandb:
+    project: "nemo-gym-swe-dynamo"
+    name: "qwen3-30b-a3b-instruct-2507-mini-swe-rollout"
+    group: "qwen3-30b-a3b-instruct-2507-mini-swe-rollout"
+    job_type: "rollout"
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false
+
+cluster:
+  gpus_per_node: 0
+  num_nodes: 1

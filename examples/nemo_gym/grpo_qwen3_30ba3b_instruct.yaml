@@ -33,8 +33,8 @@ policy:
   # This is one minibatch, which is 256 prompts per step * 16 rollouts per prompt.
   train_global_batch_size: 4096
 
-  # max_total_sequence_length goes up to 131072, but we default to 32768 to make training more efficient for this instruct model which doesn't initially have such long output length.
-  max_total_sequence_length: 32768
+  # Official native context length for Qwen3-30B-A3B-Instruct-2507.
+  max_total_sequence_length: 262144
 
   # Don't use dtensor. optimizer and scheduler are dtensor only (mcore has its own version of these)
   dtensor_cfg:
