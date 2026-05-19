@@ -678,7 +678,7 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # valid module names and their per-model-type compatibility, so we only
     # require a non-empty list here and let Megatron validate the contents.
     fine_grained_activation_offloading = config["megatron_cfg"].get(
-        "fine_grained_activation_offloading", False
+        "fine_grained_activation_offloading"
     )
     if fine_grained_activation_offloading:
         offload_modules = config["megatron_cfg"].get("offload_modules")
