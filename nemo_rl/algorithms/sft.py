@@ -59,17 +59,17 @@ def _default_sft_save_state() -> SFTSaveState:
 
 
 class SFTConfig(BaseModel, extra="allow"):
-    max_num_steps: int
-    max_num_epochs: int
-    val_period: int
-    val_batches: int
-    val_global_batch_size: int
-    val_micro_batch_size: int
-    val_at_start: bool
+    max_num_steps: int = 60
+    max_num_epochs: int = 1
+    val_period: int = 10
+    val_batches: int = 8
+    val_global_batch_size: int = 32
+    val_micro_batch_size: int = 1
+    val_at_start: bool = True
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
-    val_at_end: bool
-    seed: int
+    val_at_end: bool = False
+    seed: int = 42
 
 
 class MasterConfig(BaseModel, extra="allow"):
