@@ -37,7 +37,6 @@ Spec:
 
 from __future__ import annotations
 
-import os
 
 import pytest
 import torch
@@ -48,6 +47,8 @@ transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
 from nemo_rl.data_plane import build_data_plane_client, materialize  # noqa: E402
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
+
+from ._rollout_shapes import mooncake_available
 
 # Ray is initialized once by the parent autouse fixture
 # ``tests/unit/conftest.py::init_ray_cluster`` (mirrors production: NeMo-RL
@@ -68,19 +69,6 @@ _DP_SEED_FIELDS = (
 )
 
 # ── loud-skip helpers ─────────────────────────────────────────────────────────
-
-_REQUIRE_MOONCAKE = os.environ.get("NEMO_RL_REQUIRE_MOONCAKE") == "1"
-
-
-def _mooncake_available() -> bool:
-    try:
-        import mooncake  # noqa: F401
-    except ImportError:
-        if _REQUIRE_MOONCAKE:
-            raise
-        return False
-    return True
-
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
@@ -116,7 +104,7 @@ def tq_client(request):
     Relies on parent autouse ``init_ray_cluster`` for the Ray runtime.
     """
     backend = request.param
-    if backend == "mooncake_cpu" and not _mooncake_available():
+    if backend == "mooncake_cpu" and not mooncake_available():
         pytest.skip(
             "mooncake not installed — skipping mooncake_cpu seqpack equivalence "
             "(set NEMO_RL_REQUIRE_MOONCAKE=1 to fail loud)"

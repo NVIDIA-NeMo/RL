@@ -34,6 +34,8 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
+from ._rollout_shapes import make_multi_turn_message_log
+
 
 def _build_message_log_batch() -> list[LLMMessageLogType]:
     return [
@@ -227,3 +229,82 @@ def test_attach_message_log_view_idempotent() -> None:
     first_len = len(batch["message_log"])
     attach_message_log_view(batch)
     assert len(batch["message_log"]) == first_len
+
+
+# ── Realistic multi-turn coverage using ``_rollout_shapes.make_multi_turn_message_log`` ──
+# Exercises decompose/reconstruct on the same shape of message_log a real
+# multi-turn rollout produces — jagged turn counts (1-4), alternating
+# user/assistant roles, variable per-turn token lengths.
+
+
+def test_decompose_realistic_multi_turn_jagged_count() -> None:
+    """Jagged turn-count message logs (1, 4, 2 turns) round-trip via decompose.
+
+    The realistic shape is what multi-turn rollouts produce — varied
+    per-sample turn counts. ``decompose_message_log`` must pad shorter
+    samples' ``turn_lengths`` with zeros without losing role / content
+    alignment.
+    """
+
+    # Force three samples with distinctly different turn counts.
+    ml_batch = make_multi_turn_message_log(n=3, turns_per_sample=[1, 4, 2], seed=23)
+    decomposed = decompose_message_log(ml_batch)
+
+    n = len(ml_batch)
+    max_turns = max(len(s) for s in ml_batch)
+
+    # Shapes
+    assert decomposed["turn_lengths"].shape == (n, max_turns)
+    assert len(decomposed["turn_roles"]) == n
+    assert len(decomposed["turn_contents"]) == n
+    # Shorter samples' tail turns padded with zero
+    assert int(decomposed["turn_lengths"][0, 1]) == 0  # 1-turn sample, slot 1 empty
+    assert int(decomposed["turn_lengths"][2, 2]) == 0  # 2-turn sample, slot 2 empty
+    # Non-padding positions match the source token counts
+    for i, sample in enumerate(ml_batch):
+        for t, turn in enumerate(sample):
+            assert int(decomposed["turn_lengths"][i, t]) == int(
+                turn["token_ids"].shape[0]
+            )
+            assert decomposed["turn_roles"][i][t] == turn["role"]
+
+
+def test_decompose_reconstruct_roundtrip_realistic_multi_turn() -> None:
+    """Full decompose → reconstruct round-trip on a realistic jagged multi-turn log.
+
+    Existing roundtrip test uses a fixed 2-turn (user/assistant) shape via
+    ``_build_message_log_batch``. This one exercises the full pipeline on
+    variable turn counts (1, 3, 4 turns) with alternating roles — the
+    realistic chat shape the wire actually carries.
+    """
+
+    ml_batch = make_multi_turn_message_log(n=3, turns_per_sample=[1, 3, 4], seed=17)
+    decomposed = decompose_message_log(ml_batch)
+
+    # Build the flat input_ids that the consumer would see on the wire.
+    flat_per_sample = [torch.cat([m["token_ids"] for m in ml]) for ml in ml_batch]
+    max_total = max(t.shape[0] for t in flat_per_sample)
+    input_ids = torch.zeros((len(ml_batch), max_total), dtype=torch.long)
+    for i, t in enumerate(flat_per_sample):
+        input_ids[i, : t.shape[0]] = t
+
+    rebuilt = reconstruct_message_log(
+        input_ids=input_ids,
+        turn_lengths=decomposed["turn_lengths"],
+        turn_roles=decomposed["turn_roles"],
+        turn_contents=decomposed["turn_contents"],
+    )
+
+    # Sample-level + turn-level identity through the pipeline.
+    assert len(rebuilt) == len(ml_batch)
+    for i, (orig_sample, new_sample) in enumerate(zip(ml_batch, rebuilt)):
+        assert len(orig_sample) == len(new_sample), (
+            f"sample {i}: turn count diverged "
+            f"orig={len(orig_sample)} != rebuilt={len(new_sample)}"
+        )
+        for t, (orig_turn, new_turn) in enumerate(zip(orig_sample, new_sample)):
+            assert orig_turn["role"] == new_turn["role"], (
+                f"sample {i} turn {t}: role diverged"
+            )
+            assert orig_turn["content"] == new_turn["content"]
+            assert torch.equal(orig_turn["token_ids"], new_turn["token_ids"])

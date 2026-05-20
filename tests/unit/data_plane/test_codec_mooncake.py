@@ -24,6 +24,10 @@ from __future__ import annotations
 
 import torch
 
+from nemo_rl.data_plane.codec import pack_per_token_field
+
+from ._rollout_shapes import make_rollout_batch
+
 # ── P1: promote_1d — writer unsqueezes, reader squeezes ──────────────────────
 
 
@@ -79,7 +83,6 @@ def test_pack_per_token_field_truncates_sp_padding() -> None:
     val.shape[1] > max(lengths). maybe_pack_jagged would skip this field
     (wrong shape); pack_per_token_field handles it correctly.
     """
-    from nemo_rl.data_plane.codec import pack_per_token_field
 
     n, max_len, sp_extra = 4, 8, 3  # val is wider by sp_extra tokens
     lengths = torch.tensor([3, 5, 7, 4], dtype=torch.long)
@@ -129,3 +132,23 @@ def test_pack_per_token_field_exact_fit_equals_maybe_pack_jagged() -> None:
             f"Row {i} differs between pack_per_token_field and maybe_pack_jagged "
             "on an exact-fit input."
         )
+
+
+# ── Realistic bf16 per-token coverage ──
+
+
+def test_pack_per_token_field_realistic_bf16_logprobs() -> None:
+    """pack_per_token_field on bf16 prev_logprobs (realistic dtype + value distribution)."""
+
+    batch = make_rollout_batch(
+        n=6, max_seqlen=96, logprob_dtype=torch.bfloat16, seed=29
+    )
+    out = pack_per_token_field(batch["prev_logprobs"], batch["input_lengths"])
+    assert out.is_nested
+    assert out.dtype == torch.bfloat16
+    # Per-row valid region matches input — bf16 round-trip is loss-y at the bit
+    # level but pack_per_token_field shouldn't change values.
+    for i, row in enumerate(out.unbind()):
+        valid = int(batch["input_lengths"][i])
+        assert row.shape[0] == valid
+        assert torch.equal(row, batch["prev_logprobs"][i, :valid])

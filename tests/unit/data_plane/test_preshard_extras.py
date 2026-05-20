@@ -31,14 +31,16 @@ import torch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
-from nemo_rl.data_plane.column_io import kv_first_write
+from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-
-def _keys_from_uids(uids: list[str], n_gen: int = 1) -> list[str]:
-    return [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]
+from ._rollout_shapes import (
+    keys_from_uids,
+    make_rollout_batch,
+    register_train_partition,
+)
 
 
 def _final_batch(n_samples: int = 4, *, with_extras: bool = False) -> BatchedDataDict:
@@ -53,25 +55,16 @@ def _final_batch(n_samples: int = 4, *, with_extras: bool = False) -> BatchedDat
     return d
 
 
-def _setup_partition(client: NoOpDataPlaneClient, *, num_samples: int):
-    client.register_partition(
-        partition_id="train",
-        fields=list(DP_TRAIN_FIELDS),
-        num_samples=num_samples,
-        consumer_tasks=["train"],
-    )
-
-
 # ── kv_first_write schema extensibility ────────────────────────────────
 
 
 def test_kv_first_write_writes_seed_fields():
     client = NoOpDataPlaneClient()
-    _setup_partition(client, num_samples=4)
+    register_train_partition(client, num_samples=4)
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
     meta = kv_first_write(
-        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=keys_from_uids(uids), dp_client=client, partition_id="train"
     )
     # Every tensor field in the input lands in TQ under f"{uid}_g0".
     assert meta.sample_ids == [f"u{i}_g0" for i in range(4)]
@@ -86,11 +79,11 @@ def test_kv_first_write_writes_seed_fields():
 def test_kv_first_write_carries_multimodal_extras():
     """VLM extras (pixel_values) ride along with no schema declaration."""
     client = NoOpDataPlaneClient()
-    _setup_partition(client, num_samples=4)
+    register_train_partition(client, num_samples=4)
     fb = _final_batch(4, with_extras=True)
     uids = [f"u{i}" for i in range(4)]
     meta = kv_first_write(
-        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=keys_from_uids(uids), dp_client=client, partition_id="train"
     )
     assert "pixel_values" in (meta.fields or [])
     fetched = client.get_samples(
@@ -105,10 +98,10 @@ def test_kv_first_write_keys_match_uids_x_ngen():
     """Keys round-trip: caller mints ``f"{uid}_g{i}"``, helper preserves them
     in ``meta.sample_ids`` byte-for-byte."""
     client = NoOpDataPlaneClient()
-    _setup_partition(client, num_samples=6)
+    register_train_partition(client, num_samples=6)
     fb = _final_batch(6)  # 3 prompts × 2 generations
     uids = ["a", "b", "c"]
-    keys = _keys_from_uids(uids, n_gen=2)
+    keys = keys_from_uids(uids, n_gen=2)
     meta = kv_first_write(fb, sample_ids=keys, dp_client=client, partition_id="train")
     assert meta.sample_ids == ["a_g0", "a_g1", "b_g0", "b_g1", "c_g0", "c_g1"]
 
@@ -193,3 +186,47 @@ def test_kvbatchmeta_concat_rejects_partition_mismatch():
     )
     with pytest.raises(ValueError, match=r"partition_ids must match"):
         m1.concat(m2)
+
+
+# ── Realistic multimodal extras via the rollout-shapes helper ──
+
+
+def test_kv_first_write_realistic_multimodal_round_trip() -> None:
+    """VLM extras (pixel_values bf16, image_grid_thw int64) flow through
+    the wire as flat top-level fields and come back intact."""
+
+    n = 4
+    batch = make_rollout_batch(n=n, max_seqlen=64, multimodal=True, seed=33)
+    client = NoOpDataPlaneClient()
+    client.register_partition(
+        partition_id="train",
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "sample_mask",
+            "pixel_values",
+            "image_grid_thw",
+        ],
+        num_samples=n,
+        consumer_tasks=["train"],
+    )
+    final = BatchedDataDict(
+        {
+            "input_ids": batch["input_ids"],
+            "input_lengths": batch["input_lengths"],
+            "sample_mask": batch["sample_mask"],
+            "pixel_values": batch["pixel_values"],
+            "image_grid_thw": batch["image_grid_thw"],
+        }
+    )
+    meta = kv_first_write(
+        final,
+        sample_ids=[f"u{i}" for i in range(n)],
+        dp_client=client,
+        partition_id="train",
+    )
+    out = read_columns(client, meta, select_fields=["pixel_values", "image_grid_thw"])
+    # bf16 pixel_values + int64 image_grid_thw survive the wire intact.
+    assert out["pixel_values"].dtype == torch.bfloat16
+    assert out["image_grid_thw"].dtype == torch.long
+    assert out["pixel_values"].shape[0] == n

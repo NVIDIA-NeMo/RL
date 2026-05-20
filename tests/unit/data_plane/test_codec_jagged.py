@@ -30,6 +30,8 @@ from nemo_rl.data_plane.codec import (
     to_nested_by_length,
 )
 
+from ._rollout_shapes import make_rollout_batch
+
 
 def _padded(rows: list[list[int]], pad: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
     """Pad a list of int sequences to a rectangle; return (padded, lengths)."""
@@ -170,3 +172,62 @@ def test_response_from_nested_extracts_response_slice() -> None:
     assert torch.allclose(rows[0], torch.tensor([0.2, 0.3, 0.4]))
     # Row 1: full has 3 tokens; resp_len=2 → values[3-2-1:3-1] = values[0:2] = [1.1, 1.2]
     assert torch.allclose(rows[1], torch.tensor([1.1, 1.2]))
+
+
+# ── Realistic-shape coverage using ``_rollout_shapes.make_rollout_batch`` ──
+# These exercise the same codec helpers with the exact dtypes + value
+# distributions a real GRPO rollout produces (bf16 logprobs, int64 ids,
+# int32 masks, variable per-row lengths). Catches dtype-narrowing and
+# padding-arithmetic bugs that pass on the toy data above.
+
+
+@pytest.mark.parametrize(
+    "logprob_dtype",
+    [torch.bfloat16, torch.float32],
+    ids=["bf16", "fp32"],
+)
+def test_to_nested_by_length_realistic_logprobs(logprob_dtype: torch.dtype) -> None:
+    """``generation_logprobs`` shape (bf16/fp32) from a real rollout shape round-trips."""
+
+    batch = make_rollout_batch(n=8, max_seqlen=128, logprob_dtype=logprob_dtype, seed=7)
+    nested = to_nested_by_length(batch["generation_logprobs"], batch["input_lengths"])
+    # dtype must survive the conversion (bf16 in → bf16 out).
+    assert nested.dtype == logprob_dtype
+    # Per-row valid region matches the input.
+    for i, row in enumerate(nested.unbind()):
+        valid = int(batch["input_lengths"][i])
+        assert row.shape[0] == valid
+        assert torch.equal(
+            row, batch["generation_logprobs"][i, :valid].to(logprob_dtype)
+        )
+
+
+def test_materialize_realistic_full_field_set_preserves_dtypes() -> None:
+    """All rollout fields round-trip through ``materialize`` with correct dtypes.
+
+    Catches the class of bugs where padding silently upcasts bf16 → fp32 or
+    coerces int64 → int32 because pad_value_dict's defaults were the wrong type.
+    """
+
+    batch = make_rollout_batch(n=4, max_seqlen=64, seed=11)
+    # Build a wire TD with jagged leaves keyed by field name.
+    td = TensorDict(
+        {
+            "input_ids": to_nested_by_length(
+                batch["input_ids"], batch["input_lengths"]
+            ),
+            "generation_logprobs": to_nested_by_length(
+                batch["generation_logprobs"], batch["input_lengths"]
+            ),
+            "token_mask": to_nested_by_length(
+                batch["token_mask"], batch["input_lengths"]
+            ),
+        },
+        batch_size=[4],
+    )
+    out = materialize(td, layout="padded", pad_value_dict={"input_ids": 0})
+
+    # Each field comes back at its original dtype.
+    assert out["input_ids"].dtype == torch.long
+    assert out["generation_logprobs"].dtype == torch.bfloat16
+    assert out["token_mask"].dtype == torch.int32

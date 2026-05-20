@@ -30,11 +30,13 @@ from nemo_rl.data_plane.column_io import kv_first_write, read_columns, write_col
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+
+from ._rollout_shapes import (
+    keys_from_uids,
+    make_rollout_batch,
+    register_train_partition,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-
-
-def _keys_from_uids(uids: list[str], n_gen: int = 1) -> list[str]:
-    return [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]
 
 
 # ── helpers ────────────────────────────────────────────────────────────
@@ -54,15 +56,6 @@ def _final_batch(n: int = 4, *, with_image: bool = False) -> BatchedDataDict:
     return d
 
 
-def _setup(client: NoOpDataPlaneClient, n: int, *, fields=None) -> None:
-    client.register_partition(
-        partition_id="train",
-        fields=list(fields if fields is not None else DP_TRAIN_FIELDS),
-        num_samples=n,
-        consumer_tasks=["train"],
-    )
-
-
 # ── fail-loud invariants ───────────────────────────────────────────────
 
 
@@ -72,11 +65,11 @@ def test_kv_batch_get_after_clear_raises() -> None:
     before clear — this test pins the contract that get-after-clear
     must fail loud, not silently return empty."""
     client = NoOpDataPlaneClient()
-    _setup(client, n=2)
+    register_train_partition(client, num_samples=2)
     fb = _final_batch(2)
     meta = kv_first_write(
         fb,
-        sample_ids=_keys_from_uids(["a", "b"]),
+        sample_ids=keys_from_uids(["a", "b"]),
         dp_client=client,
         partition_id="train",
     )
@@ -96,11 +89,11 @@ def test_kv_batch_get_unproduced_field_raises() -> None:
     """Mid-pipeline guard: requesting a field that no producer has
     written must fail loud, not return zeros / silently skip."""
     client = NoOpDataPlaneClient()
-    _setup(client, n=2)
+    register_train_partition(client, num_samples=2)
     fb = _final_batch(2)
     meta = kv_first_write(
         fb,
-        sample_ids=_keys_from_uids(["a", "b"]),
+        sample_ids=keys_from_uids(["a", "b"]),
         dp_client=client,
         partition_id="train",
     )
@@ -117,11 +110,11 @@ def test_kv_batch_get_unproduced_field_raises() -> None:
 def test_get_data_without_select_fields_raises() -> None:
     """P2 invariant — never silently fetch all fields."""
     client = NoOpDataPlaneClient()
-    _setup(client, n=2)
+    register_train_partition(client, num_samples=2)
     fb = _final_batch(2)
     kv_first_write(
         fb,
-        sample_ids=_keys_from_uids(["a", "b"]),
+        sample_ids=keys_from_uids(["a", "b"]),
         dp_client=client,
         partition_id="train",
     )
@@ -140,7 +133,7 @@ def test_kv_batch_put_rejects_non_tensor_leaves() -> None:
     """P3 — no pickle on the bus. Adapters MUST reject non-tensor
     leaves so callers can't accidentally ship Python objects."""
     client = NoOpDataPlaneClient()
-    _setup(client, n=2, fields=["input_ids", "metadata"])
+    register_train_partition(client, num_samples=2, fields=["input_ids", "metadata"])
 
     # Build a TensorDict that smuggles a non-tensor — bypass via
     # tensordict's NonTensorData where possible.
@@ -186,11 +179,11 @@ def test_kv_clear_with_none_drops_partition() -> None:
     """Step-end teardown must remove the partition entirely so the
     next step's register_partition starts clean."""
     client = NoOpDataPlaneClient()
-    _setup(client, n=2)
+    register_train_partition(client, num_samples=2)
     fb = _final_batch(2)
     meta = kv_first_write(
         fb,
-        sample_ids=_keys_from_uids(["a", "b"]),
+        sample_ids=keys_from_uids(["a", "b"]),
         dp_client=client,
         partition_id="train",
     )
@@ -198,7 +191,7 @@ def test_kv_clear_with_none_drops_partition() -> None:
     client.clear_samples(sample_ids=None, partition_id="train")
 
     # Partition is gone — re-registering must succeed.
-    _setup(client, n=2)
+    register_train_partition(client, num_samples=2)
 
 
 def test_double_register_partition_is_idempotent_overwrite() -> None:
@@ -226,11 +219,11 @@ def test_check_consumption_status_only_true_when_all_consumed() -> None:
     """Authoritative cross-worker stage-done signal — must NOT lie
     when consumers haven't fetched yet."""
     client = NoOpDataPlaneClient()
-    _setup(client, n=2)
+    register_train_partition(client, num_samples=2)
     fb = _final_batch(2)
     meta = kv_first_write(
         fb,
-        sample_ids=_keys_from_uids(["a", "b"]),
+        sample_ids=keys_from_uids(["a", "b"]),
         dp_client=client,
         partition_id="train",
     )
@@ -257,11 +250,11 @@ def test_shard_meta_for_dp_partitions_keys_disjointly() -> None:
     here we only care about the metas.
     """
     client = NoOpDataPlaneClient()
-    _setup(client, n=8)
+    register_train_partition(client, num_samples=8)
     fb = _final_batch(8)
     meta = kv_first_write(
         fb,
-        sample_ids=_keys_from_uids([f"u{i}" for i in range(8)]),
+        sample_ids=keys_from_uids([f"u{i}" for i in range(8)]),
         dp_client=client,
         partition_id="train",
     )
@@ -279,11 +272,11 @@ def test_shard_meta_for_dp_partitions_keys_disjointly() -> None:
 
 def test_shard_meta_for_dp_keeps_partition_id() -> None:
     client = NoOpDataPlaneClient()
-    _setup(client, n=4)
+    register_train_partition(client, num_samples=4)
     fb = _final_batch(4)
     meta = kv_first_write(
         fb,
-        sample_ids=_keys_from_uids([f"u{i}" for i in range(4)]),
+        sample_ids=keys_from_uids([f"u{i}" for i in range(4)]),
         dp_client=client,
         partition_id="train",
     )
@@ -312,7 +305,7 @@ def test_kv_first_write_carries_multimodal_extras_through_tq() -> None:
 
     meta = kv_first_write(
         fb,
-        sample_ids=_keys_from_uids([f"u{i}" for i in range(4)]),
+        sample_ids=keys_from_uids([f"u{i}" for i in range(4)]),
         dp_client=client,
         partition_id="train",
     )
@@ -381,11 +374,11 @@ def test_write_columns_accepts_batched_data_dict_input() -> None:
     pins that contract.
     """
     client = NoOpDataPlaneClient()
-    _setup(client, n=2)
+    register_train_partition(client, num_samples=2)
     fb = _final_batch(2)
     meta = kv_first_write(
         fb,
-        sample_ids=_keys_from_uids(["a", "b"]),
+        sample_ids=keys_from_uids(["a", "b"]),
         dp_client=client,
         partition_id="train",
     )
@@ -409,7 +402,7 @@ def test_kv_first_write_rejects_key_count_mismatch() -> None:
     Must fail loud. (Caller-side ``n % len(uids) == 0`` is now enforced
     at the rollout actor — see ``SyncRolloutActor.rollout_and_first_put``.)"""
     client = NoOpDataPlaneClient()
-    _setup(client, n=5)
+    register_train_partition(client, num_samples=5)
     fb = _final_batch(5)
     with pytest.raises(ValueError, match=r"must match batch size"):
         kv_first_write(
@@ -424,14 +417,65 @@ def test_kv_first_write_meta_sequence_lengths_match_input_lengths() -> None:
     """meta.sequence_lengths is consumed by Megatron's balanced packing
     on the driver — it MUST mirror final_batch.input_lengths."""
     client = NoOpDataPlaneClient()
-    _setup(client, n=4)
+    register_train_partition(client, num_samples=4)
     fb = _final_batch(4)
     fb["input_lengths"] = torch.tensor([3, 5, 7, 8], dtype=torch.long)
 
     meta = kv_first_write(
         fb,
-        sample_ids=_keys_from_uids([f"u{i}" for i in range(4)]),
+        sample_ids=keys_from_uids([f"u{i}" for i in range(4)]),
         dp_client=client,
         partition_id="train",
     )
     assert meta.sequence_lengths == [3, 5, 7, 8]
+
+
+# ── Realistic-shape round-trip ──
+# Uses ``_rollout_shapes.make_rollout_batch`` so the put/read path is
+# exercised with the same dtypes (bf16 logprobs, int32 masks, int64 ids)
+# and realistic value distributions a production rollout produces.
+
+
+def test_kv_first_write_then_read_preserves_dtypes_realistic() -> None:
+    """Full kv_first_write → get_samples round-trip preserves every field's dtype."""
+
+    n = 8
+    batch = make_rollout_batch(n=n, max_seqlen=128, seed=99)
+    client = NoOpDataPlaneClient()
+    client.register_partition(
+        partition_id="train",
+        fields=list(DP_TRAIN_FIELDS),
+        num_samples=n,
+        consumer_tasks=["train"],
+    )
+    seed = BatchedDataDict(
+        {
+            "input_ids": batch["input_ids"],
+            "input_lengths": batch["input_lengths"],
+            "token_mask": batch["token_mask"],
+            "sample_mask": batch["sample_mask"],
+            "generation_logprobs": batch["generation_logprobs"],
+        }
+    )
+    meta = kv_first_write(
+        seed,
+        sample_ids=[f"u{i}" for i in range(n)],
+        dp_client=client,
+        partition_id="train",
+    )
+    out = read_columns(
+        client,
+        meta,
+        select_fields=[
+            "input_ids",
+            "input_lengths",
+            "token_mask",
+            "sample_mask",
+            "generation_logprobs",
+        ],
+    )
+    assert out["input_ids"].dtype == torch.long
+    assert out["token_mask"].dtype == torch.int32
+    assert out["generation_logprobs"].dtype == torch.bfloat16
+    # Per-row lengths preserved.
+    assert torch.equal(out["input_lengths"].to(torch.long), batch["input_lengths"])

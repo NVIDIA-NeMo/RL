@@ -26,6 +26,8 @@ import pytest
 
 from nemo_rl.data_plane import KVBatchMeta
 
+from ._rollout_shapes import make_realistic_tags
+
 
 def test_size_matches_keys():
     """T1-meta-len — ``size`` is the source of truth derived from
@@ -153,3 +155,29 @@ def test_tags_none_when_either_side_missing_in_concat():
     )
     without = KVBatchMeta(partition_id="p", task_name="t", sample_ids=["b"])
     assert with_tags.concat(without).tags is None
+
+
+# ── Realistic tags from the rollout-shapes helper ──
+
+
+def test_realistic_tags_align_with_keys() -> None:
+    """Driver-stamped tags (std/total_reward/prompt_id/...) align 1:1 with keys."""
+
+    n = 16
+    sample_ids = [f"u{i}" for i in range(n)]
+    tags = make_realistic_tags(n, zero_std_fraction=0.25, seed=42)
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="train",
+        sample_ids=sample_ids,
+        tags=tags,
+    )
+    # Per-row alignment + tag schema preserved.
+    assert meta.size == n
+    assert len(meta.tags) == n
+    for tag in meta.tags:
+        assert {"std", "total_reward", "prompt_id", "weight_version"} <= set(tag.keys())
+    # The zero-std rows are the filter input for dynamic sampling — a realistic
+    # mix lets the subset/concat logic exercise both branches.
+    n_zero = sum(1 for t in meta.tags if t["std"] == 0.0)
+    assert n_zero == n // 4

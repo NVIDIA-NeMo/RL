@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
@@ -36,6 +37,13 @@ from nemo_rl.data_plane.column_io import kv_first_write, read_columns, write_col
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+from ._rollout_shapes import (
+    keys_from_uids,
+    make_realistic_tags,
+    make_rollout_batch,
+    register_train_partition,
+)
 
 
 def _fake_policy(client):
@@ -51,10 +59,6 @@ def _fake_policy(client):
     )
 
 
-def _keys_from_uids(uids: list[str], n_gen: int = 1) -> list[str]:
-    return [f"{uid}_g{i}" for uid in uids for i in range(n_gen)]
-
-
 def _final_batch(n: int = 4) -> BatchedDataDict:
     d: BatchedDataDict = BatchedDataDict()
     d["input_ids"] = torch.arange(n * 8, dtype=torch.long).reshape(n, 8)
@@ -63,15 +67,6 @@ def _final_batch(n: int = 4) -> BatchedDataDict:
     d["sample_mask"] = torch.ones((n,), dtype=torch.long)
     d["generation_logprobs"] = torch.zeros((n, 8), dtype=torch.float32)
     return d
-
-
-def _setup(client: NoOpDataPlaneClient, n: int) -> None:
-    client.register_partition(
-        partition_id="train",
-        fields=list(DP_TRAIN_FIELDS),
-        num_samples=n,
-        consumer_tasks=["train"],
-    )
 
 
 # ── write_columns / read_columns roundtrip ─────────────────────────────
@@ -84,11 +79,11 @@ def _setup(client: NoOpDataPlaneClient, n: int) -> None:
 
 def test_write_columns_lands_in_tq():
     client = NoOpDataPlaneClient()
-    _setup(client, n=4)
+    register_train_partition(client, num_samples=4)
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
     meta = kv_first_write(
-        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=keys_from_uids(uids), dp_client=client, partition_id="train"
     )
 
     # Driver delta-write: simulates advantage compute on the trainer.
@@ -105,11 +100,11 @@ def test_write_columns_lands_in_tq():
 
 def test_read_columns_returns_only_requested_fields():
     client = NoOpDataPlaneClient()
-    _setup(client, n=4)
+    register_train_partition(client, num_samples=4)
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
     meta = kv_first_write(
-        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=keys_from_uids(uids), dp_client=client, partition_id="train"
     )
 
     bdd = read_columns(client, meta, ["input_ids", "input_lengths"])
@@ -122,11 +117,11 @@ def test_read_columns_returns_only_requested_fields():
 def test_write_then_read_roundtrip_after_train_window():
     """Full lifecycle: rollout puts → driver delta-writes → read deltas back."""
     client = NoOpDataPlaneClient()
-    _setup(client, n=4)
+    register_train_partition(client, num_samples=4)
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
     meta = kv_first_write(
-        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=keys_from_uids(uids), dp_client=client, partition_id="train"
     )
 
     # Simulate the full sync 1-hop trainer-step writes:
@@ -164,11 +159,11 @@ def test_meta_keys_identity_across_dp_shards():
     """``shard_meta_for_dp`` must NOT mint new keys — every per-rank
     slice references a subset of the original ``meta.sample_ids``."""
     client = NoOpDataPlaneClient()
-    _setup(client, n=8)
+    register_train_partition(client, num_samples=8)
     fb = _final_batch(8)
     uids = [f"u{i}" for i in range(8)]
     meta = kv_first_write(
-        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=keys_from_uids(uids), dp_client=client, partition_id="train"
     )
 
     rank_metas, _ = shard_meta_for_dp(meta, dp_world=4, batch_size=8)
@@ -185,11 +180,11 @@ def test_kv_clear_uses_meta_keys_minted_at_rollout():
     """The keys cleared at step end are the SAME keys the rollout
     actor minted — no minting at any stage in between."""
     client = NoOpDataPlaneClient()
-    _setup(client, n=4)
+    register_train_partition(client, num_samples=4)
     fb = _final_batch(4)
     uids = [f"u{i}" for i in range(4)]
     meta = kv_first_write(
-        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=keys_from_uids(uids), dp_client=client, partition_id="train"
     )
     rollout_keys = list(meta.sample_ids)
 
@@ -238,11 +233,11 @@ def _make_driver_carry(rewards: list[float], stds: list[float]) -> BatchedDataDi
 
 def _seed_meta(client: NoOpDataPlaneClient, prefix: str, n: int) -> KVBatchMeta:
     """Stage n keys in TQ so clear_samples has something to remove."""
-    _setup(client, n=n)
+    register_train_partition(client, num_samples=n)
     fb = _final_batch(n)
     uids = [f"{prefix}{i}" for i in range(n)]
     return kv_first_write(
-        fb, sample_ids=_keys_from_uids(uids), dp_client=client, partition_id="train"
+        fb, sample_ids=keys_from_uids(uids), dp_client=client, partition_id="train"
     )
 
 
@@ -384,4 +379,115 @@ def test_apply_dynamic_sampling_raises_on_max_gen_batches():
             num_gen_batches=11,
             max_gen_batches=10,  # exceeded
             policy=_fake_policy(client),
+        )
+
+
+# ── Multi-stage TQ lifecycle on a realistic batch ──
+# Walks the same sequence the production sync trainer runs:
+#   1. register_partition → 2. kv_first_write (seed) → 3. stamp filter tags
+#   → 4. worker logprob delta-writes → 5. driver advantage delta-write
+#   → 6. full read of train fields → 7. clear_samples at step-end.
+# Each stage uses data shaped like the real rollout writer's output
+# (bf16 logprobs, int64 ids, int32 masks, realistic value distributions).
+
+
+def test_full_sync_step_lifecycle_on_realistic_batch() -> None:
+    """End-to-end TQ lifecycle test mirroring grpo_train_sync's per-step flow."""
+
+    _PARTITION = "train"
+    client = NoOpDataPlaneClient()
+    n = 8
+    max_seqlen = 128
+
+    # ── Stage 1: register partition with the schema rollout will write ──
+    client.register_partition(
+        partition_id=_PARTITION,
+        fields=list(DP_TRAIN_FIELDS),
+        num_samples=n,
+        consumer_tasks=["prev_lp", "ref_lp", "train"],
+    )
+
+    # ── Stage 2: rollout writes seed fields via kv_first_write ──
+    batch = make_rollout_batch(n=n, max_seqlen=max_seqlen, seed=101)
+    uids = [f"u{i}" for i in range(n)]
+    seed_fields = {
+        "input_ids": batch["input_ids"],
+        "input_lengths": batch["input_lengths"],
+        "token_mask": batch["token_mask"],
+        "sample_mask": batch["sample_mask"],
+        "generation_logprobs": batch["generation_logprobs"],
+    }
+    final = BatchedDataDict(seed_fields)
+    meta = kv_first_write(
+        final,
+        sample_ids=keys_from_uids(uids),
+        dp_client=client,
+        partition_id=_PARTITION,
+    )
+    # Sanity: meta carries the per-row lengths the driver needs for packing.
+    assert meta.sequence_lengths is not None
+    assert len(meta.sample_ids) == n
+    # Bf16 logprob survives the put.
+    seeded = client.get_samples(
+        sample_ids=meta.sample_ids,
+        partition_id=_PARTITION,
+        select_fields=["generation_logprobs"],
+    )
+    assert seeded["generation_logprobs"].dtype == torch.bfloat16
+
+    # ── Stage 3: driver stamps per-row tags (filter input for dyn sampling) ──
+    tags = make_realistic_tags(n, zero_std_fraction=0.25, seed=101)
+    meta.tags = tags
+    assert sum(1 for t in tags if t["std"] == 0.0) == n // 4
+
+    # ── Stage 4: workers compute logprob deltas, write back ──
+    write_columns(
+        client,
+        meta,
+        fields={
+            "prev_logprobs": batch["prev_logprobs"],
+            "reference_policy_logprobs": batch["reference_policy_logprobs"],
+        },
+    )
+
+    # ── Stage 5: driver computes advantages, writes back ──
+    write_columns(
+        client,
+        meta,
+        fields={"advantages": batch["advantages"]},
+    )
+
+    # ── Stage 6: full read of train fields (what train_presharded does) ──
+    full = read_columns(
+        client,
+        meta,
+        select_fields=[
+            "input_ids",
+            "input_lengths",
+            "token_mask",
+            "sample_mask",
+            "generation_logprobs",
+            "prev_logprobs",
+            "reference_policy_logprobs",
+            "advantages",
+        ],
+    )
+    # All fields present, dtypes preserved end-to-end.
+    assert full["input_ids"].dtype == torch.long
+    assert full["token_mask"].dtype == torch.int32
+    assert full["generation_logprobs"].dtype == torch.bfloat16
+    assert full["prev_logprobs"].dtype == torch.bfloat16
+    assert full["reference_policy_logprobs"].dtype == torch.bfloat16
+    assert full["advantages"].dtype == torch.bfloat16
+    # Row count survives the full pipeline.
+    assert full["input_ids"].shape[0] == n
+
+    # ── Stage 7: step-end clear (mirror of finish_step) ──
+    client.clear_samples(sample_ids=meta.sample_ids, partition_id=_PARTITION)
+    # Subsequent get must fail loud — the keys are gone.
+    with pytest.raises(KeyError):
+        client.get_samples(
+            sample_ids=[meta.sample_ids[0]],
+            partition_id=_PARTITION,
+            select_fields=["input_ids"],
         )

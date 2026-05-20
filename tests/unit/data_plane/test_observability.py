@@ -28,6 +28,8 @@ from tensordict import TensorDict
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 
+from ._rollout_shapes import make_rollout_batch
+
 
 @pytest.fixture
 def wrapped_client():
@@ -139,4 +141,43 @@ def test_factory_wraps_when_observability_enabled():
         partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["r"]
     )
     assert len(seen) == 1 and seen[0]["op"] == "register"
+    client.close()
+
+
+def test_observability_records_realistic_rollout_put() -> None:
+    """Metrics middleware records put-bytes correctly when the put carries a
+    realistic rollout-shaped batch (bf16 logprobs, int32 masks, int64 ids)."""
+
+    inner = NoOpDataPlaneClient()
+    seen: list[dict] = []
+    client = MetricsDataPlaneClient(inner, on_event=seen.append)
+
+    n = 4
+    batch = make_rollout_batch(n=n, max_seqlen=64, seed=71)
+    client.register_partition(
+        partition_id="train",
+        fields=["input_ids", "input_lengths", "generation_logprobs"],
+        num_samples=n,
+        consumer_tasks=["train"],
+    )
+    fields = TensorDict(
+        {
+            "input_ids": batch["input_ids"],
+            "input_lengths": batch["input_lengths"],
+            "generation_logprobs": batch["generation_logprobs"],
+        },
+        batch_size=[n],
+    )
+    client.put_samples(
+        sample_ids=[f"u{i}" for i in range(n)],
+        partition_id="train",
+        fields=fields,
+    )
+
+    put_events = [e for e in seen if e["op"] == "put"]
+    assert len(put_events) == 1
+    # Bytes should reflect bf16 logprobs (2 bytes/elem) + int64 ids (8 bytes/elem),
+    # not a fixed-dtype assumption. Lower bound: at least one full int64 batch.
+    min_expected = n * 64 * 8  # input_ids alone
+    assert put_events[0]["n_bytes"] >= min_expected
     client.close()

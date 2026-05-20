@@ -45,6 +45,8 @@ import numpy as np
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict
 
+from ._rollout_shapes import make_multi_turn_message_log
+from nemo_rl.data.llm_message_utils import decompose_message_log
 from nemo_rl.data_plane.codec import (
     materialize,
     to_nested_by_length,
@@ -153,3 +155,35 @@ def test_materialize_decodes_nontensor_stack_with_tensor_field() -> None:
 # and ::test_object_and_tensor_mixed_round_trip_backends. The unit
 # tests above cover the decode path in isolation; the functional tests
 # cover the full wire round-trip.
+
+
+def test_materialize_realistic_message_log_object_field() -> None:
+    """Realistic multi-turn message_log decomposes into ``turn_roles`` /
+    ``turn_contents`` as ``np.ndarray(dtype=object)`` and materializes back."""
+
+    n = 4
+    ml_batch = make_multi_turn_message_log(n=n, turns_per_sample=[1, 2, 3, 4], seed=51)
+    decomposed = decompose_message_log(ml_batch)
+
+    # The wire-shape: turn_roles + turn_contents are per-sample lists.
+    # Build a TD with a NonTensorStack of those lists.
+    roles_stack = NonTensorStack(*[list(r) for r in decomposed["turn_roles"]])
+    contents_stack = NonTensorStack(*[list(c) for c in decomposed["turn_contents"]])
+    td = TensorDict(
+        {
+            "turn_lengths": decomposed["turn_lengths"],
+            "turn_roles": roles_stack,
+            "turn_contents": contents_stack,
+        },
+        batch_size=[n],
+    )
+
+    out = materialize(td, layout="padded")
+    # Object fields come back as np.ndarray(dtype=object) — the codec's
+    # canonical decode of NonTensorStack.
+    assert isinstance(out["turn_roles"], np.ndarray)
+    assert out["turn_roles"].dtype == object
+    assert isinstance(out["turn_contents"], np.ndarray)
+    # Per-sample identity survives the decode.
+    for i in range(n):
+        assert list(out["turn_roles"][i]) == list(decomposed["turn_roles"][i])
