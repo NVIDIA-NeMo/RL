@@ -349,17 +349,24 @@ def materialize(
         if val.is_nested and layout == "padded":
             pad = pads.get(key, 0)
             padded = torch.nested.to_padded_tensor(val, padding=pad)
-            if (
-                pad_to_seqlen > 0
-                and padded.dim() >= 2
-                and padded.shape[1] < pad_to_seqlen
-            ):
-                pad_spec = [0, 0] * (padded.dim() - 2) + [
-                    0,
-                    pad_to_seqlen - padded.shape[1],
-                ]
-                padded = torch.nn.functional.pad(padded, pad_spec, value=pad)
-            out[key] = padded
         else:
-            out[key] = val
+            pad = pads.get(key, 0)
+            padded = val
+        # Apply `pad_to_seqlen` to ALL 2D+ tensors, not only the freshly-
+        # padded-from-nested case. Rectangular wire payloads (vLLM's
+        # right-padded output) ride the ``else`` branch above, so without
+        # this they'd skip the cross-DP forward pad target and break the
+        # microbatch iterator (truncate_tensors → narrow length>size).
+        if (
+            pad_to_seqlen > 0
+            and isinstance(padded, torch.Tensor)
+            and padded.dim() >= 2
+            and padded.shape[1] < pad_to_seqlen
+        ):
+            pad_spec = [0, 0] * (padded.dim() - 2) + [
+                0,
+                pad_to_seqlen - padded.shape[1],
+            ]
+            padded = torch.nn.functional.pad(padded, pad_spec, value=pad)
+        out[key] = padded
     return BatchedDataDict(out)
