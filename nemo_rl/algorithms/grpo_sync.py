@@ -864,6 +864,26 @@ def grpo_train_sync(
                             calibration_data,
                             include_q=True,
                         )["layers"]
+                        # Route scales through TQ so the wire actually
+                        # carries them. Legacy refit still consumes the
+                        # dict-of-dict shape, but the values now
+                        # ROUND-TRIP through TQ as flat tensors —
+                        # validates the transport for scales and is the
+                        # first step toward async-decoupled refit (where
+                        # the vLLM worker reads from TQ directly instead
+                        # of receiving via Ray broadcast).
+                        from nemo_rl.data_plane.kv_scales import (
+                            get_kv_scales,
+                            pack_kv_scales,
+                            put_kv_scales,
+                            unpack_kv_scales,
+                        )
+                        put_kv_scales(
+                            policy.dp_client, pack_kv_scales(kv_scales_cache)
+                        )
+                        kv_scales_cache = unpack_kv_scales(
+                            get_kv_scales(policy.dp_client)
+                        )
                         POLICY_GENERATION_STALE = True
 
                 # Stash input_ids and content before clear_samples so the
