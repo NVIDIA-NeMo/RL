@@ -70,7 +70,7 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.schema import DP_CALIB_EXCLUDED_FIELDS
+from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
@@ -849,11 +849,13 @@ def grpo_train_sync(
                             "▶ Recomputing KV cache scales after policy update...",
                             flush=True,
                         )
-                        # Exclude logprobs, masks, and advantages; multimodal extras pass through.
+                        # Positive include-list — calibration only consumes
+                        # seq-dim tensor inputs. Train-side deltas
+                        # (logprobs/advantages/masks) and wire-only message
+                        # log bulk fields are skipped by virtue of not being
+                        # in DP_CALIB_INPUT_FIELDS.
                         _calib_fields = [
-                            f
-                            for f in (meta.fields or [])
-                            if f not in DP_CALIB_EXCLUDED_FIELDS
+                            f for f in (meta.fields or []) if f in DP_CALIB_INPUT_FIELDS
                         ]
                         calibration_data = policy.read_from_dataplane(
                             meta,

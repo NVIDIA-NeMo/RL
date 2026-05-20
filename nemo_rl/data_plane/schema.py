@@ -15,8 +15,6 @@
 
 from typing import Literal
 
-from nemo_rl.data.llm_message_utils import MESSAGE_LOG_BULK_FIELDS
-
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
 Layout = Literal["padded", "jagged"]
 
@@ -54,17 +52,11 @@ LP_SEED_FIELDS = (
     "sample_mask",
 )
 
-# Train-partition fields NOT needed for KV-scale calibration. Derived
-# from ``DP_TRAIN_FIELDS`` so a new train-side column added to the
-# schema is excluded-by-default — to include a new column in
-# calibration, add it to the private set below. Wire-only metadata
-# from ``decompose_message_log`` (turn_lengths/turn_roles/turn_contents)
-# is also excluded because ``calibrate_qkv_fp8_scales`` routes through
-# the legacy ``get_microbatch_iterator`` which crashes on non-seq-dim
-# fields. Wire still transfers them; this just narrows the calibration
-# request.
-_DP_CALIB_INPUT_FIELDS = frozenset({INPUT_IDS, INPUT_LENGTHS})
-DP_CALIB_EXCLUDED_FIELDS = (
-    (frozenset(DP_TRAIN_FIELDS) - _DP_CALIB_INPUT_FIELDS)
-    | frozenset(MESSAGE_LOG_BULK_FIELDS)
-)
+# Fields requested for KV-scale calibration. Positive include-list:
+# calibration only handles seq-dim tensor inputs, so we name them
+# explicitly. Train-side deltas (logprobs/advantages/masks) and
+# wire-only message-log bulk fields are skipped by virtue of not being
+# in this list. ``multi_modal_inputs`` covers VLM extras (pixel values,
+# grid metadata, etc.) when present; it's harmlessly absent for
+# text-only models so the filter skips it on those.
+DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS, "multi_modal_inputs")
