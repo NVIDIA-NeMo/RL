@@ -34,13 +34,9 @@ run_test() {
     fi
 }
 
-run_test fast uv run --no-sync bash ./tests/functional/audio_grpo_megatron.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_megatron.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_mbridge_restore.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_eagle3_online.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_lora.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_lora_async.sh
+run_test      uv run --no-sync bash ./tests/functional/eval.sh
+run_test      uv run --no-sync bash ./tests/functional/eval_async.sh
+run_test fast uv run --no-sync bash ./tests/functional/eval_audio.sh
 
 cd ${PROJECT_ROOT}/tests
 coverage combine .coverage*

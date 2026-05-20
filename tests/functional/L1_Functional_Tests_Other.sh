@@ -39,9 +39,7 @@ run_test      bash ./tests/functional/test_frozen_env.sh
 
 run_test fast uv run --no-sync bash ./tests/functional/distillation.sh
 run_test fast uv run --no-sync bash ./tests/functional/dpo.sh
-run_test      uv run --no-sync bash ./tests/functional/eval.sh
-run_test      uv run --no-sync bash ./tests/functional/eval_async.sh
-run_test fast uv run --no-sync bash ./tests/functional/eval_audio.sh
+run_test      uv run --no-sync bash ./tests/functional/prorlv2.sh
 run_test      uv run --no-sync bash ./tests/functional/rm.sh
 run_test fast uv run --no-sync bash ./tests/functional/test_converters.sh
 run_test      uv run --no-sync bash ./tests/functional/test_decode_vs_prefill.sh

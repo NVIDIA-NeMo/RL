@@ -441,6 +441,8 @@ jobs:
         include:
           - script: L1_Functional_Tests_Megatron
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_Megatron_Other
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
           - script: L1_Functional_Tests_AutoModel
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
           - script: L1_Functional_Tests_SGLang
@@ -450,6 +452,8 @@ jobs:
           - script: L1_Functional_Tests_GRPO
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
           - script: L1_Functional_Tests_SFT
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_Eval
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
           - script: L1_Functional_Tests_Other
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
@@ -480,6 +484,8 @@ jobs:
         include:
           - script: L1_Functional_Tests_Megatron
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_Megatron_Other
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
           - script: L1_Functional_Tests_AutoModel
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
           - script: L1_Functional_Tests_SGLang
@@ -489,6 +495,8 @@ jobs:
           - script: L1_Functional_Tests_GRPO
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
           - script: L1_Functional_Tests_SFT
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_Eval
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
           - script: L1_Functional_Tests_Other
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
