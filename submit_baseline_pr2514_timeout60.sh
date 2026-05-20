@@ -26,7 +26,7 @@ CONTAINER="/lustre/fsw/portfolios/coreai/users/yukih/enroot-images/nvcr.io/nvidi
 
 # hybridep variant overrides + PR #2280 selective recompute (start aggressive: core_attn+moe_act only)
 VARIANT_TAG="baseline-pr2514-timeout60"
-EXTRA_OVERRIDES=""
+EXTRA_OVERRIDES="++policy.megatron_cfg.recompute_granularity=full"
 EXTRA_ENVS=""
 export TORCH_CUDA_ARCH_LIST_OVERRIDE="9.0"
 
