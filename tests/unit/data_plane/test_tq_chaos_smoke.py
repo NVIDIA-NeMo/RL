@@ -51,6 +51,11 @@ _TQ_CFG = {
     "backend": "simple",
     "storage_capacity": 1024,
     "num_storage_units": 1,
+    "claim_meta_poll_interval_s": 0.5,
+    # Required by DataPlaneConfig schema even for backend=simple
+    # (only read when backend == mooncake_cpu). CI-sized values.
+    "global_segment_size": 8589934592,  # 8 GiB
+    "local_buffer_size": 1073741824,  # 1 GiB
 }
 
 # Budget: the test must raise within this many seconds after the kill.
