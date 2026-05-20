@@ -918,10 +918,9 @@ async def test_vllm_generation_with_hf_training_colocated(
     cluster, tokenizer, async_engine, cpu_offload, vllm_precision, enable_lora
 ):
     """This test validates that DTensor policy can work together with colocated vLLM policy."""
-    device_name = torch.cuda.get_device_name(0)
-    if vllm_precision == "fp8" and "GB200" in device_name:
+    if vllm_precision == "fp8":
         pytest.skip(
-            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
+            "Skipping FP8 test until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
         )
 
     # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
@@ -995,10 +994,9 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     vllm_precision,
     enable_lora,
 ):
-    device_name = torch.cuda.get_device_name(0)
-    if vllm_precision == "fp8" and "GB200" in device_name:
+    if vllm_precision == "fp8":
         pytest.skip(
-            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
+            "Skipping FP8 test until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
         )
 
     # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
@@ -1640,10 +1638,9 @@ def test_vllm_weight_update_and_prefix_cache_reset(
     cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
     """Test that the vLLM prefix cache is correctly reset when weights change."""
-    device_name = torch.cuda.get_device_name(0)
-    if vllm_precision == "fp8" and "GB200" in device_name:
+    if vllm_precision == "fp8":
         pytest.skip(
-            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
+            "Skipping FP8 test until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
         )
 
     if vllm_precision == "fp8":
@@ -2060,10 +2057,9 @@ def test_vllm_generation_with_megatron_training(
 
     This test validates that vLLM and Megatron policies can work together.
     """
-    device_name = torch.cuda.get_device_name(0)
-    if vllm_precision == "fp8" and "GB200" in device_name:
+    if vllm_precision == "fp8":
         pytest.skip(
-            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
+            "Skipping FP8 test until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
         )
 
     # Skip invalid configurations: kv_cache_dtype=fp8 requires precision=fp8
@@ -2240,10 +2236,9 @@ def test_vllm_generation_with_megatron_training_moe_model(
 
     This test validates that vLLM and Megatron policies can work together.
     """
-    device_name = torch.cuda.get_device_name(0)
-    if vllm_precision == "fp8" and "GB200" in device_name:
+    if vllm_precision == "fp8":
         pytest.skip(
-            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
+            "Skipping FP8 test until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
         )
 
     # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
