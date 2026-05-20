@@ -144,7 +144,7 @@ From within the NeMo RL container:
 ```bash
 cd /opt/nemo-rl
 
-PYTHONPATH=$PWD/3rdparty/Megatron-LM-workspace/Megatron-LM:${PYTHONPATH:-} \
+PYTHONPATH=$PWD/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:${PYTHONPATH:-} \
 uv run --extra mcore --extra modelopt \
   torchrun --nproc_per_node <pipeline-parallel-size> \
   3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/examples/quantization/export.py \
