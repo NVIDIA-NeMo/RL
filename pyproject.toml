@@ -423,7 +423,7 @@ requires-dist = ["setuptools", "wheel", "torch", "numpy"]
 [[tool.uv.dependency-metadata]]
 name = "sglang-kernel"
 # This version has to match the version in the commit/rev/tag used
-version = "0.5.10"
+version = "0.4.1"
 requires-dist = ["torch", "scikit-build-core", "wheel"]
 
 [[tool.uv.dependency-metadata]]
@@ -477,7 +477,7 @@ requires-dist = [
   "sentencepiece",
   "setproctitle",
   "flash-attn-4>=4.0.0b4",
-  "sglang-kernel==0.5.10",
+  "sglang-kernel==0.4.1",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
