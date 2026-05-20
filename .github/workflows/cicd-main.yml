@@ -353,7 +353,7 @@ jobs:
           (needs.build-container.result == 'success' || needs.build-container.result == 'skipped')
         ) && !cancelled()
       }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: rl-azure-gpu-x2
     name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
     environment: nemo-ci
     steps:
@@ -377,11 +377,11 @@ jobs:
       matrix:
         include:
           - script: L0_Unit_Tests_Generation
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: rl-azure-gpu-x2
           - script: L0_Unit_Tests_Policy
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: rl-azure-gpu-x2
           - script: L0_Unit_Tests_Other
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: rl-azure-gpu-x2
     needs: [pre-flight, build-container, cicd-doc-tests, org-member-pre-flight]
     if: >-
       ${{
@@ -421,7 +421,7 @@ jobs:
       matrix:
         include:
           - script: L1_Functional_Tests_GPU
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: rl-azure-gpu-x2
     needs: [pre-flight, build-container, cicd-unit-tests, org-member-pre-flight]
     runs-on: ${{ matrix.runner }}
     if: ${{ contains('L1 L2', needs.pre-flight.outputs.test_level) }}
@@ -448,7 +448,7 @@ jobs:
       matrix:
         include:
           - script: L1_Functional_Tests_GPU
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: rl-azure-gpu-x2
     needs: [pre-flight, org-member-pre-flight]
     if: ${{ contains('Lfast', needs.pre-flight.outputs.test_level) }}
     runs-on: ${{ matrix.runner }}
