@@ -92,7 +92,7 @@ test -d $WEIGHTS_DIR || { echo "[FAIL] no policy/weights under $STEP_DIR"; exit 
 rm -rf $EXPORT_DIR
 mkdir -p $EXPORT_DIR
 
-MEGATRON_LM_SRC=$PROJECT_ROOT/3rdparty/Megatron-LM-workspace/Megatron-LM
+MEGATRON_LM_SRC=$PROJECT_ROOT/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
 PYTHONPATH=$MEGATRON_LM_SRC:${PYTHONPATH:-} \
 uv run --extra mcore --extra modelopt \
     torchrun --nproc_per_node 1 \

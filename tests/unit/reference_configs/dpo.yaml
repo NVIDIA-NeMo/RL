@@ -1,0 +1,297 @@
+# DPO Algorithm Configuration
+dpo:
+  max_num_epochs: 1
+  max_num_steps: 150
+  val_period: 25
+  val_batches: 8
+  val_global_batch_size: 8
+  val_micro_batch_size: 1
+  val_at_start: true
+  val_at_end: false
+  seed: 42
+
+  reference_policy_kl_penalty: 0.05
+  preference_average_log_probs: False # whether normalizing log probs according to the sequence length in preference_loss
+  sft_average_log_probs: ${.preference_average_log_probs} # whether normalizing log probs according to the sequence length in sft_loss
+
+  ## TODO(@ashors) support other loss functions
+  #preference_loss: dpo # the preference loss, we support dpo, ipo, rpo_sq, rpo_bwd_kl, rpo_fwd_kl
+  #gt_reward_scale: 1. # the scale of the rewards in RPO
+  preference_loss_weight: 1 # the coefficient of the preference loss
+  sft_loss_weight: 0 # the coefficient of the SFT loss
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/dpo"
+  metric_name: "val:validation-default_loss"
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 50
+  checkpoint_must_save_by: null
+  save_optimizer: true
+
+policy:
+  model_name: "meta-llama/Llama-3.2-1B-Instruct"
+  tokenizer:
+    name: "meta-llama/Llama-3.2-1B-Instruct"
+    chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
+
+  # number of preference samples per batch
+  # each preference sample corresponds to a pair of chosen and rejected responses
+  # so the actual batch size processed by the model is train_global_batch_size * 2
+  train_global_batch_size: 128
+  train_micro_batch_size: 2
+
+  ## TODO(@ashors) support
+  #logprob_batch_size: ${policy.train_micro_batch_size}
+  max_total_sequence_length: 1024
+  precision: "bfloat16"
+
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf
+    enabled: true
+    cpu_offload: False
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    clear_cache_every_n_steps: null
+
+    # Automodel kwargs passed to from_pretrained.
+    # Uncomment force_hf if the custom model's adapter doesn't support per-tensor
+    # weight conversion (e.g. Qwen2, Llama). Auto-detected if not set.
+    # See https://github.com/NVIDIA-NeMo/RL/issues/2072
+    automodel_kwargs: {}
+      # force_hf: true
+
+    # LoRA (Low-Rank Adaptation) Configuration
+    lora_cfg:
+      enabled: False  # Set to True to enable LoRA fine-tuning
+      target_modules: []  # List of module names to apply LoRA (empty list with match_all_linear=true applies to all linear layers)
+      exclude_modules: []  # List of module names to exclude from LoRA
+      match_all_linear: true  # If True, applies LoRA to all linear layers (overrides target_modules)
+      dim: 8  # LoRA rank (r): lower rank = fewer parameters but less capacity. Typical values: 4, 8, 16, 32, 64
+      alpha: 32  # LoRA scaling factor: effective learning rate multiplier = alpha/dim. Typical values: 16, 32, 64
+      dropout: 0.0  # Dropout probability applied to LoRA layers (0.0 = no dropout)
+      dropout_position: "post"  # Where to apply dropout: "pre" (before LoRA) or "post" (after LoRA)
+      lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
+      use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
+
+  dynamic_batching:
+    enabled: false
+
+  sequence_packing:
+    enabled: false
+
+  # makes the training sequence length divisible by the tensor parallel size
+  # this is useful for sequence parallel training
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-6
+      weight_decay: 0.1
+      betas: [0.9, 0.98]
+      eps: 1e-5
+      # when using Dtensor, we need to set foreach
+      # and fused to False
+      foreach: False
+      fused: False
+    
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+    
+  ## ignored since enabled=false, but needed for testing purposes
+  megatron_cfg:
+    enabled: false
+    use_linear_ce_fusion_loss: false
+    linear_ce_fusion_chunk_size: 256
+    force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
+    empty_unused_memory_level: 1
+    activation_checkpointing: false
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    sequence_parallel: true
+    freeze_moe_router: false
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "aux_loss"
+    moe_router_bias_update_rate: 1e-3
+    moe_permute_fusion: true
+    #gives ~20% training perf speedup with sequence packing 
+    apply_rope_fusion: True
+    # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
+    bias_activation_fusion: True
+    defer_fp32_logits: False
+    moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
+
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: null
+
+    optimizer:
+      optimizer: "adam"
+      lr: 5.0e-6 #4.0e-5
+      min_lr: 5.0e-6 #4.0e-5
+      weight_decay: 0.1
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      #adam
+      adam_beta1: 0.9
+      adam_beta2: 0.98
+      adam_eps: 1e-8
+
+      #sgd
+      sgd_momentum: 0.9
+
+      #distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+      # optimizer cpu offload
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_warmup_iters: 1
+      lr_warmup_init: 0.00000001
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      data_parallel_sharding_strategy: "optim_grads_params"
+      use_custom_fsdp: false
+
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 1
+
+  # dataset
+  train:
+    dataset_name: HelpSteer3
+    split: train
+  validation:
+    dataset_name: HelpSteer3
+    split: validation
+  # You can use custom preference datasets for training and validation. For example:
+  # 1. PreferenceDataset
+  #   train:
+  #     # this dataset will override prompt_key and use the default values for other vars
+  #     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+  #     subset: null  # used for HuggingFace datasets
+  #     split: train  # used for HuggingFace datasets
+  #   validation:
+  #     # this dataset will use the default values for other vars except data_path
+  #     data_path: /path/to/local/val_dataset.jsonl
+  #   default:
+  #     # will use below vars as default values if dataset doesn't specify it
+  #     dataset_name: PreferenceDataset
+  #     prompt_file: null
+  #     system_prompt_file: null
+  #   # multiple validation sets is supported by using val_data_paths
+  #   # this will be removed after refactor
+  #   val_data_paths:
+  #     <NameOfValidationDataset1>: /path/to/local/val_dataset_1.jsonl
+  #     <NameOfValidationDataset2>: /path/to/local/val_dataset_2.jsonl
+  # 2. BinaryPreferenceDataset
+  #   train:
+  #     # this dataset will override prompt_key and use the default values for other vars
+  #     data_path: /path/to/local/train_dataset.jsonl  # local file or hf_org/hf_dataset_name (HuggingFace)
+  #     prompt_key: context
+  #     subset: null  # used for HuggingFace datasets
+  #     split: train  # used for HuggingFace datasets
+  #   validation:
+  #     # this dataset will use the default values for other vars except data_path
+  #     data_path: /path/to/local/val_dataset.jsonl
+  #   default:
+  #     # will use below vars as default values if dataset doesn't specify it
+  #     dataset_name: BinaryPreferenceDataset
+  #     prompt_key: prompt
+  #     chosen_key: chosen
+  #     rejected_key: rejected
+  #     prompt_file: null
+  #     system_prompt_file: null
+  # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/dpo.md#datasets for more details.
+
+  # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
+  #   checkpointing:
+  #     metric_name: "val:validation-<NameOfValidationDataset1>_loss"
+  #   ...
+
+logger:
+  log_dir: "logs"  # Base directory for all logs
+  wandb_enabled: false # Make sure you do a ``wandb login [Your API key]'' before running
+
+  tensorboard_enabled: false
+  mlflow_enabled: false  # Disable MLflow logging
+  swanlab_enabled: false # Disable SwanLab logging
+  monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  wandb:
+    project: "dpo-dev"
+    name: "dpo"
+  swanlab:
+    project: "dpo-dev"
+    name: "dpo"
+  tensorboard:
+    log_dir: "tb_logs-dpo-dev"
+  mlflow:
+    experiment_name: "dpo-dev"
+    run_name: "dpo"
+    tracking_uri: "http://localhost:5000"
+  gpu_monitoring:
+    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
+    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1

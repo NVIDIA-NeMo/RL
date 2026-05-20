@@ -297,9 +297,44 @@ jobs:
       registry: ${{ needs.org-member-pre-flight.outputs.registry }}
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
+        ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}-uv-cache:latest', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       build-args: |
         MAX_JOBS=4
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
+        ${{ needs.org-member-pre-flight.outputs.is_member != 'true' && 'SKIP_SGLANG_BUILD=1' || '' }}
+
+  update-uv-cache:
+    name: Update uv build cache
+    needs: [build-container, org-member-pre-flight]
+    if: >-
+      ${{
+        github.ref == 'refs/heads/main' &&
+        needs.build-container.result == 'success'
+      }}
+    runs-on: ${{ format('{0}-gpu-x2', needs.org-member-pre-flight.outputs.runner_prefix) }}
+    environment: nemo-ci
+    env:
+      REGISTRY: ${{ needs.org-member-pre-flight.outputs.registry }}
+      IMAGE_NAME: ${{ vars.CI_CONTAINER_NAME }}
+    steps:
+      - name: Extract and push uv cache image
+        run: |
+          set -euo pipefail
+          SRC="${REGISTRY}/${IMAGE_NAME}:${{ github.run_id }}"
+          DST="${REGISTRY}/${IMAGE_NAME}-uv-cache:latest"
+
+          docker pull "${SRC}"
+          CID=$(docker create "${SRC}" true)
+          mkdir -p /tmp/uv-cache
+          docker cp "${CID}:/root/.cache/uv/." /tmp/uv-cache/
+          docker rm "${CID}"
+
+          printf 'FROM scratch\nCOPY uv-cache/ /\n' > /tmp/Dockerfile.uv-cache
+          docker build -t "${DST}" -f /tmp/Dockerfile.uv-cache /tmp
+          docker push "${DST}"
+
+          docker rmi "${SRC}" "${DST}" 2>/dev/null || true
+          rm -rf /tmp/uv-cache /tmp/Dockerfile.uv-cache
 
   cicd-doc-tests:
     strategy:

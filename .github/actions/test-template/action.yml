@@ -160,7 +160,7 @@ runs:
             # fingerprint once upfront instead of using NRL_FORCE_REBUILD_VENVS=true which
             # rebuilds on every Ray remote call.
             if [[ "${FAST:-0}" == "1" ]]; then
-              UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+              UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters sglang
               python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
             fi
             bash tests/${{ inputs.is_doc_test == 'true' && 'docs' || (inputs.is_unit_test == 'true' && 'unit' || 'functional') }}/${{ inputs.script }}.sh && \
