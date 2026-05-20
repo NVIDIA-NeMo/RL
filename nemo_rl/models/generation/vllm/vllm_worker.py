@@ -500,11 +500,25 @@ class BaseVllmGenerationWorker:
         if self.cfg["vllm_cfg"]["precision"] == "fp8":
             from nemo_rl.models.generation.vllm.quantization.fp8 import init_fp8
 
+            existing_hf_overrides = copy.deepcopy(vllm_kwargs.get("hf_overrides", {}))
             fp8_kwargs = init_fp8(
                 self.cfg["vllm_cfg"], self.model_name, model_parallel_size
             )
+            fp8_hf_overrides = fp8_kwargs.pop("hf_overrides", {})
 
             vllm_kwargs.update(fp8_kwargs)
+            if not isinstance(existing_hf_overrides, dict):
+                existing_hf_overrides = {}
+            if not isinstance(fp8_hf_overrides, dict):
+                fp8_hf_overrides = {}
+            vllm_kwargs["hf_overrides"] = {
+                **fp8_hf_overrides,
+                **existing_hf_overrides,
+            }
+            if "quantization_config" in fp8_hf_overrides:
+                vllm_kwargs["hf_overrides"]["quantization_config"] = fp8_hf_overrides[
+                    "quantization_config"
+                ]
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
