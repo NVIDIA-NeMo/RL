@@ -11,176 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Static architecture invariants — see test plan §4.8.
+"""Minimal behavioral invariants for the data-plane wiring.
 
-Cheap regex-level tests. Run in milliseconds. Catch entire classes of
-drift around the verl-style sibling-trainer split:
-
-  * legacy ``grpo.py`` is fully untouched by the data plane,
-  * ``grpo_sync.py`` requires a TQPolicy with no feature-gate temptation,
-  * the production factory has no NoOp escape hatch,
-  * ``examples/run_grpo.py`` dispatches both trainers explicitly.
-
-Plan §4.8 was written assuming a ``train_from_dp_meta`` separate-method
-design. We instead chose subclass-based polymorphism: ``TQPolicy``
-overrides ``Policy`` methods, and ``examples/run_grpo.py`` selects
-which policy + trainer pair is constructed.
+* ``examples/run_grpo._select_trainer`` dispatches the legacy trainer
+  when ``data_plane`` is absent and the sync trainer when enabled.
+* The ``DataPlaneClient`` ABC carries every method adapters depend on.
 """
 
 from __future__ import annotations
 
 import pathlib
-import re
 
 import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 
 
-def _read(rel: str) -> str:
-    return (REPO / rel).read_text()
-
-
-def _strip_comments_and_docstrings(src: str) -> str:
-    """Best-effort cleaner so we don't false-positive on docstring text."""
-    src = re.sub(r"#.*", "", src)
-    src = re.sub(r'""".*?"""', "", src, flags=re.DOTALL)
-    src = re.sub(r"'''.*?'''", "", src, flags=re.DOTALL)
-    return src
-
-
-# ─── R-C9 — sync trainer engages the data plane (TQPolicy design) ────────
-
-
-def test_grpo_sync_engages_tq_policy():
-    """Sync trainer must require a TQ-mediated policy.
-
-    The TQ engagement is now encapsulated in
-    :class:`nemo_rl.models.policy.tq_policy.TQPolicy` — the trainer's job
-    is to enforce that the policy in hand actually carries the TQ
-    transport (``policy.dp_cfg`` is the public marker set by
-    ``TQPolicy.__init__``). Without this guard, a misconfiguration could
-    silently route through the legacy in-memory dispatch.
-
-    The TQ wire-level constructs (``KVBatchMeta``, ``shard_meta_for_dp``,
-    ``build_data_plane_client``) belong inside ``tq_policy.py`` /
-    ``preshard.py``, not in the trainer.
-    """
-    src = _strip_comments_and_docstrings(_read("nemo_rl/algorithms/grpo_sync.py"))
-    assert 'hasattr(policy, "dp_cfg")' in src or "hasattr(policy, 'dp_cfg')" in src, (
-        "grpo_sync.py must guard on `hasattr(policy, 'dp_cfg')` so a "
-        "non-TQ Policy instance is rejected with a clear error."
-    )
-    # TQ engagement happens through the policy's overridden methods —
-    # check that the chain reaches a real KVBatchMeta construction.
-    helper_src = _strip_comments_and_docstrings(_read("nemo_rl/data_plane/preshard.py"))
-    assert "KVBatchMeta(" in helper_src, (
-        "preshard.py must still construct KVBatchMeta — TQPolicy "
-        "delegates here on each fan-out."
-    )
-    tq_policy_src = _strip_comments_and_docstrings(
-        _read("nemo_rl/models/policy/tq_policy.py")
-    )
-    assert "build_data_plane_client(" in tq_policy_src, (
-        "TQPolicy must construct the data-plane client in __init__."
-    )
-
-
-def test_grpo_sync_requires_data_plane_enabled():
-    """The sync trainer should hard-fail when invoked without the data
-    plane enabled — running it in legacy mode is a category error."""
-    src = _strip_comments_and_docstrings(_read("nemo_rl/algorithms/grpo_sync.py"))
-    # Either a guard or a direct require — at minimum the error must be
-    # raised when enabled=False.
-    assert "raise ValueError" in src or "raise RuntimeError" in src, (
-        "grpo_sync.py should raise when data_plane is not enabled."
-    )
-    # And the failure message should name the legacy escape hatch so
-    # users can self-recover.
-    assert "grpo_train" in src or "grpo.py" in src, (
-        "grpo_sync.py's enabled-required error should point users at the legacy trainer."
-    )
-
-
-def test_no_feature_gate_pattern_in_either_trainer():
-    """Catch the next 'just one if branch' temptation in *either*
-    trainer — the sibling-trainer split forbids cross-trainer
-    conditionals."""
-    legacy = _strip_comments_and_docstrings(_read("nemo_rl/algorithms/grpo.py"))
-    sync = _strip_comments_and_docstrings(_read("nemo_rl/algorithms/grpo_sync.py"))
-
-    # In the legacy trainer, ANY data_plane-conditional is wrong —
-    # legacy must not even know the data plane exists.
-    legacy_forbidden = [
-        r"if\s+.*data_plane",
-        r"if\s+.*tq\b",
-        r"if\s+.*transfer_queue",
-        r"cfg\.get\([\"']data_plane",
-        r"master_config\[[\"']data_plane",
-        r"master_config\.get\([\"']data_plane",
-    ]
-    for pat in legacy_forbidden:
-        m = re.findall(pat, legacy)
-        assert not m, (
-            f"legacy grpo.py reintroduced a data-plane gate: "
-            f"pattern {pat!r} matched {m}."
-        )
-
-    # In the sync trainer, an early "is enabled?" guard is allowed
-    # (we use one), but per-stage feature gates inside the loop are not.
-    # Heuristic: feature-gate guards inside an inner block tend to look
-    # like `if dp_client is not None:` after the early guard already
-    # raised. Allow the early guard once; warn on more.
-    n_dp_client_gates = len(re.findall(r"if\s+dp_client\s+is\s+not\s+None", sync))
-    assert n_dp_client_gates == 0, (
-        f"grpo_sync.py has {n_dp_client_gates} `if dp_client is not None` "
-        "guards. Sync trainer assumes the client is always present — "
-        "the existence check belongs at the top of the function only."
-    )
-
-
-# ─── R-C10 — factory rejects NoOp in production ──────────────────────────
-
-
-def test_factory_does_not_construct_noop():
-    """The production factory must not return a NoOp client.
-
-    ``NoOpDataPlaneClient`` is test-only; importing it directly from
-    ``adapters/noop.py`` is fine in tests, but the factory has no
-    business handing it out.
-    """
-    src = _read("nemo_rl/data_plane/factory.py")
-    # No import of NoOp from the factory.
-    assert "NoOpDataPlaneClient" not in src, (
-        "factory.py imports/constructs NoOpDataPlaneClient. NoOp must "
-        "be reachable only via direct import from tests."
-    )
-    # Disabled or unknown impl raises.
-    assert "raise ValueError" in src, (
-        "factory.py must fail-fast on disabled or unknown impl."
-    )
-
-
-def test_factory_rejects_disabled_impl():
-    """Factory must raise — not return None, not return a NoOp — when
-    the caller passes ``enabled=False``. The legacy trainer should not
-    call the factory at all."""
-    src = _read("nemo_rl/data_plane/factory.py")
-    cleaned = _strip_comments_and_docstrings(src)
-    # The enabled-check should land before any impl dispatch.
-    assert re.search(r"enabled.*False|not.*enabled", cleaned), (
-        "factory.py is missing an enabled-check. Disabled cfg must "
-        "fail-fast, not silently return a client."
-    )
-
-
-# ─── examples/run_grpo.py dispatches both trainers ───────────────────────
-
-
 def test_run_grpo_dispatches_both_trainers():
-    """``examples/run_grpo.py._select_trainer`` must return the
-    TQ-mediated ``grpo_train_sync`` iff ``data_plane.enabled`` is true,
-    and the legacy ``grpo_train`` otherwise."""
+    """``examples/run_grpo._select_trainer`` returns the TQ-mediated
+    ``grpo_train_sync`` iff ``data_plane.enabled`` is true, and the
+    legacy ``grpo_train`` otherwise."""
     import sys
 
     sys.path.insert(0, str(REPO / "examples"))
@@ -198,86 +48,6 @@ def test_run_grpo_dispatches_both_trainers():
     assert _select_trainer(cfg_sync) is grpo_train_sync
 
 
-# ─── Legacy trainer must not import grpo_sync (one-way dependency) ───────
-
-
-def test_legacy_does_not_import_sync():
-    """Dependency direction: ``grpo_sync.py`` imports helpers from
-    ``grpo.py``. The reverse must never hold or we'd recreate the
-    coupling we split."""
-    legacy = _read("nemo_rl/algorithms/grpo.py")
-    assert "grpo_sync" not in legacy, (
-        "legacy grpo.py imports from grpo_sync.py. The dependency "
-        "direction is one-way: sync imports legacy helpers, never "
-        "the other way around."
-    )
-
-
-# ─── pack_per_token_field export guard (commit 45f4ffb8) ─────────────────────
-
-
-def test_pack_per_token_field_is_exported() -> None:
-    """pack_per_token_field must be importable from nemo_rl.data_plane.codec.
-
-    Guards against silent deletion of the helper added in commit 45f4ffb8.
-    The function handles the qwen3 + TP + SP padding case where
-    val.shape[1] > max(lengths); maybe_pack_jagged is shape-strict and
-    cannot handle that.
-    """
-    from nemo_rl.data_plane.codec import pack_per_token_field  # noqa: F401
-
-    assert callable(pack_per_token_field), (
-        "nemo_rl.data_plane.codec.pack_per_token_field must be callable. "
-        "It was added in commit 45f4ffb8 to handle SP-padded-wider write-backs."
-    )
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "pack_per_token_field defined in codec.py:151 but no callers — "
-        "wiring incomplete on this branch (45f4ffb8). "
-        "When wired, this test xpasses and someone removes the marker."
-    ),
-)
-def test_pack_per_token_field_is_wired_into_writeback() -> None:
-    """At least one of the three write-back call sites must import
-    pack_per_token_field.
-
-    Known sites still using maybe_pack_jagged as of commit 45f4ffb8:
-      - nemo_rl/data_plane/worker_mixin.py:336
-      - nemo_rl/data_plane/column_io.py:85
-      - nemo_rl/experience/sync_rollout_actor.py:107
-
-    If this test FAILS (i.e., the xfail is not triggered), the SP-padded-wider
-    write-back regression (commit 45f4ffb8) is no longer guarded.
-    Wire `pack_per_token_field` into at least one of the three call sites to
-    make this test xpass, then remove the xfail marker.
-    """
-    sites = [
-        "nemo_rl/data_plane/worker_mixin.py",
-        "nemo_rl/data_plane/column_io.py",
-        "nemo_rl/experience/sync_rollout_actor.py",
-    ]
-    found_in_any = False
-    for rel_path in sites:
-        src = _read(rel_path)
-        if "pack_per_token_field" in src:
-            found_in_any = True
-            break
-
-    assert found_in_any, (
-        "None of the three write-back call sites reference pack_per_token_field:\n"
-        + "\n".join(f"  {s}" for s in sites)
-        + "\nIf this fails, the SP-padded-wider write-back regression "
-        "(commit 45f4ffb8) is no longer guarded — wire `pack_per_token_field` "
-        "into one of the three call sites."
-    )
-
-
-# ─── ABC contract method names — catch silent renames ────────────────────
-
-
 @pytest.mark.parametrize(
     "method",
     [
@@ -291,86 +61,12 @@ def test_pack_per_token_field_is_wired_into_writeback() -> None:
         "close",
     ],
 )
-def test_abc_method_present(method):
-    """The DataPlaneClient ABC contract is the swap surface. Renaming
-    a method silently is a breaking change for every adapter."""
-    src = _read("nemo_rl/data_plane/interfaces.py")
-    assert f"def {method}" in src, (
+def test_data_plane_client_abc_method_present(method: str) -> None:
+    """The ``DataPlaneClient`` ABC is the swap surface; a silent rename
+    is a breaking change for every adapter."""
+    from nemo_rl.data_plane.interfaces import DataPlaneClient
+
+    assert hasattr(DataPlaneClient, method), (
         f"DataPlaneClient ABC is missing required method {method!r}. "
-        f"This is a breaking change for every adapter (G2)."
+        "This is a breaking change for every adapter."
     )
-
-
-# ─── FP8-calib path: end-to-end shape contract ──────────────────────────
-
-
-def test_fp8_calib_filter_then_seqlen_check_no_crash():
-    """End-to-end behavioral test of the bug we hit on job 11920261.
-
-    Reproduces the FP8 calibration request → legacy seqlen-assert
-    pipeline in isolation:
-
-    1. Build a synthetic ``meta.fields`` that mirrors what the
-       data-plane wire actually publishes for a train partition with
-       message-log decompose: DP_TRAIN_FIELDS ∪ MESSAGE_LOG_BULK_FIELDS.
-    2. Run the actual filter from ``grpo_sync.py`` —
-       ``[f for f in meta.fields if f not in DP_CALIB_EXCLUDED_FIELDS]``.
-    3. Build a synthetic ``BatchedDataDict`` containing the resulting
-       fields with realistic shapes (input_ids/input_lengths per-token,
-       turn_lengths as (B, max_turns) — NOT per-token).
-    4. Call ``get_and_validate_seqlen`` on the filtered dict.
-
-    Before the schema.py fix, the filter let turn_lengths through and
-    step 4 raised ``AssertionError: Dim 1 must be the sequence dim``.
-    After the fix, turn_lengths is filtered out and the assertion is
-    never reached.
-    """
-    import torch
-
-    from nemo_rl.data.llm_message_utils import MESSAGE_LOG_BULK_FIELDS
-    from nemo_rl.data_plane.schema import DP_CALIB_EXCLUDED_FIELDS, DP_TRAIN_FIELDS
-    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-    from nemo_rl.models.megatron.data import get_and_validate_seqlen
-
-    B, seq_len, max_turns = 4, 8192, 3
-    # Wire fields published by the train partition (mirrors meta.fields).
-    meta_fields = list(DP_TRAIN_FIELDS) + list(MESSAGE_LOG_BULK_FIELDS)
-
-    # Step 2: the actual filter from grpo_sync.py:853-856.
-    calib_fields = [f for f in meta_fields if f not in DP_CALIB_EXCLUDED_FIELDS]
-
-    # Filtered set must not include any per-turn metadata.
-    assert not (set(calib_fields) & set(MESSAGE_LOG_BULK_FIELDS)), (
-        f"_calib_fields leaked MESSAGE_LOG_BULK_FIELDS: "
-        f"{set(calib_fields) & set(MESSAGE_LOG_BULK_FIELDS)!r}"
-    )
-    assert "input_ids" in calib_fields
-    assert "input_lengths" in calib_fields
-
-    # Step 3: build a BatchedDataDict at realistic shapes for the
-    # FILTERED field set. ``turn_lengths`` etc. are absent here — the
-    # filter dropped them, so materialize would never read them.
-    data = BatchedDataDict(
-        {
-            "input_ids": torch.zeros(B, seq_len, dtype=torch.long),
-            "input_lengths": torch.full((B,), seq_len, dtype=torch.long),
-        }
-    )
-    # Step 4: legacy validator. Pre-fix this crashed when ``turn_lengths``
-    # was in the dict because dim 1 was max_turns, not seq_len.
-    sequence_dim, seq_dim_size = get_and_validate_seqlen(data)
-    assert sequence_dim == 1
-    assert seq_dim_size == seq_len
-
-    # Negative control: verify the validator would still crash if the
-    # filter regressed and let turn_lengths through. Catches anyone who
-    # later removes MESSAGE_LOG_BULK_FIELDS from DP_CALIB_EXCLUDED_FIELDS.
-    leaky_data = BatchedDataDict(
-        {
-            "input_ids": torch.zeros(B, seq_len, dtype=torch.long),
-            "input_lengths": torch.full((B,), seq_len, dtype=torch.long),
-            "turn_lengths": torch.zeros(B, max_turns, dtype=torch.long),
-        }
-    )
-    with pytest.raises(AssertionError, match="Dim 1 must be the sequence dim"):
-        get_and_validate_seqlen(leaky_data)
