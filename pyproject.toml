@@ -5,6 +5,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 packages = ["nemo_rl"]
 
+[tool.setuptools.package-data]
+nemo_rl = ["utils/*.json"]
+
 [tool.setuptools.dynamic]
 version = { attr = "nemo_rl.__version__" }                      # any module attribute compatible with ast.literal_eval
 readme = { file = "README.md", content-type = "text/markdown" }

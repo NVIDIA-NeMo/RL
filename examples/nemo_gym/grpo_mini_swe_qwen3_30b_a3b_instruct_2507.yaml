@@ -70,6 +70,8 @@ policy:
         collection_interval: 10
         timeout: 5
         metric_prefixes: ["dynamo_"]
+        export:
+          enabled: true
     colocated:
       enabled: false
 
