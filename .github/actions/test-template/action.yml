@@ -41,19 +41,6 @@ inputs:
     description: "Run tests on CPU only"
     required: false
     default: "false"
-  azure-client-id:
-    description: "Azure Client ID"
-    required: true
-  azure-tenant-id:
-    description: "Azure Tenant ID"
-    required: true
-  azure-subscription-id:
-    description: "Azure Subscription ID"
-    required: true
-  has-azure-credentials:
-    description: "Has Azure credentials"
-    required: false
-    default: "false"
   is_fork_pr:
     description: "Whether this is a pull request from a fork"
     required: false
@@ -77,19 +64,9 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Install Azure CLI
-      if: ${{ inputs.has-azure-credentials == 'true' }}
-      shell: bash
-      run: |
-        for i in 1 2 3; do
-          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash && break
-          echo "Attempt $i failed, retrying in 10s..."
-          sleep 10
-        done
-
     - name: Install uuidgen
       shell: bash -x -e -u -o pipefail {0}
-      if: ${{ contains(inputs.runner, 'gcp') }}
+      if: ${{ contains(inputs.runner, 'aws') || contains(inputs.runner, 'gcp') }}
       run: |
         for i in 1 2 3; do
           apt-get update && apt-get install -y uuid-runtime && break
@@ -138,6 +115,7 @@ runs:
         docker run --rm -u root --runtime=nvidia --gpus all \
           --shm-size=64g \
           --env TRANSFORMERS_OFFLINE=0 \
+          --env GHA_RUNNER=${{ inputs.runner }} \
           --env HYDRA_FULL_ERROR=1 \
           --env HF_HOME=/home/TestData/nemo-rl/hf_home \
           --env HF_DATASETS_CACHE=/home/TestData/nemo-rl/hf_datasets_cache \
