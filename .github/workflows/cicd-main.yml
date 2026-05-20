@@ -297,7 +297,6 @@ jobs:
       registry: nemoci.azurecr.io
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
-        ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}-uv-cache:latest', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       build-args: |
         MAX_JOBS=4
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
