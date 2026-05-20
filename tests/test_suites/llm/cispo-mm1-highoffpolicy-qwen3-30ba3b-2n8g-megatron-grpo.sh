@@ -2,8 +2,9 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
-# MiniMax-M1 replication study, DAPO ("Clip-Higher") arm (2n8g).
-# See examples/configs/recipes/llm/cispo-mm1-replica-qwen3-30ba3b-2n8g-megatron-dapo.yaml.
+# MiniMax-M1 high-off-policy study, GRPO baseline arm (2n8g sized to match the
+# proven SAPO sister recipe).
+# See examples/configs/recipes/llm/cispo-mm1-highoffpolicy-qwen3-30ba3b-2n8g-megatron-grpo.yaml.
 # NOT in the CISPO PR - local research artifact.
 
 # ===== BEGIN CONFIG =====

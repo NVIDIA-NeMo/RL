@@ -1,16 +1,17 @@
-# MiniMax-M1 replication study (https://arxiv.org/abs/2506.13585), CISPO arm.
-# Minimal-diff copy of workspace-4's proven 2n8g SAPO recipe. Only the
-# loss_fn block differs across arms.
+# MiniMax-M1 high-off-policy study (https://arxiv.org/abs/2506.13585), GRPO arm.
+# Minimal-diff copy of workspace-4's proven 2n8g SAPO recipe:
+#   grpo-qwen3-30ba3b-2n8g-megatron-sapo-asym.yaml
+# Only the loss_fn block (and logger names) differs.
 #
-# CISPO (MiniMax-M1 §3.1) clips the IS weight as a stop-gradient
-# coefficient instead of clipping the policy ratio. Gradients flow
-# through log pi for *every* token, including the rare reflective
-# tokens ("However", "Wait", "Recheck") that GRPO/DAPO would zero out.
+# Three-way A/B/C: this is the GRPO baseline; DAPO and CISPO are at
+#   cispo-mm1-highoffpolicy-qwen3-30ba3b-2n8g-megatron-dapo.yaml
+#   cispo-mm1-highoffpolicy-qwen3-30ba3b-2n8g-megatron-cispo.yaml
+# Submit via cispo_mm1_replica.slurm with ARM=grpo|dapo|cispo.
 #
-#   L_CISPO = -A * sg(clip(r, 1 - eps_low, 1 + eps_high)) * log pi(a)
-#
-# Per ms-swift's CISPO recipe and ScaleRL (arXiv:2510.13786), we use a
-# very loose lower clip and a much wider upper clip (eps_high = 5.0).
+# Off-policy regime: 32 x 16 = 512 trajectories, train_global_batch_size=32
+# -> 16 gradient updates per rollout (SAPO/GSPO Sec 5.1 setting). KL beta=0,
+# token-level loss, sampling temperature 1.0.
+# NOT in the PR; local research artifact.
 defaults: ../../grpo_math_qwen30ba3b_megatron.yaml
 
 grpo:
@@ -25,7 +26,7 @@ grpo:
 
 policy:
   model_name: Qwen/Qwen3-30B-A3B
-  train_global_batch_size: 128
+  train_global_batch_size: 32
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 4096
@@ -63,32 +64,34 @@ policy:
       enabled: true
 
 loss_fn:
-  # ---- CISPO arm ----
+  # ---- GRPO baseline arm ---- (only the loss_fn block differs across arms)
   reference_policy_kl_penalty: 0.0
   reference_policy_kl_type: k3
-  ratio_clip_min: 1.0                  # lower bound = 0; effectively unclipped
-  ratio_clip_max: 5.0                  # eps_high = 5.0 (ms-swift / ScaleRL)
-  ratio_clip_c: null                   # dual clipping MUST be off for CISPO
+  ratio_clip_min: 0.2                  # standard PPO/GRPO epsilon
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
   token_level_loss: true
   use_importance_sampling_correction: false
   sequence_level_importance_ratios: false
   force_on_policy_ratio: false
-  use_cispo: true
+  use_cispo: false
+  # Shared CISPO-style diagnostics across all 3 arms so the GRPO baseline
+  # also reports grpo_would_clip_frac (the gap CISPO claims to close).
   cispo_diagnostics: true
-  cispo_diag_grpo_eps: 0.2             # measure GRPO-equivalent clip rate
+  cispo_diag_grpo_eps: 0.2
   cispo_diag_low_prob_threshold: 0.05
 
 checkpointing:
   enabled: false
 
 logger:
-  log_dir: logs/cispo-mm1-replica-qwen3-30ba3b-2n8g-megatron-cispo
+  log_dir: logs/cispo-mm1-highoffpolicy-qwen3-30ba3b-2n8g-megatron-grpo
   wandb_enabled: true
   tensorboard_enabled: true
   monitor_gpus: false
   wandb:
     project: nemo-rl
-    name: cispo-mm1-replica-qwen3-30ba3b-2n8g-megatron-cispo
+    name: cispo-mm1-highoffpolicy-qwen3-30ba3b-2n8g-megatron-grpo
 
 cluster:
   gpus_per_node: 8
