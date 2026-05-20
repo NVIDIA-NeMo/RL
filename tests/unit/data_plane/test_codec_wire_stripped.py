@@ -45,13 +45,14 @@ import numpy as np
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict
 
-from ._rollout_shapes import make_multi_turn_message_log
 from nemo_rl.data.llm_message_utils import decompose_message_log
 from nemo_rl.data_plane.codec import (
     materialize,
     to_nested_by_length,
     unwrap_wire_stripped_payload,
 )
+
+from ._rollout_shapes import make_multi_turn_message_log
 
 # ── unwrap_wire_stripped_payload — direct per-item coverage ───────────
 

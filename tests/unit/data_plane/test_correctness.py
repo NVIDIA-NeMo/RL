@@ -30,14 +30,13 @@ from nemo_rl.data_plane.column_io import kv_first_write, read_columns, write_col
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 from ._rollout_shapes import (
     keys_from_uids,
     make_rollout_batch,
     register_train_partition,
 )
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-
 
 # ── helpers ────────────────────────────────────────────────────────────
 

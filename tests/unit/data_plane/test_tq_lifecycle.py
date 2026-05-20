@@ -22,7 +22,6 @@ the data-plane extra still passes.
 
 from __future__ import annotations
 
-
 import numpy as np
 import pytest
 import torch
