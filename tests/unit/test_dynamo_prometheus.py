@@ -1,5 +1,4 @@
 import json
-import sys
 
 from nemo_rl.utils.dynamo_prometheus import (
     DynamoPrometheusMonitor,
@@ -7,16 +6,30 @@ from nemo_rl.utils.dynamo_prometheus import (
 )
 
 
-class _DummyWandbLogger:
+class _FailingRun:
+    def log(self, *args, **kwargs):
+        raise AssertionError("Dynamo Prometheus should not log to W&B")
+
     def define_metric(self, *args, **kwargs):
-        pass
+        raise AssertionError("Dynamo Prometheus should not define W&B metrics")
+
+    def finish(self):
+        raise AssertionError("Dynamo Prometheus should not own a W&B run")
+
+
+class _FailingWandbLogger:
+    run = _FailingRun()
+
+    def define_metric(self, *args, **kwargs):
+        raise AssertionError("Dynamo Prometheus should not define W&B metrics")
 
 
 class _DummyLogger:
-    wandb_logger = _DummyWandbLogger()
+    def __init__(self):
+        self.wandb_logger = _FailingWandbLogger()
 
     def log_metrics(self, *args, **kwargs):
-        pass
+        raise AssertionError("Dynamo Prometheus should not use logger.log_metrics")
 
 
 def test_resolve_metric_endpoint_from_dgd_name():
@@ -74,51 +87,29 @@ python_info{version="3.11"} 1
     assert second[mean_keys[0]] == 3
 
 
-class _RecordingRun:
-    def __init__(self):
-        self.logged = []
-        self.defined_metrics = []
-        self.finished = False
-        self.id = "main-run-id"
-        self.name = "main-run"
-        self.project = "test-project"
-        self.entity = "test-entity"
-        self.group = "test-group"
-
-    def log(self, metrics, **kwargs):
-        self.logged.append((metrics, kwargs))
-
-    def define_metric(self, *args, **kwargs):
-        self.defined_metrics.append((args, kwargs))
-
-    def finish(self):
-        self.finished = True
-
-
-class _RecordingWandbLogger:
-    def __init__(self):
-        self.run = _RecordingRun()
-        self.defined_metrics = []
-
-    def define_metric(self, *args, **kwargs):
-        self.defined_metrics.append((args, kwargs))
-
-
-class _RecordingLogger:
-    def __init__(self):
-        self.wandb_logger = _RecordingWandbLogger()
-        self.log_metrics_calls = []
-
-    def log_metrics(self, *args, **kwargs):
-        self.log_metrics_calls.append((args, kwargs))
-
-
-def test_collect_flushes_prometheus_metrics_on_elapsed_time(monkeypatch):
-    logger = _RecordingLogger()
+def test_start_skips_when_local_export_is_disabled():
+    logger = _DummyLogger()
     monitor = DynamoPrometheusMonitor(
         logger=logger,
         dynamo_cfg={"dgd_name": "jonas-swe"},
         prometheus_cfg={"endpoints": {"decode": "http://example/metrics"}},
+    )
+
+    monitor.start()
+
+    assert monitor.is_running is False
+
+
+def test_collect_writes_export_sample_on_elapsed_time(tmp_path, monkeypatch):
+    logger = _DummyLogger()
+    logger.base_log_dir = str(tmp_path)
+    monitor = DynamoPrometheusMonitor(
+        logger=logger,
+        dynamo_cfg={"dgd_name": "jonas-swe"},
+        prometheus_cfg={
+            "endpoints": {"decode": "http://example/metrics"},
+            "export": {"enabled": True},
+        },
     )
     monitor.start_time = 100.0
     monkeypatch.setattr(
@@ -131,111 +122,21 @@ def test_collect_flushes_prometheus_metrics_on_elapsed_time(monkeypatch):
         lambda endpoint_name, endpoint_url: {"decode/some_metric": 7.0},
     )
 
+    monitor._prepare_export()
     monitor._collect_and_log()
+    export_dir = monitor._finalize_export()
 
-    assert logger.log_metrics_calls == []
-    assert logger.wandb_logger.run.logged == []
-
-    assert monitor._flush_samples_to_wandb() == 1
-    assert len(logger.wandb_logger.run.logged) == 1
-    metrics, kwargs = logger.wandb_logger.run.logged[0]
-
-    assert kwargs == {}
-    assert metrics["dynamo_prometheus/elapsed_seconds"] == 12.5
-    assert metrics["dynamo_prometheus/wall_time"] == 112.5
-    assert metrics["dynamo_prometheus/decode/some_metric"] == 7.0
-
-
-def test_start_defines_endpoint_metrics_against_elapsed_time():
-    logger = _RecordingLogger()
-    monitor = DynamoPrometheusMonitor(
-        logger=logger,
-        dynamo_cfg={"dgd_name": "jonas-swe"},
-        prometheus_cfg={"endpoints": {"decode": "http://example/metrics"}},
-    )
-    monitor._collection_loop = lambda: None
-
-    monitor.start()
-    monitor.stop()
-
-    assert (
-        ("dynamo_prometheus/elapsed_seconds",),
-        {},
-    ) in logger.wandb_logger.defined_metrics
-    assert (
-        ("dynamo_prometheus/wall_time",),
-        {},
-    ) in logger.wandb_logger.defined_metrics
-    assert (
-        ("dynamo_prometheus/decode/*",),
-        {"step_metric": "dynamo_prometheus/elapsed_seconds"},
-    ) in logger.wandb_logger.defined_metrics
-
-
-def test_separate_wandb_run_groups_with_parent_run(monkeypatch):
-    class _FakeWandb:
-        def __init__(self):
-            self.init_calls = []
-            self.run = None
-
-        def init(self, **kwargs):
-            self.init_calls.append(kwargs)
-            self.run = _RecordingRun()
-            self.run.id = "dynamo-run-id"
-            self.run.name = kwargs["name"]
-            self.run.project = kwargs["project"]
-            self.run.entity = kwargs["entity"]
-            self.run.group = kwargs["group"]
-            return self.run
-
-    fake_wandb = _FakeWandb()
-    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
-
-    logger = _RecordingLogger()
-    monitor = DynamoPrometheusMonitor(
-        logger=logger,
-        dynamo_cfg={"dgd_name": "jonas-swe"},
-        prometheus_cfg={
-            "endpoints": {"decode": "http://example/metrics"},
-            "wandb_run": "separate",
-        },
-        logger_config={
-            "wandb": {
-                "project": "nemo-gym-swe-dynamo",
-                "name": "qwen25-coder-14b-mini-swe-rollout",
-                "entity": "nvidia",
-                "group": "qwen25-coder-14b-mini-swe-rollout",
-            }
-        },
-    )
-    monitor._collection_loop = lambda: None
-
-    monitor.start()
-    assert fake_wandb.init_calls == [
+    samples = [
+        json.loads(line)
+        for line in (export_dir / "samples.jsonl").read_text().splitlines()
+    ]
+    assert samples == [
         {
-            "project": "nemo-gym-swe-dynamo",
-            "entity": "nvidia",
-            "name": "qwen25-coder-14b-mini-swe-rollout-dynamo-prometheus",
-            "group": "qwen25-coder-14b-mini-swe-rollout",
-            "job_type": "dynamo-prometheus",
-            "reinit": "create_new",
-            "resume": "never",
-            "config": {
-                "source_wandb_run_id": "main-run-id",
-                "source_wandb_run_name": "qwen25-coder-14b-mini-swe-rollout",
-                "metric_prefix": "dynamo_prometheus",
-                "metric_prefixes": ["dynamo_"],
-                "endpoints": {"decode": "http://example/metrics"},
-            },
+            "dynamo_prometheus/decode/some_metric": 7.0,
+            "dynamo_prometheus/elapsed_seconds": 12.5,
+            "dynamo_prometheus/wall_time": 112.5,
         }
     ]
-    assert (
-        ("dynamo_prometheus/decode/*",),
-        {"step_metric": "dynamo_prometheus/elapsed_seconds"},
-    ) in fake_wandb.run.defined_metrics
-
-    monitor.stop()
-    assert fake_wandb.run.finished is True
 
 
 def test_export_writes_replay_artifacts(tmp_path, monkeypatch):
@@ -248,7 +149,7 @@ dynamo_component_request_bytes_total{dynamo_component="VllmDecodeWorker",dynamo_
 python_info{version="3.11"} 1
 """
 
-    logger = _RecordingLogger()
+    logger = _DummyLogger()
     logger.base_log_dir = str(tmp_path)
     monitor = DynamoPrometheusMonitor(
         logger=logger,

@@ -65,7 +65,6 @@ policy:
       tool_call_parser: "hermes"
       prometheus_metrics:
         enabled: true
-        wandb_run: "separate"
         service_names: ["vllmdecodeworker"]
         collection_interval: 10
         timeout: 5

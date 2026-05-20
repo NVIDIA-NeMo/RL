@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Forward Dynamo Prometheus metrics into W&B and local replay artifacts."""
+"""Export Dynamo Prometheus metrics as local replay artifacts."""
 
 import json
 import math
@@ -65,13 +65,7 @@ def maybe_start_dynamo_prometheus_monitor(
     master_config: Mapping[str, Any],
     logger: "Logger",
 ) -> Optional["DynamoPrometheusMonitor"]:
-    """Start Dynamo Prometheus forwarding when this run uses Dynamo + W&B.
-
-    By default the monitor writes into the active W&B run. Set
-    ``policy.generation.dynamo_cfg.prometheus_metrics.wandb_run: separate`` to
-    write Dynamo telemetry into a dedicated W&B run grouped with the training
-    run.
-    """
+    """Start local Dynamo Prometheus export when this run uses Dynamo."""
     generation_config = (
         master_config.get("policy", {}).get("generation", {})  # type: ignore[union-attr]
         or {}
@@ -86,10 +80,9 @@ def maybe_start_dynamo_prometheus_monitor(
         return None
 
     export_enabled = _export_enabled(prometheus_cfg)
-    if getattr(logger, "wandb_logger", None) is None and not export_enabled:
+    if not export_enabled:
         print(
-            "[Dynamo Prometheus] W&B logger is not enabled and local export is "
-            "disabled; skipping forwarding."
+            "[Dynamo Prometheus] Local export is disabled; skipping collection."
         )
         return None
 
@@ -104,7 +97,7 @@ def maybe_start_dynamo_prometheus_monitor(
 
 
 class DynamoPrometheusMonitor:
-    """Poll Dynamo Prometheus endpoints and log scalar samples to W&B."""
+    """Poll Dynamo Prometheus endpoints and write local replay artifacts."""
 
     def __init__(
         self,
@@ -168,13 +161,6 @@ class DynamoPrometheusMonitor:
         self.export_finalized = False
         self.endpoints = _resolve_metric_endpoints(dynamo_cfg, prometheus_cfg)
         self.previous_values: dict[tuple[str, tuple[tuple[str, str], ...], str], float] = {}
-        self.samples: list[dict[str, Any]] = []
-        self.samples_lock = threading.Lock()
-        self.flushed_sample_count = 0
-        self.log_live = bool(prometheus_cfg.get("log_live", False))
-        self.separate_wandb_run = _uses_separate_wandb_run(prometheus_cfg)
-        self.wandb_run: Any = None
-        self.owns_wandb_run = False
         self.is_running = False
         self.collection_thread: Optional[threading.Thread] = None
         self.start_time = float("-inf")
@@ -199,26 +185,9 @@ class DynamoPrometheusMonitor:
                     flush=True,
                 )
 
-        if self._can_log_to_wandb():
-            self.wandb_run = self._resolve_wandb_run()
-
-        if self.wandb_run is None and not self.export_enabled:
-            print(
-                "[Dynamo Prometheus] No W&B run or local export available; "
-                "skipping forwarding."
-            )
+        if not self.export_enabled:
+            print("[Dynamo Prometheus] No local export available; skipping.")
             return
-
-        if self.wandb_run is not None:
-            self._define_wandb_metric(self.elapsed_time_metric)
-            self._define_wandb_metric(self.wall_time_metric)
-            for endpoint_name, _ in self.endpoints:
-                endpoint_prefix = (
-                    f"{self.metric_prefix}/{_sanitize_metric_part(endpoint_name)}/*"
-                )
-                self._define_wandb_metric(
-                    endpoint_prefix, step_metric=self.elapsed_time_metric
-                )
 
         self.start_time = time.time()
         self.is_running = True
@@ -228,15 +197,9 @@ class DynamoPrometheusMonitor:
         )
         self.collection_thread.start()
         endpoint_summary = ", ".join(f"{name}={url}" for name, url in self.endpoints)
-        sinks = []
-        if self.wandb_run is not None:
-            sinks.append("W&B time series")
-        if self.export_enabled and self.export_dir is not None:
-            sinks.append(f"local export at {self.export_dir}")
-        sink_summary = " and ".join(sinks)
         print(
-            "[Dynamo Prometheus] Collecting metrics for "
-            f"{sink_summary} every {self.collection_interval}s from {endpoint_summary}",
+            "[Dynamo Prometheus] Exporting replay artifacts to "
+            f"{self.export_dir} every {self.collection_interval}s from {endpoint_summary}",
             flush=True,
         )
 
@@ -250,22 +213,14 @@ class DynamoPrometheusMonitor:
                 self._collect_and_log()
             except Exception as exc:
                 self._log_fetch_error(f"final export scrape failed: {exc}")
-        flushed = self._flush_samples_to_wandb()
         export_dir = self._finalize_export()
-        print(
-            f"[Dynamo Prometheus] Forwarding stopped; flushed {flushed} samples",
-            flush=True,
-        )
+        print("[Dynamo Prometheus] Collection stopped", flush=True)
         if export_dir is not None:
             print(
                 "[Dynamo Prometheus] Exported replay artifacts to "
                 f"{export_dir}",
                 flush=True,
             )
-        if self.owns_wandb_run and self.wandb_run is not None:
-            self.wandb_run.finish()
-            self.wandb_run = None
-            self.owns_wandb_run = False
 
     def _collection_loop(self) -> None:
         while self.is_running:
@@ -291,118 +246,7 @@ class DynamoPrometheusMonitor:
         if len(metrics) == 2:
             return
 
-        with self.samples_lock:
-            self.samples.append(metrics)
-
         self._write_export_sample(metrics)
-
-        if self.log_live:
-            self._log_wandb_sample(metrics)
-            with self.samples_lock:
-                self.flushed_sample_count = len(self.samples)
-
-    def _flush_samples_to_wandb(self) -> int:
-        with self.samples_lock:
-            samples = self.samples[self.flushed_sample_count :]
-
-        if self.wandb_run is None:
-            self.wandb_run = self._resolve_wandb_run()
-        if self.wandb_run is None:
-            return 0
-
-        for sample in samples:
-            self._log_wandb_sample(sample)
-
-        with self.samples_lock:
-            self.flushed_sample_count = len(self.samples)
-        return len(samples)
-
-    def _log_wandb_sample(self, sample: Mapping[str, Any]) -> None:
-        # Use W&B directly here instead of Logger.log_metrics(step=...):
-        # Prometheus samples are wall-clock telemetry, not training-step data.
-        # Logging them after collection keeps the training step monotonic while
-        # still giving the Dynamo panels a time-based x-axis.
-        if not self._can_log_to_wandb():
-            return
-        if self.wandb_run is None:
-            self.wandb_run = self._resolve_wandb_run()
-        if self.wandb_run is not None:
-            self.wandb_run.log(dict(sample))
-
-    def _resolve_wandb_run(self) -> Any:
-        if not self._can_log_to_wandb():
-            return None
-        if self.separate_wandb_run:
-            return self._start_separate_wandb_run()
-        return self.logger.wandb_logger.run
-
-    def _define_wandb_metric(
-        self, name: str, step_metric: Optional[str] = None
-    ) -> None:
-        if self.wandb_run is None:
-            return
-        if self.owns_wandb_run:
-            self.wandb_run.define_metric(name, step_metric=step_metric)
-        elif getattr(self.logger, "wandb_logger", None) is not None:
-            self.logger.wandb_logger.define_metric(name, step_metric=step_metric)
-
-    def _can_log_to_wandb(self) -> bool:
-        return getattr(self.logger, "wandb_logger", None) is not None
-
-    def _start_separate_wandb_run(self) -> Any:
-        import wandb
-
-        main_run = self.logger.wandb_logger.run
-        wandb_cfg = dict(self.logger_config.get("wandb", {}) or {})
-        main_run_id = getattr(main_run, "id", None)
-        main_run_name = (
-            wandb_cfg.get("name")
-            or getattr(main_run, "name", None)
-            or main_run_id
-            or "training"
-        )
-        group = (
-            self.prometheus_cfg.get("wandb_group")
-            or wandb_cfg.get("group")
-            or getattr(main_run, "group", None)
-            or main_run_id
-        )
-        run_name = self.prometheus_cfg.get(
-            "wandb_name", f"{main_run_name}-dynamo-prometheus"
-        )
-        init_kwargs = {
-            "project": self.prometheus_cfg.get("wandb_project")
-            or wandb_cfg.get("project")
-            or getattr(main_run, "project", None),
-            "entity": self.prometheus_cfg.get("wandb_entity")
-            or wandb_cfg.get("entity")
-            or getattr(main_run, "entity", None),
-            "name": run_name,
-            "group": group,
-            "job_type": self.prometheus_cfg.get(
-                "wandb_job_type", "dynamo-prometheus"
-            ),
-            "reinit": "create_new",
-            "resume": "never",
-            "config": {
-                "source_wandb_run_id": main_run_id,
-                "source_wandb_run_name": main_run_name,
-                "metric_prefix": self.metric_prefix,
-                "metric_prefixes": list(self.metric_prefixes),
-                "endpoints": dict(self.endpoints),
-            },
-        }
-        init_kwargs = {
-            key: value for key, value in init_kwargs.items() if value is not None
-        }
-        run = wandb.init(**init_kwargs)
-        self.owns_wandb_run = True
-        print(
-            "[Dynamo Prometheus] Logging telemetry to separate W&B run "
-            f"{run_name} in group {group}",
-            flush=True,
-        )
-        return run
 
     def _fetch_endpoint_metrics(
         self, endpoint_name: str, endpoint_url: str
@@ -719,7 +563,7 @@ class DynamoPrometheusMonitor:
 This directory contains Dynamo `/metrics` samples captured during the NeMo-RL run.
 
 Files:
-- `{EXPORT_SAMPLES_FILENAME}`: parsed scalar samples in the same shape used for W&B logging.
+- `{EXPORT_SAMPLES_FILENAME}`: parsed scalar sample snapshots for offline inspection.
 - `{EXPORT_RAW_SCRAPES_FILENAME}`: raw `/metrics` scrape text with scrape timestamps.
 - `{EXPORT_OPENMETRICS_FILENAME}`: filtered OpenMetrics samples with explicit wall-clock timestamps.
 - `{EXPORT_METADATA_FILENAME}`: endpoints, time range, and export counters.
@@ -810,13 +654,6 @@ def _export_enabled(prometheus_cfg: Mapping[str, Any]) -> bool:
     if "enabled" in export_cfg:
         return bool(export_cfg["enabled"])
     return bool(prometheus_cfg.get("export_on_exit", False))
-
-
-def _uses_separate_wandb_run(prometheus_cfg: Mapping[str, Any]) -> bool:
-    if bool(prometheus_cfg.get("separate_wandb_run", False)):
-        return True
-    wandb_run = str(prometheus_cfg.get("wandb_run", "same")).lower()
-    return wandb_run in {"separate", "dedicated", "new"}
 
 
 def _extract_prometheus_text_metric_names(
