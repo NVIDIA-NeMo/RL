@@ -312,7 +312,7 @@ jobs:
       registry: ${{ needs.org-member-pre-flight.outputs.registry }}
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
-        ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}-uv-cache:latest', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
+        ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       build-args: |
         MAX_JOBS=4
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
@@ -339,7 +339,7 @@ jobs:
       registry: ${{ needs.gb200-config.outputs.registry }}
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
-        ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}-uv-cache:latest', needs.gb200-config.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
+        ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.gb200-config.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       build-args: |
         MAX_JOBS=4
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
@@ -353,7 +353,6 @@ jobs:
         needs.build-container.result == 'success'
       }}
     runs-on: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-    environment: nemo-ci
     env:
       REGISTRY: ${{ needs.org-member-pre-flight.outputs.registry }}
       IMAGE_NAME: ${{ vars.CI_CONTAINER_NAME }}
@@ -362,7 +361,39 @@ jobs:
         run: |
           set -euo pipefail
           SRC="${REGISTRY}/${IMAGE_NAME}:${{ github.run_id }}"
-          DST="${REGISTRY}/${IMAGE_NAME}-uv-cache:latest"
+          DST="${REGISTRY}/${IMAGE_NAME}:uv-cache"
+
+          docker pull "${SRC}"
+          CID=$(docker create "${SRC}" true)
+          mkdir -p /tmp/uv-cache
+          docker cp "${CID}:/root/.cache/uv/." /tmp/uv-cache/
+          docker rm "${CID}"
+
+          printf 'FROM scratch\nCOPY uv-cache/ /\n' > /tmp/Dockerfile.uv-cache
+          docker build -t "${DST}" -f /tmp/Dockerfile.uv-cache /tmp
+          docker push "${DST}"
+
+          docker rmi "${SRC}" "${DST}" 2>/dev/null || true
+          rm -rf /tmp/uv-cache /tmp/Dockerfile.uv-cache
+
+  update-uv-cache-gb200:
+    name: Update GB200 uv build cache
+    needs: [build-container-gb200, gb200-config]
+    if: >-
+      ${{
+        github.ref == 'refs/heads/main' &&
+        needs.build-container-gb200.result == 'success'
+      }}
+    runs-on: nemo-ci-gcp-gpu-x2
+    env:
+      REGISTRY: ${{ needs.gb200-config.outputs.registry }}
+      IMAGE_NAME: ${{ vars.CI_CONTAINER_NAME }}
+    steps:
+      - name: Extract and push uv cache image
+        run: |
+          set -euo pipefail
+          SRC="${REGISTRY}/${IMAGE_NAME}:${{ github.run_id }}"
+          DST="${REGISTRY}/${IMAGE_NAME}:uv-cache"
 
           docker pull "${SRC}"
           CID=$(docker create "${SRC}" true)
@@ -518,7 +549,6 @@ jobs:
         !cancelled()
       }}
     name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
-    environment: ${{ needs.org-member-pre-flight.outputs.is_member == 'true' && 'nemo-ci' || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -570,7 +600,6 @@ jobs:
         !cancelled()
       }}
     name: gb200_${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
-    environment: nemo-ci
     steps:
       - name: Checkout
         uses: actions/checkout@v6
