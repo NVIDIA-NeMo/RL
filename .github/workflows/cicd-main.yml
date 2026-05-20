@@ -414,10 +414,7 @@ jobs:
     name: Update uv build cache
     needs: [build-container, org-member-pre-flight]
     if: >-
-      ${{
-        github.ref == 'refs/heads/main' &&
-        needs.build-container.result == 'success'
-      }}
+      ${{ needs.build-container.result == 'success' }}
     runs-on: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
     env:
       REGISTRY: ${{ needs.org-member-pre-flight.outputs.registry }}
@@ -446,10 +443,7 @@ jobs:
     name: Update GB200 uv build cache
     needs: [build-container-gb200, gb200-config]
     if: >-
-      ${{
-        github.ref == 'refs/heads/main' &&
-        needs.build-container-gb200.result == 'success'
-      }}
+      ${{ needs.build-container-gb200.result == 'success' }}
     runs-on: nemo-ci-gcp-gpu-x2
     env:
       REGISTRY: ${{ needs.gb200-config.outputs.registry }}
