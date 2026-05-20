@@ -61,6 +61,13 @@ dependencies = [
   "cuda-bindings; sys_platform != 'darwin'",                                                                          # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                           # for transformer-engine no build isolation
+  # tilelang — replacement Triton kernel mamba-ssm requires when
+  # Triton >= 3.4.0 on Hopper, see github.com/state-spaces/mamba#640.
+  # Without this, qwen3.5 / nano-v3 / moonlight megatron recipes
+  # crash at first gated-chunk backward with a RuntimeError pointing
+  # at this exact pip install. Linux x86_64 only — mamba-ssm itself
+  # is gated to that pair.
+  "tilelang; sys_platform == 'linux' and platform_machine == 'x86_64'",
   # Data-plane stack — promoted to base so worker venvs (built by
   # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
   # automatically include them. Removes the need for a `[data-plane]`
