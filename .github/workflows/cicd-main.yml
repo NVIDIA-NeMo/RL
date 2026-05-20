@@ -297,40 +297,10 @@ jobs:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.57.0
 
-  check-uv-cache:
-    name: Check H100 uv cache seed
-    if: ${{ needs.pre-flight.outputs.test_level != 'none' && needs.pre-flight.outputs.image_tag == '' }}
-    needs: [pre-flight, org-member-pre-flight]
-    runs-on: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-    outputs:
-      build_context: ${{ steps.check.outputs.build_context }}
-    env:
-      IMAGE_NAME: ${{ vars.CI_CONTAINER_NAME }}
-      REGISTRY: ${{ needs.org-member-pre-flight.outputs.registry }}
-      UV_BUILD_CACHE: ${{ vars.UV_BUILD_CACHE }}
-    steps:
-      - name: Check uv cache image
-        id: check
-        run: |
-          set -euo pipefail
-
-          if [[ "$UV_BUILD_CACHE" != "enabled" ]]; then
-            echo "build_context=" | tee -a "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          image="${REGISTRY}/${IMAGE_NAME}:uv-cache"
-          if docker manifest inspect "$image" >/dev/null 2>&1; then
-            echo "build_context=uv-cache-seed=docker-image://${image}" | tee -a "$GITHUB_OUTPUT"
-          else
-            echo "::notice title=uv cache seed::${image} not found; building without uv cache seed"
-            echo "build_context=" | tee -a "$GITHUB_OUTPUT"
-          fi
-
   build-container:
     name: Build H100 container
     if: ${{ needs.pre-flight.outputs.test_level != 'none' && needs.pre-flight.outputs.image_tag == '' }}
-    needs: [pre-flight, org-member-pre-flight, check-uv-cache]
+    needs: [pre-flight, org-member-pre-flight]
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.78.0
     with:
       build-ref: ${{ needs.pre-flight.outputs.test_sha }}
@@ -342,47 +312,10 @@ jobs:
       registry: ${{ needs.org-member-pre-flight.outputs.registry }}
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
-        ${{ needs.check-uv-cache.outputs.build_context }}
       build-args: |
         MAX_JOBS=4
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
         ${{ needs.org-member-pre-flight.outputs.is_member != 'true' && 'SKIP_SGLANG_BUILD=1' || '' }}
-
-  check-uv-cache-gb200:
-    name: Check GB200 uv cache seed
-    if: >-
-      ${{
-        needs.pre-flight.outputs.test_level != 'none' &&
-        needs.pre-flight.outputs.image_tag == '' &&
-        needs.org-member-pre-flight.outputs.is_member == 'true' &&
-        contains('L1 L2', needs.pre-flight.outputs.test_level)
-      }}
-    needs: [pre-flight, org-member-pre-flight, gb200-config]
-    runs-on: nemo-ci-gcp-gpu-x2
-    outputs:
-      build_context: ${{ steps.check.outputs.build_context }}
-    env:
-      IMAGE_NAME: ${{ vars.CI_CONTAINER_NAME }}
-      REGISTRY: ${{ needs.gb200-config.outputs.registry }}
-      UV_BUILD_CACHE: ${{ vars.UV_BUILD_CACHE }}
-    steps:
-      - name: Check uv cache image
-        id: check
-        run: |
-          set -euo pipefail
-
-          if [[ "$UV_BUILD_CACHE" != "enabled" ]]; then
-            echo "build_context=" | tee -a "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          image="${REGISTRY}/${IMAGE_NAME}:uv-cache"
-          if docker manifest inspect "$image" >/dev/null 2>&1; then
-            echo "build_context=uv-cache-seed=docker-image://${image}" | tee -a "$GITHUB_OUTPUT"
-          else
-            echo "::notice title=uv cache seed::${image} not found; building without uv cache seed"
-            echo "build_context=" | tee -a "$GITHUB_OUTPUT"
-          fi
 
   build-container-gb200:
     name: Build GB200/GCP container
@@ -393,7 +326,7 @@ jobs:
         needs.org-member-pre-flight.outputs.is_member == 'true' &&
         contains('L1 L2', needs.pre-flight.outputs.test_level)
       }}
-    needs: [pre-flight, org-member-pre-flight, gb200-config, check-uv-cache-gb200]
+    needs: [pre-flight, org-member-pre-flight, gb200-config]
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.78.0
     with:
       build-ref: ${{ needs.pre-flight.outputs.test_sha }}
@@ -405,7 +338,6 @@ jobs:
       registry: ${{ needs.gb200-config.outputs.registry }}
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
-        ${{ needs.check-uv-cache-gb200.outputs.build_context }}
       build-args: |
         MAX_JOBS=4
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
