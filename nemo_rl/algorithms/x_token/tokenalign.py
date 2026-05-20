@@ -30,12 +30,13 @@ Public surface:
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any, List, Tuple
 
 import numpy as np
 import torch
+
+from nemo_rl.algorithms.x_token.utils import parse_projection_file
 
 # Visual byte representations used by some BPE tokenizers (especially for
 # emojis / non-ASCII bytes). Copied from the PT reference verbatim — these
@@ -202,65 +203,31 @@ class TokenAligner:
 
     def _load_projection_components(self) -> None:
         """Load and normalize the projection matrix into COO components."""
-        if not os.path.exists(self.projection_matrix_path):
-            raise FileNotFoundError(
-                f"Projection matrix file not found: {self.projection_matrix_path}"
-            )
-        data = torch.load(
-            self.projection_matrix_path, map_location="cpu", weights_only=False
+        indices, values, v_student_file, _ = parse_projection_file(
+            self.projection_matrix_path
         )
         v_student = len(self.student_tokenizer)
         v_teacher = len(self.teacher_tokenizer)
-
-        if isinstance(data, dict) and "indices" in data and "likelihoods" in data:
-            # Dense top-k format: indices [V_student, top_k] holds teacher
-            # token ids; likelihoods [V_student, top_k] holds the projection
-            # weights. We unfold to COO so the loss fn can use a uniform
-            # sparse-matmul path regardless of file format.
-            top_indices: torch.Tensor = data["indices"].long()
-            top_likelihoods: torch.Tensor = data["likelihoods"].float()
-            assert top_indices.shape == top_likelihoods.shape, (
-                f"indices/likelihoods shape mismatch: "
-                f"{top_indices.shape} vs {top_likelihoods.shape}"
-            )
-            v_student_file, top_k = top_indices.shape
-            assert v_student_file == v_student, (
+        # The dense top-k format encodes V_student in its rowcount; the
+        # sparse format infers from max(student_idx)+1, which can be < V_s
+        # if some rows are missing — check only the dense case where the
+        # file shape is authoritative. parse_projection_file returns
+        # ``rows`` for dense and ``max+1`` for sparse, so a mismatch here
+        # only fires for the dense format.
+        if v_student_file > v_student:
+            raise AssertionError(
                 f"projection rows ({v_student_file}) != student vocab "
                 f"({v_student}) for tokenizer "
                 f"{getattr(self.student_tokenizer, 'name_or_path', '?')}"
             )
-            student_idx = (
-                torch.arange(v_student).unsqueeze(1).expand(-1, top_k).reshape(-1)
-            )
-            teacher_idx = top_indices.reshape(-1)
-            values = top_likelihoods.reshape(-1)
-            # Drop entries that point at out-of-range teacher ids; the dense
-            # format pads with 0 in some checkpoints, so we keep only valid
-            # rows.
-            keep = teacher_idx < v_teacher
-            self._projection_indices = torch.stack(
-                [student_idx[keep], teacher_idx[keep]], dim=0
-            )
-            self._projection_values = values[keep]
-            self._projection_shape = (v_student, v_teacher)
-        elif isinstance(data, dict) and all(
-            isinstance(k, tuple) and len(k) == 2 for k in data.keys()
-        ):
-            # Sparse multi-token format: dict[(student_id, teacher_id)] -> count.
-            keys = list(data.keys())
-            values = list(data.values())
-            student_idx = torch.tensor([k[0] for k in keys], dtype=torch.long)
-            teacher_idx = torch.tensor([k[1] for k in keys], dtype=torch.long)
-            self._projection_indices = torch.stack([student_idx, teacher_idx], dim=0)
-            self._projection_values = torch.tensor(values, dtype=torch.float32)
-            self._projection_shape = (v_student, v_teacher)
-        else:
-            raise ValueError(
-                f"Unrecognized projection matrix format at "
-                f"{self.projection_matrix_path}; expected dict with "
-                f"'indices'/'likelihoods' tensors or "
-                f"dict[(student_id, teacher_id)] -> count."
-            )
+        # Drop entries that point at out-of-range teacher ids; the dense
+        # format pads with 0 (or -1 sentinels from _exact_map_remapped
+        # files), so we keep only valid rows.
+        teacher_idx = indices[1]
+        keep = (teacher_idx >= 0) & (teacher_idx < v_teacher)
+        self._projection_indices = indices[:, keep]
+        self._projection_values = values[keep]
+        self._projection_shape = (v_student, v_teacher)
 
     # ------------------------------------------------------------------ #
     # Public alignment API

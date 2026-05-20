@@ -76,8 +76,6 @@ XTOKEN_NON_STUDENT_SEQ_KEYS: frozenset[str] = frozenset(
         "teacher_full_logits_ipc",
         "teacher_input_ids",
         "teacher_token_mask",
-        "alignment_student_spans",
-        "alignment_teacher_spans",
         "alignment_pair_valid",
         "alignment_pair_is_correct",
         "alignment_teacher_exact_partition_mask",
@@ -426,8 +424,6 @@ def xtoken_distillation_train(
                     token_mask=batch["token_mask"],
                     sample_mask=batch["sample_mask"],
                     teacher_full_logits_ipc=teacher_handles,
-                    alignment_student_spans=batch["alignment_student_spans"],
-                    alignment_teacher_spans=batch["alignment_teacher_spans"],
                     alignment_pair_valid=batch["alignment_pair_valid"],
                     alignment_pair_is_correct=batch["alignment_pair_is_correct"],
                     alignment_student_exact_partition_mask=(
@@ -696,8 +692,6 @@ def validate(
                 token_mask=batch["token_mask"],
                 sample_mask=batch["sample_mask"],
                 teacher_full_logits_ipc=teacher_handles,
-                alignment_student_spans=batch["alignment_student_spans"],
-                alignment_teacher_spans=batch["alignment_teacher_spans"],
                 alignment_pair_valid=batch["alignment_pair_valid"],
                 alignment_pair_is_correct=batch["alignment_pair_is_correct"],
                 alignment_student_exact_partition_mask=(

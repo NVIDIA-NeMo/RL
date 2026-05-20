@@ -117,8 +117,6 @@ class CrossTokenizerCollator:
             teacher_input_lengths=teacher_attention_mask.sum(dim=-1).long(),
             teacher_token_mask=teacher_attention_mask.long(),
             # Alignment payload, dense-padded so DTensor V2 can shard on dim 0.
-            alignment_student_spans=alignment.student_spans,
-            alignment_teacher_spans=alignment.teacher_spans,
             alignment_pair_valid=alignment.pair_valid,
             alignment_pair_is_correct=alignment.pair_is_correct,
             alignment_student_exact_partition_mask=(
