@@ -25,9 +25,8 @@ from nemo_rl.distributed.model_utils import DistributedCrossEntropy
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
-class DraftCrossEntropyLossConfig(BaseModel, extra="allow"):
-    model_config = {"arbitrary_types_allowed": True}
-    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None
+class DraftCrossEntropyLossConfig(TypedDict):
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup]
 
 
 class DraftCrossEntropyLossDataDict(TypedDict):
@@ -969,9 +968,7 @@ class DistillationLossFn(LossFunction):
     loss_type = LossType.TOKEN_LEVEL
     input_type = LossInputType.DISTILLATION
 
-    def __init__(self, cfg: DistillationLossConfig | dict):
-        if isinstance(cfg, dict):
-            cfg = DistillationLossConfig(**cfg)
+    def __init__(self, cfg: DistillationLossConfig):
         self.kl_type = cfg.kl_type
         self.mixed_kl_weight = cfg.mixed_kl_weight
         self.zero_outside_topk = cfg.zero_outside_topk
