@@ -1,6 +1,6 @@
 # NeMo Gym Integration
 
-This document describes how NeMo RL integrates with [NeMo Gym](https://docs.nvidia.com/nemo/gym/latest/index.html) for multi-step and multi-turn reinforcement learning training.
+This document describes how NeMo RL integrates with [NeMo Gym](https://docs.nvidia.com/nemo/gym/v0.2.1/index.html) for multi-step and multi-turn reinforcement learning training.
 
 ## Overview
 
@@ -254,4 +254,4 @@ Token IDs are extracted at the NeMo RL vLLM layer via the `/tokenize` endpoint. 
 - Tokenization matches the exact model and tokenizer used for generation
 - No re-tokenization drift between generation and training
 
-For details on on-policy token ID handling, see {doc}`../guides/environments` and the [NeMo Gym on-policy corrections documentation](https://docs.nvidia.com/nemo/gym/latest/contribute/rl-framework-integration/openai-compatible-http-server-on-policy-correction.html).
+For details on on-policy token ID handling, see {doc}`../guides/environments` and the [NeMo Gym on-policy corrections documentation](https://docs.nvidia.com/nemo/gym/v0.2.1/contribute/rl-framework-integration/openai-compatible-http-server-on-policy-correction.html).
