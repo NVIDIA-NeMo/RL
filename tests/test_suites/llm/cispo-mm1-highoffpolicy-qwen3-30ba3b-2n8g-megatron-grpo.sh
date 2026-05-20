@@ -5,12 +5,11 @@ source $SCRIPT_DIR/common.env
 # MiniMax-M1 high-off-policy study, GRPO baseline arm (2n8g sized to match the
 # proven SAPO sister recipe).
 # See examples/configs/recipes/llm/cispo-mm1-highoffpolicy-qwen3-30ba3b-2n8g-megatron-grpo.yaml.
-# NOT in the CISPO PR - local research artifact.
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=2
-STEPS_PER_RUN=500
-MAX_STEPS=500
+STEPS_PER_RUN=100
+MAX_STEPS=100
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
 NUM_MINUTES=$((24 * 60))
 # ===== END CONFIG =====

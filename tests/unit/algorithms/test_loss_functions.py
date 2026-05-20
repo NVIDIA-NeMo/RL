@@ -680,24 +680,30 @@ def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
 
 
 @pytest.mark.parametrize(
-    "incompatible_flag,value",
+    "incompatible_config",
     [
-        ("disable_ppo_ratio", True),
-        ("ratio_clip_c", 3.0),
+        {"disable_ppo_ratio": True},
+        {"force_on_policy_ratio": True},
+        {"ratio_clip_c": 3.0},
+        {"sequence_level_importance_ratios": True, "token_level_loss": False},
     ],
 )
-def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_flag, value):
+def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_config):
     """CISPO must reject configs that conflict with its semantics.
 
     - disable_ppo_ratio removes the pi_theta / pi_theta_old ratio that CISPO
       uses as the importance weight, so they are mutually exclusive.
+    - force_on_policy_ratio makes every ratio 1.0, removing CISPO's clipped
+      importance-weight behavior.
+    - sequence_level_importance_ratios changes the token-level IS weights that
+      CISPO is defined over.
     - ratio_clip_c (dual clipping) runs after the CISPO loss assembly inside
       ClippedPGLossFn and would silently overwrite it.
     """
     cfg = ClippedPGLossConfig(
         reference_policy_kl_penalty=0.0,
         use_cispo=True,
-        **{incompatible_flag: value},
+        **incompatible_config,
     )
     with pytest.raises(AssertionError):
         ClippedPGLossFn(cfg)

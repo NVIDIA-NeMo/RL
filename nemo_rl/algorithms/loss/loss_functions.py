@@ -252,6 +252,14 @@ class ClippedPGLossFn(LossFunction):
                 "use_cispo is incompatible with disable_ppo_ratio; "
                 "CISPO needs the pi_theta/pi_theta_old ratio but disable_ppo_ratio removes it"
             )
+            assert not self.force_on_policy_ratio, (
+                "use_cispo is incompatible with force_on_policy_ratio; "
+                "forcing ratio=1 removes the clipped IS-weight that CISPO optimizes"
+            )
+            assert not self.sequence_level_importance_ratios, (
+                "use_cispo is incompatible with sequence_level_importance_ratios; "
+                "CISPO uses token-level importance weights"
+            )
             assert self.ratio_clip_c is None, (
                 "use_cispo is incompatible with dual clipping (ratio_clip_c); "
                 "the dual-clip block runs after the CISPO loss assembly and would "
@@ -698,13 +706,6 @@ class ClippedPGLossFn(LossFunction):
                     global_normalization_factor=global_valid_toks,
                 ).item()
 
-                if masked_ratios.numel() > 0:
-                    r_t_p50 = torch.quantile(masked_ratios, 0.50).item()
-                    r_t_p95 = torch.quantile(masked_ratios, 0.95).item()
-                    r_t_p99 = torch.quantile(masked_ratios, 0.99).item()
-                else:
-                    r_t_p50 = r_t_p95 = r_t_p99 = float("nan")
-
                 # Coarse, tokenizer-free proxy for "rare reflective tokens":
                 # tokens whose behaviour-policy probability was below the
                 # threshold. CISPO's central claim is that these are exactly
@@ -729,13 +730,8 @@ class ClippedPGLossFn(LossFunction):
                     "cispo_diag/grpo_would_clip_frac": grpo_would_clip_frac,
                     "cispo_diag/grpo_would_clip_pos_frac": grpo_would_clip_pos_frac,
                     "cispo_diag/grpo_would_clip_neg_frac": grpo_would_clip_neg_frac,
-                    "cispo_diag/r_t_p50": r_t_p50,
-                    "cispo_diag/r_t_p95": r_t_p95,
-                    "cispo_diag/r_t_p99": r_t_p99,
                     "cispo_diag/low_prob_token_frac": low_prob_token_frac,
                     "cispo_diag/would_clip_and_low_prob_frac": would_clip_and_low_prob,
-                    "cispo_diag/grpo_eps": eps,
-                    "cispo_diag/low_prob_threshold": self.cispo_diag_low_prob_threshold,
                 }
 
         # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
