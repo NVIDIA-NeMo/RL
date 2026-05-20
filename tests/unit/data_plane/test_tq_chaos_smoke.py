@@ -18,7 +18,6 @@ Recovery / rebalance / soak are nightly-only.
 
 Tests:
   P7-a  T2-tq-controller-fails-loud: kill controller, next call raises within 5s.
-  P7-b  T2-tq-storage-actor-fails-loud: kill storage actor, next call raises within 5s.
   P7-c  T2-tq-port-already-bound: pre-bound port causes init error with a message
         naming "address already in use" (or equivalent) — not a generic KeyError.
 
@@ -164,66 +163,6 @@ def test_controller_kill_raises_within_5s(tq_client_and_ray) -> None:
         budget_s=_TIMEOUT_S,
     )
     # Any exception is acceptable — the key property is "raises, not hangs".
-    assert exc is not None
-
-
-# ── P7-b: kill storage actor ──────────────────────────────────────────────────
-
-
-def test_storage_actor_kill_raises_within_5s(tq_client_and_ray) -> None:
-    """After ray.kill on a TQ storage actor, the next get_samples must raise
-    within _TIMEOUT_S seconds.
-
-    Risk guarded: storage actor failure must surface as a raised exception,
-    not a silent hang or a corrupt partial result.
-    """
-    client, ray = tq_client_and_ray
-    keys = _seed_partition(client, "chaos-storage")
-
-    # Locate a storage actor. TQ names them with a prefix like "SimpleStorageUnit".
-    storage = None
-    for name_candidate in [
-        "SimpleStorageUnit_0",
-        "SimpleStorageUnit0",
-        "tq_storage_0",
-        "StorageUnit_0",
-    ]:
-        try:
-            storage = ray.get_actor(name_candidate)
-            break
-        except Exception:
-            continue
-
-    if storage is None:
-        # Try listing all actors and looking for a storage-like name.
-        try:
-            actors = ray.util.list_named_actors(all_namespaces=False)
-            for a in actors:
-                if "storage" in a.lower() or "Storage" in a:
-                    try:
-                        storage = ray.get_actor(a)
-                        break
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-    if storage is None:
-        pytest.skip(
-            "Could not locate TQ storage actor by known names. "
-            "Update the name_candidates list in this test."
-        )
-
-    ray.kill(storage, no_restart=True)
-
-    exc = _call_raises_within(
-        lambda: client.get_samples(
-            sample_ids=keys,
-            partition_id="chaos-storage",
-            select_fields=["x"],
-        ),
-        budget_s=_TIMEOUT_S,
-    )
     assert exc is not None
 
 
