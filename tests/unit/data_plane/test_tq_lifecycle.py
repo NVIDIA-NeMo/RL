@@ -69,6 +69,9 @@ def tq_client():
             "backend": "simple",
             "storage_capacity": 1024,
             "num_storage_units": 1,
+            "claim_meta_poll_interval_s": 0.5,
+            "global_segment_size": 8589934592,  # 8 GiB (only read by mooncake_cpu)
+            "local_buffer_size": 1073741824,  # 1 GiB (only read by mooncake_cpu)
         }
     )
     yield client
@@ -104,6 +107,9 @@ def tq_client_backends(request):
             "backend": backend,
             "storage_capacity": 1024,
             "num_storage_units": 1,
+            "claim_meta_poll_interval_s": 0.5,
+            "global_segment_size": 8589934592,  # 8 GiB
+            "local_buffer_size": 1073741824,  # 1 GiB
         }
     )
     yield client
