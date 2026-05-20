@@ -439,7 +439,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - script: L1_Functional_Tests_GPU
+          - script: L1_Functional_Tests_Megatron
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_AutoModel
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_SGLang
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_Gym
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_GRPO
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_SFT
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_Other
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
     needs: [pre-flight, build-container, cicd-unit-tests, org-member-pre-flight]
     runs-on: ${{ matrix.runner }}
@@ -466,7 +478,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - script: L1_Functional_Tests_GPU
+          - script: L1_Functional_Tests_Megatron
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_AutoModel
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_SGLang
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_Gym
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_GRPO
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_SFT
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
+          - script: L1_Functional_Tests_Other
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}-gpu-x2
     needs: [pre-flight, org-member-pre-flight]
     if: ${{ contains('Lfast', needs.pre-flight.outputs.test_level) }}
