@@ -278,7 +278,9 @@ if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "
   _block_digits=\$(echo "\$_block_part" | tr -dc '0-9')
   _node_digits=\$(echo "\$_node_part" | tr -dc '0-9')
   if [[ -n "\$_block_digits" && -n "\$_node_digits" ]]; then
-    TOPO_RANK=\$(( _block_digits * 10000000000 + _node_digits ))
+    # Force base-10 interpretation; leading-zero digits like "08" would otherwise
+    # be parsed as invalid octal by bash arithmetic, silently leaving TOPO_RANK empty.
+    TOPO_RANK=\$(( 10#\$_block_digits * 10000000000 + 10#\$_node_digits ))
   fi
 elif [[ -n "\${SLURM_PROCID:-}" ]]; then
   TOPO_RANK="\$SLURM_PROCID"
