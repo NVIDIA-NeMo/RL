@@ -34,7 +34,6 @@ policy:
     sequence_parallel: true
     activation_checkpointing: true
     moe_token_dispatcher_type: allgather
-    moe_router_dtype: fp32
     apply_rope_fusion: false
     defer_fp32_logits: true
     optimizer:
