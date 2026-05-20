@@ -659,9 +659,7 @@ jobs:
       - pr-branch-up-to-date-check
       - lint-check
       - sphinx-build
-      - check-uv-cache
       - build-container
-      - check-uv-cache-gb200
       - build-container-gb200
       - cicd-doc-tests
       - cicd-unit-tests
