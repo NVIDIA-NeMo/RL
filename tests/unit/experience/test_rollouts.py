@@ -786,6 +786,25 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
     print("\nSliding Puzzle VLLM Test assertions passed.")
 
 
+def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
+    class _FakePolicyGeneration:
+        cfg = {"vllm_cfg": {"max_model_len": 100}}
+
+    # stop_strings is truthy so the function hits the next assert and exits
+    # right after emitting the warning — keeps this test free of any rollout work.
+    with pytest.warns(UserWarning, match="greater than the"):
+        with pytest.raises(AssertionError, match="Stop strings"):
+            run_async_nemo_gym_rollout(
+                policy_generation=_FakePolicyGeneration(),
+                input_batch={"extra_env_info": []},
+                tokenizer=None,
+                task_to_env={},
+                generation_config={"stop_strings": "x", "max_new_tokens": 50},
+                max_seq_len=200,
+                max_rollout_turns=None,
+            )
+
+
 @pytest.mark.nemo_gym
 def test_run_async_nemo_gym_rollout(
     nemo_gym,  # noqa: F811
@@ -809,15 +828,26 @@ def test_run_async_nemo_gym_rollout(
     ]
 
     input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(nemo_rl_compatible_examples)
+    rows = input_batch["extra_env_info"]
+    assert len(rows) >= 2, "test expects the fixture to provide at least two rows"
+
+    max_new_tokens = nemo_gym_vllm_generation.cfg["max_new_tokens"]
+    # Row 0: per-agent override looser than the configured cap — min() should clamp down to max_new_tokens.
+    # Row 1: no per-agent override — should fall back to max_new_tokens.
+    rows[0]["responses_create_params"]["max_output_tokens"] = max_new_tokens + 1
+    assert "max_output_tokens" not in rows[1]["responses_create_params"]
+
     actual_result = run_async_nemo_gym_rollout(
         policy_generation=nemo_gym_vllm_generation,
         input_batch=input_batch,
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
-        max_seq_len=None,
+        max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         generation_config=nemo_gym_vllm_generation.cfg,
         max_rollout_turns=None,
     )
+    for row in rows:
+        assert row["responses_create_params"]["max_output_tokens"] == max_new_tokens
     actual_result = asdict(actual_result)
     actual_result["final_batch"] = actual_result["final_batch"].get_dict()
 

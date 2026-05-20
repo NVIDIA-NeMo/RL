@@ -8,6 +8,7 @@ checkpointing:
 policy:
   model_name: Qwen/Qwen3-30B-A3B
   train_micro_batch_size: 1
+  logprob_batch_size: 2
   max_total_sequence_length: 4096
   dtensor_cfg:
     enabled: false
@@ -21,6 +22,7 @@ policy:
     pipeline_model_parallel_size: 1
     expert_model_parallel_size: 16
     sequence_parallel: false
+    moe_grouped_gemm: true
     optimizer:
       lr: 3.0e-07
       min_lr: 3.0e-08

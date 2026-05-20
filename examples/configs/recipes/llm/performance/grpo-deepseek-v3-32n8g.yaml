@@ -15,6 +15,8 @@ policy:
   logprob_batch_size: 1
   max_total_sequence_length: 1536
   make_sequence_length_divisible_by: 1
+  sequence_packing:
+    fuse_loss: true
   dtensor_cfg:
     enabled: false
   megatron_cfg:
@@ -24,6 +26,7 @@ policy:
     pipeline_model_parallel_size: 16
     expert_model_parallel_size: 16
     activation_checkpointing: true
+    moe_grouped_gemm: true
     num_layers_in_first_pipeline_stage: 3
     num_layers_in_last_pipeline_stage: 2
     apply_rope_fusion: false

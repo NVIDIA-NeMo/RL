@@ -1,6 +1,7 @@
 ---
 name: config-conventions
-description: Configuration conventions for NeMo-RL. YAML is the single source of truth for defaults. Covers TypedDict usage, exemplar YAML updates, and forbidden default patterns. Auto-invoked during code review.
+description: Configuration conventions for NeMo-RL. YAML is the single source of truth for defaults. Covers TypedDict usage, exemplar YAML updates, and forbidden default patterns.
+when_to_use: Adding or modifying config fields; reviewing config changes; 'where do I set defaults', 'TypedDict pattern', 'exemplar YAML', 'forbidden default patterns', during code review of config files.
 ---
 
 # Configuration Conventions
@@ -53,7 +54,7 @@ When accessing a `NotRequired` field, use an `in` check or `.get(key)` / `.get(k
 stop_properly_penalty_coef = cfg.get("stop_properly_penalty_coef", None)
 
 # Truthiness check for optional booleans
-if master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
+if master_config.grpo.get("skip_reference_policy_logprobs_calculation"):
     ...
 
 # Nested NotRequired: check presence at each level explicitly
@@ -97,4 +98,4 @@ if "milestones" in scheduler_cfg:
     configure_milestones(scheduler_cfg["milestones"])
 ```
 
-See also: [TypedDict and Configuration Defaults](docs/design-docs/design-and-philosophy.md#typeddict-and-configuration-defaults).
+See also: @docs/design-docs/design-and-philosophy.md (TypedDict and Configuration Defaults section).
