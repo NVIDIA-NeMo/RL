@@ -1060,8 +1060,14 @@ def run_async_nemo_gym_rollout(
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
 
-        # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
-        # generation_config["max_new_tokens"]
+        # Configure max_output_tokens to respect the max_new_tokens setting.
+        # Will clamp max_output_tokens in vllm_worker_async.py so that input + output <= max_seq_len
+        existing_max_output_tokens = responses_create_params.get("max_output_tokens")
+        responses_create_params["max_output_tokens"] = (
+            min(existing_max_output_tokens, generation_config["max_new_tokens"])
+            if existing_max_output_tokens is not None
+            else generation_config["max_new_tokens"]
+        )
 
         row["_rowidx"] = rowidx
 
