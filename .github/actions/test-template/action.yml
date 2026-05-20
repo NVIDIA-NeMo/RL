@@ -160,7 +160,7 @@ runs:
             # fingerprint once upfront instead of using NRL_FORCE_REBUILD_VENVS=true which
             # rebuilds on every Ray remote call.
             if [[ "${FAST:-0}" == "1" ]]; then
-              UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+              UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters sglang
               python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
             fi
             bash tests/${{ inputs.is_doc_test == 'true' && 'docs' || (inputs.is_unit_test == 'true' && 'unit' || 'functional') }}/${{ inputs.script }}.sh && \
@@ -210,6 +210,15 @@ runs:
         path: |
           ${{ github.workspace }}/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl/tests/.coverage
         include-hidden-files: true
+
+    - name: Upload test duration reports
+      uses: actions/upload-artifact@v6
+      if: always()
+      with:
+        name: test-durations-${{ inputs.script }}-${{ github.run_id }}
+        path: |
+          ${{ github.workspace }}/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl/tests/*_durations.xml
+        if-no-files-found: ignore
 
     - name: Upload nemo_gym actual test data
       uses: actions/upload-artifact@v6
