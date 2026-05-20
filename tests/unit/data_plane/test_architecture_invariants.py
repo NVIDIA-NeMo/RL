@@ -299,3 +299,78 @@ def test_abc_method_present(method):
         f"DataPlaneClient ABC is missing required method {method!r}. "
         f"This is a breaking change for every adapter (G2)."
     )
+
+
+# ─── FP8-calib path: end-to-end shape contract ──────────────────────────
+
+
+def test_fp8_calib_filter_then_seqlen_check_no_crash():
+    """End-to-end behavioral test of the bug we hit on job 11920261.
+
+    Reproduces the FP8 calibration request → legacy seqlen-assert
+    pipeline in isolation:
+
+    1. Build a synthetic ``meta.fields`` that mirrors what the
+       data-plane wire actually publishes for a train partition with
+       message-log decompose: DP_TRAIN_FIELDS ∪ MESSAGE_LOG_BULK_FIELDS.
+    2. Run the actual filter from ``grpo_sync.py`` —
+       ``[f for f in meta.fields if f not in DP_CALIB_EXCLUDED_FIELDS]``.
+    3. Build a synthetic ``BatchedDataDict`` containing the resulting
+       fields with realistic shapes (input_ids/input_lengths per-token,
+       turn_lengths as (B, max_turns) — NOT per-token).
+    4. Call ``get_and_validate_seqlen`` on the filtered dict.
+
+    Before the schema.py fix, the filter let turn_lengths through and
+    step 4 raised ``AssertionError: Dim 1 must be the sequence dim``.
+    After the fix, turn_lengths is filtered out and the assertion is
+    never reached.
+    """
+    import torch
+
+    from nemo_rl.data.llm_message_utils import MESSAGE_LOG_BULK_FIELDS
+    from nemo_rl.data_plane.schema import DP_CALIB_EXCLUDED_FIELDS, DP_TRAIN_FIELDS
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+    B, seq_len, max_turns = 4, 8192, 3
+    # Wire fields published by the train partition (mirrors meta.fields).
+    meta_fields = list(DP_TRAIN_FIELDS) + list(MESSAGE_LOG_BULK_FIELDS)
+
+    # Step 2: the actual filter from grpo_sync.py:853-856.
+    calib_fields = [f for f in meta_fields if f not in DP_CALIB_EXCLUDED_FIELDS]
+
+    # Filtered set must not include any per-turn metadata.
+    assert not (set(calib_fields) & set(MESSAGE_LOG_BULK_FIELDS)), (
+        f"_calib_fields leaked MESSAGE_LOG_BULK_FIELDS: "
+        f"{set(calib_fields) & set(MESSAGE_LOG_BULK_FIELDS)!r}"
+    )
+    assert "input_ids" in calib_fields
+    assert "input_lengths" in calib_fields
+
+    # Step 3: build a BatchedDataDict at realistic shapes for the
+    # FILTERED field set. ``turn_lengths`` etc. are absent here — the
+    # filter dropped them, so materialize would never read them.
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(B, seq_len, dtype=torch.long),
+            "input_lengths": torch.full((B,), seq_len, dtype=torch.long),
+        }
+    )
+    # Step 4: legacy validator. Pre-fix this crashed when ``turn_lengths``
+    # was in the dict because dim 1 was max_turns, not seq_len.
+    sequence_dim, seq_dim_size = get_and_validate_seqlen(data)
+    assert sequence_dim == 1
+    assert seq_dim_size == seq_len
+
+    # Negative control: verify the validator would still crash if the
+    # filter regressed and let turn_lengths through. Catches anyone who
+    # later removes MESSAGE_LOG_BULK_FIELDS from DP_CALIB_EXCLUDED_FIELDS.
+    leaky_data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(B, seq_len, dtype=torch.long),
+            "input_lengths": torch.full((B,), seq_len, dtype=torch.long),
+            "turn_lengths": torch.zeros(B, max_turns, dtype=torch.long),
+        }
+    )
+    with pytest.raises(AssertionError, match="Dim 1 must be the sequence dim"):
+        get_and_validate_seqlen(leaky_data)
