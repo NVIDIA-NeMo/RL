@@ -190,11 +190,11 @@ requires-dist = ["setuptools", "wheel", "torch", "numpy"]
 [[manifest.dependency-metadata]]
 name = "sglang"
 version = "0.5.10"
-requires-dist = ["ipython", "aiohttp", "apache-tvm-ffi>=0.1.5,<0.2", "anthropic>=0.20.0", "blobfile==3.0.0", "build", "compressed-tensors", "cuda-python==13.0", "decord2", "datasets", "einops", "fastapi", "flashinfer-python==0.6.7.post2", "flashinfer-cubin==0.6.7.post2", "gguf", "interegular", "llguidance>=0.7.11,<0.8.0", "modelscope", "msgspec", "ninja", "numpy", "nvidia-cutlass-dsl>=4.4.1", "nvidia-ml-py", "openai-harmony==0.0.4", "openai==2.6.1", "orjson", "outlines==0.1.11", "packaging", "partial-json-parser", "pillow", "prometheus-client>=0.20.0", "psutil", "py-spy", "pybase64", "pydantic", "python-multipart", "pyzmq>=25.1.2", "quack-kernels>=0.3.0", "requests", "scipy", "sentencepiece", "setproctitle", "flash-attn-4>=4.0.0b4", "sglang-kernel==0.4.1", "soundfile==0.13.1", "tiktoken", "timm==1.0.16", "torch-memory-saver==0.0.9", "torch==2.9.1", "torchao==0.9.0", "torchaudio==2.9.1", "torchcodec==0.9.1 ; (platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l') or sys_platform != 'linux'", "torchvision", "tqdm", "mistral-common>=1.9.0", "transformers==5.3.0", "uvicorn", "uvloop", "watchfiles", "xgrammar==0.1.32", "smg-grpc-servicer>=0.5.0"]
+requires-dist = ["ipython", "aiohttp", "apache-tvm-ffi>=0.1.5,<0.2", "anthropic>=0.20.0", "blobfile==3.0.0", "build", "compressed-tensors", "cuda-python==13.0", "decord2", "datasets", "einops", "fastapi", "flashinfer-python==0.6.7.post2", "flashinfer-cubin==0.6.7.post2", "gguf", "interegular", "llguidance>=0.7.11,<0.8.0", "modelscope", "msgspec", "ninja", "numpy", "nvidia-cutlass-dsl>=4.4.1", "nvidia-ml-py", "openai-harmony==0.0.4", "openai==2.6.1", "orjson", "outlines==0.1.11", "packaging", "partial-json-parser", "pillow", "prometheus-client>=0.20.0", "psutil", "py-spy", "pybase64", "pydantic", "python-multipart", "pyzmq>=25.1.2", "quack-kernels>=0.3.0", "requests", "scipy", "sentencepiece", "setproctitle", "flash-attn-4>=4.0.0b4", "sglang-kernel==0.5.10", "soundfile==0.13.1", "tiktoken", "timm==1.0.16", "torch-memory-saver==0.0.9", "torch==2.9.1", "torchao==0.9.0", "torchaudio==2.9.1", "torchcodec==0.9.1 ; (platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l') or sys_platform != 'linux'", "torchvision", "tqdm", "mistral-common>=1.9.0", "transformers==5.3.0", "uvicorn", "uvloop", "watchfiles", "xgrammar==0.1.32", "smg-grpc-servicer>=0.5.0"]
 
 [[manifest.dependency-metadata]]
 name = "sglang-kernel"
-version = "0.4.1"
+version = "0.5.10"
 requires-dist = ["torch", "scikit-build-core", "wheel"]
 
 [[manifest.dependency-metadata]]
@@ -7136,7 +7136,7 @@ dependencies = [
 
 [[package]]
 name = "sglang-kernel"
-version = "0.4.1"
+version = "0.5.10"
 source = { git = "https://github.com/sgl-project/sglang.git?subdirectory=sgl-kernel&tag=v0.5.10#1519acf37c23f2189adb93f57ca9cd2db1bebf18" }
 dependencies = [
     { name = "scikit-build-core" },
