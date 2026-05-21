@@ -169,28 +169,30 @@ class VllmInternalWorkerExtension:
 
         Megatron pads vocab to a multiple, but vLLM 0.20's autoloader
         strictly asserts loaded_weight.shape[0] == org_vocab_size on
-        VocabParallelEmbedding layers. Find org_vocab_size from the
-        draft model and trim any embedding/lm_head weights that exceed it.
+        VocabParallelEmbedding layers. Each such layer may have a
+        different org_vocab_size (e.g. embed_tokens uses vocab_size
+        while lm_head uses draft_vocab_size), so we match each weight
+        to its target module by name.
         """
         from vllm.model_executor.layers.vocab_parallel_embedding import (
             VocabParallelEmbedding,
         )
 
-        org_vocab_size = None
-        for module in draft_model.modules():
+        vocab_sizes: dict[str, int] = {}
+        for name, module in draft_model.named_modules():
             if isinstance(module, VocabParallelEmbedding):
-                org_vocab_size = module.org_vocab_size
-                break
+                vocab_sizes[name] = module.org_vocab_size
 
-        if org_vocab_size is None:
+        if not vocab_sizes:
             return draft_weights
 
         trimmed = []
         for key, tensor in draft_weights:
-            if tensor.shape[0] > org_vocab_size and (
-                "embed_tokens" in key or "lm_head" in key or "output_layer" in key
-            ):
-                tensor = tensor[:org_vocab_size]
+            for mod_name, org_vocab_size in vocab_sizes.items():
+                leaf = mod_name.rsplit(".", 1)[-1]
+                if leaf in key and tensor.shape[0] > org_vocab_size:
+                    tensor = tensor[:org_vocab_size]
+                    break
             trimmed.append((key, tensor))
         return trimmed
 
