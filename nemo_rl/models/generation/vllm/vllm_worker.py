@@ -453,8 +453,9 @@ class BaseVllmGenerationWorker:
             # Use Ray for distributed execution in parallel mode
             vllm_kwargs["distributed_executor_backend"] = "ray"
         else:
-            # For non-parallel mode, explicitly set executor to None to avoid Ray issues
-            vllm_kwargs["distributed_executor_backend"] = None
+            # For non-parallel mode, explicitly set executor to mp; Otherwise, it will fall back to
+            # ray, which causes hang when we vllm_dp > 1 (i.e., ep_size > tp_size)
+            vllm_kwargs["distributed_executor_backend"] = "mp"
 
         os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
