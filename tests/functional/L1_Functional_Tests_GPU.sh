@@ -66,7 +66,10 @@ run_test      uv run --no-sync bash ./tests/functional/grpo_multiple_dataloaders
 run_test      uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_rm_env.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_sglang.sh
+# Skip sglang functional test if sglang was not built into the container
+if python -c "import sglang" 2>/dev/null; then
+    run_test      uv run --no-sync bash ./tests/functional/grpo_sglang.sh
+fi
 run_test fast uv run --no-sync bash ./tests/functional/grpo_topp_topk.sh
 run_test      uv run --no-sync bash ./tests/functional/prorlv2.sh
 run_test      uv run --no-sync bash ./tests/functional/qa_distillation_megatron.sh

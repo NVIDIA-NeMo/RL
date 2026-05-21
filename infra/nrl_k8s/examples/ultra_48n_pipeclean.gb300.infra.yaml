@@ -72,7 +72,7 @@ _shared:
     # OPT-IN ONLY (set the env var to enable <E2><80><94> overlaying these shadows prebuilt
     # venvs and compiled artifacts inside the container, forcing expensive
     # re-creation at startup):
-    - {mountPath: /opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM, name: rl-workspace, subPath: "${user:}/nemo-rl-ultra/3rdparty/Megatron-LM-workspace/Megatron-LM"}
+    - {mountPath: /opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM, name: rl-workspace, subPath: "${user:}/nemo-rl-ultra/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"}
     - {mountPath: /opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge, name: rl-workspace, subPath: "${user:}/nemo-rl-ultra/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"}
     - {mountPath: /opt/nemo-rl/3rdparty/Gym-workspace/Gym, name: rl-workspace, subPath: "${user:}/nemo-rl-ultra/3rdparty/Gym-workspace/Gym"}
     # Use vllm inside container unless you need to swap something in
@@ -156,7 +156,7 @@ launch:
     mkdir -p "\${LOG_DIR}" "\${CHECKPOINT_DIR}" "\${NEMO_GYM_LOG_DIR}"
 
     export RAY_enable_infeasible_task_early_exit=true
-    export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM
+    export PYTHONPATH=.:3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
 
     OMP_NUM_THREADS=16 \
     RAY_DEDUP_LOGS=1 \
