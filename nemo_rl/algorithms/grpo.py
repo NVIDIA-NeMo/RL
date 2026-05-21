@@ -58,7 +58,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.utils import extract_necessary_env_names
+from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -319,10 +319,7 @@ def setup(
             num_workers=data_config["num_workers"],
         )
         if last_checkpoint_path is not None:
-            dataloader_state_dict = torch.load(
-                os.path.join(last_checkpoint_path, f"train_dataloader{suffix}.pt")
-            )
-            dataloader.load_state_dict(dataloader_state_dict)
+            load_dataloader_state(dataloader, last_checkpoint_path, data_config, suffix)
         return dataloader
 
     if data_config["use_multiple_dataloader"]:
@@ -1586,7 +1583,11 @@ def grpo_train(
                             max_rollout_turns=master_config.grpo["max_rollout_turns"],
                             greedy=False,
                         )
-                    policy_generation.finish_generation()
+                    policy_generation.finish_generation(
+                        discard_weights=colocated_inference
+                    )
+                    if colocated_inference:
+                        POLICY_GENERATION_STALE = True
                     # Collect generation logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each worker
                     if policy_generation is not None:
