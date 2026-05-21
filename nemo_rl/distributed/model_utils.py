@@ -12,15 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-from megatron.core.models.gpt import GPTModel
-from megatron.core.parallel_state import (
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-)
-from megatron.core.utils import deprecate_inference_params, get_pg_size
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 from nemo_rl.algorithms.logits_sampling_utils import (
@@ -28,6 +22,9 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
 )
+
+if TYPE_CHECKING:
+    from megatron.core.models.gpt import GPTModel
 
 
 @torch.no_grad()
@@ -2044,6 +2041,8 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
 
 
 def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
+    from megatron.core.models.gpt import GPTModel
+
     if getattr(GPTModel, "_linear_ce_fusion_forward_patched", False):
         GPTModel._linear_ce_fusion_chunk_size = chunk_size
         return
@@ -2054,7 +2053,7 @@ def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
 
 
 def _gpt_forward_with_linear_ce_fusion(
-    self: GPTModel,
+    self: "GPTModel",
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -2106,6 +2105,12 @@ def _gpt_forward_with_linear_ce_fusion(
     """
     if labels is None:
         raise ValueError("labels must be provided when linear CE fusion is enabled")
+
+    from megatron.core.parallel_state import (
+        get_tensor_model_parallel_group,
+        get_tensor_model_parallel_rank,
+    )
+    from megatron.core.utils import deprecate_inference_params, get_pg_size
 
     inference_context = deprecate_inference_params(inference_context, inference_params)
 
