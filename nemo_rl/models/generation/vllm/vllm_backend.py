@@ -122,6 +122,7 @@ class VllmInternalWorkerExtension:
             return
 
         # FP8 KV cache: process KV scales after weight loading
+        from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.utils import (
             process_weights_after_loading,
         )
@@ -130,11 +131,12 @@ class VllmInternalWorkerExtension:
         target_device = next(self.model_runner.model.parameters()).device
 
         # Call process_weights_after_loading to handle KV scales
-        process_weights_after_loading(
-            self.model_runner.model,
-            self.model_runner.model_config,
-            target_device,
-        )
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            process_weights_after_loading(
+                self.model_runner.model,
+                self.model_runner.model_config,
+                target_device,
+            )
 
     @staticmethod
     def _split_policy_and_draft_weights(
@@ -158,6 +160,40 @@ class VllmInternalWorkerExtension:
                 policy_weights.append((key, tensor))
         return policy_weights, draft_weights
 
+    @staticmethod
+    def _trim_vocab_padding(
+        draft_model: torch.nn.Module,
+        draft_weights: list[tuple[str, torch.Tensor]],
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Trim padded vocab dimensions from draft weights.
+
+        Megatron pads vocab to a multiple, but vLLM 0.20's autoloader
+        strictly asserts loaded_weight.shape[0] == org_vocab_size on
+        VocabParallelEmbedding layers. Find org_vocab_size from the
+        draft model and trim any embedding/lm_head weights that exceed it.
+        """
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            VocabParallelEmbedding,
+        )
+
+        org_vocab_size = None
+        for module in draft_model.modules():
+            if isinstance(module, VocabParallelEmbedding):
+                org_vocab_size = module.org_vocab_size
+                break
+
+        if org_vocab_size is None:
+            return draft_weights
+
+        trimmed = []
+        for key, tensor in draft_weights:
+            if tensor.shape[0] > org_vocab_size and (
+                "embed_tokens" in key or "lm_head" in key or "output_layer" in key
+            ):
+                tensor = tensor[:org_vocab_size]
+            trimmed.append((key, tensor))
+        return trimmed
+
     def _load_draft_weights(
         self, draft_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
@@ -172,6 +208,7 @@ class VllmInternalWorkerExtension:
                 "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
             )
             return
+        draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         draft_model.load_weights(weights=draft_weights)
 
     def _load_weights(self, weights):
@@ -217,13 +254,15 @@ class VllmInternalWorkerExtension:
 
                 if payload == IPCProtocol.COMPLETE:
                     # means the update is done
+                    from vllm.config import set_current_vllm_config
                     from vllm.model_executor.model_loader.utils import (
                         process_weights_after_loading,
                     )
 
-                    process_weights_after_loading(
-                        self.model_runner.model, self.model_config, self.device
-                    )
+                    with set_current_vllm_config(self.model_runner.vllm_config):
+                        process_weights_after_loading(
+                            self.model_runner.model, self.model_config, self.device
+                        )
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
