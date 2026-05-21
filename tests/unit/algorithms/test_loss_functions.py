@@ -19,6 +19,7 @@ import torch
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
+    DistillationLossConfig,
     DistillationLossFn,
     DPOLossFn,
     NLLLossFn,
@@ -1804,11 +1805,11 @@ def test_distillation_loss_different_settings(kl_type, zero_outside_topk):
     data, student_logits = setup_distillation_test_data()
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": kl_type,
-            "mixed_kl_weight": 0.3,
-            "zero_outside_topk": zero_outside_topk,
-        }
+        DistillationLossConfig(
+            kl_type=kl_type,
+            mixed_kl_weight=0.3,
+            zero_outside_topk=zero_outside_topk,
+        )
     )
 
     loss_input, data = prepare_loss_input(student_logits, data, loss_fn)
@@ -1849,11 +1850,11 @@ def test_distillation_loss_topk_filtering(k, zero_outside_topk):
     data, student_logits = setup_distillation_test_data(topk=k)
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": zero_outside_topk,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=zero_outside_topk,
+        )
     )
 
     loss_input, data = prepare_loss_input(student_logits, data, loss_fn)
@@ -1887,11 +1888,11 @@ def test_distillation_loss_invalid_k_zero():
     data, student_logits = setup_distillation_test_data(topk=0)
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
     )
 
     # This should raise a ValueError for k=0
@@ -1907,11 +1908,11 @@ def test_distillation_loss_gradient_flow():
     student_logits.requires_grad_(True)
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
     )
 
     loss_input, data = prepare_loss_input(student_logits, data, loss_fn)
@@ -1939,11 +1940,11 @@ def test_distillation_loss_edge_cases():
     data, student_logits = setup_distillation_test_data()
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
     )
 
     # Test with all-zero logits
@@ -1992,22 +1993,22 @@ def test_distillation_loss_edge_cases():
 def test_distillation_loss_fn_initialization():
     """Test DistillationLossFn initialization."""
     # Test with default values
-    default_config = {
-        "kl_type": "forward",
-        "mixed_kl_weight": 0.5,
-        "zero_outside_topk": False,
-    }
+    default_config = DistillationLossConfig(
+        kl_type="forward",
+        mixed_kl_weight=0.5,
+        zero_outside_topk=False,
+    )
     loss_fn = DistillationLossFn(default_config)
     assert loss_fn.kl_type == "forward"
     assert loss_fn.mixed_kl_weight == 0.5
     assert not loss_fn.zero_outside_topk
 
     # Test with custom values
-    custom_config = {
-        "kl_type": "reverse",
-        "mixed_kl_weight": 0.3,
-        "zero_outside_topk": True,
-    }
+    custom_config = DistillationLossConfig(
+        kl_type="reverse",
+        mixed_kl_weight=0.3,
+        zero_outside_topk=True,
+    )
     loss_fn = DistillationLossFn(custom_config)
     assert loss_fn.kl_type == "reverse"
     assert loss_fn.mixed_kl_weight == 0.3
@@ -2019,11 +2020,11 @@ def test_distillation_loss_fn_call():
     data, student_logits = setup_distillation_test_data()
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
     )
 
     loss_input, data = prepare_loss_input(student_logits, data, loss_fn)
