@@ -4,6 +4,7 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
+GPUS_PER_NODE=4
 STEPS_PER_RUN=30
 MAX_STEPS=30
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
@@ -37,8 +38,9 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'median(data["train/token_mult_prob_error"]) < 1.1' \
         'data["train/token_mult_prob_error"]["30"] < 1.1' \
         'mean(data["train/reward"]) > 0.45' \
-        'mean(data["timing/train/total_step_time"], -11, -1) < 70'
+        'mean(data["timing/train/total_step_time"], -11, -1) < 80'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
 fi
+

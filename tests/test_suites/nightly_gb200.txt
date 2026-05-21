@@ -16,7 +16,7 @@ tests/test_suites/llm/grpo-qwen3-1.7b-1n4g-megatron-eagle3.sh
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n4g-megatron_generation.sh
 
 # vLLM
-tests/test_suites/llm/grpo-qwen3-30ba3b-8n4g-megatron-vllm-dp.sh
+tests/test_suites/llm/grpo-moonlight-16ba3b-4n4g-megatron-vllm-dp.sh
 
 # Functional moonlight run
 tests/test_suites/llm/grpo-moonlight-16ba3b-4n4g-megatron.sh
