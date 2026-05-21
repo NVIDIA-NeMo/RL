@@ -1006,14 +1006,16 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping():
     assert torch.allclose(raw_std[:3], torch.zeros(3))
     assert (raw_std[3:] > 0).all()
 
-    master_config = {
-        "grpo": {
-            "use_dynamic_sampling": True,
-            "num_prompts_per_step": 1,
-            "num_generations_per_prompt": 3,
-            "dynamic_sampling_max_gen_batches": 5,
+    master_config = MasterConfig.model_construct(
+        **{
+            "grpo": {
+                "use_dynamic_sampling": True,
+                "num_prompts_per_step": 1,
+                "num_generations_per_prompt": 3,
+                "dynamic_sampling_max_gen_batches": 5,
+            }
         }
-    }
+    )
 
     result_batch, is_batch_complete, _, _ = dynamic_sampling(
         repeated_batch,
