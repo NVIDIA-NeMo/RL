@@ -184,7 +184,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
-            # Must run before _setup_vllm_server spawns the uvicorn thread.
+            # Must run after AsyncLLM.from_engine_args and before
+            # _setup_vllm_server spawns the uvicorn thread.
             self._install_engine_input_socket_lock()
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
@@ -201,20 +202,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         to prevent race conditions that block the vLLM engine (e.g. during
         in flight weight updates in async grpo).
         """
-        try:
-            shadow_sock = self.llm.engine_core.input_socket._shadow_sock
-        except AttributeError as exc:
-            # ``self.llm`` already owns EngineCore subprocesses; tear them down
-            # before re-raising so we don't leak when actor __init__ aborts.
-            try:
-                self.llm.shutdown()
-            except Exception:
-                pass
-            raise RuntimeError(
-                "AsyncMPClient.input_socket._shadow_sock is unreachable; vLLM "
-                "internals have shifted. Update this guard before exposing the "
-                "vLLM HTTP server."
-            ) from exc
+        shadow_sock = self.llm.engine_core.input_socket._shadow_sock
 
         lock = threading.Lock()
         original_send_multipart = shadow_sock.send_multipart
