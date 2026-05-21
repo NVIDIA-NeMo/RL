@@ -78,25 +78,10 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
-def _aggregate_logprob_results(
-    results: list[Optional[BatchedDataDict[Any]]],
-) -> Optional[BatchedDataDict[Any]]:
-    # Workers may return None when the per-token tensor has been
-    # committed to TQ — driver reads via read_from_dataplane and skips
-    # the Ray plasma roundtrip. Aggregation is a no-op in that case.
-    if all(r is None for r in results):
-        return None
-    return BatchedDataDict.from_batches(results, pad_value_dict={"logprobs": 0.0})
-
-
-def _aggregate_reference_logprob_results(
-    results: list[Optional[BatchedDataDict[Any]]],
-) -> Optional[BatchedDataDict[Any]]:
-    if all(r is None for r in results):
-        return None
-    return BatchedDataDict.from_batches(
-        results, pad_value_dict={"reference_logprobs": 0.0}
-    )
+# Logprob results land in TQ directly via the worker-side
+# ``_write_back_result_field`` leader path; the per-rank Ray return is
+# always None (see :meth:`TQWorkerMixin.get_logprobs_presharded`). The
+# dispatcher only waits for completion — no aggregation needed.
 
 
 class TQPolicy(Policy):
@@ -284,22 +269,24 @@ class TQPolicy(Policy):
         *,
         task_name: str,
         worker_method: str,
-        aggregate_fn: Any,
         timer_prefix: str,
         timer: Optional[Timer],
         common_kwargs: dict[str, Any],
-    ) -> BatchedDataDict[Any]:
+    ) -> None:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
         Logprob workers need only LP_SEED_FIELDS — narrow the meta's
         field list so ``_fetch`` doesn't pull rollout-only payload (e.g.
         multimodal). The same shape is used for both prev_lp and ref_lp.
+        Workers compute the per-token tensor and commit it to TQ via the
+        leader-rank ``_write_back_result_field``; the Ray return is
+        always None, so this dispatcher just waits for completion.
         """
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("logprob_mb_tokens")
         lp_meta = replace(meta, fields=list(LP_SEED_FIELDS), task_name=task_name)
         with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
-            metas, unsorted_indices = shard_meta_for_dp(
+            metas, _ = shard_meta_for_dp(
                 lp_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
                 batch_size=None,
@@ -323,22 +310,19 @@ class TQPolicy(Policy):
                 ],
                 common_kwargs=common_kwargs,
             )
-        result = aggregate_fn(self.worker_group.get_all_worker_results(futures))
-        if result is not None and unsorted_indices is not None:
-            result.reorder_data(unsorted_indices)
-        return result
+        # Wait for completion; per-rank returns are None.
+        self.worker_group.get_all_worker_results(futures)
 
     def get_logprobs_from_meta(
         self,
         meta: KVBatchMeta,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
-    ) -> BatchedDataDict[LogprobOutputSpec]:
-        return self._logprob_dispatch(
+    ) -> None:
+        self._logprob_dispatch(
             meta,
             task_name="prev_lp",
             worker_method="get_logprobs_presharded",
-            aggregate_fn=_aggregate_logprob_results,
             timer_prefix="get_logprobs",
             timer=timer,
             common_kwargs={"micro_batch_size": micro_batch_size},
@@ -349,12 +333,11 @@ class TQPolicy(Policy):
         meta: KVBatchMeta,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
-    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
-        return self._logprob_dispatch(
+    ) -> None:
+        self._logprob_dispatch(
             meta,
             task_name="ref_lp",
             worker_method="get_reference_policy_logprobs_presharded",
-            aggregate_fn=_aggregate_reference_logprob_results,
             timer_prefix="get_reference_policy_logprobs",
             timer=timer,
             common_kwargs={"micro_batch_size": micro_batch_size},

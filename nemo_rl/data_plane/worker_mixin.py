@@ -460,9 +460,11 @@ class TQWorkerMixin:
         """Per-rank logprob entrypoint. Fetch → packing prep → run → write back.
 
         Returns ``None`` — the per-token tensor is committed to TQ via
-        :meth:`_write_back_result_field` under the canonical column name
-        ``prev_logprobs``. Callers retrieve it through
-        :meth:`TQPolicy.read_from_dataplane` (no Ray plasma roundtrip).
+        :meth:`_write_back_result_field` under ``prev_logprobs``.
+        Callers fetch it through :meth:`TQPolicy.read_from_dataplane` —
+        skipping the Ray plasma roundtrip on the (B, S) tensor.
+        ``del result`` drops the local reference before returning so the
+        worker doesn't carry the tensor into the next dispatch.
         """
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
@@ -476,7 +478,7 @@ class TQWorkerMixin:
             result_key="logprobs",
             tq_field="prev_logprobs",
         )
-        return None
+        del result
 
     @wrap_with_nvtx_name("policy_worker/get_reference_policy_logprobs_presharded")
     def get_reference_policy_logprobs_presharded(
@@ -486,9 +488,8 @@ class TQWorkerMixin:
     ) -> None:
         """Per-rank reference-policy logprob entrypoint.
 
-        Returns ``None`` — tensor lives in TQ under
-        ``reference_policy_logprobs``. See
-        :meth:`get_logprobs_presharded` for the rationale.
+        See :meth:`get_logprobs_presharded` for the contract. Tensor
+        lives in TQ under ``reference_policy_logprobs``.
         """
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
@@ -502,4 +503,4 @@ class TQWorkerMixin:
             result_key="reference_logprobs",
             tq_field="reference_policy_logprobs",
         )
-        return None
+        del result
