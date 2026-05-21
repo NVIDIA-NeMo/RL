@@ -20,4 +20,4 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
-uv run --no-sync bash -x ./tests/run_unit.sh "unit/models/" "--ignore=unit/models/generation/" "${EXCLUDED_UNIT_TESTS[@]}" --shard-id=1 --num-shards=3 --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
+uv run --no-sync bash -x ./tests/run_unit.sh "unit/models/" "--ignore=unit/models/generation/" "${EXCLUDED_UNIT_TESTS[@]}" --shard-id=1 --num-shards=4 --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated

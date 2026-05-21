@@ -13,12 +13,8 @@
 # limitations under the License.
 
 #!/bin/bash
-# Shard: vLLM generation tests (base + vllm-marked)
+# Shard: automodel-marked policy worker tests (test_dtensor_worker*.py, test_automodel_types.py)
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
-# Base run (tests without extra markers)
-uv run --no-sync bash -x ./tests/run_unit.sh "unit/models/generation/test_vllm*.py" "${EXCLUDED_UNIT_TESTS[@]}" --shard-id=0 --num-shards=3 --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
-
-# vllm-only run (catch-all across all unit tests)
-uv run --extra vllm bash -x ./tests/run_unit.sh "unit/" "${EXCLUDED_UNIT_TESTS[@]}" --shard-id=0 --num-shards=3 --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --vllm-only
+uv run --extra automodel bash -x ./tests/run_unit.sh "unit/models/policy/" "${EXCLUDED_UNIT_TESTS[@]}" --shard-id=2 --num-shards=3 --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated --automodel-only

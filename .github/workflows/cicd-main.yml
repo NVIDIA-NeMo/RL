@@ -455,11 +455,14 @@ jobs:
   cicd-unit-tests:
     strategy:
       fail-fast: false
+      max-parallel: 16
       matrix:
         include:
           - script: L0_Unit_Tests_Vllm_1
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Vllm_2
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L0_Unit_Tests_Vllm_3
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Sglang
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
@@ -478,11 +481,15 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Automodel_Policy_2
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L0_Unit_Tests_Automodel_Policy_3
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Models_1
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Models_2
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Models_3
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L0_Unit_Tests_Models_4
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Environments
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}

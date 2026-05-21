@@ -13,12 +13,11 @@
 # limitations under the License.
 
 #!/bin/bash
-# Shard: vLLM generation tests (base + vllm-marked)
+# Shard: Model tests not covered by mcore/automodel/generation shards
+# Picks up base (unmarked) tests from models/policy/, models/dtensor/, models/huggingface/
+# Tests in models/megatron/ (all mcore) and models/automodel/ (all automodel) are excluded
+# by conftest.py filtering since this is a base run.
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
-# Base run (tests without extra markers)
-uv run --no-sync bash -x ./tests/run_unit.sh "unit/models/generation/test_vllm*.py" "${EXCLUDED_UNIT_TESTS[@]}" --shard-id=0 --num-shards=3 --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
-
-# vllm-only run (catch-all across all unit tests)
-uv run --extra vllm bash -x ./tests/run_unit.sh "unit/" "${EXCLUDED_UNIT_TESTS[@]}" --shard-id=0 --num-shards=3 --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --vllm-only
+uv run --no-sync bash -x ./tests/run_unit.sh "unit/models/" "--ignore=unit/models/generation/" "${EXCLUDED_UNIT_TESTS[@]}" --shard-id=3 --num-shards=4 --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
