@@ -622,8 +622,6 @@ class TestSetupDistributed:
         # Configure dimension subscript access
         dp_dim = MagicMock()
         dp_dim.size.return_value = 4
-        dp_shard_dim = MagicMock()
-        dp_shard_dim.size.return_value = 4
         tp_dim = MagicMock()
         tp_dim.size.return_value = 1
         cp_dim = MagicMock()
@@ -631,7 +629,6 @@ class TestSetupDistributed:
 
         mock_mesh.__getitem__ = lambda self, key: {
             "dp": dp_dim,
-            "dp_shard": dp_shard_dim,
             "tp": tp_dim,
             "cp": cp_dim,
         }[key]
@@ -786,6 +783,28 @@ class TestSetupDistributed:
         assert mesh_call_kwargs["ep_size"] == 1
         assert mesh_call_kwargs["dp_replicate_size"] == 2
         assert mesh_call_kwargs["world_size"] == 4
+
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_dp_replicate_size_requires_divisible_dp(
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_create_mesh,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+    ):
+        """dp_replicate_size must divide the inferred data-parallel size."""
+        mock_torch_dist.get_world_size.return_value = 6
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value = MagicMock()
+        mock_config["dtensor_cfg"]["dp_replicate_size"] = 4
+
+        with pytest.raises(ValueError, match="dp_replicate_size"):
+            setup_distributed(mock_config, mock_runtime_config)
 
 
 @pytest.mark.automodel

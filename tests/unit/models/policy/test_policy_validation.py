@@ -348,24 +348,6 @@ def test_dtensor_dp_replicate_size_requires_v2(
     mock_ray_worker_group.assert_not_called()
 
 
-@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_dtensor_dp_replicate_size_requires_divisible_dp(
-    mock_ray_worker_group,
-    tiny_llama_model_path,
-):
-    """Test that dp_replicate_size must divide the inferred data parallel size."""
-    cluster = create_mock_cluster(world_size=6)
-    tokenizer = create_mock_tokenizer()
-    config = create_dtensor_config(tiny_llama_model_path, tp=1)
-    config["dtensor_cfg"]["_v2"] = True
-    config["dtensor_cfg"]["dp_replicate_size"] = 4
-
-    with pytest.raises(ValueError, match="dp_replicate_size"):
-        Policy(cluster=cluster, config=config, tokenizer=tokenizer)
-
-    mock_ray_worker_group.assert_not_called()
-
-
 @pytest.mark.parametrize(
     "world_size,tp,pp,cp,should_pass,expected_error_type,description",
     [

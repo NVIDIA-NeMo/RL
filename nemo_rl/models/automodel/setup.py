@@ -431,6 +431,16 @@ def setup_distributed(
     dp_replicate_size = config["dtensor_cfg"].get("dp_replicate_size", 1)
     sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
 
+    # HSDP requires the data-parallel axis to evenly contain the replicate dim.
+    model_parallel_size = tp_size * cp_size * ep_size
+    dp_size = world_size // model_parallel_size
+    if dp_size % dp_replicate_size != 0:
+        raise ValueError(
+            f"Data parallel size ({dp_size}) must be divisible by "
+            f"dp_replicate_size ({dp_replicate_size}). "
+            "Please adjust your cluster size or parallelism parameters."
+        )
+
     # Build tp_plan from custom_parallel_plan config if set, else None (auto-select)
     tp_plan = config["dtensor_cfg"].get("custom_parallel_plan", None)
 

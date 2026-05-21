@@ -51,8 +51,8 @@ policy:
     activation_checkpointing: false
     tensor_parallel_size: 1
     context_parallel_size: 1
-    # DP size while using Automodel DTensor v2 Hybrid Sharded Data Parallel (HSDP).
-    # Optimally number of nodes
+    # HSDP replicate dimension size for Automodel DTensor v2.
+    # Typically set to the number of nodes; set to 1 to disable HSDP.
     dp_replicate_size: 1
     custom_parallel_plan: null
 

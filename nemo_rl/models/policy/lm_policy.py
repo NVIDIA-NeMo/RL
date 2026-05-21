@@ -145,6 +145,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
                     is False
                 ), "LoRA is not supported for DTensorPolicyWorker V1"
+                if config["dtensor_cfg"].get("dp_replicate_size", 1) > 1:
+                    raise ValueError(
+                        "dp_replicate_size > 1 requires policy.dtensor_cfg._v2: true "
+                        "(Automodel DTensor v2 backend). HSDP is not supported with the "
+                        "V1 DTensor worker."
+                    )
                 worker_builder_cls_fqn = resolve_policy_worker_cls(
                     "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker",
                     config,
@@ -165,21 +171,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
         actual_world_size = cluster.world_size()
-        dp_replicate_size = (
-            config["dtensor_cfg"].get("dp_replicate_size", 1) if dtensor_enable else 1
-        )
-        if dp_replicate_size is None or dp_replicate_size <= 0:
-            dp_replicate_size = 1
-        if (
-            dtensor_enable
-            and dp_replicate_size > 1
-            and not config["dtensor_cfg"].get("_v2", False)
-        ):
-            raise ValueError(
-                "dp_replicate_size > 1 requires policy.dtensor_cfg._v2: true "
-                "(Automodel DTensor v2 backend). HSDP is not supported with the "
-                "V1 DTensor worker."
-            )
 
         if (
             not bool(os.environ.get("NRL_IGNORE_TP_ACCURACY_CHECK"))
@@ -215,14 +206,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 f"The data parallel size (DP = world_size / (PP * CP * TP)) must be a positive integer. "
                 f"Current DP would be {actual_world_size}/{model_parallel_size} = {dp_size_float:.6f}, which is not an integer. "
                 f"Please adjust your cluster size or parallelism parameters."
-            )
-
-        dp_size = actual_world_size // model_parallel_size
-        if dp_size % dp_replicate_size != 0:
-            raise ValueError(
-                f"Data parallel size ({dp_size}) must be divisible by "
-                f"dp_replicate_size ({dp_replicate_size}). "
-                "Please adjust your cluster size or parallelism parameters."
             )
 
         self.sharding_annotations = NamedSharding(
