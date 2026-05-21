@@ -2,11 +2,12 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
-# MiniMax-M1 async lag-1 high-off-policy study, CISPO arm (2n8g).
+# MiniMax-M1 async lag-1 high-off-policy study, CISPO arm.
+# Uses 2 nodes for Megatron policy training plus 1 non-colocated vLLM node.
 # See examples/configs/recipes/llm/cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-2n8g-megatron-cispo.yaml.
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=2
+NUM_NODES=3
 STEPS_PER_RUN=100
 MAX_STEPS=100
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
