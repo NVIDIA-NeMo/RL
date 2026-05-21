@@ -478,7 +478,11 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Automodel_Policy_2
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Models
+          - script: L0_Unit_Tests_Models_1
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L0_Unit_Tests_Models_2
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L0_Unit_Tests_Models_3
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Environments
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
@@ -546,7 +550,11 @@ jobs:
             uses_sglang: true
           - script: L1_Functional_Tests_Gym
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_GRPO
+          - script: L1_Functional_Tests_GRPO_1
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_GRPO_2
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_GRPO_3
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_SFT
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
@@ -602,7 +610,11 @@ jobs:
             uses_sglang: true
           - script: L1_Functional_Tests_Gym
             runner: nemo-ci-gcp-gpu-x2
-          - script: L1_Functional_Tests_GRPO
+          - script: L1_Functional_Tests_GRPO_1
+            runner: nemo-ci-gcp-gpu-x2
+          - script: L1_Functional_Tests_GRPO_2
+            runner: nemo-ci-gcp-gpu-x2
+          - script: L1_Functional_Tests_GRPO_3
             runner: nemo-ci-gcp-gpu-x2
           - script: L1_Functional_Tests_SFT
             runner: nemo-ci-gcp-gpu-x2
@@ -657,7 +669,11 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Gym
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_GRPO
+          - script: L1_Functional_Tests_GRPO_1
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_GRPO_2
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_GRPO_3
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_SFT
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}

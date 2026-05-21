@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 #!/bin/bash
-set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
+set -xeuo pipefail
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 PROJECT_ROOT=$(realpath ${SCRIPT_DIR}/../..)
@@ -38,15 +38,8 @@ run_test() {
 run_test      bash ./tests/functional/grpo_frozen_env.sh
 
 run_test fast uv run --no-sync bash ./tests/functional/gdpo.sh
-run_test fast uv run --no-sync bash ./tests/functional/gdpo_async_grpo.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_fsdp2.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_multiple_dataloaders.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_rm_env.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_topp_topk.sh
-run_test      uv run --no-sync bash ./tests/functional/vlm_grpo.sh
 
 cd ${PROJECT_ROOT}/tests
 coverage combine .coverage*
