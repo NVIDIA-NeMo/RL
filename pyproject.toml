@@ -83,14 +83,15 @@ dependencies = [
   # binary that ships in this wheel at <site-packages>/mooncake/. Bundled
   # with TQ rather than gated behind an extra so worker venvs (built
   # without extras) can be flipped to mooncake_cpu via config alone.
-  # PyPI's `mooncake-transfer-engine` is cu12-only (links libcudart.so.12),
-  # which breaks on cu13 containers ("libcudart.so.12: cannot open shared
-  # object file"). Upstream ships a cu13 variant as a GitHub release
-  # asset under a separate distribution name `mooncake-transfer-engine-cuda13`;
-  # same `mooncake/` import namespace, store.so linked against
-  # libcudart.so.13. Pin the GitHub URL directly (same pattern as
-  # flash-attn below). Drop and revert to PyPI when cu13 is promoted.
-  "mooncake-transfer-engine-cuda13 @ https://github.com/kvcache-ai/Mooncake/releases/download/v0.3.10.post2/mooncake_transfer_engine_cuda13-0.3.10.post2-cp313-cp313-manylinux_2_35_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # PyPI's base `mooncake-transfer-engine` is cu12-only (links
+  # libcudart.so.12), which breaks on cu13 containers. Upstream now also
+  # publishes a cu13 variant as a separate distribution name
+  # `mooncake-transfer-engine-cuda13` (same `mooncake/` import namespace,
+  # store.so linked against libcudart.so.13). Resolve from PyPI rather
+  # than the GitHub release URL — the wheel is byte-identical (verified
+  # sha256), and PyPI's CDN is far more reliable than github releases
+  # from compute nodes.
+  "mooncake-transfer-engine-cuda13==0.3.10.post2 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [project.optional-dependencies]
