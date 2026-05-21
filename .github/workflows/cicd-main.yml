@@ -359,6 +359,7 @@ jobs:
     needs: [build-container, org-member-pre-flight]
     if: >-
       ${{
+        github.ref == 'refs/heads/main' &&
         vars.UV_BUILD_CACHE == 'true' &&
         needs.build-container.result == 'success'
       }}
@@ -391,6 +392,7 @@ jobs:
     needs: [build-container-gb200, gb200-config]
     if: >-
       ${{
+        github.ref == 'refs/heads/main' &&
         vars.UV_BUILD_CACHE == 'true' &&
         needs.build-container-gb200.result == 'success'
       }}
@@ -569,7 +571,9 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Eval
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Other
+          - script: L1_Functional_Tests_Other_1
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_Other_2
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
     needs: [pre-flight, build-container, cicd-unit-tests, org-member-pre-flight]
     runs-on: ${{ matrix.runner }}
@@ -631,7 +635,9 @@ jobs:
             runner: nemo-ci-gcp-gpu-x2
           - script: L1_Functional_Tests_Eval
             runner: nemo-ci-gcp-gpu-x2
-          - script: L1_Functional_Tests_Other
+          - script: L1_Functional_Tests_Other_1
+            runner: nemo-ci-gcp-gpu-x2
+          - script: L1_Functional_Tests_Other_2
             runner: nemo-ci-gcp-gpu-x2
     needs: [pre-flight, build-container-gb200, cicd-unit-tests, org-member-pre-flight, gb200-config]
     runs-on: ${{ matrix.runner }}
@@ -692,7 +698,9 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Eval
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Other
+          - script: L1_Functional_Tests_Other_1
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_Other_2
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
     needs: [pre-flight, org-member-pre-flight]
     if: ${{ contains('Lfast', needs.pre-flight.outputs.test_level) }}
