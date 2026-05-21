@@ -185,7 +185,6 @@ class MegatronPolicyWorkerImpl(
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
         init_reference_model: bool = True,
-        inference_only: bool = False,
         *,
         worker_sharding_annotations: NamedSharding,
         **kwargs: Any,
@@ -296,7 +295,6 @@ class MegatronPolicyWorkerImpl(
             self.megatron_cfg,
             init_optimizer,
             pre_load_checkpoint_hook=getattr(self, "_pre_load_checkpoint_hook", None),
-            inference_only=inference_only,
         )
 
         self.mcore_state = model_and_optimizer_state.state

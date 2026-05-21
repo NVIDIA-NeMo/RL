@@ -984,7 +984,6 @@ def setup_model_and_optimizer(
     get_embedding_ranks=None,  # TODO @sahilj: What is this?
     get_position_embedding_ranks=None,
     pre_load_checkpoint_hook: Optional[Callable] = None,
-    inference_only: bool = False,
 ):
     state = GlobalState()
     state.cfg = megatron_cfg

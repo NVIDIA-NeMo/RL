@@ -88,7 +88,6 @@ class MegatronGeneration(GenerationInterface):
             processor=processor,
             init_optimizer=False,
             init_reference_model=False,
-            inference_only=True,
             weights_path=weights_path,
         )
 

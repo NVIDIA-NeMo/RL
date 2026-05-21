@@ -67,7 +67,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         name_prefix: str = "lm_policy",
         workers_per_node: Optional[Union[int, list[int]]] = None,
         init_optimizer: bool = True,
-        inference_only: bool = False,
         weights_path: Optional[PathLike] = None,
         optimizer_path: Optional[PathLike] = None,
         init_reference_model: bool = True,
@@ -222,7 +221,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         worker_kwargs = dict(
             init_optimizer=init_optimizer,
-            inference_only=inference_only,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_reference_model=init_reference_model,
