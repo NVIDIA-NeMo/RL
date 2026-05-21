@@ -674,7 +674,7 @@ def print_performance_metrics(
     # Idle Time from Training Worker (Async GRPO only)
     grpo_config = master_config.grpo
     if (
-        "async_grpo" in grpo_config and grpo_config["async_grpo"]["enabled"]
+        grpo_config.async_grpo is not None and grpo_config.async_grpo.enabled
     ) and not colocated_inference:
         # async grpo
         exposed_generation_time = timing_metrics["exposed_generation"]
@@ -697,7 +697,7 @@ def print_performance_metrics(
         )
 
     number_of_samples_per_step = (
-        grpo_config["num_prompts_per_step"] * grpo_config["num_generations_per_prompt"]
+        grpo_config.num_prompts_per_step * grpo_config.num_generations_per_prompt
     )
 
     if colocated_inference:

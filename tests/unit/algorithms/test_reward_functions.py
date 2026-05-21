@@ -204,15 +204,15 @@ def test_reward_shaping_missing_config_values():
         apply_reward_shaping(batch, config)
 
     # Test missing overlong_buffer_penalty
-    config["overlong_buffer_length"] = 5
-    config["overlong_buffer_penalty"] = None
+    config.overlong_buffer_length = 5
+    config.overlong_buffer_penalty = None
 
     with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
         apply_reward_shaping(batch, config)
 
     # Test missing max_response_length
-    config["overlong_buffer_penalty"] = 0.1
-    config["max_response_length"] = None
+    config.overlong_buffer_penalty = 0.1
+    config.max_response_length = None
 
     with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
         apply_reward_shaping(batch, config)
@@ -305,7 +305,7 @@ def test_stop_properly_penalty_boundary_coefs():
 
     # Test coef=1: no penalty applied
     batch["total_reward"] = torch.tensor([1.0, 0.5])
-    config["stop_properly_penalty_coef"] = 1.0
+    config.stop_properly_penalty_coef = 1.0
     result = apply_reward_shaping(batch, config)
     assert torch.allclose(result["total_reward"], torch.tensor([1.0, 0.5]), atol=1e-6)
 
@@ -323,10 +323,10 @@ def test_stop_properly_penalty_error_cases():
 
     # Invalid coef values
     batch["truncated"] = torch.tensor([False, True])
-    config["stop_properly_penalty_coef"] = -0.1
+    config.stop_properly_penalty_coef = -0.1
     with pytest.raises(AssertionError, match="stop_properly_penalty_coef must be in"):
         apply_reward_shaping(batch, config)
 
-    config["stop_properly_penalty_coef"] = 1.5
+    config.stop_properly_penalty_coef = 1.5
     with pytest.raises(AssertionError, match="stop_properly_penalty_coef must be in"):
         apply_reward_shaping(batch, config)

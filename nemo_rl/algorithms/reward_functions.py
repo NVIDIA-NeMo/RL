@@ -11,43 +11,40 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import (
-    NotRequired,
-    TypedDict,
-    TypeVar,
-)
+from typing import Optional, TypeVar
 
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
-class RewardShapingConfig(TypedDict):
+class RewardShapingConfig(BaseModel, extra="allow"):
     """Configuration for reward function processing.
 
     This configuration enables custom reward shaping, currently supporting DAPO-style
     penalties for responses that exceed the maximum response length threshold.
     """
 
-    enabled: bool
+    enabled: bool = False
 
     # The length of the buffer to penalize responses that exceed the maximum response length threshold.
     # Responses of length greater than overlong_buffer_length + max_response_length will
     # receive the maximum penalty.
-    overlong_buffer_length: NotRequired[int]
+    overlong_buffer_length: Optional[int] = None
 
     # The penalty for responses that exceed the maximum response length threshold.
-    overlong_buffer_penalty: NotRequired[float]
+    overlong_buffer_penalty: Optional[float] = None
 
     # The maximum response length threshold. Responses exceeding this length will be penalized.
-    max_response_length: NotRequired[int]
+    max_response_length: Optional[int] = None
 
     # Stop properly penalty: scale factor for rewards of truncated responses (0-1).
     # When set to 0, truncated responses get zero reward.
     # When set to 1, no penalty is applied (default behavior).
-    stop_properly_penalty_coef: NotRequired[float | None]
+    stop_properly_penalty_coef: Optional[float] = None
 
 
 def apply_reward_shaping(
@@ -58,22 +55,22 @@ def apply_reward_shaping(
     Nonetheless, it can be potentially extended to support any custom reward logic.
     """
     rewards = batch["total_reward"]
-    if not cfg["enabled"]:
+    if not cfg.enabled:
         return batch
 
     # Apply stop properly penalty if configured
-    stop_properly_penalty_coef = cfg.get("stop_properly_penalty_coef", None)
-    if stop_properly_penalty_coef is not None:
+    if cfg.stop_properly_penalty_coef is not None:
+        stop_properly_penalty_coef = cfg.stop_properly_penalty_coef
         assert 0 <= stop_properly_penalty_coef <= 1, (
             f"stop_properly_penalty_coef must be in [0, 1], got {stop_properly_penalty_coef}"
         )
         # Warn user that DAPO overlong parameters are ignored when stop_properly_penalty_coef is set
         ignored_params = []
-        if cfg.get("overlong_buffer_length") is not None:
+        if cfg.overlong_buffer_length is not None:
             ignored_params.append("overlong_buffer_length")
-        if cfg.get("overlong_buffer_penalty") is not None:
+        if cfg.overlong_buffer_penalty is not None:
             ignored_params.append("overlong_buffer_penalty")
-        if cfg.get("max_response_length") is not None:
+        if cfg.max_response_length is not None:
             ignored_params.append("max_response_length")
         if ignored_params:
             print(
@@ -114,18 +111,18 @@ def apply_reward_shaping(
 
     # DAPO reward shaping requires overlong_buffer_length, overlong_buffer_penalty, and max_response_length to be set.
     if (
-        cfg.get("overlong_buffer_length") is None
-        or cfg.get("overlong_buffer_penalty") is None
-        or cfg.get("max_response_length") is None
+        cfg.overlong_buffer_length is None
+        or cfg.overlong_buffer_penalty is None
+        or cfg.max_response_length is None
     ):
         raise ValueError(
             "Reward function is enabled but only DAPO reward shaping is currently supported. Please ensure overlong_buffer_length, overlong_buffer_penalty, and max_response_length are properly configured."
         )
 
     # Get the overlong_buffer_length, overlong_buffer_penalty and max_response_length
-    overlong_buffer_length = cfg["overlong_buffer_length"]
-    overlong_buffer_penalty = cfg["overlong_buffer_penalty"]
-    max_response_length = cfg["max_response_length"]
+    overlong_buffer_length = cfg.overlong_buffer_length
+    overlong_buffer_penalty = cfg.overlong_buffer_penalty
+    max_response_length = cfg.max_response_length
     assert overlong_buffer_penalty >= 0, f"{overlong_buffer_penalty=} must be >=0"
     # Calculate the expected response length
     expected_response_length = max_response_length - overlong_buffer_length

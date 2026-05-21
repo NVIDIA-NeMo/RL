@@ -170,7 +170,7 @@ def main() -> None:
     )
 
     # Validation dataset config setup.
-    if config.grpo["max_val_samples"] is not None:
+    if config.grpo.max_val_samples is not None:
         raise ValueError(
             """A non-null `grpo.max_val_samples` parameter is not supported.
 
@@ -183,8 +183,8 @@ The validation set you pass in will directly be used for validation with no addi
         print(
             f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
         )
-        config.grpo["max_val_samples"] = len(val_dataset)
-        config.grpo["val_batch_size"] = config.grpo["max_val_samples"]
+        config.grpo.max_val_samples = len(val_dataset)
+        config.grpo.val_batch_size = config.grpo.max_val_samples
 
     # Print config
     print("Final config:")
@@ -233,28 +233,16 @@ The validation set you pass in will directly be used for validation with no addi
             master_config=master_config,
         )
     # Check if async mode is enabled
-    elif "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
+    elif config.grpo.async_grpo is not None and config.grpo.async_grpo.enabled:
         # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
-        unsupported_features = [
-            "use_dynamic_sampling",
-            "reward_scaling",
-            "reward_shaping",
-        ]
-
-        for feature in unsupported_features:
-            if feature not in config.grpo:
-                continue
-
-            if feature == "use_dynamic_sampling":
-                if config.grpo[feature]:
-                    raise NotImplementedError(
-                        f"{feature} is not supported with async GRPO"
-                    )
-            else:
-                if config.grpo[feature]["enabled"]:
-                    raise NotImplementedError(
-                        f"{feature} is not supported with async GRPO"
-                    )
+        if config.grpo.use_dynamic_sampling:
+            raise NotImplementedError(
+                "use_dynamic_sampling is not supported with async GRPO"
+            )
+        if config.grpo.reward_scaling.enabled:
+            raise NotImplementedError("reward_scaling is not supported with async GRPO")
+        if config.grpo.reward_shaping.enabled:
+            raise NotImplementedError("reward_shaping is not supported with async GRPO")
 
         # Async GRPO does not support multiple dataloaders
         if config.data["use_multiple_dataloader"]:
@@ -266,7 +254,6 @@ The validation set you pass in will directly be used for validation with no addi
 
         print("🚀 Running async GRPO training")
 
-        async_config = config.grpo["async_grpo"]
         # Run async GRPO training
         async_grpo_train(
             policy=policy,
@@ -281,7 +268,7 @@ The validation set you pass in will directly be used for validation with no addi
             checkpointer=checkpointer,
             grpo_save_state=grpo_state,
             master_config=master_config,
-            max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+            max_trajectory_age_steps=config.grpo.async_grpo.max_trajectory_age_steps,
         )
     else:
         print("🚀 Running synchronous GRPO training")
