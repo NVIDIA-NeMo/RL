@@ -174,8 +174,8 @@ tests/test_suites/llm/distillation-qwen3-1.7b-1n8g-megatron-qa-nvfp4.sh
 # PPO #
 #######
 
-# Megatron PPO with GAE and value model (DeepSeek-7B, GSM8K)
-tests/test_suites/llm/ppo-deepseek7b-gsm8k-1n8g-megatron.sh
+# Megatron PPO with GAE and value model (Qwen2.5-1.5B, GSM8K)
+tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron.sh
 
 # Megatron PPO with KL penalty + importance sampling (DeepSeek-R1-7B, DAPOMath)
 tests/test_suites/llm/ppo-dsr1-7b-math-8n8g-megatron.sh
