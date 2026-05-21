@@ -529,9 +529,25 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             assert request.temperature == generation_config["temperature"]
             assert request.top_p == generation_config["top_p"]
 
-            generator = await openai_serving_chat.create_chat_completion(
-                request, raw_request
-            )
+            try:
+                generator = await openai_serving_chat.create_chat_completion(
+                    request, raw_request
+                )
+            except VLLMValidationError as e:
+                # vLLM 0.20 raises VLLMValidationError for prompts exceeding
+                # max_model_len during tokenization, instead of returning an
+                # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
+                # detect context-length overflow and handle it gracefully.
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(
