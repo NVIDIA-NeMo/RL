@@ -170,6 +170,8 @@ def get_modelopt_checkpoint_dir() -> str:
 
 def _is_mamba_provider(config) -> bool:
     """Detect whether a Megatron model provider is a MBridge Mamba provider."""
+    # MBridge layer-spec callables receive the provider instance as `config`;
+    # legacy providers also carry config fields, hence the overloaded name.
     return isinstance(config, MambaModelProvider)
 
 
