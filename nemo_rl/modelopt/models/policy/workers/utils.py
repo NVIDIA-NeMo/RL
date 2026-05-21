@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
 from megatron.bridge.models.mamba.mamba_provider import (
+    MambaModelProvider,
     modelopt_mamba_stack_spec,
     transformer_engine_mamba_stack_spec,
 )
@@ -168,18 +169,8 @@ def get_modelopt_checkpoint_dir() -> str:
 
 
 def _is_mamba_provider(config) -> bool:
-    """Detect whether a Megatron model provider is a Mamba/hybrid model.
-
-    True for either explicit ``mamba_stack_spec`` (NemotronH and similar) or
-    a hybrid SSM model with ``mamba_num_heads`` and a layer-pattern field.
-    """
-    if hasattr(config, "mamba_stack_spec"):
-        return True
-    if not hasattr(config, "mamba_num_heads"):
-        return False
-    return hasattr(config, "hybrid_layer_pattern") or hasattr(
-        config, "hybrid_override_pattern"
-    )
+    """Detect whether a Megatron model provider is a MBridge Mamba provider."""
+    return isinstance(config, MambaModelProvider)
 
 
 def quantization_layer_spec(config):
