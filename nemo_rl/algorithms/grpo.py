@@ -343,9 +343,14 @@ def setup(
         )
     else:
         dataloader = init_train_dataloader(dataset)
-        train_sample_count = len(dataloader)
+        train_sample_count = len(dataset)
+        num_batches = len(dataloader)
+        dropped = train_sample_count - num_batches * dataloader_batch_size
         print(
-            f"  ✓ Training dataloader loaded with {train_sample_count} samples",
+            f"  ✓ Training dataloader loaded with {train_sample_count} samples "
+            f"({num_batches} batches of {dataloader_batch_size}"
+            + (f"; {dropped} dropped by drop_last" if dropped > 0 else "")
+            + ")",
             flush=True,
         )
 
@@ -565,6 +570,7 @@ def setup(
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_optimizer=True,
+            init_ema_teacher=policy_config.get("init_ema_teacher", False),
         )
         return p, time.perf_counter() - t0
 

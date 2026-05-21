@@ -337,6 +337,10 @@ class PolicyConfig(TypedDict):
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
+    # When True, each policy worker allocates a CPU state dict that serves as
+    # an EMA-regularized teacher for SDPO (paper Table 12). Read by the SDPO
+    # algorithm; ignored by other algos.
+    init_ema_teacher: NotRequired[bool]
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float]
