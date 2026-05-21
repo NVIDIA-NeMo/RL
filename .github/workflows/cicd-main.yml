@@ -315,6 +315,7 @@ jobs:
       build-args: |
         MAX_JOBS=4
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
+        uv-cache-seed=docker-image://${{ needs.org-member-pre-flight.outputs.registry }}/${{ vars.CI_CONTAINER_NAME }}:uv-cache
         ${{ needs.org-member-pre-flight.outputs.is_member != 'true' && 'SKIP_SGLANG_BUILD=1' || '' }}
 
   build-container-gb200:
@@ -338,6 +339,8 @@ jobs:
       registry: ${{ needs.gb200-config.outputs.registry }}
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
+        uv-cache-seed=docker-image://${{ needs.gb200-config.outputs.registry }}/${{ vars.CI_CONTAINER_NAME }}-uv-cache:latest
+        ${{ needs.org-member-pre-flight.outputs.is_member != 'true' && 'SKIP_SGLANG_BUILD=1' || '' }}
       build-args: |
         MAX_JOBS=4
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
