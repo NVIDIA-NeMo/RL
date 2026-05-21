@@ -905,10 +905,6 @@ def distillation_train(
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
-            if "kl_loss" in metrics:
-                print(f"  • KL Loss: {metrics['kl_loss']:.4f}")
-            if "sft_loss" in metrics:
-                print(f"  • SFT Loss: {metrics['sft_loss']:.4f}")
             print(
                 f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
             )
