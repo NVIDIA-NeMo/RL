@@ -1259,6 +1259,18 @@ def refit_policy_generation(
     if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["weights"])
 
+    if (
+        not colocated_inference
+        and isinstance(policy_generation, MegatronGeneration)
+        and policy_generation.cfg["generation"]["mcore_generation_config"].get(
+            "refit_backend"
+        )
+        == "nvshmem"
+    ):
+        futures_train = policy.preinit_nvshmem_collective()
+        futures_inference = policy_generation.preinit_nvshmem_collective()
+        ray.get(futures_train + futures_inference)
+
     # Create a context manager that does nothing when timer is None
     timer_context = (
         timer.time("prepare_for_generation/transfer_and_update_weights")
