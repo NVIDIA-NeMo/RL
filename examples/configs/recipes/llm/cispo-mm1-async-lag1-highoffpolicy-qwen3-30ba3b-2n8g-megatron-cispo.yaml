@@ -82,9 +82,6 @@ loss_fn:
   sequence_level_importance_ratios: false
   force_on_policy_ratio: false
   use_cispo: true
-  cispo_diagnostics: true
-  cispo_diag_grpo_eps: 0.2             # measure GRPO-equivalent clip rate
-  cispo_diag_low_prob_threshold: 0.05
 
 checkpointing:
   enabled: false
