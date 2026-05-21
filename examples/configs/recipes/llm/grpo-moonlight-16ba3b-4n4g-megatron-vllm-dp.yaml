@@ -4,6 +4,7 @@ checkpointing:
 policy:
   generation:
     vllm_cfg:
+      async_engine: true
       tensor_parallel_size: 2
       expert_parallel_size: 16 # test cross-node EP
 logger:
