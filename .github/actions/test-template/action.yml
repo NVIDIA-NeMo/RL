@@ -74,11 +74,6 @@ runs:
           sleep 10
         done
 
-    - name: Docker system cleanup
-      shell: bash
-      run: |
-        docker system prune -af --filter "until=48h" --force || true
-
     - name: Docker pull image
       shell: bash
       run: |
