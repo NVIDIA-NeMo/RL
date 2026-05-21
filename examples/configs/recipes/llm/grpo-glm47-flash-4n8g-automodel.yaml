@@ -6,6 +6,7 @@ grpo:
 loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
   truncated_importance_sampling_ratio: 2
 checkpointing:
   checkpoint_dir: results/grpo-glm47-flash-4n8g-automodel
