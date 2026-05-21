@@ -41,6 +41,7 @@ dependencies = [
   "nvidia-ml-py",
   "hydra-core",
   "tiktoken",
+  "sentencepiece",
   "blobfile",
   "debugpy",
   "nvtx",
@@ -117,7 +118,7 @@ automodel = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  "transformers>=5.5.0,<=5.6.0",
+  "transformers>=5.3.0,<5.4.0",
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
@@ -282,7 +283,10 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv]
-environments = ["python_version == '3.13'"]
+environments = [
+  "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
 preview = true # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
   "transformer-engine-torch",
