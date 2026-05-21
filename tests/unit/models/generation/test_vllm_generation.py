@@ -1001,7 +1001,9 @@ async def test_vllm_generation_with_hf_training_non_colocated(
         and not enable_lora
         and "H100" in torch.cuda.get_device_name()
     ):
-        pytest.skip("Skipping H100 timeout in async non-colocated BF16 vLLM collective init.")
+        pytest.skip(
+            "Skipping H100 timeout in async non-colocated BF16 vLLM collective init."
+        )
 
     if vllm_precision == "fp8":
         pytest.skip(
