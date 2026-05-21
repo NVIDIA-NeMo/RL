@@ -61,6 +61,11 @@ def apply_reward_shaping(
     if not cfg["enabled"]:
         return batch
 
+    # Preserve the pre-shaping reward so downstream consumers (e.g. DAPO
+    # dynamic sampling) can filter prompt groups on the raw task metric
+    # rather than on length-dependent shaped rewards.
+    batch["unshaped_total_reward"] = rewards.clone()
+
     # Apply stop properly penalty if configured
     stop_properly_penalty_coef = cfg.get("stop_properly_penalty_coef", None)
     if stop_properly_penalty_coef is not None:

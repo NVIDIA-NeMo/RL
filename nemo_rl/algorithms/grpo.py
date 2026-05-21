@@ -1617,6 +1617,17 @@ def grpo_train(
                     rewards = repeated_batch["total_reward"]
 
                     print("▶ Computing advantages...", flush=True)
+                    # For DAPO with reward shaping, compute std on the raw
+                    # pre-shaping reward so dynamic sampling filters prompt
+                    # groups on the raw task metric (e.g. acc) instead of on
+                    # length-dependent shaped reward variance. Baseline
+                    # (which drives advantages) stays on the shaped reward.
+                    std_rewards = (
+                        repeated_batch["unshaped_total_reward"]
+                        if master_config.grpo["use_dynamic_sampling"]
+                        and "unshaped_total_reward" in repeated_batch
+                        else None
+                    )
                     if master_config.grpo.get("calculate_advantages_on_gpu"):
                         print("Computing advantages on GPU!")
                         # Just fix the device id for now
@@ -1628,6 +1639,11 @@ def grpo_train(
                             leave_one_out_baseline=master_config.grpo[
                                 "use_leave_one_out_baseline"
                             ],
+                            std_rewards=(
+                                std_rewards.cuda(device_id)
+                                if std_rewards is not None
+                                else None
+                            ),
                         )
                         baseline = baseline.cpu()
                         std = std.cpu()
@@ -1639,6 +1655,7 @@ def grpo_train(
                             leave_one_out_baseline=master_config.grpo[
                                 "use_leave_one_out_baseline"
                             ],
+                            std_rewards=std_rewards,
                         )
 
                     # Apply dynamic sampling to filter prompts with non-zero std (DAPO algorithm)
