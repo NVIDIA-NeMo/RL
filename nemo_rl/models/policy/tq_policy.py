@@ -79,14 +79,21 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _aggregate_logprob_results(
-    results: list[BatchedDataDict[Any]],
-) -> BatchedDataDict[Any]:
+    results: list[Optional[BatchedDataDict[Any]]],
+) -> Optional[BatchedDataDict[Any]]:
+    # Workers may return None when the per-token tensor has been
+    # committed to TQ — driver reads via read_from_dataplane and skips
+    # the Ray plasma roundtrip. Aggregation is a no-op in that case.
+    if all(r is None for r in results):
+        return None
     return BatchedDataDict.from_batches(results, pad_value_dict={"logprobs": 0.0})
 
 
 def _aggregate_reference_logprob_results(
-    results: list[BatchedDataDict[Any]],
-) -> BatchedDataDict[Any]:
+    results: list[Optional[BatchedDataDict[Any]]],
+) -> Optional[BatchedDataDict[Any]]:
+    if all(r is None for r in results):
+        return None
     return BatchedDataDict.from_batches(
         results, pad_value_dict={"reference_logprobs": 0.0}
     )
@@ -317,7 +324,7 @@ class TQPolicy(Policy):
                 common_kwargs=common_kwargs,
             )
         result = aggregate_fn(self.worker_group.get_all_worker_results(futures))
-        if unsorted_indices is not None:
+        if result is not None and unsorted_indices is not None:
             result.reorder_data(unsorted_indices)
         return result
 
