@@ -480,7 +480,12 @@ class BaseVllmGenerationWorker:
             # Pass DP size/rank in args so vLLM skips the offline-SPMD env-var
             # path that sets data_parallel_rank_local and breaks the external-LB
             # handshake (`assert not handshake_local_only`).
-            if self.cfg["vllm_cfg"].get("async_engine", False):
+            use_async_engine = self.cfg["vllm_cfg"].get("async_engine", False)
+            if not use_async_engine and model_parallel_size == 1:
+                raise ValueError(
+                    "Nemo-RL does not support vLLM DP with tp_size * pp_size == 1 for sync vLLM engine; set vllm_cfg.async_engine to True to use vLLM DP."
+                )
+            if use_async_engine:
                 vllm_kwargs["data_parallel_size"] = int(os.environ["VLLM_DP_SIZE"])
                 vllm_kwargs["data_parallel_rank"] = int(os.environ["VLLM_DP_RANK"])
                 vllm_kwargs["data_parallel_external_lb"] = True
