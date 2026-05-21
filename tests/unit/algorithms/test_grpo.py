@@ -990,9 +990,7 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping():
 
     # Use prompt-only token_ids to identify groups, mirroring the grpo.py
     # call site.
-    input_ids = torch.stack(
-        [m[0]["token_ids"] for m in repeated_batch["message_log"]]
-    )
+    input_ids = torch.stack([m[0]["token_ids"] for m in repeated_batch["message_log"]])
     rewards = repeated_batch["total_reward"]
     baseline, raw_std = calculate_baseline_and_std_per_prompt(
         input_ids,
