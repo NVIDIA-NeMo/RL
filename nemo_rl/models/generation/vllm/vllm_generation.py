@@ -160,10 +160,6 @@ class VllmGeneration(GenerationInterface):
                 "[INFO] NCCL_NVLS_ENABLE is set to 0 for non-colocated inference with cross-node model parallelism."
                 "See https://github.com/NVIDIA-NeMo/RL/issues/1352 for more details."
             )
-        # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
-        # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
-        if self.ep_size > self.tp_size:
-            env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
