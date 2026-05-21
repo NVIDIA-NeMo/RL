@@ -104,6 +104,7 @@ def normalize_routed_experts_for_generation_output(
     valid_length: int,
     padded_length: int,
     device: torch.device,
+    require_complete_routed_experts: bool = False,
 ) -> Optional[torch.Tensor]:
     """Return full-sequence-aligned routed experts as ``[S, L, topk]`` int32."""
     routed = getattr(completion_output, "routed_experts", None)
@@ -127,6 +128,18 @@ def normalize_routed_experts_for_generation_output(
             f"got {tuple(routed.shape)}"
         )
 
+    expected_rows = min(max(valid_length - 1, 0), padded_length)
+    if require_complete_routed_experts and routed.shape[0] < expected_rows:
+        num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
+        raise ValueError(
+            "vLLM returned incomplete routed_experts for router replay: "
+            f"rows={routed.shape[0]}, expected_at_least={expected_rows}, "
+            f"valid_length={valid_length}, padded_length={padded_length}, "
+            f"num_cached_tokens={num_cached_tokens}. This usually means the "
+            "generation backend did not return routed experts for every "
+            "non-final token in the prompt+response sequence."
+        )
+
     default_route = torch.arange(
         routed.shape[2],
         dtype=torch.int32,
@@ -138,7 +151,7 @@ def normalize_routed_experts_for_generation_output(
         .clone()
     )
     full = full.to(dtype=torch.int32)
-    rows_to_copy = min(max(valid_length - 1, 0), routed.shape[0], padded_length)
+    rows_to_copy = min(expected_rows, routed.shape[0])
     if rows_to_copy > 0:
         full[:rows_to_copy] = routed[:rows_to_copy].to(device=device)
     return full

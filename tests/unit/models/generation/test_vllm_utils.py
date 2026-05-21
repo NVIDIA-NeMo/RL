@@ -222,6 +222,26 @@ def test_normalize_routed_experts_keeps_final_token_dummy_even_if_vllm_returns_r
     assert torch.equal(routed_experts[2:], expected_default_route.expand(1, 2, 3))
 
 
+def test_normalize_routed_experts_strict_mode_rejects_missing_rows():
+    class Output:
+        pass
+
+    request_output = Output()
+    request_output.num_cached_tokens = 4
+    completion_output = Output()
+    completion_output.routed_experts = torch.ones(2, 1, 2, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="incomplete routed_experts"):
+        normalize_routed_experts_for_generation_output(
+            request_output,
+            completion_output,
+            valid_length=6,
+            padded_length=6,
+            device=torch.device("cpu"),
+            require_complete_routed_experts=True,
+        )
+
+
 @pytest.mark.vllm
 def test_vllm_speculative_decoding_patch_removed():
     # The speculative decoding patch was fixed upstream in vLLM >= 0.14.0:

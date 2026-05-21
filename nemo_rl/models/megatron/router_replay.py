@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import os
-import warnings
 from collections.abc import Iterable
 from typing import Any, Optional
 
@@ -43,20 +42,6 @@ def configure_vllm_for_router_replay(config: PolicyConfig) -> None:
     vllm_kwargs = generation.setdefault("vllm_kwargs", {})
     vllm_kwargs["enable_return_routed_experts"] = True
 
-    vllm_cfg = generation.setdefault("vllm_cfg", {})
-    # vLLM returns routes by KV slot. Prefix-cached tokens are not forwarded
-    # for each request, so their route slots may be empty unless vLLM grows a
-    # route-aware prefix cache. Disable it for the correctness-first R3 path.
-    if vllm_cfg.get("enable_prefix_caching") is not False:
-        warnings.warn(
-            "router_replay.enabled=true disables vLLM prefix caching so routed "
-            "experts are captured for every prompt token. This can reduce "
-            "generation throughput for long prompts.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    vllm_cfg["enable_prefix_caching"] = False
-
 
 def validate_router_replay_config(config: PolicyConfig) -> None:
     if not router_replay_enabled(config):
@@ -69,12 +54,6 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
         raise ValueError("router_replay.enabled requires vLLM generation.")
     if not megatron_cfg.get("enabled", False):
         raise ValueError("router_replay.enabled requires the Megatron policy backend.")
-    if (generation.get("vllm_cfg") or {}).get("enable_prefix_caching") is not False:
-        raise ValueError(
-            "router_replay.enabled requires vLLM prefix caching to be disabled. "
-            "Set policy.generation.vllm_cfg.enable_prefix_caching=false so vLLM "
-            "forwards and captures routes for every prompt token."
-        )
 
     vpp_size = megatron_cfg.get("virtual_pipeline_model_parallel_size")
     if vpp_size not in (None, 1):

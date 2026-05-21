@@ -808,6 +808,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                 valid_length=response_length,
                 padded_length=total_length,
                 device=input_ids.device,
+                require_complete_routed_experts=return_routed_experts,
             )
             if return_routed_experts and full_routed_experts is None:
                 raise RuntimeError(

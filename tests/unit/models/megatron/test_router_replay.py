@@ -19,7 +19,7 @@ import torch
 
 
 @pytest.mark.mcore
-def test_configure_vllm_for_router_replay_disables_prefix_cache():
+def test_configure_vllm_for_router_replay_preserves_prefix_cache():
     from nemo_rl.models.megatron.router_replay import (
         configure_vllm_for_router_replay,
         validate_router_replay_config,
@@ -35,16 +35,15 @@ def test_configure_vllm_for_router_replay_disables_prefix_cache():
         "megatron_cfg": {"enabled": True},
     }
 
-    with pytest.warns(RuntimeWarning, match="disables vLLM prefix caching"):
-        configure_vllm_for_router_replay(config)
+    configure_vllm_for_router_replay(config)
 
     assert config["generation"]["vllm_kwargs"]["enable_return_routed_experts"] is True
-    assert config["generation"]["vllm_cfg"]["enable_prefix_caching"] is False
+    assert config["generation"]["vllm_cfg"]["enable_prefix_caching"] is True
     validate_router_replay_config(config)
 
 
 @pytest.mark.mcore
-def test_validate_router_replay_config_rejects_prefix_cache_default():
+def test_validate_router_replay_config_allows_prefix_cache_default():
     from nemo_rl.models.megatron.router_replay import validate_router_replay_config
 
     config = {
@@ -53,8 +52,7 @@ def test_validate_router_replay_config_rejects_prefix_cache_default():
         "megatron_cfg": {"enabled": True},
     }
 
-    with pytest.raises(ValueError, match="prefix caching"):
-        validate_router_replay_config(config)
+    validate_router_replay_config(config)
 
 
 @pytest.mark.mcore

@@ -905,6 +905,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 valid_length=unpadded_total_length,
                 padded_length=final_output_tensor_len,
                 device=original_input_ids_single_row.device,
+                require_complete_routed_experts=return_routed_experts,
             )
             if return_routed_experts and routed_experts is None:
                 raise RuntimeError(
