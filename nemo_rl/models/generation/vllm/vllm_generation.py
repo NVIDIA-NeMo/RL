@@ -732,10 +732,12 @@ class VllmGeneration(GenerationInterface):
                     if self.cfg["vllm_cfg"]["async_engine"]
                     else "reset_prefix_cache"
                 )
+                kwargs = {}
             # Use run_all_workers_single_data for methods that don't need data
             futures = self.worker_group.run_all_workers_single_data(
                 method_name,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                **kwargs,
             )
             # Wait for all futures to complete
             results = ray.get(futures)
