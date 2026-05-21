@@ -792,9 +792,9 @@ def setup(
         if backend == "megatron":
             # Non-colocated Megatron: use init_refit_collective with the
             # configured refit backend (gloo or nvshmem).
-            refit_backend = policy_config.get("megatron_cfg", {}).get(
-                "refit_backend", "gloo"
-            )
+            refit_backend = policy_config["generation"]["mcore_generation_config"][
+                "refit_backend"
+            ]
             futures_train = policy.init_refit_collective(
                 ip, port, world_size,
                 rank_offset=0,

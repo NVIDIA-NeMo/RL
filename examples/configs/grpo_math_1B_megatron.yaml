@@ -115,14 +115,10 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
-    #gives ~20% training perf speedup with sequence packing 
+    #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
-    moe_pad_experts_for_cuda_graph_inference: false
-    cuda_graph_impl: "local"
-    cuda_graph_scope: "full_iteration_inference"
     use_te_rng_tracker: true
     inference_rng_tracker: true
-    batch_invariant_mode: false
 
     peft:
       enabled: false
@@ -161,7 +157,6 @@ policy:
       clip_grad: ${policy.max_grad_norm}
 
     scheduler:
-      override_opt_param_scheduler: true
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
@@ -184,6 +179,8 @@ policy:
     top_p: 1.0
     top_k: null
     mcore_generation_config:
+      cuda_graph_impl: "local"
+      cuda_graph_scope: "full_iteration_inference"
       buffer_size_gb: 10  # Total buffer size is 2x this value (active requests + paused requests)
       num_cuda_graphs: 4  # Number of CUDA graphs to pre-compile for different batch sizes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
@@ -193,7 +190,7 @@ policy:
       enable_chunked_prefill: false
       kv_cache_management_mode: "persist" # Can be "persist", "offload", or "recompute"
       static_kv_memory_pointers: false # Relevant only for offload and recompute modes
-      materialize_only_last_token_logits: false
+      materialize_only_last_token_logits: true
       async_engine: false
 
     vllm_cfg:

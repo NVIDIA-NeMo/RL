@@ -7,24 +7,20 @@ grpo:
 
 policy:
   megatron_cfg:
-    distributed_data_parallel_config:
-      overlap_grad_reduce: false
-    converter_type: "LlamaForCausalLM"
-    cuda_graph_impl: "local"
-    cuda_graph_scope: "full_iteration"
     use_te_rng_tracker: true
     batch_invariant_mode: false
-    # Needed to set this to false because it causes "full" recompute_granularity
-    # which isn't compatible with "full_iteration_inference" CUDA graph scope.
-    activation_checkpointing: false
 
   generation:
     backend: "megatron"
 
     mcore_generation_config:
+      # Scoped to generation workers only; training keeps its own defaults
+      # via the base yaml. The mcore_generation_config block is merged into
+      # megatron_cfg for inference workers before model setup runs.
       transformer_impl: "inference_optimized"
+      cuda_graph_impl: "local"
       cuda_graph_scope: "full_iteration_inference"
-      moe_pad_experts_for_cuda_graph_inference: false
+      activation_checkpointing: false
       mamba_inference_ssm_states_dtype: "float32"
       inference_moe_token_dispatcher_type: "nccl"  # Fall back to NCCL for now
       inference_grouped_gemm_backend: "vllm"

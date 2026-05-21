@@ -41,6 +41,9 @@ class MegatronGenerationConfig(TypedDict):
     # Can cause OOM if set too high so should be tuned with buffer_size_gb if OOMing. If set too
     # low, then will only do 512 tokens at a time, which can be slow.
     max_tokens: int
+    # Copy-service backend used to transfer weights from training to inference
+    # workers via the refit collective. Options: "gloo" or "nvshmem".
+    refit_backend: str
 
 
 ## returned from validate_and_set_config
