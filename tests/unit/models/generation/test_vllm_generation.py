@@ -994,7 +994,15 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     vllm_precision,
     enable_lora,
 ):
-    pytest.skip("Skip for now")
+    if (
+        async_engine
+        and not cpu_offload
+        and vllm_precision == "bfloat16"
+        and not enable_lora
+        and "H100" in torch.cuda.get_device_name()
+    ):
+        pytest.skip("Skipping H100 timeout in async non-colocated BF16 vLLM collective init.")
+
     if vllm_precision == "fp8":
         pytest.skip(
             "Skipping FP8 test until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
