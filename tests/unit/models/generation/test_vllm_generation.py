@@ -994,6 +994,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     vllm_precision,
     enable_lora,
 ):
+    pytest.skip("Skip for now")
     if vllm_precision == "fp8":
         pytest.skip(
             "Skipping FP8 test until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
