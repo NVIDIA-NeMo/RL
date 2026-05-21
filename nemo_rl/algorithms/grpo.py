@@ -53,7 +53,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, VLMMessageLogType
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
@@ -1043,6 +1043,37 @@ def extract_initial_prompt_messages(
     return initial_prompt_message_logs
 
 
+def add_grpo_token_loss_masks_and_generation_logprobs(
+    message_logs: list[LLMMessageLogType | VLMMessageLogType],
+) -> None:
+    """Add GRPO loss masks and ensure generation logprobs exist in message logs.
+
+    Assistant messages can be part of the original multi-turn prompt history. Only
+    generated assistant messages have generation_logprobs, so use that field as the
+    trainable-token marker. This function mutates each message in-place by adding a
+    token_loss_mask and, when missing, a zero-valued generation_logprobs tensor.
+
+    Args:
+        message_logs: Batch of tokenized message logs. Each message must contain a
+            ``role`` and ``token_ids`` field. Messages that already contain
+            ``generation_logprobs`` are treated as rollout-generated messages.
+    """
+    for message_log in message_logs:
+        for message in message_log:
+            role = cast(str, message["role"])
+            token_ids = cast(torch.Tensor, message["token_ids"])
+
+            if role == "assistant" and "generation_logprobs" in message:
+                message["token_loss_mask"] = torch.ones_like(token_ids)
+            else:
+                message["token_loss_mask"] = torch.zeros_like(token_ids)
+
+            if "generation_logprobs" not in message:
+                message["generation_logprobs"] = torch.zeros_like(
+                    token_ids, dtype=torch.float32
+                )
+
+
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
@@ -1719,11 +1750,9 @@ def grpo_train(
                         repeated_batch["message_log"],
                         repeated_batch["length"],
                     )
-                    prompt_batched_flat, prompt_input_lengths = (
-                        batched_message_log_to_flat_message(
-                            initial_prompt_message_logs,
-                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        )
+                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                        initial_prompt_message_logs,
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
                     del initial_prompt_message_logs
@@ -1743,21 +1772,9 @@ def grpo_train(
 
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
-                    # Add loss mask to each message in LLMMessageLogType
-                    for i, message_log in enumerate(repeated_batch["message_log"]):
-                        for j, message in enumerate(message_log):
-                            if message["role"] == "assistant":
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
-                            if "generation_logprobs" not in message:
-                                message["generation_logprobs"] = torch.zeros_like(
-                                    message["token_ids"], dtype=torch.float32
-                                )
+                    add_grpo_token_loss_masks_and_generation_logprobs(
+                        repeated_batch["message_log"]
+                    )
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -2858,11 +2875,9 @@ def async_grpo_train(
                         repeated_batch["length"],
                     )
 
-                    prompt_batched_flat, prompt_input_lengths = (
-                        batched_message_log_to_flat_message(
-                            initial_prompt_message_logs,
-                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        )
+                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                        initial_prompt_message_logs,
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
                     del initial_prompt_message_logs
@@ -2876,21 +2891,9 @@ def async_grpo_train(
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
-                    # Add loss mask to each message
-                    for i, message_log in enumerate(repeated_batch["message_log"]):
-                        for j, message in enumerate(message_log):
-                            if message["role"] == "assistant":
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
-                            if "generation_logprobs" not in message:
-                                message["generation_logprobs"] = torch.zeros_like(
-                                    message["token_ids"], dtype=torch.float32
-                                )
+                    add_grpo_token_loss_masks_and_generation_logprobs(
+                        repeated_batch["message_log"]
+                    )
 
                     # Convert to flat format for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(

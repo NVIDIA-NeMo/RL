@@ -33,7 +33,11 @@ from nemo_rl.algorithms.async_utils import (
     ReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferNew
-from nemo_rl.algorithms.grpo import MasterConfig, extract_initial_prompt_messages
+from nemo_rl.algorithms.grpo import (
+    MasterConfig,
+    add_grpo_token_loss_masks_and_generation_logprobs,
+    extract_initial_prompt_messages,
+)
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
@@ -855,9 +859,21 @@ class TestPromptExtraction:
         # Create a multi-turn prompt with assistant messages in the history
         # Original prompt: user -> assistant -> user (3 messages, 15 tokens total)
         original_prompt_messages = [
-            {"role": "user", "content": "What is 2+2?", "token_ids": torch.tensor([1, 2, 3, 4, 5])},
-            {"role": "assistant", "content": "4", "token_ids": torch.tensor([6, 7, 8, 9, 10])},
-            {"role": "user", "content": "Now what is 3+3?", "token_ids": torch.tensor([11, 12, 13, 14, 15])},
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2, 3, 4, 5]),
+            },
+            {
+                "role": "assistant",
+                "content": "4",
+                "token_ids": torch.tensor([6, 7, 8, 9, 10]),
+            },
+            {
+                "role": "user",
+                "content": "Now what is 3+3?",
+                "token_ids": torch.tensor([11, 12, 13, 14, 15]),
+            },
         ]
 
         # Generated response (added after original prompt)
@@ -871,7 +887,9 @@ class TestPromptExtraction:
         full_message_log = original_prompt_messages + [generated_message]
 
         # Original prompt length = sum of token_ids in original prompt
-        original_prompt_length = sum(len(m["token_ids"]) for m in original_prompt_messages)  # 15
+        original_prompt_length = sum(
+            len(m["token_ids"]) for m in original_prompt_messages
+        )  # 15
 
         message_logs = [full_message_log]
         original_prompt_lengths = torch.tensor([original_prompt_length])
@@ -893,7 +911,11 @@ class TestPromptExtraction:
     def test_prompt_extraction_with_single_turn(self):
         """Test that prompt extraction works correctly for single-turn prompts (regression test)."""
         original_prompt_messages = [
-            {"role": "user", "content": "What is 2+2?", "token_ids": torch.tensor([1, 2, 3, 4, 5])},
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2, 3, 4, 5]),
+            },
         ]
 
         generated_message = {
@@ -903,7 +925,9 @@ class TestPromptExtraction:
         }
 
         full_message_log = original_prompt_messages + [generated_message]
-        original_prompt_length = sum(len(m["token_ids"]) for m in original_prompt_messages)
+        original_prompt_length = sum(
+            len(m["token_ids"]) for m in original_prompt_messages
+        )
 
         result = extract_initial_prompt_messages(
             [full_message_log], torch.tensor([original_prompt_length])
@@ -917,8 +941,16 @@ class TestPromptExtraction:
     def test_prompt_extraction_with_system_message(self):
         """Test prompt extraction with system message included."""
         original_prompt_messages = [
-            {"role": "system", "content": "You are a math tutor.", "token_ids": torch.tensor([1, 2, 3])},
-            {"role": "user", "content": "What is 2+2?", "token_ids": torch.tensor([4, 5, 6, 7])},
+            {
+                "role": "system",
+                "content": "You are a math tutor.",
+                "token_ids": torch.tensor([1, 2, 3]),
+            },
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([4, 5, 6, 7]),
+            },
         ]
 
         generated_message = {
@@ -928,7 +960,9 @@ class TestPromptExtraction:
         }
 
         full_message_log = original_prompt_messages + [generated_message]
-        original_prompt_length = sum(len(m["token_ids"]) for m in original_prompt_messages)
+        original_prompt_length = sum(
+            len(m["token_ids"]) for m in original_prompt_messages
+        )
 
         result = extract_initial_prompt_messages(
             [full_message_log], torch.tensor([original_prompt_length])
@@ -943,7 +977,11 @@ class TestPromptExtraction:
     def test_prompt_extraction_complex_multi_turn(self):
         """Test prompt extraction with complex multi-turn history (multiple assistant turns)."""
         original_prompt_messages = [
-            {"role": "system", "content": "Math tutor", "token_ids": torch.tensor([1, 2])},
+            {
+                "role": "system",
+                "content": "Math tutor",
+                "token_ids": torch.tensor([1, 2]),
+            },
             {"role": "user", "content": "2+2?", "token_ids": torch.tensor([3, 4])},
             {"role": "assistant", "content": "4", "token_ids": torch.tensor([5, 6])},
             {"role": "user", "content": "3+3?", "token_ids": torch.tensor([7, 8])},
@@ -958,7 +996,9 @@ class TestPromptExtraction:
         }
 
         full_message_log = original_prompt_messages + [generated_message]
-        original_prompt_length = sum(len(m["token_ids"]) for m in original_prompt_messages)
+        original_prompt_length = sum(
+            len(m["token_ids"]) for m in original_prompt_messages
+        )
 
         result = extract_initial_prompt_messages(
             [full_message_log], torch.tensor([original_prompt_length])
@@ -974,3 +1014,72 @@ class TestPromptExtraction:
         actual_roles = [m["role"] for m in initial_prompt_log]
         assert actual_roles == expected_roles
         assert generated_message not in initial_prompt_log
+
+    def test_grpo_loss_mask_excludes_assistant_prompt_history(self):
+        """Test that assistant messages in the original prompt are not trained on."""
+        original_prompt_messages = [
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "assistant",
+                "content": "4",
+                "token_ids": torch.tensor([3, 4]),
+            },
+            {
+                "role": "user",
+                "content": "Now what is 3+3?",
+                "token_ids": torch.tensor([5, 6]),
+            },
+        ]
+        generated_logprobs = torch.tensor([0.1, 0.2])
+        generated_message = {
+            "role": "assistant",
+            "content": "6",
+            "token_ids": torch.tensor([7, 8]),
+            "generation_logprobs": generated_logprobs,
+        }
+        full_message_log = original_prompt_messages + [generated_message]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([full_message_log])
+
+        assert torch.equal(full_message_log[0]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(full_message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(full_message_log[2]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(full_message_log[3]["token_loss_mask"], torch.tensor([1, 1]))
+        assert torch.equal(
+            full_message_log[3]["generation_logprobs"], generated_logprobs
+        )
+
+    def test_grpo_loss_mask_uses_generation_logprobs_marker(self):
+        """Test that only assistant messages with generation logprobs are trainable."""
+        message_log = [
+            {
+                "role": "assistant",
+                "content": "prompt history",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "user",
+                "content": "next question",
+                "token_ids": torch.tensor([3, 4]),
+                "generation_logprobs": torch.tensor([0.3, 0.4]),
+            },
+            {
+                "role": "assistant",
+                "content": "generated response",
+                "token_ids": torch.tensor([5, 6]),
+                "generation_logprobs": torch.tensor([0.5, 0.6]),
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        assert torch.equal(message_log[0]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(
+            message_log[0]["generation_logprobs"], torch.tensor([0.0, 0.0])
+        )
+        assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[2]["token_loss_mask"], torch.tensor([1, 1]))
