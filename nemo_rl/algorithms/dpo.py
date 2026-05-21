@@ -273,7 +273,7 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     loss_fn = DPOLossFn(
-        master_config.dpo.model_dump(),
+        master_config.dpo,
         use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
         and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"],
     )
