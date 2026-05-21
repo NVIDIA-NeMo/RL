@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,13 +34,10 @@ run_test() {
     fi
 }
 
-run_test fast uv run --no-sync bash ./tests/functional/audio_grpo_megatron.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_megatron.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_mbridge_restore.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_eagle3_online.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_lora.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_lora_async.sh
+run_test      uv run --no-sync bash ./tests/functional/distillation_megatron.sh
+run_test      uv run --no-sync bash ./tests/functional/qa_distillation_megatron.sh
+run_test      uv run --no-sync bash ./tests/functional/dpo_megatron.sh
+run_test      uv run --no-sync bash ./tests/functional/sft_megatron.sh
 
 cd ${PROJECT_ROOT}/tests
 coverage combine .coverage*

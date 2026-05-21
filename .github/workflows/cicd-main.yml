@@ -546,9 +546,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - script: L1_Functional_Tests_Megatron
+          - script: L1_Functional_Tests_Megatron_1
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Megatron_Other
+          - script: L1_Functional_Tests_Megatron_2
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_Megatron_3
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_AutoModel
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
@@ -606,9 +608,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - script: L1_Functional_Tests_Megatron
+          - script: L1_Functional_Tests_Megatron_1
             runner: nemo-ci-gcp-gpu-x2
-          - script: L1_Functional_Tests_Megatron_Other
+          - script: L1_Functional_Tests_Megatron_2
+            runner: nemo-ci-gcp-gpu-x2
+          - script: L1_Functional_Tests_Megatron_3
             runner: nemo-ci-gcp-gpu-x2
           - script: L1_Functional_Tests_AutoModel
             runner: nemo-ci-gcp-gpu-x2
@@ -668,9 +672,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - script: L1_Functional_Tests_Megatron
+          - script: L1_Functional_Tests_Megatron_1
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Megatron_Other
+          - script: L1_Functional_Tests_Megatron_2
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_Megatron_3
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_AutoModel
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
