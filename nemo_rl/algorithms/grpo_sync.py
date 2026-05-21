@@ -720,24 +720,23 @@ def grpo_train_sync(
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
                     # Meta-driven worker dispatch. Workers fetch their
-                    # slice from TQ; logprob result is also written back
-                    # to TQ as ``prev_logprobs`` /
-                    # ``reference_policy_logprobs`` columns under
-                    # ``meta.sample_ids`` AND returned to the driver via Ray
-                    # for the next compute.
-                    _prev_lp = policy.get_logprobs_from_meta(meta, timer=timer)
-                    prev_logprobs = _prev_lp["logprobs"]
-
+                    # slice from TQ and write ``prev_logprobs`` /
+                    # ``reference_policy_logprobs`` columns back to TQ
+                    # under ``meta.sample_ids``. The Ray return is
+                    # discarded — driver reads from TQ below in one
+                    # batched fetch to avoid double-shipping the per-token
+                    # tensor through Ray's plasma store on top of the TQ
+                    # writeback.
+                    policy.get_logprobs_from_meta(meta, timer=timer)
+                    _ref_select: list[str] = []
                     if not master_config.grpo.get(
                         "skip_reference_policy_logprobs_calculation"
                     ):
-                        _ref_lp = policy.get_reference_policy_logprobs_from_meta(
+                        policy.get_reference_policy_logprobs_from_meta(
                             meta,
                             timer=timer,
                         )
-                        reference_policy_logprobs = _ref_lp["reference_logprobs"]
-                    else:
-                        reference_policy_logprobs = None
+                        _ref_select.append("reference_policy_logprobs")
 
                     # Driver pulls only the per-token columns it needs
                     # for masking / advantage. Bulk (input_ids, multimodal,
@@ -745,11 +744,22 @@ def grpo_train_sync(
                     # TQ — workers will fetch it via ``train_presharded``.
                     extras_bdd = policy.read_from_dataplane(
                         meta,
-                        select_fields=["generation_logprobs", "token_mask"],
+                        select_fields=[
+                            "prev_logprobs",
+                            "generation_logprobs",
+                            "token_mask",
+                            *_ref_select,
+                        ],
                         pad_value_dict=_pad_dict,
                     )
+                    prev_logprobs = extras_bdd["prev_logprobs"]
                     generation_logprobs = extras_bdd["generation_logprobs"]
                     token_mask = extras_bdd["token_mask"]
+                    reference_policy_logprobs = (
+                        extras_bdd["reference_policy_logprobs"]
+                        if _ref_select
+                        else None
+                    )
 
                     # Thin BDD for the data-driven masking call: take
                     # the slice you need, transform, write delta back.
