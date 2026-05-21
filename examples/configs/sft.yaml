@@ -12,6 +12,9 @@ sft:
   val_at_start: true
   val_at_end: false
   seed: 42
+  # If true, only the final message in each conversation is unmasked for loss
+  # computation. If false, all assistant messages are unmasked.
+  only_unmask_final: false
 
 checkpointing:
   enabled: true
