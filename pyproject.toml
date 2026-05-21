@@ -136,6 +136,9 @@ mcore = [
   "emerging-optimizers==0.2.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
+  # Required by flash-linear-attention's gated_delta_rule chunk_bwd_dqkwg path on Hopper with Triton >= 3.4.0
+  # (see https://github.com/fla-org/flash-linear-attention/issues/640). Used by Megatron-Core's gated_delta_net.
+  "tilelang ; sys_platform == 'linux'",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
@@ -219,7 +222,7 @@ emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizer
 sglang = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "python" }
 sglang-kernel = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "sgl-kernel" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "905018803414702e414a86716484ed4115b37ba6" }
-nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "15a851565a4ce846c04431ecb0cf09903ab4837e" }
+nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d" }
 
 [tool.uv.workspace]
 members = [
@@ -503,7 +506,7 @@ name = "megatron-bridge"
 # Must stay in sync with 3rdparty/Megatron-Bridge-workspace/setup.py::CACHED_DEPENDENCIES.
 version = "0.0.0"
 requires-dist = [
-  "transformers>=5.0.0,<=5.3.0",
+  "transformers>=5.8.1,<5.9.0",
   "peft>=0.18.1",
   "datasets>=2.20.0",
   "accelerate",
@@ -525,17 +528,16 @@ requires-dist = [
   # megatron-core omitted here: it's a workspace member and already a direct dep of the mcore extra.
   # Non-workspace path deps cannot depend on workspace members (uv name-shadowing restriction).
   "qwen-vl-utils",
-  # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13
-  "transformer-engine[pytorch,core_cu13]",
-  "mamba-ssm",
   "nvidia-resiliency-ext",
-  "causal-conv1d",
   "flash-linear-attention",
   "timm",
   "open-clip-torch>=3.2.0",
   "mlflow>=3.9.0",
   "comet-ml>=3.50.0",
   "torch>=2.6.0",
+  "mistral-common>=1.10.0",
+  "flashinfer-cubin==0.6.8.post1",
+  "flashinfer-python==0.6.8.post1",
 ]
 
 # Override logsage metadata to remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
