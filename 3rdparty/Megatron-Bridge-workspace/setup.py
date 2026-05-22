@@ -61,24 +61,6 @@ CACHED_DEPENDENCIES = [
     "torch>=2.6.0",
 ]
 
-# The NeMo-RL container is still pinned to the dependency stack below, while the
-# bumped MBridge submodule has already moved to newer package metadata. The MoE
-# amax mapping change used by this branch is independent of those dependency
-# bumps, so keep the proxy package on NeMo-RL's known-good stack and fail only on
-# unexpected drift outside this explicit allowlist.
-ALLOWED_MISSING_IN_CACHED = {
-    "flashinfer-cubin==0.6.8.post1",
-    "flashinfer-python==0.6.8.post1",
-    "mistral-common>=1.10.0",
-    "transformers>=5.8.1,<5.9.0",
-}
-ALLOWED_EXTRA_IN_CACHED = {
-    "causal-conv1d",
-    "mamba-ssm",
-    "transformer-engine[pytorch,core_cu12]",
-    "transformers>=5.0.0,<=5.3.0",
-}
-
 # If the bridge source exists, compare cached dependencies with the submodule's pyproject
 if os.path.exists(bridge_src_dir):
     pyproject_path = os.path.join("Megatron-Bridge", "pyproject.toml")
@@ -106,38 +88,31 @@ if os.path.exists(bridge_src_dir):
     normalized_cached = set(_normalize_te_cuda(d) for d in CACHED_DEPENDENCIES)
     missing_in_cached = normalized_submodule - normalized_cached
     extra_in_cached = normalized_cached - normalized_submodule
-    unexpected_missing = missing_in_cached - ALLOWED_MISSING_IN_CACHED
-    unexpected_extra = extra_in_cached - ALLOWED_EXTRA_IN_CACHED
 
-    if unexpected_missing or unexpected_extra:
+    if missing_in_cached or extra_in_cached:
         print(
             "[megatron-bridge][setup] Dependency mismatch between Megatron-Bridge-workspace/Megatron-Bridge/pyproject.toml vs Megatron-Bridge-workspace/setup.py::CACHED_DEPENDENCIES.",
             file=sys.stderr,
         )
-        if unexpected_missing:
+        if missing_in_cached:
             print(
                 "  - Present in Megatron-Bridge/pyproject.toml but missing from CACHED_DEPENDENCIES:",
                 file=sys.stderr,
             )
-            for dep in sorted(unexpected_missing):
+            for dep in sorted(missing_in_cached):
                 print(f"    * {dep}", file=sys.stderr)
-        if unexpected_extra:
+        if extra_in_cached:
             print(
                 "  - Present in CACHED_DEPENDENCIES but not in Megatron-Bridge/pyproject.toml:",
                 file=sys.stderr,
             )
-            for dep in sorted(unexpected_extra):
+            for dep in sorted(extra_in_cached):
                 print(f"    * {dep}", file=sys.stderr)
         print(
             "  Please update CACHED_DEPENDENCIES or the submodule pyproject to keep them in sync.",
             file=sys.stderr,
         )
         sys.exit(1)
-    elif missing_in_cached or extra_in_cached:
-        print(
-            "[megatron-bridge][setup] Dependency sets are consistent modulo NeMo-RL compatibility overrides.",
-            file=sys.stderr,
-        )
     else:
         print(
             "[megatron-bridge][setup] Dependency sets are consistent with the submodule pyproject.",
