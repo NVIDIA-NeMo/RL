@@ -981,18 +981,29 @@ async def run_hf_train_process(
             lm_policy.shutdown()
 
 
-@pytest.mark.timeout(420)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        (True, False, "bfloat16", False),
-        (False, True, "bfloat16", False),
-        (True, False, "fp8", False),
-        (False, True, "fp8", False),
-        # LoRA tests (requires dtensor v2 / automodel)
-        pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
-        pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
+        pytest.param(True, False, "bfloat16", False, marks=pytest.mark.timeout(420)),
+        pytest.param(False, True, "bfloat16", False, marks=pytest.mark.timeout(420)),
+        pytest.param(True, False, "fp8", False, marks=pytest.mark.timeout(420)),
+        pytest.param(False, True, "fp8", False, marks=pytest.mark.timeout(420)),
+        # LoRA tests require dtensor v2 / automodel and take longer in CI.
+        pytest.param(
+            False,
+            False,
+            "bfloat16",
+            True,
+            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
+        ),
+        pytest.param(
+            True,
+            False,
+            "bfloat16",
+            True,
+            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
+        ),
     ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
@@ -1051,20 +1062,31 @@ async def test_vllm_generation_with_hf_training_colocated(
     )
 
 
-@pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        (True, False, "bfloat16", False),
-        (False, True, "bfloat16", False),
+        pytest.param(True, False, "bfloat16", False, marks=pytest.mark.timeout(900)),
+        pytest.param(False, True, "bfloat16", False, marks=pytest.mark.timeout(300)),
         # NOTE: non-colocated FP8 tests fail on main as of 3/9/2026 with
         # avg_prob_mult_error=1.13 > 1.08 threshold. Left unskipped to match main.
-        (True, False, "fp8", False),
-        (False, True, "fp8", False),
-        # LoRA tests (requires dtensor v2 / automodel)
-        pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
-        pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
+        pytest.param(True, False, "fp8", False, marks=pytest.mark.timeout(300)),
+        pytest.param(False, True, "fp8", False, marks=pytest.mark.timeout(300)),
+        # LoRA tests require dtensor v2 / automodel and take longer in CI.
+        pytest.param(
+            False,
+            False,
+            "bfloat16",
+            True,
+            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
+        ),
+        pytest.param(
+            True,
+            False,
+            "bfloat16",
+            True,
+            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
+        ),
     ],
 )
 async def test_vllm_generation_with_hf_training_non_colocated(
@@ -1075,17 +1097,6 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     vllm_precision,
     enable_lora,
 ):
-    if (
-        async_engine
-        and not cpu_offload
-        and vllm_precision == "bfloat16"
-        and not enable_lora
-        and "H100" in torch.cuda.get_device_name()
-    ):
-        pytest.skip(
-            "Skipping H100 timeout in async non-colocated BF16 vLLM collective init."
-        )
-
     if vllm_precision == "fp8":
         pytest.skip(
             "Skipping FP8 test until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
