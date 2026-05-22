@@ -322,7 +322,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         Controlled by vllm_metrics_logger_interval (default: 0.5) in vllm_cfg.
         Runs only on the model-owner actor.
         """
-        from vllm.v1.metrics.reader import Gauge, Counter, get_metrics_snapshot
+        from vllm.v1.metrics.reader import Gauge, Counter, Histogram, get_metrics_snapshot
 
         assert self.cfg["vllm_cfg"].get("async_engine", False), (
             "vLLM metrics logger is only supported with async engine enabled"
@@ -347,6 +347,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self.num_pending_samples: list[int] = []
         self.kv_cache_usage_perc: list[float] = []
         self.generation_tokens: list[int] = []
+        self.prompt_tokens: list[int] = []
+        self.request_prefill_time_sum: list[float] = []
+        self.request_prefill_time_count: list[int] = []
+        self.request_decode_time_sum: list[float] = []
+        self.request_decode_time_count: list[int] = []
 
         def _logger_loop():
             # Delay a little to let engine settle
@@ -368,6 +373,15 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                             elif isinstance(m, Counter):
                                 if m.name == "vllm:generation_tokens":
                                     self.generation_tokens.append(int(m.value))
+                                elif m.name == "vllm:prompt_tokens":
+                                    self.prompt_tokens.append(int(m.value))
+                            elif isinstance(m, Histogram):
+                                if m.name == "vllm:request_prefill_time_seconds":
+                                    self.request_prefill_time_sum.append(float(m.sum))
+                                    self.request_prefill_time_count.append(int(m.count))
+                                elif m.name == "vllm:request_decode_time_seconds":
+                                    self.request_decode_time_sum.append(float(m.sum))
+                                    self.request_decode_time_count.append(int(m.count))
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
@@ -396,6 +410,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 "num_pending_samples": copy.deepcopy(self.num_pending_samples),
                 "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
                 "generation_tokens": copy.deepcopy(self.generation_tokens),
+                "prompt_tokens": copy.deepcopy(self.prompt_tokens),
+                "request_prefill_time_sum": copy.deepcopy(self.request_prefill_time_sum),
+                "request_prefill_time_count": copy.deepcopy(self.request_prefill_time_count),
+                "request_decode_time_sum": copy.deepcopy(self.request_decode_time_sum),
+                "request_decode_time_count": copy.deepcopy(self.request_decode_time_count),
             }
         return metric
 
@@ -408,6 +427,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             self.num_pending_samples = []
             self.kv_cache_usage_perc = []
             self.generation_tokens = []
+            self.prompt_tokens = []
+            self.request_prefill_time_sum = []
+            self.request_prefill_time_count = []
+            self.request_decode_time_sum = []
+            self.request_decode_time_count = []
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()

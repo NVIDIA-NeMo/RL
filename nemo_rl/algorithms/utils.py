@@ -563,6 +563,51 @@ def print_performance_metrics(
                     None,
                 )
 
+        # Prefill / Decode breakdown derived from vLLM Prometheus snapshots
+        # Counter samples are cumulative since engine start, so per-step delta
+        # equals (last sample - first sample) within the cleared window.
+        def _delta_int(d):
+            total = 0
+            for v in d.values():
+                if len(v) >= 2:
+                    total += int(v[-1]) - int(v[0])
+            return total
+
+        def _delta_float(d):
+            total = 0.0
+            for v in d.values():
+                if len(v) >= 2:
+                    total += float(v[-1]) - float(v[0])
+            return total
+
+        prompt_tokens_step = _delta_int(vllm_logger_metrics.get("prompt_tokens", {}))
+        gen_tokens_step = _delta_int(vllm_logger_metrics.get("generation_tokens", {}))
+        prefill_t_step = _delta_float(vllm_logger_metrics.get("request_prefill_time_sum", {}))
+        prefill_c_step = _delta_int(vllm_logger_metrics.get("request_prefill_time_count", {}))
+        decode_t_step = _delta_float(vllm_logger_metrics.get("request_decode_time_sum", {}))
+        decode_c_step = _delta_int(vllm_logger_metrics.get("request_decode_time_count", {}))
+
+        if prompt_tokens_step or gen_tokens_step or prefill_c_step or decode_c_step:
+            print("  • Prefill/Decode Breakdown (delta over step, summed across DP groups):")
+            print(f"    - Prompt tokens (prefill):     {prompt_tokens_step:,}")
+            print(f"    - Generation tokens (decode):  {gen_tokens_step:,}")
+            if prefill_c_step > 0:
+                avg_pf = prefill_t_step / prefill_c_step
+                print(
+                    f"    - Prefill:  {prefill_c_step} reqs, sum {prefill_t_step:.2f}s, avg {avg_pf:.3f}s/req"
+                )
+            if decode_c_step > 0:
+                avg_dec = decode_t_step / decode_c_step
+                print(
+                    f"    - Decode:   {decode_c_step} reqs, sum {decode_t_step:.2f}s, avg {avg_dec:.3f}s/req"
+                )
+            total_pd = prefill_t_step + decode_t_step
+            if total_pd > 0:
+                ratio = prefill_t_step / total_pd * 100.0
+                print(
+                    f"    - Prefill share of (prefill+decode) wall time: {ratio:.1f}%"
+                )
+
     # =====================================================
     # Throughputs
     # =====================================================

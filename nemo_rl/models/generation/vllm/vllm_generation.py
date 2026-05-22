@@ -958,6 +958,11 @@ class VllmGeneration(GenerationInterface):
             "num_pending_samples": {},  # dp_idx -> list[int]
             "kv_cache_usage_perc": {},  # dp_idx -> list[float]
             "generation_tokens": {},  # dp_idx -> list[int]
+            "prompt_tokens": {},  # dp_idx -> list[int]
+            "request_prefill_time_sum": {},  # dp_idx -> list[float]
+            "request_prefill_time_count": {},  # dp_idx -> list[int]
+            "request_decode_time_sum": {},  # dp_idx -> list[float]
+            "request_decode_time_count": {},  # dp_idx -> list[int]
         }
 
         for dp_idx, stats in zip(dp_indices, results):
@@ -977,6 +982,16 @@ class VllmGeneration(GenerationInterface):
             generation_tokens = stats.get("generation_tokens")
             if generation_tokens:
                 vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
+            for k in (
+                "prompt_tokens",
+                "request_prefill_time_sum",
+                "request_prefill_time_count",
+                "request_decode_time_sum",
+                "request_decode_time_count",
+            ):
+                v = stats.get(k)
+                if v:
+                    vllm_logger_metrics[k][dp_idx] = v
 
         return vllm_logger_metrics
 
