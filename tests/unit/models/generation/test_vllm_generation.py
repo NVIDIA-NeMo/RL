@@ -148,9 +148,9 @@ basic_lora_test_config: LoRAConfig = {
 
 def skip_fp8_if_unsupported() -> None:
     device_name = torch.cuda.get_device_name()
-    if "GB200" in device_name:
+    if any(gpu_name in device_name for gpu_name in ("H100", "GB200")):
         pytest.skip(
-            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
+            f"Skipping FP8 test on {device_name} until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
         )
 
     major_capability, _ = torch.cuda.get_device_capability()
