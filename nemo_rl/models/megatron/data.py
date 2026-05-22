@@ -509,6 +509,8 @@ def _pack_sequences_for_megatron(
     if cu_seqlens_padded is None:
         cu_seqlens_padded = cu_seqlens.clone()
 
+    # total_tokens is required for PackedSeqParams.__post_init__ to build
+    # seq_idx, which Mamba uses to reset SSM state at sample boundaries.
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens_padded,
         cu_seqlens_kv=cu_seqlens_padded,
@@ -517,6 +519,7 @@ def _pack_sequences_for_megatron(
         max_seqlen_q=int(max_seqlen),
         max_seqlen_kv=int(max_seqlen),
         qkv_format="thd",
+        total_tokens=packed_input_ids.shape[1],
     )
 
     return (
