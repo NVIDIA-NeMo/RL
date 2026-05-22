@@ -755,9 +755,7 @@ def grpo_train_sync(
                     generation_logprobs = extras_bdd["generation_logprobs"]
                     token_mask = extras_bdd["token_mask"]
                     reference_policy_logprobs = (
-                        extras_bdd["reference_policy_logprobs"]
-                        if compute_ref
-                        else None
+                        extras_bdd["reference_policy_logprobs"] if compute_ref else None
                     )
 
                     # Thin BDD for the data-driven masking call: take

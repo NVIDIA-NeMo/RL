@@ -47,10 +47,6 @@ from nemo_rl.data_plane.schema import (
     LP_SEED_FIELDS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.policy.interfaces import (
-    LogprobOutputSpec,
-    ReferenceLogprobOutputSpec,
-)
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
