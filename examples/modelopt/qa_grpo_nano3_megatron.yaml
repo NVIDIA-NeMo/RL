@@ -1,0 +1,40 @@
+# Nano3 Quantization-Aware RL (QARL) with Megatron, vLLM, and ModelOpt.
+#
+# This config layers Nano3 NVFP4 weight-only quantization onto the existing
+# Nano3 Megatron GRPO recipe. The base recipe keeps LoRA enabled to make the
+# Nano3 example fit a 2-node / 16-GPU run shape.
+#
+# Example usage:
+#   uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_nano3_megatron.yaml
+
+defaults: "../configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml"
+
+policy:
+  # Nano3 is a hybrid MoE/Mamba model. This recipe keeps attention and the
+  # known Nano3-sensitive layers in BF16, while applying NVFP4 to weights.
+  quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml"
+  quant_calib_data: "cnn_dailymail"
+  quant_calib_size: 512
+  quant_batch_size: 1
+  quant_sequence_length: 2048
+
+  megatron_cfg:
+    # ModelOpt quantization is incompatible with gradient accumulation fusion.
+    gradient_accumulation_fusion: false
+
+  generation:
+    # Match the student's quantization recipe during vLLM rollouts.
+    quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml"
+    vllm_kwargs:
+      # Nano3 Mamba cache is numerically safer in FP32 during generation.
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        backend: "eager"
+
+checkpointing:
+  checkpoint_dir: "results/qa_grpo_nano3_megatron"
+
+logger:
+  log_dir: "logs/qa_grpo_nano3_megatron"
+  wandb:
+    name: "qa-grpo-nano3-megatron"
