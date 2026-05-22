@@ -1,0 +1,142 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: Build container
+
+on:
+  workflow_call:
+    inputs:
+      build-ref:
+        required: false
+        default: ${{ github.sha }}
+        description: Ref, branch, or SHA to build.
+        type: string
+      image-name:
+        required: true
+        description: Name of the image to build and push.
+        type: string
+      build-args:
+        required: false
+        default: ""
+        description: Additional Docker build args.
+        type: string
+      build-contexts:
+        required: false
+        default: ""
+        description: Additional Docker build contexts.
+        type: string
+      dockerfile:
+        required: true
+        description: Path to the Dockerfile.
+        type: string
+      platform:
+        required: true
+        description: Docker build platform.
+        type: string
+      runner:
+        required: true
+        description: Runner to use for the build.
+        type: string
+      registry:
+        required: true
+        description: Container registry to push to.
+        type: string
+      target:
+        required: false
+        default: ""
+        description: Dockerfile stage to build.
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash -x -e -u -o pipefail {0}
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    env:
+      REGISTRY: ${{ inputs.registry }}
+      IMAGE_NAME: ${{ inputs.image-name }}
+      GH_REF: ${{ github.ref }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.build-ref }}
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute build metadata
+        id: build_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PR_NUMBER=""
+          if [[ "$GH_REF" =~ refs/heads/pull-request/([0-9]+) ]]; then
+            PR_NUMBER="${BASH_REMATCH[1]}"
+          fi
+
+          TAGS=("$REGISTRY/$IMAGE_NAME:$RUN_ID")
+          if [[ "$GH_REF" == "refs/heads/main" ]]; then
+            CACHE_KEY="main"
+            TAGS+=("$REGISTRY/$IMAGE_NAME:main")
+          elif [[ -n "$PR_NUMBER" ]]; then
+            CACHE_KEY="$PR_NUMBER"
+            TAGS+=("$REGISTRY/$IMAGE_NAME:$PR_NUMBER")
+          else
+            CACHE_KEY=$(printf '%s' "${GITHUB_REF_NAME:-$RUN_ID}" | tr '/' '-' | tr -cd '[:alnum:]._-')
+            if [[ -z "$CACHE_KEY" ]]; then
+              CACHE_KEY="$RUN_ID"
+            fi
+          fi
+
+          CACHE_FROM=(
+            "type=registry,ref=$REGISTRY/$IMAGE_NAME:main-buildcache"
+          )
+          if [[ "$CACHE_KEY" != "main" ]]; then
+            CACHE_FROM+=("type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_KEY-buildcache")
+          fi
+
+          {
+            echo "tags<<EOF"
+            printf '%s\n' "${TAGS[@]}"
+            echo "EOF"
+            echo "cache-from<<EOF"
+            printf '%s\n' "${CACHE_FROM[@]}"
+            echo "EOF"
+            echo "cache-to=type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_KEY-buildcache,mode=max"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          file: ${{ inputs.dockerfile }}
+          push: true
+          context: .
+          platforms: ${{ inputs.platform }}
+          build-contexts: ${{ inputs.build-contexts }}
+          build-args: ${{ inputs.build-args }}
+          cache-from: |
+            ${{ steps.build_meta.outputs.cache-from }}
+          cache-to: ${{ steps.build_meta.outputs.cache-to }}
+          no-cache: false
+          tags: |
+            ${{ steps.build_meta.outputs.tags }}
+          target: ${{ inputs.target }}

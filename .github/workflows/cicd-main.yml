@@ -351,19 +351,19 @@ jobs:
         !cancelled()
       }}
     needs: [pre-flight, org-member-pre-flight, cicd-wait-in-queue]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.78.0
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_build_container.yml
     with:
       build-ref: ${{ needs.pre-flight.outputs.test_sha }}
       image-name: ${{ vars.CI_CONTAINER_NAME }}
       dockerfile: docker/Dockerfile
-      runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-      image-label: ${{ vars.CI_CONTAINER_NAME }}
-      target: release
+      platform: linux/amd64
       registry: ${{ needs.org-member-pre-flight.outputs.registry }}
-      use-inline-cache: false
-      enable-pull-cache: false
+      runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+      target: release
       build-contexts: |
-        nemo-rl=${{ github.run_id }}/
+        nemo-rl=.
         ${{ (vars.UV_BUILD_CACHE == 'true' && needs.pre-flight.outputs.skip_sglang != 'true' && needs.org-member-pre-flight.outputs.is_member == 'true') && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       build-args: |
         MAX_JOBS=4
@@ -389,19 +389,19 @@ jobs:
         !cancelled()
       }}
     needs: [pre-flight, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.78.0
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_build_container.yml
     with:
       build-ref: ${{ needs.pre-flight.outputs.test_sha }}
       image-name: ${{ vars.CI_CONTAINER_NAME }}
       dockerfile: docker/Dockerfile
-      runner: ${{ vars.GB200_RUNNER }}
-      image-label: ${{ vars.CI_CONTAINER_NAME }}
-      target: release
+      platform: linux/arm64
       registry: ${{ needs.gb200-config.outputs.registry }}
-      use-inline-cache: false
-      enable-pull-cache: false
+      runner: ${{ vars.GB200_RUNNER }}
+      target: release
       build-contexts: |
-        nemo-rl=${{ github.run_id }}/
+        nemo-rl=.
         ${{ (vars.UV_BUILD_CACHE == 'true' && needs.pre-flight.outputs.skip_sglang != 'true' && needs.org-member-pre-flight.outputs.is_member == 'true') && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.gb200-config.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       build-args: |
         MAX_JOBS=4
