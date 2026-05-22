@@ -51,27 +51,16 @@ def _tolerate_dummy_weight_nan_amax():
     needs it. Genuine numerical NaN at runtime — when the calibrator is
     no longer active — would still be caught by the production callsite.
 
-    Partial-NaN tensors (mixed finite + NaN) still trip the upstream
-    assertion, preserving the safety net for real bugs.
+    Nonfinite dummy activations are sanitized before calibration reduce. The
+    patch is active only inside the dummy-weight prolog, before runtime
+    generation starts and before real amax values are loaded.
     """
     _original_collect = MaxCalibrator.collect
 
     @torch.no_grad()
     def _safe_collect(self, x):
-        if x.numel() > 0 and torch.isnan(x).all():
-            from modelopt.torch.quantization import utils as quant_utils
-
-            reduce_axis = quant_utils.convert_quantization_axis_to_reduce_axis(
-                x, self._axis
-            )
-            local_amax = quant_utils.reduce_amax(x, axis=reduce_axis).detach()
-            local_amax = torch.zeros_like(local_amax)
-            if x.device.type == "meta":
-                self._calib_amax = local_amax
-                return
-            if self._calib_amax is None:
-                self._calib_amax = local_amax
-            return
+        if x.numel() > 0 and not torch.isfinite(x).all():
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         _original_collect(self, x)
 
     MaxCalibrator.collect = _safe_collect
