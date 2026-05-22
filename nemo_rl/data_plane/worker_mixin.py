@@ -352,20 +352,38 @@ class TQWorkerMixin:
         leader = torch.distributed.get_global_rank(replica_group, 0)
         return torch.distributed.get_rank() == leader
 
+    # ── Single source of truth for TQ-side rank gating ────────────────
+    # ``_sharding_coords`` is pushed into the actor by
+    # :meth:`RayWorkerGroup._create_workers_from_bundle_indices` right
+    # after construction, using ``sharding_annotations.get_worker_coords``.
+    # Workers no longer re-derive (tp, cp, pp) coords from
+    # torch.distributed / device_mesh / parallel_state — the dispatcher
+    # already knows them.
+    _sharding_coords: Optional[dict[str, int]] = None
+
+    def set_sharding_coords(self, coords: dict[str, int]) -> None:
+        """Driver-side hook: install this worker's (axis -> coord) mapping.
+
+        Called once per actor by the worker-group constructor. Idempotent.
+        """
+        self._sharding_coords = dict(coords)
+
     def _is_writeback_leader(self) -> bool:
         """True iff this rank is the TP×CP×PP leader for write-back to TQ.
 
-        Distinct from :meth:`_is_replica_leader` because that one piggybacks
-        on :meth:`_get_replica_group`, which subclasses gate on ``CP > 1``
-        (a fetch-path optimization). Under TP-only configs (e.g. TP=2,
-        CP=1) the replica group is ``None`` → every rank passes the
-        leader check → every TP rank writes the same keys, which crashes
-        the mooncake_cpu backend with ``-601 ILLEGAL_CLIENT`` (concurrent
-        UpsertStart from different Mooncake clients on the same key).
-        Subclasses with TP/CP/PP siblings must override to gate on the
-        true (TP, CP, PP) coordinates regardless of CP.
+        Reads from ``_sharding_coords`` (pushed by the dispatcher), so
+        the answer matches Ray's own ``output_is_replicated`` semantics
+        and never disagrees with the dispatch-side view of leadership.
+        Untopologized workers (no coords pushed) default to True for
+        the trivial single-worker case.
         """
-        return self._is_replica_leader()
+        coords = self._sharding_coords
+        if coords is None:
+            return True
+        return all(
+            coords.get(ax, 0) == 0
+            for ax in ("tensor_parallel", "context_parallel", "pipeline_parallel")
+        )
 
     def _write_back(
         self,
