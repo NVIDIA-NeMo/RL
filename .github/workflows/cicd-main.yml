@@ -353,6 +353,7 @@ jobs:
     needs: [pre-flight, org-member-pre-flight, cicd-wait-in-queue]
     permissions:
       contents: read
+      pull-requests: read
     uses: ./.github/workflows/_build_container.yml
     with:
       build-ref: ${{ needs.pre-flight.outputs.test_sha }}
@@ -391,6 +392,7 @@ jobs:
     needs: [pre-flight, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
     permissions:
       contents: read
+      pull-requests: read
     uses: ./.github/workflows/_build_container.yml
     with:
       build-ref: ${{ needs.pre-flight.outputs.test_sha }}

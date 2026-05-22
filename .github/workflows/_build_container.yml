@@ -59,6 +59,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 defaults:
   run:
@@ -81,6 +82,34 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Get recently merged PR cache refs
+        id: recent_pr_cache_refs
+        uses: actions/github-script@v8
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+        with:
+          script: |
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
+            const result = await github.graphql(`
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                    nodes {
+                      number
+                    }
+                  }
+                }
+              }
+            `, { owner, repo });
+
+            const refs = result.repository.pullRequests.nodes
+              .map(({ number }) => `type=registry,ref=${process.env.REGISTRY}/${process.env.IMAGE_NAME}:${number}-buildcache,mode=max`)
+              .join("\n");
+
+            core.setOutput("cache-from", refs);
+            core.info(`Found ${result.repository.pullRequests.nodes.length} recently merged PR cache refs.`);
 
       - name: Compute build metadata
         id: build_meta
@@ -108,10 +137,10 @@ jobs:
           fi
 
           CACHE_FROM=(
-            "type=registry,ref=$REGISTRY/$IMAGE_NAME:main-buildcache"
+            "type=registry,ref=$REGISTRY/$IMAGE_NAME:main-buildcache,mode=max"
           )
           if [[ "$CACHE_KEY" != "main" ]]; then
-            CACHE_FROM+=("type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_KEY-buildcache")
+            CACHE_FROM+=("type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_KEY-buildcache,mode=max")
           fi
 
           {
@@ -135,6 +164,7 @@ jobs:
           build-args: ${{ inputs.build-args }}
           cache-from: |
             ${{ steps.build_meta.outputs.cache-from }}
+            ${{ steps.recent_pr_cache_refs.outputs.cache-from }}
           cache-to: ${{ steps.build_meta.outputs.cache-to }}
           no-cache: false
           tags: |
