@@ -361,6 +361,7 @@ jobs:
       target: release
       registry: ${{ needs.org-member-pre-flight.outputs.registry }}
       use-inline-cache: false
+      enable-pull-cache: false
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
         ${{ (vars.UV_BUILD_CACHE == 'true' && needs.pre-flight.outputs.skip_sglang != 'true' && needs.org-member-pre-flight.outputs.is_member == 'true') && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
@@ -398,6 +399,7 @@ jobs:
       target: release
       registry: ${{ needs.gb200-config.outputs.registry }}
       use-inline-cache: false
+      enable-pull-cache: false
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
         ${{ (vars.UV_BUILD_CACHE == 'true' && needs.pre-flight.outputs.skip_sglang != 'true' && needs.org-member-pre-flight.outputs.is_member == 'true') && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.gb200-config.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
