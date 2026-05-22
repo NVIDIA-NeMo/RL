@@ -29,11 +29,11 @@ from tensordict import TensorDict
 
 transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
-from tensordict import NonTensorStack
-
 from nemo_rl.data_plane import build_data_plane_client
-from nemo_rl.data_plane.column_io import read_columns
+from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 from ._rollout_shapes import mooncake_available
 
@@ -243,9 +243,10 @@ def test_object_round_trip_backends(tq_client_backends) -> None:
 
     Mirrors the wire used by ``SyncRolloutActor.kv_first_write`` for
     ``message_log`` / ``content``: object fields ride as
-    ``NonTensorStack`` leaves (TQ-native non-tensor passthrough);
-    :func:`read_columns` → :func:`materialize` decodes them back to
-    ``np.ndarray(dtype=object)``.
+    ``np.ndarray(dtype=object)`` (matching ``sync_rollout_actor.py``
+    line 273 / 292); the TensorDict constructor wraps them as
+    ``NonTensorData`` internally. :func:`read_columns` →
+    :func:`materialize` decodes them back to ``np.ndarray(dtype=object)``.
     """
     client = tq_client_backends
     n = 8
@@ -262,7 +263,7 @@ def test_object_round_trip_backends(tq_client_backends) -> None:
         sample_ids=keys,
         partition_id="obj-backend",
         fields=TensorDict(
-            {field_name: NonTensorStack(*_object_payload(n).tolist())},
+            {field_name: _object_payload(n)},
             batch_size=[n],
         ),
     )
@@ -288,61 +289,117 @@ def test_object_round_trip_backends(tq_client_backends) -> None:
 
 
 def test_object_and_tensor_mixed_round_trip_backends(tq_client_backends) -> None:
-    """Mixed tensor + object fields in one put — exercises the actor's
-    real schema (tensors + object data side-by-side).
+    """End-to-end mirror of ``SyncRolloutActor.kv_first_write``.
 
-    Regression guard: object writes coexisting with tensor writes must
-    not corrupt either side. Co-fetch decodes the tensor via padding
-    and the ``NonTensorStack`` leaf via :func:`materialize` in one call.
+    Pins the production e2e GRPO pipeline shape on both backends:
+
+    * ``register_partition`` declares ``DP_TRAIN_FIELDS`` (tensor-only),
+      matching :meth:`TQPolicy.prepare_step`.
+    * ``bulk_batch`` includes 1D + 2D tensors **and** an
+      ``np.ndarray(dtype=object)`` (``content``) — the shape built by
+      ``sync_rollout_actor.py`` lines 257–273.
+    * ``kv_first_write`` does the put through :func:`pack_jagged_fields`.
+    * ``read_columns`` fetches a mixed tensor + object subset, the same
+      pattern used by ``grpo_sync.py`` lines 887–896.
+
+    Regression guard for the data-plane wire round-trip end-to-end.
     """
     client = tq_client_backends
     n = 6
-    keys = [f"mx_{i}" for i in range(n)]
+    seq_len = 4
+    sample_ids = [f"sample_{i}" for i in range(n)]
+    partition_id = "mix-e2e"
 
+    # Tensor-only schema — matches `TQPolicy.prepare_step`.
     client.register_partition(
-        partition_id="mix-backend",
-        fields=["ids", "lens", "msg"],
+        partition_id=partition_id,
+        fields=list(DP_TRAIN_FIELDS),
         num_samples=n,
         consumer_tasks=["read"],
     )
-    ids = torch.arange(n * 4, dtype=torch.long).reshape(n, 4)
-    lens = torch.full((n,), 4, dtype=torch.long)
-    msg = NonTensorStack(*_object_payload(n).tolist())
 
-    client.put_samples(
-        sample_ids=keys,
-        partition_id="mix-backend",
-        fields=TensorDict(
-            {"ids": ids, "lens": lens, "msg": msg},
-            batch_size=[n],
-        ),
+    # Production-shape `bulk_batch`: tensors + np.ndarray(dtype=object).
+    input_ids = torch.arange(n * seq_len, dtype=torch.long).reshape(n, seq_len)
+    input_lengths = torch.full((n,), seq_len, dtype=torch.long)
+    generation_logprobs = torch.zeros(n, seq_len, dtype=torch.float)
+    token_mask = torch.ones(n, seq_len, dtype=torch.float)
+    sample_mask = torch.ones(n, dtype=torch.float)
+    content = _object_payload(n)
+
+    bulk_batch = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "generation_logprobs": generation_logprobs,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "content": content,
+        }
     )
 
-    meta = KVBatchMeta(
-        partition_id="mix-backend",
+    # Production write path.
+    meta = kv_first_write(
+        bulk_batch,
+        sample_ids=sample_ids,
+        dp_client=client,
+        partition_id=partition_id,
         task_name="read",
-        sample_ids=keys,
-        fields=["ids", "lens", "msg"],
-        sequence_lengths=[4] * n,
     )
 
-    # Read all three together — tensor fields decode via padding,
-    # object field decodes via NonTensorStack passthrough.
-    bdd = read_columns(client, meta, select_fields=["ids", "lens", "msg"])
-    assert torch.equal(bdd["ids"], ids)
-    assert torch.equal(bdd["lens"], lens)
+    # Production read path — mixed tensor + object subset.
+    bdd = read_columns(
+        client, meta, select_fields=["input_ids", "input_lengths", "content"]
+    )
+    assert torch.equal(bdd["input_ids"], input_ids)
+    assert torch.equal(bdd["input_lengths"], input_lengths)
     expected = _object_payload(n)
     for i in range(n):
-        assert bdd["msg"][i] == expected[i]
+        assert bdd["content"][i] == expected[i], (
+            f"row {i} content mismatch: got {bdd['content'][i]!r}, "
+            f"expected {expected[i]!r}"
+        )
 
-    # Read just the tensor.
-    only_ids = read_columns(client, meta, select_fields=["ids"])
-    assert torch.equal(only_ids["ids"], ids)
-    assert "msg" not in only_ids
+    # Tensor-only subset still works.
+    only_ids = read_columns(client, meta, select_fields=["input_ids"])
+    assert torch.equal(only_ids["input_ids"], input_ids)
+    assert "content" not in only_ids
 
-    # Read just the object.
-    only_msg = read_columns(client, meta, select_fields=["msg"])
-    assert isinstance(only_msg["msg"], np.ndarray)
-    assert "ids" not in only_msg
+    # Object-only subset still works.
+    only_content = read_columns(client, meta, select_fields=["content"])
+    assert isinstance(only_content["content"], np.ndarray)
+    assert "input_ids" not in only_content
 
-    client.clear_samples(sample_ids=None, partition_id="mix-backend")
+    client.clear_samples(sample_ids=None, partition_id=partition_id)
+
+
+def test_promote_1d_leaves_object_array_roundtrip() -> None:
+    """``_promote_1d_leaves`` + ``_from_wire`` preserves non-tensor leaves.
+
+    Pins the production TD shape (1D tensor + object array + 2D tensor)
+    against tensordict 0.12.2 reconstruction bugs that could silently
+    strip ``NonTensorStack`` / ``NonTensorData`` leaves. Symmetric to
+    the documented ``.contiguous()`` bug in
+    ``adapters/transfer_queue.py`` lines 558–562.
+    """
+    from nemo_rl.data_plane.adapters.transfer_queue import (
+        _from_wire,
+        _promote_1d_leaves,
+    )
+
+    arr = np.empty(4, dtype=object)
+    arr[:] = [["a", "b"], ["c"], ["d", "e"], ["f"]]
+    td = TensorDict(
+        {
+            "input_ids": torch.zeros(4, 8, dtype=torch.long),
+            "input_lengths": torch.tensor([4, 3, 2, 1]),  # 1D → promoted
+            "content": arr,
+        },
+        batch_size=[4],
+    )
+    promoted = _promote_1d_leaves(td)
+    assert promoted["input_lengths"].shape == (4, 1)
+    np.testing.assert_array_equal(promoted["content"], arr)
+
+    restored = _from_wire(promoted)
+    assert restored["input_lengths"].shape == (4,)
+    np.testing.assert_array_equal(restored["content"], arr)

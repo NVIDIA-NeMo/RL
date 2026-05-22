@@ -306,6 +306,21 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def _assert_no_key_loss(src_dict: dict, new_td: TensorDict, fn: str) -> None:
+    """Guard against silent leaf drops through TensorDict constructor rebuild.
+
+    tensordict's constructor has historically dropped NonTensorStack /
+    NonTensorData leaves when built from a plain dict. Compare the
+    source dict's keys against the rebuilt TD's top-level keys.
+    """
+    new_keys = set(new_td.keys())
+    if set(src_dict.keys()) != new_keys:
+        dropped = sorted(set(src_dict.keys()) - new_keys)
+        raise RuntimeError(
+            f"{fn} lost leaves through TensorDict rebuild: dropped={dropped}."
+        )
+
+
 def _promote_1d_leaves(td: TensorDict) -> TensorDict:
     """Unsqueeze 1D tensor leaves to ``(N, 1)`` — mooncake_cpu KV-path workaround.
 
@@ -321,26 +336,32 @@ def _promote_1d_leaves(td: TensorDict) -> TensorDict:
         ``TensorDict`` with 1D tensor leaves unsqueezed to ``(N, 1)``;
         all other leaves pass through unchanged.
     """
-    new_dict: dict[str, torch.Tensor] = {}
+    # td.keys() (top-level) includes NonTensorData / NonTensorStack leaves.
+    # keys(include_nested=True, leaves_only=True) enumerates tensor leaves
+    # only — non-tensor leaves would silently fall out of the rebuilt dict.
+    new_dict: dict[str, Any] = {}
     changed = False
-    for k in td.keys(include_nested=True, leaves_only=True):
+    for k in td.keys():
         v = td.get(k)
         if isinstance(v, torch.Tensor) and not v.is_nested and v.dim() == 1:
             new_dict[str(k)] = v.unsqueeze(-1).contiguous()
             changed = True
         else:
-            # pyrefly: ignore  # bad-argument-type
             new_dict[str(k)] = v
     if not changed:
         return td
-    return TensorDict(new_dict, batch_size=td.batch_size)
+    new_td = TensorDict(new_dict, batch_size=td.batch_size)
+    _assert_no_key_loss(new_dict, new_td, "_promote_1d_leaves")
+    return new_td
 
 
 def _from_wire(td: TensorDict) -> TensorDict:
     """Inverse of `_promote_1d_leaves`: squeeze trailing 1 back to (N,)."""
-    new_dict: dict[str, torch.Tensor] = {}
+    # Same top-level iteration as `_promote_1d_leaves`: NonTensorData /
+    # NonTensorStack leaves are only visible via td.keys(), not leaves_only.
+    new_dict: dict[str, Any] = {}
     changed = False
-    for k in td.keys(include_nested=True, leaves_only=True):
+    for k in td.keys():
         v = td.get(k)
         if (
             isinstance(v, torch.Tensor)
@@ -351,11 +372,12 @@ def _from_wire(td: TensorDict) -> TensorDict:
             new_dict[str(k)] = v.squeeze(-1).contiguous()
             changed = True
         else:
-            # pyrefly: ignore  # bad-argument-type
             new_dict[str(k)] = v
     if not changed:
         return td
-    return TensorDict(new_dict, batch_size=td.batch_size)
+    new_td = TensorDict(new_dict, batch_size=td.batch_size)
+    _assert_no_key_loss(new_dict, new_td, "_from_wire")
+    return new_td
 
 
 class TQDataPlaneClient(DataPlaneClient):
