@@ -728,15 +728,14 @@ def grpo_train_sync(
                     # tensor through Ray's plasma store on top of the TQ
                     # writeback.
                     policy.get_logprobs_from_meta(meta, timer=timer)
-                    _ref_select: list[str] = []
-                    if not master_config.grpo.get(
+                    compute_ref = not master_config.grpo.get(
                         "skip_reference_policy_logprobs_calculation"
-                    ):
+                    )
+                    if compute_ref:
                         policy.get_reference_policy_logprobs_from_meta(
                             meta,
                             timer=timer,
                         )
-                        _ref_select.append("reference_policy_logprobs")
 
                     # Driver pulls only the per-token columns it needs
                     # for masking / advantage. Bulk (input_ids, multimodal,
@@ -748,7 +747,7 @@ def grpo_train_sync(
                             "prev_logprobs",
                             "generation_logprobs",
                             "token_mask",
-                            *_ref_select,
+                            *(["reference_policy_logprobs"] if compute_ref else []),
                         ],
                         pad_value_dict=_pad_dict,
                     )
@@ -757,7 +756,7 @@ def grpo_train_sync(
                     token_mask = extras_bdd["token_mask"]
                     reference_policy_logprobs = (
                         extras_bdd["reference_policy_logprobs"]
-                        if _ref_select
+                        if compute_ref
                         else None
                     )
 

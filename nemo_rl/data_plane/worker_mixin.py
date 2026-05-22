@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 def _broadcast_batched_data_dict(
     data: Optional[BatchedDataDict[Any]],
     *,
+    is_leader: bool,
     src: int,
     group: Any,
 ) -> BatchedDataDict[Any]:
@@ -63,7 +64,6 @@ def _broadcast_batched_data_dict(
     current device. The leader supplies ``data``; non-leaders pass
     ``None`` and get an empty BatchedDataDict filled in-place.
     """
-    is_leader = torch.distributed.get_rank() == src
     # NCCL groups can only broadcast CUDA tensors; pick the broadcast
     # device from the group backend so CPU TQ outputs are moved to GPU
     # before NCCL broadcast.
@@ -225,9 +225,9 @@ class TQWorkerMixin:
 
         pad_to_seqlen = self._forward_pad_seqlen(meta) if dp_aligned_seq_len else 0
 
-        if replica_group is not None:
+        if replica_group is not None and replica_group.size() > 1:
+            is_leader = self._is_replica_leader()
             leader = torch.distributed.get_global_rank(replica_group, 0)
-            is_leader = torch.distributed.get_rank() == leader
             if is_leader:
                 td = self._require_dp_client().get_samples(
                     sample_ids=meta.sample_ids,
@@ -244,6 +244,7 @@ class TQWorkerMixin:
                 data = None
             data = _broadcast_batched_data_dict(
                 data,
+                is_leader=is_leader,
                 src=leader,
                 group=replica_group,
             )
@@ -341,31 +342,31 @@ class TQWorkerMixin:
             return data
         return self._apply_packing_prep(data)
 
+    def _local_coords(self) -> dict[str, int]:
+        """This worker's (axis -> local-rank) mapping.
+
+        Subclasses MUST override: DTensor reads ``device_mesh``,
+        Megatron reads ``parallel_state``. There's no honest default —
+        a missing impl would silently make every rank a writeback
+        leader and re-create the ``-601 ILLEGAL_CLIENT`` duplicate-write
+        bug.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _local_coords() to gate TQ writeback. "
+            "Return (axis -> local rank) from the worker's parallelism state."
+        )
+
     def _is_replica_leader(self) -> bool:
         """True iff this rank should perform per-DP-rank-unique side-effects.
 
-        Examples include TQ write-back. Always True for non-replicated configs.
+        Examples include TQ write-back. Shares the same predicate the
+        driver uses to gate dispatch (:meth:`NamedSharding.is_axis_zero`)
+        — fed by per-worker :meth:`_local_coords` instead of
+        ``NamedSharding.get_worker_coords``; same answer either way.
         """
-        replica_group = self._get_replica_group()
-        if replica_group is None:
-            return True
-        leader = torch.distributed.get_global_rank(replica_group, 0)
-        return torch.distributed.get_rank() == leader
+        from nemo_rl.distributed.named_sharding import REPLICATED_AXES, NamedSharding
 
-    def _is_writeback_leader(self) -> bool:
-        """True iff this rank is the TP×CP×PP leader for write-back to TQ.
-
-        Distinct from :meth:`_is_replica_leader` because that one piggybacks
-        on :meth:`_get_replica_group`, which subclasses gate on ``CP > 1``
-        (a fetch-path optimization). Under TP-only configs (e.g. TP=2,
-        CP=1) the replica group is ``None`` → every rank passes the
-        leader check → every TP rank writes the same keys, which crashes
-        the mooncake_cpu backend with ``-601 ILLEGAL_CLIENT`` (concurrent
-        UpsertStart from different Mooncake clients on the same key).
-        Subclasses with TP/CP/PP siblings must override to gate on the
-        true (TP, CP, PP) coordinates regardless of CP.
-        """
-        return self._is_replica_leader()
+        return NamedSharding.is_axis_zero(self._local_coords(), REPLICATED_AXES)
 
     def _write_back(
         self,
@@ -383,7 +384,7 @@ class TQWorkerMixin:
             meta: Per-rank ``KVBatchMeta`` for this slice.
             fields: Map of field name to tensor to write back.
         """
-        if not self._is_writeback_leader() or not fields:
+        if not self._is_replica_leader() or not fields:
             return
         from nemo_rl.data_plane.column_io import write_columns
 

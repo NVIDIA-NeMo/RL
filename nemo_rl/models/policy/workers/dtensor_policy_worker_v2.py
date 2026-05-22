@@ -206,23 +206,13 @@ class DTensorPolicyWorkerV2Impl(
 
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = flattened (cp, tp) sub-mesh — see V1 worker."""
-        if getattr(self, "cp_size", 1) <= 1:
-            return None
         return self.device_mesh[("cp", "tp")]._flatten().get_group()
 
-    def _is_writeback_leader(self) -> bool:
-        """``(cp_local_rank, tp_local_rank) == (0, 0)``.
-
-        See :meth:`TQWorkerMixin._is_writeback_leader` for the rationale.
-        """
-        if not hasattr(self, "device_mesh") or self.device_mesh is None:
-            return True
-        try:
-            cp = self.device_mesh["cp"].get_local_rank()
-            tp = self.device_mesh["tp"].get_local_rank()
-        except Exception:
-            return True
-        return cp == 0 and tp == 0
+    def _local_coords(self) -> dict[str, int]:
+        return {
+            "tensor_parallel": self.device_mesh["tp"].get_local_rank(),
+            "context_parallel": self.device_mesh["cp"].get_local_rank(),
+        }
 
     def __init__(
         self,

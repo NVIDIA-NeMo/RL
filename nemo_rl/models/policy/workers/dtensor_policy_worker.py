@@ -179,30 +179,14 @@ class DTensorPolicyWorkerImpl(
             return f"{self.__class__.__qualname__}"
 
     def _get_replica_group(self) -> Optional[Any]:
-        """Replica group = flattened (cp, tp) sub-mesh, gated on CP > 1.
-
-        Returns ``None`` for CP=1 so ``_fetch`` keeps using the proven
-        independent path (matches the qwen3-mcore-seqpack TP=2 baseline).
-        Once CP > 1, broadcasting the full BatchedDataDict to (CP, TP)
-        siblings amortizes the TQ read across siblings that need it.
-        """
-        if getattr(self, "cp_size", 1) <= 1:
-            return None
+        """Replica group = flattened (cp, tp) sub-mesh, for NCCL broadcast in ``_fetch``."""
         return self.device_mesh[("cp", "tp")]._flatten().get_group()
 
-    def _is_writeback_leader(self) -> bool:
-        """``(cp_local_rank, tp_local_rank) == (0, 0)``.
-
-        See :meth:`TQWorkerMixin._is_writeback_leader` for the rationale.
-        """
-        if not hasattr(self, "device_mesh") or self.device_mesh is None:
-            return True
-        try:
-            cp = self.device_mesh["cp"].get_local_rank()
-            tp = self.device_mesh["tp"].get_local_rank()
-        except Exception:
-            return True
-        return cp == 0 and tp == 0
+    def _local_coords(self) -> dict[str, int]:
+        return {
+            "tensor_parallel": self.device_mesh["tp"].get_local_rank(),
+            "context_parallel": self.device_mesh["cp"].get_local_rank(),
+        }
 
     def __init__(
         self,
