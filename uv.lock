@@ -114,7 +114,7 @@ constraints = [
     { name = "pyjwt", specifier = ">=2.12.0" },
     { name = "python-multipart", specifier = ">=0.0.22" },
     { name = "starlette", specifier = ">=0.49.1" },
-    { name = "urllib3", specifier = ">=2.6.3" },
+    { name = "urllib3", specifier = ">=2.7.0" },
     { name = "wheel", specifier = ">=0.46.2" },
 ]
 overrides = [
@@ -123,7 +123,7 @@ overrides = [
     { name = "flashinfer-cubin", specifier = ">=0.5.0" },
     { name = "flashinfer-python", specifier = ">=0.5.0" },
     { name = "llguidance", specifier = ">=1.3.0,<1.4.0" },
-    { name = "mlflow", specifier = ">=3.11.1" },
+    { name = "mlflow", specifier = ">=3.12.0" },
     { name = "nvidia-cublas", marker = "sys_platform != 'darwin'", specifier = "==13.3.0.5" },
     { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'", specifier = "==9.20.0.48" },
     { name = "nvidia-cutlass-dsl", specifier = ">=4.4.1" },
@@ -3694,6 +3694,7 @@ dependencies = [
     { name = "devtools" },
     { name = "fastapi" },
     { name = "fonttools" },
+    { name = "gitpython" },
     { name = "gprof2dot" },
     { name = "hydra-core" },
     { name = "itsdangerous" },
@@ -3752,11 +3753,12 @@ requires-dist = [
     { name = "devtools" },
     { name = "fastapi" },
     { name = "fonttools", specifier = ">=4.60.2" },
+    { name = "gitpython", specifier = ">=3.1.50" },
     { name = "gprof2dot" },
     { name = "hydra-core" },
     { name = "itsdangerous" },
-    { name = "mlflow" },
-    { name = "mlflow-skinny" },
+    { name = "mlflow", specifier = ">=3.12.0" },
+    { name = "mlflow-skinny", specifier = ">=3.12.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8.0" },
     { name = "omegaconf" },
     { name = "openai", specifier = "<=2.7.2" },
@@ -3771,12 +3773,12 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "pytest-xdist", marker = "extra == 'dev'" },
     { name = "python-multipart", specifier = ">=0.0.22" },
-    { name = "ray", extras = ["default"] },
+    { name = "ray", extras = ["default"], specifier = ">=2.55.1" },
     { name = "requests-mock", marker = "extra == 'dev'" },
     { name = "rich" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "tqdm" },
-    { name = "urllib3", specifier = ">=2.6.3" },
+    { name = "urllib3", specifier = ">=2.7.0" },
     { name = "uvicorn" },
     { name = "uvloop" },
     { name = "wandb" },
@@ -3983,7 +3985,7 @@ requires-dist = [
     { name = "matplotlib" },
     { name = "megatron-bridge", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-Bridge-workspace" },
     { name = "megatron-core", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM" },
-    { name = "mlflow", specifier = ">=3.11.1" },
+    { name = "mlflow", specifier = ">=3.12.0" },
     { name = "nccl4py", marker = "sys_platform != 'darwin'" },
     { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'automodel'", editable = "3rdparty/Automodel-workspace/Automodel" },
     { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "3rdparty/Gym-workspace/Gym" },
@@ -4007,7 +4009,7 @@ requires-dist = [
     { name = "plotly" },
     { name = "pybase64" },
     { name = "pyzmq" },
-    { name = "ray", extras = ["default"], specifier = "==2.54.0" },
+    { name = "ray", extras = ["default"], specifier = "==2.55.1" },
     { name = "rich" },
     { name = "setuptools" },
     { name = "sglang", marker = "extra == 'sglang'", git = "https://github.com/sgl-project/sglang.git?subdirectory=python&tag=v0.5.10" },
@@ -5844,7 +5846,7 @@ wheels = [
 
 [[package]]
 name = "ray"
-version = "2.54.0"
+version = "2.55.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -5857,9 +5859,9 @@ dependencies = [
     { name = "requests" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/f2/5c0161d10445e703b7d01413ab54ec1cc5e27032555279d296df89b9c4ee/ray-2.54.0-cp313-cp313-macosx_12_0_arm64.whl", hash = "sha256:5ad77961fea16c697a0fb0e51216dd39c0bec28868cde54ac668edd58d12b8ae", size = 70030991, upload-time = "2026-02-18T04:05:43.966Z" },
-    { url = "https://files.pythonhosted.org/packages/fd/8c/4a4a38eaec6e9614076a96967f58540f4f8d4aa0c793f43150c5df23cb9a/ray-2.54.0-cp313-cp313-manylinux2014_aarch64.whl", hash = "sha256:8952c23a8aa94f10728c2d16e0dc3732d09aa0e6254801757ff494984a214f45", size = 72013826, upload-time = "2026-02-18T04:05:49.866Z" },
-    { url = "https://files.pythonhosted.org/packages/42/ac/e7ec2a406bd755f61c7090460fa5ab3f09b00c3c2d8db6d0b559f78a30eb/ray-2.54.0-cp313-cp313-manylinux2014_x86_64.whl", hash = "sha256:ab89e6089abb6e46fb98fdd96d399b31a852d79127cd8ac00746c61d93defa2c", size = 72880209, upload-time = "2026-02-18T04:05:55.498Z" },
+    { url = "https://files.pythonhosted.org/packages/d5/95/898699cc1a6a5f304ea95376d079843b5c05f4c8c1ec7e55a5cc7ffcea50/ray-2.55.1-cp313-cp313-macosx_12_0_arm64.whl", hash = "sha256:f9844a9272ef2e6eb5771025866072cf4234cf4c7cc1a31e235b7de7111864be", size = 65766823, upload-time = "2026-04-22T20:10:20.786Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/13/87deecc090c672e45a0cf6f5eef511de448b93f37ef18fd10eb8e8557a0d/ray-2.55.1-cp313-cp313-manylinux2014_aarch64.whl", hash = "sha256:b415d590e062f248907e0fe42994943f11726b7178fcf4b1cf5546721fb1a5f8", size = 72818676, upload-time = "2026-04-22T20:10:26.705Z" },
+    { url = "https://files.pythonhosted.org/packages/71/d7/fc95d3b8824c62105c64aa1b59c59600b581f608d78a2af753e010936dc9/ray-2.55.1-cp313-cp313-manylinux2014_x86_64.whl", hash = "sha256:1380e043eb57cde69b7e9199c6f2558ceeb8f0fc41c97d1d5e50ea042115f302", size = 73678908, upload-time = "2026-04-22T20:10:32.795Z" },
 ]
 
 [package.optional-dependencies]
