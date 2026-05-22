@@ -14,14 +14,17 @@
 import argparse
 import difflib
 import os
-import re
 from collections import defaultdict
 
 import torch
 import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
-from nemo_rl.algorithms.x_token.tokenalign import TokenAligner
+from nemo_rl.utils.x_token._shared import (
+    apply_canonicalization_if_enabled,
+    clean_model_name_for_filename,
+    sinkhorn_one_dim,
+)
 
 
 #remove all special tokens that start with <| and end with |>
@@ -34,22 +37,6 @@ from nemo_rl.algorithms.x_token.tokenalign import TokenAligner
 
 # this file implements 3rd way
 
-def sinkhorn_one_dim(A, n_iters=1):
-    for _ in range(n_iters):
-
-
-        # A = A / (A.sum(dim=1, keepdim=True) + 1e-6)
-        row_sums = A.sum(dim=1, keepdim=True)
-        safe_row_sums = torch.where(row_sums == 0, torch.ones_like(row_sums), row_sums)
-        A = A / safe_row_sums
-
-    return A
-
-def apply_canonicalization_if_enabled(token_str, use_canonicalization):
-    """Apply canonicalization to token string if enabled."""
-    if use_canonicalization:
-        return TokenAligner._canonical_token(token_str)
-    return token_str
 
 def create_weight_distribution(num_tokens):
     """Create weight distribution for multi-token mappings using exponential decay."""
@@ -65,17 +52,6 @@ def create_weight_distribution(num_tokens):
     total = sum(weights)
     weights = [w / total for w in weights]
     return weights
-
-
-def clean_model_name_for_filename(name: str) -> str:
-    """Removes parameter counts and common suffixes from model names for cleaner filenames."""
-    # Removes patterns like -8B, -1.5B, -4b, -125m etc.
-    cleaned_name = re.sub(r"-?[0-9\.]+[bBmB]", "", name, flags=re.IGNORECASE)
-    # Remove common suffixes
-    cleaned_name = cleaned_name.replace("-Base", "").replace("-it", "").replace("-Instruct", "")
-    # Clean up any leading/trailing hyphens that might result
-    cleaned_name = cleaned_name.strip("-_")
-    return cleaned_name
 
 
 def print_projection_map_examples(
@@ -97,7 +73,7 @@ def print_projection_map_examples(
         direction: Human-readable direction label, e.g. "student->teacher".
         num_examples: Number of source tokens to print (highest-id first).
         use_raw_tokens: If True, use ``convert_ids_to_tokens`` instead of ``decode``.
-        use_canonicalization: If True, apply ``TokenAligner._canonical_token`` after decoding.
+        use_canonicalization: If True, apply :func:`_canonical_token` after decoding.
     """
     print(
         f"\n--- Projection map examples {direction} (showing {num_examples} examples) ---"
@@ -172,7 +148,7 @@ def add_multitoken_mappings(
             weights are accumulated in place.
         tokens_to_cut: Cap the re-encoding at this many target tokens.
         use_raw_tokens: If True, decode via ``convert_ids_to_tokens`` instead of ``decode``.
-        use_canonicalization: If True, apply ``TokenAligner._canonical_token`` after decoding.
+        use_canonicalization: If True, apply :func:`_canonical_token` after decoding.
 
     Returns:
         ``(decoded_source_tokens, examples)`` where ``decoded_source_tokens`` is a

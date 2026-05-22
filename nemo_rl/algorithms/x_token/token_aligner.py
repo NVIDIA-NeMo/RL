@@ -36,8 +36,6 @@ from typing import Any, List, Tuple
 import numpy as np
 import torch
 
-from nemo_rl.algorithms.x_token.utils import parse_projection_file
-
 # Visual byte representations used by some BPE tokenizers (especially for
 # emojis / non-ASCII bytes). Copied from the PT reference verbatim — these
 # constants are content-coupled to the tokenizers we align across.
@@ -135,19 +133,14 @@ class TokenAligner:
     token can match a span of teacher tokens and vice versa, up to
     ``max_comb_len``) and anchor-based segmentation for long sequences.
 
-    Construction loads the projection matrix from disk into memory. The
-    raw COO components (indices, values, shape) are stored picklable so the
-    aligner can be pickled into DataLoader worker processes; the loss fn is
-    expected to materialize the actual ``torch.sparse_coo_tensor`` on the
-    training device on first use.
-
     Args:
         student_tokenizer: HF tokenizer for the student model.
         teacher_tokenizer: HF tokenizer for the teacher model.
-        projection_matrix_path: Path to a ``.pt`` file holding either the
-            sparse multi-token format (dict[(student_id, teacher_id)] -> count)
-            or the dense top-k format (dict with ``indices`` and
-            ``likelihoods`` tensors, shape ``[V_student, top_k]``).
+        projection_matrix_path: Path retained on the aligner for downstream
+            callers (e.g. the loss fn) that materialize the projection on
+            their training device via
+            :func:`nemo_rl.algorithms.x_token.utils.get_sparse_projection_for_collator`
+            or :func:`get_topk_projection_for_loss`.
         max_comb_len: Maximum span length considered when matching one token
             on one side against multiple tokens on the other.
     """
@@ -164,74 +157,6 @@ class TokenAligner:
         self.max_combination_len = max_comb_len
         self.projection_matrix_path = projection_matrix_path
 
-        # Loaded lazily by load_projection_matrix(); the loss fn calls that
-        # explicitly on its training device. We store the raw COO components
-        # so this aligner remains picklable across DataLoader workers (no
-        # CUDA tensors, no nn.Parameter).
-        self._projection_indices: torch.Tensor | None = None
-        self._projection_values: torch.Tensor | None = None
-        self._projection_shape: Tuple[int, int] | None = None
-
-    # ------------------------------------------------------------------ #
-    # Projection matrix loading
-    # ------------------------------------------------------------------ #
-    def load_projection_matrix(
-        self, device: torch.device | str = "cpu"
-    ) -> torch.Tensor:
-        """Materialize the projection matrix as a sparse COO tensor.
-
-        Args:
-            device: Device to place the tensor on.
-
-        Returns:
-            A ``torch.sparse_coo_tensor`` of shape
-            ``(V_student, V_teacher)``.
-        """
-        if self._projection_indices is None:
-            self._load_projection_components()
-        assert self._projection_indices is not None
-        assert self._projection_values is not None
-        assert self._projection_shape is not None
-        sparse = torch.sparse_coo_tensor(
-            self._projection_indices,
-            self._projection_values,
-            self._projection_shape,
-            device=device,
-            dtype=torch.float32,
-        ).coalesce()
-        return sparse
-
-    def _load_projection_components(self) -> None:
-        """Load and normalize the projection matrix into COO components."""
-        indices, values, v_student_file, _ = parse_projection_file(
-            self.projection_matrix_path
-        )
-        v_student = len(self.student_tokenizer)
-        v_teacher = len(self.teacher_tokenizer)
-        # The dense top-k format encodes V_student in its rowcount; the
-        # sparse format infers from max(student_idx)+1, which can be < V_s
-        # if some rows are missing — check only the dense case where the
-        # file shape is authoritative. parse_projection_file returns
-        # ``rows`` for dense and ``max+1`` for sparse, so a mismatch here
-        # only fires for the dense format.
-        if v_student_file > v_student:
-            raise AssertionError(
-                f"projection rows ({v_student_file}) != student vocab "
-                f"({v_student}) for tokenizer "
-                f"{getattr(self.student_tokenizer, 'name_or_path', '?')}"
-            )
-        # Drop entries that point at out-of-range teacher ids; the dense
-        # format pads with 0 (or -1 sentinels from _exact_map_remapped
-        # files), so we keep only valid rows.
-        teacher_idx = indices[1]
-        keep = (teacher_idx >= 0) & (teacher_idx < v_teacher)
-        self._projection_indices = indices[:, keep]
-        self._projection_values = values[keep]
-        self._projection_shape = (v_student, v_teacher)
-
-    # ------------------------------------------------------------------ #
-    # Public alignment API
-    # ------------------------------------------------------------------ #
     def align(
         self,
         student_ids: torch.Tensor,
@@ -342,8 +267,8 @@ class TokenAligner:
     # ------------------------------------------------------------------ #
     def _align_single(
         self,
-        seq1: List[str],
-        seq2: List[str],
+        student_tokens: List[str],
+        teacher_tokens: List[str],
         exact_match_score: float = 3.0,
         combination_score_multiplier: float = 1.5,
         gap_penalty: float = -1.5,
@@ -356,19 +281,18 @@ class TokenAligner:
             t_end, is_correct)``. Insertions/deletions use ``-1`` for the
             empty side's start/end.
         """
-        seq1_canon = _canonicalize_sequence(seq1)
-        seq2_canon = _canonicalize_sequence(seq2)
+        student_canon = _canonicalize_sequence(student_tokens)
+        teacher_canon = _canonicalize_sequence(teacher_tokens)
 
-        kwargs = dict(
+        aligned, _ = self._align_with_anchors(
+            student_canon,
+            teacher_canon,
+            anchor_lengths=anchor_lengths,
             exact_match_score=exact_match_score,
             combination_score_multiplier=combination_score_multiplier,
             gap_penalty=gap_penalty,
             max_combination_len=self.max_combination_len,
             ignore_leading_char_diff=False,
-        )
-
-        aligned, _ = self._align_with_anchors(
-            seq1_canon, seq2_canon, anchor_lengths=anchor_lengths, **kwargs
         )
         aligned = _post_process_alignment(
             aligned,
@@ -387,83 +311,95 @@ class TokenAligner:
     # ------------------------------------------------------------------ #
     def _align_with_anchors(
         self,
-        seq1: List[str],
-        seq2: List[str],
+        student_tokens: List[str],
+        teacher_tokens: List[str],
         anchor_lengths: Tuple[int, ...] = (3,),
-        **kwargs,
+        *,
+        exact_match_score: float,
+        combination_score_multiplier: float,
+        gap_penalty: float,
+        max_combination_len: int,
+        ignore_leading_char_diff: bool,
     ) -> Tuple[List[Tuple[Any, ...]], float]:
         """Optimize long alignments by pinning unique n-gram matches as anchors.
 
         Falls back to plain DP when no anchors exist or when
         ``anchor_lengths`` is empty.
         """
+        dp_kwargs = dict(
+            exact_match_score=exact_match_score,
+            combination_score_multiplier=combination_score_multiplier,
+            gap_penalty=gap_penalty,
+            max_combination_len=max_combination_len,
+            ignore_leading_char_diff=ignore_leading_char_diff,
+        )
         if not anchor_lengths:
-            return _align_dp(seq1, seq2, **kwargs)
+            return _align_dp(student_tokens, teacher_tokens, **dp_kwargs)
 
         # Find unique n-gram matches in both sequences.
         all_potential_anchors: List[Tuple[int, int, int]] = []
         for anchor_len in anchor_lengths:
             if anchor_len == 1:
-                s1_counts: dict[str, List[int]] = {}
-                s2_counts: dict[str, List[int]] = {}
-                for i, t in enumerate(seq1):
-                    s1_counts.setdefault(t, []).append(i)
-                for j, t in enumerate(seq2):
-                    s2_counts.setdefault(t, []).append(j)
-                for token in s1_counts.keys() & s2_counts.keys():
-                    if len(s1_counts[token]) == 1 and len(s2_counts[token]) == 1:
+                student_counts: dict[str, List[int]] = {}
+                teacher_counts: dict[str, List[int]] = {}
+                for i, t in enumerate(student_tokens):
+                    student_counts.setdefault(t, []).append(i)
+                for j, t in enumerate(teacher_tokens):
+                    teacher_counts.setdefault(t, []).append(j)
+                for token in student_counts.keys() & teacher_counts.keys():
+                    if len(student_counts[token]) == 1 and len(teacher_counts[token]) == 1:
                         all_potential_anchors.append(
-                            (s1_counts[token][0], s2_counts[token][0], 1)
+                            (student_counts[token][0], teacher_counts[token][0], 1)
                         )
             else:
-                s1_ngrams: dict[Tuple[str, ...], List[int]] = {}
-                s2_ngrams: dict[Tuple[str, ...], List[int]] = {}
-                for i in range(len(seq1) - anchor_len + 1):
-                    s1_ngrams.setdefault(tuple(seq1[i : i + anchor_len]), []).append(i)
-                for j in range(len(seq2) - anchor_len + 1):
-                    s2_ngrams.setdefault(tuple(seq2[j : j + anchor_len]), []).append(j)
-                for ngram in s1_ngrams.keys() & s2_ngrams.keys():
-                    if len(s1_ngrams[ngram]) == 1 and len(s2_ngrams[ngram]) == 1:
-                        i = s1_ngrams[ngram][0]
-                        j = s2_ngrams[ngram][0]
+                student_ngrams: dict[Tuple[str, ...], List[int]] = {}
+                teacher_ngrams: dict[Tuple[str, ...], List[int]] = {}
+                for i in range(len(student_tokens) - anchor_len + 1):
+                    student_ngrams.setdefault(tuple(student_tokens[i : i + anchor_len]), []).append(i)
+                for j in range(len(teacher_tokens) - anchor_len + 1):
+                    teacher_ngrams.setdefault(tuple(teacher_tokens[j : j + anchor_len]), []).append(j)
+                for ngram in student_ngrams.keys() & teacher_ngrams.keys():
+                    if len(student_ngrams[ngram]) == 1 and len(teacher_ngrams[ngram]) == 1:
+                        i = student_ngrams[ngram][0]
+                        j = teacher_ngrams[ngram][0]
                         if (
-                            i + anchor_len <= len(seq1)
-                            and j + anchor_len <= len(seq2)
-                            and seq1[i : i + anchor_len] == seq2[j : j + anchor_len]
+                            i + anchor_len <= len(student_tokens)
+                            and j + anchor_len <= len(teacher_tokens)
+                            and student_tokens[i : i + anchor_len] == teacher_tokens[j : j + anchor_len]
                         ):
                             all_potential_anchors.append((i, j, anchor_len))
 
         # Greedy non-conflicting selection, preferring longer anchors.
         all_potential_anchors.sort(key=lambda x: (-x[2], x[0], x[1]))
-        used_seq1: set[int] = set()
-        used_seq2: set[int] = set()
+        used_student: set[int] = set()
+        used_teacher: set[int] = set()
         selected: List[Tuple[int, int, int]] = []
         for i, j, k in all_potential_anchors:
             r1 = set(range(i, i + k))
             r2 = set(range(j, j + k))
-            if not (r1 & used_seq1) and not (r2 & used_seq2):
+            if not (r1 & used_student) and not (r2 & used_teacher):
                 selected.append((i, j, k))
-                used_seq1.update(r1)
-                used_seq2.update(r2)
+                used_student.update(r1)
+                used_teacher.update(r2)
         selected.sort()
 
         # Validate monotonic ordering.
         validated: List[Tuple[int, int, int]] = []
         last_j = -1
         for i, j, k in selected:
-            if j > last_j and seq1[i : i + k] == seq2[j : j + k]:
+            if j > last_j and student_tokens[i : i + k] == teacher_tokens[j : j + k]:
                 validated.append((i, j, k))
                 last_j = j + k - 1
 
         if not validated:
-            return _align_dp(seq1, seq2, **kwargs)
+            return _align_dp(student_tokens, teacher_tokens, **dp_kwargs)
 
         full_alignment: List[Tuple[Any, ...]] = []
         last_i, last_j = 0, 0
         for i, j, k in validated:
-            seg1, seg2 = seq1[last_i:i], seq2[last_j:j]
-            if seg1 or seg2:
-                aligned_segment, _ = _align_dp(seg1, seg2, **kwargs)
+            student_seg, teacher_seg = student_tokens[last_i:i], teacher_tokens[last_j:j]
+            if student_seg or teacher_seg:
+                aligned_segment, _ = _align_dp(student_seg, teacher_seg, **dp_kwargs)
                 full_alignment.extend(
                     _shift_pairs(aligned_segment, last_i, last_j)
                 )
@@ -471,8 +407,8 @@ class TokenAligner:
             for kk in range(k):
                 full_alignment.append(
                     (
-                        [seq1[i + kk]],
-                        [seq2[j + kk]],
+                        [student_tokens[i + kk]],
+                        [teacher_tokens[j + kk]],
                         i + kk,
                         i + kk + 1,
                         j + kk,
@@ -481,9 +417,9 @@ class TokenAligner:
                 )
             last_i, last_j = i + k, j + k
 
-        seg1, seg2 = seq1[last_i:], seq2[last_j:]
-        if seg1 or seg2:
-            aligned_segment, _ = _align_dp(seg1, seg2, **kwargs)
+        student_seg, teacher_seg = student_tokens[last_i:], teacher_tokens[last_j:]
+        if student_seg or teacher_seg:
+            aligned_segment, _ = _align_dp(student_seg, teacher_seg, **dp_kwargs)
             full_alignment.extend(_shift_pairs(aligned_segment, last_i, last_j))
 
         return full_alignment, 0.0
@@ -651,8 +587,8 @@ def _strings_equal_flexible(s1: str, s2: str, ignore_leading_char_diff: bool) ->
 
 
 def _align_dp(
-    seq1: List[str],
-    seq2: List[str],
+    student_tokens: List[str],
+    teacher_tokens: List[str],
     *,
     exact_match_score: float,
     combination_score_multiplier: float,
@@ -661,7 +597,7 @@ def _align_dp(
     ignore_leading_char_diff: bool,
 ) -> Tuple[List[Tuple[Any, ...]], float]:
     """Needleman-Wunsch DP with up-to-``max_combination_len`` token spans."""
-    n1, n2 = len(seq1), len(seq2)
+    n1, n2 = len(student_tokens), len(teacher_tokens)
     dp = np.zeros((n1 + 1, n2 + 1), dtype=np.float32)
     trace = np.full((n1 + 1, n2 + 1), "", dtype=object)
 
@@ -672,23 +608,23 @@ def _align_dp(
         dp[0, j] = dp[0, j - 1] + gap_penalty
         trace[0, j] = "left"
 
-    joined_seq1 = {
-        (i - k, i): "".join(seq1[i - k : i])
+    joined_student = {
+        (i - k, i): "".join(student_tokens[i - k : i])
         for i in range(n1 + 1)
         for k in range(1, min(i, max_combination_len) + 1)
     }
-    joined_seq2 = {
-        (j - k, j): "".join(seq2[j - k : j])
+    joined_teacher = {
+        (j - k, j): "".join(teacher_tokens[j - k : j])
         for j in range(n2 + 1)
         for k in range(1, min(j, max_combination_len) + 1)
     }
 
     for i in range(1, n1 + 1):
         for j in range(1, n2 + 1):
-            s1_val, s2_val = seq1[i - 1], seq2[j - 1]
+            student_val, teacher_val = student_tokens[i - 1], teacher_tokens[j - 1]
             match_score = (
                 exact_match_score
-                if _strings_equal_flexible(s1_val, s2_val, ignore_leading_char_diff)
+                if _strings_equal_flexible(student_val, teacher_val, ignore_leading_char_diff)
                 else -exact_match_score
             )
             score_diag = dp[i - 1, j - 1] + match_score
@@ -706,8 +642,8 @@ def _align_dp(
 
             for k in range(2, min(j + 1, max_combination_len + 1)):
                 key = (j - k, j)
-                if key in joined_seq2 and _strings_equal_flexible(
-                    s1_val, joined_seq2[key], ignore_leading_char_diff
+                if key in joined_teacher and _strings_equal_flexible(
+                    student_val, joined_teacher[key], ignore_leading_char_diff
                 ):
                     cand = dp[i - 1, j - k] + combination_score_multiplier * k
                     if cand > max_score:
@@ -716,8 +652,8 @@ def _align_dp(
 
             for k in range(2, min(i + 1, max_combination_len + 1)):
                 key = (i - k, i)
-                if key in joined_seq1 and _strings_equal_flexible(
-                    s2_val, joined_seq1[key], ignore_leading_char_diff
+                if key in joined_student and _strings_equal_flexible(
+                    teacher_val, joined_student[key], ignore_leading_char_diff
                 ):
                     cand = dp[i - k, j - 1] + combination_score_multiplier * k
                     if cand > max_score:
@@ -732,23 +668,23 @@ def _align_dp(
     while i > 0 or j > 0:
         move = trace[i, j]
         if move == "diag":
-            aligned.append(([seq1[i - 1]], [seq2[j - 1]], i - 1, i, j - 1, j))
+            aligned.append(([student_tokens[i - 1]], [teacher_tokens[j - 1]], i - 1, i, j - 1, j))
             i -= 1
             j -= 1
         elif move == "up":
-            aligned.append(([seq1[i - 1]], [], i - 1, i, -1, -1))
+            aligned.append(([student_tokens[i - 1]], [], i - 1, i, -1, -1))
             i -= 1
         elif move == "left":
-            aligned.append(([], [seq2[j - 1]], -1, -1, j - 1, j))
+            aligned.append(([], [teacher_tokens[j - 1]], -1, -1, j - 1, j))
             j -= 1
         elif move.startswith("comb_s1_over_s2_"):
             k = int(move.rsplit("_", 1)[-1])
-            aligned.append(([seq1[i - 1]], seq2[j - k : j], i - 1, i, j - k, j))
+            aligned.append(([student_tokens[i - 1]], teacher_tokens[j - k : j], i - 1, i, j - k, j))
             i -= 1
             j -= k
         elif move.startswith("comb_s2_over_s1_"):
             k = int(move.rsplit("_", 1)[-1])
-            aligned.append((seq1[i - k : i], [seq2[j - 1]], i - k, i, j - 1, j))
+            aligned.append((student_tokens[i - k : i], [teacher_tokens[j - 1]], i - k, i, j - 1, j))
             i -= k
             j -= 1
         else:

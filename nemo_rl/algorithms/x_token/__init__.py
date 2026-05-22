@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_rl.algorithms.x_token.tokenalign import AlignmentBatch, TokenAligner
+from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch, TokenAligner
 
 __all__ = ["AlignmentBatch", "TokenAligner"]

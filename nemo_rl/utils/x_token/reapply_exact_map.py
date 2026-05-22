@@ -17,13 +17,8 @@ import os
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from nemo_rl.algorithms.x_token.tokenalign import TokenAligner
+from nemo_rl.utils.x_token._shared import apply_canonicalization_if_enabled
 
-def apply_canonicalization_if_enabled(token_str, use_canonicalization):
-    """Apply canonicalization to token string if enabled."""
-    if use_canonicalization:
-        return TokenAligner._canonical_token(token_str)
-    return token_str
 
 def parse_arguments():
     """Parse command line arguments for the multi-token projection script."""

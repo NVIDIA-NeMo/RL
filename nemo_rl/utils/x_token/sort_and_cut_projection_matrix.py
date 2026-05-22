@@ -18,6 +18,8 @@ import re
 import torch
 import tqdm
 
+from nemo_rl.utils.x_token._shared import sinkhorn_one_dim
+
 
 def parse_arguments() -> argparse.Namespace:
     """Parse CLI arguments for the sort-and-cut script."""
@@ -42,16 +44,6 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--quiet", "-q", action="store_true", help="Suppress progress output")
     return parser.parse_args()
-
-
-def sinkhorn_one_dim(A, n_iters=1):
-    """Apply Sinkhorn normalization to make each row sum to 1."""
-    for _ in range(n_iters):
-        # A = A / (A.sum(dim=1, keepdim=True) + 1e-6)
-        row_sums = A.sum(dim=1, keepdim=True)
-        safe_row_sums = torch.where(row_sums == 0, torch.ones_like(row_sums), row_sums)
-        A = A / safe_row_sums
-    return A
 
 
 def print_projection_statistics(

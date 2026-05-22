@@ -36,7 +36,7 @@ from typing import Any, List
 import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.x_token.tokenalign import TokenAligner
+from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 

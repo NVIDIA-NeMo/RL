@@ -13,7 +13,7 @@
 # limitations under the License.
 """Shared utilities for cross-tokenizer distillation.
 
-Hosts pieces that are used by both :mod:`tokenalign` (in this package)
+Hosts pieces that are used by both :mod:`token_aligner` (in this package)
 and :mod:`nemo_rl.algorithms.loss.loss_functions`:
 
     - :class:`Fp32SparseMM` — FP32 sparse-dense matmul autograd Function
@@ -133,7 +133,7 @@ def parse_projection_file(
     preserved in the returned ``indices``, and the inferred vocab sizes
     are derived from the file alone (caller may override them upward
     against tokenizer / config knowledge). This keeps a single parser
-    while letting :mod:`tokenalign` and the loss fn keep their own
+    while letting :mod:`token_aligner` and the loss fn keep their own
     clipping rules.
 
     Args:

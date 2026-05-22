@@ -214,5 +214,5 @@ training environment so the in-tree HuggingFace implementation is used.
 
 - Config exemplar: [`examples/configs/xtoken_distillation.yaml`](../../examples/configs/xtoken_distillation.yaml)
 - Loss implementation: `nemo_rl/algorithms/loss/loss_functions.py::CrossTokenizerDistillationLossFn`
-- Token alignment: `nemo_rl/algorithms/x_token/tokenalign.py::TokenAligner`
+- Token alignment: `nemo_rl/algorithms/x_token/token_aligner.py::TokenAligner`
 - Same-tokenizer distillation: [Quantization-Aware RL](quantization-aware-rl.md) (the QA-Distillation workflow uses the same training entrypoint with a same-tokenizer teacher).

@@ -13,11 +13,16 @@
 # limitations under the License.
 import argparse
 import os
-import re
 
 import torch
 from tqdm.auto import tqdm
 from transformers import AutoConfig, AutoModel, AutoTokenizer
+
+from nemo_rl.utils.x_token._shared import (
+    clean_model_name_for_filename,
+    project_token_likelihoods,
+    sinkhorn_one_dim,
+)
 
 
 EXACT_MATCH_ONLY = False
@@ -80,13 +85,6 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-args = parse_arguments()
-
-if args.student_model == args.teacher_model:
-    raise ValueError(
-        f"Cannot use the same model for both student and teacher: {args.student_model}"
-    )
-
 EMBEDDING_MODEL_CHOICES = [
     {"name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "type": "sbert"},
     {"name": "sentence-transformers/all-mpnet-base-v2", "type": "sbert"},
@@ -98,46 +96,8 @@ EMBEDDING_MODEL_CHOICES = [
 MAX_SEQ_LENGTH_EMBEDDING = 64
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def sinkhorn(A, n_iters=10):
-    for _ in range(n_iters):
-        if _ % 2 == 0:
-            # A = A / (A.sum(dim=0, keepdim=True) + 1e-6)
-            col_sums = A.sum(dim=0, keepdim=True)
-            safe_col_sums = torch.where(col_sums == 0, torch.ones_like(col_sums), col_sums)
-            A = A / safe_col_sums
-        else:
-            #0, 2, 4, 6
-            # A = A / (A.sum(dim=1, keepdim=True) + 1e-6)
-            row_sums = A.sum(dim=1, keepdim=True)
-            safe_row_sums = torch.where(row_sums == 0, torch.ones_like(row_sums), row_sums)
-            A = A / safe_row_sums
-
-    return A
-
-def sinkhorn_one_dim(A, n_iters=1):
-    for _ in range(n_iters):
-
-
-        # A = A / (A.sum(dim=1, keepdim=True) + 1e-6)
-        row_sums = A.sum(dim=1, keepdim=True)
-        safe_row_sums = torch.where(row_sums == 0, torch.ones_like(row_sums), row_sums)
-        A = A / safe_row_sums
-
-    return A
 
 # --- Helper Functions ---
-
-def clean_model_name_for_filename(name: str) -> str:
-    """Removes parameter counts and common suffixes from model names for cleaner filenames."""
-    # Removes patterns like -8B, -1.5B, -4b, -125m etc.
-    cleaned_name = re.sub(r'-?[0-9\.]+[bBmB]', '', name, flags=re.IGNORECASE)
-    # Remove common suffixes
-    cleaned_name = cleaned_name.replace('-Base', '').replace('-it', '').replace('-Instruct', '')
-    # Clean up any leading/trailing hyphens that might result
-    cleaned_name = cleaned_name.strip('-_')
-    if 'mini' in name:
-        cleaned_name += "_mini"
-    return cleaned_name
 
 def load_tokenizer(model_id_or_path):
     """Loads a HuggingFace tokenizer, setting a pad token if necessary."""
@@ -240,147 +200,15 @@ def generate_projection_map_chunk(similarities, args):
 
     return top_k_indices, top_k_likelihood
 
-def project_token_likelihoods(input_likelihoods, projection_map_indices, projection_map_values, target_vocab_size, device):
-    """Projects token likelihoods from a source to a target vocabulary using a sparse map."""
-    batch_size, seq_len, source_vocab_size = input_likelihoods.shape
-    if source_vocab_size != projection_map_indices.shape[0]:
-        raise ValueError(f"Source vocab size of input ({source_vocab_size}) mismatches projection map size ({projection_map_indices.shape[0]})")
-
-    top_k = projection_map_indices.shape[1]
-    input_likelihoods = input_likelihoods.to(device)
-    projection_map_indices = projection_map_indices.to(device)
-    projection_map_values = projection_map_values.to(device)
-
-    crow_indices = torch.arange(0, (source_vocab_size + 1) * top_k, top_k, device=device, dtype=torch.long)
-    col_indices = projection_map_indices.flatten()
-    values = projection_map_values.flatten()
-
-    sparse_projection_matrix = torch.sparse_csr_tensor(
-        crow_indices, col_indices, values, size=(source_vocab_size, target_vocab_size), device=device
-    )
-
-    reshaped_input = input_likelihoods.reshape(batch_size * seq_len, source_vocab_size)
-    projected_likelihoods_reshaped = torch.matmul(reshaped_input, sparse_projection_matrix)
-    return projected_likelihoods_reshaped.reshape(batch_size, seq_len, target_vocab_size)
-
-def debug_projection_map(top_k_indices, top_k_likelihood, source_tokenizer, target_tokenizer, direction="", N=2000):
-    """Debug function to show first N rows with decoded tokens and weights."""
-    N = min(N, top_k_indices.shape[0])  # Show first N rows or less
-    print(f"\n--- Debugging projection map {direction} (first {N} rows) ---")
-
-    for row_idx in range(N):
-        # for row_idx in range(-N,-1):
-        # Decode source token
-        try:
-            token_id = row_idx if row_idx >= 0 else top_k_indices.shape[0] + row_idx
-            source_token = source_tokenizer.decode([token_id])
-            # source_token = source_tokenizer.convert_ids_to_tokens([token_id])[0]
-            source_token_str = repr(source_token)  # Use repr to show special chars
-        except Exception:
-            source_token_str = f"<ID:{row_idx}>"
-
-        # Build the target tokens with weights string
-        row_indices = top_k_indices[row_idx].cpu().numpy()
-        row_weights = top_k_likelihood[row_idx].float().cpu().numpy()
-
-        weight_total = 0
-        target_parts = []
-
-        if row_weights.max() != row_weights[-1]:
-            continue
-
-
-        for target_idx, weight in zip(row_indices, row_weights):
-            try:
-                target_token = target_tokenizer.decode([target_idx])
-                target_token_str = repr(target_token)
-            except Exception:
-                target_token_str = f"<ID:{target_idx}>"
-
-
-            target_parts.append(f"{target_token_str}({weight:.4f})")
-            weight_total += weight
-
-        target_string = " ".join(target_parts)
-        # print(f"Weight total: {weight_total:.4f}")
-        print(f"{source_token_str} -> {target_string}")
-
-def generate_projection_map(similarities, args):
-    """Calculates the sparse likelihood map from a similarity matrix."""
-    similarities = similarities.abs()
-    similarities[similarities > 0.999999999] = 1.0
-    max_similarities = torch.max(similarities, dim=1, keepdim=True)[0]
-    sharpness = 10.0 * max_similarities
-    likelihood = similarities ** sharpness
-
-    # Create a sparse representation by keeping only top-k values
-    # top_k_likelihood_pre_norm, _ = likelihood.topk(args.top_k, dim=1)
-    # likelihood = likelihood.where(likelihood >= top_k_likelihood_pre_norm[:, -1:], torch.zeros_like(likelihood))
-
-    # Normalize the row to sum to 1, handling rows that are all zero
-    # row_sums = likelihood.sum(dim=1, keepdim=True)
-    # safe_row_sums = torch.where(row_sums == 0, torch.ones_like(row_sums), row_sums)
-    # likelihood = likelihood / safe_row_sums
-    # likelihood = sinkhorn_one_dim(likelihood)
-
-    # Get the final top-k values and their indices from the sparse, normalized likelihood matrix
-    top_k_likelihood, top_k_indices = likelihood.topk(args.top_k, dim=1)
-
-    # Store top-k values before zeroing (to avoid losing them)
-    row_indices = torch.arange(likelihood.shape[0]).unsqueeze(1).expand(-1, args.top_k)
-    top_k_values = likelihood[row_indices, top_k_indices].clone()
-
-    # Zero out entire likelihood matrix in-place, then restore only top-k elements
-    likelihood.zero_()
-    likelihood[row_indices, top_k_indices] = top_k_values
-
-    # likelihood = sinkhorn(likelihood, n_iters=1)
-    # likelihood = sinkhorn(likelihood, n_iters=1) works the best
-
-
-    likelihood = sinkhorn_one_dim(likelihood)
-
-    # Extract final top-k values from the normalized sparse likelihood matrix
-    top_k_likelihood, top_k_indices = likelihood.topk(args.top_k, dim=1)
-
-    # Apply weight threshold filtering if specified
-    if args.weight_threshold > 0.0:
-        print(f"Applying weight threshold filter: {args.weight_threshold}")
-        # Create mask for values above threshold
-        threshold_mask = top_k_likelihood >= args.weight_threshold
-
-        #set indices to -1 where threshold is not met
-        top_k_indices = top_k_indices.where(threshold_mask, torch.full_like(top_k_indices, -1))
-
-        # # Count how many values per row are above threshold
-        # valid_counts = threshold_mask.sum(dim=1)
-        # total_filtered = (valid_counts == 0).sum().item()
-        # total_kept = threshold_mask.sum().item()
-        # total_possible = top_k_likelihood.numel()
-
-        # print(f"Kept {total_kept}/{total_possible} ({100*total_kept/total_possible:.1f}%) projections above threshold")
-
-        # if total_filtered > 0:
-        #     print(f"Warning: {total_filtered} tokens have no projections above threshold {args.weight_threshold}")
-
-        # # Zero out values below threshold
-        # filtered_likelihood = top_k_likelihood * threshold_mask.to(top_k_likelihood.dtype)
-        # filtered_indices = top_k_indices.clone()
-
-        # # For rows with no values above threshold, keep the top value to avoid empty rows
-        # empty_rows = valid_counts == 0
-        # if empty_rows.any():
-        #     print(f"Keeping top projection for {empty_rows.sum().item()} tokens with no values above threshold")
-        #     filtered_likelihood[empty_rows, 0] = top_k_likelihood[empty_rows, 0]
-
-        # top_k_likelihood = filtered_likelihood
-        # top_k_indices = filtered_indices
-
-
-    return top_k_indices, top_k_likelihood
-
 # --- Main Execution ---
 if __name__ == "__main__":
+    args = parse_arguments()
+
+    if args.student_model == args.teacher_model:
+        raise ValueError(
+            f"Cannot use the same model for both student and teacher: {args.student_model}"
+        )
+
     # 1. Load student and teacher tokenizers directly from --student-model / --teacher-model.
     #    No alphabetical swap — the projection direction follows the CLI args.
     student = {"id": args.student_model}
@@ -452,11 +280,11 @@ if __name__ == "__main__":
 
         # Apply canonicalization if requested
         if args.use_canonicalization:
-            from nemo_rl.algorithms.x_token.tokenalign import TokenAligner
+            from nemo_rl.algorithms.x_token.token_aligner import _canonical_token
 
             print("Applying token canonicalization before embedding generation...")
-            decoded_tokens_student = [TokenAligner._canonical_token(token) for token in raw_tokens_student]
-            decoded_tokens_teacher = [TokenAligner._canonical_token(token) for token in raw_tokens_teacher]
+            decoded_tokens_student = [_canonical_token(token) for token in raw_tokens_student]
+            decoded_tokens_teacher = [_canonical_token(token) for token in raw_tokens_teacher]
 
             # Show some examples of canonicalization
             print("Canonicalization examples:")
