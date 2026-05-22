@@ -619,21 +619,6 @@ class RayWorkerGroup:
                 }
             )
 
-        # Push each worker's (axis -> coord) into the actor so TQ-aware
-        # workers can do rank gating (e.g. single-writer writeback) from
-        # this single source of truth instead of re-deriving from
-        # torch.distributed / device_mesh / parallel_state. Workers that
-        # don't implement set_sharding_coords are silently skipped.
-        if self.sharding_annotations is not None:
-            push_futures = []
-            for worker_idx, worker in enumerate(self._workers):
-                if not hasattr(worker, "set_sharding_coords"):
-                    continue
-                coords = self.sharding_annotations.get_worker_coords(worker_idx)
-                push_futures.append(worker.set_sharding_coords.remote(coords))
-            if push_futures:
-                ray.get(push_futures)
-
     @property
     def workers(self) -> list[ray.actor.ActorHandle]:
         return self._workers

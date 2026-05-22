@@ -111,6 +111,19 @@ class MegatronPolicyWorkerImpl(
         else:
             return f"{self.__class__.__qualname__}"
 
+    def _is_writeback_leader(self) -> bool:
+        """``(tp_rank, cp_rank, pp_rank) == (0, 0, 0)``.
+
+        See :meth:`TQWorkerMixin._is_writeback_leader` for the rationale.
+        """
+        if not torch.distributed.is_initialized():
+            return True
+        return (
+            parallel_state.get_tensor_model_parallel_rank() == 0
+            and parallel_state.get_context_parallel_rank() == 0
+            and parallel_state.get_pipeline_model_parallel_rank() == 0
+        )
+
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
 
