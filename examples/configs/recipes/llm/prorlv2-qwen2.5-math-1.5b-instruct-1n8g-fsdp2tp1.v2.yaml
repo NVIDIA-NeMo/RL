@@ -1,4 +1,4 @@
-defaults: ../../prorlv2.yaml
+defaults: ../../prorlv2.v2.yaml
 grpo:
   max_num_steps: 450
 checkpointing:

@@ -15,7 +15,7 @@ The following workflow + quantization recipe combinations have been validated en
 | Workflow | Quantization | Recipe | Status | Example Config |
 |---|---|---|---|---|
 | QA-Distillation | W4A4 | `NVFP4_DEFAULT_CFG` (NVFP4 weights + NVFP4 activations) | ✅ Converges | `examples/modelopt/qa_distillation_math_megatron.yaml` |
-| QA-GRPO | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16.yaml` (NVFP4 weights, native-dtype activations) | ✅ Converges | `examples/modelopt/qa_grpo_llama8b_megatron.yaml` |
+| QA-GRPO | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16.yaml` (NVFP4 weights, native-dtype activations) | ✅ Converges | `examples/modelopt/qa_grpo_llama8b_megatron.v2.yaml` |
 | QA-GRPO | W4A4 | `NVFP4_DEFAULT_CFG` | ⚠️ Known convergence issue | `examples/modelopt/qa_grpo_math_megatron.yaml` |
 
 The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation.
@@ -27,7 +27,7 @@ The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dy
 The QA-GRPO config extends the standard Megatron GRPO config by adding quantization parameters. See [Verified Configurations](#verified-configurations) for the status of W4A4 vs W4A16 on GRPO.
 
 ```yaml
-# examples/modelopt/qa_grpo_llama8b_megatron.yaml
+# examples/modelopt/qa_grpo_llama8b_megatron.v2.yaml
 defaults: "../configs/grpo_math_8B_megatron.yaml"
 
 policy:
@@ -47,7 +47,7 @@ policy:
 
 ```bash
 uv run examples/run_grpo.py \
-  --config examples/modelopt/qa_grpo_llama8b_megatron.yaml \
+  --config examples/modelopt/qa_grpo_llama8b_megatron.v2.yaml \
   policy.model_name=meta-llama/Llama-3.1-8B-Instruct
 ```
 
@@ -55,7 +55,7 @@ uv run examples/run_grpo.py \
 
 ```bash
 COMMAND="uv run examples/run_grpo.py \
-  --config examples/modelopt/qa_grpo_llama8b_megatron.yaml \
+  --config examples/modelopt/qa_grpo_llama8b_megatron.v2.yaml \
   policy.model_name=meta-llama/Llama-3.1-8B-Instruct \
   checkpointing.checkpoint_dir=results/qa_grpo" \
 CONTAINER=YOUR_CONTAINER \

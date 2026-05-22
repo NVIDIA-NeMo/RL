@@ -30,6 +30,7 @@ from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
 )
+from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
@@ -149,10 +150,7 @@ def setup(
     )
 
     if last_checkpoint_path is not None:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
-        )
-        train_dataloader.load_state_dict(dataloader_state_dict)
+        load_dataloader_state(train_dataloader, last_checkpoint_path, data_config)
 
     if val_dataset is not None:
         val_dataloader = StatefulDataLoader(
