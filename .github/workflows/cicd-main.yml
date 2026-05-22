@@ -753,9 +753,7 @@ jobs:
               (
                 needs.pre-flight.outputs.test_level != 'none' &&
                 needs.sphinx-build.result == 'success' &&
-                (needs.check-uv-cache.result == 'success' || needs.check-uv-cache.result == 'skipped') &&
                 (needs.build-container.result == 'success' || needs.build-container.result == 'skipped') &&
-                (needs.check-uv-cache-gb200.result == 'success' || needs.check-uv-cache-gb200.result == 'skipped') &&
                 (needs.build-container-gb200.result == 'success' || needs.build-container-gb200.result == 'skipped') &&
                 (
                   (
