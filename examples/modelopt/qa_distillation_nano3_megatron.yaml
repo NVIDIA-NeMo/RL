@@ -1,9 +1,9 @@
 # Nano3 Quantization-Aware Distillation / OPD (QADOPD) with Megatron,
 # vLLM, and ModelOpt.
 #
-# The student policy and rollout worker use Nano3 NVFP4 weight-only
-# quantization; the teacher stays BF16. This keeps the on-policy distillation
-# target full precision while training the quantized student in the same loop.
+# The student policy and rollout worker use Nano3 NVFP4 W4A4 quantization; the
+# teacher stays BF16. This keeps the on-policy distillation target full
+# precision while training the quantized student in the same loop.
 #
 # Example usage:
 #   uv run examples/run_distillation.py --config examples/modelopt/qa_distillation_nano3_megatron.yaml
@@ -37,8 +37,9 @@ policy:
   offload_optimizer_for_logprob: true
 
   # Nano3 is a hybrid MoE/Mamba model. This recipe keeps attention and the
-  # known Nano3-sensitive layers in BF16, while applying NVFP4 to weights.
-  quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml"
+  # known Nano3-sensitive layers in BF16, while applying NVFP4 to weights and
+  # layer-input activations.
+  quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_default.yaml"
   quant_calib_data: "cnn_dailymail"
   quant_calib_size: 512
   quant_batch_size: 1
@@ -75,7 +76,7 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
-    quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml"
+    quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_default.yaml"
     vllm_cfg:
       tensor_parallel_size: 4
       pipeline_parallel_size: 1
