@@ -112,6 +112,7 @@ class DTensorConfig(TypedDict):
     # Model config
     lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
     automodel_kwargs: NotRequired[AutomodelKwargs]
+    load_precision: NotRequired[str]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
 

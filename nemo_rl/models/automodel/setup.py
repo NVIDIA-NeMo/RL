@@ -56,6 +56,12 @@ STRING_TO_DTYPE = {
 }
 
 
+def _precision_to_dtype(precision: str, field_name: str) -> torch.dtype:
+    if precision not in STRING_TO_DTYPE:
+        raise ValueError(f"Unknown {field_name}: {precision}")
+    return STRING_TO_DTYPE[precision]
+
+
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     """Validate and maybe auto-set force_hf based on adapter compatibility.
 
@@ -259,9 +265,11 @@ def validate_and_prepare_config(
 
     # Parse precision
     precision = config["precision"]
-    if precision not in STRING_TO_DTYPE:
-        raise ValueError(f"Unknown precision: {precision}")
-    dtype = STRING_TO_DTYPE[precision]
+    dtype = _precision_to_dtype(precision, "precision")
+    load_precision = config["dtensor_cfg"].get("load_precision", "float32")
+    model_load_dtype = _precision_to_dtype(
+        load_precision, "dtensor_cfg.load_precision"
+    )
 
     # Get other configuration values
     cpu_offload = config["dtensor_cfg"]["cpu_offload"]
@@ -302,7 +310,10 @@ def validate_and_prepare_config(
     # Load model config
     model_config = AutoConfig.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,  # Always load in float32 for master weights
+        # Default remains float32 to preserve previous master-weight behavior.
+        # Reference/teacher workers can set dtensor_cfg.load_precision=bfloat16
+        # to reduce initialization and resident parameter memory.
+        torch_dtype=model_load_dtype,
         trust_remote_code=True,
         attn_implementation="flash_attention_2" if enable_seq_packing else None,
         **hf_config_overrides,
@@ -364,6 +375,7 @@ def validate_and_prepare_config(
         model_class=model_class,
         model_config=model_config,
         hf_config_overrides=hf_config_overrides,
+        model_load_dtype=model_load_dtype,
         allow_flash_attn_args=allow_flash_attn_args,
         attn_impl=attn_impl,
         dtype=dtype,
@@ -533,6 +545,7 @@ def setup_model_and_optimizer(
     attn_impl = runtime_config.attn_impl
     cpu_offload = runtime_config.cpu_offload
     is_reward_model = runtime_config.is_reward_model
+    model_load_dtype = runtime_config.model_load_dtype
 
     # Extract distributed configuration from context
     rank = torch.distributed.get_rank()
@@ -596,7 +609,10 @@ def setup_model_and_optimizer(
         cfg_dict_with_dtype = {**lora_cfg, "lora_dtype": "torch.float32"}
         peft_config = PeftConfig.from_dict(cfg_dict_with_dtype)
 
-    print(f"[Rank {rank}] Initializing model via from_pretrained...")
+    print(
+        f"[Rank {rank}] Initializing model via from_pretrained "
+        f"(load_dtype={model_load_dtype}, precision={runtime_config.dtype})..."
+    )
 
     # Prepare automodel kwargs
     automodel_kwargs = config["dtensor_cfg"].get("automodel_kwargs", {})
@@ -668,7 +684,7 @@ def setup_model_and_optimizer(
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
         peft_config=peft_config,
         attn_implementation=attn_impl,
-        torch_dtype=str(model_config.torch_dtype),
+        torch_dtype=model_load_dtype,
         trust_remote_code=True,
         sdpa_method=sdpa_method,
         **from_pretrained_kwargs,
