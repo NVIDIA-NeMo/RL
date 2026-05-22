@@ -863,7 +863,6 @@ def setup(
                     ray_namespace=ray_namespace,
                     initial_global_config_dict=nemo_gym_dict,
                     invalid_tool_call_patterns=env_configs.get("nemo_gym", {}).get("invalid_tool_call_patterns", None),
-                    enforce_monotonicity=generation_config.get("vllm_cfg", {}).get("enforce_monotonicity", True),
                 )
                 nemo_gym_opts = {}
                 if nemo_gym_num_nodes:
