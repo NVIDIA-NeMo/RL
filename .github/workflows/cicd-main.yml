@@ -43,7 +43,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  container-registry-gb200: ${{ vars.GB200_CONTAINER_REGISTRY || 'us-east4-docker.pkg.dev/nv-projdgxchipp-20260113193621/rl' }}
+  GB200_CONTAINER_REGISTRY: ${{ vars.GB200_CONTAINER_REGISTRY }}
 
 jobs:
   pre-flight:
@@ -188,12 +188,12 @@ jobs:
   org-member-pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.80.1
     with:
-      default_runner_prefix: nemo-ci-aws-gpu-x2
-      non_nvidia_runner_prefix: nemo-ci-aws-gpu-x2-ephemeral
-      default_test_data_path: /mnt/datadrive/TestData/nemo-fw/TestData
-      non_nvidia_test_data_path: /mnt/datadrive/TestData/nemo-fw/TestData
-      default_registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
-      non_nvidia_registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
+      default_runner_prefix: ${{ vars.DEFAULT_H100_RUNNER }}
+      non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_H100_RUNNER }}
+      default_test_data_path: ${{ vars.DEFAULT_H100_TEST_DATA_PATH }}
+      non_nvidia_test_data_path: ${{ vars.NON_NVIDIA_H100_TEST_DATA_PATH }}
+      default_registry: ${{ vars.DEFAULT_H100_CONTAINER_REGISTRY }}
+      non_nvidia_registry: ${{ vars.NON_NVIDIA_H100_CONTAINER_REGISTRY }}
       sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
     secrets:
       NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
@@ -206,7 +206,7 @@ jobs:
       - name: Configure GB200 registry
         id: config
         env:
-          GB200_REGISTRY: ${{ env.container-registry-gb200 }}
+          GB200_REGISTRY: ${{ env.GB200_CONTAINER_REGISTRY }}
         run: echo "registry=$GB200_REGISTRY" | tee -a "$GITHUB_OUTPUT"
 
   pr-branch-up-to-date-check:
@@ -393,7 +393,7 @@ jobs:
       build-ref: ${{ needs.pre-flight.outputs.test_sha }}
       image-name: ${{ vars.CI_CONTAINER_NAME }}
       dockerfile: docker/Dockerfile
-      runner: nemo-ci-gcp-gpu-x2
+      runner: ${{ vars.GB200_RUNNER }}
       image-label: ${{ vars.CI_CONTAINER_NAME }}
       target: release
       registry: ${{ needs.gb200-config.outputs.registry }}
@@ -448,7 +448,7 @@ jobs:
         vars.UV_BUILD_CACHE == 'true' &&
         needs.build-container-gb200.result == 'success'
       }}
-    runs-on: nemo-ci-gcp-gpu-x2
+    runs-on: ${{ vars.GB200_RUNNER }}
     env:
       REGISTRY: ${{ needs.gb200-config.outputs.registry }}
       IMAGE_NAME: ${{ vars.CI_CONTAINER_NAME }}
@@ -683,32 +683,32 @@ jobs:
       matrix:
         include:
           - script: L1_Functional_Tests_Megatron_1
-            runner: nemo-ci-gcp-gpu-x2
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Megatron_2
-            runner: nemo-ci-gcp-gpu-x2
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Megatron_3
-            runner: nemo-ci-gcp-gpu-x2
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_AutoModel
-            runner: nemo-ci-gcp-gpu-x2
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_SGLang
-            runner: nemo-ci-gcp-gpu-x2
+            runner: ${{ vars.GB200_RUNNER }}
             uses_sglang: true
           - script: L1_Functional_Tests_Gym
-            runner: nemo-ci-gcp-gpu-x2
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_GRPO_1
-            runner: nemo-ci-gcp-gpu-x2
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_GRPO_2
-            runner: nemo-ci-gcp-gpu-x2
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_GRPO_3
-            runner: nemo-ci-gcp-gpu-x2
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_SFT
-            runner: nemo-ci-gcp-gpu-x2
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Eval
-            runner: nemo-ci-gcp-gpu-x2
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Other_1
-            runner: nemo-ci-gcp-gpu-x2
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Other_2
-            runner: nemo-ci-gcp-gpu-x2
+            runner: ${{ vars.GB200_RUNNER }}
     needs: [pre-flight, build-container-gb200, cicd-unit-tests, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
     runs-on: ${{ matrix.runner }}
     if: >-
