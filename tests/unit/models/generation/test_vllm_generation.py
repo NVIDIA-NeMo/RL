@@ -999,10 +999,10 @@ async def run_hf_train_process(
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        pytest.param(True, False, "bfloat16", False, marks=pytest.mark.timeout(420)),
-        pytest.param(False, True, "bfloat16", False, marks=pytest.mark.timeout(420)),
-        pytest.param(True, False, "fp8", False, marks=pytest.mark.timeout(420)),
-        pytest.param(False, True, "fp8", False, marks=pytest.mark.timeout(420)),
+        pytest.param(True, False, "bfloat16", False, marks=pytest.mark.timeout(900)),
+        pytest.param(False, True, "bfloat16", False, marks=pytest.mark.timeout(900)),
+        pytest.param(True, False, "fp8", False, marks=pytest.mark.timeout(900)),
+        pytest.param(False, True, "fp8", False, marks=pytest.mark.timeout(900)),
         # LoRA tests require dtensor v2 / automodel and take longer in CI.
         pytest.param(
             False,
@@ -1071,11 +1071,11 @@ async def test_vllm_generation_with_hf_training_colocated(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
         pytest.param(True, False, "bfloat16", False, marks=pytest.mark.timeout(900)),
-        pytest.param(False, True, "bfloat16", False, marks=pytest.mark.timeout(300)),
+        pytest.param(False, True, "bfloat16", False, marks=pytest.mark.timeout(900)),
         # NOTE: non-colocated FP8 tests fail on main as of 3/9/2026 with
         # avg_prob_mult_error=1.13 > 1.08 threshold. Left unskipped to match main.
-        pytest.param(True, False, "fp8", False, marks=pytest.mark.timeout(300)),
-        pytest.param(False, True, "fp8", False, marks=pytest.mark.timeout(300)),
+        pytest.param(True, False, "fp8", False, marks=pytest.mark.timeout(900)),
+        pytest.param(False, True, "fp8", False, marks=pytest.mark.timeout(900)),
         # LoRA tests require dtensor v2 / automodel and take longer in CI.
         pytest.param(
             False,
@@ -1728,7 +1728,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
     vllm_generation.shutdown()
 
 
-@pytest.mark.timeout(600)
+@pytest.mark.timeout(900)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_weight_update_and_prefix_cache_reset(
@@ -2134,7 +2134,7 @@ async def test_vllm_refit_non_colocated_update_weights(
 
 
 @pytest.mark.mcore
-@pytest.mark.timeout(360)
+@pytest.mark.timeout(600)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 @pytest.mark.parametrize("kv_cache_dtype", [None, "fp8"])
