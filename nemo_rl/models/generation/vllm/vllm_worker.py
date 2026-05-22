@@ -259,6 +259,7 @@ class BaseVllmGenerationWorker:
                 "        self.lm_head = ParallelLMHead(\n"
                 "            self.config.draft_vocab_size,\n"
                 "            self.config.hidden_size,\n"
+                "            quant_config=get_draft_quant_config(vllm_config),\n"
                 '            prefix=maybe_prefix(prefix, "lm_head"),\n'
                 "        )\n"
                 "        self.logits_processor = LogitsProcessor(\n"
@@ -268,6 +269,7 @@ class BaseVllmGenerationWorker:
                 "        self.lm_head = ParallelLMHead(\n"
                 "            self.config.draft_vocab_size,\n"
                 "            self.config.hidden_size,\n"
+                "            quant_config=get_draft_quant_config(vllm_config),\n"
                 '            prefix=maybe_prefix(prefix, "lm_head"),\n'
                 "        )\n"
                 "        self.has_own_lm_head = (\n"
