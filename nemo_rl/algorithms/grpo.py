@@ -58,7 +58,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.utils import extract_necessary_env_names
+from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -319,10 +319,7 @@ def setup(
             num_workers=data_config["num_workers"],
         )
         if last_checkpoint_path is not None:
-            dataloader_state_dict = torch.load(
-                os.path.join(last_checkpoint_path, f"train_dataloader{suffix}.pt")
-            )
-            dataloader.load_state_dict(dataloader_state_dict)
+            load_dataloader_state(dataloader, last_checkpoint_path, data_config, suffix)
         return dataloader
 
     if data_config["use_multiple_dataloader"]:
@@ -1586,7 +1583,11 @@ def grpo_train(
                             max_rollout_turns=master_config.grpo["max_rollout_turns"],
                             greedy=False,
                         )
-                    policy_generation.finish_generation()
+                    policy_generation.finish_generation(
+                        discard_weights=colocated_inference
+                    )
+                    if colocated_inference:
+                        POLICY_GENERATION_STALE = True
                     # Collect generation logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each worker
                     if policy_generation is not None:
@@ -1616,6 +1617,17 @@ def grpo_train(
                     rewards = repeated_batch["total_reward"]
 
                     print("▶ Computing advantages...", flush=True)
+                    # For DAPO with reward shaping, compute std on the raw
+                    # pre-shaping reward so dynamic sampling filters prompt
+                    # groups on the raw task metric (e.g. acc) instead of on
+                    # length-dependent shaped reward variance. Baseline
+                    # (which drives advantages) stays on the shaped reward.
+                    std_rewards = (
+                        repeated_batch["unshaped_total_reward"]
+                        if master_config.grpo["use_dynamic_sampling"]
+                        and "unshaped_total_reward" in repeated_batch
+                        else None
+                    )
                     if master_config.grpo.get("calculate_advantages_on_gpu"):
                         print("Computing advantages on GPU!")
                         # Just fix the device id for now
@@ -1627,6 +1639,11 @@ def grpo_train(
                             leave_one_out_baseline=master_config.grpo[
                                 "use_leave_one_out_baseline"
                             ],
+                            std_rewards=(
+                                std_rewards.cuda(device_id)
+                                if std_rewards is not None
+                                else None
+                            ),
                         )
                         baseline = baseline.cpu()
                         std = std.cpu()
@@ -1638,6 +1655,7 @@ def grpo_train(
                             leave_one_out_baseline=master_config.grpo[
                                 "use_leave_one_out_baseline"
                             ],
+                            std_rewards=std_rewards,
                         )
 
                     # Apply dynamic sampling to filter prompts with non-zero std (DAPO algorithm)
@@ -2415,6 +2433,39 @@ def validate(
     return val_metrics, timing_metrics
 
 
+def aggregate_rollout_metrics(
+    per_group_metrics: dict[str, list],
+) -> dict[str, Any]:
+    """Aggregate rollout metrics from multiple trajectory groups.
+
+    Different metric types are aggregated according to their semantics:
+    - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
+    - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
+    - "total_turns": summed
+    - Non-numeric values: passed through as-is
+    - All other numeric metrics: averaged
+
+    Args:
+        per_group_metrics: A dict mapping metric names to lists of per-group values.
+
+    Returns:
+        A dict mapping metric names to their aggregated scalar values.
+    """
+    aggregated = {}
+    for k, v in per_group_metrics.items():
+        if not isinstance(v[0], (int, float)):
+            aggregated[k] = v
+        elif k.endswith("/min") or (k.startswith("min_") and not k.endswith("_rate")):
+            aggregated[k] = min(v)
+        elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
+            aggregated[k] = max(v)
+        elif k == "total_turns":
+            aggregated[k] = sum(v)
+        else:
+            aggregated[k] = sum(v) / len(v)
+    return aggregated
+
+
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -2747,16 +2798,12 @@ def async_grpo_train(
                     # Concatenate per-prompt groups into a single training batch
                     per_prompt_batches = [t["batch"] for t in trajectories]
                     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
-                    # Aggregate rollout metrics across groups (simple mean where applicable)
-                    rollout_metrics = {}
+                    # Aggregate rollout metrics across groups with proper aggregation per metric type
+                    per_group_metrics = {}
                     for t in trajectories:
                         for k, v in t["rollout_metrics"].items():
-                            rollout_metrics.setdefault(k, []).append(v)
-                    # TODO: this simple averaging might cause misleading information for such data as max_gen_tokens, etc.
-                    rollout_metrics = {
-                        k: (sum(v) / len(v) if isinstance(v[0], (int, float)) else v)
-                        for k, v in rollout_metrics.items()
-                    }
+                            per_group_metrics.setdefault(k, []).append(v)
+                    rollout_metrics = aggregate_rollout_metrics(per_group_metrics)
 
                 # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
                 expected_batch_size = (

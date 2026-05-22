@@ -29,6 +29,7 @@ policy:
     context_parallel_size: 2
     expert_model_parallel_size: 16
     activation_checkpointing: true
+    moe_grouped_gemm: true
     num_layers_in_first_pipeline_stage: 11
     num_layers_in_last_pipeline_stage: 11
     defer_fp32_logits: true
