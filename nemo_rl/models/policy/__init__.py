@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict, Union
+from typing import Any, Literal, NotRequired, Optional, TypedDict, Union
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
@@ -249,7 +249,7 @@ class MegatronConfig(TypedDict):
     # "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm",
     # "expert_fc1", "moe_act". Note: "attn_proj" requires "core_attn".
     # See: https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L1440-L1448
-    offload_modules: NotRequired[list[str]]
+    offload_modules: NotRequired[Optional[list[str]]]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
