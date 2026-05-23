@@ -48,6 +48,12 @@ Based on the answers, select the reference pattern:
 - Single-turn → follow the math environment pattern
 - Multi-turn → follow the sliding puzzle pattern
 
+**Critical: calibrate task difficulty for the model size.** Small models (0.6B-1.5B) need tasks they can partially solve from the start. If the model gets 0% reward for the first 20+ steps, GRPO cannot learn (there's no signal to reinforce). Guidelines:
+- For games/puzzles: start with the easiest variant (small word list, small board, few constraints). You can increase difficulty later.
+- For multi-turn tasks: reward partial progress (e.g., 0.5 for getting close, not just 1.0 for perfect).
+- Test: run 5 steps and check if `mean_reward > 0.0`. If not, simplify the task before continuing.
+- Example: Wordle with 200 words and a 0.6B model gets 0% reward — too hard. Use 20-30 very common words, or add partial rewards for correct letters.
+
 ### Stage 2: Model Selection
 
 Ask the user to choose a model. Recommend starting with a small model for fast iteration:
