@@ -243,6 +243,13 @@ Key multi-turn differences:
 - `terminateds` is `False` until the episode ends.
 - `observations` contain rendered state for the next turn.
 - `next_stop_strings` tells the model when to stop generating.
+- Set `max_rollout_turns` in the GRPO config to at least the max number of turns in the environment (e.g., 50 for sliding puzzle, 6 for Wordle).
+
+For complex multi-turn environments (e.g., tool use, multi-agent), see `nemo_rl/environments/tau_bench_environment.py` (PR #2479) as a reference:
+- Use Ray workers (`chunk_list_to_workers`) for parallel execution across the batch.
+- Track per-episode state in the metadata `TypedDict` (episode ID, step count, etc.).
+- Override `obs_use_chat_template() -> True` if observations use standard chat roles ("user", "tool") rather than the custom "environment" role.
+- For environments that need external LLM calls (user simulators, judges), include mock modes for fast iteration without API dependencies.
 
 #### Register the environment
 
@@ -381,9 +388,64 @@ If reward is flat at 0.0:
 - The task may be too hard for the model. Try an easier variant or a more capable model.
 - The reward function may have a bug. Test it manually with known-good and known-bad answers.
 - The data processor may not be formatting prompts correctly. Inspect the tokenized output.
+- For RLHF with reward models: the reward model may not differentiate well at this quality level. Try a different reward model or add reward scaling.
 
 If reward is flat at 1.0:
 - The task is too easy or the reward function always returns 1.0. Verify the check logic.
+
+If reward oscillates or doesn't converge:
+- Reduce learning rate (try `5e-7` instead of `5e-6`).
+- Increase `num_generations_per_prompt` for better advantage estimation (16 or 32).
+- Enable `use_leave_one_out_baseline: true` for variance reduction.
+- For multi-turn tasks: check if the environment returns intermediate rewards properly and that metadata state is carried correctly between turns.
+- Consider increasing `reference_policy_kl_penalty` to prevent the policy from diverging too far from the reference.
+
+### Stage 8b: Using an Existing Reward Model (RLHF)
+
+NeMo-RL has a built-in `reward_model` environment for RLHF training. Instead of writing a custom verification function, you can use a pre-trained reward model (e.g., Skywork, ArmoRM) to score model outputs.
+
+**When to use**: The task has no deterministic verification (e.g., open-ended instruction following, helpfulness, safety alignment).
+
+**How to configure**:
+
+1. Use `env_name: "reward_model"` in the data config.
+2. The reward model environment **requires DTensor** (`dtensor_cfg.enabled: true`). The Megatron path is **not supported**.
+3. The reward model must be a Bradley-Terry model compatible with `AutoModelForSequenceClassification`.
+4. Disable dynamic batching and sequence packing for the reward model.
+
+Example config additions:
+```yaml
+data:
+  default:
+    env_name: "reward_model"
+
+env:
+  reward_model:
+    enabled: true
+    model_name: "Skywork/Skywork-Reward-V2-Qwen3-0.6B"  # or another HF reward model
+    precision: "bfloat16"
+    batch_size: 4
+    reward_model_cfg:
+      enabled: true
+      reward_model_type: "bradley_terry"
+    dtensor_cfg:
+      enabled: true
+      cpu_offload: false
+      activation_checkpointing: false
+    resources:
+      gpus_per_node: 1
+      num_nodes: 1
+    dynamic_batching:
+      enabled: false
+    sequence_packing:
+      enabled: false
+```
+
+**Supported reward models**: Any HuggingFace model that works with `AutoModelForSequenceClassification`, including:
+- `Skywork/Skywork-Reward-V2-Qwen3-0.6B` (small, fast)
+- `Skywork/Skywork-Reward-Llama-3.1-8B-v0.2` (more capable)
+
+**Limitation**: Only the DTensor backend is supported. Megatron-based reward models are not supported (tracked in issue #1154).
 
 ### Stage 9: Scale to 8 GPU (optional)
 
