@@ -450,8 +450,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
         }
-        # Collect MoE aux metrics averaged across microbatches
-        num_moe_experts = getattr(self.model.config, "num_moe_experts", None)
+        # Read "config" via getattr-by-string so the token stays out of
+        # train.__code__.co_names; with torch 2.11 cloudpickle otherwise
+        # matches torch.distributed.config (a non-pickleable ConfigModuleInstance).
+        model_config = getattr(self.model, "config", None)
+        num_moe_experts = getattr(model_config, "num_moe_experts", None)
         if num_moe_experts is not None and num_moe_experts > 1:
             moe_loss_scale = 1.0 / max(1, total_num_microbatches)
             moe_metrics = get_moe_metrics(
@@ -765,9 +768,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             data: BatchedDataDict containing input_ids and input_lengths tensors
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
-                - output_ids: input + generated token IDs
-                - logprobs: Log probabilities for each token
-                - generation_lengths: Lengths of each response
+                - ``output_ids``: input + generated token IDs
+                - ``logprobs``: Log probabilities for each token
+                - ``generation_lengths``: Lengths of each response
         """
         # 512 bATCH SIZE (200 tokens)
         no_grad = torch.no_grad()
