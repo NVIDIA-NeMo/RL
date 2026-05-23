@@ -354,6 +354,8 @@ uv run python examples/run_grpo.py --config examples/configs/grpo_<task_name>.ya
 1. Parse args and load config.
 2. Initialize Ray and tokenizer.
 3. Set up dataset (IterableDataset) and environment (Ray actor).
+
+**Important**: After `config = MasterConfig(**config)`, use **attribute access** for top-level config sections: `config.grpo["seed"]`, `config.policy["tokenizer"]`, `config.env`, etc. Do **not** use `config["grpo"]` — `MasterConfig` wraps sub-dicts as attributes.
 4. Call `setup()` and `grpo_train()` from `nemo_rl.algorithms.grpo`.
 
 ### Stage 8: Validate on 1 GPU
