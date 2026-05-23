@@ -18,7 +18,7 @@ import torch
 from tqdm.auto import tqdm
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
-from nemo_rl.utils.x_token._shared import (
+from tools.x_token._shared import (
     clean_model_name_for_filename,
     project_token_likelihoods,
     sinkhorn_one_dim,

@@ -57,6 +57,29 @@ The projection matrix is a sparse `[V_student, top_k]` tensor that the
 training-time loss multiplies against the student logits to project them into
 the teacher's vocab space (or vice versa, depending on the loss mode).
 
+## Quickstart — single command
+
+For the typical case, `tools/x_token/build_projection_matrix.sh` chains
+the four prep steps with auto-derived intermediate paths:
+
+```bash
+./tools/x_token/build_projection_matrix.sh \
+    --student-model meta-llama/Llama-3.2-1B \
+    --teacher-model Qwen/Qwen3-4B \
+    --runtime-top-k 4
+```
+
+The wrapper writes the final matrix to
+`cross_tokenizer_data/projection_matrix_<student>_<teacher>_top<N>.pt`
+(override with `--final-output`). Pass `--skip-exact-map` to skip the
+optional Step 3, or `--no-{scale-trick,reverse-pass,special-token-mapping}`
+to tweak Step 2 defaults. Run `./tools/x_token/build_projection_matrix.sh
+--help` for the full flag list.
+
+The per-step recipes below are for advanced customization (non-default
+weight thresholds, custom embedding model, hand-picked intermediate
+filenames, etc.).
+
 ## Backend and scope
 
 - **DTensor V2 only.** Set `policy.dtensor_cfg.enabled=true` and
@@ -75,7 +98,7 @@ with a small embedding LLM (or a sentence-transformers model), and stores the
 top-`k` teacher tokens by cosine similarity for each student token.
 
 ```bash
-uv run python -m nemo_rl.utils.x_token.minimal_projection_generator \
+uv run python -m tools.x_token.minimal_projection_generator \
     --student-model "meta-llama/Llama-3.2-1B" \
     --teacher-model "Qwen/Qwen3-4B" \
     --top_k 32 \
@@ -102,7 +125,7 @@ weighted entries to the projection. With `--enable-reverse-pass` it also
 does the symmetric teacher → student walk.
 
 ```bash
-uv run python -m nemo_rl.utils.x_token.minimal_projection_via_multitoken \
+uv run python -m tools.x_token.minimal_projection_via_multitoken \
     --student-model "meta-llama/Llama-3.2-1B" \
     --teacher-model "Qwen/Qwen3-4B" \
     --initial-projection-path cross_tokenizer_data/temp_projection_map_Llama-3.2_to_Qwen3_top_32.pt \
@@ -128,7 +151,7 @@ ASCII characters). `reapply_exact_map.py` pins those to 1-to-1 mappings with
 weight 1.0, overwriting whatever Steps 1–2 produced for them.
 
 ```bash
-uv run python -m nemo_rl.utils.x_token.reapply_exact_map \
+uv run python -m tools.x_token.reapply_exact_map \
     --student-model "meta-llama/Llama-3.2-1B" \
     --teacher-model "Qwen/Qwen3-4B" \
     --initial-projection-path cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special.pt
@@ -142,7 +165,7 @@ The training loss only needs a small `top_k` per row (typical: 4–8). This
 step sorts each row by weight and trims to the chosen runtime cap.
 
 ```bash
-uv run python -m nemo_rl.utils.x_token.sort_and_cut_projection_matrix \
+uv run python -m tools.x_token.sort_and_cut_projection_matrix \
     --initial-projection-path cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special_exact_map_remapped.pt \
     --top_k 4 \
     --output_path cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
@@ -204,10 +227,10 @@ training environment so the in-tree HuggingFace implementation is used.
 
 | Stage | Tool | Default output |
 |---|---|---|
-| Generate base | `nemo_rl/utils/x_token/minimal_projection_generator.py` | `<data_dir>/temp_projection_map_<student>_to_<teacher>_top_<N>.pt` |
-| Add multi-token | `nemo_rl/utils/x_token/minimal_projection_via_multitoken.py` | `<output_dir>/projection_map_<student>_to_<teacher>_multitoken_top_<N>_double[_special].pt` |
-| Reapply exact map | `nemo_rl/utils/x_token/reapply_exact_map.py` | `<input>_exact_map_remapped.pt` |
-| Sort and trim | `nemo_rl/utils/x_token/sort_and_cut_projection_matrix.py` | `<input_dir>/<basename>_top_<N>_sorted[_preservelast].pt` (or `--output_path`) |
+| Generate base | `tools/x_token/minimal_projection_generator.py` | `<data_dir>/temp_projection_map_<student>_to_<teacher>_top_<N>.pt` |
+| Add multi-token | `tools/x_token/minimal_projection_via_multitoken.py` | `<output_dir>/projection_map_<student>_to_<teacher>_multitoken_top_<N>_double[_special].pt` |
+| Reapply exact map | `tools/x_token/reapply_exact_map.py` | `<input>_exact_map_remapped.pt` |
+| Sort and trim | `tools/x_token/sort_and_cut_projection_matrix.py` | `<input_dir>/<basename>_top_<N>_sorted[_preservelast].pt` (or `--output_path`) |
 | Train | `examples/run_xtoken_distillation.py` | per the run's `logger.log_dir` and `checkpointing.checkpoint_dir` |
 
 ## Related

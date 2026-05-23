@@ -17,7 +17,7 @@ import os
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from nemo_rl.utils.x_token._shared import apply_canonicalization_if_enabled
+from tools.x_token._shared import apply_canonicalization_if_enabled
 
 
 def parse_arguments():

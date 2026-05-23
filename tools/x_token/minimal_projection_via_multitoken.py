@@ -20,7 +20,7 @@ import torch
 import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
-from nemo_rl.utils.x_token._shared import (
+from tools.x_token._shared import (
     apply_canonicalization_if_enabled,
     clean_model_name_for_filename,
     sinkhorn_one_dim,

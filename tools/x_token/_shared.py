@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Helpers shared across the projection-prep CLIs in ``nemo_rl.utils.x_token``.
+"""Helpers shared across the projection-prep CLIs in ``tools.x_token``.
 
 These are not on the training import path — they're only invoked by the
 standalone CLI tools that build projection matrices for cross-tokenizer
