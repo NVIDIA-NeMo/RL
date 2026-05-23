@@ -307,11 +307,16 @@ def setup(
     # ==========================
     #         Loss
     # ==========================
-    # Inject the teacher's full vocab size so the projection matrix's V_t
-    # axis covers every teacher id the loss fn's exact-token map / P-KL
-    # global top-k can pick. `len(tokenizer)` is what HF treats as the
-    # embedding/lm_head dim.
-    loss_config = {**loss_config, "teacher_vocab_size": len(teacher_tokenizer)}
+    # Inject both tokenizer vocab sizes so the projection matrix's V_s
+    # and V_t axes match `logits.shape[-1]` exactly, instead of being
+    # recovered from the highest ids that happen to appear in the sparse
+    # projection file. `len(tokenizer)` is what HF treats as the
+    # embedding / lm_head dim.
+    loss_config = {
+        **loss_config,
+        "student_vocab_size": len(student_tokenizer),
+        "teacher_vocab_size": len(teacher_tokenizer),
+    }
     loss_fn = CrossTokenizerDistillationLossFn(loss_config)
 
     print("\n" + "=" * 60)

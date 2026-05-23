@@ -1095,6 +1095,18 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
         ce_loss_scale: Scalar multiplier on the CE term (P-KL path).
         dynamic_loss_scaling: If True, rescale KL each step so its detached
             magnitude matches CE (P-KL path).
+        student_vocab_size: Full student tokenizer vocab size, used to size
+            the projection matrix's student-side (V_s) axis. Runtime-injected
+            by ``xtoken_distillation.setup`` from ``len(student_tokenizer)``;
+            not a user knob in YAML. Sizing V_s from the configured tokenizer
+            vocab (rather than ``max(observed student_id) + 1`` from the
+            sparse projection file) keeps V_s in lockstep with
+            ``logits.shape[-1]`` when the file's highest student ids happen
+            to be absent.
+        teacher_vocab_size: Full teacher tokenizer vocab size, used to size
+            the projection matrix's teacher-side (V_t) axis. Runtime-injected
+            symmetrically to ``student_vocab_size`` from
+            ``len(teacher_tokenizer)``; not a user knob in YAML.
     """
 
     projection_matrix_path: str
@@ -1109,6 +1121,7 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
     kl_loss_weight: float
     ce_loss_scale: float
     dynamic_loss_scaling: bool
+    student_vocab_size: int
     teacher_vocab_size: int
 
 
@@ -1458,7 +1471,10 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # context wraps loss.backward(), so a plain `.float()` cast isn't
         # enough — the backward kernel is still dispatched as BF16.
         M = get_sparse_projection_matrix(
-            self.projection_matrix_path, device, self.cfg["teacher_vocab_size"],
+            self.projection_matrix_path,
+            device,
+            student_vocab_size=self.cfg["student_vocab_size"],
+            teacher_vocab_size=self.cfg["teacher_vocab_size"],
         )  # [V_s, V_t] sparse COO, fp32
         flat = student_probs.reshape(b * t_s, v_s)
         # Fp32SparseMM internally computes M.t() @ dense; passing M (not
@@ -1573,7 +1589,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
            shared helper.
         4. Slice each chunk-averaged tensor to ``common_*`` indices and
            compute (forward or reverse) KL, reduced as
-           ``sum / chunk_mask.sum()``.
+           ``sum / valid_chunk.sum()`` where ``valid_chunk`` is the
+           geometric chunk mask AND'd with ``sample_mask`` (mirrors the
+           P-KL path).
         5. Slice to ``uncommon_*`` indices, ``.exp()`` to probs, sort/topk
            descending (capped at ``cfg['uncommon_topk']``), truncate to
            ``min(student_len, teacher_len)``, L1 with ``reduction="none"``
@@ -1619,8 +1637,12 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         )  # [B, C, V_t] / [B, C]
 
         chunk_mask = valid_chunk_mask(s_sizes, t_sizes, pair_valid)
+        # Match the P-KL path: a chunk only contributes if its alignment is
+        # geometrically valid AND its sample isn't masked out by sample_mask.
+        sample_mask = data["sample_mask"]  # [B]
+        valid_chunk = chunk_mask & sample_mask.bool().unsqueeze(-1)
         zero_dtype = student_log_probs.dtype
-        if not chunk_mask.any():
+        if not valid_chunk.any():
             zero = torch.zeros((), device=device, dtype=zero_dtype)
             return (
                 zero,
@@ -1644,8 +1666,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                     student_common, teacher_common,
                     reduction="none", log_target=True,
                 )
-            kl_per_chunk = kl_per_elem.sum(dim=-1) * chunk_mask  # [B, C]
-            kl_common = kl_per_chunk.sum() / chunk_mask.sum().float().clamp(
+            kl_per_chunk = kl_per_elem.sum(dim=-1) * valid_chunk  # [B, C]
+            kl_common = kl_per_chunk.sum() / valid_chunk.sum().float().clamp(
                 min=1.0
             )
         else:
@@ -1658,8 +1680,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # -------------------- L1 on uncommon ----------------------
         uncommon_topk = cfg["uncommon_topk"]
         if uncommon_s.numel() > 0 or uncommon_t.numel() > 0:
-            student_unc = student_chunks[:, :, uncommon_s][chunk_mask]   # [N_valid, N_u_s]
-            teacher_unc = teacher_chunks[:, :, uncommon_t][chunk_mask]   # [N_valid, N_u_t]
+            student_unc = student_chunks[:, :, uncommon_s][valid_chunk]   # [N_valid, N_u_s]
+            teacher_unc = teacher_chunks[:, :, uncommon_t][valid_chunk]   # [N_valid, N_u_t]
             n_valid = student_unc.shape[0]
             max_uncommon = min(
                 student_unc.shape[-1],
@@ -1706,13 +1728,13 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # -------------------- Top-1 accuracy ----------------------
         with torch.no_grad():
             if student_common is not None:
-                s_common_valid = student_common[chunk_mask]
-                t_common_valid = teacher_common[chunk_mask]
+                s_common_valid = student_common[valid_chunk]
+                t_common_valid = teacher_common[valid_chunk]
                 matches = (
                     s_common_valid.argmax(dim=-1)
                     == t_common_valid.argmax(dim=-1)
                 ).sum().float()
-                top1_acc = matches / chunk_mask.sum().float().clamp(min=1.0)
+                top1_acc = matches / valid_chunk.sum().float().clamp(min=1.0)
             else:
                 top1_acc = torch.zeros((), device=device, dtype=zero_dtype)
 
@@ -1721,7 +1743,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             loss,
             kl_common.detach(),
             l1_uncommon.detach(),
-            chunk_mask.sum().detach(),
+            valid_chunk.sum().detach(),
             top1_acc.detach(),
         )
 

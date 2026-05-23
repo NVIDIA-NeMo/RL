@@ -208,13 +208,14 @@ def parse_projection_file(
 # workers, and the driver process — which never enters a forward / loss
 # path — never populates them.
 #
-# Keyed by ``(path, device, teacher_vocab_size)`` for the sparse cache
-# because the sparse-COO shape's ``V_t`` is sized from
-# ``teacher_vocab_size``; same path with a different size would build a
-# different tensor. The top-k cache key is ``(path, device)`` — the raw
-# top-k arrays don't depend on a vocab-size knob.
+# Keyed by ``(path, device, student_vocab_size, teacher_vocab_size)`` for
+# the sparse cache because the sparse-COO shape's ``V_s`` and ``V_t`` are
+# both sized from the configured vocab sizes; same path with a different
+# size would build a different tensor. The top-k cache key is
+# ``(path, device)`` — the raw top-k arrays don't depend on a vocab-size
+# knob.
 _SPARSE_PROJECTION_CACHE: dict[
-    Tuple[str, torch.device, int], torch.Tensor
+    Tuple[str, torch.device, int, int], torch.Tensor
 ] = {}
 _TOPK_PROJECTION_CACHE: dict[
     Tuple[str, torch.device], Tuple[torch.Tensor, torch.Tensor]
@@ -224,32 +225,45 @@ _TOPK_PROJECTION_CACHE: dict[
 def get_sparse_projection_matrix(
     path: Union[str, os.PathLike],
     device: torch.device,
+    *,
+    student_vocab_size: int,
     teacher_vocab_size: int,
 ) -> torch.Tensor:
     """Return the sparse-COO projection matrix on ``device`` (cached).
 
     On a cache miss, parses the file via :func:`parse_projection_file`,
     drops ``-1`` teacher sentinels (illegal in sparse-COO), sizes
-    ``V_t = max(teacher_vocab_size, max_observed_teacher_idx + 1)``,
-    and builds a coalesced ``torch.sparse_coo_tensor`` on ``device``.
-    Subsequent calls with the same ``(path, device, teacher_vocab_size)``
-    return the cached tensor — no disk I/O, no re-materialization.
+    ``V_s = max(student_vocab_size, max_observed_student_idx + 1)`` and
+    ``V_t = max(teacher_vocab_size, max_observed_teacher_idx + 1)``, and
+    builds a coalesced ``torch.sparse_coo_tensor`` on ``device``.
+    Subsequent calls with the same
+    ``(path, device, student_vocab_size, teacher_vocab_size)`` return the
+    cached tensor — no disk I/O, no re-materialization.
+
+    Both vocab sizes are keyword-only to prevent a positional swap (two
+    same-magnitude ints, no error if confused).
 
     Args:
         path: Path to a ``torch.save``d projection-matrix file.
         device: Device the sparse tensor must live on.
+        student_vocab_size: Minimum width of the student-side axis.
         teacher_vocab_size: Minimum width of the teacher-side axis.
 
     Returns:
         ``torch.sparse_coo_tensor`` of shape ``(V_s, V_t)``, coalesced,
         ``dtype=float32``.
     """
-    key = (str(path), device, int(teacher_vocab_size))
+    key = (
+        str(path),
+        device,
+        int(student_vocab_size),
+        int(teacher_vocab_size),
+    )
     cached = _SPARSE_PROJECTION_CACHE.get(key)
     if cached is not None:
         return cached
 
-    indices, values, v_student, _ = parse_projection_file(path)
+    indices, values, _v_student, _ = parse_projection_file(path)
     # `_exact_map_remapped` projection files use -1 as a padding
     # sentinel for student rows that have fewer than top_k teacher
     # mappings. A negative column index is illegal in a sparse tensor
@@ -259,15 +273,23 @@ def get_sparse_projection_matrix(
     keep = indices[1] >= 0
     indices = indices[:, keep]
     values = values[keep]
-    # Use the teacher's full vocab size as V_t — not max(teacher_idx)+1.
-    # The P-KL global top-k pick happens over the teacher's full vocab,
-    # including ids the projection doesn't cover. Sizing the projected
-    # output to the full teacher vocab makes those columns all-zero
-    # (correct semantics: unmapped teacher tokens get zero projected
-    # probability) and keeps the gather in bounds.
+    # Size both axes from the configured tokenizer vocabs, not from the
+    # highest ids observed in the projection file. The sparse format
+    # only stores entries for (student_id, teacher_id) pairs that
+    # appeared during projection prep, so the highest valid vocab ids
+    # may be absent. Sizing V_s from `max(observed student_id)+1` would
+    # then make V_s < logits.shape[-1] and silently break the sparse
+    # matmul; the symmetric concern on V_t lets the P-KL global top-k
+    # gather go out of bounds. We clamp up against the projection's
+    # observed max as a defensive fallback in case the file happens to
+    # cover ids beyond the configured size.
+    projection_max_student = (
+        int(indices[0].max().item()) + 1 if indices.numel() > 0 else 0
+    )
     projection_max_teacher = (
         int(indices[1].max().item()) + 1 if indices.numel() > 0 else 0
     )
+    v_student = max(int(student_vocab_size), projection_max_student)
     v_teacher = max(int(teacher_vocab_size), projection_max_teacher)
 
     sparse = torch.sparse_coo_tensor(
