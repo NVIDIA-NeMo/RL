@@ -26,6 +26,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollouts import _calculate_single_metric, _tensorize_by_key
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -65,8 +66,18 @@ class AsyncNemoGymRolloutManager:
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
         """
+        timer = Timer()
+        timer_prefix = "timing/rollout"
+        timer.start(f"{timer_prefix}/total")
+
         rows = self._build_rows(input_sample)
-        completions, rollout_metrics = await self._run_rollouts(rows)
+        completions, rollout_metrics = await self._run_rollouts(
+            rows, timer, timer_prefix
+        )
+
+        timer.stop(f"{timer_prefix}/total")
+        rollout_metrics.update(timer.get_timing_metrics("sum"))
+
         return PromptGroupRecord(
             prompt_idx=input_sample["idx"],
             prompt=input_sample["message_log"],
@@ -128,25 +139,28 @@ class AsyncNemoGymRolloutManager:
         return rows
 
     async def _run_rollouts(
-        self, rows: list[dict]
+        self, rows: list[dict], timer: Timer, timer_prefix: str
     ) -> tuple[list[Completion], dict[str, Any]]:
         """Dispatch rows to NeMo-Gym and return completions + metrics."""
-        # Run generation.
         nemo_gym_environment = self._task_to_env["nemo_gym"]
-        results, timing_metrics = ray.get(
-            nemo_gym_environment.run_rollouts.remote(
-                rows, self._tokenizer, "timing/rollout"
-            )
-        )
 
-        # Convert results to completions.
-        completions = [self._result_to_completion(r) for r in results]
+        # Run generation.
+        with timer.time(f"{timer_prefix}/run_rollouts"):
+            results, nemo_gym_timing_metrics = ray.get(
+                nemo_gym_environment.run_rollouts.remote(
+                    rows, self._tokenizer, timer_prefix
+                )
+            )
+            # Convert results to completions.
+            completions = [self._result_to_completion(r) for r in results]
 
         # Compute rollout metrics.
-        rollout_metrics = self._compute_rollout_metrics(
-            completions, rows[0]["agent_ref"]["name"]
-        )
-        rollout_metrics.update(timing_metrics)
+        with timer.time(f"{timer_prefix}/compute_metrics"):
+            rollout_metrics = self._compute_rollout_metrics(
+                completions, rows[0]["agent_ref"]["name"]
+            )
+
+        rollout_metrics.update(nemo_gym_timing_metrics)
 
         return completions, rollout_metrics
 
