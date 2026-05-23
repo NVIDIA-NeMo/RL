@@ -187,13 +187,13 @@ corpus, and the P-KL loss mode. Override paths via Hydra CLI:
 uv run python examples/run_xtoken_distillation.py \
     --config examples/configs/xtoken_distillation.yaml \
     loss_fn.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
-    data.train.arrow_files=/path/to/corpus/*.arrow \
+    data.train.data_files=/path/to/corpus/*.arrow \
     cluster.gpus_per_node=8 \
     cluster.num_nodes=1
 ```
 
 The exemplar config keeps `loss_fn.projection_matrix_path` and
-`data.train.arrow_files` as `null` so they must be supplied at the CLI — this
+`data.train.data_files` as `null` so they must be supplied at the CLI — this
 makes the config reusable across (student, teacher) pairs.
 
 ### Loss-mode knobs

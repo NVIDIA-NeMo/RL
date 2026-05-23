@@ -33,8 +33,10 @@ class ArrowTextDataset(RawDataset):
     """Load arrow shards as a stream of raw text strings.
 
     Args:
-        arrow_files: Path or glob to one or more ``.arrow`` files. Forwarded
-            to ``datasets.load_dataset("arrow", data_files=...)``.
+        data_files: Path or glob to one or more ``.arrow`` files (local
+            paths, globs, or HTTP URLs). Forwarded verbatim to
+            ``datasets.load_dataset("arrow", data_files=...)``; the
+            parameter name mirrors the HuggingFace API.
         text_key: Column on the loaded dataset that contains the raw text.
         characters_per_sample: If set, pack consecutive rows together until
             the running character count reaches this threshold; emit a packed
@@ -46,7 +48,7 @@ class ArrowTextDataset(RawDataset):
 
     def __init__(
         self,
-        arrow_files: str | list[str],
+        data_files: str | list[str],
         text_key: str = "text",
         characters_per_sample: int | None = None,
         split_validation_size: float = 0.0,
@@ -56,11 +58,32 @@ class ArrowTextDataset(RawDataset):
         self.text_key = text_key
         self.task_name = "x_token"
 
-        raw = load_dataset("arrow", data_files=arrow_files, split="train")
+        raw = load_dataset("arrow", data_files=data_files, split="train")
+        # Drop rows whose text column is non-string or empty. Applied at the
+        # source so the packed and non-packed branches below see the same
+        # corpus; without this filter the non-packed branch passed ``None``
+        # and ``""`` straight through to ``kd_data_processor`` / the
+        # cross-tokenizer collator, while the packed branch dropped them
+        # inside ``_pack_generator`` — same corpus produced different
+        # samples depending on ``characters_per_sample``.
+        raw = raw.filter(
+            lambda d: isinstance(d[text_key], str) and bool(d[text_key])
+        )
 
         if characters_per_sample is None or characters_per_sample <= 0:
+            # Emit both `text` (read by kd_data_processor for cross-tokenizer
+            # distillation) and a single-assistant `messages` field (read by
+            # sft_processor) so the same dataset works for both pipelines.
+            # Wrapping in role="assistant" lets the SFT pipeline's hard-coded
+            # roles_to_train_on=["assistant"] unmask every token, matching
+            # the loss-on-every-token semantic of the distillation path.
+            task_name = self.task_name
             self.dataset = raw.map(
-                lambda d: {"text": d[text_key], "task_name": self.task_name},
+                lambda d: {
+                    "text": d[text_key],
+                    "messages": [{"role": "assistant", "content": d[text_key]}],
+                    "task_name": task_name,
+                },
                 remove_columns=raw.column_names,
             )
         else:
@@ -71,6 +94,12 @@ class ArrowTextDataset(RawDataset):
                     "text_key": text_key,
                     "characters_per_sample": characters_per_sample,
                     "task_name": self.task_name,
+                    # Bump this string whenever the emitted row schema
+                    # changes; it becomes part of the HF datasets cache
+                    # fingerprint so a schema change forces a fresh
+                    # cache build rather than silently reusing a stale
+                    # cache produced by older code.
+                    "schema_version": "messages-v1",
                 },
             )
 
@@ -83,19 +112,34 @@ def _pack_generator(
     text_key: str,
     characters_per_sample: int,
     task_name: str,
+    schema_version: str = "messages-v1",
 ) -> Iterable[dict[str, Any]]:
-    """Pack consecutive rows until each pack hits ``characters_per_sample``."""
+    """Pack consecutive rows until each pack hits ``characters_per_sample``.
+
+    ``schema_version`` is accepted only so that HF datasets includes it in
+    the ``from_generator`` cache fingerprint. Bump the value in the caller
+    when the emitted row schema changes.
+    """
+    del schema_version
     buf: list[str] = []
     n = 0
     for row in raw:
         text = row[text_key]
-        if not isinstance(text, str) or not text:
-            continue
         buf.append(text)
         n += len(text)
         if n >= characters_per_sample:
-            yield {"text": "\n".join(buf), "task_name": task_name}
+            packed = "\n".join(buf)
+            yield {
+                "text": packed,
+                "messages": [{"role": "assistant", "content": packed}],
+                "task_name": task_name,
+            }
             buf = []
             n = 0
     if buf:
-        yield {"text": "\n".join(buf), "task_name": task_name}
+        packed = "\n".join(buf)
+        yield {
+            "text": packed,
+            "messages": [{"role": "assistant", "content": packed}],
+            "task_name": task_name,
+        }

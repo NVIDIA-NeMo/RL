@@ -2,7 +2,7 @@
 #
 # Defaults: Llama-3.2-1B (student) <- Qwen3-4B (teacher), arrow-text corpus,
 # P-KL loss mode (gold_loss=false, xtoken_loss=false). Override the model
-# names, tokenizers, and arrow_files via Hydra CLI for other pairs.
+# names, tokenizers, and data_files via Hydra CLI for other pairs.
 
 distillation:
   num_prompts_per_step: 64
@@ -166,7 +166,8 @@ data:
   train:
     dataset_name: "arrow_text"
     processor: "kd_data_processor"
-    arrow_files: null            # set via Hydra CLI, e.g. data.train.arrow_files=/path/glob/*.arrow
+    data_files: null             # set via Hydra CLI, e.g. data.train.data_files=/path/glob/*.arrow
+                                 # (matches the HF `load_dataset("arrow", data_files=...)` arg name; accepts globs or HTTP URLs)
     text_key: "text"
     characters_per_sample: 16384
   validation: null
