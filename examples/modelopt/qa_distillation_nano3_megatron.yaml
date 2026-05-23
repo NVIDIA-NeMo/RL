@@ -6,7 +6,7 @@
 # precision while training the quantized student in the same loop.
 #
 # Example usage:
-#   uv run examples/run_distillation.py --config examples/modelopt/qa_distillation_nano3_megatron.yaml
+#   uv run examples/nemo_gym/run_distillation_nemo_gym.py --config examples/modelopt/qa_distillation_nano3_megatron.yaml
 
 defaults: "./qa_distillation_math_megatron.yaml"
 
@@ -14,6 +14,7 @@ distillation:
   # Keep the example moderate; scale these for production runs.
   num_prompts_per_step: 16
   num_generations_per_prompt: 4
+  max_val_samples: null
 
 loss_fn:
   # Reverse KL is the usual OPD direction for matching the teacher on student
@@ -78,6 +79,7 @@ policy:
     top_k: null
     quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_default.yaml"
     vllm_cfg:
+      expose_http_server: true
       tensor_parallel_size: 4
       pipeline_parallel_size: 1
       expert_parallel_size: 1
@@ -125,7 +127,30 @@ teacher:
     gradient_accumulation_fusion: false
 
 data:
-  max_input_seq_length: ${policy.max_total_sequence_length}
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 0
+  # Existing Gym-format QA fixture. Real training should point to data produced
+  # by `ng_prepare_data`.
+  train:
+    dataset_name: NemoGymDataset
+    data_path: "3rdparty/Gym-workspace/Gym/responses_api_agents/verifiers_agent/data/acereason-math-example.jsonl"
+  validation: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    rollout_max_attempts_to_avoid_lp_nan: 1
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/verifiers_agent/configs/acereason-math.yaml
 
 checkpointing:
   checkpoint_dir: "checkpoints/qa-distillation-nano3-megatron"
