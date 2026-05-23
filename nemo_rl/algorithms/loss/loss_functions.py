@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
-from nemo_rl.algorithms.x_token.utils import (
+from nemo_rl.algorithms.x_token.loss_utils import (
     Fp32SparseMM,
     chunk_average_log_probs,
     get_sparse_projection_matrix,
@@ -1184,7 +1184,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         self.cfg = cfg
         self.projection_matrix_path = cfg["projection_matrix_path"]
         # The materialized projection matrix lives in a process-local
-        # cache in ``x_token.utils`` (see ``get_sparse_projection_matrix``
+        # cache in ``x_token.loss_utils`` (see ``get_sparse_projection_matrix``
         # / ``get_topk_projection``), not on this instance. That keeps
         # the driver-side ``loss_fn`` free of any large CUDA tensors and
         # lets multiple loss instances on the same worker share one

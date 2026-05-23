@@ -88,7 +88,7 @@ XTOKEN_NON_STUDENT_SEQ_KEYS: frozenset[str] = frozenset(
 # ===============================================================================
 
 
-class XTokenDistillationConfig(TypedDict):
+class OffPolicyDistillationConfig(TypedDict):
     """Top-level distillation algo config.
 
     Attributes:
@@ -110,7 +110,7 @@ class XTokenDistillationConfig(TypedDict):
     val_at_end: bool
 
 
-class XTokenDistillationSaveState(TypedDict):
+class OffPolicyDistillationSaveState(TypedDict):
     current_epoch: int
     current_step: int
     total_steps: int
@@ -119,7 +119,7 @@ class XTokenDistillationSaveState(TypedDict):
     val_loss: NotRequired[float]
 
 
-def _default_save_state() -> XTokenDistillationSaveState:
+def _default_off_policy_distillation_save_state() -> OffPolicyDistillationSaveState:
     return {
         "current_epoch": 0,
         "current_step": 0,
@@ -134,7 +134,7 @@ class MasterConfig(TypedDict):
     teacher: PolicyConfig
     loss_fn: CrossTokenizerDistillationLossConfig
     data: DataConfig
-    distillation: XTokenDistillationConfig
+    distillation: OffPolicyDistillationConfig
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
@@ -159,14 +159,14 @@ def setup(
     CrossTokenizerDistillationLossFn,
     Logger,
     CheckpointManager,
-    XTokenDistillationSaveState,
+    OffPolicyDistillationSaveState,
     MasterConfig,
 ]:
     """Construct cluster, dataloaders, policies, and loss fn for the run."""
     policy_config = master_config["policy"]
     teacher_config = master_config["teacher"]
     loss_config = master_config["loss_fn"]
-    distill_config = master_config["distillation"]
+    distillation_config = master_config["distillation"]
     data_config = master_config["data"]
     logger_config = master_config["logger"]
     cluster_config = master_config["cluster"]
@@ -179,7 +179,7 @@ def setup(
         "_v2", False
     ), "xtoken distillation requires teacher.dtensor_cfg.enabled=true and _v2=true."
 
-    set_seed(distill_config["seed"])
+    set_seed(distillation_config["seed"])
 
     # ==========================
     #         Logger
@@ -192,12 +192,12 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    save_state: Optional[XTokenDistillationSaveState] = cast(
-        Optional[XTokenDistillationSaveState],
+    off_policy_distillation_state: Optional[OffPolicyDistillationSaveState] = cast(
+        Optional[OffPolicyDistillationSaveState],
         checkpointer.load_training_info(last_checkpoint_path),
     )
-    if save_state is None:
-        save_state = _default_save_state()
+    if off_policy_distillation_state is None:
+        off_policy_distillation_state = _default_off_policy_distillation_save_state()
 
     # ==========================
     #     Aligner + Collator
@@ -224,7 +224,7 @@ def setup(
     # ==========================
     train_dataloader = StatefulDataLoader(
         train_dataset,
-        batch_size=distill_config["num_prompts_per_step"],
+        batch_size=distillation_config["num_prompts_per_step"],
         shuffle=data_config["shuffle"],
         collate_fn=collator,
         drop_last=True,
@@ -242,13 +242,13 @@ def setup(
 
     val_dataloader: Optional[StatefulDataLoader] = None
     if val_dataset is not None and (
-        distill_config["val_period"] > 0
-        or distill_config["val_at_start"]
-        or distill_config["val_at_end"]
+        distillation_config["val_period"] > 0
+        or distillation_config["val_at_start"]
+        or distillation_config["val_at_end"]
     ):
         val_dataloader = StatefulDataLoader(
             val_dataset,
-            batch_size=distill_config["num_prompts_per_step"],
+            batch_size=distillation_config["num_prompts_per_step"],
             shuffle=False,
             collate_fn=collator,
             drop_last=False,
@@ -331,7 +331,7 @@ def setup(
         loss_fn,
         logger,
         checkpointer,
-        save_state,
+        off_policy_distillation_state,
         master_config,
     )
 
@@ -349,7 +349,7 @@ def xtoken_distillation_train(
     loss_fn: CrossTokenizerDistillationLossFn,
     logger: Logger,
     checkpointer: CheckpointManager,
-    save_state: XTokenDistillationSaveState,
+    off_policy_distillation_state: OffPolicyDistillationSaveState,
     master_config: MasterConfig,
 ) -> None:
     """Off-policy CT distillation training loop."""
@@ -361,11 +361,11 @@ def xtoken_distillation_train(
     timeout.start_iterations()
 
     distill_cfg = master_config["distillation"]
-    current_epoch = save_state["current_epoch"]
-    current_step = save_state["current_step"]
-    total_steps = save_state["total_steps"]
-    consumed_samples = save_state["consumed_samples"]
-    total_valid_tokens = save_state["total_valid_tokens"]
+    current_epoch = off_policy_distillation_state["current_epoch"]
+    current_step = off_policy_distillation_state["current_step"]
+    total_steps = off_policy_distillation_state["total_steps"]
+    consumed_samples = off_policy_distillation_state["consumed_samples"]
+    total_valid_tokens = off_policy_distillation_state["total_valid_tokens"]
     val_period = distill_cfg["val_period"]
     val_at_start = distill_cfg["val_at_start"]
     val_at_end = distill_cfg["val_at_end"]
@@ -529,26 +529,26 @@ def xtoken_distillation_train(
                     should_save_by_step or should_save_by_timeout
                 ):
                     student_policy.prepare_for_training()
-                    save_state["current_epoch"] = current_epoch
-                    save_state["current_step"] = current_step + 1
-                    save_state["total_steps"] = total_steps + 1
-                    save_state["total_valid_tokens"] = total_valid_tokens
-                    save_state["consumed_samples"] = consumed_samples
+                    off_policy_distillation_state["current_epoch"] = current_epoch
+                    off_policy_distillation_state["current_step"] = current_step + 1
+                    off_policy_distillation_state["total_steps"] = total_steps + 1
+                    off_policy_distillation_state["total_valid_tokens"] = total_valid_tokens
+                    off_policy_distillation_state["consumed_samples"] = consumed_samples
                     if val_metrics is not None and "loss" in val_metrics:
-                        save_state["val_loss"] = float(val_metrics["loss"])
-                    elif "val_loss" in save_state:
-                        del save_state["val_loss"]
+                        off_policy_distillation_state["val_loss"] = float(val_metrics["loss"])
+                    elif "val_loss" in off_policy_distillation_state:
+                        del off_policy_distillation_state["val_loss"]
 
                     full_metric_name = master_config["checkpointing"]["metric_name"]
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         source = metrics if prefix == "train" else (val_metrics or {})
                         if metric_name in source:
-                            save_state[full_metric_name] = float(source[metric_name])
+                            off_policy_distillation_state[full_metric_name] = float(source[metric_name])
 
                     with timer.time("checkpointing"):
                         ckpt_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, save_state, master_config
+                            total_steps + 1, off_policy_distillation_state, master_config
                         )
                         student_policy.save_checkpoint(
                             weights_path=os.path.join(

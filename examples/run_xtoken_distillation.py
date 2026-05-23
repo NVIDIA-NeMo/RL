@@ -109,7 +109,7 @@ def main() -> None:
         loss_fn,
         logger,
         checkpointer,
-        save_state,
+        off_policy_distillation_state,
         master_config,
     ) = setup(config, student_tokenizer, teacher_tokenizer, train_dataset, val_dataset)
 
@@ -121,7 +121,7 @@ def main() -> None:
         loss_fn,
         logger,
         checkpointer,
-        save_state,
+        off_policy_distillation_state,
         master_config,
     )
 

@@ -139,8 +139,8 @@ class TokenAligner:
         projection_matrix_path: Path retained on the aligner for downstream
             callers (e.g. the loss fn) that materialize the projection on
             their training device via
-            :func:`nemo_rl.algorithms.x_token.utils.get_sparse_projection_for_collator`
-            or :func:`get_topk_projection_for_loss`.
+            :func:`nemo_rl.algorithms.x_token.loss_utils.get_sparse_projection_matrix`
+            or :func:`nemo_rl.algorithms.x_token.loss_utils.get_topk_projection`.
         max_comb_len: Maximum span length considered when matching one token
             on one side against multiple tokens on the other.
     """
