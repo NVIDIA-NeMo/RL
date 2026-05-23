@@ -1,0 +1,424 @@
+---
+name: add-native-environment
+description: Interactive skill for building a new native RL environment in NeMo-RL. Guides through creating the full stack — dataset, data processor, environment, config, and training script — then validates end-to-end with a GRPO training run.
+when_to_use: "add environment", "new RL environment", "create a native environment", "build a training task", "add a new game", "add a new reward function", "new GRPO task", "add native env".
+allowed-tools: Bash Read Grep Glob Edit Write Agent AskUserQuestion
+---
+
+# Add Native Environment — interactive skill
+
+This skill walks through building a **native RL environment** in NeMo-RL: a Ray actor implementing `EnvironmentInterface`, paired with a dataset and data processor, wired together with a GRPO training config. At the end, it validates the whole stack by training on 1 GPU and confirming reward increases.
+
+**Native environments** run in-process with the training loop (as Ray actors). They are different from NeMo-Gym environments (external HTTP microservices) — for those, use the `add-benchmark` skill instead.
+
+## Prerequisite knowledge
+
+Before starting, read these files to understand the interfaces:
+
+| What | File |
+|------|------|
+| `EnvironmentInterface`, `EnvironmentReturn` | `nemo_rl/environments/interfaces.py` |
+| `ENV_REGISTRY`, `register_env()`, `create_env()` | `nemo_rl/environments/utils.py` |
+| `DatumSpec`, `TaskDataSpec`, `TaskDataProcessFnCallable` | `nemo_rl/data/interfaces.py` |
+| `PROCESSOR_REGISTRY`, `register_processor()` | `nemo_rl/data/processors.py` |
+| `DATASET_REGISTRY`, `load_response_dataset()` | `nemo_rl/data/datasets/response_datasets/__init__.py` |
+
+Reference implementations to study:
+
+| Pattern | Environment | Data processor | Dataset | Config | Training script |
+|---------|-------------|----------------|---------|--------|-----------------|
+| **Single-turn** (model answers once, env scores) | `nemo_rl/environments/math_environment.py` | `math_hf_data_processor` in `processors.py` | `nemo_rl/data/datasets/response_datasets/openmathinstruct2.py` | `examples/configs/grpo_math_1B.yaml` | `examples/run_grpo.py` |
+| **Multi-turn** (model + env interact over multiple steps) | `nemo_rl/environments/games/sliding_puzzle.py` | Inline in training script | `IterablePuzzleDataset` in `examples/run_grpo_sliding_puzzle.py` | `examples/configs/grpo_sliding_puzzle.yaml` | `examples/run_grpo_sliding_puzzle.py` |
+
+## Workflow
+
+Follow these stages in order. Use `AskUserQuestion` at decision points.
+
+### Stage 1: Task Discovery
+
+Ask the user what RL task they want to build. Gather:
+
+1. **Task description**: What should the model learn to do? (e.g., "solve 24 game puzzles", "answer trivia questions", "play tic-tac-toe")
+2. **Single-turn or multi-turn?**
+   - Single-turn: model produces one response, environment scores it (like math). Set `max_rollout_turns: 1`.
+   - Multi-turn: model and environment exchange messages across multiple turns with persistent state (like sliding puzzle). Set `max_rollout_turns` to the max number of turns.
+3. **Reward signal**: How is correctness determined? (exact match, expression evaluation, game win condition, code execution, LLM-as-judge, etc.)
+
+Based on the answers, select the reference pattern:
+- Single-turn → follow the math environment pattern
+- Multi-turn → follow the sliding puzzle pattern
+
+### Stage 2: Model Selection
+
+Ask the user to choose a model. Recommend starting with a small model for fast iteration:
+- `Qwen/Qwen3-0.6B` (fastest, good for debugging)
+- `Qwen/Qwen2.5-1.5B-Instruct` (good balance)
+- `Qwen/Qwen2.5-3B-Instruct` (more capable)
+
+Surface the **base vs. instruct model tradeoff**:
+- **Instruct models**: follow instructions well out of the box, but may have collapsed entropy (low exploration), making RL less effective.
+- **Base models**: higher entropy (better exploration), but may need SFT warm-up first since they haven't been fine-tuned for the task format.
+
+Recommend instruct for initial validation. Note that if entropy is too low during training, switching to a base model + SFT may help.
+
+### Stage 3: Dataset
+
+Determine the data source:
+
+**Option A: Off-the-shelf HuggingFace dataset**
+
+1. Identify the dataset (e.g., `nvidia/OpenMathInstruct-2`, a custom HF dataset).
+2. Create a dataset class in `nemo_rl/data/datasets/response_datasets/<name>.py` following the `OpenMathInstruct2Dataset` pattern:
+   - Subclass `RawDataset`
+   - Implement `__init__` to load via `datasets.load_dataset()`
+   - Implement a `.map()` transform to normalize the schema to `{"messages": [...], "task_name": "..."}` or whatever fields the processor expects
+   - Optionally implement train/val split
+3. Register in `DATASET_REGISTRY` in `nemo_rl/data/datasets/response_datasets/__init__.py`.
+
+**Option B: Procedurally generated data (games, puzzles)**
+
+1. Create an `IterableDataset` that generates data on-the-fly (following `IterablePuzzleDataset` in `examples/run_grpo_sliding_puzzle.py`).
+2. The `__iter__` method yields `DatumSpec` directly (no separate processor needed — processing is inline).
+3. The `__len__` method returns a virtual length (total samples across all steps).
+4. Wire the dataset in a custom training script (not via config `data.train.dataset_name`).
+
+**Option C: Static JSONL / existing dataset**
+
+1. Use `dataset_name: "openai_format"` or `dataset_name: "ResponseDataset"` in the config.
+2. Point `data_path` to the JSONL file.
+3. Write a matching processor (Stage 4).
+
+### Stage 4: Data Processor
+
+Skip this stage if using Option B (procedurally generated data with inline processing).
+
+Create a data processor function in `nemo_rl/data/processors.py`. The processor converts a raw dataset row into a `DatumSpec`:
+
+```python
+def my_task_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    # 1. Extract the problem/prompt from datum_dict
+    problem = datum_dict["problem"]
+
+    # 2. Extract ground truth or env metadata for verification
+    extra_env_info = {"ground_truth": datum_dict["answer"]}
+
+    # 3. Build the message log with tokenized content
+    message_list = []
+    if task_data_spec.system_prompt:
+        message_list.append({"role": "system", "content": task_data_spec.system_prompt})
+    formatted_content = (
+        task_data_spec.prompt.format(problem) if task_data_spec.prompt else problem
+    )
+    message_list.append({"role": "user", "content": formatted_content})
+
+    message: str = tokenizer.apply_chat_template(
+        message_list,
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    token_ids = tokenizer(message, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
+
+    # 4. Handle overlength
+    length = sum(len(m["token_ids"]) for m in message_log)
+    loss_multiplier = 1.0
+    if length >= max_seq_length:
+        for chat_message in message_log:
+            chat_message["token_ids"] = chat_message["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+        loss_multiplier = 0.0
+
+    # 5. Return DatumSpec
+    return {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict.get("task_name", "my_task"),
+    }
+```
+
+Register the processor in `PROCESSOR_REGISTRY` at the bottom of `processors.py`:
+
+```python
+PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
+    Dict[str, TaskDataProcessFnCallable],
+    {
+        ...existing entries...
+        "my_task_data_processor": my_task_data_processor,
+    },
+)
+```
+
+### Stage 5: Environment
+
+Create the environment class. The structure depends on single-turn vs. multi-turn.
+
+#### Single-turn environment
+
+Create `nemo_rl/environments/<task_name>_environment.py`:
+
+```python
+import ray
+import torch
+from nemo_rl.data.interfaces import LLMMessageLogType
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
+
+@ray.remote
+class MyTaskEnvironment(EnvironmentInterface[dict]):
+    def __init__(self, config: dict):
+        self.config = config
+
+    def step(
+        self,
+        message_log_batch: list[LLMMessageLogType],
+        metadata: list[dict],
+    ) -> EnvironmentReturn[dict]:
+        rewards = []
+        answers = []
+        for message_log, meta in zip(message_log_batch, metadata):
+            # Extract model's response (last assistant message)
+            response = message_log[-1]["content"]
+
+            # Extract ground truth from metadata
+            ground_truth = meta["ground_truth"]
+
+            # Verify and compute reward
+            extracted_answer = self._extract_answer(response)
+            reward = 1.0 if self._verify(extracted_answer, ground_truth) else 0.0
+
+            rewards.append(reward)
+            answers.append(extracted_answer)
+
+        batch_size = len(message_log_batch)
+        return EnvironmentReturn(
+            observations=[{"role": "environment", "content": ""}] * batch_size,
+            metadata=[None] * batch_size,  # single-turn: no state to carry
+            next_stop_strings=[None] * batch_size,
+            rewards=torch.tensor(rewards, dtype=torch.float32),
+            terminateds=torch.ones(batch_size, dtype=torch.bool),  # always done
+            answers=answers,
+        )
+
+    def global_post_process_and_metrics(
+        self, batch: BatchedDataDict
+    ) -> tuple[BatchedDataDict, dict]:
+        final_rewards = batch.get("total_reward", torch.tensor([0.0]))
+        accuracy = final_rewards.mean().item() if len(final_rewards) > 0 else 0.0
+        return batch, {"accuracy": accuracy}
+
+    def _extract_answer(self, response: str) -> str:
+        # Task-specific answer extraction logic
+        ...
+
+    def _verify(self, extracted: str, ground_truth: str) -> bool:
+        # Task-specific verification logic
+        ...
+```
+
+#### Multi-turn environment
+
+Follow the sliding puzzle pattern in `nemo_rl/environments/games/sliding_puzzle.py`:
+
+1. Define a `TypedDict` for metadata (game state, move count, max moves).
+2. Create game logic class with static methods: `generate()`, `step()`, `render()`.
+3. Create a runner class with `process_turn()` that parses actions from `<action>...</action>` tags.
+4. Create the Ray actor `@ray.remote` class implementing `EnvironmentInterface`.
+5. Use `stop_strings: ["</action>"]` in the datum to delimit action boundaries.
+
+Key multi-turn differences:
+- `metadata` carries state between turns (not `None`).
+- `terminateds` is `False` until the episode ends.
+- `observations` contain rendered state for the next turn.
+- `next_stop_strings` tells the model when to stop generating.
+
+#### Register the environment
+
+Add to `ENV_REGISTRY` in `nemo_rl/environments/utils.py`:
+
+```python
+ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
+    ...existing entries...
+    "my_task": {
+        "actor_class_fqn": "nemo_rl.environments.my_task_environment.MyTaskEnvironment",
+    },
+}
+```
+
+### Stage 6: Config
+
+Create a YAML config at `examples/configs/grpo_<task_name>.yaml`.
+
+**For single-turn tasks** (HF dataset path), inherit from a base config:
+
+```yaml
+defaults: "grpo_math_1B.yaml"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1
+  max_num_steps: 200
+  seed: 42
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  max_total_sequence_length: 2048
+  dtensor_cfg:
+    enabled: true
+    cpu_offload: true
+    activation_checkpointing: true
+    sequence_parallel: true
+  generation:
+    backend: "vllm"
+    max_new_tokens: 1024
+    temperature: 1.0
+    top_p: 0.999
+    top_k: 10000
+    vllm_cfg:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+
+data:
+  train:
+    dataset_name: "<dataset_name>"
+    split: "train"
+  default:
+    processor: "<processor_name>"
+    env_name: "<env_name>"
+
+env:
+  <env_name>:
+    num_workers: 2
+
+logger:
+  log_dir: "logs"
+  wandb_enabled: true
+  wandb:
+    project: "nemo-rl-native-env"
+    name: "grpo-<task_name>"
+```
+
+**For multi-turn tasks** (procedural data), inherit from the sliding puzzle config:
+
+```yaml
+defaults: "grpo_math_1B.yaml"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_rollout_turns: 30
+  max_num_steps: 200
+
+data:
+  add_system_prompt: false
+  shuffle: false
+
+env:
+  <task_name>:
+    cfg:
+      # task-specific config
+      max_moves: 30
+
+logger:
+  log_dir: "logs"
+  wandb_enabled: true
+  wandb:
+    project: "nemo-rl-native-env"
+    name: "grpo-<task_name>"
+```
+
+### Stage 7: Training Script
+
+**For single-turn tasks** using a registered dataset + processor, use the standard entry point:
+
+```bash
+uv run python examples/run_grpo.py --config examples/configs/grpo_<task_name>.yaml
+```
+
+**For multi-turn / procedural tasks**, create a custom training script at `examples/run_grpo_<task_name>.py` following `examples/run_grpo_sliding_puzzle.py`:
+
+1. Parse args and load config.
+2. Initialize Ray and tokenizer.
+3. Set up dataset (IterableDataset) and environment (Ray actor).
+4. Call `setup()` and `grpo_train()` from `nemo_rl.algorithms.grpo`.
+
+### Stage 8: Validate on 1 GPU
+
+Run the training loop on a single GPU:
+
+```bash
+# Single-turn (standard entry point)
+uv run python examples/run_grpo.py --config examples/configs/grpo_<task_name>.yaml \
+  cluster.num_nodes=1 cluster.gpus_per_node=1
+
+# Multi-turn (custom script)
+uv run python examples/run_grpo_<task_name>.py --config examples/configs/grpo_<task_name>.yaml \
+  cluster.num_nodes=1 cluster.gpus_per_node=1
+```
+
+**What to check:**
+- Training starts without errors.
+- `train:mean_reward` (or equivalent metric) in the logs/wandb increases over steps.
+- The environment correctly rewards good answers and penalizes bad ones (inspect logged samples if available).
+
+If reward is flat at 0.0:
+- The task may be too hard for the model. Try an easier variant or a more capable model.
+- The reward function may have a bug. Test it manually with known-good and known-bad answers.
+- The data processor may not be formatting prompts correctly. Inspect the tokenized output.
+
+If reward is flat at 1.0:
+- The task is too easy or the reward function always returns 1.0. Verify the check logic.
+
+### Stage 9: Scale to 8 GPU (optional)
+
+Ask the user if they want to scale up. If yes, adjust the config:
+
+```yaml
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+policy:
+  dtensor_cfg:
+    enabled: true
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 1  # keep TP=1 per generation worker, more workers in parallel
+
+grpo:
+  num_prompts_per_step: 128  # scale up batch size
+  num_generations_per_prompt: 16
+
+env:
+  <env_name>:
+    num_workers: 8  # more env workers to match throughput
+```
+
+## Checklist
+
+Use this to verify completeness before declaring the task done:
+
+- [ ] Environment class implements `EnvironmentInterface` with `step()` and `global_post_process_and_metrics()`
+- [ ] Environment is registered in `ENV_REGISTRY` (or via `register_env()`)
+- [ ] Dataset loads correctly (HF dataset class or IterableDataset)
+- [ ] Data processor converts raw data to `DatumSpec` with correct `message_log`, `extra_env_info`, and tokenization
+- [ ] Processor is registered in `PROCESSOR_REGISTRY` (or via `register_processor()`)
+- [ ] YAML config wires dataset → processor → environment correctly
+- [ ] Training script runs without errors
+- [ ] `train:mean_reward` increases over training steps
+- [ ] All new files have the Apache 2.0 copyright header
+- [ ] Code passes `uv run --group dev pre-commit run --files <new_files>`
