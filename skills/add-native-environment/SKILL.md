@@ -463,6 +463,15 @@ env:
 
 **Limitation**: Only the DTensor backend is supported. Megatron-based reward models are not supported (tracked in issue #1154).
 
+**GPU allocation**: The reward model needs its own GPU(s). With 2 GPUs, use 1 for policy + 1 for reward model. With 8 GPUs, split based on model sizes. See `examples/configs/grpo_rm_1B.yaml` for a working example.
+
+**What to expect**: Bradley-Terry reward models output logits that can be large negative numbers (e.g., -10 to -15). A typical RLHF run starts with mean reward around -10 and should trend upward. Validated: mean reward went from -9.9 to +0.5 over 25 steps with Skywork-Reward-V2-Qwen3-0.6B on OpenMathInstruct-2.
+
+**Troubleshooting RLHF**: If reward doesn't increase after 10+ steps:
+- The reward model may not differentiate well for this task. Try a different reward model.
+- Enable `reward_scaling` in the GRPO config to normalize reward range.
+- Reduce learning rate to `1e-6` to prevent policy from diverging too fast.
+
 ### Stage 9: Scale to 8 GPU (optional)
 
 Ask the user if they want to scale up. If yes, adjust the config:
