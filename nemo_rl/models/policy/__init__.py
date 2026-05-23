@@ -240,7 +240,9 @@ class MegatronConfig(TypedDict):
     # Offload specific module activations to CPU to reduce peak GPU memory.
     # Works with both dense and MoE models. Different from
     # optimizer_cpu_offload which offloads optimizer states.
-    # Requires transformer_engine implementation.
+    # Requires transformer_engine. For TE >= 2.10.0 also requires
+    # NVTE_CPU_OFFLOAD_V1=1 in the environment (validated by
+    # Megatron-Bridge at runtime).
     fine_grained_activation_offloading: NotRequired[bool]
     # Modules to offload when fine_grained_activation_offloading is True.
     # Required (no default). Valid values:

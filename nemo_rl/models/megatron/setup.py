@@ -719,6 +719,10 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             )
 
     # Megatron validates module names and per-model-type compatibility.
+    # Note: Megatron-Bridge's standalone training path also sets NUMA-aware
+    # CPU affinity via set_ideal_affinity_for_current_gpu() when this is on,
+    # which improves PCIe/DRAM throughput. NeMo-RL does not call it; users
+    # who need maximum offload bandwidth may want to set affinity externally.
     fine_grained_activation_offloading = config["megatron_cfg"].get(
         "fine_grained_activation_offloading"
     )
