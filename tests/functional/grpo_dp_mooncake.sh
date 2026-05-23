@@ -10,6 +10,13 @@ git config --global --add safe.directory $PROJECT_ROOT
 
 set -eou pipefail
 
+# mooncake_cpu backend requires the mooncake package — skip gracefully in
+# containers (e.g. standard CI) where it is not installed.
+if ! python3 -c "import mooncake" 2>/dev/null; then
+    echo "mooncake not available — skipping grpo_dp_mooncake test"
+    exit 0
+fi
+
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
