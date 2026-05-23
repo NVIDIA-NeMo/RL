@@ -56,6 +56,9 @@ ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
     "twenty_four_game": {
         "actor_class_fqn": "nemo_rl.environments.games.twenty_four_game.TwentyFourGameEnv",
     },
+    "wordle": {
+        "actor_class_fqn": "nemo_rl.environments.games.wordle.WordleEnv",
+    },
 }
 
 
