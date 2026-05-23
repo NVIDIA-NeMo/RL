@@ -13,6 +13,7 @@ checkpointing:
 
 policy:
   model_name: "Qwen/Qwen3-0.6B"
+  train_global_batch_size: 128  # num_prompts_per_step * num_generations_per_prompt
   max_total_sequence_length: 1024
 
   dtensor_cfg:
