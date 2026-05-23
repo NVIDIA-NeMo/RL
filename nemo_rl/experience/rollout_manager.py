@@ -17,7 +17,6 @@ import json
 import warnings
 from typing import Any, Optional
 
-import ray
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
@@ -142,14 +141,12 @@ class AsyncNemoGymRolloutManager:
         self, rows: list[dict], timer: Timer, timer_prefix: str
     ) -> tuple[list[Completion], dict[str, Any]]:
         """Dispatch rows to NeMo-Gym and return completions + metrics."""
-        nemo_gym_environment = self._task_to_env["nemo_gym"]
+        nemo_gym_env = self._task_to_env["nemo_gym"]
 
         # Run generation.
         with timer.time(f"{timer_prefix}/run_rollouts"):
-            results, nemo_gym_timing_metrics = ray.get(
-                nemo_gym_environment.run_rollouts.remote(
-                    rows, self._tokenizer, timer_prefix
-                )
+            results, env_timing_metrics = await nemo_gym_env.run_rollouts.remote(
+                rows, self._tokenizer, timer_prefix
             )
             # Convert results to completions.
             completions = [self._result_to_completion(r) for r in results]
@@ -160,7 +157,7 @@ class AsyncNemoGymRolloutManager:
                 completions, rows[0]["agent_ref"]["name"]
             )
 
-        rollout_metrics.update(nemo_gym_timing_metrics)
+        rollout_metrics.update(env_timing_metrics)
 
         return completions, rollout_metrics
 
