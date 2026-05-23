@@ -44,6 +44,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationDatumSpec,
@@ -1309,4 +1310,85 @@ def run_async_nemo_gym_rollout(
         input_ids=input_ids,
         final_batch=final_batch,
         rollout_metrics=rollout_metrics,
+    )
+
+
+async def run_async_multi_turn_rollout_by_prompt(
+    policy_generation: GenerationInterface,
+    input_sample: DatumSpec,
+    tokenizer: TokenizerType,
+    task_to_env: dict[str, EnvironmentInterface],
+    max_seq_len: int,
+    num_generations_per_prompt: int,
+    max_rollout_turns: int = 999999,
+    greedy: bool = False,
+) -> PromptGroupRecord:
+    """Run multi-turn rollouts for a single prompt, producing multiple completions.
+
+    Each completion is generated independently via run_sample_multi_turn_rollout.
+    All completions are produced concurrently via asyncio.gather.
+
+    Args:
+        policy_generation: The generation interface (policy)
+        input_sample: A single prompt (one DatumSpec entry, not a batch)
+        tokenizer: The tokenizer
+        task_to_env: Dictionary mapping task names to environment instances
+        max_seq_len: Maximum sequence length allowed
+        num_generations_per_prompt: Number of completions to generate
+        max_rollout_turns: Maximum number of agent-environment interaction turns
+        greedy: Whether to use greedy decoding
+
+    Returns:
+        PromptGroupRecord with num_generations_per_prompt completions
+    """
+    prompt_idx = input_sample["idx"]
+    task_name = input_sample["task_name"]
+
+    async def _generate_one(idx: int) -> tuple[dict, dict]:
+        sample_state = {
+            "message_log": copy.deepcopy(input_sample["message_log"]),
+            "extra_env_info": copy.deepcopy(input_sample["extra_env_info"]),
+            "task_name": task_name,
+            "stop_strings": input_sample.get("stop_strings", None),
+            "idx": idx,
+        }
+        return await run_sample_multi_turn_rollout(
+            sample_idx=idx,
+            initial_sample_state=sample_state,
+            policy_generation=policy_generation,
+            tokenizer=tokenizer,
+            task_to_env=task_to_env,
+            max_seq_len=max_seq_len,
+            max_rollout_turns=max_rollout_turns,
+            greedy=greedy,
+        )
+
+    results = await asyncio.gather(
+        *[_generate_one(idx) for idx in range(num_generations_per_prompt)]
+    )
+
+    completions = []
+    for final_state, sample_metrics in results:
+        # Collect per-component reward keys (reward1, reward2, ...) into env_extras
+        env_extras: dict[str, Any] = dict(final_state["extra_env_info"])
+        for k, v in final_state.items():
+            if isinstance(k, str) and k.startswith("reward") and k[6:].isdigit():
+                env_extras[k] = (
+                    float(v.item()) if isinstance(v, torch.Tensor) else float(v)
+                )
+        completions.append(
+            Completion(
+                message_log=final_state["message_log"],
+                env_extras=env_extras,
+                truncated=sample_metrics["truncated"],
+                reward=float(final_state["total_reward"].item()),
+            )
+        )
+
+    return PromptGroupRecord(
+        prompt_idx=prompt_idx,
+        prompt=copy.deepcopy(input_sample["message_log"]),
+        extra_env_info=input_sample["extra_env_info"],
+        metadata={"task_name": task_name},
+        completions=completions,
     )

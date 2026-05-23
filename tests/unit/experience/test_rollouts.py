@@ -42,6 +42,7 @@ from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutManager
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     run_async_multi_turn_rollout,
+    run_async_multi_turn_rollout_by_prompt,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
@@ -973,6 +974,167 @@ def test_run_async_nemo_gym_rollout(
     1. In nemo_rl/experience/rollouts.py::run_async_nemo_gym_rollout, the sampling params are passed appropriately
     2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """
+
+
+# ---------------------------------------------------------------------------
+# Tests for run_async_multi_turn_rollout_by_prompt
+# ---------------------------------------------------------------------------
+
+
+def test_run_async_multi_turn_rollout_by_prompt(
+    multi_step_setup_vllm_async,
+    single_multi_step_calculator_input_sample,
+):
+    """Standalone test for run_async_multi_turn_rollout_by_prompt.
+
+    Given 1 prompt with num_generations_per_prompt=N, asserts:
+    - output is a PromptGroupRecord with N Completion objects
+    - each Completion has a reward (float)
+    - each Completion's message_log has at least 2 messages (prompt + response)
+    - completions hold independent (not aliased) message_log objects
+    """
+    vllm_generation, rollout_tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
+    input_sample = single_multi_step_calculator_input_sample
+    num_generations = 2
+    max_seq_len = 1024
+    max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
+
+    vllm_generation.prepare_for_generation()
+    record = asyncio.run(
+        run_async_multi_turn_rollout_by_prompt(
+            policy_generation=vllm_generation,
+            input_sample=input_sample,
+            tokenizer=rollout_tokenizer,
+            task_to_env=task_to_env,
+            max_seq_len=max_seq_len,
+            num_generations_per_prompt=num_generations,
+            max_rollout_turns=max_rollout_turns,
+        )
+    )
+    vllm_generation.finish_generation()
+
+    assert isinstance(record, PromptGroupRecord)
+    assert len(record.completions) == num_generations, (
+        f"Expected {num_generations} completions, got {len(record.completions)}"
+    )
+    assert record.prompt_idx == input_sample["idx"]
+
+    for i, completion in enumerate(record.completions):
+        assert isinstance(completion, Completion)
+
+        # 1. message_log length
+        assert len(completion.message_log) == 7, (
+            f"Completion {i}: expected 7 messages, got {len(completion.message_log)}"
+        )
+
+        # 2. last assistant content
+        last_assistant = next(
+            (m for m in reversed(completion.message_log) if m["role"] == "assistant"),
+            None,
+        )
+        assert last_assistant is not None, f"Completion {i}: no assistant message found"
+        assert last_assistant["content"] == " 16", (
+            f"Completion {i}: last assistant content {last_assistant['content']!r} != ' 16'"
+        )
+
+        # 3. reward
+        assert completion.reward == 1.0, (
+            f"Completion {i}: reward {completion.reward} != 1.0"
+        )
+
+    # completions hold independent (not aliased) message_log objects
+    assert record.completions[0].message_log is not record.completions[1].message_log
+
+
+def test_run_async_multi_turn_rollout_by_prompt_matches_original(
+    multi_step_setup_vllm_async,
+    single_multi_step_calculator_input_sample,
+):
+    """Comparison test: _by_prompt output is structurally equivalent to the original.
+
+    Calls run_async_multi_turn_rollout with a batch of N identical prompts,
+    then calls run_async_multi_turn_rollout_by_prompt with 1 prompt and N generations.
+    Asserts that both produce N results with the same message-log depth and reward range.
+    """
+    vllm_generation, rollout_tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
+    input_sample = single_multi_step_calculator_input_sample
+    num_generations = 2
+    max_seq_len = 1024
+    max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
+
+    # Build a batch of N identical prompts for the original function
+    batch = BatchedDataDict(
+        {
+            "message_log": [
+                deepcopy(input_sample["message_log"]) for _ in range(num_generations)
+            ],
+            "extra_env_info": [
+                deepcopy(input_sample["extra_env_info"]) for _ in range(num_generations)
+            ],
+            "task_name": [input_sample["task_name"]] * num_generations,
+            "stop_strings": [input_sample["stop_strings"]] * num_generations,
+            "idx": list(range(num_generations)),
+            "loss_multiplier": [1.0] * num_generations,
+        }
+    )
+
+    vllm_generation.prepare_for_generation()
+    original_batch, _ = run_async_multi_turn_rollout(
+        policy_generation=vllm_generation,
+        input_batch=batch,
+        tokenizer=rollout_tokenizer,
+        task_to_env=task_to_env,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+    )
+
+    record = asyncio.run(
+        run_async_multi_turn_rollout_by_prompt(
+            policy_generation=vllm_generation,
+            input_sample=input_sample,
+            tokenizer=rollout_tokenizer,
+            task_to_env=task_to_env,
+            max_seq_len=max_seq_len,
+            num_generations_per_prompt=num_generations,
+            max_rollout_turns=max_rollout_turns,
+        )
+    )
+    vllm_generation.finish_generation()
+
+    # Both should produce N results
+    assert len(record.completions) == num_generations
+    assert len(original_batch["message_log"]) == num_generations
+
+    for i in range(num_generations):
+        orig_msg_log = original_batch["message_log"][i]
+        new_msg_log = record.completions[i].message_log
+
+        # 1. message_log length matches
+        assert len(orig_msg_log) == len(new_msg_log), (
+            f"Completion {i}: message_log length {len(new_msg_log)} != original {len(orig_msg_log)}"
+        )
+
+        # 2. last assistant content matches
+        def _last_assistant_content(msg_log):
+            for m in reversed(msg_log):
+                if m["role"] == "assistant":
+                    return m.get("content", "")
+            return ""
+
+        orig_last = _last_assistant_content(orig_msg_log)
+        new_last = _last_assistant_content(new_msg_log)
+        assert orig_last == new_last, (
+            f"Completion {i}: last assistant content mismatch\n"
+            f"  original:  {orig_last!r}\n"
+            f"  by_prompt: {new_last!r}"
+        )
+
+        # 3. reward matches
+        orig_reward = original_batch["total_reward"][i].item()
+        new_reward = record.completions[i].reward
+        assert orig_reward == new_reward, (
+            f"Completion {i}: reward mismatch — original {orig_reward}, by_prompt {new_reward}"
+        )
 
 
 # ---------------------------------------------------------------------------
