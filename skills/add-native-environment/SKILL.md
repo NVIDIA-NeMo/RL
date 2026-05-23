@@ -373,6 +373,16 @@ uv run python examples/run_grpo.py --config examples/configs/grpo_<task_name>.ya
 
 ### Stage 8: Validate on 1 GPU
 
+**Important 1-GPU config constraints** — when running on a single GPU, you must set:
+```yaml
+policy:
+  dtensor_cfg:
+    cpu_offload: false  # CPUOffload does NOT work on single GPU with AutoModel
+```
+If you see `NotImplementedError: CPUOffload doesn't work on single GPU for AutoModel`, this is why.
+
+Also ensure `train_global_batch_size` is consistent with `num_prompts_per_step * num_generations_per_prompt`. A mismatch causes `AssertionError: Total batch size (X) is not a multiple of batch_size (Y)`.
+
 Run the training loop on a single GPU:
 
 ```bash
