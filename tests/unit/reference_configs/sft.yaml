@@ -107,6 +107,8 @@ policy:
     activation_checkpointing: false
     fine_grained_activation_offloading: false
     offload_modules: null
+    recompute_granularity: "full"
+    recompute_modules: null
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
