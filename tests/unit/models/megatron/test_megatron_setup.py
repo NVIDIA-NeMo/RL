@@ -1078,7 +1078,7 @@ class TestApplyPerformanceConfig:
             _apply_performance_config(model_cfg, config)
 
     def test_fine_grained_activation_offloading_missing_modules_raises(self):
-        """When enabled but offload_modules key is absent, defaults to [] → raises."""
+        """When enabled but offload_modules key is absent, defaults to None → raises."""
         from nemo_rl.models.megatron.setup import _apply_performance_config
 
         model_cfg = MagicMock()

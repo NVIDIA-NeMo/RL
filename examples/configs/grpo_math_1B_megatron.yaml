@@ -86,6 +86,15 @@ policy:
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false
+    # Offload specific module activations to CPU. Works for both dense and MoE
+    # models. Requires transformer_engine. Different from optimizer_cpu_offload
+    # which offloads optimizer states.
+    fine_grained_activation_offloading: false
+    # Modules to offload when fine_grained_activation_offloading is true.
+    # Valid options: ["attn_norm", "qkv_linear", "core_attn", "attn_proj",
+    # "mlp_norm", "expert_fc1", "moe_act"]. "attn_proj" requires "core_attn".
+    # See: https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L1440-L1448
+    offload_modules: null
     converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
