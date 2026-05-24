@@ -6,6 +6,9 @@ grpo:
   max_rollout_turns: 1
   max_num_steps: 200
   seed: 42
+  val_at_start: false
+  val_at_end: false
+  val_period: 0
 
 policy:
   model_name: "Qwen/Qwen3-0.6B"
