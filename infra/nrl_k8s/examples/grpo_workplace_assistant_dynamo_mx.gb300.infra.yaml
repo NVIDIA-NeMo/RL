@@ -49,19 +49,25 @@ _shared:
     - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
     - {name: NCCL_DEBUG,                    value: WARN}
     - {name: RAY_memory_monitor_refresh_ms, value: "0"}
-    # MX publisher needs UCX/NIXL NIC pinning hint.
+    # RDMA over RoCE + cuda_copy for dma-buf staging. Restricted TLS
+    # (rc,cuda_copy only) — broader set caused prep_xfer_dlist failures.
+    # See DEBUGGING_POSTMORTEM §12n.
+    - {name: UCX_TLS,                       value: "rc,cuda_copy"}
+    - {name: NIXL_UCX_TLS,                  value: "rc,cuda_copy"}
+    - {name: UCX_IB_GPU_DIRECT_RDMA,        value: "yes"}
+    - {name: UCX_CUDA_COPY_DMABUF,          value: "yes"}
     - {name: MX_RDMA_NIC_PIN,               value: "auto"}
   headResources: &head_resources
-    limits:   {cpu: "16", memory: "64Gi"}
-    requests: {cpu: "8",  memory: "32Gi"}
+    limits:   {cpu: "8",  memory: "32Gi"}
+    requests: {cpu: "4",  memory: "16Gi"}
   gpuWorkerResources: &gpu_worker_resources
     limits:
-      cpu: "32"
-      memory: "200Gi"
-      nvidia.com/gpu: "1"
-    requests:
       cpu: "16"
       memory: "100Gi"
+      nvidia.com/gpu: "1"
+    requests:
+      cpu: "8"
+      memory: "50Gi"
       nvidia.com/gpu: "1"
     claims:
       - {name: roce-channel}
@@ -115,12 +121,27 @@ launch:
       exit 1
     fi
 
-    # The nemo-rl-mx image bakes in everything the trainer needs:
-    # nixl-cu12, modelexpress, wandb 0.26+, protobuf 6.31+ — across the
-    # main venv and every actor venv. With receiver-side polling, the
-    # trainer also no longer needs ai-dynamo-runtime. So no MX bootstrap
-    # on this side; just the standard PYTHONPATH for nemo-rl.
-    export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM
+    # The nemo-rl-mx image bakes modelexpress@1d8049d5 (pre-rebase head)
+    # into every venv. Shadow it with the Lustre checkout where we have
+    # the rebased kavink/nemo_rl_moe @ 8594fd6 (ucx_utils + sidecar fix
+    # + post-rebase fixups). Drop once the image is rebaked.
+    export PYTHONPATH=/mnt/rl-workspace/${user:}/modelexpress/modelexpress_client/python:.:3rdparty/Megatron-LM-workspace/Megatron-LM
+    # PR #255 (ucx_utils) is no-op unless MX_RDMA_NIC_PIN is set.
+    export MX_RDMA_NIC_PIN=auto
+    # Align trainer NIXL with worker (image bakes 1.1.0; worker has 0.10.1).
+    # Empirically validated 2026-05-23 as load-bearing — dropping this
+    # leaves the publish silently no-op and refit never fires.
+    # See DEBUGGING_POSTMORTEM §15. Drop once image is rebaked with 0.10.1.
+    for VENV in /opt/nemo_rl_venv /opt/ray_venvs/*; do
+      if [ -x "\${VENV}/bin/pip" ] && [ -x "\${VENV}/bin/python" ]; then
+        CUR=$("\${VENV}/bin/python" -c "import importlib.metadata; print(importlib.metadata.version('nixl-cu12'))" 2>/dev/null || echo missing)
+        if [ "\${CUR}" != "0.10.1" ] && [ "\${CUR}" != "missing" ]; then
+          echo "[nixl-align] \${VENV}: downgrading nixl-cu12 from \${CUR} to 0.10.1 ..." >&2
+          "\${VENV}/bin/pip" install --quiet --force-reinstall --no-deps "nixl-cu12==0.10.1" >&2 || \
+            echo "[nixl-align] \${VENV}: downgrade failed" >&2
+        fi
+      fi
+    done
     TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
     LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
     LOG=\${LOG_DIR}/${user:}-wpa-dynamo-mx-\${TIMESTAMP}.log
@@ -168,6 +189,26 @@ kuberay:
                 resources: *head_resources
                 ports: *gpu_head_ports
                 volumeMounts: *code_mounts
+                # Downgrade nixl-cu12 from image-baked 1.1.0 to 0.10.1
+                # to match the worker. Empirically validated as load-bearing
+                # (§15 in DEBUGGING_POSTMORTEM). Drop after image rebake.
+                lifecycle: &nixl_010_postStart
+                  postStart:
+                    exec:
+                      command:
+                        - /bin/bash
+                        - -c
+                        - |
+                          set -e
+                          WHEEL_DIR=/mnt/rl-workspace/jothomson/nixl_wheels
+                          for V in /opt/nemo_rl_venv /opt/ray_venvs/*; do
+                            [ -x "$V/bin/pip" ] || continue
+                            CUR=$("$V/bin/python" -c "import importlib.metadata; print(importlib.metadata.version('nixl-cu12'))" 2>/dev/null || echo missing)
+                            if [ "$CUR" != "0.10.1" ] && [ "$CUR" != "missing" ]; then
+                              "$V/bin/pip" install --quiet --force-reinstall --no-deps --no-index --find-links="$WHEEL_DIR" "nixl-cu12==0.10.1" >> /tmp/nixl-align.log 2>&1 || true
+                            fi
+                          done
+                          echo "[nixl-align] postStart done" >> /tmp/nixl-align.log
             volumes: *head_volumes
       workerGroupSpecs:
         - groupName: gpu-workers
@@ -198,6 +239,7 @@ kuberay:
                     capabilities:
                       add: [IPC_LOCK]
                   volumeMounts: *code_mounts
+                  lifecycle: *nixl_010_postStart
               volumes: *worker_volumes
 
 dynamo:
