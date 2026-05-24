@@ -31,6 +31,16 @@ class ResponseDatasetConfig(TypedDict):
     split_validation_size: NotRequired[float]
     # Seed for train/validation split when split_validation_size > 0
     seed: NotRequired[int]
+    # ArrowTextDataset (dataset_name="arrow_text"): forwarded to
+    # `datasets.load_dataset("arrow", data_files=...)`. Accepts a local
+    # path, a glob, a list of paths, or an HTTP URL.
+    data_files: NotRequired[str | list[str]]
+    # ArrowTextDataset: column on the loaded dataset that holds the raw text.
+    text_key: NotRequired[str]
+    # ArrowTextDataset: if set, pack consecutive rows together until the
+    # running character count reaches this threshold; emit a packed
+    # sample and start a fresh one. If None, every input row is one sample.
+    characters_per_sample: NotRequired[int | None]
 
 
 class PreferenceDatasetConfig(TypedDict):

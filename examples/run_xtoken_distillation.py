@@ -27,7 +27,7 @@ from nemo_rl.algorithms.xtoken_distillation import (
     setup,
     xtoken_distillation_train,
 )
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
+from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.utils.config import (
     load_config,
@@ -81,25 +81,14 @@ def main() -> None:
     student_tokenizer = get_tokenizer(config["policy"]["tokenizer"])
     teacher_tokenizer = get_tokenizer(config["teacher"]["tokenizer"])
 
-    # Load arrow_text dataset directly (no env / no rollout path).
-    train_data = load_response_dataset(config["data"]["train"])
-    train_dataset = AllTaskProcessedDataset(
-        train_data.dataset,
-        student_tokenizer,
-        train_data.task_spec,
-        train_data.processor,
-        max_seq_length=config["data"]["max_input_seq_length"],
+    # `env_configs=None` skips the env-creation block (no rollout path);
+    # `setup_response_data` then handles dataset construction, the optional
+    # train/val split via `split_validation_size`, `data.default` merging,
+    # and validation-from-config — features the prior manual route silently
+    # dropped.
+    train_dataset, val_dataset = setup_response_data(
+        student_tokenizer, config["data"], env_configs=None
     )
-    val_dataset = None
-    if config["data"].get("validation") is not None:
-        val_data = load_response_dataset(config["data"]["validation"])
-        val_dataset = AllTaskProcessedDataset(
-            val_data.dataset,
-            student_tokenizer,
-            val_data.task_spec,
-            val_data.processor,
-            max_seq_length=config["data"]["max_input_seq_length"],
-        )
 
     (
         student_policy,
