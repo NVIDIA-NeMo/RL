@@ -61,6 +61,41 @@ dependencies = [
   "cuda-bindings; sys_platform != 'darwin'",                                                                          # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                           # for transformer-engine no build isolation
+  # tilelang — replacement Triton kernel mamba-ssm requires when
+  # Triton >= 3.4.0 on Hopper, see github.com/state-spaces/mamba#640.
+  # Without this, qwen3.5 / nano-v3 / moonlight megatron recipes
+  # crash at first gated-chunk backward with a RuntimeError pointing
+  # at this exact pip install. Linux x86_64 only — mamba-ssm itself
+  # is gated to that pair.
+  "tilelang; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # Data-plane stack — promoted to base so worker venvs (built by
+  # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
+  # automatically include them. Removes the need for a `[data-plane]`
+  # extra and the corresponding plumbing in the per-worker venv builder.
+  "tensordict",
+  # Pinned to b266d39 (post-0.1.6, pre-0.1.7) for PR #77's MooncakeStore
+  # refactor: `clear` switched from unanchored `remove_by_regex` to
+  # exact-key `batch_remove`, which fixes a collateral-key-deletion bug
+  # that breaks DAPO + mooncake_cpu. Bump to the 0.1.7 tag when released.
+  "TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@b266d39",
+  # Backs data_plane.backend="mooncake_cpu". Default backend is "simple"
+  # (in-process), but the mooncake_cpu path needs the `mooncake_master`
+  # binary that ships in this wheel at <site-packages>/mooncake/. Bundled
+  # with TQ rather than gated behind an extra so worker venvs (built
+  # without extras) can be flipped to mooncake_cpu via config alone.
+  # PyPI's base `mooncake-transfer-engine` is cu12-only (links
+  # libcudart.so.12), which breaks on cu13 containers. Upstream now also
+  # publishes a cu13 variant as a separate distribution name
+  # `mooncake-transfer-engine-cuda13` (same `mooncake/` import namespace,
+  # store.so linked against libcudart.so.13). Resolve from PyPI rather
+  # than the GitHub release URL — the wheel is byte-identical (verified
+  # sha256), and PyPI's CDN is far more reliable than github releases
+  # from compute nodes.
+  # Upstream publishes both x86_64 and aarch64 wheels (see uv.lock).  CI's
+  # build-container runner is aarch64 (uv reports aarch64-unknown-linux-gnu),
+  # so the marker must include aarch64 — otherwise mooncake is silently
+  # excluded from the resolution during the Docker build.
+  "mooncake-transfer-engine-cuda13==0.3.10.post2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 
 [project.optional-dependencies]
@@ -304,6 +339,11 @@ override-dependencies = [
   "outlines>=0.2.0",
   # Upgrade pytest to 9.0.3
   "pytest>=9.0.3",
+  # TransferQueue (data-plane extra) pins numpy<2.0.0; megatron-core needs
+  # numpy>=2.1.0 via onnx → ml-dtypes. Override globally so the data-plane
+  # extra composes with mcore/automodel without version-mirroring TQ's
+  # requirements.txt. Forward-compatible across TQ minor bumps.
+  "numpy>=2.1.0",
 ]
 
 # CVE fixes
