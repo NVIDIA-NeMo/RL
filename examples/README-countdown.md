@@ -11,12 +11,13 @@ Puzzles are procedurally generated and guaranteed to be solvable. Numbers are dr
 ### Train (1 GPU)
 
 ```bash
-uv run python examples/run_grpo_countdown.py \
+python examples/run_grpo_countdown.py \
   --config examples/configs/grpo_countdown.yaml \
   cluster.num_nodes=1 cluster.gpus_per_node=1 \
   grpo.max_num_steps=50 \
   grpo.num_prompts_per_step=16 \
   grpo.num_generations_per_prompt=8 \
+  policy.train_global_batch_size=128 \
   logger.wandb_enabled=true \
   policy.dtensor_cfg.cpu_offload=false
 ```
@@ -24,21 +25,24 @@ uv run python examples/run_grpo_countdown.py \
 ### Train (8 GPU)
 
 ```bash
-uv run python examples/run_grpo_countdown.py \
+python examples/run_grpo_countdown.py \
   --config examples/configs/grpo_countdown.yaml \
   cluster.num_nodes=1 cluster.gpus_per_node=8 \
   grpo.max_num_steps=50 \
   grpo.num_prompts_per_step=64 \
   grpo.num_generations_per_prompt=16 \
+  policy.train_global_batch_size=1024 \
   logger.wandb_enabled=true \
   logger.wandb.name=grpo-countdown-8gpu
 ```
 
 ## Results
 
-*Results will be added after training runs complete.*
+Model: Qwen/Qwen3-0.6B, 50 training steps. Reward = fraction of correct countdown solutions.
 
 | Run | Steps | Mean Reward (start) | Mean Reward (end) | W&B Link |
 |-----|-------|--------------------|--------------------|----------|
-| 1-GPU | 50 | TBD | TBD | TBD |
-| 8-GPU | 50 | TBD | TBD | TBD |
+| 1-GPU (16x8) | 50 | 0.047 | 0.867 | [wandb](https://wandb.ai/nvidia/nemo-rl-native-env/runs/s64hunlh) |
+| 8-GPU (64x16) | 50 | 0.041 | 0.865 | [wandb](https://wandb.ai/nvidia/nemo-rl-native-env/runs/pnti5c3d) |
+
+Both runs show a clear learning curve from ~4% to ~87% accuracy over 50 steps.
