@@ -35,9 +35,14 @@ uv run python examples/run_grpo.py --config examples/configs/grpo_xlam_function_
 
 ## Results
 
-Training reward trajectory (wandb): *link TBD after training run*
+Training reward trajectory (wandb): https://wandb.ai/nvidia/nemo-rl-native-env/runs/gd0vhpie
 
-| Step | Mean Reward |
-|------|-------------|
-| 1    | TBD         |
-| 50   | TBD         |
+Qwen3-0.6B, 1 GPU, 50 steps, 16 prompts/step, 8 generations/prompt:
+
+| Step | Train Reward | Val Accuracy |
+|------|-------------|--------------|
+| 11   | 0.49        | --           |
+| 20   | 0.55        | 0.627        |
+| 30   | 0.62        | 0.654        |
+| 40   | 0.66        | 0.662        |
+| 50   | 0.59        | 0.660        |
