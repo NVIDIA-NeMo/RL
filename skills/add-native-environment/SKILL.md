@@ -53,6 +53,8 @@ Based on the answers, select the reference pattern:
 - For multi-turn tasks: reward partial progress (e.g., 0.5 for getting close, not just 1.0 for perfect).
 - Test: run 5 steps and check if `mean_reward > 0.0`. If not, simplify the task before continuing.
 - Example: Wordle with 200 words and a 0.6B model gets 0% reward — too hard. Use 20-30 very common words, or add partial rewards for correct letters.
+- For procedural puzzles: **only generate solvable instances**. If many puzzles are unsolvable, the model gets 0 reward for correct behavior (not attempting impossible puzzles), which degrades training. Example: Countdown Game with random targets 100-999 has many unsolvable instances, causing reward to decrease. Either verify solvability before presenting, or add partial rewards.
+- Watch for reward *decreasing* — this means the task has negative training signal (the KL penalty outweighs the sparse reward). Simplify the task or add denser reward signal.
 
 ### Stage 2: Model Selection
 
