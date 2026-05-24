@@ -51,7 +51,9 @@ def _worker(rank: int, world_size: int, tmp_init_file: str, q):
         else:
             data = None
 
-        out = _broadcast_batched_data_dict(data, is_leader=(rank == 0), src=0, group=dist.group.WORLD)
+        out = _broadcast_batched_data_dict(
+            data, is_leader=(rank == 0), src=0, group=dist.group.WORLD
+        )
 
         assert torch.equal(
             out["input_ids"], torch.arange(12, dtype=torch.long).reshape(3, 4)
