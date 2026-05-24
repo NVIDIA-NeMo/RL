@@ -88,6 +88,7 @@ def calculate_baseline_and_std_per_prompt(
     rewards: torch.Tensor,
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
+    std_rewards: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
 
@@ -99,10 +100,17 @@ def calculate_baseline_and_std_per_prompt(
     valid_mask: tensor (b,)       Vector of 0/1, where 0 is to ignore and 1 is to keep
     leave_one_out_baseline: bool  Compute an unbiased baseline by leaving out the sample that
                                   the baseline is for (from RLOO https://arxiv.org/abs/2402.14740)
+    std_rewards: tensor (b,)      Optional separate reward tensor used only for the std
+                                  calculation. Defaults to `rewards`. Useful for DAPO,
+                                  which needs std on the raw task metric for dynamic
+                                  sampling filtering while keeping baseline on the
+                                  shaped reward.
 
     Returns:
     tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
     """
+    if std_rewards is None:
+        std_rewards = rewards
     unique_prompts = torch.unique(prompts, dim=0)
 
     baseline = torch.zeros_like(rewards)
@@ -141,19 +149,28 @@ def calculate_baseline_and_std_per_prompt(
                 )
                 / num_valid
             )
-            prompt_baseline_square = (
+            std_prompt_baseline = (
+                prompt_baseline
+                if std_rewards is rewards
+                else torch.matmul(
+                    baseline_mask_matrix,
+                    std_rewards[prompt_idx] * valid_mask[prompt_idx],
+                )
+                / num_valid
+            )
+            std_prompt_baseline_square = (
                 torch.matmul(
                     baseline_mask_matrix,
-                    torch.pow(rewards[prompt_idx], 2) * valid_mask[prompt_idx],
+                    torch.pow(std_rewards[prompt_idx], 2) * valid_mask[prompt_idx],
                 )
                 / num_valid
             )
 
             baseline[prompt_idx] = prompt_baseline
-            sq_baseline[prompt_idx] = prompt_baseline_square
+            sq_baseline[prompt_idx] = std_prompt_baseline_square
             std[prompt_idx] = (
                 (
-                    (prompt_baseline_square - prompt_baseline.square())
+                    (std_prompt_baseline_square - std_prompt_baseline.square())
                     * (num_valid / (num_valid - 1))
                 )
                 .sqrt()

@@ -82,6 +82,39 @@ def test_math_dataset():
         )
 
 
+@pytest.mark.parametrize("variant", ["aime2024", "aime2025", "aime2026"])
+@pytest.mark.skip(reason="dataset download is flaky")
+def test_aime_dataset(variant):
+    # load the dataset
+    data_config = {
+        "dataset_name": variant,
+        "prompt_file": None,
+        "system_prompt_file": None,
+    }
+    aime_dataset = load_eval_dataset(data_config)
+
+    # load the tokenizer
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+
+    # check that the dataset is formatted correctly
+    for example in aime_dataset.rekeyed_ds.take(5):
+        assert "problem" in example
+        assert "expected_answer" in example
+
+        ## check that applying chat template works as expected
+        default_templated = tokenizer.apply_chat_template(
+            [{"role": "user", "content": example["problem"]}],
+            tokenize=False,
+            add_generation_prompt=False,
+            add_special_tokens=False,
+        )
+
+        assert (
+            default_templated
+            == f"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n{example['problem']}<|im_end|>\n"
+        )
+
+
 @pytest.mark.skip(reason="dataset download is flaky")
 def test_mmlu_dataset():
     # load the dataset

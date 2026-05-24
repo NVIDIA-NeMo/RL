@@ -133,7 +133,7 @@ class AIMEEvalDataConfig(TypedDict):
     """Config for AIME datasets."""
 
     max_input_seq_length: int
-    dataset_name: Literal["aime2024", "aime2025"]
+    dataset_name: Literal["aime2024", "aime2025", "aime2026"]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
 

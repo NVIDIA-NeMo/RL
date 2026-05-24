@@ -16,6 +16,8 @@ import os
 from collections import defaultdict
 from typing import Any, Optional, Union
 
+import torch
+import yaml
 from datasets import concatenate_datasets
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -35,6 +37,76 @@ from nemo_rl.environments.dummy_environment import DummyEnvironment
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
 from nemo_rl.utils.sequence_length_generator import get_sequence_length_generator
+
+
+def get_train_dataset_name(data_config: DataConfig) -> Optional[str]:
+    """Return the training ``dataset_name`` from a data config.
+
+    The shape of ``data_config["train"]`` is not consistent across algorithms
+    at the point where checkpoint save/load happens:
+    - ``setup_response_data`` (used by GRPO/Distillation) and ``setup_data``
+      in ``run_sft.py`` normalize a single-dataset dict into ``[dict]``.
+    - ``setup_preference_data`` (used by DPO/RM) leaves it as a ``dict``.
+
+    This helper tolerates both shapes and returns ``None`` when the dataset
+    name cannot be determined (e.g. legacy checkpoints with no name written,
+    multi-dataset training, or malformed configs).
+    """
+    if not data_config:
+        return None
+    train = data_config.get("train")
+    if isinstance(train, list):
+        train = train[0] if train else None
+    if isinstance(train, dict):
+        return train.get("dataset_name")
+    return None
+
+
+def load_dataloader_state(
+    dataloader: Any,
+    checkpoint_path: str,
+    data_config: DataConfig,
+    suffix: str = "",
+) -> None:
+    """Restore a dataloader's state from a checkpoint, with dataset-swap guard.
+
+    Loads ``{checkpoint_path}/train_dataloader{suffix}.pt`` and, when a
+    ``config.yaml`` is also present in the checkpoint dir (always written by
+    ``CheckpointManager.init_tmp_checkpoint``), compares the saved
+    ``dataset_name`` to the current run's ``dataset_name``. On mismatch the
+    dataloader state restore is **skipped** so the new dataset starts from
+    index 0 — otherwise ``StatefulDataLoader`` would inherit ``samples_yielded``
+    from the old run, silently skipping samples and (when the new dataset is
+    shorter than that count) crashing with ``StopIteration`` during ``iter()``.
+
+    No on-disk format change is needed: ``train_dataloader{suffix}.pt`` keeps
+    its existing raw-``state_dict`` shape, and the saved ``dataset_name`` is
+    read out of the sibling ``config.yaml`` so every existing checkpoint is
+    automatically compatible.
+    """
+    saved_state = torch.load(
+        os.path.join(checkpoint_path, f"train_dataloader{suffix}.pt")
+    )
+
+    config_path = os.path.join(checkpoint_path, "config.yaml")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            saved_config = yaml.safe_load(f) or {}
+        saved_name = get_train_dataset_name(saved_config.get("data"))
+        current_name = get_train_dataset_name(data_config)
+        if (
+            saved_name is not None
+            and current_name is not None
+            and saved_name != current_name
+        ):
+            print(
+                f"  ⚠ Dataset swap detected: was {saved_name!r}, now {current_name!r}. "
+                f"Skipping dataloader state restore; new dataset starts from index 0.",
+                flush=True,
+            )
+            return
+
+    dataloader.load_state_dict(saved_state)
 
 
 # TODO: @yukih: unify to setup_data after dataset refactored

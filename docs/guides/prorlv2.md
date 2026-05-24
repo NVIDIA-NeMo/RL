@@ -1,6 +1,6 @@
 # An In-Depth Walkthrough of ProRLv2 in NeMo RL
 
-This guide covers the ProRLv2 configuration pattern in NeMo RL, based on the example config [`examples/configs/prorlv2.yaml`](../../examples/configs/prorlv2.yaml).
+This guide covers the ProRLv2 configuration pattern in NeMo RL, based on the example config [`examples/configs/prorlv2.v2.yaml`](../../examples/configs/prorlv2.v2.yaml).
 
 ProRLv2 is best thought of as **GRPO plus a bundle of stability/efficiency techniques** commonly used for long-horizon RL fine-tuning:
 
@@ -15,13 +15,13 @@ This document focuses on ProRLv2-specific knobs and gotchas. For foundational co
 
 ## Quickstart: Launch a ProRLv2 Run
 
-Use the example configuration [`examples/configs/prorlv2.yaml`](../../examples/configs/prorlv2.yaml):
+Use the example configuration [`examples/configs/prorlv2.v2.yaml`](../../examples/configs/prorlv2.v2.yaml):
 
 ```bash
-uv run examples/run_grpo_math.py --config examples/configs/prorlv2.yaml {overrides}
+uv run examples/run_grpo_math.py --config examples/configs/prorlv2.v2.yaml {overrides}
 ```
 
-`prorlv2.yaml` inherits from [`examples/configs/grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml) and only overrides a small set of fields under `grpo` and `loss_fn`, plus output directories.
+`prorlv2.v2.yaml` inherits from [`examples/configs/grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml) and only overrides a small set of fields under `grpo` and `loss_fn`, plus output directories.
 
 **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for gated models.
 
@@ -47,7 +47,7 @@ Quick intuition:
 Computation (as implemented in this repo, with the ProRLv2 example defaults):
 
 ```text
-Defaults in examples/configs/prorlv2.yaml:
+Defaults in examples/configs/prorlv2.v2.yaml:
   grpo.adv_estimator.minus_baseline = true
   loss_fn.use_kl_in_reward          = false
 
@@ -204,18 +204,18 @@ Under Pure Online training (single update per rollout), the PPO policy ratio is 
 - **Seq-mask-tis** — sequence-level filtering instead of token-level ICE-POP.
 - **No DAPO dynamic sampling** (`use_dynamic_sampling: false`).
 
-Use [`examples/configs/prorlv2_1_moe.yaml`](../../examples/configs/prorlv2_1_moe.yaml) directly. See the [ProRL v2.1 blog post](https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/) for the full motivation.
+Use [`examples/configs/prorlv2_1_moe.v2.yaml`](../../examples/configs/prorlv2_1_moe.v2.yaml) directly. See the [ProRL v2.1 blog post](https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/) for the full motivation.
 :::
 
 ```bash
 # Launch ProRL v2.1 for MoE models
-uv run examples/run_grpo_math.py --config examples/configs/prorlv2_1_moe.yaml {overrides}
+uv run examples/run_grpo_math.py --config examples/configs/prorlv2_1_moe.v2.yaml {overrides}
 ```
 
 ## Full Example Configs
 
-- **ProRLv2** (ICE-POP, DAPO, clipping): [`examples/configs/prorlv2.yaml`](../../examples/configs/prorlv2.yaml) — inherits from [`grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml)
-- **ProRL v2.1** (seq-mask-tis, pure online, MoE): [`examples/configs/prorlv2_1_moe.yaml`](../../examples/configs/prorlv2_1_moe.yaml) — inherits from `prorlv2.yaml`, adds `force_on_policy_ratio`, switches to seq-mask-tis, disables dynamic sampling
+- **ProRLv2** (ICE-POP, DAPO, clipping): [`examples/configs/prorlv2.v2.yaml`](../../examples/configs/prorlv2.v2.yaml) — inherits from [`grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml)
+- **ProRL v2.1** (seq-mask-tis, pure online, MoE): [`examples/configs/prorlv2_1_moe.v2.yaml`](../../examples/configs/prorlv2_1_moe.v2.yaml) — inherits from `prorlv2.v2.yaml`, adds `force_on_policy_ratio`, switches to seq-mask-tis, disables dynamic sampling
 
 ## Practical Overrides
 
@@ -223,7 +223,7 @@ A few common overrides when launching:
 
 ```bash
 uv run examples/run_grpo_math.py \
-  --config examples/configs/prorlv2.yaml \
+  --config examples/configs/prorlv2.v2.yaml \
   policy.model_name="Qwen/Qwen2.5-1.5B" \
   logger.wandb_enabled=true \
   logger.wandb.project="prorlv2-dev" \
@@ -235,7 +235,7 @@ If you want to enable DAPO overlong reward shaping instead of stop-properly:
 
 ```bash
 uv run examples/run_grpo_math.py \
-  --config examples/configs/prorlv2.yaml \
+  --config examples/configs/prorlv2.v2.yaml \
   grpo.reward_shaping.stop_properly_penalty_coef=null \
   grpo.reward_shaping.overlong_buffer_length=4096 \
   grpo.reward_shaping.overlong_buffer_penalty=1.0 \

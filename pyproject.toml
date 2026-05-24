@@ -13,7 +13,7 @@ readme = { file = "README.md", content-type = "text/markdown" }
 name = "nemo-rl"
 dynamic = ["version", "readme"]
 description = "NeMo RL: A Scalable and Efficient Post-Training Library for Models Ranging from 1 GPU to 1000s, and from Tiny to >100B Parameters"
-requires-python = ">=3.13.13"
+requires-python = ">=3.13.13,<3.14"
 license = { text = "Apache 2.0" }
 maintainers = [
   { name = "Yi-Fu Wu", email = "yifuw@nvidia.com" },
@@ -25,7 +25,7 @@ dependencies = [
   "setuptools",
   "pip",                                                                                                              # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",                                                                                                            # for flash-attn parallel build
-  "torch==2.10.0",
+  "torch==2.11.0",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]==2.54.0",
@@ -48,7 +48,7 @@ dependencies = [
   "plotly",
   "sympy>=1.14.0",
   "pillow>=12.1.1",
-  "torchvision==0.25.0",
+  "torchvision==0.26.0",
   "transformers==5.3.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
   "mlflow>=3.11.1",
@@ -61,6 +61,41 @@ dependencies = [
   "cuda-bindings; sys_platform != 'darwin'",                                                                          # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                           # for transformer-engine no build isolation
+  # tilelang — replacement Triton kernel mamba-ssm requires when
+  # Triton >= 3.4.0 on Hopper, see github.com/state-spaces/mamba#640.
+  # Without this, qwen3.5 / nano-v3 / moonlight megatron recipes
+  # crash at first gated-chunk backward with a RuntimeError pointing
+  # at this exact pip install. Linux x86_64 only — mamba-ssm itself
+  # is gated to that pair.
+  "tilelang; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # Data-plane stack — promoted to base so worker venvs (built by
+  # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
+  # automatically include them. Removes the need for a `[data-plane]`
+  # extra and the corresponding plumbing in the per-worker venv builder.
+  "tensordict",
+  # Pinned to b266d39 (post-0.1.6, pre-0.1.7) for PR #77's MooncakeStore
+  # refactor: `clear` switched from unanchored `remove_by_regex` to
+  # exact-key `batch_remove`, which fixes a collateral-key-deletion bug
+  # that breaks DAPO + mooncake_cpu. Bump to the 0.1.7 tag when released.
+  "TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@b266d39",
+  # Backs data_plane.backend="mooncake_cpu". Default backend is "simple"
+  # (in-process), but the mooncake_cpu path needs the `mooncake_master`
+  # binary that ships in this wheel at <site-packages>/mooncake/. Bundled
+  # with TQ rather than gated behind an extra so worker venvs (built
+  # without extras) can be flipped to mooncake_cpu via config alone.
+  # PyPI's base `mooncake-transfer-engine` is cu12-only (links
+  # libcudart.so.12), which breaks on cu13 containers. Upstream now also
+  # publishes a cu13 variant as a separate distribution name
+  # `mooncake-transfer-engine-cuda13` (same `mooncake/` import namespace,
+  # store.so linked against libcudart.so.13). Resolve from PyPI rather
+  # than the GitHub release URL — the wheel is byte-identical (verified
+  # sha256), and PyPI's CDN is far more reliable than github releases
+  # from compute nodes.
+  # Upstream publishes both x86_64 and aarch64 wheels (see uv.lock).  CI's
+  # build-container runner is aarch64 (uv reports aarch64-unknown-linux-gnu),
+  # so the marker must include aarch64 — otherwise mooncake is silently
+  # excluded from the resolution during the Docker build.
+  "mooncake-transfer-engine-cuda13==0.3.10.post2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 
 [project.optional-dependencies]
@@ -86,7 +121,8 @@ automodel = [
   "causal-conv1d",
   "nv-grouped-gemm",
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
 ]
 vllm = [
   "cuda-python",
@@ -94,16 +130,16 @@ vllm = [
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  # +cu130 wheels from GitHub match torch (pytorch-cu130). PyPI can resolve to +cu12
-  # binaries on Linux (e.g. libcudart.so.12 vs torch cu13). See v0.17.1 release assets:
-  # https://github.com/vllm-project/vllm/releases/tag/v0.17.1
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.17.1/vllm-0.17.1+cu130-cp38-abi3-manylinux_2_35_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.17.1/vllm-0.17.1+cu130-cp38-abi3-manylinux_2_35_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "vllm==0.17.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
+  # Default wheels on GitHub are cu130. See v0.20.0 release assets:
+  # https://github.com/vllm-project/vllm/releases/tag/v0.20.0
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "vllm==0.20.0 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.4",
-  "flashinfer-cubin==0.6.4",
+  "flashinfer-python==0.6.8.post1",
+  "flashinfer-cubin==0.6.8.post1",
   "nvidia-cutlass-dsl>=4.4.0.dev1",
 ]
 sglang = [
@@ -123,6 +159,8 @@ mcore = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
   "megatron-core",
   "megatron-bridge",
+  "nvidia-modelopt[torch]; sys_platform != 'darwin'",
+  "onnxscript",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
@@ -130,7 +168,8 @@ mcore = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "emerging-optimizers==0.2.0",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
@@ -143,7 +182,7 @@ nemo_gym = ["nemo_gym"]
 # This is a default group so that we install these even with bare `uv sync`
 build = [
   # Build requirement for TE
-  "torch==2.10.0",
+  "torch==2.11.0",
   # Build requirement for TE
   "setuptools",
   "packaging",
@@ -184,7 +223,7 @@ test = [
 ]
 
 [tool.uv.sources]
-megatron-core = { workspace = true }
+megatron-core = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM", editable = true }
 nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = true }
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace", editable = true }
 nemo_gym = { workspace = true }
@@ -214,10 +253,10 @@ emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizer
 sglang = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "python" }
 sglang-kernel = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "sgl-kernel" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "905018803414702e414a86716484ed4115b37ba6" }
+nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "15a851565a4ce846c04431ecb0cf09903ab4837e" }
 
 [tool.uv.workspace]
 members = [
-  "3rdparty/Megatron-LM-workspace",
   "3rdparty/Gym-workspace/Gym",
   # Research projects are also added here in order for them to share the global root level uv.lock.
   # If we don't do this, the research projects do not see the global uv.lock, and may mistakenly
@@ -271,16 +310,17 @@ override-dependencies = [
   "opencv-python-headless>=4.11.0",
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.39.0",
-  "torch==2.10.0",
-  "torchaudio==2.10.0",
+  "torch==2.11.0",
+  "torchaudio==2.11.0",
   # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  # Note: flashinfer versions are pinned per-extra (vllm uses 0.6.4, sglang uses 0.6.7.post2)
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
+  # Note: flashinfer versions are pinned per-extra (vllm uses 0.6.8.post1, sglang uses 0.6.7.post2)
   # since vllm and sglang extras are mutually exclusive and have different requirements.
-  # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm (0.6.4) and sglang (0.6.7.post2)
+  # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm (0.6.8.post1) and sglang (0.6.7.post2)
   "flashinfer-python>=0.5.0",
   "flashinfer-cubin>=0.5.0",
   # sglang 0.5.10 requires nvidia-cutlass-dsl>=4.4.1 (via flashinfer 0.6.7.post2 which uses CUTLASS 4.4.2).
@@ -288,8 +328,8 @@ override-dependencies = [
   "nvidia-cutlass-dsl>=4.4.1",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
-  # vLLM 0.17.0 code is compatible with transformers v5 but the PyPI metadata still declares <5.
-  # Override until vllm officially relaxes the constraint (https://github.com/vllm-project/vllm/issues/30466).
+  # vLLM 0.20.0 excludes transformers 5.0-5.5.0 but our codebase needs 5.3.0.
+  # Override so uv can resolve transformers==5.3.0 for non-vllm extras.
   "transformers==5.3.0",
   #Override till we can upgrade sglang version to address CVE GHSA-7rgv-gqhr-fxg3
   "xgrammar==0.1.33",
@@ -299,6 +339,11 @@ override-dependencies = [
   "outlines>=0.2.0",
   # Upgrade pytest to 9.0.3
   "pytest>=9.0.3",
+  # TransferQueue (data-plane extra) pins numpy<2.0.0; megatron-core needs
+  # numpy>=2.1.0 via onnx → ml-dtypes. Override globally so the data-plane
+  # extra composes with mcore/automodel without version-mirroring TQ's
+  # requirements.txt. Forward-compatible across TQ minor bumps.
+  "numpy>=2.1.0",
 ]
 
 # CVE fixes
