@@ -18,6 +18,8 @@ Given a list of numbers and a target, combine numbers using +, -, *, /
 to reach the target. Each number may be used at most once.
 """
 
+import ast
+import operator
 import re
 from collections import Counter
 from typing import Optional
@@ -27,8 +29,49 @@ import torch
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.environments.games.twenty_four_game import _safe_eval_expr
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
+
+_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _safe_eval_expr(expr_str: str) -> Optional[float]:
+    """Safely evaluate a mathematical expression using AST parsing.
+
+    Only allows +, -, *, / operators, integer/float literals, and parentheses.
+    Returns None if the expression is invalid or causes an error.
+    """
+    try:
+        tree = ast.parse(expr_str, mode="eval")
+    except SyntaxError:
+        return None
+
+    def _eval_node(node: ast.expr) -> float:
+        if isinstance(node, ast.Expression):
+            return _eval_node(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.BinOp):
+            op_func = _OPS.get(type(node.op))
+            if op_func is None:
+                raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
+            left = _eval_node(node.left)
+            right = _eval_node(node.right)
+            if isinstance(node.op, ast.Div) and right == 0:
+                raise ZeroDivisionError
+            return op_func(left, right)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -_eval_node(node.operand)
+        raise ValueError(f"Unsupported node type: {type(node).__name__}")
+
+    try:
+        return _eval_node(tree)
+    except (ValueError, ZeroDivisionError, TypeError):
+        return None
 
 
 def _extract_numbers_from_expr(expr_str: str) -> list[int]:

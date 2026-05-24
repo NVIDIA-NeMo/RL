@@ -36,7 +36,6 @@ from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer, set_seed
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.games.countdown import CountdownEnv
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
     load_config,
@@ -217,30 +216,50 @@ def main():
     print("Final config:")
     pprint.pprint(config)
 
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
-    print(f"Using log directory: {config.logger['log_dir']}")
-    if config.checkpointing["enabled"]:
-        print(f"Using checkpoint directory: {config.checkpointing['checkpoint_dir']}")
+    config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
+    print(f"Using log directory: {config['logger']['log_dir']}")
+    if config["checkpointing"]["enabled"]:
+        print(
+            f"Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
+        )
 
     init_ray()
-    set_seed(config.grpo["seed"])
+    set_seed(config["grpo"]["seed"])
 
-    tokenizer = get_tokenizer(config.policy["tokenizer"])
-    config.policy["generation"] = configure_generation_config(
-        config.policy["generation"], tokenizer
+    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+    config["policy"]["generation"] = configure_generation_config(
+        config["policy"]["generation"], tokenizer
     )
 
-    # Setup environment
+    # Setup environment — load the CountdownEnv class from this project tree
+    # (needed when the editable install points to a different copy of the repo)
     task_name = "countdown"
-    env_config = config.env[task_name]
+    env_config = config["env"][task_name]
+    import importlib.util
+
+    _countdown_path = os.path.join(
+        os.path.dirname(__file__),
+        os.pardir,
+        "nemo_rl",
+        "environments",
+        "games",
+        "countdown.py",
+    )
+    _spec = importlib.util.spec_from_file_location(
+        "nemo_rl.environments.games.countdown", os.path.abspath(_countdown_path)
+    )
+    _countdown_mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_countdown_mod)
+    CountdownEnv = _countdown_mod.CountdownEnv
+
     env = CountdownEnv.options(num_gpus=0).remote(cfg=dict(env_config.get("cfg", {})))
     task_to_env = {task_name: env}
 
     # Setup datasets
     ds_length = (
-        config.grpo["num_prompts_per_step"]
-        * config.grpo["num_generations_per_prompt"]
-        * config.grpo["max_num_steps"]
+        config["grpo"]["num_prompts_per_step"]
+        * config["grpo"]["num_generations_per_prompt"]
+        * config["grpo"]["max_num_steps"]
     )
     countdown_cfg = env_config.get("cfg", {})
     dataset = IterableCountdownDataset(
@@ -248,7 +267,7 @@ def main():
         num_count_min=countdown_cfg.get("num_count_min", 3),
         num_count_max=countdown_cfg.get("num_count_max", 6),
         task_name=task_name,
-        add_system_prompt=config.data["add_system_prompt"],
+        add_system_prompt=config["data"]["add_system_prompt"],
         length=ds_length,
     )
     val_dataset = IterableCountdownDataset(
@@ -256,8 +275,8 @@ def main():
         num_count_min=countdown_cfg.get("num_count_min", 3),
         num_count_max=countdown_cfg.get("num_count_max", 6),
         task_name=task_name,
-        add_system_prompt=config.data["add_system_prompt"],
-        length=config.grpo["max_val_samples"],
+        add_system_prompt=config["data"]["add_system_prompt"],
+        length=config["grpo"]["max_val_samples"],
     )
     val_task_to_env = task_to_env
 
