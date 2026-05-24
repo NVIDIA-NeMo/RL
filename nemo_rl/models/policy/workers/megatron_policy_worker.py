@@ -1173,7 +1173,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
     def finish_inference(self, *args, **kwargs):
         """Offload model params to CPU after inference."""
-        self.model = self.move_model(self.model, "cpu", move_params=True, move_grads=False)
+        self.model = self.move_model(
+            self.model, "cpu", move_params=True, move_grads=False
+        )
         self.model.eval()
 
         gc.collect()
@@ -1181,7 +1183,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
     def finish_training(self, *args, **kwargs):
         """Offload model, gradients, and optimizer to CPU after training."""
-        self.model = self.move_model(self.model, "cpu", move_params=True, move_grads=True)
+        self.model = self.move_model(
+            self.model, "cpu", move_params=True, move_grads=True
+        )
         self.model.eval()
 
         if (
