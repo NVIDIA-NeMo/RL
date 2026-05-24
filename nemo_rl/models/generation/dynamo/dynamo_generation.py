@@ -36,6 +36,259 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.k8s import is_in_kubernetes, read_pod_namespace
 
 DEFAULT_FRONTEND_PORT = 8000
+DEFAULT_DYN_SYSTEM_PORT = 9090
+
+
+def _http_post_json(url: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+    """POST a JSON body to a URL and parse the JSON response.
+
+    Returns the parsed dict (or a ``{"status": "error", ...}`` shape on
+    transport / HTTP error). Never raises — caller decides how to handle
+    a non-ok status.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        err = exc.read().decode("utf-8", "replace") if exc.fp else ""
+        return {"status": "error", "http_status": exc.code, "raw": err}
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return {"status": "error", "transport_error": f"{type(exc).__name__}: {exc}"}
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return {"status": "error", "raw": body.decode("utf-8", "replace")}
+
+
+def _discover_worker_instances(
+    *,
+    frontend_host: str,
+    frontend_port: int,
+    dyn_namespace: str,
+    dyn_system_port: int,
+    timeout_s: float = 15.0,
+) -> list[dict[str, Any]]:
+    """Discover live worker instances via the frontend's ``GET /health``.
+
+    Each entry in the response's ``instances`` array has an
+    ``instance_id`` (per-worker-pod stable identifier) and a
+    ``transport.tcp`` URL of the form
+    ``tcp://<pod_ip>:<tcp_port>/<channel>/<endpoint_name>``. We extract
+    the pod IP, pair it with the well-known ``DYN_SYSTEM_PORT`` (default
+    9090) where the ``/engine/<route>`` HTTP admin server listens, and
+    dedupe per ``instance_id`` (each pod registers multiple endpoint
+    instances but we only need one system URL per pod).
+
+    Returns a list of ``{instance_id, system_url}`` dicts. Empty on
+    transport / parse error — caller decides whether that's fatal.
+    """
+    import json
+    import re
+    import urllib.error
+    import urllib.request
+
+    url = f"http://{frontend_host}:{frontend_port}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.HTTPError, urllib.error.URLError,
+            TimeoutError, json.JSONDecodeError):
+        return []
+    instances = data.get("instances", []) if isinstance(data, dict) else []
+    if not isinstance(instances, list):
+        return []
+
+    seen_ids: set[Any] = set()
+    out: list[dict[str, Any]] = []
+    # ``transport.tcp`` is ``<pod_ip>:<port>/<channel>/<endpoint>`` with no
+    # scheme prefix; we just need the host part.
+    tcp_re = re.compile(r"^(?:tcp://)?([^:/]+):")
+    for inst in instances:
+        if not isinstance(inst, dict):
+            continue
+        if inst.get("namespace") != dyn_namespace:
+            continue
+        inst_id = inst.get("instance_id")
+        if inst_id is None or inst_id in seen_ids:
+            continue
+        transport = inst.get("transport") or {}
+        tcp = transport.get("tcp") if isinstance(transport, dict) else None
+        if not isinstance(tcp, str):
+            continue
+        m = tcp_re.match(tcp)
+        if not m:
+            continue
+        pod_ip = m.group(1)
+        seen_ids.add(inst_id)
+        out.append({
+            "instance_id": inst_id,
+            "system_url": f"http://{pod_ip}:{dyn_system_port}",
+        })
+    return out
+
+
+@ray.remote(num_cpus=0)
+def _dispatch_update_weights_via_mx_remote(
+    *,
+    k8s_namespace: str,
+    dgd_name: str,
+    version: int,
+    mx_config_dict: dict[str, Any],
+    frontend_port: int = DEFAULT_FRONTEND_PORT,
+    dyn_system_port: int = DEFAULT_DYN_SYSTEM_PORT,
+    refit_timeout_s: float = 300.0,
+    admin_timeout_s: float = 30.0,
+    max_convergence_iterations: int = 5,
+) -> dict[str, Any]:
+    """Synchronously orchestrate an MX refit cycle that converges over scaling.
+
+    Architecture (minimum surgical, no biswapanda PR dependency):
+
+      1. GET http://<dgd>-frontend.<ns>.svc:8000/health
+         → enumerate worker pods from ``instances[*]``
+         → key by ``instance_id``; system_url = http://<pod_ip>:<DYN_SYSTEM_PORT>
+      2. For each NEW worker (not already refitted in this cycle):
+         a. POST /engine/pause_generation       (stop accepting new generates)
+         b. POST /engine/update_weights_via_mx  (real NIXL receive, blocks)
+         c. POST /engine/flush_cache            (drop stale prefix cache)
+         d. POST /engine/resume_generation      (try/finally so we always re-enable)
+      3. Re-discover via /health. If new instance_ids appeared (a worker
+         scaled in or restarted during the cycle), go to step 2.
+      4. Once a discovery shows no new instance_ids, return.
+
+    Workers that DISAPPEARED mid-cycle (instance_id no longer in /health)
+    are silently dropped — they're gone, so they can't be serving stale
+    weights. Caller-visible failure only on per-worker step errors or if
+    the loop fails to converge within ``max_convergence_iterations``
+    passes (defense against pathological scale-thrash).
+    """
+    frontend_host = f"{dgd_name}-frontend.{k8s_namespace}.svc.cluster.local"
+    dyn_namespace = f"{k8s_namespace}-{dgd_name}"
+    payload = {"version": version, "mx_config": mx_config_dict}
+
+    def _step(sys_url: str, route: str, body: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+        return _http_post_json(f"{sys_url}/engine/{route}", body, timeout_s)
+
+    refitted_ids: set[Any] = set()
+    iteration_logs: list[dict[str, Any]] = []
+    failures: list[str] = []
+
+    for iteration in range(max_convergence_iterations):
+        if iteration == 0:
+            # On the first pass, the worker pod may be container-Ready but
+            # not yet registered in the frontend's discovery system. Retry
+            # with backoff before giving up.
+            import time as _time
+            instances = []
+            for _attempt in range(20):
+                instances = _discover_worker_instances(
+                    frontend_host=frontend_host,
+                    frontend_port=frontend_port,
+                    dyn_namespace=dyn_namespace,
+                    dyn_system_port=dyn_system_port,
+                )
+                if instances:
+                    break
+                _time.sleep(3.0)
+            if not instances:
+                raise RuntimeError(
+                    f"[mx] GET http://{frontend_host}:{frontend_port}/health "
+                    f"returned no instances for namespace={dyn_namespace} "
+                    f"after 20 retries (60s). Verify DGD is healthy. Refit aborted."
+                )
+        else:
+            instances = _discover_worker_instances(
+                frontend_host=frontend_host,
+                frontend_port=frontend_port,
+                dyn_namespace=dyn_namespace,
+                dyn_system_port=dyn_system_port,
+            )
+
+        new_instances = [
+            i for i in instances if i["instance_id"] not in refitted_ids
+        ]
+        iter_log = {
+            "iteration": iteration,
+            "discovered": len(instances),
+            "new": len(new_instances),
+            "already_refitted": len(refitted_ids),
+        }
+        if not new_instances:
+            iteration_logs.append(iter_log)
+            break  # converged: every live worker has been refitted
+
+        for inst in new_instances:
+            sys_url = inst["system_url"]
+            inst_id = inst["instance_id"]
+            steps: dict[str, Any] = {}
+
+            r_pause = _step(sys_url, "pause_generation", {}, admin_timeout_s)
+            steps["pause"] = r_pause
+            if r_pause.get("status") != "ok":
+                # Resume to undo partial pause (defensive), then record fail.
+                _step(sys_url, "resume_generation", {}, admin_timeout_s)
+                failures.append(f"pause@{sys_url}({inst_id}): {r_pause}")
+                continue
+
+            try:
+                r_refit = _step(
+                    sys_url, "update_weights_via_mx", payload, refit_timeout_s
+                )
+                steps["refit"] = r_refit
+                if r_refit.get("status") != "ok":
+                    failures.append(f"refit@{sys_url}({inst_id}): {r_refit}")
+
+                r_flush = _step(sys_url, "flush_cache", {}, admin_timeout_s)
+                steps["flush"] = r_flush
+                if r_flush.get("status") not in ("ok", None):
+                    failures.append(f"flush@{sys_url}({inst_id}): {r_flush}")
+            finally:
+                r_resume = _step(
+                    sys_url, "resume_generation", {}, admin_timeout_s
+                )
+                steps["resume"] = r_resume
+                if r_resume.get("status") != "ok":
+                    failures.append(f"resume@{sys_url}({inst_id}): {r_resume}")
+
+            # Whether or not the refit step succeeded, we've completed
+            # the cycle on this instance — mark it so we don't re-pause
+            # next iteration. If it failed, it's already in `failures`
+            # and the final aggregate-raise will surface it.
+            refitted_ids.add(inst_id)
+
+        iter_log["refitted_this_pass"] = len(new_instances)
+        iteration_logs.append(iter_log)
+    else:
+        # Loop hit max iterations without converging — pathological churn.
+        raise RuntimeError(
+            f"[mx] update_weights_via_mx(version={version}) did not converge "
+            f"after {max_convergence_iterations} passes "
+            f"(workers refitted: {len(refitted_ids)}). Worker pool may be "
+            f"churning faster than refit can keep up. Iteration log: "
+            f"{iteration_logs}"
+        )
+
+    if failures:
+        raise RuntimeError(
+            f"[mx] update_weights_via_mx(version={version}) refit cycle "
+            f"failed: " + " | ".join(failures[:3])
+        )
+    return {
+        "status": "ok", "version": version,
+        "workers_refitted": len(refitted_ids),
+        "iterations": iteration_logs,
+    }
 
 
 def _derive_frontend_url_from_dgd(dynamo_cfg: dict[str, Any]) -> str:
@@ -194,18 +447,45 @@ class DynamoGeneration(GenerationInterface):
         version: int,
         mx_config: Any,
     ) -> list[ray.ObjectRef]:
-        """No-op on the trainer side; the DGD workers poll MX for new versions.
+        """Synchronously trigger refit on every DGD VllmDecodeWorker.
 
-        The refit_policy_generation mx branch in nemo_rl/algorithms/grpo.py
-        publishes via ``policy.stream_weights_via_mx`` and then calls this
-        method on the generation interface. With the receiver-side polling
-        architecture, the DGD's ``MxRefitWorkerExtension`` runs a background
-        loop that watches the MX server for new versions matching its
-        model_name and triggers a refit automatically when one appears —
-        so no trainer→worker RPC is needed.
+        After the trainer has published the new weight version to the MX
+        server (via ``policy.stream_weights_via_mx``), call the Dynamo
+        Endpoint ``{namespace}.{component}.update_weights_via_mx`` on each
+        worker. The handler at ``BaseWorkerHandler.update_weights_via_mx``
+        fans into ``AsyncLLM.collective_rpc("update_weights_via_mx", …)``
+        which runs the real NIXL receive synchronously inside every vLLM
+        worker process; the endpoint streams back one JSON object whose
+        ``status`` field tells us whether the receive succeeded.
 
-        Returns an empty list of ObjectRefs to satisfy the abstract method
-        signature; ``ray.get([])`` is a no-op.
+        Returns a list of Ray ObjectRefs (one per worker). The caller
+        ``ray.get(...)`` raises if any worker reported a non-ok status,
+        producing a loud failure if the publish was invisible or the
+        receive errored — replaces the silent stale-weight failure mode
+        of the prior poll-only architecture.
         """
-        del version, mx_config  # unused — receiver polls
-        return []
+        dynamo_cfg = self.cfg.get("dynamo_cfg", {}) or {}
+        dgd_name = dynamo_cfg.get("dgd_name")
+        if not dgd_name:
+            raise RuntimeError(
+                "DynamoGeneration.update_weights_via_mx requires "
+                "policy.generation.dynamo_cfg.dgd_name to identify the DGD."
+            )
+        namespace = dynamo_cfg.get("namespace") or read_pod_namespace() or "default"
+
+        # Serialize MxConfig (dataclass or already-a-dict) to a JSON-safe dict.
+        if isinstance(mx_config, dict):
+            mx_config_dict = dict(mx_config)
+        elif hasattr(mx_config, "__dataclass_fields__"):
+            import dataclasses
+            mx_config_dict = dataclasses.asdict(mx_config)
+        else:
+            mx_config_dict = {}
+
+        ref = _dispatch_update_weights_via_mx_remote.remote(
+            k8s_namespace=namespace,
+            dgd_name=dgd_name,
+            version=int(version),
+            mx_config_dict=mx_config_dict,
+        )
+        return [ref]
