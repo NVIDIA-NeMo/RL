@@ -232,6 +232,7 @@ def forward_step_value(
     if pack_sequences and packed_seq_params is not None:
         loss_fn = SequencePackingLossWrapper(
             loss_fn=loss_fn,
+            prepare_fn=lambda logits, data: (logits, data),
             cu_seqlens_q=packed_seq_params.cu_seqlens_q,
             cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
         )
@@ -431,6 +432,15 @@ class MegatronValueWorker(AbstractPolicyWorker):
             # For Megatron optimizers, we need to handle this carefully.
             # The value head is a small module, so we add it as a separate param group.
             self._add_value_head_to_optimizer()
+
+            if optimizer_path is not None:
+                vh_opt_path = os.path.join(optimizer_path, "value_head_optimizer.pt")
+                if os.path.exists(vh_opt_path):
+                    vh_opt_state = torch.load(
+                        vh_opt_path, map_location="cuda", weights_only=True
+                    )
+                    self.value_head_optimizer.load_state_dict(vh_opt_state)
+                    print(f"Loaded value head optimizer state from {vh_opt_path}")
 
         # Step 6: Finalize setup
         (
@@ -773,7 +783,10 @@ class MegatronValueWorker(AbstractPolicyWorker):
         }
 
         # Collect MoE aux metrics if applicable
-        num_moe_experts = getattr(self.model.config, "num_moe_experts", None)
+        # Use getattr-by-string so "config" stays out of co_names; torch 2.11
+        # cloudpickle otherwise matches torch.distributed.config (non-pickleable).
+        model_config = getattr(self.model, "config", None)
+        num_moe_experts = getattr(model_config, "num_moe_experts", None)
         if num_moe_experts is not None and num_moe_experts > 1:
             moe_loss_scale = 1.0 / max(1, total_num_microbatches)
             moe_metrics = get_moe_metrics(

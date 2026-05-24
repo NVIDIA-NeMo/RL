@@ -65,7 +65,7 @@ data:
 logger:
   log_dir: logs/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron
   wandb:
-    project: binguo-ppo-v1
+    project: nemo-rl
     name: ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron
 cluster:
   gpus_per_node: 8
