@@ -1088,9 +1088,6 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
         exact_token_match_only: If True, only aligned pairs flagged as
             'is_correct' contribute to KL; mismatched pairs are masked out.
             Used by the P-KL path only.
-        project_teacher_to_student: If True, project the teacher distribution
-            into student vocab via M.T instead of projecting student into
-            teacher vocab via M.
         kl_loss_weight: Scalar multiplier on the KL term (P-KL path).
         ce_loss_scale: Scalar multiplier on the CE term (P-KL path).
         dynamic_loss_scaling: If True, rescale KL each step so its detached
@@ -1117,7 +1114,6 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
     uncommon_topk: int
     reverse_kl: bool
     exact_token_match_only: bool
-    project_teacher_to_student: bool
     kl_loss_weight: float
     ce_loss_scale: float
     dynamic_loss_scaling: bool
@@ -1221,14 +1217,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the cross-tokenizer distillation loss for one microbatch."""
         cfg = self.cfg
-
-        if cfg["project_teacher_to_student"]:
-            raise NotImplementedError(
-                "project_teacher_to_student=True is not implemented in v0. "
-                "It would invert the projection direction (teacher distribution "
-                "projected into student vocab via M.T) and isn't on the "
-                "smoke-test path."
-            )
 
         if cfg["gold_loss"]:
             loss, kl_common, l1_uncommon, num_valid_chunks, top1_acc = (

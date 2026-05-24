@@ -41,7 +41,6 @@ loss_fn:
                               # (matches PT default at tokenalign.py:3727)
   reverse_kl: false
   exact_token_match_only: false
-  project_teacher_to_student: false
   kl_loss_weight: 1.0         # P-KL only
   ce_loss_scale: 0.1          # P-KL only
   dynamic_loss_scaling: true  # P-KL only
