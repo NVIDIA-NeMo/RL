@@ -252,7 +252,9 @@ def main():
     _spec.loader.exec_module(_countdown_mod)
     CountdownEnv = _countdown_mod.CountdownEnv
 
-    env = CountdownEnv.options(num_gpus=0).remote(cfg=dict(env_config.get("cfg", {})))
+    env = CountdownEnv.options(num_gpus=0).remote(
+        config=dict(env_config.get("cfg", {}))
+    )
     task_to_env = {task_name: env}
 
     # Setup datasets
